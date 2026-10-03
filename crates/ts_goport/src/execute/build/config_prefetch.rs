@@ -119,6 +119,10 @@ enum SlotState {
     /// The thread's match, `None` when the parse matched nothing (no
     /// config file, no options) or panicked.
     Done(Option<MatchedFileNames>),
+    /// The thread's work after the parse (`parse_config`) panicked with
+    /// this payload. The orchestrator panics with it when it takes the
+    /// slot.
+    Panicked(Box<dyn std::any::Any + Send>),
     /// The orchestrator took the slot.
     Taken,
 }
@@ -406,7 +410,8 @@ impl PrefetchPool {
     /// The match of a thread for the config at `path`, when its inputs
     /// equal those of the orchestrator's match (`inputs`). Waits for the
     /// thread that parses the config. A config that no thread has started
-    /// becomes the orchestrator's: None, and no thread starts it.
+    /// becomes the orchestrator's: None, and no thread starts it. When the
+    /// thread's work after the parse panicked, panics with its payload.
     fn take(&self, path: &Path, inputs: &MatchInputs) -> Option<MatchedFileNames> {
         let slot = lock(&self.shared.slots).get(path).cloned()?;
         let mut state = lock(&slot.state);
@@ -429,6 +434,10 @@ impl PrefetchPool {
                 }
                 SlotState::Done(matched) => {
                     return matched.filter(|matched| matched.inputs == *inputs);
+                }
+                SlotState::Panicked(payload) => {
+                    drop(state);
+                    std::panic::resume_unwind(payload);
                 }
             }
         }
@@ -660,7 +669,10 @@ fn run_thread(shared: &Arc<Shared>) {
 /// Parses `config` for its slot. Before the orchestrator can take the
 /// slot, queues its references, and its build info read with the key of
 /// the file. It starts no thread for the read: this thread is free for it
-/// after the parse.
+/// after the parse. When that work panics, the slot keeps the payload, and
+/// the orchestrator panics with it (`take`), as when it found the key on
+/// its own thread. So the slot does not stay `Running`, and the
+/// orchestrator does not wait for it forever.
 fn parse_config(
     shared: &Arc<Shared>,
     options: &ParseOptions,
@@ -706,20 +718,31 @@ fn parse_config(
             .map(|(_, matched)| matched),
         Err(_) => None,
     };
-    if let Ok(Some((references, read))) = parsed {
-        queue_configs(shared, &references);
-        if let Some(read) = read {
-            let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
-            let key = PathKeys::new(&fs, &shared.compare_paths_options).build_info_key(&read.name);
-            let mut queue = lock(&shared.queue);
-            if let Some(job) = add_read(&mut queue, &path, read, Some(key)) {
-                queue.reads.push_back(job);
-                drop(queue);
-                shared.ready.notify_one();
-            }
+    let queued = match parsed {
+        Ok(Some((references, read))) => {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                tests::panic_after_parse(&config);
+                queue_configs(shared, &references);
+                if let Some(read) = read {
+                    let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
+                    let key = PathKeys::new(&fs, &shared.compare_paths_options)
+                        .build_info_key(&read.name);
+                    let mut queue = lock(&shared.queue);
+                    if let Some(job) = add_read(&mut queue, &path, read, Some(key)) {
+                        queue.reads.push_back(job);
+                        drop(queue);
+                        shared.ready.notify_one();
+                    }
+                }
+            }))
         }
-    }
-    *lock(&slot.state) = SlotState::Done(matched);
+        _ => Ok(()),
+    };
+    *lock(&slot.state) = match queued {
+        Ok(()) => SlotState::Done(matched),
+        Err(payload) => SlotState::Panicked(payload),
+    };
     slot.done.notify_all();
 }
 
@@ -867,5 +890,89 @@ impl Fs for RecordingFs<'_> {
 
     fn realpath(&self, path: &str) -> String {
         self.lookups.realpath(path, || self.fs.realpath(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The configs whose work after the parse panics (`panic_after_parse`).
+    static PANIC_AFTER_PARSE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Test-only panic hook of `parse_config`: panics after the parse of a
+    /// config in `PANIC_AFTER_PARSE`, where the key and queue calls can
+    /// panic.
+    pub(super) fn panic_after_parse(config: &str) {
+        if lock(&PANIC_AFTER_PARSE).iter().any(|name| name == config) {
+            panic!("test panic after the parse of {config}");
+        }
+    }
+
+    // A panic in a thread's work after the parse (build info key, queued
+    // references) reaches the orchestrator's take as a panic. Before, the
+    // slot stayed Running and `tsc -b` waited for it forever.
+    #[test]
+    fn panic_after_parse_reaches_take() {
+        let dir =
+            std::env::temp_dir().join(format!("ts_goport_prefetch_panic_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), "export {};").unwrap();
+        std::fs::write(dir.join("tsconfig.json"), r#"{"files": ["a.ts"]}"#).unwrap();
+        let config = dir.join("tsconfig.json").to_str().unwrap().to_string();
+        lock(&PANIC_AFTER_PARSE).push(config.clone());
+        let compare_paths_options = ComparePathsOptions {
+            use_case_sensitive_file_names: true,
+            current_directory: dir.to_str().unwrap().to_string(),
+        };
+        let path = to_path(&config, &compare_paths_options.current_directory, true);
+        let pool = PrefetchPool::start(
+            CompilerOptions::default(),
+            None,
+            &compare_paths_options,
+            false,
+            std::slice::from_ref(&config),
+        )
+        .expect("a prefetch thread starts");
+        // The orchestrator parses a config that no thread has started, so
+        // the take waits until a thread has started it.
+        let slot = lock(&pool.shared.slots).get(&path).cloned().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while matches!(*lock(&slot.state), SlotState::Queued) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no thread started the config"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let inputs = MatchInputs {
+            base_path: String::new(),
+            files: Vec::new(),
+            include: Vec::new(),
+            exclude: Vec::new(),
+            extensions: Vec::new(),
+            extensions_with_json: Vec::new(),
+        };
+        // A take that waits forever fails the test after the timeout.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let taken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool.take(&path, &inputs).is_some()
+            }));
+            let _ = sender.send(taken.map_err(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_default()
+            }));
+        });
+        let taken = receiver.recv_timeout(std::time::Duration::from_secs(60));
+        lock(&PANIC_AFTER_PARSE).retain(|name| *name != config);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            taken,
+            Ok(Err(format!("test panic after the parse of {config}")))
+        );
     }
 }
