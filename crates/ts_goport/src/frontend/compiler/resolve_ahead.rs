@@ -83,7 +83,9 @@ pub fn last_stats() -> Option<LoadStats> {
 }
 
 /// Makes the workers of the loads on this thread panic outside a
-/// resolution, as a port bug would (`run_task`). For tests.
+/// resolution, as a port bug would (`run_task`), after they resolved their
+/// keys: the answers are published, and the load must take none of them
+/// (`AheadQueue::fail`). For tests.
 #[doc(hidden)]
 pub fn inject_worker_panic(on: bool) {
     INJECT_PANIC.with(|inject| inject.set(on));
@@ -781,7 +783,7 @@ struct Job {
     stats: WorkerStats,
     config: Arc<ResolverConfig>,
     /// `inject_worker_panic` (tests): each worker panics in the job,
-    /// outside its resolutions.
+    /// outside its resolutions, after it resolved its keys.
     inject_panic: bool,
 }
 
@@ -809,9 +811,6 @@ fn run_job(job: &Arc<Job>) {
         kept,
         directory_exists,
     );
-    if job.inject_panic {
-        panic!("resolve ahead: a worker panic outside a resolution (inject_worker_panic)");
-    }
     let fs: Rc<dyn Fs> = fs;
     let mut resolver = job.config.new_resolver(fs, Some(package_jsons.clone()));
     resolver.caches.shared = Some(SharedResolutionLink {
@@ -837,6 +836,9 @@ fn run_job(job: &Arc<Job>) {
     });
     if let Some(index) = current.get() {
         job.queue.done(index);
+    }
+    if job.inject_panic {
+        panic!("resolve ahead: a worker panic outside a resolution (inject_worker_panic)");
     }
     let reads = end_ahead_thread();
     drop(resolver);

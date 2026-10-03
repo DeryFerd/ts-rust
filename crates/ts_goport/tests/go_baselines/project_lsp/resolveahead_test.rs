@@ -483,7 +483,9 @@ os_child_test! {
     /// A worker that panics outside a resolution (a port bug; a test hook
     /// makes one) must not make a load that waits for the workers
     /// (`Mode::Force`) wait forever, nor leave the pool: that load resolves
-    /// its keys itself, and the next load takes every answer again.
+    /// its keys itself, and the next load takes every answer again. The
+    /// workers panic after they resolved their keys, so their answers are
+    /// there: the load takes none of them (`AheadQueue::fail`).
     fn a_worker_panic_outside_a_resolution_makes_the_load_serial() {
         watchdog(120);
         let stats = same_with_and_without("panic", &|session, root| {
