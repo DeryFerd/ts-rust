@@ -11,6 +11,76 @@
 
 use crate::prelude::*;
 
+#[cfg(target_family = "wasm")]
+pub use by_index::{sort_func, sort_slice, sort_stable_func};
+
+/// wasm: `sort_func`, `sort_stable_func` and `sort_slice` with one copy of
+/// each algorithm for all element types. Each sorts the indexes of `x`
+/// (`u32`) with a `dyn` comparator, then puts `x` in that order. The Go
+/// algorithm makes the same comparisons, in the same order, and the same
+/// swaps on the indexes as on `x`, so the result is the same. One copy per
+/// element and comparator type was 49 KB of the module (123 copies).
+#[cfg(any(test, target_family = "wasm"))]
+mod by_index {
+    use super::{LessSwap, bits_len, pdqsort_cmp_func, pdqsort_func, stable_cmp_func};
+
+    /// Go `slices.SortFunc` (see the native `sort_func`).
+    pub fn sort_func<T, F: FnMut(&T, &T) -> i32>(x: &mut [T], mut cmp: F) {
+        let mut order = indexes(x);
+        let n = order.len() as isize;
+        let mut by_index = |a: &u32, b: &u32| cmp(&x[*a as usize], &x[*b as usize]);
+        let mut by_index: &mut dyn FnMut(&u32, &u32) -> i32 = &mut by_index;
+        pdqsort_cmp_func(&mut order, 0, n, bits_len(n as usize), &mut by_index);
+        put_in_order(x, &mut order);
+    }
+
+    /// Go `slices.SortStableFunc` (see the native `sort_stable_func`).
+    pub fn sort_stable_func<T, F: FnMut(&T, &T) -> i32>(x: &mut [T], mut cmp: F) {
+        let mut order = indexes(x);
+        let n = order.len() as isize;
+        let mut by_index = |a: &u32, b: &u32| cmp(&x[*a as usize], &x[*b as usize]);
+        let mut by_index: &mut dyn FnMut(&u32, &u32) -> i32 = &mut by_index;
+        stable_cmp_func(&mut order, n, &mut by_index);
+        put_in_order(x, &mut order);
+    }
+
+    /// Go `sort.Slice` (see the native `sort_slice`).
+    pub fn sort_slice<T, F: FnMut(&T, &T) -> bool>(x: &mut [T], mut less: F) {
+        let mut order = indexes(x);
+        let n = order.len() as isize;
+        let mut by_index = |a: &u32, b: &u32| less(&x[*a as usize], &x[*b as usize]);
+        let by_index: &mut dyn FnMut(&u32, &u32) -> bool = &mut by_index;
+        let mut data = LessSwap {
+            data: &mut order,
+            less_fn: by_index,
+        };
+        pdqsort_func(&mut data, 0, n, bits_len(n as usize));
+        put_in_order(x, &mut order);
+    }
+
+    /// The indexes of `x`, in order.
+    fn indexes<T>(x: &[T]) -> Vec<u32> {
+        (0..u32::try_from(x.len()).expect("a slice of under 4G elements")).collect()
+    }
+
+    /// Moves the element at `order[i]` of `x` to `i`, for each `i`, by
+    /// following each cycle of `order` with swaps. Leaves `order` as `0..n`.
+    fn put_in_order<T>(x: &mut [T], order: &mut [u32]) {
+        for start in 0..order.len() {
+            let mut current = start;
+            loop {
+                let next = order[current] as usize;
+                order[current] = current as u32;
+                if next == start {
+                    break;
+                }
+                x.swap(current, next);
+                current = next;
+            }
+        }
+    }
+}
+
 // Go: slices/sort.go:30 SortFunc
 /// SortFunc sorts the slice x in ascending order as determined by the cmp
 /// function. This sort is not guaranteed to be stable.
@@ -21,6 +91,7 @@ use crate::prelude::*;
 /// SortFunc requires that cmp is a strict weak ordering.
 /// See <https://en.wikipedia.org/wiki/Weak_ordering#Strict_weak_orderings>.
 /// The function should return 0 for incomparable items.
+#[cfg(not(target_family = "wasm"))]
 pub fn sort_func<T, F: FnMut(&T, &T) -> i32>(x: &mut [T], mut cmp: F) {
     let n = x.len() as isize;
     pdqsort_cmp_func(x, 0, n, bits_len(n as usize), &mut cmp);
@@ -30,6 +101,7 @@ pub fn sort_func<T, F: FnMut(&T, &T) -> i32>(x: &mut [T], mut cmp: F) {
 /// SortStableFunc sorts the slice x while keeping the original order of
 /// equal elements, using cmp to compare elements in the same way as
 /// [SortFunc].
+#[cfg(not(target_family = "wasm"))]
 pub fn sort_stable_func<T, F: FnMut(&T, &T) -> i32>(x: &mut [T], mut cmp: F) {
     let n = x.len() as isize;
     stable_cmp_func(x, n, &mut cmp);
@@ -722,6 +794,7 @@ pub fn rotate_cmp_func<T, F: FnMut(&T, &T) -> i32>(
 ///
 /// PORT: Go `less(i, j int)` reads `x[i]` and `x[j]`; here `less` gets
 /// the two elements. Go's reflect swapper is `<[T]>::swap`.
+#[cfg(not(target_family = "wasm"))]
 pub fn sort_slice<T, F: FnMut(&T, &T) -> bool>(x: &mut [T], less: F) {
     let length = x.len() as isize;
     let limit = bits_len(length as usize);
@@ -1400,6 +1473,43 @@ mod tests {
         let mut c = keys(64);
         sort_slice(&mut c, |x, y| cmp_keys(x, y) < 0);
         assert_eq!(ids(&c), go_unstable);
+    }
+
+    /// The wasm sorts (`by_index`) give the same permutation as the direct
+    /// sorts, for a comparator that is not transitive and for one that
+    /// answers at random: they make the same comparisons in the same order.
+    #[test]
+    fn index_sorts_match_direct_sorts() {
+        for n in [0, 1, 2, 12, 13, 20, 21, 50, 64, 100, 300] {
+            let input = keys(n);
+            let (mut want, mut got) = (input.clone(), input.clone());
+            sort_func(&mut want, cmp_keys);
+            by_index::sort_func(&mut got, cmp_keys);
+            assert_eq!(ids(&got), ids(&want));
+            let (mut want, mut got) = (input.clone(), input.clone());
+            sort_stable_func(&mut want, cmp_keys);
+            by_index::sort_stable_func(&mut got, cmp_keys);
+            assert_eq!(ids(&got), ids(&want));
+            let (mut want, mut got) = (input.clone(), input.clone());
+            sort_slice(&mut want, |x, y| cmp_keys(x, y) < 0);
+            by_index::sort_slice(&mut got, |x, y| cmp_keys(x, y) < 0);
+            assert_eq!(ids(&got), ids(&want));
+
+            let seed = n as u64 + 7;
+            let (mut a, mut b) = (Xorshift(seed), Xorshift(seed));
+            let (mut want, mut got) = (input.clone(), input.clone());
+            sort_func(&mut want, |_, _| (a.next() % 3) as i32 - 1);
+            by_index::sort_func(&mut got, |_, _| (b.next() % 3) as i32 - 1);
+            assert_eq!(ids(&got), ids(&want));
+            let (mut want, mut got) = (input.clone(), input.clone());
+            sort_stable_func(&mut want, |_, _| (a.next() % 3) as i32 - 1);
+            by_index::sort_stable_func(&mut got, |_, _| (b.next() % 3) as i32 - 1);
+            assert_eq!(ids(&got), ids(&want));
+            let (mut want, mut got) = (input.clone(), input);
+            sort_slice(&mut want, |_, _| a.next() % 2 == 0);
+            by_index::sort_slice(&mut got, |_, _| b.next() % 2 == 0);
+            assert_eq!(ids(&got), ids(&want));
+        }
     }
 
     /// A comparator with a random answer on every call, at sizes that reach
