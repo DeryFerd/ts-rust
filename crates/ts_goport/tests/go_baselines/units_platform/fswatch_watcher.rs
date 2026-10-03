@@ -1,39 +1,46 @@
-//! Go: `internal/fswatch/{watcher,testutil,fanotify_linux}_test.go` (the
-//! Linux tests). `tests/fswatch_linux.rs` already has `TestWatchFileCreate`
-//! and `TestSubscribeSubfileUpdate` for the default backend only; this file
-//! runs every Go test on every available backend, as Go does.
+//! Go: `internal/fswatch/{watcher,testutil}_test.go` (every OS) and
+//! `fanotify_linux_test.go` (Linux). `tests/fswatch_linux.rs` already has
+//! `TestWatchFileCreate` and `TestSubscribeSubfileUpdate` for the default
+//! backend only; this file runs every Go test on every available backend,
+//! as Go does.
 //!
 //! PORT: Go `testingT` and `retryT` are `T`. A Go `t.Fatal` is a panic; Go
 //! `runWithRetry` catches it and retries the body with longer timeouts, up
 //! to three attempts. Go runs the per-backend subtests in parallel; the
 //! port runs them on scoped threads. Go `t.TempDir()` is `T::temp_dir`
 //! (under `std::env::temp_dir()`, as Go's `os.TempDir`), removed after the
-//! cleanups. The kqueue, FSEvents and Windows branches are not reached on
-//! Linux.
+//! cleanups. Go `w == FSEvents() || w == Kqueue()` compares the backend
+//! name (`is_kqueue_or_fsevents`), and Go `runtime.GOOS` is
+//! `std::env::consts::OS` ("macos" for Go "darwin"). The fanotify items
+//! and `fanotify_linux_test.go` build on Linux only, as in Go. The Windows
+//! branches are not ported (this file uses `std::os::unix`).
 //!
 //! Not portable: `TestSubscribeRejectsNilCallback` (a Rust `WatchCallback`
 //! cannot be nil). `TestLinuxFanotifyBackendSelection` checks only that the
 //! fanotify watcher starts: Go's `impl.(*fanotifyBackend)` type assertion
 //! has no Rust form for a `dyn WatcherImpl` without `Any`.
-#![cfg(target_os = "linux")]
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use ts_goport::fswatch::fanotify_linux::{
     fanotify_available, make_fanotify_handle_key, maybe_wrap_unsupported_filesystem,
     new_fanotify_backend,
 };
 use ts_goport::fswatch::pathcompare::PathComparer;
 use ts_goport::fswatch::{
-    self, DirWatch, DirWatchError, ERR_FILESYSTEM_UNSUPPORTED, ERR_UNAVAILABLE,
-    ERR_WATCH_TERMINATED, Event, EventKind, EventList, MAX_WAIT_TIME, Watch, WatchCallback,
-    WatchOption, Watcher, WatcherBase, WatcherImpl, WatcherStruct, new_debounce, new_dir_watch,
-    new_watcher, with_recursive,
+    self, DirWatch, DirWatchError, ERR_UNAVAILABLE, ERR_WATCH_TERMINATED, Event, EventKind,
+    EventList, MAX_WAIT_TIME, Watch, WatchCallback, WatchOption, Watcher, WatcherBase, WatcherImpl,
+    new_debounce, new_dir_watch, with_recursive,
 };
+#[cfg(target_os = "linux")]
+use ts_goport::fswatch::{ERR_FILESYSTEM_UNSUPPORTED, WatcherStruct, new_watcher};
 use ts_goport::gostd::{GoError, errors};
 
 use crate::astnav_api::panic_message;
@@ -178,6 +185,7 @@ fn run_with_retry(name: &str, body: &(dyn Fn(&T) + Sync)) -> Result<(), String> 
 }
 
 // Go: fanotify_linux_test.go:21 fanotifyNoRenameWatcher (and its init)
+#[cfg(target_os = "linux")]
 static FANOTIFY_NO_RENAME_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(|| {
     new_watcher("fanotify-no-rename", |w| {
         if fanotify_available() {
@@ -187,11 +195,15 @@ static FANOTIFY_NO_RENAME_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(
 });
 
 // Go: watcher_test.go:66 availableWatchers (with additionalTestWatchers)
+// PORT: only fanotify_linux_test.go adds a test watcher, so the other
+// platforms have none.
 fn available_watchers() -> Vec<Arc<dyn Watcher>> {
+    #[allow(unused_mut)]
     let mut out: Vec<Arc<dyn Watcher>> = fswatch::all_watchers()
         .into_iter()
         .filter(|w| w.available())
         .collect();
+    #[cfg(target_os = "linux")]
     if fanotify_available() {
         let w: Arc<dyn Watcher> = FANOTIFY_NO_RENAME_WATCHER.clone();
         if w.available() {
@@ -230,6 +242,27 @@ fn run_for_each_watcher(test: &str, body: fn(&T, &Arc<dyn Watcher>)) {
 // Go: watcher_test.go:31 defaultEventTimeout
 fn default_event_timeout() -> Duration {
     Duration::from_secs(1)
+}
+
+// Go: watcher_test.go:41 kqueueFSEventsTimeout
+fn kqueue_fsevents_timeout() -> Duration {
+    Duration::from_secs(2)
+}
+
+/// Go `w == FSEvents() || w == Kqueue()`. PORT: Go compares the watcher
+/// values; the port compares the backend names.
+pub(crate) fn is_kqueue_or_fsevents(w: &Arc<dyn Watcher>) -> bool {
+    matches!(w.name().as_str(), "fsevents" | "kqueue")
+}
+
+// Go: watcher_test.go:50 watcherEventTimeout (the base; `Recorder::deadline`
+// applies the retry scale)
+pub(crate) fn watcher_event_timeout_base(w: &Arc<dyn Watcher>) -> Duration {
+    if is_kqueue_or_fsevents(w) {
+        kqueue_fsevents_timeout()
+    } else {
+        default_event_timeout()
+    }
 }
 
 // Go: watcher_test.go:111 newTmpDir
@@ -280,14 +313,29 @@ fn subscribe_for(t: &T, dir: &str, w: &Arc<dyn Watcher>) -> (Arc<Recorder>, Arc<
     subscribe_for_opts(t, dir, w, vec![with_recursive()])
 }
 
-// Go: watcher_test.go:167 settleSleep (the Linux value)
-fn settle_sleep() -> Duration {
+// Go: watcher_test.go:167 settleSleep
+pub(crate) fn settle_sleep(w: &Arc<dyn Watcher>) -> Duration {
+    if is_kqueue_or_fsevents(w) {
+        return Duration::from_millis(300);
+    }
     Duration::from_millis(60)
+}
+
+// Go: watcher_test.go:177 preSubscribeSleep
+pub(crate) fn pre_subscribe_sleep(w: &Arc<dyn Watcher>) -> Duration {
+    if is_kqueue_or_fsevents(w) {
+        return Duration::from_millis(50);
+    }
+    Duration::ZERO
 }
 
 // Go: watcher_test.go:185 subscribeFileFor
 fn subscribe_file_for(t: &T, path: &str, w: &Arc<dyn Watcher>) -> (Arc<Recorder>, Arc<dyn Watch>) {
-    let r = Recorder::new(t);
+    let d = pre_subscribe_sleep(w);
+    if d > Duration::ZERO {
+        std::thread::sleep(d);
+    }
+    let r = Recorder::for_watcher(t, w);
     let sub = w
         .watch_file(path, r.callback())
         .unwrap_or_else(|e| fatal(format!("subscribeFile: {}", e.error())));
@@ -296,7 +344,7 @@ fn subscribe_file_for(t: &T, path: &str, w: &Arc<dyn Watcher>) -> (Arc<Recorder>
     t.cleanup(move || {
         let _ = s2.close();
     });
-    std::thread::sleep(settle_sleep());
+    std::thread::sleep(settle_sleep(w));
     (r, sub)
 }
 
@@ -307,7 +355,11 @@ fn subscribe_for_opts(
     w: &Arc<dyn Watcher>,
     opts: Vec<Box<dyn WatchOption>>,
 ) -> (Arc<Recorder>, Arc<dyn Watch>) {
-    let r = Recorder::new(t);
+    let d = pre_subscribe_sleep(w);
+    if d > Duration::ZERO {
+        std::thread::sleep(d);
+    }
+    let r = Recorder::for_watcher(t, w);
     let sub = w
         .watch_directory(dir, r.callback(), &opts)
         .unwrap_or_else(|e| fatal(format!("subscribe: {}", e.error())));
@@ -316,7 +368,7 @@ fn subscribe_for_opts(
     t.cleanup(move || {
         let _ = s2.close();
     });
-    std::thread::sleep(settle_sleep());
+    std::thread::sleep(settle_sleep(w));
     (r, sub)
 }
 
@@ -334,8 +386,11 @@ struct RecState {
 }
 
 // Go: watcher_test.go:220 recordingWatcher
+// PORT: Go keeps the bound `watcher` to choose the timeout; the port keeps
+// that base timeout (`base`).
 pub(crate) struct Recorder {
     attempt: u32,
+    base: Duration,
     state: Mutex<RecState>,
     cond: Condvar,
 }
@@ -343,16 +398,27 @@ pub(crate) struct Recorder {
 impl Recorder {
     // Go: watcher_test.go:229 newRecorder
     fn new(t: &T) -> Arc<Recorder> {
+        Self::with_base(t, default_event_timeout())
+    }
+
+    /// Go `newRecorder(t)` followed by `r.watcher = w`.
+    fn for_watcher(t: &T, w: &Arc<dyn Watcher>) -> Arc<Recorder> {
+        Self::with_base(t, watcher_event_timeout_base(w))
+    }
+
+    fn with_base(t: &T, base: Duration) -> Arc<Recorder> {
         Arc::new(Recorder {
             attempt: t.attempt,
+            base,
             state: Mutex::new(RecState::default()),
             cond: Condvar::new(),
         })
     }
 
-    // Go: watcher_test.go:239 deadline
+    // Go: watcher_test.go:239 deadline (watcherEventTimeout for a bound
+    // watcher, scaledDeadline(defaultEventTimeout) for an unbound one)
     fn deadline(&self) -> Duration {
-        default_event_timeout() * retry_timeout_scale(self.attempt)
+        self.base * retry_timeout_scale(self.attempt)
     }
 
     // Go: watcher_test.go:256 callback
@@ -913,6 +979,10 @@ fn test_subscribe_subdir_delete_with_files() {
 // Go: watcher_test.go:1212 TestSubscribeSymlinkCreate
 #[test]
 fn test_subscribe_symlink_create() {
+    if std::env::consts::OS == "dragonfly" {
+        println!("SKIP: DragonFlyBSD kqueue doesn't fire NOTE_WRITE on symlink creation");
+        return;
+    }
     run_for_each_watcher("TestSubscribeSymlinkCreate", |t, wi| {
         let dir = new_t_tmp_dir(t);
         let f1 = sub_path(&dir);
@@ -1085,8 +1155,8 @@ fn test_watch_directories_batch() {
     run_for_each_watcher("TestWatchDirectoriesBatch", |t, wi| {
         let dir1 = new_t_tmp_dir(t);
         let dir2 = new_t_tmp_dir(t);
-        let r1 = Recorder::new(t);
-        let r2 = Recorder::new(t);
+        let r1 = Recorder::for_watcher(t, wi);
+        let r2 = Recorder::for_watcher(t, wi);
 
         let opts1: Vec<Box<dyn WatchOption>> = vec![with_recursive()];
         let opts2: Vec<Box<dyn WatchOption>> = vec![with_recursive()];
@@ -1109,7 +1179,7 @@ fn test_watch_directories_batch() {
                 let _ = watch.close();
             }
         });
-        std::thread::sleep(settle_sleep());
+        std::thread::sleep(settle_sleep(wi));
 
         let f1 = sub_path(&dir1);
         let f2 = sub_path(&dir2);
@@ -1208,7 +1278,14 @@ fn test_subscribe_close_then_re_subscribe() {
         t.cleanup(move || {
             let _ = c2.close();
         });
-        sleep(ms(60));
+
+        // Give the second watcher a moment to settle (fsevents/kqueue
+        // need it; inotify/fanotify/Windows don't but the wait is cheap).
+        if is_kqueue_or_fsevents(wi) {
+            sleep(ms(300));
+        } else {
+            sleep(ms(60));
+        }
 
         let f = sub_path(&dir);
         write_file(&f, "hi");
@@ -1228,8 +1305,25 @@ const THREAD_CHILD_TEST: &str = "units_platform::fswatch_watcher::no_thread_leak
 const THREAD_CHILD_ENV: &str = "S2_FSWATCH_THREAD_CHILD";
 
 /// The number of threads of this process (Go `runtime.NumGoroutine()`).
+#[cfg(target_os = "linux")]
 fn num_threads() -> usize {
     std::fs::read_dir("/proc/self/task").map_or(0, |d| d.count())
+}
+
+/// The number of threads of this process (Go `runtime.NumGoroutine()`).
+/// PORT: there is no `/proc` outside Linux; `ps -M` prints one header row
+/// and one row per thread (macOS and the BSDs).
+#[cfg(not(target_os = "linux"))]
+fn num_threads() -> usize {
+    std::process::Command::new("ps")
+        .args(["-M", "-p", &std::process::id().to_string()])
+        .output()
+        .map_or(0, |out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .count()
+                .saturating_sub(1)
+        })
 }
 
 /// Child entry of `TestSubscribeNoGoroutineLeak`. Does nothing unless
@@ -1698,15 +1792,37 @@ fn test_rename_dir_out_of_tree_no_stale_events() {
 // ----- platform-specific -------------------------------------------------
 
 // Go: watcher_test.go:2344 TestDefaultBackendMatchesPlatform
+// PORT: Go wants "fsevents" on darwin. `fswatch::default` picks FSEvents
+// when that backend is available and kqueue (Go's fallback) when it is
+// not, so the port wants the backend that is available.
 #[test]
 fn test_default_backend_matches_platform() {
     let d = fswatch::default();
-    let want_name = if fswatch::fanotify().available() {
-        "fanotify"
-    } else {
-        "inotify"
+    let os = std::env::consts::OS;
+    let want_name = match os {
+        "linux" => {
+            if fswatch::fanotify().available() {
+                "fanotify"
+            } else {
+                "inotify"
+            }
+        }
+        "android" => "inotify",
+        "macos" => {
+            if fswatch::fs_events().available() {
+                "fsevents"
+            } else {
+                "kqueue"
+            }
+        }
+        "windows" => "windows",
+        "freebsd" | "openbsd" | "netbsd" | "dragonfly" => "kqueue",
+        _ => {
+            println!("SKIP: no expected default watcher for {os}");
+            return;
+        }
     };
-    assert!(d.available(), "Default() should be available on linux");
+    assert!(d.available(), "Default() should be available on {os}");
     assert_eq!(d.name(), want_name, "Default().Name()");
 }
 
@@ -2138,6 +2254,11 @@ fn test_replace_parent_dir_with_different() {
 #[test]
 fn test_round_trip_rename() {
     run_for_each_watcher("TestRoundTripRename", |t, wi| {
+        if wi.name() == "kqueue" {
+            skip(
+                "kqueue fd-based tracking delivers stale delete before parent NOTE_WRITE reconciles",
+            );
+        }
         let dir = new_t_tmp_dir(t);
         let orig = join(&dir, "data.txt");
         write_file(&orig, "content");
@@ -2177,9 +2298,10 @@ fn test_recursive_with_denied_subdir() {
     });
 }
 
-// ----- fanotify_linux_test.go --------------------------------------------
+// ----- fanotify_linux_test.go (Linux only, as in Go) ----------------------
 
 // Go: fanotify_linux_test.go:30 TestLinuxFanotifyShutdownBeforeStart
+#[cfg(target_os = "linux")]
 #[test]
 fn test_linux_fanotify_shutdown_before_start() {
     new_fanotify_backend(false).shutdown();
@@ -2188,6 +2310,7 @@ fn test_linux_fanotify_shutdown_before_start() {
 // Go: fanotify_linux_test.go:35 TestLinuxFanotifyBackendSelection
 // PORT: the Go `impl.(*fanotifyBackend)` type assertion is not portable
 // (see the module comment); this checks that the backend starts.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_linux_fanotify_backend_selection() {
     if !fanotify_available() {
@@ -2200,6 +2323,7 @@ fn test_linux_fanotify_backend_selection() {
 }
 
 // Go: fanotify_linux_test.go:49 TestLinuxFanotifySubscribeCleansUpAfterMarkFailure
+#[cfg(target_os = "linux")]
 #[test]
 fn test_linux_fanotify_subscribe_cleans_up_after_mark_failure() {
     let t = T::new(1);
@@ -2223,6 +2347,7 @@ fn test_linux_fanotify_subscribe_cleans_up_after_mark_failure() {
 }
 
 // Go: fanotify_linux_test.go:68 TestLinuxFanotifyParseDfidNameRoundTrip
+#[cfg(target_os = "linux")]
 #[test]
 fn test_linux_fanotify_parse_dfid_name_round_trip() {
     use ts_goport::fswatch::unix;
@@ -2246,6 +2371,7 @@ fn test_linux_fanotify_parse_dfid_name_round_trip() {
 }
 
 // Go: fanotify_linux_test.go:93 TestFanotifyCrossWatcherSameFs
+#[cfg(target_os = "linux")]
 #[test]
 fn test_fanotify_cross_watcher_same_fs() {
     if !fanotify_available() {
@@ -2283,6 +2409,7 @@ fn test_fanotify_cross_watcher_same_fs() {
 }
 
 // Go: fanotify_linux_test.go:124 TestLinuxFanotifyMaybeWrapUnsupportedFilesystem
+#[cfg(target_os = "linux")]
 #[test]
 fn test_linux_fanotify_maybe_wrap_unsupported_filesystem() {
     use ts_goport::fswatch::unix;
@@ -2317,6 +2444,7 @@ fn test_linux_fanotify_maybe_wrap_unsupported_filesystem() {
 }
 
 // Go: fanotify_linux_test.go:147 TestLinuxFanotifyMarkENODEVTagged
+#[cfg(target_os = "linux")]
 #[test]
 fn test_linux_fanotify_mark_enodev_tagged() {
     use ts_goport::fswatch::unix;
@@ -2340,6 +2468,7 @@ fn test_linux_fanotify_mark_enodev_tagged() {
 // Go: fanotify_linux_test.go:164 TestLinuxFanotifyUnsupportedTagSurvivesDirWatchError
 /// PORT: Go's `dirWatchError` literal has a nil `dirWatch`; the Rust field
 /// is not optional, so the error gets a direct watcher that is never used.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_linux_fanotify_unsupported_tag_survives_dir_watch_error() {
     use ts_goport::fswatch::unix;
