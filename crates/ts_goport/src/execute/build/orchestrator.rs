@@ -682,9 +682,9 @@ impl Orchestrator {
                 .collect();
             let project_outputs = resolved.get_output_file_names();
             let mut deleted = false;
-            for output_file in &project_outputs {
+            for output_file in project_outputs {
                 deleted = self.clean_project_output(
-                    output_file,
+                    &output_file,
                     &inputs,
                     dry,
                     &mut result.files_to_delete,

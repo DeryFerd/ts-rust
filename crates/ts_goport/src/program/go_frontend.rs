@@ -97,6 +97,13 @@ type FrontendResolutions =
 
 /// Thread-safe copies of the frontend project references. Go shares one
 /// `*ParsedCommandLine` per referenced project, so each is copied once.
+/// PORT: Go reads `CommonSourceDirectory` of a reference only when it needs
+/// it (output names with outDir or declarationDir, the checker for
+/// `rewriteRelativeImportExtensions`), and that call records TS6059 errors
+/// on the reference. The copy needs the value now, so it reads it without
+/// the check (`common_source_directory_unchecked`). The checker's call then
+/// records no error on the reference; Go records them there from a checker
+/// thread.
 #[derive(Default)]
 struct ProjectReferenceCopies {
     resolved: FxHashMap<*const ParsedCommandLine, Arc<ResolvedProjectReference>>,
@@ -109,7 +116,7 @@ impl ProjectReferenceCopies {
             .or_insert_with(|| {
                 Arc::new(ResolvedProjectReference::new(
                     (**parsed.compiler_options()).clone(),
-                    parsed.common_source_directory().to_string(),
+                    parsed.common_source_directory_unchecked(),
                 ))
             })
             .clone()
