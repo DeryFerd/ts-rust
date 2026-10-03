@@ -11,8 +11,10 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
+use crate::frontend::module::{AheadCall, KeyList, ModuleKeyParts};
 use crate::frontend::parser;
 use std::cell::Cell;
+use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
 
 // Go: project/compilerhost.go:16 compilerHost
@@ -36,6 +38,12 @@ pub struct CompilerHost {
     /// first load). `compiler::CompilerHost::prefetch_parses` returns it.
     // PORT: not in Go (see `compiler::CompilerHost::prefetch_parses`).
     pub first_load: bool,
+
+    /// The module resolution keys of the last program load with this host,
+    /// or else of the project's host before it: the keys that the next load
+    /// resolves ahead (`compiler::CompilerHost::resolve_ahead`).
+    // PORT: not in Go (perf).
+    pub resolution_keys: Rc<RefCell<Option<Arc<KeyList>>>>,
 }
 
 // Go: project/compilerhost.go:29 newCompilerHost
@@ -48,9 +56,16 @@ pub fn new_compiler_host(
     builder: &Rc<ProjectCollectionBuilder>,
     logger: Option<Rc<logging::LogTree>>,
 ) -> Rc<CompilerHost> {
-    let (config_file_path, first_load) = {
+    let (config_file_path, first_load, resolution_keys) = {
         let project = project.borrow();
-        (project.config_file_path.clone(), project.program.is_none())
+        (
+            project.config_file_path.clone(),
+            project.program.is_none(),
+            project
+                .host
+                .as_ref()
+                .and_then(|host| host.resolution_keys.borrow().clone()),
+        )
     };
     let source_fs = new_source_fs(true, builder.fs.clone(), builder.to_path.clone());
     Rc::new(CompilerHost {
@@ -68,6 +83,7 @@ pub fn new_compiler_host(
         content_mapper_once: Cell::new(false),
 
         first_load,
+        resolution_keys: Rc::new(RefCell::new(resolution_keys)),
     })
 }
 
@@ -324,5 +340,205 @@ impl compiler::CompilerHost for CompilerHost {
         self.source_fs.release();
         let config_file_registry = self.config_file_registry.borrow_mut().take();
         drop(config_file_registry);
+        let resolution_keys = self.resolution_keys.borrow_mut().take();
+        drop(resolution_keys);
     }
+
+    // PORT: not in Go (perf, see `compiler::CompilerHost::resolve_ahead`).
+    // Only while the host tracks the files that its program load sees
+    // (before `freeze`), on a case-sensitive file system whose layers are
+    // the open files over the OS file system: the workers then see what
+    // the loader sees, except the snapshot's cached files, which the check
+    // compares (`accept_ahead_answer`). A case-insensitive file system
+    // could spell a read file name another way than the loader would.
+    fn resolve_ahead(&self) -> Option<compiler::resolve_ahead::ResolveAheadHost> {
+        if !self.source_fs.tracking.get() {
+            return None;
+        }
+        let builder = self.builder.borrow().clone()?;
+        let files = builder.fs.clone();
+        // The loader reads `files` through `source_fs`.
+        if !std::ptr::addr_eq(
+            Rc::as_ptr(&*self.source_fs.source.borrow()),
+            Rc::as_ptr(&files),
+        ) {
+            return None;
+        }
+        let use_case_sensitive_file_names =
+            vfs::Fs::use_case_sensitive_file_names(&*self.source_fs);
+        if !use_case_sensitive_file_names {
+            return None;
+        }
+        // The workers make the paths as `source_fs` does.
+        let current_directory = self.session_options.current_directory.clone();
+        let probe = "a/B.ts";
+        if (self.source_fs.to_path)(probe)
+            != tspath::to_path(probe, &current_directory, use_case_sensitive_file_names)
+        {
+            return None;
+        }
+        let (open_files, open_directories) = files.open_files_over_os()?;
+        let load = AheadCheck {
+            reads: RefCell::new(FxHashMap::default()),
+            package_jsons: RefCell::new(FxHashSet::default()),
+        };
+        let accept = {
+            let source_fs = self.source_fs.clone();
+            let files = files.clone();
+            Rc::new(
+                move |_key: ModuleKeyParts<'_>, _value: &ResolvedModule, calls: &[AheadCall]| {
+                    accept_ahead_answer(&source_fs, &files, &load, calls)
+                },
+            )
+        };
+        let keys = self.resolution_keys.clone();
+        let scratch = cfg!(debug_assertions).then(|| {
+            let to_path = self.source_fs.to_path.clone();
+            Rc::new(move || {
+                let fs = new_source_fs(true, files.clone(), to_path.clone());
+                let tracked = fs.clone();
+                compiler::resolve_ahead::ScratchFs {
+                    fs,
+                    tracked: Box::new(move || {
+                        let seen = tracked
+                            .seen_files
+                            .borrow()
+                            .as_ref()
+                            .map(|seen| seen.borrow().clone());
+                        let missing = tracked
+                            .missing_directories
+                            .as_ref()
+                            .map(|missing| missing.borrow().clone());
+                        (seen.unwrap_or_default(), missing.unwrap_or_default())
+                    }),
+                    to_path: to_path.clone(),
+                }
+            }) as Rc<dyn Fn() -> compiler::resolve_ahead::ScratchFs>
+        });
+        Some(compiler::resolve_ahead::ResolveAheadHost {
+            previous_keys: self.resolution_keys.borrow().clone(),
+            view: compiler::resolve_ahead::WorkerView {
+                current_directory,
+                use_case_sensitive_file_names,
+                open_files,
+                open_directories,
+            },
+            accept,
+            keep_keys: Box::new(move |new_keys| *keys.borrow_mut() = Some(new_keys)),
+            scratch,
+        })
+    }
+}
+
+/// Checks the file system calls of a resolve-ahead answer on this host's
+/// file system, as the loader's own resolution of the key would make them
+/// at this point of the load, and replays their side effects
+/// (`compiler::CompilerHost::resolve_ahead`). False: a call would give
+/// another answer here, and the loader resolves the key itself.
+///
+/// - `file_exists`: the snapshot's cached file of the path decides, if it
+///   has one (`SnapshotFSBuilder::cached_file_state`). A cached file that
+///   needs a reload fails the check: the loader's lookup would read it.
+///   Else the layered file system decides, which the worker read the same
+///   way (open files over the OS), unless the worker's answer is `known`
+///   (not read in this load): then the check asks the layered file system.
+/// - a read is the loader's own read (`SourceFS::get_file`: it tracks the
+///   file, caches it and notes a `node_modules` realpath alias), made at
+///   the moment the loader would make it, since every call before it gave
+///   the same answer. Its text must have the worker's hash. `reads` keeps
+///   the reads of this load, so a later answer that reads the file again
+///   only compares the hash.
+/// - then each `file_exists` path becomes a seen file and each missing
+///   directory a missing directory, as the loader's calls would note them.
+/// - the calls of a package.json cache entry (`AheadCall::PackageJson`)
+///   are checked and replayed once per load: the snapshot does not change
+///   during the load, and the replay notes the same paths again.
+/// What `accept_ahead_answer` keeps during one load.
+struct AheadCheck {
+    /// The hash of each file that the check read, by name.
+    reads: RefCell<FxHashMap<String, Option<u128>>>,
+    /// The package.json call groups that passed the check and were
+    /// replayed, by address (the answers keep them for the whole load).
+    package_jsons: RefCell<FxHashSet<usize>>,
+}
+
+fn accept_ahead_answer(
+    source_fs: &SourceFS,
+    files: &SnapshotFSBuilder,
+    load: &AheadCheck,
+    calls: &[AheadCall],
+) -> bool {
+    if !calls
+        .iter()
+        .all(|call| check_ahead_call(source_fs, files, load, call))
+    {
+        return false;
+    }
+    for call in calls {
+        replay_ahead_call(source_fs, load, call);
+    }
+    true
+}
+
+/// True when `call` gives the same answer on this host's file system
+/// (`accept_ahead_answer`).
+fn check_ahead_call(
+    source_fs: &SourceFS,
+    files: &SnapshotFSBuilder,
+    load: &AheadCheck,
+    call: &AheadCall,
+) -> bool {
+    match call {
+        AheadCall::FileExists {
+            path,
+            exists,
+            known,
+        } => match files.cached_file_state(path) {
+            // The worker asked the OS through the open files, as the
+            // layered file system does; a known answer is checked here
+            // (the same call as the loader's own lookup).
+            CachedFileState::Absent => {
+                !*known || vfs::Fs::file_exists(&*files.fs, path.as_str()) == *exists
+            }
+            CachedFileState::Live => *exists,
+            CachedFileState::NoValue => !*exists,
+            CachedFileState::NeedsReload => false,
+        },
+        AheadCall::MissingDirectory { .. } => true,
+        AheadCall::Read { file_name, hash } => {
+            let known = load.reads.borrow().get(file_name).copied();
+            let read = known.unwrap_or_else(|| {
+                let read = source_fs.get_file(file_name).map(|file| file.hash());
+                load.reads.borrow_mut().insert(file_name.clone(), read);
+                read
+            });
+            read == *hash
+        }
+        AheadCall::PackageJson(group) => {
+            load.package_jsons.borrow().contains(&group_key(group))
+                || group
+                    .iter()
+                    .all(|call| check_ahead_call(source_fs, files, load, call))
+        }
+    }
+}
+
+/// Notes the side effects of `call` (`accept_ahead_answer`).
+fn replay_ahead_call(source_fs: &SourceFS, load: &AheadCheck, call: &AheadCall) {
+    match call {
+        AheadCall::FileExists { path, .. } => source_fs.track_path(path),
+        AheadCall::MissingDirectory { path } => source_fs.note_missing_directory(path),
+        AheadCall::Read { .. } => {}
+        AheadCall::PackageJson(group) => {
+            if load.package_jsons.borrow_mut().insert(group_key(group)) {
+                for call in group.iter() {
+                    replay_ahead_call(source_fs, load, call);
+                }
+            }
+        }
+    }
+}
+
+fn group_key(group: &Arc<[AheadCall]>) -> usize {
+    Arc::as_ptr(group).cast::<AheadCall>() as usize
 }

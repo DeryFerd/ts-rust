@@ -57,6 +57,17 @@ pub trait CompilerHost {
         None
     }
 
+    /// The host's part in resolve ahead (resolve_ahead.rs): the module
+    /// resolution keys of its previous program load, the workers' view of
+    /// `fs()`, and the check of a worker answer on `fs()`. Only the
+    /// language server's project host has it, on the OS file system with
+    /// open files over it.
+    // PORT: not in Go (perf). Go resolves in every parse task on the host's
+    // file system.
+    fn resolve_ahead(&self) -> Option<super::resolve_ahead::ResolveAheadHost> {
+        None
+    }
+
     /// True when a program load with this host starts parse workers that
     /// parse the queued files ahead of the loader (`FilesParser::parse`).
     /// A host that gives most files from its own cache returns false: the

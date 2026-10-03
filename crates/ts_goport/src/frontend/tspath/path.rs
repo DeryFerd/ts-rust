@@ -700,26 +700,44 @@ fn simple_normalize_path(path: &str) -> Option<String> {
 // Go: tspath/path.go:532 hasRelativePathSegment
 // hasRelativePathSegment reports whether p contains ".", "..", "./", "../", "/.", "/..", "//", "/./", or "/../".
 fn has_relative_path_segment(p: &str) -> bool {
+    // PORT: the answer is true exactly when a segment is "." or ".." or
+    // empty between two slashes. memchr jumps from '/' to '/' and tests
+    // only the bytes after it, so a `node_modules/.pnpm` segment (a dot
+    // that starts a name) does not need the byte loop of Go.
+    let fast = has_dot_or_empty_segment(p.as_bytes());
+    debug_assert_eq!(fast, has_relative_path_segment_go(p), "{p}");
+    fast
+}
+
+/// True when a segment of `b` is "." or "..", or a slash follows a slash.
+/// Two SIMD searches, for "//" and for "/." (a dot that starts a segment,
+/// rare in a path), cost less than a search per slash.
+fn has_dot_or_empty_segment(b: &[u8]) -> bool {
+    static SLASH_SLASH: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+        std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"//"));
+    static SLASH_DOT: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
+        std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"/."));
+    // The segment that starts at `i` is "." or "..".
+    let dot_segment = |i: usize| match b.get(i) {
+        Some(b'.') => match b.get(i + 1) {
+            None | Some(b'/') => true,
+            Some(b'.') => matches!(b.get(i + 2), None | Some(b'/')),
+            Some(_) => false,
+        },
+        _ => false,
+    };
+    dot_segment(0)
+        || SLASH_SLASH.find(b).is_some()
+        || SLASH_DOT.find_iter(b).any(|i| dot_segment(i + 1))
+}
+
+// Go: tspath/path.go:531 hasRelativePathSegment (the debug check of
+// `has_relative_path_segment`).
+fn has_relative_path_segment_go(p: &str) -> bool {
     let b = p.as_bytes();
     let n = b.len();
     if n == 0 {
         return false;
-    }
-    // PORT: fast path. Every relative segment starts the path with '.' or
-    // contains "/." or "//", so a path with none of these has no segment.
-    // memchr jumps from '/' to '/' and tests only the next byte, instead of
-    // testing every byte pair.
-    if b[0] != b'.' {
-        let has_slash_dot_or_slash =
-            memchr::memchr_iter(b'/', b).any(|i| matches!(b.get(i + 1), Some(b'.' | b'/')));
-        debug_assert_eq!(
-            has_slash_dot_or_slash,
-            b.windows(2)
-                .any(|w| w[0] == b'/' && (w[1] == b'.' || w[1] == b'/'))
-        );
-        if !has_slash_dot_or_slash {
-            return false;
-        }
     }
 
     if p == "." || p == ".." {
@@ -1596,4 +1614,29 @@ pub fn contains_ignored_path(path: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod relative_segment_tests {
+    use super::{has_dot_or_empty_segment, has_relative_path_segment_go};
+
+    /// The fast `has_relative_path_segment` gives Go's answer for every path
+    /// of up to 8 bytes over '.', '/' and 'a'.
+    #[test]
+    fn has_relative_path_segment_matches_go() {
+        let mut level = vec![String::new()];
+        for _ in 0..8 {
+            level = level
+                .iter()
+                .flat_map(|path| ['.', '/', 'a'].map(|c| format!("{path}{c}")))
+                .collect();
+            for path in &level {
+                assert_eq!(
+                    has_dot_or_empty_segment(path.as_bytes()),
+                    has_relative_path_segment_go(path),
+                    "{path}"
+                );
+            }
+        }
+    }
 }

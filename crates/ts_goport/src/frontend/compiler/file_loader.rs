@@ -262,6 +262,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         .host
         .clone()
         .expect("projectReferenceFileMapper.host is set until processing ends");
+    let mut resolve_ahead = None;
     let resolver_options = ResolverOptions {
         host: Some(resolver_host),
         compiler_options: Some(compiler_options.clone()),
@@ -308,6 +309,25 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
                 publish: false,
             });
             loader.shared_resolution = Some(shared);
+        } else if !single_threaded
+            && super::resolve_ahead::mode() != super::resolve_ahead::Mode::Off
+            && workers_resolve_imports(&compiler_options)
+            && !loader.opts.skip_module_resolution
+            && compiler_options.trace_resolution != Tristate::True
+            && loader
+                .opts
+                .config
+                .resolved_project_reference_paths()
+                .is_empty()
+            && let Some(host) = loader.opts.host.resolve_ahead()
+        {
+            // PERF: a language server load after the first: workers resolve
+            // the keys of the previous load ahead of the loader
+            // (resolve_ahead.rs). Same conditions as above, but the host's
+            // file system is not the plain OS one: the host checks each
+            // answer before the loader takes it. No project references, so
+            // no key has a redirect and the resolver host fakes no file.
+            resolve_ahead = Some(super::resolve_ahead::ResolveAhead::start(host, &resolver));
         }
         loader.resolver = Some(Rc::new(resolver));
     }
@@ -363,6 +383,14 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
 
     let root_tasks = loader.root_tasks.clone();
     loader.files_parser.borrow_mut().parse(&loader, &root_tasks);
+    if let Some(resolve_ahead) = resolve_ahead
+        && let Some(resolver) = loader
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.as_default_resolver())
+    {
+        resolve_ahead.finish(resolver);
+    }
     // The parse workers have ended. The `tsc -b` host's cache keeps the
     // lookups of the worker answers that the loader took, as Go's cache
     // keeps the lookups of its parse tasks, and drops the other worker
