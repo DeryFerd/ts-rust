@@ -85,6 +85,15 @@ else
     "$tmp/keyed.wasm" -o "$out"
 fi
 
+# The module must not hold a mapped build path (see remaps above).
+for remap in "${remaps[@]}"; do
+  from="${remap%=*}"
+  if [[ "$from" != *[[:space:]]* ]] && grep -qaF "${from%/}/" "$out"; then
+    echo "error: $out holds the build path ${from%/}" >&2
+    exit 1
+  fi
+done
+
 size() { wc -c <"$1" | tr -d ' '; }
 echo "built:  $(size "$built") bytes ($built)"
 echo "output: $(size "$out") bytes ($out)"
