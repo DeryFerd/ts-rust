@@ -1402,6 +1402,11 @@ impl BuildInfoPrefetch {
         compare_paths_options: ComparePathsOptions,
         m_times: MTimePrefetch,
     ) -> Option<Self> {
+        // wasm32-wasip1 has no threads, so no thread can start. Saying so
+        // leaves the threads out of the wasm module.
+        if cfg!(target_family = "wasm") {
+            return None;
+        }
         let slots: Vec<(String, Arc<BuildInfoSlot>)> = reads
             .iter()
             .map(|read| (read.name.clone(), Arc::default()))

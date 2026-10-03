@@ -141,6 +141,11 @@ impl ConfigPrefetch {
         command_line_raw: Option<IndexMap<String, CompilerOptionsValue>>,
         compare_paths_options: &ComparePathsOptions,
     ) -> Option<Self> {
+        // wasm32-wasip1 has no threads, so no thread can start. Saying so
+        // leaves the thread out of the wasm module.
+        if cfg!(target_family = "wasm") {
+            return None;
+        }
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 pending: VecDeque::new(),

@@ -1911,6 +1911,11 @@ impl PrefetchPool {
 
     /// Starts `workers` more parse workers on the queue of this pool.
     fn add_workers(&mut self, workers: usize) {
+        // wasm32-wasip1 has no threads, so no worker can start. Saying so
+        // leaves the worker thread out of the wasm module.
+        if cfg!(target_family = "wasm") {
+            return;
+        }
         for _ in 0..workers {
             let shared = self.shared.clone();
             // A worker that cannot start only makes the parse less parallel.
