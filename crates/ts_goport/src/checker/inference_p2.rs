@@ -204,7 +204,7 @@ impl Checker {
         // context. `inferTypes` reads only the inference list.
         let inferences = InferenceContextId(self.inference_contexts.len() as u32);
         self.inference_contexts.push(InferenceContext {
-            inferences: vec![inference],
+            inferences: Box::new([inference]),
             ..InferenceContext::default()
         });
         self.infer_types(
@@ -627,7 +627,7 @@ impl Checker {
         // PERF: every field is set here. `..InferenceContext::default()`
         // would allocate the nil comparer (an `Rc`) and drop it again.
         self.inference_contexts.push(InferenceContext {
-            inferences,
+            inferences: inferences.into_boxed_slice(),
             signature,
             flags,
             compare_types,
@@ -712,14 +712,14 @@ impl Checker {
             if signature.is_some() {
                 let mut inferred_covariant_type = TypeId::NIL;
                 if !self.inference_context(n).inferences[index]
-                    .candidates
+                    .candidates()
                     .is_empty()
                 {
                     inferred_covariant_type = self.get_covariant_inference(n, index, signature);
                 }
                 let mut inferred_contravariant_type = TypeId::NIL;
                 if !self.inference_context(n).inferences[index]
-                    .contra_candidates
+                    .contra_candidates()
                     .is_empty()
                 {
                     inferred_contravariant_type = self.get_contravariant_inference(n, index);
@@ -742,8 +742,8 @@ impl Checker {
                                     // the slice) lives on the stack up to 8.
                                     let contra_candidates: SmallVec<[TypeId; 8]> =
                                         SmallVec::from_slice(
-                                            &self.inference_context(n).inferences[index]
-                                                .contra_candidates,
+                                            self.inference_context(n).inferences[index]
+                                                .contra_candidates(),
                                         );
                                     let mut some = false;
                                     for t in contra_candidates {
@@ -767,8 +767,8 @@ impl Checker {
                                             || {
                                                 let other_candidates: SmallVec<[TypeId; 8]> =
                                                     SmallVec::from_slice(
-                                                        &self.inference_context(n).inferences[j]
-                                                            .candidates,
+                                                        self.inference_context(n).inferences[j]
+                                                            .candidates(),
                                                     );
                                                 let mut all = true;
                                                 for t in other_candidates {
@@ -966,7 +966,7 @@ impl Checker {
         let (inference_candidates, type_parameter, top_level, is_fixed, priority) = {
             let info = &self.inference_context(n).inferences[inference];
             (
-                SmallVec::<[TypeId; 8]>::from_slice(&info.candidates),
+                SmallVec::<[TypeId; 8]>::from_slice(info.candidates()),
                 info.type_parameter,
                 info.top_level,
                 info.is_fixed,
@@ -1022,7 +1022,7 @@ impl Checker {
             let info = &self.inference_context(n).inferences[inference];
             (
                 info.priority,
-                SmallVec::<[TypeId; 8]>::from_slice(&info.contra_candidates),
+                SmallVec::<[TypeId; 8]>::from_slice(info.contra_candidates()),
             )
         };
         if priority.intersects(InferencePriority::PRIORITY_IMPLIES_COMBINATION) {
@@ -1130,8 +1130,8 @@ impl Checker {
         let (candidates, contra_candidates) = {
             let info = &self.inference_context(n).inferences[inference];
             (
-                SmallVec::<[TypeId; 8]>::from_slice(&info.candidates),
-                SmallVec::<[TypeId; 8]>::from_slice(&info.contra_candidates),
+                SmallVec::<[TypeId; 8]>::from_slice(info.candidates()),
+                SmallVec::<[TypeId; 8]>::from_slice(info.contra_candidates()),
             )
         };
         if !candidates.is_empty() {
@@ -1314,8 +1314,7 @@ pub fn new_inference_info(type_parameter: TypeId) -> InferenceInfo {
 pub fn clone_inference_info(info: &InferenceInfo) -> InferenceInfo {
     InferenceInfo {
         type_parameter: info.type_parameter,
-        candidates: info.candidates.clone(),
-        contra_candidates: info.contra_candidates.clone(),
+        candidate_lists: info.candidate_lists.clone(),
         inferred_type: info.inferred_type,
         priority: info.priority,
         top_level: info.top_level,
@@ -1341,7 +1340,7 @@ impl Checker {
     // Go: checker/inference.go:1651 hasInferenceCandidates
     pub fn has_inference_candidates(&self, n: InferenceContextId, info: usize) -> bool {
         let info = &self.inference_context(n).inferences[info];
-        !info.candidates.is_empty() || !info.contra_candidates.is_empty()
+        !info.candidates().is_empty() || !info.contra_candidates().is_empty()
     }
 
     // Go: checker/inference.go:1655 hasInferenceCandidatesOrDefault

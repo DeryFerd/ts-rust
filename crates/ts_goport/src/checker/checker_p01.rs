@@ -295,7 +295,7 @@ pub struct FlowLoopInfo {
 // InferenceContext
 
 // Go: checker/checker.go:276 InferenceContext
-// PERF (infermem1): 64 bytes (asserted below). The port keeps every context
+// PERF (infermem1): 56 bytes (asserted below), not 120. The port keeps every context
 // of a run (typebox: about 3.9M, almost all from conditional types with
 // `infer`), so the fields that those contexts never set are in `rare`, a box
 // that is made on the first write. The accessors give Go's zero values while
@@ -303,7 +303,9 @@ pub struct FlowLoopInfo {
 #[derive(Clone)]
 pub struct InferenceContext {
     /// Inferences made for each type parameter
-    pub inferences: Vec<InferenceInfo>,
+    // PERF (infermem1): a boxed slice, 8 bytes less than a `Vec`. The list
+    // never changes its length after the context is made.
+    pub inferences: Box<[InferenceInfo]>,
     /// Generic signature for which inferences are made (if any)
     pub signature: SignatureId,
     /// Inference flags
@@ -318,7 +320,7 @@ pub struct InferenceContext {
     pub rare: Option<Box<InferenceContextRare>>,
 }
 
-const _: () = assert!(std::mem::size_of::<InferenceContext>() == 64);
+const _: () = assert!(std::mem::size_of::<InferenceContext>() == 56);
 
 /// The fields of Go `InferenceContext` that only signature inference sets.
 #[derive(Clone, Default)]
@@ -388,7 +390,7 @@ impl InferenceContext {
 impl Default for InferenceContext {
     fn default() -> Self {
         InferenceContext {
-            inferences: Vec::new(),
+            inferences: Box::default(),
             signature: SignatureId::NIL,
             flags: InferenceFlags::NONE,
             compare_types: nil_type_comparer(),
@@ -401,14 +403,16 @@ impl Default for InferenceContext {
 
 // Go: checker/checker.go:289 InferenceInfo
 // PORT: Go `*InferenceInfo` is an index into `InferenceContext::inferences`.
+// PERF (infermem1): 32 bytes (asserted below), not 72. The two candidate
+// lists are in one box that the first candidate makes (typebox: about 6M
+// infos, under a third of them with candidates). `candidates()` and
+// `contra_candidates()` give Go's nil lists while it is absent.
 #[derive(Clone, Debug, Default)]
 pub struct InferenceInfo {
     /// Type parameter for which inferences are being made
     pub type_parameter: TypeId,
-    /// Candidates in covariant positions in decreasing depth order
-    pub candidates: Vec<TypeId>,
-    /// Candidates in contravariant positions
-    pub contra_candidates: Vec<TypeId>,
+    /// Go `candidates` and `contraCandidates`, or `None` while both are nil.
+    pub candidate_lists: Option<Box<InferenceCandidates>>,
     /// Cache for resolved inferred type
     pub inferred_type: TypeId,
     /// Priority of current inference set
@@ -419,6 +423,38 @@ pub struct InferenceInfo {
     pub is_fixed: bool,
     /// Implied arity (or -1)
     pub implied_arity: i32,
+}
+
+const _: () = assert!(std::mem::size_of::<InferenceInfo>() == 32);
+
+/// The candidate lists of an `InferenceInfo`.
+#[derive(Clone, Debug, Default)]
+pub struct InferenceCandidates {
+    /// Candidates in covariant positions in decreasing depth order
+    pub candidates: Vec<TypeId>,
+    /// Candidates in contravariant positions
+    pub contra_candidates: Vec<TypeId>,
+}
+
+impl InferenceInfo {
+    /// Go `info.candidates`.
+    #[must_use]
+    pub fn candidates(&self) -> &[TypeId] {
+        self.candidate_lists.as_ref().map_or(&[], |l| &l.candidates)
+    }
+
+    /// Go `info.contraCandidates`.
+    #[must_use]
+    pub fn contra_candidates(&self) -> &[TypeId] {
+        self.candidate_lists
+            .as_ref()
+            .map_or(&[], |l| &l.contra_candidates)
+    }
+
+    /// The candidate lists for a write. Makes the box on the first write.
+    pub fn candidate_lists_mut(&mut self) -> &mut InferenceCandidates {
+        self.candidate_lists.get_or_insert_default()
+    }
 }
 
 // Go: checker/checker.go:321 IntraExpressionInferenceSite

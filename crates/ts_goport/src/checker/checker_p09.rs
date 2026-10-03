@@ -7,7 +7,7 @@ use crate::prelude::*;
 // helper on the Rust `InferenceInfo` value, because the Go `[]*InferenceInfo`
 // slices used here are not all owned by one inference context.
 fn info_has_inference_candidates(info: &InferenceInfo) -> bool {
-    !info.candidates.is_empty() || !info.contra_candidates.is_empty()
+    !info.candidates().is_empty() || !info.contra_candidates().is_empty()
 }
 
 impl Checker {
@@ -202,7 +202,7 @@ impl Checker {
             // `inferences`, so the fresh list lives in a scratch context cloned from
             // `context`. `inferTypes` reads only the inference list.
             let mut scratch = self.inference_context(context).clone();
-            scratch.inferences = fresh_inferences;
+            scratch.inferences = fresh_inferences.into_boxed_slice();
             let inferences = InferenceContextId(self.inference_contexts.len() as u32);
             self.inference_contexts.push(scratch);
             self.apply_to_parameter_types(
