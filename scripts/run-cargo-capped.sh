@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Cargo for this repo with caps: one Cargo at a time across all worktrees (one lock), a memory limit, and each
-# worktree's own target dir.
+# Cargo for this repo with caps: TS_CARGO_SLOTS Cargo runs at a time across all worktrees (2 on zbook), a memory
+# limit, and each worktree's own target dir.
 # usage: scripts/run-cargo-capped.sh <cargo command> [args...]   e.g. build --release -p ts_goport --bins
 #        scripts/run-cargo-capped.sh help                       this text
 # - Target: <worktree>/target, with sccache when installed. Do not set CARGO_TARGET_DIR (TS_CARGO_SEPARATE_TARGET=1
 #   with its own CARGO_TARGET_DIR only for a deliberate fresh-target reproduction).
 # - TS_CARGO_JOBS: build jobs (16 on zbook, 1 elsewhere). TS_CARGO_MEMORY_LIMIT_KIB: the memory cap of the run.
+# - TS_CARGO_SLOTS: Cargo runs at a time (2 on zbook, 1 elsewhere). A run takes the first free slot lock
+#   (/tmp/ts-rust-cargo-<id>.lock, then <id>-1.lock, ...); slot 0 keeps the old single-lock name.
 # - Edit-loop builds (build, check, test, run, bench without --profile goport) use nightly -Zthreads=8 and
 #   incremental ts_goport. TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 gives a stable build (for timing, or after an
 #   internal compiler error). --profile goport (fat LTO, 7 to 20 minutes) stays on 1.93.0: timing and shipped bins.
@@ -30,8 +32,8 @@ if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
-# A virtual-memory limit applies per process. Serializing Cargo keeps separate
-# rustc and test processes from multiplying that limit across this repository.
+# A virtual-memory limit applies per process. The slot locks below keep separate
+# rustc and test processes from multiplying that limit beyond TS_CARGO_SLOTS runs.
 # Allow 8 GiB for one job and 4 GiB per job above that, capped at three quarters
 # of available memory.
 default_memory_limit_kib=$((jobs == 1 ? 8388608 : jobs * 4194304))
@@ -95,8 +97,34 @@ if [[ -n "${CARGO_TARGET_DIR:-}" && "${TS_CARGO_SEPARATE_TARGET:-0}" != 1 &&
 fi
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$default_target_dir}"
 
-exec 9>"${TMPDIR:-/tmp}/ts-rust-cargo-${lock_id}.lock"
-flock 9
+# TS_CARGO_SLOTS Cargo runs at a time across all worktrees (2 on zbook, 1
+# elsewhere): one lock file per slot, and slot 0 keeps the old lock name. From
+# 2026-10-01 to 10-03 one slot made builds wait 1.9 min on average (p90 6.4 min)
+# behind 20-minute PGO builds, while the long ts_goport rustc step uses 8 of
+# zbook's 32 threads and no Cargo scope peaked above 11.6 GB of its 94 GB.
+case "$(hostname)" in
+  zbook) default_slots=2 ;;
+  *) default_slots=1 ;;
+esac
+slots="${TS_CARGO_SLOTS:-$default_slots}"
+if [[ ! "$slots" =~ ^[1-9][0-9]*$ ]]; then
+  echo "TS_CARGO_SLOTS must be a positive integer" >&2
+  exit 2
+fi
+slot=0
+while :; do
+  slot_suffix=""
+  ((slot == 0)) || slot_suffix="-$slot"
+  exec 9>"${TMPDIR:-/tmp}/ts-rust-cargo-${lock_id}${slot_suffix}.lock"
+  if ((slots == 1)); then
+    flock 9
+    break
+  fi
+  flock -n 9 && break
+  exec 9>&-
+  slot=$(((slot + 1) % slots))
+  ((slot)) || sleep 2
+done
 
 ulimit -v "$virtual_memory_limit_kib"
 ulimit -c 0
@@ -192,7 +220,7 @@ esac
 # the build. TS_CARGO_SCCACHE=0 disables it.
 if [[ "${TS_CARGO_SCCACHE:-1}" == 1 ]] && command -v sccache >/dev/null; then
   export RUSTC_WRAPPER=sccache
-  export SCCACHE_SERVER_UDS="${TMPDIR:-/tmp}/ts-rust-sccache-${lock_id}.sock"
+  export SCCACHE_SERVER_UDS="${TMPDIR:-/tmp}/ts-rust-sccache-${lock_id}${slot_suffix}.sock"
   export SCCACHE_IDLE_TIMEOUT=120
   sccache --start-server >/dev/null 9>&-
   trap 'sccache --stop-server >/dev/null 2>&1 || true' EXIT

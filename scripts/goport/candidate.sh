@@ -32,6 +32,11 @@
 #                          move the old <kind>.json, <kind>-fail.json and <kind>-compare.json aside and run side
 #                          with a new label: the oracle runs stay in lsp-run and api-run, so no oracle runs
 #                          again. Check first with --dry-run that every other step says "reuse".
+#                          An integration runs `side int<N> --checkout <its worktree>` in its checks step. The
+#                          revision's side run then reuses its bins, test run, gate run and oracle runs (same
+#                          crates tree, so same key) and runs only the bound runs. A tests or gate compare
+#                          made with an older base (the integration ran before the last accept) moves to
+#                          tests-base-<sha>.json or gate-compare-base-<label>.json and runs again.
 #   verdict-request <rev>  The request text for the auditor and the reviewer, then the accept command.
 # --dry-run prints each command that writes and runs only the read-only checks.
 # The state, target/ and the host commands (gate.sh, lsp_oracle.py, api_oracle.py, which remote.sh sync-scripts
@@ -315,7 +320,7 @@ free_name() { local n=$2 i=2; while [[ -e $1/$n ]]; do n=$2-$i i=$((i + 1)); don
 # verdict request lists every failed run, and accept_revision.py refuses one without a flake note. The other
 # steps still run, so the verdict request has all the evidence. Last log line: SIDE DONE or SIDE FAIL rc=<N>.
 side_unit() {
-  local label=$1 wt=$2 pin=${3#-} host=$4 map=${5#-} key C B commit fp n r gl ll al rc oracle lock synced=0 g l fails='' base
+  local label=$1 wt=$2 pin=${3#-} host=$4 map=${5#-} key C B commit fp n r gl ll al rc oracle lock synced=0 g l fails='' base old
   local bt bts bg bgs bl ba
   local -a pinexec=()
   [[ $DRY == 1 ]] || trap 'rc=$?; if ((rc)); then echo "SIDE FAIL rc=$rc"; else echo "SIDE DONE"; fi' EXIT
@@ -364,8 +369,17 @@ side_unit() {
   # goport tests: the test binaries of the checkout (build-goport-tests.sh takes the target lock itself),
   # every protected suite (goport-tests.sh, on zbook) and the per-name compare with the base results.
   # The run is cached in tests-run/; only a passing compare is cached, so a rerun with --name-map only
-  # compares again.
-  if [[ -f $C/tests.json ]]; then say "reuse goport tests $(jq -c .compare "$C/tests.json")"; else
+  # compares again. A compare with an older base (an integration's side run before the last accept) is
+  # not reused: it moves to tests-base-<sha256 prefix>.json, and the run is compared with the current base.
+  if [[ -f $C/tests.json && $(jq -r .baseSha256 "$C/tests.json") == "$bts" ]]; then
+    say "reuse goport tests $(jq -c .compare "$C/tests.json")"
+  else
+    if [[ -f $C/tests.json ]]; then
+      old=$(jq -r .baseSha256 "$C/tests.json" | cut -c1-12)
+      say "goport tests: the cached compare used base $(jq -r .base "$C/tests.json"); keep it as tests-base-$old.json and compare again"
+      run mv "$C/tests.json" "$C/tests-base-$old.json"
+      run mv "$C/tests-compare.json" "$C/tests-compare-base-$old.json"
+    fi
     if [[ -f $C/testbin/bins.sha256 ]]; then say "reuse test bins $C/testbin (built from $(cat "$C/testbin/COMMIT"))"; else
       say "$(date -u +%FT%TZ) build test bins"
       run_sh "$G/build-goport-tests.sh $wt $C/testbin > $C/testbin-build.log 2>&1" || die "test bin build failed (log $C/testbin-build.log)"
@@ -455,7 +469,15 @@ side_unit() {
 
   # Gate compare: each item against the base gate manifest (a MATCH stays MATCH, no new FAIL, no removed id,
   # the open editor long-growth items under their fixed caps). A failed run is kept under its label.
-  if [[ -f $C/gate-compare.json ]]; then say "reuse gate compare $(jq -c .counts "$C/gate-compare.json")"; else
+  # A compare with an older base moves to gate-compare-base-<base label>.json, and the run is compared again.
+  if [[ -f $C/gate-compare.json && $(jq -r .base.sha256 "$C/gate-compare.json") == "$bgs" ]]; then
+    say "reuse gate compare $(jq -c .counts "$C/gate-compare.json")"
+  else
+    if [[ -f $C/gate-compare.json ]]; then
+      old=$(jq -r .base.label "$C/gate-compare.json")
+      say "gate compare: the cached compare used base $old; keep it as gate-compare-base-$old.json and compare again"
+      run mv "$C/gate-compare.json" "$C/gate-compare-base-$old.json"
+    fi
     say "gate compare with the base"
     rc=0
     run_sh "python3 $G/gate-compare.py $bg \$(jq -r .manifest $C/gate.json) --out $C/gate-compare.json > /dev/null" || rc=$?
