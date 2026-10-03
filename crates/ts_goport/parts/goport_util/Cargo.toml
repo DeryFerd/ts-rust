@@ -42,6 +42,11 @@ name-to-handle-at = "=0.1.0"
 [target.'cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))'.dependencies]
 nix = { version = "=0.31.3", default-features = false, features = ["event"] }
 
+# fswatch/fsevents_darwin.rs: the FSEvents stream through notify's safe
+# `FsEventWatcher` (see the module comment).
+[target.'cfg(target_os = "macos")'.dependencies]
+notify = { version = "=8.2.0", default-features = false, features = ["macos_fsevent"] }
+
 # fswatch/windows.rs: ReadDirectoryChangesW through notify's safe
 # `ReadDirectoryChangesWatcher` (see the module comment).
 [target.'cfg(windows)'.dependencies]
