@@ -460,8 +460,15 @@ fn get_smart_selection_range(
                             || node.kind() == SyntaxKind::NoSubstitutionTemplateLiteral
                         {
                             // Only add inner content range if there's actually content (handles unterminated literals)
-                            if start + 1 < end - 1 {
-                                push_selection_range(start + 1, end - 1);
+                            // PORT: Go `end-1` is one Go byte back
+                            // (`go_offset_before`). An unterminated literal
+                            // can end in a char whose port form is longer.
+                            let inner_end = crate::scanner_util::go_offset_before(
+                                &source_file_text(source_file),
+                                end,
+                            );
+                            if start + 1 < inner_end {
+                                push_selection_range(start + 1, inner_end);
                             }
                         }
                     }

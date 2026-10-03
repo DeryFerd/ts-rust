@@ -107,6 +107,7 @@ mod requestfilesystem_filechanges_test;
 mod requestfilesystem_pathtree_test;
 mod requestfilesystem_test;
 mod resolveahead_test;
+mod selectionranges_test;
 mod session_test;
 mod snapshot_test;
 mod snapshotfs_test;
