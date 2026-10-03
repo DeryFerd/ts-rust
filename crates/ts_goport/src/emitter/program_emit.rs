@@ -739,8 +739,9 @@ impl PendingPoolEmit {
     }
 }
 
-/// The JS part of a file's emit when the d.ts part runs on the checker
-/// thread (`Emitter::js_part`).
+/// The JS part of a file's emit when the d.ts part runs in another emitter
+/// (`Emitter::js_part`): a job on the emit pool, or the result of the JS
+/// print that ran before it on the twin (`TwinFile::run`).
 pub struct PoolJsPart {
     job: Option<EmitPoolJob<EmitResult>>,
     result: Option<std::thread::Result<EmitResult>>,

@@ -256,6 +256,9 @@ fn run_config(config: &str, edit: impl FnOnce(&mut CompilerOptions)) -> Run {
     run
 }
 
+/// The outputs of one file in the order Go writes them.
+const GO_ORDER: [&str; 4] = [".js.map", ".js", ".d.ts.map", ".d.ts"];
+
 /// Runs `run_emit` with a write callback that records each write, and
 /// returns what it wrote and returned. It asserts that the outputs of each
 /// file are written in Go's order: the `.js.map`, the `.js`, the
@@ -274,7 +277,6 @@ fn record_writes(run_emit: impl FnOnce(WriteFile) -> EmitResult) -> Written {
     let writes = std::mem::take(&mut *writes.lock().expect("writes lock"));
 
     let order: Vec<&str> = writes.iter().map(|(name, _)| name.as_str()).collect();
-    const GO_ORDER: [&str; 4] = [".js.map", ".js", ".d.ts.map", ".d.ts"];
     for (index, name) in order.iter().enumerate() {
         let Some((stem, rank)) = GO_ORDER
             .iter()

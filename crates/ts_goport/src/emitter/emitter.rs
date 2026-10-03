@@ -51,10 +51,11 @@ pub struct Emitter {
     pub force_emit: bool,
     pub write_file: Option<WriteFile>,
     /// PORT: not in Go. Set when this emitter runs only the d.ts part of the
-    /// file, on its checker thread, and the JS part runs on the emit pool
-    /// (`program_emit`). The d.ts part waits for the JS part before it
-    /// writes, so a file's outputs are written in Go's order (JS, then
-    /// d.ts), and its `WriteFileData` holds the JS diagnostics too.
+    /// file and another emitter runs the JS part: on the emit pool, or before
+    /// it on the twin of the file's checker (`program_emit`). The d.ts part
+    /// waits for the JS part before it writes, so a file's outputs are
+    /// written in Go's order (JS, then d.ts), and its `WriteFileData` holds
+    /// the JS diagnostics too.
     pub js_part: Option<Rc<RefCell<PoolJsPart>>>,
 }
 
@@ -727,8 +728,8 @@ impl Emitter {
         self.writer().clear();
     }
 
-    /// Waits for the JS part on the emit pool, if this emitter runs a d.ts
-    /// part (`js_part`). Go runs the JS part first on the same goroutine.
+    /// Waits for the JS part, if this emitter runs a d.ts part (`js_part`).
+    /// Go runs the JS part first on the same goroutine.
     fn wait_for_js_part(&self) {
         if let Some(js_part) = &self.js_part {
             js_part.borrow_mut().wait();
@@ -737,8 +738,8 @@ impl Emitter {
 
     /// Go `e.emitterDiagnostics.GetDiagnostics()` for `WriteFileData`. In Go
     /// the collection also holds the diagnostics of the JS part when the
-    /// d.ts part writes; with the JS part on the emit pool they are added
-    /// here.
+    /// d.ts part writes; with the JS part in another emitter (`js_part`)
+    /// they are added here.
     fn write_data_diagnostics(&self) -> Vec<Diagnostic> {
         let Some(js_part) = &self.js_part else {
             return self.emitter_diagnostics.get_diagnostics();
