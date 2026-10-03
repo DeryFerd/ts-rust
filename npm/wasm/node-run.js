@@ -38,8 +38,13 @@ export function nodeFileSystem() {
         },
         stat(path) {
             try {
-                const stat = fs.statSync(path);
-                return { isDirectory: stat.isDirectory(), size: stat.size, mtimeMs: stat.mtimeMs };
+                const stat = fs.statSync(path, { bigint: true });
+                return {
+                    isDirectory: stat.isDirectory(),
+                    isFile: stat.isFile(),
+                    size: Number(stat.size),
+                    mtimeNs: stat.mtimeNs,
+                };
             } catch {
                 return undefined;
             }
@@ -85,12 +90,13 @@ export function nodeFileSystem() {
                 return false;
             }
         },
-        chtimes(path, atimeMs, mtimeMs) {
+        chtimes(path, atimeNs, mtimeNs) {
             try {
-                const stat = fs.statSync(path);
-                fs.utimesSync(path, (atimeMs ?? stat.atimeMs) / 1000, (mtimeMs ?? stat.mtimeMs) / 1000);
-            } catch {
-                // Go ignores a failed chtimes of an output file too.
+                const stat = fs.statSync(path, { bigint: true });
+                const seconds = ns => Number(ns) / 1e9;
+                fs.utimesSync(path, seconds(atimeNs ?? stat.atimeNs), seconds(mtimeNs ?? stat.mtimeNs));
+            } catch (error) {
+                return goError("chtimes", path, error);
             }
         },
     };

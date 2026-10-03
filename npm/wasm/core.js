@@ -64,7 +64,9 @@ function fsCall(fs, op, request) {
         case OP_STAT: {
             const stat = fs.stat(text);
             if (!stat) return undefined;
-            return encoder.encode(`${stat.isDirectory ? "d" : "f"} ${stat.size ?? 0} ${stat.mtimeMs ?? 0}`);
+            const kind = stat.isDirectory ? "d" : stat.isFile === false ? "o" : "f";
+            const ns = stat.mtimeNs ?? BigInt(Math.round((stat.mtimeMs ?? 0) * 1e6));
+            return encoder.encode(`${kind} ${stat.size ?? 0} ${ns}`);
         }
         case OP_READ_DIR: {
             const entries = fs.readDirectory(text);
@@ -89,7 +91,7 @@ function fsCall(fs, op, request) {
         case OP_CHTIMES: {
             const [path, atime, mtime] = text.split("\0");
             if (!fs.chtimes) return new Uint8Array();
-            return writeResult(fs.chtimes(path, atime ? Number(atime) : undefined, mtime ? Number(mtime) : undefined));
+            return writeResult(fs.chtimes(path, atime ? BigInt(atime) : undefined, mtime ? BigInt(mtime) : undefined));
         }
     }
     return undefined;
@@ -274,14 +276,17 @@ export function runTsc(module, options) {
 
 /**
  * `runTsc` as a promise, for browsers. It makes the instance with
- * `WebAssembly.instantiate`, which a page's main thread may also do. Where
- * JSPI is available (`WebAssembly.promising`), the run gets its own stack:
- * in a Chrome worker that stack is about 3 times deeper.
+ * `WebAssembly.instantiate`, which a page's main thread may also do. Off a
+ * page's main thread, where JSPI is available (`WebAssembly.promising`),
+ * the run gets its own stack: in a Chrome worker it reaches about 2 times
+ * deeper. On a page's main thread JSPI gave less depth (Firefox), so it is
+ * not used there.
  */
 export async function runTscAsync(module, options) {
     const run = prepareRun(module, options);
     const tsRun = run.start(await WebAssembly.instantiate(module, run.imports));
-    const call = typeof WebAssembly.promising === "function" ? WebAssembly.promising(tsRun) : tsRun;
+    const jspi = typeof WebAssembly.promising === "function" && typeof document === "undefined";
+    const call = jspi ? WebAssembly.promising(tsRun) : tsRun;
     let exitCode;
     let error;
     try {

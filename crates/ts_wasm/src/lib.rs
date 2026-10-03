@@ -61,20 +61,15 @@ impl TscCompilationHooks for WasmTsc {
     }
 }
 
-/// The first option of `args` that the wasm build cannot run: watch mode
-/// needs threads and file events, and `--pprofDir` profiles the process
-/// and writes with `std::fs`. tsc takes an option with one or two dashes,
-/// in any case.
-fn unsupported_option(args: &[String]) -> Option<&'static str> {
-    args.iter().find_map(|arg| {
-        if !arg.starts_with('-') {
-            return None;
-        }
-        match arg.trim_start_matches('-').to_ascii_lowercase().as_str() {
-            "w" | "watch" => Some("--watch"),
-            "pprofdir" => Some("--pprofDir"),
-            _ => None,
-        }
+/// True when `args` is a `tsc -b` command line, by the test of
+/// `execute_tsc::command_line`. Build mode reports through its own
+/// reporters, which `diagnostic_reporter` does not reach.
+fn is_build(args: &[String]) -> bool {
+    args.first().is_some_and(|arg| {
+        matches!(
+            arg.to_lowercase().as_str(),
+            "-b" | "--b" | "-build" | "--build"
+        )
     })
 }
 
@@ -83,7 +78,7 @@ fn unsupported_option(args: &[String]) -> Option<&'static str> {
 #[must_use]
 pub fn run(request: &str) -> (i32, String) {
     let mut fields = request.split('\0');
-    let cwd = normalize_path(fields.next().unwrap_or("/"));
+    let cwd = normalize_path(fields.next().filter(|cwd| !cwd.is_empty()).unwrap_or("/"));
     let flags: u32 = fields
         .next()
         .and_then(|flags| flags.parse().ok())
@@ -91,8 +86,10 @@ pub fn run(request: &str) -> (i32, String) {
     let args: Vec<String> = fields
         .map(|arg| go_string_from_utf8(arg.to_string()))
         .collect();
-    if let Some(option) = unsupported_option(&args) {
-        eprintln!("error: {option} is not supported by the wasm build");
+    // ts_goport ends a run that asks for watch mode or `--pprofDir` on
+    // wasm (`execute_tsc` `wasm_unsupported`).
+    if flags & FLAG_DIAGNOSTICS_JSON != 0 && is_build(&args) {
+        eprintln!("error: diagnostics as JSON are not supported with --build");
         return (1, String::new());
     }
 
@@ -129,7 +126,7 @@ mod exports {
     use std::io::Write;
 
     use ts_goport::execute::tsc::EXIT_UNPORTED;
-    use ts_goport::prelude::{EXIT_GO_PANIC, print_go_panic, unported_report};
+    use ts_goport::prelude::{EXIT_GO_PANIC, print_go_panic, record_unported, unported_report};
 
     thread_local! {
         static INPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -175,30 +172,41 @@ mod exports {
     }
 
     /// wasm cannot unwind, so a panic cannot be caught as `tsgo` catches
-    /// it. This prints what `tsgo` prints for it and ends the run with
-    /// `tsgo`'s exit status.
+    /// it (`bin/tsgo.rs` `install_panic_hook` and `finish`). This prints
+    /// what `tsgo` prints for it and ends the run with `tsgo`'s exit
+    /// status: 2 for a Go panic, 70 for any other or for unported code.
     fn install_panic_hook() {
         std::panic::set_hook(Box::new(|info| {
             ts_goport::execute::tsc::stdio::flush_cli_stdout_at_exit();
             let _ = std::io::stdout().flush();
-            if print_go_panic(info.payload()) {
-                std::process::exit(EXIT_GO_PANIC);
+            let go_panic = print_go_panic(info.payload());
+            if !go_panic {
+                let message = info
+                    .payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                    .unwrap_or_default();
+                // `tsgo` counts unported code quietly.
+                if !message.starts_with("unported Go code") {
+                    let location = info
+                        .location()
+                        .map(|l| format!(" at {}:{}", l.file(), l.line()))
+                        .unwrap_or_default();
+                    eprintln!("tsgo: panic{location}: {message}");
+                    record_unported("panic");
+                }
             }
-            for (name, count) in unported_report() {
+            let unported = unported_report();
+            for (name, count) in &unported {
                 eprintln!("unported: {name} {count}");
             }
-            let message = info
-                .payload()
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| info.payload().downcast_ref::<String>().cloned())
-                .unwrap_or_default();
-            let location = info
-                .location()
-                .map(|l| format!(" at {}:{}", l.file(), l.line()))
-                .unwrap_or_default();
-            eprintln!("tsgo: panic{location}: {message}");
-            std::process::exit(EXIT_UNPORTED);
+            let code = if go_panic && unported.is_empty() {
+                EXIT_GO_PANIC
+            } else {
+                EXIT_UNPORTED
+            };
+            std::process::exit(code);
         }));
     }
 }

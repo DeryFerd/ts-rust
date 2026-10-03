@@ -11,12 +11,12 @@
 //! | op | request | result |
 //! | --- | --- | --- |
 //! | `Read` | path | the file bytes |
-//! | `Stat` | path (links followed) | `<kind> <size> <mtime ms>`, kind `f` or `d` |
+//! | `Stat` | path (links followed) | `<kind> <size> <mtime ns>`, kind `f`, `d` or `o` (other) |
 //! | `ReadDir` | path | `<kind><name>` entries, each ended by NUL; kind `f`, `d`, `l` (link) or `o` |
 //! | `Realpath` | path | the real path |
 //! | `Write`, `Append` | path, NUL, data | empty |
 //! | `Remove` | path (recursive) | empty |
-//! | `Chtimes` | path, NUL, atime ms, NUL, mtime ms (empty: unchanged) | empty |
+//! | `Chtimes` | path, NUL, atime ns, NUL, mtime ns (empty: unchanged) | empty |
 
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
@@ -131,26 +131,26 @@ fn host_error(op: &'static str, path: &str, text: String) -> FsError {
     }
 }
 
-fn time_from_ms(ms: &str) -> Option<SystemTime> {
-    let ms = ms.parse::<f64>().ok()?;
-    if !ms.is_finite() || ms < 0.0 {
-        return None;
-    }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(ms as u64))
+/// A time in nanoseconds since the Unix epoch. `tsc -b` compares mtimes, so
+/// they keep the precision that the OS gives, as in Go.
+fn time_from_ns(ns: &str) -> Option<SystemTime> {
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_nanos(ns.parse().ok()?))
 }
 
-/// Parses a `Stat` result: `<kind> <size> <mtime ms>`.
+/// Parses a `Stat` result: `<kind> <size> <mtime ns>`.
 fn parse_stat(name: &str, result: &[u8]) -> Option<FileInfo> {
     let text = std::str::from_utf8(result).ok()?;
     let mut parts = text.split(' ');
     let mode = match parts.next()? {
         "d" => FileMode::DIR | FileMode(0o755),
         "f" => FileMode(0o644),
+        // A FIFO or a device: Go's stat gives a file that is not a
+        // directory, so it exists as a file.
+        "o" => FileMode::IRREGULAR | FileMode(0o644),
         _ => return None,
     };
     let size = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let mod_time = parts.next().and_then(time_from_ms);
+    let mod_time = parts.next().and_then(time_from_ns);
     Some(FileInfo {
         name: name.to_string(),
         size,
@@ -227,9 +227,9 @@ fn path_and_data(path: &str, data: &str) -> Vec<u8> {
     request
 }
 
-fn ms_since_epoch(time: Option<SystemTime>) -> String {
+fn ns_since_epoch(time: Option<SystemTime>) -> String {
     time.and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis().to_string())
+        .map(|d| d.as_nanos().to_string())
         .unwrap_or_default()
 }
 
@@ -273,8 +273,8 @@ impl Fs for HostFs {
         let request = format!(
             "{}\0{}\0{}",
             String::from_utf8_lossy(&bytes(path)),
-            ms_since_epoch(a_time),
-            ms_since_epoch(m_time)
+            ns_since_epoch(a_time),
+            ns_since_epoch(m_time)
         );
         call(Op::Chtimes, request.as_bytes())
             .map(drop)

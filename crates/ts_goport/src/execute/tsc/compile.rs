@@ -634,8 +634,11 @@ impl ProcessExitState for ChildProcess {
     }
 }
 
-// PORT: not in Go. wasm cannot start processes, so `Spawn` fails with the
-// Go `exec.Command` error text for an unsupported platform.
+// Go: cmd/tsc/sys.go:74 spawnProcess, built for GOOS=wasip1
+// PORT: wasm cannot start processes. Go's wasip1 `exec.LookPath`
+// (os/exec/lp_wasm.go) finds no executable, so a name without a slash
+// gives Go's not-found text. A path reaches `os.StartProcess`, which
+// gives ENOSYS (syscall/tables_wasip1.go).
 #[cfg(target_family = "wasm")]
 pub fn spawn_process(
     command: &[String],
@@ -643,9 +646,15 @@ pub fn spawn_process(
     _stderr: Option<Box<dyn std::io::Write + Send>>,
 ) -> Result<Arc<dyn ProcessExitState>, GoError> {
     let name = command.first().map_or("", String::as_str);
-    Err(crate::gostd::errors::new(format!(
-        "fork/exec {name}: not supported by wasm"
-    )))
+    let text = if name.contains('/') {
+        format!("fork/exec {name}: Not implemented on wasip1")
+    } else {
+        format!(
+            "exec: {}: executable file not found in $PATH",
+            crate::gostd::strconv::quote(name)
+        )
+    };
+    Err(crate::gostd::errors::new(text))
 }
 
 /// Go `exec.LookPath(file)` (os/exec/lp_unix.go, go1.26) for a name without

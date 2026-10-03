@@ -40,8 +40,13 @@ export type WriteResult = boolean | string | void;
 /** A file system for `runTsc`. Paths are absolute, with `/` separators. */
 export interface HostFileSystem {
     readFile(path: string): Uint8Array | string | undefined;
-    /** Follows links. */
-    stat(path: string): { isDirectory: boolean; size?: number; mtimeMs?: number } | undefined;
+    /**
+     * Follows links. `isFile: false` with `isDirectory: false` is another
+     * kind (a FIFO or a device). `mtimeNs` is more exact than `mtimeMs`.
+     */
+    stat(
+        path: string,
+    ): { isDirectory: boolean; isFile?: boolean; size?: number; mtimeNs?: bigint; mtimeMs?: number } | undefined;
     readDirectory(path: string): { name: string; kind: "file" | "directory" | "symlink" | "other" }[] | undefined;
     realpath?(path: string): string | undefined;
     /**
@@ -52,7 +57,8 @@ export interface HostFileSystem {
     writeFile?(path: string, data: Uint8Array, append: boolean): WriteResult;
     /** Removes a file or a directory tree. Failure as in `writeFile`. */
     remove?(path: string): WriteResult;
-    chtimes?(path: string, atimeMs: number | undefined, mtimeMs: number | undefined): WriteResult;
+    /** Times in nanoseconds since the Unix epoch; undefined keeps a time. */
+    chtimes?(path: string, atimeNs: bigint | undefined, mtimeNs: bigint | undefined): WriteResult;
 }
 
 export interface MemoryFileSystem extends HostFileSystem {
@@ -94,9 +100,9 @@ export function runTsc(
 ): { exitCode: number; diagnostics?: Diagnostic[] };
 
 /**
- * `runTsc` as a promise. A page's main thread may call it too. Where the
- * engine has JSPI (`WebAssembly.promising`), the run gets its own stack,
- * which is deeper in a browser worker.
+ * `runTsc` as a promise. A page's main thread may call it too. Off a page's
+ * main thread, where the engine has JSPI (`WebAssembly.promising`), the run
+ * gets its own stack, which is about 2 times deeper in a Chrome worker.
  */
 export function runTscAsync(
     module: WebAssembly.Module,

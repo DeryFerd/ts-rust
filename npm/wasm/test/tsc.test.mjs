@@ -183,10 +183,19 @@ test("keeps the BOM of an emitted file in memory (--emitBOM)", async () => {
     assert.equal(result.files.get("/b/out/a.d.ts"), "\uFEFFexport declare const n = 1;\n");
 });
 
-test("refuses watch mode", async () => {
-    for (const flag of ["--watch", "-w", "-watch", "--WATCH"]) {
-        const result = await tsc([flag], { files: project, cwd: "/p" });
-        assert.equal(result.exitCode, 1, flag);
-        assert.match(result.stderr, /--watch is not supported/, flag);
+test("refuses watch mode, also from a response file", async () => {
+    const files = { ...project, "/p/args.txt": "--watch\n" };
+    for (const args of [["--watch"], ["-w"], ["-watch"], ["--WATCH"], ["@args.txt"], ["-b", "--watch"]]) {
+        const result = await tsc(args, { files, cwd: "/p" });
+        assert.equal(result.exitCode, 1, args.join(" "));
+        assert.match(result.stderr, /--watch is not supported/, args.join(" "));
     }
+    const result = await tsc(["--watch", "false", "--noEmit"], { files, cwd: "/p" });
+    assert.equal(result.exitCode, 2);
+});
+
+test("refuses JSON diagnostics for --build", async () => {
+    const result = await tsc(["-b"], { files: project, cwd: "/p", diagnostics: "json" });
+    assert.equal(result.exitCode, 1);
+    assert.match(result.stderr, /not supported with --build/);
 });

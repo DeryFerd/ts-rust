@@ -64,21 +64,27 @@ To try the example, run `python3 -m http.server -d npm/wasm` and open
 ## How it works
 
 - `crates/ts_wasm` is the module: `tsc` from `ts_goport` for `wasm32-wasip1`. The `wasm` cargo
-  profile (opt-level z, fat LTO) and `wasm-opt -Oz` make it 5.7 MB (2.5 MB gzip, 2.0 MB brotli).
-  The libs are in it, packed with LZMA. `scripts/wasm/build.sh` tells how to build a module that
-  checks about 18% faster at 6.9 MB.
+  profile (opt-level z, fat LTO) and wasm-opt make it 5.4 MB (2.3 MB gzip, 1.8 MB brotli). The
+  libs are in it, packed with LZMA. `scripts/wasm/build.sh` tells how to build a module that
+  checks about 17% faster at 6.5 MB.
 - The host (`core.js`) gives the file system through two imports (`ts_host.fs`, `fs_take`), and a
   small WASI shim gives clocks, random bytes, stdout and stderr. There is no WASI file system and
   no `node:wasi`.
 - wasm has one thread. The checkers run their jobs on the calling thread
-  (`program.rs` `send_thread_job`), as Go's `--singleThreaded` runs its work groups inline.
+  (`program.rs` `send_thread_job`), as Go's `--singleThreaded` runs its work groups inline. Each
+  checker keeps its own node and symbol ids, as a native checker thread does.
 - Each run uses a new instance of the compiled module, because the compiler keeps one program per
-  process. The module is compiled once.
+  process. The module is compiled once. Memory goes back when a run ends.
 - The checker recurses deeply, so very deep nesting can run out of stack. Node runs each call in a
-  worker thread with a 256 MB stack. Bun ignores that setting, so under Bun a call runs on the
-  calling thread. In browsers, `tsc` runs through JSPI where the engine has it, which gives a run
-  about 3 times the stack of a Chrome worker (about 1,500 levels of `1 + 1 + ...`).
+  worker thread with a 256 MB stack (about 30,000 terms of `1 + 1 + ...`). Bun ignores that
+  setting, so under Bun a call runs on the calling thread. In a browser worker, `tsc` runs through
+  JSPI where the engine has it, which gives about 2 times the stack in Chrome.
 - `scripts/wasm/diff.mjs` compares the module with the native tsgo on Query core, Hono, the
-  multiprog fixtures and more: exit codes, output and emitted files are byte-identical.
-- Not supported: `--watch`, `--pprofDir`, `--lsp`, `--api`, and plugins or content mappers that
-  start processes. `--locale` gives English: the module has no message catalogs, to keep it small.
+  multiprog fixtures and more, and `scripts/wasm/corpus.mjs` on the TypeScript compiler test cases.
+  Exit codes, output and emitted files are byte-identical.
+- Not supported: `--watch`, `--pprofDir`, `--lsp`, `--api`, diagnostics as JSON with `--build`, and
+  plugins or content mappers that start processes. `--locale` gives English: the module has no
+  message catalogs, to keep it small. With `--generateTrace`, a panic in the trace's type display
+  ends the run (native recovers from it).
+- `tsc -b` keeps the synthetic nodes of each built project until the run ends (native frees them
+  when a project is done), so a very large build uses more memory.
