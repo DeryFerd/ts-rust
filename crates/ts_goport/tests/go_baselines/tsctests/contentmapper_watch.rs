@@ -10,26 +10,39 @@
 //!
 //! PORT: Go `<-closed` blocks until the test times out. Here the wait has a
 //! deadline (`CLOSED_WAIT`) so that a missing close fails the test.
+//!
+//! PORT: the last test is not in Go. It runs `tsc -b -w` on the OS file
+//! system, where the port's build info prefetch runs.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, SystemTime};
 
+use rustc_hash::FxHashMap;
 use ts_goport::contentmapper::{self, ProcessExitState};
+use ts_goport::emitter::program_emit::{EmitResult, WriteFile};
 use ts_goport::execute;
-use ts_goport::execute::execute_tsc::command_line;
-use ts_goport::execute::tsc::compile::{ErrorWriter, System, Writer};
+use ts_goport::execute::execute_tsc::{TscCompilationHooks, command_line};
+use ts_goport::execute::incremental::program::Program;
+use ts_goport::execute::tsc::compile::{
+    CommandLineTesting, ErrorWriter, OsSystem, System, Writer, new_os_system,
+};
 use ts_goport::execute::tsc::{CommandLineResult, ExitStatus, Watcher};
 use ts_goport::execute::watcher::set_test_watch_backend;
+use ts_goport::frontend::compiler::TraceFn;
+use ts_goport::frontend::tspath::Path;
 use ts_goport::frontend::vfs::Fs;
 use ts_goport::fswatch::{Event, EventKind};
 use ts_goport::gostd::{Context, GoError, context};
 use ts_goport::ipc;
+use ts_goport::locale::Locale;
 
 use crate::support::child::{ChildHooks, new_in_process_test_sys, run_test_in_child};
 use crate::support::contentmappertest::{self, ProjectLifecycle};
+use crate::support::mock_watch_backend::MockWatchBackend;
 use crate::support::runner::{FileMap, TscInput};
 use crate::support::test_sys::TestSys;
 use crate::support::vfstest::{MapFile, symlink};
@@ -992,5 +1005,245 @@ fn content_mapper_build_watch_shared_lifecycle() {
             }
             cancel();
         },
+    );
+}
+
+/// PORT: not in Go. The OS system with the in-process test mappers as its
+/// `Spawn`: the `tsc -b` build info prefetch (orchestrator.rs
+/// `start_build_info_prefetch`) reads only the OS file system, which the
+/// test systems are not.
+struct OsMapperSystem {
+    os: OsSystem,
+    spawner: Rc<dyn contentmapper::Spawner>,
+}
+
+impl System for OsMapperSystem {
+    fn writer(&self) -> Writer {
+        self.os.writer()
+    }
+    fn error_writer(&self) -> ErrorWriter {
+        self.os.error_writer()
+    }
+    fn fs(&self) -> Rc<dyn Fs> {
+        self.os.fs()
+    }
+    fn default_library_path(&self) -> String {
+        self.os.default_library_path()
+    }
+    fn get_current_directory(&self) -> String {
+        self.os.get_current_directory()
+    }
+    fn write_output_is_tty(&self) -> bool {
+        false
+    }
+    fn get_width_of_terminal(&self) -> i32 {
+        0
+    }
+    fn get_environment_variable(&self, name: &str) -> (String, bool) {
+        self.os.get_environment_variable(name)
+    }
+    fn spawn(
+        &self,
+        command: &[String],
+        dir: &str,
+        stderr: Option<Box<dyn std::io::Write + Send>>,
+    ) -> Result<Arc<dyn ProcessExitState>, GoError> {
+        contentmapper::Spawner::spawn(&*self.spawner, command, dir, stderr)
+    }
+    fn now(&self) -> SystemTime {
+        self.os.now()
+    }
+    fn since_start(&self) -> Duration {
+        self.os.since_start()
+    }
+}
+
+/// PORT: not in Go. A Go `testing` that changes no output: with it, Go
+/// `Watch` starts no loop and the test runs each `DoCycle`.
+struct OsTesting;
+
+impl CommandLineTesting for OsTesting {
+    fn on_emitted_files(
+        &self,
+        _result: &EmitResult,
+        _m_times_cache: Option<&Mutex<FxHashMap<Path, Option<SystemTime>>>>,
+    ) {
+    }
+    fn on_list_files_start(&self, _w: &Writer) {}
+    fn on_list_files_end(&self, _w: &Writer) {}
+    fn on_statistics_start(&self, _w: &Writer) {}
+    fn on_statistics_end(&self, _w: &Writer) {}
+    fn on_build_status_report_start(&self, _w: &Writer) {}
+    fn on_build_status_report_end(&self, _w: &Writer) {}
+    fn on_watch_status_report_start(&self) {}
+    fn on_watch_status_report_end(&self) {}
+    fn get_trace(&self, _w: Writer, _locale: Locale) -> TraceFn {
+        Rc::new(|_, _| {})
+    }
+    fn on_program(&self, _program: &Program) {}
+}
+
+struct OsTestingHooks;
+
+impl TscCompilationHooks for OsTestingHooks {
+    fn write_file(&self) -> Option<WriteFile> {
+        None
+    }
+    fn testing(&self) -> Option<Rc<dyn CommandLineTesting>> {
+        Some(Rc::new(OsTesting))
+    }
+}
+
+/// PORT: not in Go. A prefetch thread reads the mtimes of a task's sources
+/// with its build info (build_task.rs `StatusPrefetch`), and the check takes
+/// them in place of its own reads. A check that returns before it takes
+/// them (here at the content mapper identity error,
+/// build/buildtask.go:385-393) leaves them in the task's build info entry,
+/// and the build that follows (buildtask.go:233-239) writes no build info
+/// that would replace the entry. In `tsc -b -w` the entry stays for the
+/// next cycles, whose checks read the disk in Go (build/host.go:102
+/// loadOrStoreMTime, after build/orchestrator.go:498 updateWatch made a new
+/// mtime cache). So no prefetched mtime may outlive its build: after the
+/// mapper is fixed, the edit of `a/a.ts` made while it was broken makes
+/// the build info older than its input, and `a` builds again.
+#[test]
+fn content_mapper_build_watch_reads_source_mtimes_after_a_mapper_error() {
+    run_test_in_child(
+        "tsctests::contentmapper_watch::content_mapper_build_watch_reads_source_mtimes_after_a_mapper_error",
+        || {
+            let scratch =
+                std::env::temp_dir().join(format!("goport-mapper-mtimes-{}", std::process::id()));
+            std::fs::create_dir_all(scratch.join("project")).expect("mkdir");
+            // The watch paths are real paths (`getcwd`).
+            let root = scratch.join("project").canonicalize().expect("a real path");
+            let write = |name: &str, text: &str| {
+                let path = root.join(name);
+                std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+                std::fs::write(&path, text).unwrap_or_else(|e| panic!("write {name}: {e}"));
+            };
+            const MANIFEST: &str = "node_modules/mapper/package.json";
+            let good_manifest =
+                contentmappertest::package_json(contentmappertest::DYNAMIC_VERBATIM_MAPPER);
+            write(
+                "tsconfig.json",
+                r#"{ "files": [], "references": [{ "path": "a" }, { "path": "b" }] }"#,
+            );
+            write(
+                "a/tsconfig.json",
+                r#"{
+	"compilerOptions": { "composite": true, "types": [] },
+	"contentMappers": [{ "package": "mapper", "extensions": [".vue"] }]
+}"#,
+            );
+            write("a/a.ts", "export const a = 1;\n");
+            write(
+                "b/tsconfig.json",
+                r#"{ "compilerOptions": { "composite": true, "types": [] } }"#,
+            );
+            write("b/b.ts", "export const b = 1;\n");
+            write(MANIFEST, &good_manifest);
+            std::env::set_current_dir(&root).expect("chdir");
+            let root_name = root.to_string_lossy().into_owned();
+            let output = Rc::new(RefCell::new(Vec::<u8>::new()));
+            let os = new_os_system()
+                .expect("an OS system")
+                .with_writer(output.clone());
+            let sys: Rc<dyn System> = Rc::new(OsMapperSystem {
+                os,
+                spawner: contentmappertest::new_spawner(),
+            });
+            let take_output =
+                || String::from_utf8(std::mem::take(&mut *output.borrow_mut())).unwrap();
+            let run = |args: &[&str]| {
+                let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+                command_line(&context::background(), sys.clone(), &args, &OsTestingHooks)
+            };
+
+            let result = run(&["--build", "--runExternalCode"]);
+            assert_eq!(result.status, ExitStatus::Success, "{}", take_output());
+            take_output();
+
+            // The mapper process cannot start: the identity check fails
+            // (Go TestContentMapperBuildIdentityFailureExitStatus).
+            write(
+                MANIFEST,
+                r#"{
+	"name": "mapper",
+	"version": "1.0.0",
+	"typescript": { "contentMapper": { "exec": ["missing-mapper"], "dynamicConfig": true } }
+}"#,
+            );
+            let backend = Rc::new(MockWatchBackend::new());
+            set_test_watch_backend(backend.clone());
+            let (ctx, cancel) = context::with_cancel(&context::background());
+            let args: Vec<String> = ["--build", "--watch", "--runExternalCode", "--verbose"]
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect();
+            let result = command_line(&ctx, sys.clone(), &args, &OsTestingHooks);
+            let mut w = result.watcher.expect("result.Watcher");
+            let first = take_output();
+            assert!(
+                first.contains("Project 'a/tsconfig.json' is out of date because"),
+                "{first}"
+            );
+            assert!(
+                first.contains("Project 'b/tsconfig.json' is up to date"),
+                "{first}"
+            );
+
+            // An edit while the mapper is broken. The explicit mtime is
+            // after the build info's whatever the file system clock.
+            write("a/a.ts", "export const a = 2;\n");
+            let build_info_time = std::fs::metadata(root.join("a/tsconfig.tsbuildinfo"))
+                .and_then(|meta| meta.modified())
+                .expect("the build info mtime");
+            std::fs::File::options()
+                .write(true)
+                .open(root.join("a/a.ts"))
+                .and_then(|file| file.set_modified(build_info_time + Duration::from_secs(10)))
+                .expect("set the mtime of a/a.ts");
+            send_os_updates(&backend, &root_name, &["a/a.ts"]);
+            w.do_cycle();
+            let broken = take_output();
+            let emitted = std::fs::read_to_string(root.join("a/a.js")).expect("a/a.js");
+            assert!(
+                emitted.contains("a = 1"),
+                "a/a.js:\n{emitted}\noutput:\n{broken}"
+            );
+
+            write(MANIFEST, &good_manifest);
+            send_os_updates(&backend, &root_name, &[MANIFEST]);
+            w.do_cycle();
+            let fixed = take_output();
+            assert!(
+                fixed.contains(
+                    "Project 'a/tsconfig.json' is out of date because output 'a/tsconfig.tsbuildinfo' is older than input 'a/a.ts'"
+                ),
+                "{fixed}"
+            );
+            let emitted = std::fs::read_to_string(root.join("a/a.js")).expect("a/a.js");
+            assert!(
+                emitted.contains("a = 2"),
+                "a/a.js:\n{emitted}\noutput:\n{fixed}"
+            );
+            cancel();
+            drop(w);
+            std::fs::remove_dir_all(&scratch)
+                .unwrap_or_else(|e| panic!("remove {}: {e}", scratch.display()));
+        },
+    );
+}
+
+/// Update events for `files` (relative to `root`) on `backend`.
+fn send_os_updates(backend: &MockWatchBackend, root: &str, files: &[&str]) {
+    backend.send_events(
+        files
+            .iter()
+            .map(|file| Event {
+                kind: EventKind::Update,
+                path: format!("{root}/{file}"),
+            })
+            .collect(),
     );
 }

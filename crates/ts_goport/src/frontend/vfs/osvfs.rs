@@ -388,6 +388,78 @@ impl Fs for OsFs {
     }
 }
 
+/// PORT: not in Go (perf). The mtime of each normalized absolute path of
+/// `paths` on the OS file system, as `osvfs_fs().stat(path)` gives it
+/// (Go os.go:112 Stat, `os.Stat`; `FileInfo::mod_time`, None when the stat
+/// fails). A run of paths in one directory is stat'ed through one open of
+/// the directory, so the OS walks the directory part of the path once. A
+/// path that this cannot stat so (no directory part, a directory that does
+/// not open, a failed stat, a path of `PATH_MAX` bytes or more) is stat'ed
+/// by its full path, as `stat` does. So is a path whose name is a symbolic
+/// link: `stat` fails with ELOOP after 40 links on the whole path, and the
+/// open of the directory and a stat of the name would each follow 40.
+/// Linux only: `statx` and `O_PATH` are not on macOS.
+#[cfg(target_os = "linux")]
+pub fn os_mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<SystemTime>> {
+    use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, StatxFlags, openat, statx};
+    use std::os::fd::OwnedFd;
+    const PATH_MAX: usize = 4096;
+    // `SystemTime::new` of std (`Metadata::modified`), which is not public.
+    let system_time = |sec: i64, nsec: u32| {
+        if nsec >= 1_000_000_000 {
+            return None;
+        }
+        let base = if sec >= 0 {
+            SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(sec.unsigned_abs()))
+        } else {
+            SystemTime::UNIX_EPOCH.checked_sub(std::time::Duration::from_secs(sec.unsigned_abs()))
+        };
+        base?.checked_add(std::time::Duration::from_nanos(u64::from(nsec)))
+    };
+    let mut dir: Option<(&str, Option<OwnedFd>)> = None;
+    let mut m_times = Vec::new();
+    for path in paths {
+        let mut m_time = None;
+        if let Some(slash) = path.rfind('/')
+            && path.len() < PATH_MAX
+        {
+            let (dir_name, name) = (&path[..slash.max(1)], &path[slash + 1..]);
+            if dir.as_ref().is_none_or(|(open, _)| *open != dir_name) {
+                let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
+                let fd = openat(CWD, &*os_path(dir_name), flags, Mode::empty()).ok();
+                dir = Some((dir_name, fd));
+            }
+            let wanted = StatxFlags::TYPE | StatxFlags::MTIME;
+            if let Some((_, Some(fd))) = &dir
+                && !name.is_empty()
+                && name != "."
+                && name != ".."
+                && let Ok(stat) = statx(fd, &*os_path(name), AtFlags::SYMLINK_NOFOLLOW, wanted)
+                && stat.stx_mask & wanted.bits() == wanted.bits()
+                && FileType::from_raw_mode(u32::from(stat.stx_mode)) != FileType::Symlink
+            {
+                m_time = system_time(stat.stx_mtime.tv_sec, stat.stx_mtime.tv_nsec).map(Some);
+            }
+        }
+        m_times.push(m_time.unwrap_or_else(|| {
+            std::fs::metadata(os_path(path))
+                .ok()
+                .and_then(|md| md.modified().ok())
+        }));
+    }
+    m_times
+}
+
+/// PORT: not in Go (perf). Off Linux, `stat` of each path.
+#[cfg(not(target_os = "linux"))]
+pub fn os_mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<SystemTime>> {
+    let fs = osvfs_fs();
+    paths
+        .into_iter()
+        .map(|path| fs.stat(path).and_then(|stat| stat.mod_time()))
+        .collect()
+}
+
 // PORT: the Go `flag int` of `writeFileWithFlag`. Go passes
 // `O_WRONLY|O_CREATE|O_TRUNC` or `O_WRONLY|O_CREATE|O_APPEND`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1096,5 +1168,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(result.is_ok());
         assert_eq!(modified, m_time);
+    }
+
+    // PORT: not in Go. `os_mod_times` gives the mtime that `stat` gives for
+    // each path: files in one directory and in another, a directory reached
+    // through a link, a link to a file, a missing file, a missing
+    // directory, a time before 1970, a path with no file name, and paths
+    // through 30 directory links to a chain of 30 file links (ELOOP: more
+    // than 40 links) and to one file link.
+    #[test]
+    fn os_mod_times_matches_stat() {
+        let dir = std::env::temp_dir().join(format!("ts_goport_mod_times_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/x.ts"), "x").unwrap();
+        std::fs::write(dir.join("a/y.ts"), "y").unwrap();
+        std::fs::write(dir.join("a/b/z.ts"), "z").unwrap();
+        std::os::unix::fs::symlink(dir.join("a/b"), dir.join("a/l")).unwrap();
+        std::os::unix::fs::symlink(dir.join("a/x.ts"), dir.join("a/lx.ts")).unwrap();
+        // Relative targets, so each link is one link whatever the temp dir.
+        std::os::unix::fs::symlink("a", dir.join("d0")).unwrap();
+        std::os::unix::fs::symlink("x.ts", dir.join("a/f0.ts")).unwrap();
+        for i in 1..30 {
+            std::os::unix::fs::symlink(format!("d{}", i - 1), dir.join(format!("d{i}"))).unwrap();
+            std::os::unix::fs::symlink(format!("f{}.ts", i - 1), dir.join(format!("a/f{i}.ts")))
+                .unwrap();
+        }
+        let old = SystemTime::UNIX_EPOCH - std::time::Duration::new(1000, 0)
+            + std::time::Duration::new(0, 7);
+        osvfs_fs()
+            .chtimes(dir.join("a/y.ts").to_str().unwrap(), None, Some(old))
+            .unwrap();
+        let root = dir.to_str().unwrap();
+        let paths: Vec<String> = [
+            "a/x.ts",
+            "a/y.ts",
+            "a/lx.ts",
+            "a/b/z.ts",
+            "a/l/z.ts",
+            "a/x.ts",
+            "a/no.ts",
+            "no/x.ts",
+            "a/b/",
+            "a",
+            "d29/f29.ts",
+            "d29/f0.ts",
+        ]
+        .iter()
+        .map(|name| format!("{root}/{name}"))
+        .collect();
+        let m_times = os_mod_times(paths.iter().map(String::as_str));
+        let fs = osvfs_fs();
+        let want: Vec<Option<SystemTime>> = paths
+            .iter()
+            .map(|path| fs.stat(path).and_then(|stat| stat.mod_time()))
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(m_times, want);
+        assert_eq!(want[1], Some(old));
+        assert!(want[6].is_none() && want[7].is_none());
+        assert!(want[10].is_none() && want[11].is_some());
     }
 }

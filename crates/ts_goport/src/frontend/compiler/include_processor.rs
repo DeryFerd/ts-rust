@@ -4,6 +4,8 @@
 
 use crate::frontend::prelude::*;
 use std::cell::OnceCell;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Go `includeProcessor`.
 // PORT: Go `collections.SyncMap` caches are `RefCell` maps (single thread).
@@ -27,6 +29,19 @@ pub struct IncludeProcessor {
     // PORT: Go returns a shared `*ast.DiagnosticsCollection` that callers
     // sort in place. Here callers borrow the `RefCell` mutably.
     pub(crate) computed_diagnostics: OnceCell<RefCell<DiagnosticsCollection>>,
+    /// PORT: Go builds `computed_diagnostics` lazily, from
+    /// `GetProgramDiagnostics` or `GetIncludeProcessorDiagnostics`. The port
+    /// builds it when it makes the program (`GoSharedState::new`), before
+    /// `ExplainFiles` can run. The `redirectAndFileFormat` lines that the
+    /// collection makes (with absolute names) wait here until the port
+    /// reaches a point where Go builds the collection
+    /// (`mark_diagnostics_read`). Until then `ExplainFiles` makes its own
+    /// lines with relative names, as in Go.
+    pub(crate) collection_redirect_and_file_format: RefCell<FxHashMap<Path, Vec<Diagnostic>>>,
+    /// True once the port reached a point where Go builds
+    /// `computed_diagnostics`. The checker threads set it
+    /// (`GoSharedState::get_include_processor_diagnostics`), so it is shared.
+    pub(crate) diagnostics_read: Arc<AtomicBool>,
     // PORT: Go nil `*ast.ObjectLiteralExpression` is `Node::NIL`.
     pub(crate) compiler_options_syntax: OnceCell<Node>,
 }
@@ -88,6 +103,13 @@ impl IncludeProcessor {
             }
             RefCell::new(computed_diagnostics)
         })
+    }
+
+    /// Marks the point where Go builds `computed_diagnostics`: Go
+    /// `GetProgramDiagnostics` and `GetIncludeProcessorDiagnostics` when the
+    /// file is checked. See `collection_redirect_and_file_format`.
+    pub fn mark_diagnostics_read(&self) {
+        self.diagnostics_read.store(true, Ordering::Relaxed);
     }
 
     // Go: includeprocessor.go:59 (*includeProcessor).addProcessingDiagnostic
@@ -196,7 +218,8 @@ impl IncludeProcessor {
 
     // Go: includeprocessor.go:123 (*includeProcessor).explainRedirectAndImpliedFormat
     // PORT: Go nil and empty results are both an empty `Vec`. Callers only
-    // append the result.
+    // append the result. This is the `ExplainFiles` caller; the diagnostics
+    // collection calls `explain_redirect_and_implied_format_for_collection`.
     pub fn explain_redirect_and_implied_format(
         &self,
         program: &NewProgram,
@@ -206,6 +229,73 @@ impl IncludeProcessor {
         if let Some(existing) = self.redirect_and_file_format.borrow().get(file_path) {
             return existing.clone();
         }
+        // Go built the collection before this call, so its lines are in
+        // the cache.
+        if self.diagnostics_read.load(Ordering::Relaxed)
+            && let Some(lines) = self
+                .collection_redirect_and_file_format
+                .borrow()
+                .get(file_path)
+        {
+            return self
+                .redirect_and_file_format
+                .borrow_mut()
+                .entry(file_path.clone())
+                .or_insert_with(|| lines.clone())
+                .clone();
+        }
+        let Some(result) = self.redirect_and_implied_format(program, file_path, to_file_name)
+        else {
+            return Vec::new();
+        };
+        self.redirect_and_file_format
+            .borrow_mut()
+            .entry(file_path.clone())
+            .or_insert(result)
+            .clone()
+    }
+
+    // Go: processingDiagnostic.go:106 the `explainRedirectAndImpliedFormat`
+    // call of the diagnostics collection, with absolute names.
+    // PORT: the lines go to `collection_redirect_and_file_format`, not to
+    // the Go cache (see that field).
+    pub fn explain_redirect_and_implied_format_for_collection(
+        &self,
+        program: &NewProgram,
+        file_path: &Path,
+    ) -> Vec<Diagnostic> {
+        if let Some(existing) = self.redirect_and_file_format.borrow().get(file_path) {
+            return existing.clone();
+        }
+        if let Some(existing) = self
+            .collection_redirect_and_file_format
+            .borrow()
+            .get(file_path)
+        {
+            return existing.clone();
+        }
+        let Some(result) =
+            self.redirect_and_implied_format(program, file_path, |file_name| file_name.to_string())
+        else {
+            return Vec::new();
+        };
+        self.collection_redirect_and_file_format
+            .borrow_mut()
+            .entry(file_path.clone())
+            .or_insert(result)
+            .clone()
+    }
+
+    // Go: includeprocessor.go:131-181, the body of
+    // explainRedirectAndImpliedFormat between the cache read and the cache
+    // write. `None` is Go's early `return nil` (no file at the path), which
+    // caches nothing.
+    fn redirect_and_implied_format(
+        &self,
+        program: &NewProgram,
+        file_path: &Path,
+        to_file_name: impl Fn(&str) -> String,
+    ) -> Option<Vec<Diagnostic>> {
         // PORT: Go `file ast.HasFileName` is the redirect file or the source
         // file. Both are kept, and `file_name`/`path` read the one that is set.
         let mut source_file: Option<Rc<ParsedSourceFile>> = None;
@@ -218,7 +308,7 @@ impl IncludeProcessor {
         } else {
             source_file = program.get_source_file_by_path(file_path);
             match &source_file {
-                None => return Vec::new(),
+                None => return None,
                 Some(source_file) => &**source_file,
             }
         };
@@ -286,10 +376,6 @@ impl IncludeProcessor {
             }
         }
 
-        self.redirect_and_file_format
-            .borrow_mut()
-            .entry(file_path.clone())
-            .or_insert(result)
-            .clone()
+        Some(result)
     }
 }
