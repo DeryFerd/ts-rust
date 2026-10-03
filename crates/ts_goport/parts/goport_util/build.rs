@@ -1,9 +1,17 @@
-//! The wasm build packs the bundled libs. For a wasm target (and not
-//! `noembed`), this writes each `crates/ts_goport/libs/lib.*.d.ts` as an
-//! LZMA stream to `OUT_DIR/libs/<name>.lzma`. `src/frontend/bundled/embed.rs`
-//! embeds these and unpacks a lib on its first read. The packed libs are
-//! 0.48 MB, not 3.79 MB. Native builds embed the texts as they are, so this
-//! does nothing for them.
+//! The wasm build packs the bundled libs and the diagnostic message texts.
+//! For a wasm target, this writes:
+//! - each `crates/ts_goport/libs/lib.*.d.ts` (not with `noembed`) as an
+//!   LZMA stream to `OUT_DIR/libs/<name>.lzma`. `src/frontend/bundled/embed.rs`
+//!   embeds these and unpacks a lib on its first read. The packed libs are
+//!   0.48 MB, not 3.79 MB.
+//! - the texts of `src/diagnostics/catalog.rs`, in catalog order and ended
+//!   by NUL, as one LZMA stream to `OUT_DIR/diagnostic_texts.lzma`.
+//!   `src/diagnostics/mod.rs` unpacks it on the first text read: 44 KB, not
+//!   151 KB.
+//!
+//! Native builds embed the texts as they are, so this does nothing for them.
+
+mod catalog_texts;
 
 use lzma_rust2::{EncodeMode, LzmaOptions, LzmaWriter, MfType};
 use std::io::Write;
@@ -11,8 +19,11 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    let wasm = std::env::var("CARGO_CFG_TARGET_FAMILY").as_deref() == Ok("wasm");
-    if !wasm || std::env::var_os("CARGO_FEATURE_NOEMBED").is_some() {
+    if std::env::var("CARGO_CFG_TARGET_FAMILY").as_deref() != Ok("wasm") {
+        return;
+    }
+    pack_diagnostic_texts();
+    if std::env::var_os("CARGO_FEATURE_NOEMBED").is_some() {
         return;
     }
     let libs = PathBuf::from(env("CARGO_MANIFEST_DIR")).join("../../libs");
@@ -29,6 +40,16 @@ fn main() {
             std::fs::write(out.join(format!("{name}.lzma")), pack(&text)).expect("write a lib");
         }
     }
+}
+
+/// Packs the message texts of the generated catalog (`catalog_texts`).
+fn pack_diagnostic_texts() {
+    let catalog = PathBuf::from(env("CARGO_MANIFEST_DIR")).join("../../src/diagnostics/catalog.rs");
+    println!("cargo:rerun-if-changed={}", catalog.display());
+    let source = std::fs::read_to_string(&catalog).expect("read the diagnostic catalog");
+    let out = PathBuf::from(env("OUT_DIR")).join("diagnostic_texts.lzma");
+    std::fs::write(out, pack(catalog_texts::catalog_texts(&source).as_bytes()))
+        .expect("write the diagnostic texts");
 }
 
 fn env(name: &str) -> String {

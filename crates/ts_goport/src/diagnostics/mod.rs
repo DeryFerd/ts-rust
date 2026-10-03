@@ -44,6 +44,8 @@ pub struct Message {
     /// wasm leaves the keys out (144 KB): `key` makes them from the text.
     #[cfg(not(target_family = "wasm"))]
     key: &'static str,
+    /// wasm packs the texts (`text`).
+    #[cfg(not(target_family = "wasm"))]
     text: &'static str,
     reports_unnecessary: bool,
     elided_in_compatibility_pyramid: bool,
@@ -63,12 +65,13 @@ impl Message {
         reports_deprecated: bool,
     ) -> Self {
         #[cfg(target_family = "wasm")]
-        let _ = key;
+        let _ = (key, text);
         Self {
             code,
             category,
             #[cfg(not(target_family = "wasm"))]
             key,
+            #[cfg(not(target_family = "wasm"))]
             text,
             reports_unnecessary,
             elided_in_compatibility_pyramid,
@@ -103,12 +106,31 @@ impl Message {
         let mut keys = KEYS.lock().unwrap_or_else(PoisonError::into_inner);
         keys.get_or_insert_with(HashMap::new)
             .entry(self.code)
-            .or_insert_with(|| Box::leak(message_key(self.text, self.code).into_boxed_str()))
+            .or_insert_with(|| Box::leak(message_key(self.text(), self.code).into_boxed_str()))
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[must_use]
     pub const fn text(self) -> &'static str {
         self.text
+    }
+
+    /// wasm: the text, from the packed texts of the catalog
+    /// (`parts/goport_util/build.rs`), which the first read unpacks.
+    #[cfg(target_family = "wasm")]
+    #[must_use]
+    pub fn text(self) -> &'static str {
+        static TEXTS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+        let texts = TEXTS.get_or_init(|| {
+            let packed = include_bytes!(concat!(env!("OUT_DIR"), "/diagnostic_texts.lzma"));
+            let texts: &'static str =
+                Box::leak(crate::frontend::bundled::unpack(packed).into_boxed_str());
+            texts.split_terminator('\0').collect()
+        });
+        let index = CATALOG
+            .binary_search_by_key(&self.code, |message| message.code)
+            .expect("a catalog message");
+        texts[index]
     }
 
     #[must_use]
@@ -132,12 +154,13 @@ impl Message {
     ///
     /// Returns an error if the message references an argument that was not supplied.
     pub fn format(self, arguments: &[String]) -> Result<String, FormatError> {
+        let text = self.text();
         if arguments.is_empty() {
-            return Ok(self.text.to_owned());
+            return Ok(text.to_owned());
         }
 
-        let mut output = String::with_capacity(self.text.len());
-        let mut remaining = self.text;
+        let mut output = String::with_capacity(text.len());
+        let mut remaining = text;
         while let Some(open) = remaining.find('{') {
             output.push_str(&remaining[..open]);
             remaining = &remaining[open + 1..];
@@ -309,9 +332,25 @@ fn message_key(text: &str, code: u32) -> String {
     format!("{key}_{code}")
 }
 
+/// The catalog text reader of the wasm build (`parts/goport_util/build.rs`),
+/// for its test.
+#[cfg(test)]
+#[path = "../../parts/goport_util/catalog_texts.rs"]
+mod catalog_texts;
+
 #[cfg(test)]
 mod tests {
     use super::{CATALOG, Category, Diagnostic, message_by_code, message_by_key, message_key};
+
+    /// The wasm build packs the texts that `catalog_texts` reads from the
+    /// catalog source; they must be the texts of the catalog.
+    #[test]
+    fn catalog_texts_reads_every_text() {
+        let texts = super::catalog_texts::catalog_texts(include_str!("catalog.rs"));
+        let texts: Vec<&str> = texts.split_terminator('\0').collect();
+        let want: Vec<&str> = CATALOG.iter().map(|message| message.text()).collect();
+        assert_eq!(texts, want);
+    }
 
     /// The wasm build makes each key from its text (`message_key`); it
     /// must give the generated key of every message.

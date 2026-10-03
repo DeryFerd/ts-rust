@@ -273,15 +273,16 @@ fn embedded_contents(rest: &str) -> Option<&'static str> {
     Some(text.get_or_init(|| unpack(packed)))
 }
 
-/// wasm: the text of a lib that build.rs packed (an `.lzma` stream).
+/// wasm: the text that `parts/goport_util/build.rs` packed (an `.lzma`
+/// stream): a lib, or the diagnostic message texts.
 #[cfg(target_family = "wasm")]
-fn unpack(packed: &[u8]) -> String {
+pub(crate) fn unpack(packed: &[u8]) -> String {
     use std::io::Read;
     let mut text = Vec::new();
     lzma_rust2::LzmaReader::new_mem_limit(packed, u32::MAX, None)
         .and_then(|mut reader| reader.read_to_end(&mut text))
-        .expect("build.rs packs each lib");
-    String::from_utf8(text).expect("a lib is UTF-8")
+        .expect("build.rs packs the text");
+    String::from_utf8(text).expect("a packed text is UTF-8")
 }
 
 /// One `EMBEDDED_CONTENTS` entry (see `bundled_lib!`).
