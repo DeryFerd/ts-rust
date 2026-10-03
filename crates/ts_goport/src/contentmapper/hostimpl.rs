@@ -1376,6 +1376,14 @@ pub fn new_host_with_options(
                 stderr_log = Some(log);
             }
             let spawned = spawner.spawn(&mapper.manifest.exec, &mapper.package_directory, stderr);
+            // PORT: not in Go. wasm cannot start a process
+            // (execute/tsc/compile.rs `spawn_process`), so a spawn there
+            // always fails. This tells the compiler, and the wasm module
+            // leaves out the mapper connection (ipc).
+            #[cfg(target_family = "wasm")]
+            let spawned = spawned.map(|_| -> Arc<dyn ProcessExitState> {
+                unreachable!("wasm cannot start a content mapper process")
+            });
             mapper_timing.spawn.record(spawn_start);
             let mut rwc: Arc<dyn ProcessExitState> = match spawned {
                 Ok(rwc) => rwc,

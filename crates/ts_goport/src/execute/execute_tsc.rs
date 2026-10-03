@@ -45,6 +45,7 @@ use crate::execute::tsc::{
     new_content_mapper_host, print_build_help, print_help, print_version, write_config_file,
     write_str,
 };
+#[cfg(not(target_family = "wasm"))]
 use crate::execute::watcher::create_watcher;
 use crate::frontend::json::json_marshal_indent_write;
 use crate::frontend::tsoptions::convert_to_ts_config;
@@ -145,6 +146,19 @@ fn result(status: ExitStatus) -> CommandLineResult {
     }
 }
 
+/// Ends a run that asks for `option`, which the wasm build cannot run:
+/// watch mode needs threads and file events, and `--pprofDir` profiles the
+/// process. crates/ts_wasm refuses both options before tsc runs, with the
+/// same text and status; a response file (`@file`) can still set them.
+/// The gates that call this let the link leave the watch and profile code
+/// out of the wasm module.
+// PORT: not in Go.
+#[cfg(target_family = "wasm")]
+fn wasm_unsupported(option: &str) -> CommandLineResult {
+    eprintln!("error: {option} is not supported by the wasm build");
+    result(ExitStatus::DiagnosticsPresentOutputsSkipped)
+}
+
 // Go: execute/tsc.go:27 startTracingIfNeeded, the warning part. The session
 // is the process session in `crate::tracing`.
 // PORT: testing. `testing` is Go `testing != nil`.
@@ -223,8 +237,20 @@ pub fn tsc_build_compilation(
         return result(ExitStatus::DiagnosticsPresentOutputsSkipped);
     }
 
+    // PORT: not in Go. A wasm build cannot watch or profile (see
+    // `wasm_unsupported`).
+    #[cfg(target_family = "wasm")]
+    if build_command.compiler_options.watch.is_true() {
+        return wasm_unsupported("--watch");
+    }
+    #[cfg(target_family = "wasm")]
+    if !build_command.compiler_options.pprof_dir.is_empty() {
+        return wasm_unsupported("--pprofDir");
+    }
+
     // PORT: Go `defer profileSession.Stop()`. The session stops when it
     // drops at the end of this function (see `crate::pprof`).
+    #[cfg(not(target_family = "wasm"))]
     let _profile_session = if build_command.compiler_options.pprof_dir.is_empty() {
         None
     } else {
@@ -276,8 +302,15 @@ pub fn tsc_compilation(
         return result(ExitStatus::DiagnosticsPresentOutputsSkipped);
     }
 
+    // PORT: not in Go. A wasm build cannot profile (see `wasm_unsupported`).
+    #[cfg(target_family = "wasm")]
+    if !command_line.compiler_options().pprof_dir.is_empty() {
+        return wasm_unsupported("--pprofDir");
+    }
+
     // PORT: Go `defer profileSession.Stop()`. The session stops when it
     // drops at the end of this function (see `crate::pprof`).
+    #[cfg(not(target_family = "wasm"))]
     let _profile_session = if command_line.compiler_options().pprof_dir.is_empty() {
         None
     } else {
@@ -451,20 +484,27 @@ pub fn tsc_compilation(
         return result(status);
     }
     if config_for_compilation.compiler_options().watch.is_true() {
-        let mut watcher = create_watcher(
-            sys,
-            Rc::new(config_for_compilation),
-            compiler_options_from_command_line,
-            command_line_raw,
-            report_diagnostic,
-            report_error_summary,
-            testing,
-        );
-        watcher.start(ctx);
-        return CommandLineResult {
-            status: ExitStatus::Success,
-            watcher: Some(Box::new(watcher)),
-        };
+        // PORT: not in Go. A wasm build cannot watch (see
+        // `wasm_unsupported`).
+        #[cfg(target_family = "wasm")]
+        return wasm_unsupported("--watch");
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let mut watcher = create_watcher(
+                sys,
+                Rc::new(config_for_compilation),
+                compiler_options_from_command_line,
+                command_line_raw,
+                report_diagnostic,
+                report_error_summary,
+                testing,
+            );
+            watcher.start(ctx);
+            return CommandLineResult {
+                status: ExitStatus::Success,
+                watcher: Some(Box::new(watcher)),
+            };
+        }
     } else if config_for_compilation.compiler_options().is_incremental() {
         return perform_incremental_compilation(
             ctx,
