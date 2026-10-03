@@ -560,6 +560,8 @@ function cases(inputs) {
 /** The edit of the `external-diag` case (see there). */
 function externalDiagnosticEdit(cwd) {
     const file = path.join(cwd, "tsconfig.tsbuildinfo");
+    // A first run that wrote none already differs from native.
+    if (!fs.existsSync(file)) return;
     const info = JSON.parse(fs.readFileSync(file, "utf8"));
     for (const entry of info.semanticDiagnosticsPerFile) {
         if (!Array.isArray(entry)) continue;

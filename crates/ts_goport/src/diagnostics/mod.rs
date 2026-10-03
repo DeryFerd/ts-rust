@@ -41,23 +41,19 @@ impl fmt::Display for Category {
 pub struct Message {
     code: u32,
     category: Category,
-    /// wasm leaves the keys out (144 KB): `key` makes them from the text.
-    #[cfg(not(target_family = "wasm"))]
+    /// "" in a catalog entry of the wasm build (`Message::catalog`).
     key: &'static str,
-    /// wasm packs the texts (`text`).
-    #[cfg(not(target_family = "wasm"))]
+    /// "" in a catalog entry of the wasm build (`Message::catalog`).
     text: &'static str,
-    /// wasm: the text of a message made outside the catalog (its key is
-    /// ""): `ast::NIL_MESSAGE` and the ad hoc messages. The catalog texts
-    /// are packed.
-    #[cfg(target_family = "wasm")]
-    own_text: Option<&'static str>,
     reports_unnecessary: bool,
     elided_in_compatibility_pyramid: bool,
     reports_deprecated: bool,
 }
 
 impl Message {
+    /// A message made outside the catalog: `ast::NIL_MESSAGE` and the ad
+    /// hoc messages (code 0, key ""), and the messages that Go removed
+    /// (`diag.rs`). It keeps its key and text on every target.
     #[doc(hidden)]
     #[must_use]
     pub const fn new(
@@ -69,19 +65,50 @@ impl Message {
         elided_in_compatibility_pyramid: bool,
         reports_deprecated: bool,
     ) -> Self {
+        // The wasm build tells catalog entries by their code with no key.
+        assert!(code == 0 || !key.is_empty(), "a message with a code has a key");
         Self {
             code,
             category,
-            #[cfg(not(target_family = "wasm"))]
             key,
-            #[cfg(not(target_family = "wasm"))]
             text,
-            #[cfg(target_family = "wasm")]
-            own_text: if key.is_empty() { Some(text) } else { None },
             reports_unnecessary,
             elided_in_compatibility_pyramid,
             reports_deprecated,
         }
+    }
+
+    /// An entry of the generated `CATALOG`. The wasm build leaves out its
+    /// key (144 KB for all) and text (151 KB): `key` makes the key from the
+    /// text, and `text` reads the texts that `parts/goport_util/build.rs`
+    /// packed.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn catalog(
+        code: u32,
+        category: Category,
+        key: &'static str,
+        text: &'static str,
+        reports_unnecessary: bool,
+        elided_in_compatibility_pyramid: bool,
+        reports_deprecated: bool,
+    ) -> Self {
+        let packed = cfg!(target_family = "wasm");
+        Self {
+            code,
+            category,
+            key: if packed { "" } else { key },
+            text: if packed { "" } else { text },
+            reports_unnecessary,
+            elided_in_compatibility_pyramid,
+            reports_deprecated,
+        }
+    }
+
+    /// wasm: true for a catalog entry, which has a code and no key.
+    #[cfg(target_family = "wasm")]
+    const fn packed(self) -> bool {
+        self.code != 0 && self.key.is_empty()
     }
 
     #[must_use]
@@ -100,16 +127,15 @@ impl Message {
         self.key
     }
 
-    /// wasm: the key, made from the text as Go's generator makes it
-    /// (`message_key`), once per message. A message made outside the
-    /// catalog has the key "".
+    /// wasm: the key. A catalog entry makes it from its text as Go's
+    /// generator does (`message_key`), once.
     #[cfg(target_family = "wasm")]
     #[must_use]
     pub fn key(self) -> &'static str {
         use std::collections::HashMap;
         use std::sync::{Mutex, PoisonError};
-        if self.own_text.is_some() {
-            return "";
+        if !self.packed() {
+            return self.key;
         }
         static KEYS: Mutex<Option<HashMap<u32, &'static str>>> = Mutex::new(None);
         let mut keys = KEYS.lock().unwrap_or_else(PoisonError::into_inner);
@@ -124,20 +150,22 @@ impl Message {
         self.text
     }
 
-    /// wasm: the text, from the packed texts of the catalog
-    /// (`parts/goport_util/build.rs`), which the first read unpacks.
+    /// wasm: the text. A catalog entry reads it from the packed texts of
+    /// the catalog, which the first read unpacks.
     #[cfg(target_family = "wasm")]
     #[must_use]
     pub fn text(self) -> &'static str {
-        if let Some(text) = self.own_text {
-            return text;
+        if !self.packed() {
+            return self.text;
         }
         static TEXTS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
         let texts = TEXTS.get_or_init(|| {
             let packed = include_bytes!(concat!(env!("OUT_DIR"), "/diagnostic_texts.lzma"));
             let texts: &'static str =
                 Box::leak(crate::frontend::bundled::unpack(packed).into_boxed_str());
-            texts.split_terminator('\0').collect()
+            let texts: Vec<&'static str> = texts.split_terminator('\0').collect();
+            assert_eq!(texts.len(), CATALOG.len(), "a packed text for each catalog entry");
+            texts
         });
         let index = CATALOG
             .binary_search_by_key(&self.code, |message| message.code)

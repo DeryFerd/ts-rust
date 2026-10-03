@@ -3,13 +3,13 @@
 //! in `src/diagnostics/mod.rs` checks it against the catalog.
 
 /// The texts of the catalog source `source`, in catalog order, each ended
-/// by NUL. Each `Message::new(` call has its arguments on their own lines;
-/// the text is the fourth. The generator escapes only `"` and `\\`.
+/// by NUL. Each `Message::catalog(` call has its arguments on their own
+/// lines; the text is the fourth. The generator escapes only `"` and `\\`.
 pub fn catalog_texts(source: &str) -> String {
     let mut texts = String::new();
     let mut lines = source.lines();
     while let Some(line) = lines.next() {
-        if line.trim() != "Message::new(" {
+        if line.trim() != "Message::catalog(" {
             continue;
         }
         let literal = lines
