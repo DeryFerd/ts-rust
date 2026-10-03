@@ -243,6 +243,38 @@ const value = 0;"#;
     t.finish();
 }
 
+// PORT: no Go counterpart. Go cuts a JSDoc comment that ends the file 2
+// bytes before its end (jsdoc.go:163), here inside the 3 bytes of `日`. The
+// string literal type keeps the first byte of the char, so its node ends
+// inside the char, and Go `GetTextOfNodeFromSourceText` (utilities.go:72)
+// slices the bytes there. Declaration emit of the reparsed type alias reads
+// it: the d.ts holds `"` and the byte E6, as Go writes it. R159 panicked on
+// the `&str` slice (CLI exit 70).
+#[test]
+fn test_text_of_js_doc_node_that_ends_inside_a_char() {
+    let source_text = "/** @typedef {\"日";
+    let opts = SourceFileParseOptions {
+        file_name: "/index.js".to_string(),
+        path: Path("/index.js".to_string()),
+        ..Default::default()
+    };
+    let file = parse_source_file(&opts, leak(source_text), ScriptKind::JS);
+    let type_alias = file
+        .statements()
+        .nodes()
+        .iter()
+        .find(|&s| is_js_type_alias_declaration(s))
+        .expect("the reparsed @typedef");
+    let literal = type_alias.type_().literal();
+    assert!(is_string_literal(literal));
+    // Go: the literal ends 1 byte into `日` (bytes 15 to 18).
+    assert_eq!((literal.pos(), literal.end()), (14, 16));
+    assert_eq!(
+        get_text_of_node_from_source_text(source_text, literal, false),
+        go_string_from_bytes(b"\"\xE6".to_vec())
+    );
+}
+
 // Go: parser/parser_test.go:292 TestJSDocTypeSourcePropagatesToConstructedReparse
 #[test]
 fn test_js_doc_type_source_propagates_to_constructed_reparse() {
