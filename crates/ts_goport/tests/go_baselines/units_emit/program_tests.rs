@@ -396,9 +396,9 @@ foo.bar;";
 // parse (`resolveJSDoc`, ast.go:2745) added. The parser defers a TS comment
 // whose `{@link}` its prefilter misses (`{@link<form feed>Foo}`). The call
 // `f()` before `f` reads that comment lazily (the `@deprecated` check), so
-// `checkSourceElement` (checker.go:2296) sees the link and marks `Foo` used.
-// Go N reports nothing; before 6472f970b the port reported TS6133 "'Foo' is
-// declared but its value is never read".
+// `checkSourceElementWorker` (checker.go:2296) sees the link and marks `Foo`
+// used. Go N reports nothing; before 6472f970b the port reported TS6133
+// "'Foo' is declared but its value is never read".
 #[test]
 fn test_lazy_js_doc_link_marks_its_target_used() {
     in_child(

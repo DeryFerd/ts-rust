@@ -267,7 +267,7 @@ fn test_text_of_js_doc_node_that_ends_inside_a_char() {
         .expect("the reparsed @typedef");
     let literal = type_alias.type_().literal();
     assert!(is_string_literal(literal));
-    // Go: the literal ends 1 byte into `日` (bytes 15 to 18).
+    // Go: the literal ends 1 byte into `日` (bytes 15 to 17).
     assert_eq!((literal.pos(), literal.end()), (14, 16));
     assert_eq!(
         get_text_of_node_from_source_text(source_text, literal, false),
