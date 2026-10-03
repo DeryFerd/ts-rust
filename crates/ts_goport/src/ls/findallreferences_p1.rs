@@ -472,10 +472,13 @@ pub fn get_range_of_node(node: Node, mut source_file: Node, end_node: Node) -> T
     let mut end = if end_node.is_some() { end_node } else { node }.end();
     // PORT: Go counts the length and steps `end` back in Go bytes. An
     // unterminated literal can end in a marker unit (see
-    // `GO_STRING_MARKER`), which has more port bytes than Go bytes.
-    if is_string_literal_like(node) {
+    // `GO_STRING_MARKER`), which has more port bytes than Go bytes, so a
+    // port length of 2 or less is also a Go length of 2 or less.
+    // PERF: `go_len` reads only the literal (both ends are token bounds, so
+    // char boundaries), not the file text before it.
+    if is_string_literal_like(node) && end - start > 2 {
         let text = source_file_text(source_file);
-        if go_byte_offset(&text, end) - go_byte_offset(&text, start) > 2 {
+        if go_len(&text[start as usize..end as usize]) > 2 {
             if end_node.is_some() {
                 crate::core::go_panic("endNode is not nil for stringLiteralLike".to_string());
             }
