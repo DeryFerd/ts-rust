@@ -2020,8 +2020,13 @@ pub fn go_text_slice(text: &str, lo: i32, hi: i32) -> Cow<'_, str> {
         crate::core::go_panic(format!("runtime error: slice bounds out of range [:{hi}]"));
     }
     if hi as usize > len {
+        // PORT: the panic names Go's numbers. Go's length is `go_len`, and
+        // a position past the text (from `UTF16ToUTF8`) is Go's position
+        // plus the port bytes of the text that Go does not have.
+        let go_len = crate::scanner_util::go_len(text);
+        let go_hi = i64::from(hi) - (len - go_len) as i64;
         crate::core::go_panic(format!(
-            "runtime error: slice bounds out of range [:{hi}] with length {len}"
+            "runtime error: slice bounds out of range [:{go_hi}] with length {go_len}"
         ));
     }
     if lo < 0 {
