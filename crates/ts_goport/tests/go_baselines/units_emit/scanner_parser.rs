@@ -275,6 +275,32 @@ fn test_text_of_js_doc_node_that_ends_inside_a_char() {
     );
 }
 
+// PORT: no Go counterpart. A missing `@typedef` name reports "Identifier
+// expected" on the char before the name (reparser.go:49), Go `pos-1`: one
+// Go byte back. The char before is the invalid byte FF, 1 Go byte and 7
+// port bytes (`scanner_util::GO_STRING_MARKER`), so the error starts at the
+// unit, not 1 port byte back inside it. Go N: (15, 16) in Go bytes. The
+// port's start inside the unit ended after its start, and `--pretty` then
+// panicked (a negative squiggle length).
+#[test]
+fn test_missing_typedef_name_error_starts_one_go_byte_back() {
+    let source_text = go_string_from_bytes(b"/** @typedef {\"\xFFyz".to_vec());
+    let opts = SourceFileParseOptions {
+        file_name: "/index.js".to_string(),
+        path: Path("/index.js".to_string()),
+        ..Default::default()
+    };
+    let file = parse_source_file(&opts, leak(&source_text), ScriptKind::JS);
+    let found: Vec<_> = file
+        .diagnostics
+        .iter()
+        .filter(|d| d.code() == 1003)
+        .map(|d| (d.pos(), d.end()))
+        .collect();
+    // The unit of FF is port bytes 15 to 22.
+    assert_eq!(found, [(15, 22)]);
+}
+
 // Go: parser/parser_test.go:292 TestJSDocTypeSourcePropagatesToConstructedReparse
 #[test]
 fn test_js_doc_type_source_propagates_to_constructed_reparse() {

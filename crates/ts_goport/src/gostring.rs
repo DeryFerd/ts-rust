@@ -831,6 +831,31 @@ pub fn port_byte_offset(text: &str, go_pos: i32) -> i32 {
     (port + (go_pos - go)) as i32
 }
 
+/// Go `pos-1` on the port offset `pos` of the port form `text`: the port
+/// offset of the Go byte before `pos`. Go steps back one byte, which can be
+/// inside the char before `pos`. A `pos` of 0 or less, or past the end,
+/// gives `pos - 1`.
+// PORT: a valid char has the same bytes in both forms, so only a marker
+// unit (see `GO_STRING_MARKER`) differs from `pos - 1`. Go offset `k` into
+// a unit of `g` Go bytes is port offset `at + k` (`port_byte_offset`), and
+// a `pos` `k` bytes into a unit is Go offset `min(k, g)` in it
+// (`go_byte_offset`).
+pub fn go_offset_before(text: &str, pos: i32) -> i32 {
+    let bytes = text.as_bytes();
+    if pos <= 0 || pos as usize > bytes.len() || bytes[pos as usize - 1] < 0x80 {
+        return pos - 1;
+    }
+    let p = pos as usize;
+    let (at, go_k) = match go_unit_cut_at(text, p) {
+        Some((at, unit, _)) => (at, (p - at).min(unit.go_len())),
+        None => {
+            let (unit, size) = go_unit_before(text, p);
+            (p - size, unit.go_len())
+        }
+    };
+    (at + go_k - 1) as i32
+}
+
 /// `go_byte_offset` and `port_byte_offset` for many offsets of one text,
 /// with one scan for markers. LSP code lenses and references convert one
 /// offset for each item; each call of the plain functions scans from the
