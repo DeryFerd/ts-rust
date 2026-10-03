@@ -95,7 +95,7 @@ use crate::leak_arena::LeakArena;
 use crate::prelude::*;
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// Slot 0: Go `nil` stored in a astdata field that has no `Option`.
@@ -463,7 +463,7 @@ impl SlotChildren {
 }
 
 /// AST node records (`ast-design/study.md`): the Go `NodeBase` fields and
-/// the hot binder fields of one slot in 32 bytes (`FileStore::records`).
+/// the hot binder fields of one slot in 24 bytes (`FileStore::records`).
 /// `NodeHeader` is the value form of its parse fields. The words are
 /// atomics that the reads load with `Relaxed` (a plain load on x86-64 and
 /// aarch64). The parse writes them through `get_mut`; the binder writes its
@@ -471,23 +471,27 @@ impl SlotChildren {
 ///
 /// - The Go `node.Kind` of the slot is not in its record but in the kind
 ///   column (`FileStore::kinds`, `FileBlock::kinds`).
-/// - `bits`: `SOURCE_FILE_ROOT`, `TEXT_IS_KEYWORD` and `NO_NODE`.
-/// - `flags`: Go `node.Flags`: the parser flags, and after the bind also
-///   the bits the binder added (`BINDER_ADDED_FLAGS` in node.rs).
+/// - `flags`: Go `node.Flags` below `RECORD_BITS`: the parser flags, and
+///   after the bind also the bits the binder added (`BINDER_ADDED_FLAGS` in
+///   node.rs). In `RECORD_BITS` (the top 3 bits, which no Go `NodeFlags`
+///   value uses): `SOURCE_FILE_ROOT`, `TEXT_IS_KEYWORD` and `NO_NODE`.
 /// - `loc`: Go `node.Loc`, pos in the low half and end in the high half.
 /// - `up` of a node slot: the parent code in the low half (`ParentCode`),
 ///   and the Go symbol (`SymbolId`) in the high half, 0 before the bind.
 ///   `up` of the nil slot or an alias slot: the whole target `Node`.
-/// - `bind`: the low half of the Go `FlowNodeData().FlowNode` (the flow
-///   node is in the same file; 0 is nil), and in the high half the index + 1
-///   of the other binder fields of the node in `FileNodeBind` (0 for none).
-///   AST node records, step 4: `bind` of the nil slot (slot 0) is the
-///   owner, the file id of the block (`block_is_owned`). The publish
-///   writes it; the bind never writes the nil slot.
+/// - `bind` without `BIND_EXTRA`: the low half of the Go
+///   `FlowNodeData().FlowNode` (the flow node is in the same file; 0 is
+///   nil). With `BIND_EXTRA`: the other bits are the index + 1 of the
+///   binder fields of the node in `FileNodeBind` (`NodeBindExtra`), which
+///   hold its flow node too. AST node records, step 4: `bind` of the nil
+///   slot (slot 0) is the owner, the file id of the block
+///   (`block_is_owned`). The publish writes it; the bind never writes the
+///   nil slot.
 ///
 /// Only the parse and the bind write a record. The bind writes after the
-/// publish, and changes only `flags` (it ORs in the bits it adds), the high
-/// half of `up` and `bind`. `header` reads each word once and takes only
+/// publish, and changes only `flags` (it ORs in the bits it adds, so the
+/// record bits stay), the high half of `up` and `bind`. `header` reads each
+/// word once and takes only
 /// the low half of `up` of a node slot (the bind never writes `up` of the
 /// nil slot or an alias slot), so it sees the parse fields and the flags
 /// from before or after the bind, never a mix of one word. The bind of a
@@ -504,17 +508,29 @@ impl SlotChildren {
 // `goport -p` +1.3% to +2.1% instructions against step 7, and a plain
 // `transmute` of the atomic load still +0.6% to +1.1%
 // (ast-design/step4b). The column adds 2 bytes per slot.
+// PERF: astmem1 P3. 24 bytes, not 32: the record bits are in the top of
+// `flags`, and the `bind` word is 32 bits. The extras index of the 60% of
+// node slots with no binder data took 4 bytes, and `bits` 4 bytes with its
+// padding. A slot with extras (locals containers, exported declarations,
+// function-like nodes: about 6% of slots) keeps its flow node in its
+// extras entry, so the flow read of every other node is one load, as before.
 #[repr(C)]
 #[derive(Debug)]
 pub struct NodeRecord {
-    bits: AtomicU8,
     flags: AtomicU32,
+    bind: AtomicU32,
     loc: AtomicU64,
     up: AtomicU64,
-    bind: AtomicU64,
 }
 
-const _: () = assert!(std::mem::size_of::<NodeRecord>() == 32);
+const _: () = assert!(std::mem::size_of::<NodeRecord>() == 24);
+
+/// The bit of a `NodeRecord::bind` word that holds an extras index
+/// (`NodeBindExtra`), not a flow node.
+pub const BIND_EXTRA: u32 = 1 << 31;
+
+// The owner word (`NodeRecord::owner_word`) is a file id.
+const _: () = assert!(FILE_ID_LIMIT <= 1 << 31);
 
 /// AST node records, step 2: the low half of `NodeRecord::up` of a node
 /// slot. 0 is a nil parent. `1..FOREIGN_PARENT` is a parent in the same
@@ -531,13 +547,16 @@ const FOREIGN_PARENT: ParentCode = 1 << 31;
 impl NodeRecord {
     /// Go `GetSourceFileOfNode(node)` is the root of the store
     /// (`mark_source_file_roots`).
-    const SOURCE_FILE_ROOT: u8 = 1;
+    const SOURCE_FILE_ROOT: u32 = 1 << 29;
     /// U1 (a): Go `scanner.GetIdentifierToken(node.Text()) !=
     /// KindIdentifier` of an Identifier or PrivateIdentifier slot.
-    const TEXT_IS_KEYWORD: u8 = 2;
+    const TEXT_IS_KEYWORD: u32 = 1 << 30;
     /// The slot holds no node: the nil slot or an alias slot. Its target is
     /// in `up`.
-    const NO_NODE: u8 = 4;
+    const NO_NODE: u32 = 1 << 31;
+    /// The record bits in the `flags` word. Go `NodeFlags` ends at bit 28
+    /// (`REPARSER_TRANSFORMED_LITERAL`); a flags write checks it.
+    const RECORD_BITS: u32 = Self::SOURCE_FILE_ROOT | Self::TEXT_IS_KEYWORD | Self::NO_NODE;
 
     /// The record of a new node slot: Go `newNode` (undefined loc, nil
     /// parent, no flags).
@@ -568,14 +587,26 @@ impl NodeRecord {
 
     /// A slot with word `up` (see `NodeRecord`) and no binder fields.
     #[inline]
-    fn new(bits: u8, flags: NodeFlags, loc: TextRange, up: u64) -> Self {
+    fn new(bits: u32, flags: NodeFlags, loc: TextRange, up: u64) -> Self {
+        debug_assert_eq!(bits & !Self::RECORD_BITS, 0);
         Self {
-            bits: AtomicU8::new(bits),
-            flags: AtomicU32::new(flags.0),
+            flags: AtomicU32::new(Self::checked_flags(flags) | bits),
+            bind: AtomicU32::new(0),
             loc: AtomicU64::new(Self::loc_word(loc)),
             up: AtomicU64::new(up),
-            bind: AtomicU64::new(0),
         }
+    }
+
+    /// `flags.0`, which must not use `RECORD_BITS`.
+    #[inline]
+    fn checked_flags(flags: NodeFlags) -> u32 {
+        assert_eq!(
+            flags.0 & Self::RECORD_BITS,
+            0,
+            "Go NodeFlags {:#x} in the node record bits",
+            flags.0
+        );
+        flags.0
     }
 
     #[inline]
@@ -586,21 +617,21 @@ impl NodeRecord {
     /// A record of a fresh pool block (`BlockPool`): all words 0.
     fn zero() -> Self {
         Self {
-            bits: AtomicU8::new(0),
             flags: AtomicU32::new(0),
+            bind: AtomicU32::new(0),
             loc: AtomicU64::new(0),
             up: AtomicU64::new(0),
-            bind: AtomicU64::new(0),
         }
     }
 
+    /// The record bits (`RECORD_BITS`).
     #[inline]
-    fn bits(&self) -> u8 {
-        self.bits.load(Ordering::Relaxed)
+    fn bits(&self) -> u32 {
+        self.flags.load(Ordering::Relaxed) & Self::RECORD_BITS
     }
 
     #[inline]
-    fn has_bit(&self, bit: u8) -> bool {
+    fn has_bit(&self, bit: u32) -> bool {
         self.bits() & bit != 0
     }
 
@@ -612,7 +643,7 @@ impl NodeRecord {
 
     #[inline]
     fn flags(&self) -> NodeFlags {
-        NodeFlags(self.flags.load(Ordering::Relaxed))
+        NodeFlags(self.flags.load(Ordering::Relaxed) & !Self::RECORD_BITS)
     }
 
     #[inline]
@@ -652,7 +683,8 @@ impl NodeRecord {
     /// parent of the nil slot or an alias slot is its target.
     #[inline]
     fn header(&self, kind: SyntaxKind, file: usize, foreign: &[Node]) -> NodeHeader {
-        let bits = self.bits();
+        let word = self.flags.load(Ordering::Relaxed);
+        let bits = word & Self::RECORD_BITS;
         let up = self.up.load(Ordering::Relaxed);
         let code = up as ParentCode;
         NodeHeader {
@@ -668,7 +700,7 @@ impl NodeRecord {
                 local_parent_of_code(code, file)
             },
             loc: self.loc(),
-            flags: self.flags(),
+            flags: NodeFlags(word & !Self::RECORD_BITS),
             kind,
             source_file_is_root: bits & Self::SOURCE_FILE_ROOT != 0,
             text_is_keyword: bits & Self::TEXT_IS_KEYWORD != 0,
@@ -684,7 +716,7 @@ impl NodeRecord {
 
     /// AST node records, step 2: the `bind` word (see `NodeRecord`).
     #[inline]
-    fn bind_word(&self) -> u64 {
+    fn bind_word(&self) -> u32 {
         self.bind.load(Ordering::Relaxed)
     }
 
@@ -695,11 +727,10 @@ impl NodeRecord {
     #[inline]
     fn store_from(&self, from: &NodeRecord) {
         let relaxed = Ordering::Relaxed;
-        self.bits.store(from.bits.load(relaxed), relaxed);
         self.flags.store(from.flags.load(relaxed), relaxed);
+        self.bind.store(from.bind.load(relaxed), relaxed);
         self.loc.store(from.loc.load(relaxed), relaxed);
         self.up.store(from.up.load(relaxed), relaxed);
-        self.bind.store(from.bind.load(relaxed), relaxed);
     }
 
     /// AST node records, step 4: the owner word of the nil slot of the
@@ -710,8 +741,9 @@ impl NodeRecord {
     // is all zero, but no read reaches it before `node_shell` writes its
     // owner.
     #[inline]
-    fn owner_word(file: usize) -> u64 {
-        file as u64
+    fn owner_word(file: usize) -> u32 {
+        // `FILE_ID_LIMIT` fits (see the assert after `BIND_EXTRA`).
+        file as u32
     }
 
     /// AST node records, step 4: true when this nil slot record is the one
@@ -733,27 +765,32 @@ impl NodeRecord {
         *self.loc.get_mut() = Self::loc_word(loc);
     }
 
+    /// Writes the Go flags and keeps the record bits.
     #[inline]
     fn set_flags(&mut self, flags: NodeFlags) {
-        *self.flags.get_mut() = flags.0;
+        let word = self.flags.get_mut();
+        *word = (*word & Self::RECORD_BITS) | Self::checked_flags(flags);
     }
 
     #[inline]
-    fn set_bit(&mut self, bit: u8, on: bool) {
-        let bits = self.bits.get_mut();
+    fn set_bit(&mut self, bit: u32, on: bool) {
+        debug_assert_eq!(bit & !Self::RECORD_BITS, 0);
+        let word = self.flags.get_mut();
         if on {
-            *bits |= bit;
+            *word |= bit;
         } else {
-            *bits &= !bit;
+            *word &= !bit;
         }
     }
 
     /// AST node records, step 2: writes the binder fields of a node slot of
     /// a published store (`bind_store_records`): the symbol into `up`, the
-    /// added flags into `flags`, and the `bind` word. The bind is the only
-    /// writer of a published record, and it writes each record once.
+    /// added flags into `flags` (the record bits stay), and the `bind` word.
+    /// The bind is the only writer of a published record, and it writes
+    /// each record once.
     #[inline]
-    fn write_bind(&self, symbol: SymbolId, added: NodeFlags, bind: u64) {
+    fn write_bind(&self, symbol: SymbolId, added: NodeFlags, bind: u32) {
+        debug_assert_eq!(added.0 & Self::RECORD_BITS, 0);
         if symbol.is_some() {
             let up = self.up.load(Ordering::Relaxed);
             self.up.store(
@@ -4221,7 +4258,7 @@ pub fn frozen_store_symbol(n: Node) -> Option<SymbolId> {
 /// bound.
 #[inline]
 #[must_use]
-pub fn frozen_store_bind_word(n: Node) -> Option<u64> {
+pub fn frozen_store_bind_word(n: Node) -> Option<u32> {
     frozen_owned_record(n).map(|r| {
         debug_assert!(r.is_node(), "store handle does not name a node slot");
         r.bind_word()
@@ -4235,7 +4272,7 @@ pub fn frozen_store_bind_word(n: Node) -> Option<u64> {
 /// `frozen_record`; panics as `check_block_owner`.
 #[inline]
 #[must_use]
-pub fn frozen_store_bind_and_file(n: Node) -> Option<(u64, Option<&'static GoFile>)> {
+pub fn frozen_store_bind_and_file(n: Node) -> Option<(u32, Option<&'static GoFile>)> {
     if n.is_nil() {
         return None;
     }
@@ -4266,11 +4303,12 @@ pub fn frozen_store_any_symbol(
 /// static file or the node shell of a freeable file version). `nodes` gives, in slot
 /// order, each node slot that has binder data or a flow node: its slot
 /// index, the index of its data entry, the data (`None` for a node with
-/// only a flow node) and the flow node (`binder::BoundNodes`). The symbol,
-/// the added flags and the flow node go into the record; the other fields
-/// go into the returned extras, and the record keeps their index + 1
-/// (`NodeRecord`, `bind`). Slots that share a data entry share one extras
-/// entry.
+/// only a flow node) and the flow node (`binder::BoundNodes`). The symbol
+/// and the added flags go into the record. A node with no other fields
+/// keeps its flow node in the record (`bind`); the other fields of any
+/// other node go into the returned extras with its flow node, and the
+/// record keeps their index + 1 with `BIND_EXTRA` (`NodeRecord`, `bind`).
+/// Slots that share a data entry and a flow node share one extras entry.
 // PORT: only this writes a published record (see `NodeRecord`). The
 // writes are `Relaxed` stores; the bind of a file ends before its binder
 // fields are read on another thread.
@@ -4287,8 +4325,12 @@ pub fn bind_store_records<'d>(
     let records: &'static [NodeRecord] = block.records;
     let flow_file = (file as u64) << 32;
     let mut extras: Vec<NodeBindExtra> = Vec::new();
-    // The last data entry, and its symbol, added flags and extras index + 1.
-    let mut last = (usize::MAX, SymbolId::NIL, NodeFlags::NONE, 0u32);
+    // The last data entry, and its symbol, added flags and extras (`None`
+    // for none).
+    let mut last = (usize::MAX, SymbolId::NIL, NodeFlags::NONE, None);
+    // The flow node and the `bind` word of the last extras entry of `last`
+    // (0 for none yet).
+    let mut last_extra = (FlowNodeId::NIL, 0u32);
     for (index, entry, data, flow) in nodes {
         // The bind never writes the nil slot: its `bind` is the owner word.
         assert_ne!(
@@ -4300,9 +4342,14 @@ pub fn bind_store_records<'d>(
             flow.is_nil() || flow.0 & !0xffff_ffff == flow_file,
             "flow node of slot {index} of file {file} is in another file"
         );
-        let flow = flow.0 & 0xffff_ffff;
+        let flow_word = flow.0 as u32;
+        assert_eq!(
+            flow_word & BIND_EXTRA,
+            0,
+            "too many flow nodes in file {file}"
+        );
         let Some(data) = data else {
-            record.write_bind(SymbolId::NIL, NodeFlags::NONE, flow);
+            record.write_bind(SymbolId::NIL, NodeFlags::NONE, flow_word);
             continue;
         };
         if last.0 != entry {
@@ -4314,22 +4361,31 @@ pub fn bind_store_records<'d>(
                     .bits()
             );
             let extra = NodeBindExtra::of(data);
-            let extra = if extra == NodeBindExtra::NONE {
-                0
-            } else {
-                extras.push(extra);
-                u32::try_from(extras.len()).expect("binder extras")
-            };
+            let extra = (extra != NodeBindExtra::NONE).then_some(extra);
             last = (entry, data.symbol, data.added_flags, extra);
+            last_extra = (FlowNodeId::NIL, 0);
         }
         let (_, symbol, added, extra) = last;
+        let bind = match extra {
+            None => flow_word,
+            Some(mut extra) => {
+                if last_extra.1 == 0 || last_extra.0 != flow {
+                    extra.flow_node = flow;
+                    extras.push(extra);
+                    let index = u32::try_from(extras.len()).expect("binder extras");
+                    assert_eq!(index & BIND_EXTRA, 0, "binder extras");
+                    last_extra = (flow, BIND_EXTRA | index);
+                }
+                last_extra.1
+            }
+        };
         // A symbol goes into `up`, which holds the target of a slot with
         // no node.
         assert!(
             symbol.is_nil() || record.is_node(),
             "binder data on slot {index} of file {file}, not a node"
         );
-        record.write_bind(symbol, added, flow | (u64::from(extra) << 32));
+        record.write_bind(symbol, added, bind);
     }
     extras
 }

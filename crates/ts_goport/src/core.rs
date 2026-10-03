@@ -2773,9 +2773,10 @@ pub struct NodeBindData {
 }
 
 /// AST node records, step 2: the binder fields of one node that are not in
-/// its `NodeRecord` (`ast/store.rs`, which holds the symbol, the flow node
-/// and the added flags). Most nodes have none of them: only locals
-/// containers, exported declarations and function-like nodes do.
+/// its `NodeRecord` (`ast/store.rs`, which holds the symbol, the added
+/// flags and, for a node with no entry here, the flow node). Most nodes
+/// have none of them: only locals containers, exported declarations and
+/// function-like nodes do.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NodeBindExtra {
     pub local_symbol: SymbolId,
@@ -2783,10 +2784,15 @@ pub struct NodeBindExtra {
     pub next_container: Node,
     pub end_flow_node: FlowNodeId,
     pub return_flow_node: FlowNodeId,
+    /// Go `FlowNodeData().FlowNode` of the node: astmem1 P3, its record
+    /// has the extras index in place of the flow node (`ast::BIND_EXTRA`).
+    /// The install sets it (`ast::bind_store_records`); `of` leaves it nil.
+    pub flow_node: FlowNodeId,
 }
 
 impl NodeBindExtra {
-    /// The fields of `data` that are not in the record.
+    /// The fields of `data` that are not in the record, with a nil flow
+    /// node.
     #[inline]
     #[must_use]
     pub fn of(data: &NodeBindData) -> Self {
@@ -2796,6 +2802,7 @@ impl NodeBindExtra {
             next_container: data.next_container,
             end_flow_node: data.end_flow_node,
             return_flow_node: data.return_flow_node,
+            flow_node: FlowNodeId::NIL,
         }
     }
 
@@ -2806,12 +2813,14 @@ impl NodeBindExtra {
         next_container: Node::NIL,
         end_flow_node: FlowNodeId::NIL,
         return_flow_node: FlowNodeId::NIL,
+        flow_node: FlowNodeId::NIL,
     };
 }
 
 /// AST node records, step 2: the binder fields of the nodes of one bound
 /// file that are not in their records (`NodeBindExtra`). The `bind` word of
-/// a record holds the index + 1 of its entry, or 0 (`FileNodeBind::extra`).
+/// a record holds the index + 1 of its entry with `ast::BIND_EXTRA`, or a
+/// flow node (`FileNodeBind::extra`).
 /// `BoundFile::install` makes it (`ast::bind_store_records`).
 #[derive(Debug, Default)]
 pub struct FileNodeBind {
@@ -2827,8 +2836,8 @@ impl FileNodeBind {
         }
     }
 
-    /// The extras entry whose index + 1 is `extra` (the high half of the
-    /// `bind` word of a record, not 0).
+    /// The extras entry whose index + 1 is `extra` (the `bind` word of a
+    /// record without `ast::BIND_EXTRA`, not 0).
     #[inline]
     #[must_use]
     pub fn extra(&self, extra: u32) -> &NodeBindExtra {

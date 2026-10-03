@@ -2602,19 +2602,17 @@ impl Node {
 
     /// Go `FlowNodeData().FlowNode`.
     // PERF: AST node records, step 2. The flow node of a published store
-    // node is in the low half of its `bind` word (the flow node is in the
-    // same file).
+    // node is its `bind` word, the low half of the id (the flow node is in
+    // the same file). astmem1 P3: a node with an extras entry
+    // (`BIND_EXTRA`) has it there.
     #[must_use]
     pub fn flow_node(self) -> FlowNodeId {
         match frozen_store_bind_word(self) {
-            Some(word) => {
-                let low = word & 0xffff_ffff;
-                if low == 0 {
-                    FlowNodeId::NIL
-                } else {
-                    FlowNodeId((self.0 & !0xffff_ffff) | low)
-                }
+            Some(0) => FlowNodeId::NIL,
+            Some(word) if word & BIND_EXTRA == 0 => {
+                FlowNodeId((self.0 & !0xffff_ffff) | u64::from(word))
             }
+            Some(_) => self.bind_extra(|e| e.flow_node),
             None => self.bind_miss().flow_node,
         }
     }
@@ -2640,13 +2638,14 @@ impl Node {
     #[inline]
     fn bind_extra<T>(self, field: impl FnOnce(&NodeBindExtra) -> T) -> T {
         match frozen_store_bind_and_file(self) {
-            Some((word, go_file)) => match (word >> 32) as u32 {
-                0 => field(&NodeBindExtra::NONE),
-                extra => match go_file {
+            Some((word, go_file)) if word & BIND_EXTRA != 0 => {
+                let extra = word & !BIND_EXTRA;
+                match go_file {
                     Some(go_file) => field(node_extra_in(go_file, extra)),
                     None => self.bind_extra_slow(extra, field),
-                },
-            },
+                }
+            }
+            Some(_) => field(&NodeBindExtra::NONE),
             None => field(&NodeBindExtra::of(&self.bind_miss())),
         }
     }
