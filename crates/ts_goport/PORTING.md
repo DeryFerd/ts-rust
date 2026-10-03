@@ -1060,6 +1060,15 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   whose resolver reads that load's host. When that load host has no live
   program, the load's resolver caches go too
   (`NewProgram::release_resolver_caches`).
+- When the release frees memory (not in Go: the GC frees it in the
+  background): on the dispatch thread the program tables and the frontend
+  program wait for `gostd::local::drop_garbage` after the answer. The
+  checkers of a released pool and the version's synthetic chunks wait in
+  the same way only when the client paused 20 ms or more before the
+  message (`gostd::local::drop_after_pause`). In a stream of messages they
+  are freed at once, because the next check then reuses their memory
+  (freecheck1). A synthetic entry leaves its table at the release in both
+  cases, so a read of it panics at once. Other threads free at once.
 - Parse workers (`CompilerHost::prefetch_parses`, not in Go) run only for
   the first program load of a project. A later load gets its files from
   the parse cache.

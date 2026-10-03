@@ -79,7 +79,10 @@
 //! Large frees (`gostd::local::drop_later`: a released program, the parse
 //! tasks of a load) wait until the message is done, and then run only
 //! while no message waits. Go's garbage collector does them in the
-//! background.
+//! background. The checkers and synthetic nodes of a released program wait
+//! in the same way only when the client paused before the message
+//! (`gostd::local::drop_after_pause`); in a stream of messages they are
+//! freed at once, so that the next check reuses their memory.
 //!
 //! Cancellation is Go's: `$/cancelRequest` reaches only a request that the
 //! dispatch loop took (`pending_client_requests`); a cancel for a queued
@@ -518,7 +521,7 @@ pub struct Server {
     // runs the dispatch loop with them (`ApiConnProtocol`).
     pub dispatch_ctx: RefCell<Option<(Context, CancelCauseFunc)>>,
     // PORT: when the dispatch loop last finished a message (see
-    // `IDLE_QUIET_PERIOD`).
+    // `IDLE_QUIET_PERIOD` and `gostd::local::note_message_gap`).
     pub free_since: Cell<Instant>,
     // PORT: Go `progressDelay` and `projectProgress` are in `ServerShared`,
     // `startWatchdog` is `ServerShared::start_watchdog`.
@@ -2064,6 +2067,9 @@ impl Server {
         }
 
         let item = self.shared.request_queue.get(ctx)?;
+        if matches!(item, QueuedRequest::Request(_)) {
+            gostd::local::note_message_gap(self.free_since.get().elapsed());
+        }
         self.shared.queued_requests.fetch_sub(1, Ordering::SeqCst);
         let req = match item {
             QueuedRequest::Request(req) => Rc::new(req),

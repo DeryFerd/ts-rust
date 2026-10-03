@@ -789,8 +789,12 @@ pub fn open_synthetic_owner(id: u32) {
 /// Frees the synthetic entries of program version `id` on this thread.
 /// Their handles must not be read again: a read panics. It does nothing
 /// when `id` is not an owner. A read that holds a node (`with_ast_data`)
-/// keeps the data chunk of that node until the read ends.
+/// keeps the data chunk of that node until the read ends. The chunks leave
+/// the tables now; after a client pause their memory is freed after the
+/// answer (`gostd::local::drop_after_pause`).
 // Not in Go: the GC frees the nodes that nothing reaches.
+// PERF (freecheck1): hono frees 30 MiB (4.1 ms) here on each edit once the
+// lsMix declaration of the long ls_edit_bench plan grows the Hono class type.
 pub fn free_synthetic_owner(id: u32) {
     let freed = ARENA.with(|a| {
         let mut a = a.borrow_mut();
@@ -813,7 +817,9 @@ pub fn free_synthetic_owner(id: u32) {
             .collect();
         Some((slots, datas, lists))
     });
-    drop(freed);
+    if let Some(freed) = freed {
+        crate::gostd::local::drop_after_pause(Box::new(freed));
+    }
 }
 
 /// New synthetic entries of this thread belong to the thread (the base
@@ -2392,6 +2398,45 @@ mod tests {
             })
             .join()
             .expect("seed thread panicked");
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    // After a client pause the free of an owner takes its entries out of the
+    // tables at once (a read panics), but its chunks wait for
+    // `drop_garbage` (`gostd::local::drop_after_pause`).
+    #[test]
+    fn owner_chunks_wait_for_drop_garbage_after_a_client_pause() {
+        use crate::gostd::local;
+        std::thread::spawn(|| {
+            let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
+                id: next_program_id(),
+                options: Box::leak(Box::default()),
+                state: std::sync::OnceLock::new(),
+            }));
+            local::keep_garbage();
+            local::note_message_gap(std::time::Duration::from_millis(20));
+            let f = NodeFactory::new();
+            let base = f.new_identifier("base");
+            let base_slots = synthetic_live_slot_count();
+
+            open_synthetic_owner(program.id);
+            let owned = {
+                let _program = enter_program(Some(program));
+                f.new_identifier("owned")
+            };
+            free_synthetic_owner(program.id);
+
+            assert_eq!(synthetic_live_slot_count(), base_slots);
+            let freed = std::panic::catch_unwind(|| owned.kind())
+                .expect_err("a node of a freed owner is read");
+            assert_eq!(panic_message(&*freed), Some(FREED));
+            assert_eq!(base.text(), "base");
+            assert_eq!(local::garbage_len(), 1, "the chunks do not wait");
+            local::drop_garbage(|| false);
+            assert_eq!(local::garbage_len(), 0);
             free_synthetic_nodes();
         })
         .join()

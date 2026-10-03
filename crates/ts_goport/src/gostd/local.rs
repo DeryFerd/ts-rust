@@ -33,7 +33,9 @@
 //! parse tasks of a load). On a thread whose dispatch loop called
 //! `keep_garbage`, the values wait until the loop calls `drop_garbage`
 //! after a message, so the free is not in the answer time. On other
-//! threads `drop_later` drops at once.
+//! threads `drop_later` drops at once. `drop_after_pause` uses this queue
+//! only when the client paused before the current burst of messages
+//! (`note_message_gap`), and drops at once otherwise.
 //!
 //! The queues are per thread: `go`, `post_later`, `go_idle`, `after_func`,
 //! `run_pending`, `run_idle`, `drop_later` and `drop_garbage` act on the
@@ -150,6 +152,9 @@ struct LocalState {
     idle: RefCell<VecDeque<Box<dyn FnOnce()>>>,
     /// Values from `drop_later`, oldest first. None until `keep_garbage`.
     garbage: RefCell<Option<VecDeque<Box<dyn Any>>>>,
+    /// Whether the client paused before the current burst of messages
+    /// (`note_message_gap`).
+    paused: Cell<bool>,
 }
 
 impl Drop for LocalState {
@@ -175,6 +180,7 @@ thread_local! {
         timers: RefCell::new(FxHashMap::default()),
         idle: RefCell::new(VecDeque::new()),
         garbage: RefCell::new(None),
+        paused: Cell::new(false),
     };
 }
 
@@ -288,6 +294,50 @@ pub fn drop_later(value: Box<dyn Any>) {
         None => Some(value),
     });
     drop(value);
+}
+
+/// A gap between two messages that is this long or longer starts a new
+/// burst of messages. Shorter gaps are one burst (a client that sends a
+/// didChange and its requests together).
+const BURST_GAP: Duration = Duration::from_millis(1);
+
+/// A gap before a burst that is this long or longer is a client pause
+/// (`drop_after_pause`). It is longer than every gap of a client that sends
+/// its messages with no pause (0.6 to 9 ms in ls_edit_bench) and shorter
+/// than the gaps of a person who types.
+const CLIENT_PAUSE: Duration = Duration::from_millis(20);
+
+/// The dispatch loop calls it when it takes a message: `gap` is the time
+/// since it finished the last message. A gap of `BURST_GAP` or more starts
+/// a new burst, which is paused when the gap is `CLIENT_PAUSE` or more.
+pub fn note_message_gap(gap: Duration) {
+    if gap >= BURST_GAP {
+        LOCAL.with(|l| l.paused.set(gap >= CLIENT_PAUSE));
+    }
+}
+
+/// `drop_later(value)` when the client paused before the current burst of
+/// messages (`note_message_gap`), else drops `value` now. No Go
+/// counterpart: Go's garbage collector frees old data in the background.
+// PERF (freecheck1): use it for a large free on the answer path that the
+// next check would otherwise reuse (the checkers of a released program).
+// In a burst, a free now is cheap (hot memory) and the next check reuses
+// its memory from the thread cache; a free after the answer made those
+// runs slower (+1% to +6%) and kept more memory. After a pause, the free
+// is cold (hono 6.5 ms, 12.7% of the edit) and the client waits for it, so
+// it goes after the answer.
+pub fn drop_after_pause(value: Box<dyn Any>) {
+    if LOCAL.with(|l| l.paused.get()) {
+        drop_later(value);
+    } else {
+        drop(value);
+    }
+}
+
+/// The number of values that wait for `drop_garbage` on this thread (for
+/// tests).
+pub fn garbage_len() -> usize {
+    LOCAL.with(|l| l.garbage.borrow().as_ref().map_or(0, VecDeque::len))
 }
 
 /// Drops the values of `drop_later`, oldest first, until none is left or
@@ -590,5 +640,31 @@ mod tests {
         })
         .join()
         .expect("timer test thread");
+    }
+
+    // A value waits for `drop_garbage` only in a burst that comes after a
+    // client pause. A short gap continues the burst before it.
+    #[test]
+    fn drop_after_pause_waits_only_after_a_client_pause() {
+        std::thread::spawn(|| {
+            keep_garbage();
+            let kept = |gap_ms: u64| {
+                note_message_gap(Duration::from_millis(gap_ms));
+                let value = Rc::new(());
+                drop_after_pause(Box::new(value.clone()));
+                let kept = Rc::strong_count(&value) == 2;
+                drop_garbage(|| false);
+                assert_eq!(Rc::strong_count(&value), 1, "drop_garbage keeps the value");
+                kept
+            };
+            assert!(!kept(0), "no pause before the first message");
+            assert!(kept(20), "a pause of 20 ms");
+            assert!(kept(0), "the burst after the pause goes on");
+            assert!(!kept(5), "a new burst with no pause");
+            assert!(!kept(0), "the burst with no pause goes on");
+            assert!(kept(500), "a pause of 500 ms");
+        })
+        .join()
+        .expect("drop_after_pause test thread");
     }
 }
