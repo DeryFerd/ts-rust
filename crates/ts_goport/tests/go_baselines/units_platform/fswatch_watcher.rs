@@ -2503,3 +2503,8 @@ fn test_linux_fanotify_unsupported_tag_survives_dir_watch_error() {
     );
     t.finish();
 }
+
+// Go: fsevents_darwin_{shared,nfd}_test.go share this Go package.
+#[cfg(target_os = "macos")]
+#[path = "fswatch_fsevents_darwin.rs"]
+mod fsevents_darwin;

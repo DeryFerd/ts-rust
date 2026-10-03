@@ -62,8 +62,12 @@ const COMMAND_CHILD_ENV: &str = "TSCTEST_COMMAND_CHILD";
 const IN_CHILD_ENV: &str = "TSCTEST_IN_CHILD";
 const TMP_ENV: &str = "TSCTEST_TMP";
 const KEEP_FILES_ENV: &str = "TSCTEST_KEEP_CHILD_FILES";
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_TMP: &str =
     "/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/go-baseline-tests/tmp";
+/// macOS: `/home` is an autofs mount there, so the default is under /tmp.
+#[cfg(target_os = "macos")]
+const DEFAULT_TMP: &str = "/tmp/ts-rust-go-baseline-tests/tmp";
 
 /// The stack of the compile thread in a child. The checker recurses
 /// deeply, and the bins use the same size.
