@@ -24,15 +24,15 @@
 //! run also when the caller blocked them (`GO_UNBLOCKED`).
 #![cfg(target_os = "linux")]
 
-use std::io::{Read, Seek};
-use std::os::fd::{AsFd, AsRawFd};
+use std::io::{Read, Seek, Write};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use rustix::process::Signal;
+use rustix::process::{Pid, Signal};
 
 /// What a tsgo run gives.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -178,15 +178,16 @@ fn a_tsgo_with_the_proc_of_another_pid_namespace() {
 
 /// tsgo as the pid 1 of a PID namespace (`unshare -pf --mount-proc`, as
 /// `docker run` without `--init`): the kernel drops each signal with the
-/// default action that such a process gets or sends itself. As in Go N,
-/// SIGHUP ends the run with exit 129 (Go `dieFromSignal`: 128 + N): sent
-/// to tsgo with and without a worker, and sent to the worker, which the
-/// signal ends. A launcher that raised the worker's signal again in a pid 1
-/// went on to `abort`, which ends a pid 1 by SIGSEGV. And a launcher whose
-/// caller ignores SIGCHLD takes the exit code from the worker's exit in a
-/// PID namespace with the /proc of another one (`own_proc`), as Go gives
-/// it. Where `unshare -U`, `env --default-signal` or `env --ignore-signal`
-/// cannot run, the test says so and passes.
+/// default action that such a process gets or sends itself. SIGHUP ends
+/// the run with exit 129, as Go at pin N does (Go `dieFromSignal`: 128 plus
+/// the signal number): sent to tsgo with and without a worker, and sent to
+/// the worker, which the signal ends. A launcher that raised the worker's
+/// signal again in a pid 1 went on to `abort`, which ends a pid 1 by
+/// SIGSEGV. And a launcher whose caller ignores SIGCHLD takes the exit code
+/// from the worker's exit in a PID namespace with the /proc of another one
+/// (`own_proc`), as Go gives it. Where `unshare -U`, `env
+/// --default-signal` or `env --ignore-signal` cannot run, the test says so
+/// and passes.
 #[test]
 fn a_tsgo_that_is_pid_1_of_a_pid_namespace() {
     if !unshare_runs(&DEFAULT_HUP) {
@@ -310,7 +311,7 @@ fn a_tsgo_whose_caller_blocks_signals() {
             let (status, stderr, ended) = signal_run(command, launch, &[(depth, signal)], &case);
             if signal == Signal::QUIT {
                 assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-                assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+                assert!(quit_once(&stderr), "{case}: {stderr}");
             } else {
                 assert_eq!(status.signal(), Some(1), "{case}: {status} {stderr}");
             }
@@ -377,8 +378,43 @@ fn a_tsgo_whose_caller_ignores_sighup() {
         command.args(["--ignore-signal=HUP", env!("CARGO_BIN_EXE_tsgo")]);
         let (status, stderr, _) = signal_run(command, launch, signals, &case);
         assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-        assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+        assert!(quit_once(&stderr), "{case}: {stderr}");
     }
+}
+
+/// A launcher whose worker cannot start runs the work itself (bin/tsgo.rs
+/// `launch`), as a run that never was a launcher: a plain compile goes on
+/// after SIGINT and SIGTERM, and SIGQUIT ends it with Go's text and exit 2.
+/// The test runs tsgo from a memfd, whose path (`/memfd:tsgo (deleted)`)
+/// cannot start a worker, and where the exec of `set_malloc_tunables` fails
+/// too: the run then ended by SIGPIPE at the second signal (that exec gave
+/// SIGPIPE its default action). Where a memfd cannot run, the test says so
+/// and passes.
+#[test]
+fn a_launcher_whose_worker_cannot_start() {
+    let memfd = rustix::fs::memfd_create("tsgo", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+    let mut file = std::fs::File::from(memfd);
+    let mut bin = std::fs::File::open(env!("CARGO_BIN_EXE_tsgo")).unwrap();
+    std::io::copy(&mut bin, &mut file).unwrap();
+    // The started process's own copy of the memfd, which it closes at exec.
+    let tsgo = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let probe = Command::new(&tsgo)
+        .arg("--version")
+        .env("GOPORT_LAUNCH", "0")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: tsgo cannot run from a memfd here");
+        return;
+    }
+    let case = "no worker";
+    let signals = [(0, Signal::INT), (0, Signal::TERM), (0, Signal::QUIT)];
+    let (status, stderr, _) = signal_run_with(Command::new(&tsgo), "1", &signals, case, |pid| {
+        assert_eq!(child_of(pid), None, "{case}: a worker started");
+    });
+    assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+    assert!(quit_once(&stderr), "{case}: {stderr}");
 }
 
 /// Starts `command` with `--all` and `GOPORT_LAUNCH=1`, sends SIGQUIT to
@@ -388,7 +424,7 @@ fn a_tsgo_whose_caller_ignores_sighup() {
 fn quit_launcher(command: Command, depth: usize, case: &str) {
     let (status, stderr, ended) = signal_run(command, "1", &[(depth, Signal::QUIT)], case);
     assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
-    assert!(stderr.starts_with("SIGQUIT: quit"), "{case}: {stderr}");
+    assert!(quit_once(&stderr), "{case}: {stderr}");
     assert!(
         ended < Duration::from_secs(1),
         "{case}: ended {ended:?} after SIGQUIT"
@@ -397,23 +433,32 @@ fn quit_launcher(command: Command, depth: usize, case: &str) {
 
 /// Starts `command` with `--all` and `GOPORT_LAUNCH=launch`, sends each
 /// signal of `signals` to the started process's descendant `depth` levels
-/// down once tsgo has written some output, 300 ms apart, and returns how
+/// down (or to its process group: `GROUP`, for a command that starts in a
+/// group of its own) once tsgo has written some output, 300 ms apart, and returns how
 /// the run ended, its stderr and the time from the last signal to the end.
-/// The output is more than the stdout pipe holds and the test does not
-/// read it, so tsgo cannot end before the first signal comes, and its
-/// handlers are set before it writes. A run that ends before the last
-/// signal, or has not ended 60 s after it, fails the test.
+/// The output is more than the stdout pipe holds (`small_pipe`) and the
+/// test does not read it, so tsgo cannot end before the first signal
+/// comes, and its handlers are set before it writes. A run that ends
+/// before the last signal, or has not ended 60 s after it, fails the test.
 fn signal_run(
-    mut command: Command,
+    command: Command,
     launch: &str,
     signals: &[(usize, Signal)],
     case: &str,
 ) -> (ExitStatus, String, Duration) {
-    const LIMIT: Duration = Duration::from_secs(60);
-    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
-    let size = rustix::pipe::fcntl_setpipe_size(&write, 4096).unwrap();
-    // `--all` writes about 19 KB.
-    assert!(size <= 8192, "{case}: the pipe holds {size} bytes");
+    signal_run_with(command, launch, signals, case, |_| {})
+}
+
+/// `signal_run`, which calls `check` with the started process's pid once
+/// tsgo has written some output, before the first signal.
+fn signal_run_with(
+    mut command: Command,
+    launch: &str,
+    signals: &[(usize, Signal)],
+    case: &str,
+    check: impl FnOnce(u32),
+) -> (ExitStatus, String, Duration) {
+    let (read, write, filled) = small_pipe();
     let mut child = command
         .arg("--all")
         .env("GOPORT_LAUNCH", launch)
@@ -424,7 +469,7 @@ fn signal_run(
     // Closes the test's copy of the write end.
     drop(command);
     let start = Instant::now();
-    while rustix::io::ioctl_fionread(&read).unwrap() == 0 {
+    while rustix::io::ioctl_fionread(&read).unwrap() == filled {
         assert!(
             child.try_wait().unwrap().is_none(),
             "{case}: ended before output"
@@ -432,6 +477,7 @@ fn signal_run(
         assert!(start.elapsed() < LIMIT, "{case}: no output in {LIMIT:?}");
         std::thread::sleep(Duration::from_millis(5));
     }
+    check(child.id());
     for (i, &(depth, signal)) in signals.iter().enumerate() {
         if i > 0 {
             std::thread::sleep(Duration::from_millis(300));
@@ -440,6 +486,11 @@ fn signal_run(
             child.try_wait().unwrap().is_none(),
             "{case}: ended before {signal:?}"
         );
+        if depth == GROUP {
+            let group = Pid::from_raw(child.id().cast_signed()).unwrap();
+            rustix::process::kill_process_group(group, signal).unwrap();
+            continue;
+        }
         let mut target = child.id();
         for _ in 0..depth {
             target = child_of(target).unwrap_or_else(|| panic!("{case}: no process to signal"));
@@ -448,18 +499,36 @@ fn signal_run(
         rustix::process::kill_process(pid, signal).unwrap();
     }
     let sent = Instant::now();
+    let (status, stderr) = end_of(child, case);
+    (status, stderr, sent.elapsed())
+}
+
+/// Whether `stderr` starts with Go's text for SIGQUIT and has it once: a
+/// launcher prints nothing of its own, and its worker prints it once.
+fn quit_once(stderr: &str) -> bool {
+    stderr.starts_with("SIGQUIT: quit")
+        && stderr
+            .lines()
+            .filter(|line| *line == "SIGQUIT: quit")
+            .count()
+            == 1
+}
+
+/// How the run `child` ended and its stderr. A run that has not ended
+/// after `LIMIT` fails the test.
+fn end_of(mut child: Child, case: &str) -> (ExitStatus, String) {
+    let start = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        if sent.elapsed() > LIMIT {
+        if start.elapsed() > LIMIT {
             let _ = child.kill();
             let _ = child.wait();
             panic!("{case}: the run did not end in {LIMIT:?} after the signal");
         }
         std::thread::sleep(Duration::from_millis(5));
     };
-    let ended = sent.elapsed();
     let mut stderr = String::new();
     child
         .stderr
@@ -467,7 +536,27 @@ fn signal_run(
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
-    (status, stderr, ended)
+    (status, stderr)
+}
+
+/// How long a test waits for output or for the end of a run.
+const LIMIT: Duration = Duration::from_secs(60);
+
+/// The `depth` of `signal_run` that sends a signal to the process group of
+/// the started process.
+const GROUP: usize = usize::MAX;
+
+/// A pipe whose write end takes 4 KiB more and then waits, with any page
+/// size, and the bytes it holds already. `--all` writes about 19 KB. The
+/// smallest pipe is one page (4 KiB, or 64 KiB on some hosts), so the test
+/// fills all of it but 4 KiB.
+fn small_pipe() -> (OwnedFd, OwnedFd, u64) {
+    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).unwrap();
+    let size = rustix::pipe::fcntl_setpipe_size(&write, 4096).unwrap();
+    let filled = size.saturating_sub(4096);
+    let fill = std::fs::File::from(write.try_clone().unwrap());
+    (&fill).write_all(&vec![b'\n'; filled]).unwrap();
+    (read, write, filled as u64)
 }
 
 /// `env` with the default action of SIGHUP, also when the test runs under
@@ -491,8 +580,25 @@ fn unshare_runs(wrap: &[&str]) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// The pid of a child of `pid`, from /proc.
+/// The pid of a child of `pid`: from the `children` file of each of its
+/// threads in /proc, or, on a kernel without those files, from the parent
+/// of each process.
 fn child_of(pid: u32) -> Option<u32> {
+    let mut listed = false;
+    for task in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .ok()?
+        .flatten()
+    {
+        if let Ok(children) = std::fs::read_to_string(task.path().join("children")) {
+            listed = true;
+            if let Some(child) = children.split_whitespace().next() {
+                return child.parse().ok();
+            }
+        }
+    }
+    if listed {
+        return None;
+    }
     std::fs::read_dir("/proc")
         .ok()?
         .flatten()
@@ -562,7 +668,6 @@ impl Drop for TempDir {
 /// and stdout. A tsgo that has not ended after `LIMIT` fails the test: a
 /// worker whose open of the pipe waits for a reader never ends.
 fn run(name: &str, args: &[&str], launch: &str, case: &str) -> (ExitStatus, String) {
-    const LIMIT: Duration = Duration::from_secs(60);
     let mut child = Command::new(env!("CARGO_BIN_EXE_tsgo"))
         .arg0(name)
         .args(args)
