@@ -633,11 +633,7 @@ impl Checker {
             compare_types,
             mapper: MapperId::NIL,
             non_fixing_mapper: MapperId::NIL,
-            return_mapper: MapperId::NIL,
-            outer_return_mapper: MapperId::NIL,
-            inferred_type_parameters: Vec::new(),
-            inferred_type_parameters_origin: 0,
-            intra_expression_inference_sites: Vec::new(),
+            rare: None,
         });
         let mapper = self.new_inference_type_mapper(n, true /*fixing*/);
         self.inference_context_mut(n).mapper = mapper;
@@ -654,6 +650,7 @@ impl Checker {
         t: TypeId,
     ) {
         self.inference_context_mut(n)
+            .rare_mut()
             .intra_expression_inference_sites
             .push(IntraExpressionInferenceSite { node, t });
     }
@@ -677,8 +674,8 @@ impl Checker {
         // keeps that behavior when inference appends new sites.
         let sites = self
             .inference_context(n)
-            .intra_expression_inference_sites
-            .clone();
+            .intra_expression_inference_sites()
+            .to_vec();
         for site in sites {
             let contextual_type = if is_method_declaration(site.node) {
                 self.get_contextual_type_for_object_literal_method(
@@ -692,8 +689,9 @@ impl Checker {
                 self.infer_types(n, site.t, contextual_type, InferencePriority::NONE, false);
             }
         }
-        self.inference_context_mut(n)
-            .intra_expression_inference_sites = Vec::new();
+        if let Some(rare) = &mut self.inference_context_mut(n).rare {
+            rare.intra_expression_inference_sites = Vec::new();
+        }
     }
 
     // Go: checker/inference.go:1317 getInferredType
@@ -939,16 +937,22 @@ impl Checker {
     // to their inferences at the time of creation.
     // Go: checker/inference.go:1423 createOuterReturnMapper
     pub fn create_outer_return_mapper(&mut self, context: InferenceContextId) -> MapperId {
-        if self.inference_context(context).outer_return_mapper.is_nil() {
+        if self
+            .inference_context(context)
+            .outer_return_mapper()
+            .is_nil()
+        {
             let cloned = self.clone_inference_context(context, InferenceFlags::NONE);
             let mut mapper = self.inference_context(cloned).mapper;
-            let return_mapper = self.inference_context(context).return_mapper;
+            let return_mapper = self.inference_context(context).return_mapper();
             if return_mapper.is_some() {
                 mapper = self.new_merged_type_mapper(return_mapper, mapper);
             }
-            self.inference_context_mut(context).outer_return_mapper = mapper;
+            self.inference_context_mut(context)
+                .rare_mut()
+                .outer_return_mapper = mapper;
         }
-        self.inference_context(context).outer_return_mapper
+        self.inference_context(context).outer_return_mapper()
     }
 
     // Go: checker/inference.go:1434 getCovariantInference

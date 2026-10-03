@@ -295,6 +295,11 @@ pub struct FlowLoopInfo {
 // InferenceContext
 
 // Go: checker/checker.go:276 InferenceContext
+// PERF (infermem1): 64 bytes (asserted below). The port keeps every context
+// of a run (typebox: about 3.9M, almost all from conditional types with
+// `infer`), so the fields that those contexts never set are in `rare`, a box
+// that is made on the first write. The accessors give Go's zero values while
+// it is absent.
 #[derive(Clone)]
 pub struct InferenceContext {
     /// Inferences made for each type parameter
@@ -309,6 +314,15 @@ pub struct InferenceContext {
     pub mapper: MapperId,
     /// Mapper that doesn't fix inferences
     pub non_fixing_mapper: MapperId,
+    /// The other Go fields, or `None` while all of them are Go zero values.
+    pub rare: Option<Box<InferenceContextRare>>,
+}
+
+const _: () = assert!(std::mem::size_of::<InferenceContext>() == 64);
+
+/// The fields of Go `InferenceContext` that only signature inference sets.
+#[derive(Clone, Default)]
+pub struct InferenceContextRare {
     /// Type mapper for inferences from return types (if any)
     pub return_mapper: MapperId,
     /// Type mapper for inferences from return types of outer function (if any)
@@ -319,6 +333,53 @@ pub struct InferenceContext {
     // `Signature::type_parameters_origin`); 0 while the list is empty.
     pub inferred_type_parameters_origin: u32,
     pub intra_expression_inference_sites: Vec<IntraExpressionInferenceSite>,
+}
+
+impl InferenceContext {
+    /// Go `n.returnMapper`.
+    #[must_use]
+    pub fn return_mapper(&self) -> MapperId {
+        self.rare
+            .as_ref()
+            .map_or(MapperId::NIL, |r| r.return_mapper)
+    }
+
+    /// Go `n.outerReturnMapper`.
+    #[must_use]
+    pub fn outer_return_mapper(&self) -> MapperId {
+        self.rare
+            .as_ref()
+            .map_or(MapperId::NIL, |r| r.outer_return_mapper)
+    }
+
+    /// Go `n.inferredTypeParameters`.
+    #[must_use]
+    pub fn inferred_type_parameters(&self) -> &[TypeId] {
+        self.rare
+            .as_ref()
+            .map_or(&[], |r| &r.inferred_type_parameters)
+    }
+
+    /// The slice identity of `inferred_type_parameters` (0 while empty).
+    #[must_use]
+    pub fn inferred_type_parameters_origin(&self) -> u32 {
+        self.rare
+            .as_ref()
+            .map_or(0, |r| r.inferred_type_parameters_origin)
+    }
+
+    /// Go `n.intraExpressionInferenceSites`.
+    #[must_use]
+    pub fn intra_expression_inference_sites(&self) -> &[IntraExpressionInferenceSite] {
+        self.rare
+            .as_ref()
+            .map_or(&[], |r| &r.intra_expression_inference_sites)
+    }
+
+    /// The rare fields for a write. Makes the box on the first write.
+    pub fn rare_mut(&mut self) -> &mut InferenceContextRare {
+        self.rare.get_or_insert_default()
+    }
 }
 
 // PORT: `Default` exists only for the dummy entry at index 0 of
@@ -333,11 +394,7 @@ impl Default for InferenceContext {
             compare_types: nil_type_comparer(),
             mapper: MapperId::NIL,
             non_fixing_mapper: MapperId::NIL,
-            return_mapper: MapperId::NIL,
-            outer_return_mapper: MapperId::NIL,
-            inferred_type_parameters: Vec::new(),
-            inferred_type_parameters_origin: 0,
-            intra_expression_inference_sites: Vec::new(),
+            rare: None,
         }
     }
 }
@@ -1053,7 +1110,10 @@ pub struct Checker {
     pub index_infos: Vec<IndexInfo>,
     pub type_predicates: Vec<TypePredicate>,
     pub mappers: ChunkedArena<TypeMapper>,
-    pub inference_contexts: Vec<InferenceContext>,
+    // PERF (infermem1): a `ChunkedArena`, not a `Vec`: a doubling `Vec` kept
+    // up to half its room unused and copied every context when it grew
+    // (typebox: buffers of 512 and 256 MiB).
+    pub inference_contexts: ChunkedArena<InferenceContext>,
 
     /// Go `tracer *Tracer` (checker.go:897): optional tracer for trace
     /// events and type recording (for --generateTrace). None is Go nil.
@@ -1512,7 +1572,7 @@ impl Checker {
             index_infos: vec![IndexInfo::default()],
             type_predicates: vec![TypePredicate::default()],
             mappers: ChunkedArena::with_nil(TypeMapper::default()),
-            inference_contexts: vec![InferenceContext::default()],
+            inference_contexts: ChunkedArena::with_nil(InferenceContext::default()),
             // Go: compiler/checkerpool.go:104 makes the tracer when the pool
             // has a tracing session; NewChecker stores it (checker.go:905).
             tracer: crate::tracing::new_checker_tracer(checker_index),
