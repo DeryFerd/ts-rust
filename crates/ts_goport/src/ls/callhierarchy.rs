@@ -438,7 +438,7 @@ pub fn find_all_initial_declarations(c: &mut Checker, node: Node) -> Vec<Node> {
     }
     let symbol_declarations: Vec<Node> = c.sym(symbol).declarations.to_vec();
 
-    // Go: callhierarchy.go:345 declKey
+    // Go: callhierarchy.go:347 declKey
     struct DeclKey {
         file: &'static str,
         pos: i32,

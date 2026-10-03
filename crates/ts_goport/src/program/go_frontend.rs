@@ -477,7 +477,7 @@ fn load_config(
         config_abs = tspath::combine_paths(&config_abs, &["tsconfig.json"]);
     }
 
-    // Go: tsc.go:213 GetParsedCommandLineOfConfigFile with the command line
+    // Go: tsc.go:214 GetParsedCommandLineOfConfigFile with the command line
     // options. PORT: the command line raw map only marks explicit nulls,
     // and the command line here has none, so it is nil.
     let mut command_line_options = CompilerOptions::default();

@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime};
 /// Go `func() time.Time`, the `nestedEmitNow` of `NewProgram` (`sys.Now`).
 pub type NestedEmitNow = Rc<dyn Fn() -> SystemTime>;
 
-// Go: incremental/program.go:20 SignatureUpdateKind
+// Go: incremental/program.go:23 SignatureUpdateKind
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum SignatureUpdateKind {
@@ -547,7 +547,7 @@ impl Program {
         result.diagnostics
     }
 
-    // Go: incremental/program.go:196 GetSuggestionDiagnostics
+    // Go: incremental/program.go:237 GetSuggestionDiagnostics
     // GetSuggestionDiagnostics implements compiler.AnyProgram interface.
     #[must_use]
     pub fn get_suggestion_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
@@ -594,7 +594,7 @@ impl Program {
         emit_files(self, options, false)
     }
 
-    // Go: incremental/program.go:229 collectSemanticDiagnosticsOfAffectedFiles (ts#64452)
+    // Go: incremental/program.go:276 collectSemanticDiagnosticsOfAffectedFiles (ts#64452)
     // Handle affected files and cache the semantic diagnostics for all of them or the file asked for
     // PORT: split in two (`semantic_diagnostics_files_to_check` and
     // `commit_semantic_diagnostics`), so `start_check` can send the check
@@ -779,7 +779,7 @@ impl Program {
         })
     }
 
-    // Go: incremental/program.go:320 ensureHasErrorsForState
+    // Go: incremental/program.go:387 ensureHasErrorsForState
     // PORT: Go `program` is the current program.
     fn ensure_has_errors_for_state(&self) {
         let files = source_files();

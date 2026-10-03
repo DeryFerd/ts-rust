@@ -750,7 +750,7 @@ fn test_unmarshal_discriminator_union_invalid_discriminator() {
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:638 TestUnmarshalDiscriminatorUnion, "discriminator after variant fields"
+// Go: lsp_json_test.go:602 TestUnmarshalDiscriminatorUnion, "discriminator after variant fields"
 #[test]
 fn test_unmarshal_discriminator_union_discriminator_after_variant_fields() {
     let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
@@ -771,7 +771,7 @@ fn test_unmarshal_discriminator_union_discriminator_after_variant_fields() {
 // it is not ported; the generated arms keep the discriminator (the tests
 // above read the arm that it picks).
 
-// Go: lsp_json_test.go:668 TestUnmarshalDiscriminatorUnion, "non-string discriminator"
+// Go: lsp_json_test.go:602 TestUnmarshalDiscriminatorUnion, "non-string discriminator"
 #[test]
 fn test_unmarshal_discriminator_union_non_string_discriminator() {
     let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
@@ -779,7 +779,7 @@ fn test_unmarshal_discriminator_union_non_string_discriminator() {
     assert!(err.is_err());
 }
 
-// Go: lsp_json_test.go:675 TestUnmarshalDiscriminatorUnion, "missing discriminator"
+// Go: lsp_json_test.go:602 TestUnmarshalDiscriminatorUnion, "missing discriminator"
 #[test]
 fn test_unmarshal_discriminator_union_missing_discriminator() {
     let mut v = WorkDoneProgressBeginOrReportOrEnd::default();
@@ -878,7 +878,7 @@ fn test_unmarshal_document_edit_union_text_document_edit_without_kind() {
     assert!(v.delete_file.is_none());
 }
 
-// Go: lsp_json_test.go:756 TestUnmarshalDocumentEditUnion, "TextDocumentEdit with non-string kind"
+// Go: lsp_json_test.go:739 TestUnmarshalDocumentEditUnion, "TextDocumentEdit with non-string kind"
 #[test]
 fn test_unmarshal_document_edit_union_text_document_edit_with_non_string_kind() {
     let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();
@@ -916,7 +916,7 @@ fn test_unmarshal_document_edit_union_create_file_with_kind_create() {
     );
 }
 
-// Go: lsp_json_test.go:781 TestUnmarshalDocumentEditUnion, "CreateFile with kind after fields"
+// Go: lsp_json_test.go:739 TestUnmarshalDocumentEditUnion, "CreateFile with kind after fields"
 #[test]
 fn test_unmarshal_document_edit_union_create_file_with_kind_after_fields() {
     let mut v = TextDocumentEditOrCreateFileOrRenameFileOrDeleteFile::default();

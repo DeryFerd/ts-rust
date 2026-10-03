@@ -259,7 +259,7 @@ impl ToSnapshot<'_> {
         }
     }
 
-    // Go: incremental/buildinfotosnapshot.go:169 setEmitDiagnostics
+    // Go: incremental/buildinfotosnapshot.go:172 setEmitDiagnostics
     fn set_emit_diagnostics(&mut self) {
         for diagnostic in self.build_info.emit_diagnostics_per_file.iter().flatten() {
             let file_path = self.to_file_path(diagnostic.file_id);
@@ -270,7 +270,7 @@ impl ToSnapshot<'_> {
         }
     }
 
-    // Go: incremental/buildinfotosnapshot.go:176 setAffectedFilesPendingEmit
+    // Go: incremental/buildinfotosnapshot.go:179 setAffectedFilesPendingEmit
     fn set_affected_files_pending_emit(&mut self) {
         let Some(affected_files_pending_emit) = self
             .build_info

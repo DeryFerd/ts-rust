@@ -4310,7 +4310,7 @@ mod tests {
     }
 
     impl MapperHandler for RecordingMapper {
-        // Go: host_test.go:893 recordingMapper.handlesProjects
+        // Go: host_test.go:890 recordingMapper.handlesProjects
         fn handles_projects(&self) -> bool {
             true
         }

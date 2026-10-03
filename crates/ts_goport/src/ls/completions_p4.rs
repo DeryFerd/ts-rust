@@ -1674,7 +1674,7 @@ pub fn entity_name_to_expression(
     )
 }
 
-// Go: completions.go:6654 snippetPrinter
+// Go: completions.go:6785 snippetPrinter
 // PORT: Go keeps `baseWriter` and the writer that embeds it as two pointers
 // to one `ChangeTrackerWriter`. In Rust the snippet writer owns it, so Go
 // `p.baseWriter` is `p.writer.borrow().change_tracker_writer`. The printer
@@ -1694,7 +1694,7 @@ impl SnippetPrinter {
         self.emit_context.factory().as_node_factory()
     }
 
-    // Go: completions.go:6663 printNode
+    // Go: completions.go:6794 printNode
     /** Snippet-escaping version of `printer.printNode`. */
     pub fn print_node(&mut self, node: Node) -> String {
         let unescaped = self.print_unescaped_node(node);
@@ -1705,7 +1705,7 @@ impl SnippetPrinter {
         unescaped
     }
 
-    // Go: completions.go:6671 printUnescapedNode
+    // Go: completions.go:6802 printUnescapedNode
     pub fn print_unescaped_node(&mut self, node: Node) -> String {
         {
             let mut writer = self.writer.borrow_mut();
@@ -1722,7 +1722,7 @@ impl SnippetPrinter {
         self.writer.borrow().string()
     }
 
-    // Go: completions.go:6678 printAndFormatNode
+    // Go: completions.go:6809 printAndFormatNode
     pub fn print_and_format_node(
         &mut self,
         ctx: &Context,
@@ -1733,7 +1733,7 @@ impl SnippetPrinter {
         self.print_and_format_node_with_settings(ctx, node, source_file, &format_options)
     }
 
-    // Go: completions.go:6682 printAndFormatNodeWithSettings
+    // Go: completions.go:6813 printAndFormatNodeWithSettings
     pub fn print_and_format_node_with_settings(
         &mut self,
         ctx: &Context,
@@ -1783,7 +1783,7 @@ impl SnippetPrinter {
     }
 }
 
-// Go: completions.go:6705 createSnippetPrinter
+// Go: completions.go:6836 createSnippetPrinter
 // PORT: a nil Go `emitContext` is `None`.
 pub fn create_snippet_printer(
     options: PrinterOptions,
@@ -1810,7 +1810,7 @@ pub fn create_snippet_printer(
     }
 }
 
-// Go: completions.go:6724 snippetEmitTextWriter
+// Go: completions.go:6855 snippetEmitTextWriter
 // Override base writer methods to perform snippet escaping.
 // PORT: Go embeds `*printer.ChangeTrackerWriter`; here it is the owned field
 // `change_tracker_writer`. The `EmitTextWriter` impl below forwards every
@@ -1821,7 +1821,7 @@ pub struct SnippetEmitTextWriter {
 }
 
 impl SnippetEmitTextWriter {
-    // Go: completions.go:6757 escapingWrite
+    // Go: completions.go:6888 escapingWrite
     // The formatter/scanner will have issues with snippet-escaped text,
     // so instead of writing the escaped text directly to the writer,
     // generate a set of changes that can be applied to the unescaped text

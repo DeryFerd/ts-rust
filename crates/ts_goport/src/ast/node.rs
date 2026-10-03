@@ -2151,7 +2151,7 @@ impl ModifierList {
         self.node_list().loc()
     }
 
-    // Go: ast.go:155 ModifierList.ModifierFlags (set at ast.go:162)
+    // Go: ast.go:157 ModifierList.ModifierFlags (set at ast.go:162)
     /// Go `modifiers.ModifierFlags`. NONE when nil.
     // PERF: store and synthetic lists hold Go `ModifiersToFlags(nodes)`,
     // stored when the factory made the list (`new_store_modifier_list`,

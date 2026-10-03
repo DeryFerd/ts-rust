@@ -3805,7 +3805,7 @@ proto_json!(marshal ResolvedTypeReferenceDirective {
 });
 
 // SourceFileMetadata carries program-stored metadata about a single source file.
-// Go: proto.go:761 SourceFileMetadata
+// Go: proto.go:1430 SourceFileMetadata
 // PORT: Go `core.ResolutionMode` marshals as its int32 value.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SourceFileMetadata {
@@ -4128,7 +4128,7 @@ proto_json!(both GetIntrinsicTypeParams {
 // WellKnownSymbolsResponse carries the handle ids of the per-checker singleton
 // symbols (unknown, undefined, arguments) so the client can identify them by id
 // without a round-trip on every check.
-// Go: proto.go:894 WellKnownSymbolsResponse
+// Go: proto.go:1582 WellKnownSymbolsResponse
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WellKnownSymbolsResponse {
     pub unknown: SymbolID,
@@ -4578,7 +4578,7 @@ proto_json!(both CheckerTypeParams {
 });
 
 // GetPropertyOfTypeParams are parameters for getPropertyOfType (a named property of a type).
-// Go: proto.go:984 GetPropertyOfTypeParams
+// Go: proto.go:1787 GetPropertyOfTypeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GetPropertyOfTypeParams {
     pub snapshot: SnapshotID,
@@ -4611,7 +4611,7 @@ proto_json!(both GetIndexInfoOfTypeParams {
 });
 
 // CheckerNodeParams are parameters for checker methods that operate on a node location.
-// Go: proto.go:992 CheckerNodeParams
+// Go: proto.go:1810 CheckerNodeParams
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CheckerNodeParams {
     pub snapshot: SnapshotID,
@@ -4659,7 +4659,7 @@ proto_json!(both CheckerSymbolParams {
 
 // JSDocTagInfo is a single JSDoc tag, mirroring Strada's JSDocTagInfo but with the tag text
 // rendered as a plain string rather than SymbolDisplayPart[].
-// Go: proto.go:1007 JSDocTagInfo
+// Go: proto.go:1825 JSDocTagInfo
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct JSDocTagInfo {
     pub name: String,

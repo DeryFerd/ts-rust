@@ -27,7 +27,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-// Go: incremental/emitfileshandler.go:14 emitUpdate
+// Go: incremental/emitfileshandler.go:15 emitUpdate
 #[derive(Clone, Debug, Default)]
 pub struct EmitUpdate {
     pub pending_kind: FileEmitKind,
@@ -47,7 +47,7 @@ pub struct EmitFilesShared {
 /// emit kind, the kind it emits now, and the file.
 type QueuedEmit = (Path, FileEmitKind, FileEmitKind, Node);
 
-// Go: incremental/emitfileshandler.go:20 emitFilesHandler
+// Go: incremental/emitfileshandler.go:21 emitFilesHandler
 pub struct EmitFilesHandler<'a> {
     program: &'a Program,
     is_for_dts_errors: bool,
@@ -99,7 +99,7 @@ impl<'a> EmitFilesHandler<'a> {
         }
     }
 
-    // Go: incremental/emitfileshandler.go:33 getPendingEmitKindForEmitOptions
+    // Go: incremental/emitfileshandler.go:34 getPendingEmitKindForEmitOptions
     // Determining what all is pending to be emitted based on previous options or previous file emit flags
     fn get_pending_emit_kind_for_emit_options(
         &self,
@@ -199,14 +199,14 @@ impl<'a> EmitFilesHandler<'a> {
         result
     }
 
-    // Go: incremental/emitfileshandler.go:91 updateHasEmitDiagnostics
+    // Go: incremental/emitfileshandler.go:103 updateHasEmitDiagnostics
     fn update_has_emit_diagnostics(&mut self, result: Option<&EmitResult>) {
         if result.is_some_and(|result| !result.diagnostics.is_empty()) {
             self.has_emit_diagnostics = true;
         }
     }
 
-    // Go: incremental/emitfileshandler.go:97 emitBuildInfo
+    // Go: incremental/emitfileshandler.go:109 emitBuildInfo
     fn emit_build_info(&self, options: &EmitOptions, result: &mut EmitResult) {
         if let Some(build_info_result) = self.program.emit_build_info(options) {
             result.diagnostics.extend(build_info_result.diagnostics);
@@ -501,7 +501,7 @@ impl<'a> EmitFilesHandler<'a> {
         }
     }
 
-    // Go: incremental/emitfileshandler.go:274 updateSnapshot
+    // Go: incremental/emitfileshandler.go:286 updateSnapshot
     fn update_snapshot(&mut self) -> Vec<EmitResult> {
         let mut snapshot = self.program.snapshot.borrow_mut();
         if snapshot.can_use_incremental_state() {

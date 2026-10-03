@@ -12,7 +12,7 @@ use crate::frontend::prelude::*;
 use std::cell::OnceCell;
 use std::sync::Arc;
 
-// Go: incremental/referencemap.go:12 referenceMap
+// Go: incremental/referencemap.go:13 referenceMap
 // PORT: Go stores `*collections.Set` pointers, and several files can share
 // one set (`buildInfoToSnapshot` stores one set for each file id list). The
 // port shares a set with `Arc`, so storing it does not copy its paths.
@@ -24,12 +24,12 @@ pub struct ReferenceMap {
 }
 
 impl ReferenceMap {
-    // Go: incremental/referencemap.go:18 storeReferences
+    // Go: incremental/referencemap.go:19 storeReferences
     pub fn store_references(&mut self, path: Path, refs: Arc<FxIndexSet<Path>>) {
         self.references.insert(path, refs);
     }
 
-    // Go: incremental/referencemap.go:22 getReferences
+    // Go: incremental/referencemap.go:23 getReferences
     // PORT: Go returns `(*Set, bool)`; a missing entry is `None`.
     #[must_use]
     pub fn get_references(&self, path: &Path) -> Option<&FxIndexSet<Path>> {
@@ -42,13 +42,13 @@ impl ReferenceMap {
         self.references.get(path).cloned()
     }
 
-    // Go: incremental/referencemap.go:27 getPathsWithReferences
+    // Go: incremental/referencemap.go:28 getPathsWithReferences
     #[must_use]
     pub fn get_paths_with_references(&self) -> Vec<Path> {
         self.references.keys().cloned().collect()
     }
 
-    // Go: incremental/referencemap.go:31 getReferencedBy
+    // Go: incremental/referencemap.go:32 getReferencedBy
     // PORT: Go returns an iterator over the set keys; this returns a copy.
     #[must_use]
     pub fn get_referenced_by(&self, path: &Path) -> Vec<Path> {

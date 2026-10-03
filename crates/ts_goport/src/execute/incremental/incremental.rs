@@ -57,7 +57,7 @@ pub fn marshal_build_info(build_info: &BuildInfo) -> Result<String, JsonError> {
     json_marshal(build_info, &[])
 }
 
-// Go: incremental/incremental.go:37 NewBuildInfoReader
+// Go: incremental/incremental.go:38 NewBuildInfoReader
 #[must_use]
 pub fn new_build_info_reader(host: Rc<dyn CompilerHost>) -> Rc<dyn BuildInfoReader> {
     Rc::new(BuildInfoReaderImpl { host })
