@@ -549,8 +549,7 @@ impl Checker {
                     {
                         let info = &mut self.inference_context_mut(ctx).inferences[inference];
                         if priority < info.priority {
-                            info.candidates = Vec::new();
-                            info.contra_candidates = Vec::new();
+                            info.candidate_lists = None;
                             info.top_level = true;
                             info.priority = priority;
                         }
@@ -560,19 +559,21 @@ impl Checker {
                         // i.e. only if we have not descended into a bivariant position.
                         if contravariant && !bivariant {
                             if !self.inference_context(ctx).inferences[inference]
-                                .contra_candidates
+                                .contra_candidates()
                                 .contains(&candidate)
                             {
                                 self.inference_context_mut(ctx).inferences[inference]
+                                    .candidate_lists_mut()
                                     .contra_candidates
                                     .push(candidate);
                                 self.clear_cached_inferences(ctx);
                             }
                         } else if !self.inference_context(ctx).inferences[inference]
-                            .candidates
+                            .candidates()
                             .contains(&candidate)
                         {
                             self.inference_context_mut(ctx).inferences[inference]
+                                .candidate_lists_mut()
                                 .candidates
                                 .push(candidate);
                             self.clear_cached_inferences(ctx);

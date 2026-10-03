@@ -157,9 +157,10 @@ impl Checker {
                     if any_candidates {
                         let cloned = self.clone_inferred_part_of_context(return_context);
                         let return_mapper = self.get_mapper_from_context(cloned);
-                        self.inference_context_mut(context).return_mapper = return_mapper;
-                    } else {
-                        self.inference_context_mut(context).return_mapper = MapperId::NIL;
+                        self.inference_context_mut(context).rare_mut().return_mapper =
+                            return_mapper;
+                    } else if let Some(rare) = &mut self.inference_context_mut(context).rare {
+                        rare.return_mapper = MapperId::NIL;
                     }
                 }
             }

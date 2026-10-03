@@ -29,18 +29,28 @@ pub type TypeMapperFn = Rc<dyn Fn(&mut Checker, TypeId) -> TypeId>;
 
 /// Go `TypeMapper` with its `TypeMapperData`. One variant per Go mapper
 /// struct. `Base` is Go `TypeMapperBase` (also the arena dummy entry).
+///
+/// PERF (infermem1): a `TypeMapper` is 16 bytes (asserted below). The port
+/// keeps every mapper of a run (typebox: 21.4M), and 87% of them are simple,
+/// merged, composite or inference mappers with at most 9 bytes of data. The
+/// larger payloads are boxed. The `Array` bool is the cached Go
+/// `MapsThisOnly`; it is outside the box, so the box is 48 bytes, a jemalloc
+/// size class. Mapper ids and their order do not change.
 #[derive(Clone)]
 pub enum TypeMapper {
     Base(TypeMapperBase),
     Simple(SimpleTypeMapper),
-    Array(ArrayTypeMapper),
-    ArrayToSingle(ArrayToSingleTypeMapper),
-    Deferred(DeferredTypeMapper),
-    Function(FunctionTypeMapper),
+    Array(Box<ArrayTypeMapper>, bool),
+    ArrayToSingle(Box<ArrayToSingleTypeMapper>),
+    Deferred(Box<DeferredTypeMapper>),
+    Function(Box<FunctionTypeMapper>),
     Merged(MergedTypeMapper),
     Composite(CompositeTypeMapper),
     Inference(InferenceTypeMapper),
 }
+
+const _: () = assert!(std::mem::size_of::<TypeMapper>() == 16);
+const _: () = assert!(std::mem::size_of::<ArrayTypeMapper>() == 48);
 
 impl Default for TypeMapper {
     fn default() -> Self {
@@ -57,7 +67,7 @@ impl std::fmt::Debug for TypeMapper {
                 .field("source", &m.source)
                 .field("target", &m.target)
                 .finish(),
-            TypeMapper::Array(m) => f
+            TypeMapper::Array(m, _) => f
                 .debug_struct("ArrayTypeMapper")
                 .field("sources", &m.sources)
                 .field("targets", &m.targets)
@@ -97,7 +107,7 @@ impl TypeMapper {
     pub fn kind(&self) -> TypeMapperKind {
         match self {
             TypeMapper::Simple(_) => TypeMapperKind::Simple,
-            TypeMapper::Array(_) => TypeMapperKind::Array,
+            TypeMapper::Array(..) => TypeMapperKind::Array,
             TypeMapper::Merged(_) => TypeMapperKind::Merged,
             // Go: TypeMapperBase.Kind for every other mapper.
             TypeMapper::Base(_)
@@ -118,7 +128,7 @@ impl TypeMapper {
     pub fn maps_this_only(&self) -> bool {
         match self {
             TypeMapper::Simple(m) => m.maps_this_only,
-            TypeMapper::Array(m) => m.maps_this_only,
+            TypeMapper::Array(_, maps_this_only) => *maps_this_only,
             TypeMapper::ArrayToSingle(m) => m.maps_this_only,
             TypeMapper::Deferred(m) => m.maps_this_only,
             // Go: TypeMapperBase.MapsThisOnly for every other mapper.
@@ -143,7 +153,7 @@ impl TypeMapper {
     #[must_use]
     pub fn as_array_type_mapper(&self) -> &ArrayTypeMapper {
         match self {
-            TypeMapper::Array(m) => m,
+            TypeMapper::Array(m, _) => m,
             _ => panic!("interface conversion: not a *ArrayTypeMapper"),
         }
     }
@@ -178,12 +188,12 @@ pub struct SimpleTypeMapper {
 // ArrayTypeMapper
 
 // Go: checker/mapper.go:143 ArrayTypeMapper
+// PORT: the cached Go `MapsThisOnly`, `len(m.sources) == 1 &&
+// isThisTypeParameter(m.sources[0])`, is the bool of `TypeMapper::Array`.
 #[derive(Clone, Debug, Default)]
 pub struct ArrayTypeMapper {
     pub sources: SharedList<TypeId>,
     pub targets: SharedList<TypeId>,
-    /// Cached Go `len(m.sources) == 1 && isThisTypeParameter(m.sources[0])`.
-    pub maps_this_only: bool,
 }
 
 // ArrayToSingleTypeMapper
@@ -251,8 +261,8 @@ impl Checker {
     /// PERF: this and the small `new_*_type_mapper` constructors that call it
     /// are `inline(always)`, with the arena push, so the `TypeMapper` is built
     /// once in its arena slot. Out of line (a plain `#[inline]` hint was not
-    /// taken), the 64-byte `TypeMapper` went through the stack, and most of
-    /// this function's time was the reload of that copy.
+    /// taken), the `TypeMapper` (64 bytes then) went through the stack, and
+    /// most of this function's time was the reload of that copy.
     #[inline(always)]
     pub fn alloc_type_mapper(&mut self, data: TypeMapper) -> MapperId {
         let id = MapperId(u32::try_from(self.mappers.len()).expect("mapper overflow"));
@@ -280,7 +290,7 @@ impl Checker {
                 t
             }
             // Go: checker/mapper.go:136 (*ArrayTypeMapper).Map
-            TypeMapper::Array(d) => {
+            TypeMapper::Array(d, _) => {
                 for (i, s) in d.sources.iter().enumerate() {
                     if t == *s {
                         return d.targets[i];
@@ -482,11 +492,10 @@ impl Checker {
     ) -> MapperId {
         // Go: checker/mapper.go:149 (*ArrayTypeMapper).MapsThisOnly
         let maps_this_only = sources.len() == 1 && self.is_this_type_parameter(sources[0]);
-        self.alloc_type_mapper(TypeMapper::Array(ArrayTypeMapper {
-            sources,
-            targets,
+        self.alloc_type_mapper(TypeMapper::Array(
+            Box::new(ArrayTypeMapper { sources, targets }),
             maps_this_only,
-        }))
+        ))
     }
 
     // Go: checker/mapper.go:182 newArrayToSingleTypeMapper
@@ -498,11 +507,13 @@ impl Checker {
     ) -> MapperId {
         // Go: checker/mapper.go:175 (*ArrayToSingleTypeMapper).MapsThisOnly
         let maps_this_only = sources.len() == 1 && self.is_this_type_parameter(sources[0]);
-        self.alloc_type_mapper(TypeMapper::ArrayToSingle(ArrayToSingleTypeMapper {
-            sources: sources.to_vec(),
-            target,
-            maps_this_only,
-        }))
+        self.alloc_type_mapper(TypeMapper::ArrayToSingle(Box::new(
+            ArrayToSingleTypeMapper {
+                sources: sources.to_vec(),
+                target,
+                maps_this_only,
+            },
+        )))
     }
 
     // Go: checker/mapper.go:209 newDeferredTypeMapper
@@ -513,16 +524,16 @@ impl Checker {
     ) -> MapperId {
         // Go: checker/mapper.go:202 (*DeferredTypeMapper).MapsThisOnly
         let maps_this_only = sources.len() == 1 && self.is_this_type_parameter(sources[0]);
-        self.alloc_type_mapper(TypeMapper::Deferred(DeferredTypeMapper {
+        self.alloc_type_mapper(TypeMapper::Deferred(Box::new(DeferredTypeMapper {
             sources: sources.to_vec(),
             targets,
             maps_this_only,
-        }))
+        })))
     }
 
     // Go: checker/mapper.go:237 newFunctionTypeMapper
     pub fn new_function_type_mapper(&mut self, fn_: TypeMapperFn) -> MapperId {
-        self.alloc_type_mapper(TypeMapper::Function(FunctionTypeMapper { fn_ }))
+        self.alloc_type_mapper(TypeMapper::Function(Box::new(FunctionTypeMapper { fn_ })))
     }
 
     // Go: checker/mapper.go:256 newMergedTypeMapper

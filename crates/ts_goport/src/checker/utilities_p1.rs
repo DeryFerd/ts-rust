@@ -1332,7 +1332,7 @@ impl Checker {
                 }
                 self.compare_types(m1.target, m2.target)
             }
-            (TypeMapper::Array(m1), TypeMapper::Array(m2)) => {
+            (TypeMapper::Array(m1, _), TypeMapper::Array(m2, _)) => {
                 let c = self.compare_type_lists(&m1.sources, &m2.sources);
                 if c != 0 {
                     return c;
