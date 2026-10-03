@@ -5,19 +5,22 @@
 # usage: scripts/wasm/build.sh [out.wasm]   (default npm/wasm/ts_rust.wasm)
 # env:   WASM_PROFILE    cargo profile (default wasm; release for a fast build)
 #        WASM_RUSTFLAGS  added to RUSTFLAGS (default none)
-#        WASM_OPT        wasm-opt flags (default "-Oz --converge"); "none"
-#                        skips wasm-opt
+#        WASM_OPT        wasm-opt flags (default "--flatten --rereloop -Oz -Oz");
+#                        "none" skips wasm-opt
 # needs: rustup target add wasm32-wasip1; wasm-opt (binaryen 132 or later)
 #
-# The default is the smallest module (opt-level z, 5.7 MB). For checks about
-# 18% faster at 6.9 MB:
+# The default is the smallest module (opt-level z, 5.4 MB). For checks about
+# 17% faster at 6.5 MB:
 #   CARGO_PROFILE_WASM_OPT_LEVEL=s \
 #   WASM_RUSTFLAGS="-C llvm-args=-inlinehint-threshold=150" scripts/wasm/build.sh
 set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 out="${1:-$repo/npm/wasm/ts_rust.wasm}"
 profile="${WASM_PROFILE:-wasm}"
-opt="${WASM_OPT:--Oz --converge}"
+# --flatten --rereloop builds the control flow of each function again from
+# its basic blocks, and the two -Oz runs then shrink it: 0.8% smaller raw,
+# gzip and brotli than "-Oz --converge", at the same speed.
+opt="${WASM_OPT:---flatten --rereloop -Oz -Oz}"
 
 # At opt-level "s", LLVM inlines `#[inline]` functions up to cost 325; the
 # faster build above lowers that to 150.
