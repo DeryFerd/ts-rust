@@ -1,8 +1,9 @@
-//! The Linux file watcher on the real kernel, default backend only: Go
-//! internal/fswatch `TestWatchFileCreate` and `TestSubscribeSubfileUpdate`
-//! (`watcher_test.go`), and the Linux case of Go `Default` (`watcher.go`).
-//! `fswatch::default()` is fanotify when `fanotify_init` succeeds (Linux 5.13
-//! or later with the needed permission), else inotify, as in Go.
+//! The Linux and macOS file watchers on the real kernel, default backend
+//! only: Go internal/fswatch `TestWatchFileCreate` and
+//! `TestSubscribeSubfileUpdate` (`watcher_test.go`), and the Linux and darwin
+//! cases of Go `Default` (`watcher.go`). On Linux `fswatch::default()` is
+//! fanotify when `fanotify_init` succeeds (Linux 5.13 or later with the
+//! needed permission), else inotify, as in Go. On macOS it is FSEvents.
 //!
 //! PORT: Go runs each test on every available backend (`runForEachWatcher`).
 //! `go_baselines` `units_platform/fswatch_watcher.rs` ports that. This binary
@@ -11,7 +12,7 @@
 //! `newTmpDir`, `subPath`, `subscribeFor` (recursive, then the Linux settle
 //! sleep), the recording watcher, `expectEventSequence` and `expectContains`.
 //! A Go `t.Fatal` is a panic.
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -121,10 +122,12 @@ struct Recorder {
 }
 
 impl Recorder {
-    // Go: watcher_test.go:239 deadline (the inotify and fanotify base,
-    // watcher_test.go:31 defaultEventTimeout, times the retry scale)
+    // Go: watcher_test.go:239 deadline (watcher_test.go:31
+    // defaultEventTimeout for inotify and fanotify, 41 kqueueFSEventsTimeout
+    // for FSEvents, times the retry scale)
     fn deadline(&self) -> Duration {
-        Duration::from_secs(1) * retry_timeout_scale(self.attempt)
+        let base = if cfg!(target_os = "macos") { 2 } else { 1 };
+        Duration::from_secs(base) * retry_timeout_scale(self.attempt)
     }
 
     // Go: watcher_test.go:346 waitForEvent
@@ -169,9 +172,9 @@ impl Drop for WatchGuard {
     }
 }
 
-// Go: watcher_test.go:159 subscribeFor and 202 subscribeForOpts. The sleep
-// is watcher_test.go:167 settleSleep (60 ms on Linux); preSubscribeSleep is 0
-// on Linux.
+// Go: watcher_test.go:159 subscribeFor and 202 subscribeForOpts. The sleeps
+// are watcher_test.go:177 preSubscribeSleep (0 on Linux, 50 ms for FSEvents)
+// and 167 settleSleep (60 ms on Linux, 300 ms for FSEvents).
 /// Watches `dir` recursively with the default watcher, then waits for the
 /// watch to settle.
 fn subscribe_for(attempt: u32, dir: &str) -> (Arc<Recorder>, WatchGuard) {
@@ -181,6 +184,12 @@ fn subscribe_for(attempt: u32, dir: &str) -> (Arc<Recorder>, WatchGuard) {
         cond: Condvar::new(),
     });
     // Go: watcher_test.go:256 callback
+    let (pre_subscribe, settle) = if cfg!(target_os = "macos") {
+        (50, 300)
+    } else {
+        (0, 60)
+    };
+    std::thread::sleep(Duration::from_millis(pre_subscribe));
     let rec = r.clone();
     let cb: fswatch::WatchCallback = Arc::new(move |events, _err| {
         rec.buf.lock().unwrap().extend(events);
@@ -190,7 +199,7 @@ fn subscribe_for(attempt: u32, dir: &str) -> (Arc<Recorder>, WatchGuard) {
         .watch_directory(dir, cb, &[fswatch::with_recursive()])
         .unwrap_or_else(|e| panic!("subscribe: {}", e.error()));
     let guard = WatchGuard(sub);
-    std::thread::sleep(Duration::from_millis(60));
+    std::thread::sleep(Duration::from_millis(settle));
     (r, guard)
 }
 
@@ -242,11 +251,14 @@ fn expect_contains(r: &Recorder, kind: EventKind, path: &str) {
 
 // ----- tests -------------------------------------------------------------
 
-// Go: watcher.go:230 Default (the linux case). Go has no test for it; its
-// fanotify_linux_test.go:35 TestLinuxFanotifyBackendSelection checks only the
-// fanotify watcher.
+// Go: watcher.go:230 Default (the linux and darwin cases). Go has no test
+// for the linux case; its fanotify_linux_test.go:35
+// TestLinuxFanotifyBackendSelection checks only the fanotify watcher.
 #[test]
 fn default_watcher_is_the_go_choice() {
+    #[cfg(target_os = "macos")]
+    let want = "fsevents";
+    #[cfg(target_os = "linux")]
     let want = if fswatch::fanotify_linux::fanotify_available() {
         "fanotify"
     } else {

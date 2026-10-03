@@ -11,10 +11,10 @@
 //! list is `target/continuation-r97-goport/tests2/bugs/S2.md`. A Go test that
 //! needs a private Rust item is listed there as blocked.
 //!
-//! Go tests whose files build only on other platforms are not ported, since
-//! the port has no code for those platforms and they never run on Linux:
-//! `fswatch/fsevents_darwin_{ffi_arm64,nfd,shared}_test.go` (13 tests,
-//! `darwin`) and `nativepath/symlink_windows_test.go` (4 tests, `windows`).
+//! The darwin FSEvents tests (`fswatch/fsevents_darwin_{nfd,shared}_test.go`)
+//! run on macOS; `fswatch_fsevents_darwin.rs` lists those that are not
+//! ported. `fswatch/fsevents_darwin_ffi_arm64_test.go` (Go's assembly) and
+//! `nativepath/symlink_windows_test.go` (4 tests, `windows`) are not ported.
 
 mod bundled;
 mod cachedvfs;

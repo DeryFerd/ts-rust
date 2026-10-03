@@ -1,4 +1,4 @@
-//! Go: the 14 Linux tests that typescript-go #4376, #4379 and #4495 added to
+//! Go: the 14 tests that typescript-go #4376, #4379 and #4495 added to
 //! `internal/fswatch/{watcher,walkdir,eventlist}_test.go` (pin 52168999f3dc):
 //! symlinked directory roots (pnpm and bun layouts), recursive watch
 //! consolidation, `rebasePath`, `physicalDirFor`, `isInDirectoryOrSelf`,
@@ -9,7 +9,9 @@
 //! PORT: the harness of `fswatch_watcher.rs` is private to that file, so
 //! this file has a small copy: `run_for_each_watcher` runs each available
 //! backend on its own thread with the Go retry (three attempts, timeouts
-//! scaled 1, 5 and 15), and drop guards do the Go `t.Cleanup` work. Go
+//! scaled 1, 5 and 15), and drop guards do the Go `t.Cleanup` work. The
+//! per-backend timeouts and sleeps come from `fswatch_watcher.rs`. The
+//! fanotify test watcher builds on Linux only, as in Go. Go
 //! `sub.(*watch)` has no Rust form (a `Box<dyn Watch>` has no `Any`), so
 //! the tests read the watch's dirWatch from the watcher's `dir_watches`.
 //! The two FSEvents tests of #4495 (`fsevents_darwin_shared_test.go`) are
@@ -21,14 +23,16 @@
 //! darwin tests (`fsevents_darwin_nfd_test.go`,
 //! `fsevents_darwin_shared_test.go`) need CoreFoundation folding and a
 //! volume query, which the port does not have, and are not ported.
-#![cfg(target_os = "linux")]
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
+#[cfg(target_os = "linux")]
+use std::sync::LazyLock;
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 use ts_goport::fswatch::fanotify_linux::{fanotify_available, new_fanotify_backend};
 use ts_goport::fswatch::pathcompare::{ComparisonPath, PathComparer, equal_fold};
 use ts_goport::fswatch::pathkey::PathComparerExported;
@@ -43,7 +47,9 @@ use ts_goport::gostd::{GoError, errors};
 use ts_goport::scanner_util::go_string_from_bytes;
 
 use super::Failures;
-use super::fswatch_watcher::{TmpDir, new_tmp_dir};
+use super::fswatch_watcher::{
+    TmpDir, new_tmp_dir, pre_subscribe_sleep, settle_sleep, watcher_event_timeout_base,
+};
 use crate::astnav_api::panic_message;
 
 // ----- harness -----------------------------------------------------------
@@ -181,6 +187,7 @@ fn retry_timeout_scale(attempt: u32) -> u32 {
 }
 
 // Go: fanotify_linux_test.go fanotifyNoRenameWatcher
+#[cfg(target_os = "linux")]
 static FANOTIFY_NO_RENAME_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(|| {
     new_watcher("fanotify-no-rename", |w| {
         if fanotify_available() {
@@ -191,13 +198,17 @@ static FANOTIFY_NO_RENAME_WATCHER: LazyLock<Arc<WatcherStruct>> = LazyLock::new(
 
 // Go: watcher_test.go:77 init (availableWatchers)
 fn available_watchers() -> Vec<Arc<dyn Watcher>> {
+    #[allow(unused_mut)]
     let mut out: Vec<Arc<dyn Watcher>> = fswatch::all_watchers()
         .into_iter()
         .filter(|w| w.available())
         .collect();
-    let extra: Arc<dyn Watcher> = FANOTIFY_NO_RENAME_WATCHER.clone();
-    if extra.available() {
-        out.push(extra);
+    #[cfg(target_os = "linux")]
+    {
+        let extra: Arc<dyn Watcher> = FANOTIFY_NO_RENAME_WATCHER.clone();
+        if extra.available() {
+            out.push(extra);
+        }
     }
     out
 }
@@ -234,22 +245,26 @@ fn run_for_each_watcher(test: &str, body: fn(u32, &Arc<dyn Watcher>)) {
 // Go: watcher_test.go:220 recordingWatcher
 struct Recorder {
     attempt: u32,
+    /// The base timeout of the bound watcher (Go `r.watcher`).
+    base: Duration,
     buf: Mutex<Vec<Event>>,
     cond: Condvar,
 }
 
 impl Recorder {
-    fn new(attempt: u32) -> Arc<Recorder> {
+    /// Go `newRecorder(t)` followed by `r.watcher = w`.
+    fn new(attempt: u32, w: &Arc<dyn Watcher>) -> Arc<Recorder> {
         Arc::new(Recorder {
             attempt,
+            base: watcher_event_timeout_base(w),
             buf: Mutex::new(Vec::new()),
             cond: Condvar::new(),
         })
     }
 
-    // Go: watcher_test.go:239 deadline (defaultEventTimeout on Linux)
+    // Go: watcher_test.go:239 deadline (watcherEventTimeout)
     fn deadline(&self) -> Duration {
-        Duration::from_secs(1) * retry_timeout_scale(self.attempt)
+        self.base * retry_timeout_scale(self.attempt)
     }
 
     // Go: watcher_test.go:256 callback
@@ -285,13 +300,17 @@ impl Recorder {
     }
 }
 
-// Go: watcher_test.go:159 subscribeFor (with the Linux settleSleep)
+// Go: watcher_test.go:159 subscribeFor (and subscribeForOpts)
 fn subscribe_for(attempt: u32, dir: &str, w: &Arc<dyn Watcher>) -> (Arc<Recorder>, Sub) {
-    let r = Recorder::new(attempt);
+    let d = pre_subscribe_sleep(w);
+    if d > Duration::ZERO {
+        std::thread::sleep(d);
+    }
+    let r = Recorder::new(attempt, w);
     let sub = w
         .watch_directory(dir, r.callback(), &[with_recursive()])
         .unwrap_or_else(|e| panic!("subscribe: {}", e.error()));
-    std::thread::sleep(Duration::from_millis(60));
+    std::thread::sleep(settle_sleep(w));
     (r, Sub(sub))
 }
 

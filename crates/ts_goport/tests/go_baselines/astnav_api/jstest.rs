@@ -15,8 +15,12 @@ use ts_goport::frontend::json::{UnmarshalerFrom, json_unmarshal};
 use ts_goport::frontend::tspath;
 
 /// Root of the temp directories when `TSCTEST_TMP` is not set.
+#[cfg(not(target_os = "macos"))]
 pub(crate) const DEFAULT_TMP_ROOT: &str =
     "/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/go-baseline-tests/tmp";
+/// macOS: `/home` is an autofs mount there, so the default is under /tmp.
+#[cfg(target_os = "macos")]
+pub(crate) const DEFAULT_TMP_ROOT: &str = "/tmp/ts-rust-go-baseline-tests/tmp";
 
 // Go: jstest/node.go:16 loaderScript
 const LOADER_SCRIPT: &str = r#"import script from "./script.mjs";

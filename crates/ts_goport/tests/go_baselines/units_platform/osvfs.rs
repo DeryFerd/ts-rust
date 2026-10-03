@@ -1,7 +1,8 @@
-//! Go: `internal/vfs/osvfs/{os,realpath,helpers}_test.go` (the Linux tests;
+//! Go: `internal/vfs/osvfs/{os,realpath,helpers}_test.go` (the unix tests;
 //! `reparsepoint_windows_test.go` is Windows only).
 //!
 //! PORT: Go `osvfs.FS()` is `osvfs_fs()`. Go `t.TempDir()` is `TempDir`.
+//! Go `runtime.GOOS` is `std::env::consts::OS`.
 
 use std::path::{Path, PathBuf};
 
@@ -41,8 +42,14 @@ fn test_os() {
         println!("SKIP TestOS/Realpath: no home directory");
     }
 
-    // UseCaseSensitiveFileNames (linux)
-    assert!(fs.use_case_sensitive_file_names());
+    // UseCaseSensitiveFileNames
+    // Just check that it works.
+    let case_sensitive = fs.use_case_sensitive_file_names();
+    match std::env::consts::OS {
+        "windows" => assert!(!case_sensitive),
+        "linux" => assert!(case_sensitive),
+        _ => {}
+    }
 }
 
 // Go: realpath_test.go:40 setupSymlinks

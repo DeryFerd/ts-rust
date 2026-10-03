@@ -10,8 +10,8 @@
 //! `Rc`. `time.AfterFunc` is `gostd::local::after_func`, so `flush` runs on
 //! the dispatch thread. fswatch callbacks reach the dispatch thread through
 //! `DeliveryBridge`. The server only makes this watcher when
-//! `fswatch::default().has_fast_recursive_backend()` is true, which is false
-//! on Linux (plan: dead there).
+//! `fswatch::default().has_fast_recursive_backend()` is true: on macOS
+//! (FSEvents) and Windows, not on Linux.
 
 use crate::lsp::lspwatcher::prelude::*;
 
