@@ -16,6 +16,7 @@
 mod catalog_texts;
 
 use lzma_rust2::{EncodeMode, LzmaOptions, LzmaWriter, MfType};
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -53,7 +54,7 @@ fn pack_libs() {
         let path = libs.join(name);
         println!("cargo:rerun-if-changed={}", path.display());
         let text = std::fs::read(path).expect("read a lib");
-        index.push_str(&format!("    (\"libs/{name}\", {}),\n", text.len()));
+        writeln!(index, "    (\"libs/{name}\", {}),", text.len()).expect("write to a String");
         texts.extend_from_slice(&text);
     }
     index.push_str("];\n");
