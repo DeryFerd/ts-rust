@@ -241,37 +241,53 @@ impl StatusPrefetch {
     /// Reads the mtimes (`input_m_times`, `file_m_times`) of the root files
     /// (`input_files`, the names of `input_paths`) and the files of the
     /// build info that are TypeScript sources (`is_typescript_source`), as
-    /// `BuildHost::get_m_time` reads them (`incremental.GetMTime`). No task
-    /// of a build writes such a file, so the mtime is the one that the
-    /// check would read later. Each path is read once: the build info
-    /// lists the root files too.
-    pub fn read_m_times(&mut self, fs: &dyn Fs, input_files: &[String]) {
-        fn m_time<'a>(
-            fs: &dyn Fs,
-            read: &mut FxHashMap<&'a Path, Option<SystemTime>>,
-            file: &str,
+    /// `BuildHost::get_m_time` reads them (`incremental.GetMTime`) on `fs`.
+    /// No task of a build writes such a file, so the mtime is the one that
+    /// the check would read later. Each path is read once: the build info
+    /// lists the root files too. `os_fs`: `fs` is the wrapped OS file
+    /// system (`is_wrapped_os_fs`), so the OS paths are read together
+    /// (`os_mod_times`).
+    pub fn read_m_times(&mut self, fs: &dyn Fs, os_fs: bool, input_files: &[String]) {
+        /// The index in `files` of the mtime of `file`, when it is read.
+        fn index_of<'a>(
+            files: &mut Vec<&'a str>,
+            indexes: &mut FxHashMap<&'a Path, usize>,
+            file: &'a str,
             path: &'a Path,
-        ) -> Option<Option<SystemTime>> {
+        ) -> Option<usize> {
             is_typescript_source(file).then(|| {
-                *read
-                    .entry(path)
-                    .or_insert_with(|| fs.stat(file).and_then(|stat| stat.mod_time()))
+                *indexes.entry(path).or_insert_with(|| {
+                    files.push(file);
+                    files.len() - 1
+                })
             })
         }
-        let mut read = FxHashMap::with_capacity_and_hasher(input_files.len(), Default::default());
-        let input_m_times = input_files
+        let mut files = Vec::with_capacity(input_files.len());
+        let mut indexes =
+            FxHashMap::with_capacity_and_hasher(input_files.len(), Default::default());
+        let input_indexes: Vec<Option<usize>> = input_files
             .iter()
             .zip(&self.input_paths)
-            .map(|(file, path)| m_time(fs, &mut read, file, path))
+            .map(|(file, path)| index_of(&mut files, &mut indexes, file, path))
             .collect();
-        let file_m_times = self
+        let file_indexes: Vec<Option<usize>> = self
             .file_names
             .iter()
-            .map(|(file, path)| m_time(fs, &mut read, file, path))
+            .map(|(file, path)| index_of(&mut files, &mut indexes, file, path))
             .collect();
-        drop(read);
-        self.input_m_times = input_m_times;
-        self.file_m_times = file_m_times;
+        drop(indexes);
+        let m_times: Vec<Option<SystemTime>> =
+            if os_fs && files.iter().all(|file| file.starts_with('/')) {
+                os_mod_times(files)
+            } else {
+                files
+                    .iter()
+                    .map(|file| fs.stat(file).and_then(|stat| stat.mod_time()))
+                    .collect()
+            };
+        let m_time_at = |index: &Option<usize>| index.map(|index| m_times[index]);
+        self.input_m_times = input_indexes.iter().map(m_time_at).collect();
+        self.file_m_times = file_indexes.iter().map(m_time_at).collect();
     }
 }
 

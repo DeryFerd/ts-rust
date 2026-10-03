@@ -704,7 +704,7 @@ fn read_build_info(shared: &Shared, job: &ReadJob) {
                     &read.input_files,
                     &shared.compare_paths_options,
                 );
-                status.read_m_times(&*fs, &read.input_files);
+                status.read_m_times(&*fs, is_wrapped_os_fs(&fs), &read.input_files);
                 status
             });
         (build_info, status)
