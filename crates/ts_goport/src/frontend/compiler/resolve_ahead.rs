@@ -13,11 +13,13 @@
 //!
 //! - a read is the loader's read, and its text must have the worker's hash;
 //! - a `file_exists`, `directory_exists` or `realpath` must agree with the
-//!   snapshot's answer for the path. When the snapshot has no answer yet,
-//!   the worker's answer, which the worker got during this load, becomes
-//!   the snapshot's answer, as the first call of a load fills Go's
-//!   per-snapshot cache. A `file_exists` answer that the workers know from
-//!   an earlier load is asked of the snapshot's file system.
+//!   snapshot's answer for the name, if it has one. The snapshot's lookup
+//!   cache takes each answer that it does not have from the workers' lookups
+//!   of the load (`WorkerStats`, `AheadLookups`) before it asks the OS, as
+//!   Go's parse tasks fill one per-snapshot cache. So a worker's answer,
+//!   which the worker got during this load, is the snapshot's answer when
+//!   the snapshot had none. A `file_exists` answer that the workers know
+//!   from an earlier load is asked of the snapshot's file system.
 //!
 //! So the load has one answer for each path, also when the disk changes
 //! during the load. The check also replays the side effects of the calls
@@ -182,6 +184,10 @@ pub struct ResolveAheadHost {
     /// Checks the calls of a worker answer on the host's file system and
     /// replays their side effects (`AheadLink::accept`).
     pub accept: AheadAccept,
+    /// Gives the lookups of the load's job to the host's snapshot file
+    /// system, which takes an answer from them before it asks the OS
+    /// (`AheadLookups`). Called when the load gives the workers a job.
+    pub attach: Box<dyn FnOnce(Arc<dyn AheadLookups>)>,
     /// Keeps the keys of this load for the next load.
     pub keep_keys: Box<dyn FnOnce(Arc<KeyList>)>,
     /// The project's share in what the workers keep from job to job.
@@ -298,12 +304,13 @@ impl ResolveAhead {
                     left: AtomicUsize::new(0),
                     answers: Arc::new(SharedResolutionCache::default()),
                     view: host.view,
-                    stats: WorkerStats::default(),
+                    stats: Arc::default(),
                     config: config.clone(),
                     inject_panic: INJECT_PANIC.with(Cell::get),
                 })
             });
         if let Some(job) = &job {
+            (host.attach)(job.stats.clone());
             host.share.epoch.set(Some(job.epoch));
         }
         let accept = match host.scratch.filter(|_| cfg!(debug_assertions)) {
@@ -805,7 +812,7 @@ struct Job {
     view: WorkerView,
     /// The OS lookups of the workers, as the host's per-snapshot cache
     /// keeps the loader's.
-    stats: WorkerStats,
+    stats: Arc<WorkerStats>,
     config: Arc<ResolverConfig>,
     /// `inject_worker_panic` (tests): each worker panics in the job,
     /// outside its resolutions.
@@ -950,13 +957,18 @@ impl KeptPackageJsons {
 }
 
 /// The OS lookups of a job's workers (`Job::stats`), as `StatCache`
-/// (files_parser.rs) keeps them, in shards by path, so the workers seldom
-/// wait for each other's lock.
+/// (files_parser.rs) keeps them, in shards by name, so the workers seldom
+/// wait for each other's lock. The workers of the job have one answer for
+/// each name. A `directory_exists` or `realpath` answer comes with its call
+/// (`AheadCall::Shared`), which the answers of the job share: the loader
+/// checks it once per load. The host's snapshot keeps the lookups after the
+/// load (`AheadLookups`).
 #[derive(Default)]
 struct WorkerStats {
     file_exists: [Mutex<FxHashMap<String, bool>>; STAT_SHARDS],
-    directory_exists: [Mutex<FxHashMap<String, bool>>; STAT_SHARDS],
-    realpath: [Mutex<FxHashMap<String, String>>; STAT_SHARDS],
+    /// The answer, and its call when the name is its path (`AheadCall`).
+    directory_exists: [Mutex<FxHashMap<String, (bool, Option<Arc<AheadCall>>)>>; STAT_SHARDS],
+    realpath: [Mutex<FxHashMap<String, (String, Arc<AheadCall>)>>; STAT_SHARDS],
 }
 
 const STAT_SHARDS: usize = 16;
@@ -966,13 +978,61 @@ impl WorkerStats {
         cached(&self.file_exists, path, load)
     }
 
-    fn directory_exists(&self, path: &str, load: impl FnOnce() -> bool) -> bool {
+    fn directory_exists(
+        &self,
+        path: &str,
+        load: impl FnOnce() -> (bool, Option<Arc<AheadCall>>),
+    ) -> (bool, Option<Arc<AheadCall>>) {
         cached(&self.directory_exists, path, load)
     }
 
-    fn realpath(&self, path: &str, load: impl FnOnce() -> String) -> String {
+    fn realpath(
+        &self,
+        path: &str,
+        load: impl FnOnce() -> (String, Arc<AheadCall>),
+    ) -> (String, Arc<AheadCall>) {
         cached(&self.realpath, path, load)
     }
+}
+
+/// The lookup answers of a resolve-ahead job (`WorkerStats`), which the
+/// workers got during the job's load. The host's snapshot file system takes
+/// an answer from them before it asks the OS
+/// (`ResolveAheadHost::attach`).
+pub trait AheadLookups: Send + Sync {
+    fn file_exists(&self, name: &str) -> Option<bool>;
+    fn directory_exists(&self, name: &str) -> Option<bool>;
+    fn realpath(&self, name: &str) -> Option<String>;
+}
+
+impl AheadLookups for WorkerStats {
+    fn file_exists(&self, name: &str) -> Option<bool> {
+        lock_shard(&self.file_exists, name).get(name).copied()
+    }
+
+    fn directory_exists(&self, name: &str) -> Option<bool> {
+        lock_shard(&self.directory_exists, name)
+            .get(name)
+            .map(|(exists, _)| *exists)
+    }
+
+    fn realpath(&self, name: &str) -> Option<String> {
+        lock_shard(&self.realpath, name)
+            .get(name)
+            .map(|(real, _)| real.clone())
+    }
+}
+
+/// The locked shard of `path`.
+fn lock_shard<'s, V>(
+    shards: &'s [Mutex<FxHashMap<String, V>>; STAT_SHARDS],
+    path: &str,
+) -> std::sync::MutexGuard<'s, FxHashMap<String, V>> {
+    use std::hash::BuildHasher;
+    let hash = rustc_hash::FxBuildHasher.hash_one(path);
+    shards[(hash >> 32) as usize % STAT_SHARDS]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The cached value of `path` in its shard, or `load()` stored as it. The
@@ -982,19 +1042,14 @@ fn cached<V: Clone>(
     path: &str,
     load: impl FnOnce() -> V,
 ) -> V {
-    use std::hash::BuildHasher;
-    let hash = rustc_hash::FxBuildHasher.hash_one(path);
-    let shard = &shards[(hash >> 32) as usize % STAT_SHARDS];
-    let lock = || {
-        shard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    };
-    if let Some(value) = lock().get(path) {
+    if let Some(value) = lock_shard(shards, path).get(path) {
         return value.clone();
     }
     let value = load();
-    lock().entry(path.to_string()).or_insert(value).clone()
+    lock_shard(shards, path)
+        .entry(path.to_string())
+        .or_insert(value)
+        .clone()
 }
 
 /// Go `module.ResolutionHost` of a worker resolver.
@@ -1032,17 +1087,30 @@ impl AheadFs {
     }
 
     /// Whether directory `path` exists, as `overlayFS.DirectoryExists`
-    /// answers it, and its path.
-    fn directory_lookup(&self, path: &str) -> (bool, Path) {
+    /// answers it, and the call to log: `None` when the name is not its
+    /// path (`AheadCall`). An answer of the OS is the job's shared call.
+    fn directory_lookup(&self, path: &str) -> (bool, Option<AheadCall>) {
         let canonical = self.path(path);
         let view = &self.job.view;
-        let exists = view.open_directories.contains(&canonical)
-            || !view.open_files.contains(&canonical)
-                && self
-                    .job
-                    .stats
-                    .directory_exists(path, || self.os.directory_exists(path));
-        (exists, canonical)
+        let open = view.open_directories.contains(&canonical);
+        if open || view.open_files.contains(&canonical) {
+            let call = (canonical.as_str() == path).then(|| AheadCall::DirectoryExists {
+                path: canonical,
+                exists: open,
+            });
+            return (open, call);
+        }
+        let (exists, call) = self.job.stats.directory_exists(path, || {
+            let exists = self.os.directory_exists(path);
+            let call = (canonical.as_str() == path).then(|| {
+                Arc::new(AheadCall::DirectoryExists {
+                    path: canonical,
+                    exists,
+                })
+            });
+            (exists, call)
+        });
+        (exists, call.map(AheadCall::Shared))
     }
 
     fn path(&self, name: &str) -> Path {
@@ -1143,11 +1211,11 @@ impl Fs for AheadFs {
 
     // Go: project/overlayfs.go:297 overlayFS.DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {
-        let (exists, canonical) = self.directory_lookup(path);
-        AheadFs::note_call(path, canonical, |path| AheadCall::DirectoryExists {
-            path,
-            exists,
-        });
+        let (exists, call) = self.directory_lookup(path);
+        match call {
+            Some(call) => note_ahead_call(call),
+            None => note_ahead_unshareable(None),
+        }
         exists
     }
 
@@ -1165,11 +1233,15 @@ impl Fs for AheadFs {
 
     // Go: project/overlayfs.go:360 overlayFS.Realpath
     fn realpath(&self, path: &str) -> String {
-        let real = self.job.stats.realpath(path, || self.os.realpath(path));
-        note_ahead_call(AheadCall::Realpath {
-            name: path.to_string(),
-            real: real.clone(),
+        let (real, call) = self.job.stats.realpath(path, || {
+            let real = self.os.realpath(path);
+            let call = Arc::new(AheadCall::Realpath {
+                name: path.to_string(),
+                real: real.clone(),
+            });
+            (real, call)
         });
+        note_ahead_call(AheadCall::Shared(call));
         real
     }
 }
@@ -1211,9 +1283,11 @@ fn debug_check_answer(
         AheadCall::Read { file_name, .. } => {
             seen.insert((scratch.to_path)(file_name));
         }
+        // `each` gives the calls of a `PackageJson` and a `Shared`.
         AheadCall::DirectoryExists { exists: true, .. }
         | AheadCall::Realpath { .. }
-        | AheadCall::PackageJson(_) => {}
+        | AheadCall::PackageJson(_)
+        | AheadCall::Shared(_) => {}
     });
     let (own_seen, own_missing) = (scratch.tracked)();
     assert!(

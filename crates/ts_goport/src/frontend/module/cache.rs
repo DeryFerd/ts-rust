@@ -619,15 +619,20 @@ pub enum AheadCall {
     /// entry (no `PackageJson` in them). One worker's answers that read the
     /// entry share them, so the loader checks them once per load.
     PackageJson(Arc<[AheadCall]>),
+    /// A `DirectoryExists` or `Realpath` that all the answers of the job
+    /// share (compiler/resolve_ahead.rs `WorkerStats`), so the loader checks
+    /// it once per load.
+    Shared(Arc<AheadCall>),
 }
 
 impl AheadCall {
     /// Calls `f` with each call of `calls`, the calls of a `PackageJson`
-    /// in its place.
+    /// or `Shared` in its place.
     pub fn each(calls: &[AheadCall], f: &mut impl FnMut(&AheadCall)) {
         for call in calls {
             match call {
                 AheadCall::PackageJson(group) => AheadCall::each(group, f),
+                AheadCall::Shared(call) => AheadCall::each(std::slice::from_ref(&**call), f),
                 call => f(call),
             }
         }
@@ -1160,15 +1165,13 @@ impl Caches {
     }
 
     /// The lookup of `package_json_path` by a worker answer that the loader
-    /// took (`ahead_package_jsons`), if one made it.
+    /// took (`ahead_package_jsons`), if one made it. The keys are names that
+    /// are their paths (`AheadCall`), so the name finds its key.
     #[must_use]
     pub fn ahead_package_json(&self, package_json_path: &str) -> Option<AheadPackageJson> {
-        let lookups = self.ahead_package_jsons.borrow();
-        if lookups.is_empty() {
-            return None;
-        }
-        lookups
-            .get(&self.package_json_info_cache.key(package_json_path))
+        self.ahead_package_jsons
+            .borrow()
+            .get(package_json_path)
             .copied()
     }
 

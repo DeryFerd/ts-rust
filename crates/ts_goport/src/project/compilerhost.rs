@@ -387,10 +387,23 @@ impl compiler::CompilerHost for CompilerHost {
             return None;
         }
         let (open_files, open_directories) = files.open_files_over_os()?;
+        let lookups = files.cached_fs()?;
+        ahead_lookup_layer(&lookups)?;
+        let job = Rc::new(Cell::new(usize::MAX));
+        let attach = {
+            let lookups = lookups.clone();
+            let job = job.clone();
+            Box::new(move |stats| {
+                if let Some(layer) = ahead_lookup_layer(&lookups) {
+                    job.set(layer.attach(stats));
+                }
+            }) as Box<dyn FnOnce(Arc<dyn compiler::resolve_ahead::AheadLookups>)>
+        };
         let load = AheadCheck {
-            lookups: files.cached_fs()?,
+            lookups,
+            job,
             reads: RefCell::new(FxHashMap::default()),
-            package_jsons: RefCell::new(FxHashSet::default()),
+            groups: RefCell::new(FxHashSet::default()),
         };
         let accept = {
             let source_fs = self.source_fs.clone();
@@ -434,6 +447,7 @@ impl compiler::CompilerHost for CompilerHost {
                 open_directories,
             },
             accept,
+            attach,
             keep_keys: Box::new(move |new_keys| *keys.borrow_mut() = Some(new_keys)),
             share: self.kept_share.borrow().clone()?,
             scratch,
@@ -450,14 +464,16 @@ impl compiler::CompilerHost for CompilerHost {
 /// - `file_exists`: the snapshot's cached file of the path decides, if it
 ///   has one (`SnapshotFSBuilder::cached_file_state`). A cached file that
 ///   needs a reload fails the check: the loader's lookup would read it.
-///   Else the snapshot's lookup cache decides (Go `cachedvfs` of the
-///   layered file system, which the worker read the same way: open files
-///   over the OS). When it has no answer for the path yet, the worker's
-///   answer becomes its answer (`CachedFs::agree_file_exists`), unless the
-///   worker's answer is `known` (not found in this load): then the check
-///   asks the layered file system through the cache.
-/// - `directory_exists` and `realpath`: the snapshot's lookup cache
-///   decides in the same way.
+///   Else the snapshot's lookup cache decides, if it has an answer (Go
+///   `cachedvfs` of the layered file system, which the worker read the same
+///   way: open files over the OS), and else the lookups of an earlier
+///   resolve-ahead job of the snapshot, if one has an answer
+///   (`AheadLookupLayer`). With neither, the answer passes: the cache takes
+///   this load's job answer, which is the worker's, when it is asked
+///   (`ResolveAheadHost::attach`). A `known` answer (not found in this load)
+///   is asked of the layered file system through the cache.
+/// - `directory_exists` and `realpath`: the same, and a call that the job's
+///   answers share (`AheadCall::Shared`) is checked once per load.
 /// - a read is the loader's own read (`SourceFS::get_file`: it tracks the
 ///   file, caches it and notes a `node_modules` realpath alias), made at
 ///   the moment the loader would make it, since every call before it gave
@@ -470,19 +486,36 @@ impl compiler::CompilerHost for CompilerHost {
 ///   are checked and replayed once per load: the snapshot does not change
 ///   its answers during the load, and the replay notes the same paths
 ///   again.
-///
-/// A worker answer that the check stores in the lookup cache and that a
-/// later call of the answer rejects stays there: the worker got it from
-/// the disk during this load, as one of Go's calls could have.
 /// What `accept_ahead_answer` keeps during one load.
 struct AheadCheck {
     /// The snapshot's lookup cache (`SnapshotFSBuilder::cached_fs`).
     lookups: Rc<vfs::CachedFs>,
+    /// The index of this load's job in the layer under `lookups`
+    /// (`AheadLookupLayer`; `usize::MAX` until the load gives the workers a
+    /// job).
+    job: Rc<Cell<usize>>,
     /// The hash of each file that the check read, by name.
     reads: RefCell<FxHashMap<String, Option<u128>>>,
-    /// The package.json call groups that passed the check and were
-    /// replayed, by address (the answers keep them for the whole load).
-    package_jsons: RefCell<FxHashSet<usize>>,
+    /// The shared calls (`AheadCall::PackageJson`, `AheadCall::Shared`)
+    /// that passed the check and were replayed, by address (the answers
+    /// keep them for the whole load).
+    groups: RefCell<FxHashSet<usize>>,
+}
+
+impl AheadCheck {
+    /// True when `answer`, a worker's answer for a lookup, is the answer of
+    /// the snapshot: `cached`, the answer of its lookup cache, or else the
+    /// answer of an earlier job (`before`), if it has one.
+    fn agrees<T: PartialEq>(
+        &self,
+        cached: Option<T>,
+        before: impl Fn(&dyn compiler::resolve_ahead::AheadLookups) -> Option<T>,
+        answer: &T,
+    ) -> bool {
+        cached
+            .or_else(|| ahead_lookup_layer(&self.lookups)?.before(self.job.get(), before))
+            .is_none_or(|snapshot| snapshot == *answer)
+    }
 }
 
 fn accept_ahead_answer(
@@ -523,15 +556,25 @@ fn check_ahead_call(
             CachedFileState::Absent if *known => {
                 vfs::Fs::file_exists(&*load.lookups, path.as_str()) == *exists
             }
-            CachedFileState::Absent => load.lookups.agree_file_exists(path.as_str(), *exists),
+            CachedFileState::Absent => load.agrees(
+                load.lookups.cached_file_exists(path.as_str()),
+                |lookups| lookups.file_exists(path.as_str()),
+                exists,
+            ),
             CachedFileState::Live => *exists,
             CachedFileState::NoValue => !*exists,
             CachedFileState::NeedsReload => false,
         },
-        AheadCall::DirectoryExists { path, exists } => {
-            load.lookups.agree_directory_exists(path.as_str(), *exists)
-        }
-        AheadCall::Realpath { name, real } => load.lookups.agree_realpath(name, real),
+        AheadCall::DirectoryExists { path, exists } => load.agrees(
+            load.lookups.cached_directory_exists(path.as_str()),
+            |lookups| lookups.directory_exists(path.as_str()),
+            exists,
+        ),
+        AheadCall::Realpath { name, real } => load.agrees(
+            load.lookups.cached_realpath(name),
+            |lookups| lookups.realpath(name),
+            real,
+        ),
         AheadCall::Read { file_name, hash } => {
             let known = load.reads.borrow().get(file_name).copied();
             let read = known.unwrap_or_else(|| {
@@ -542,10 +585,14 @@ fn check_ahead_call(
             read == *hash
         }
         AheadCall::PackageJson(group) => {
-            load.package_jsons.borrow().contains(&group_key(group))
+            load.groups.borrow().contains(&group_key(group))
                 || group
                     .iter()
                     .all(|call| check_ahead_call(source_fs, files, load, call))
+        }
+        AheadCall::Shared(call) => {
+            load.groups.borrow().contains(&shared_key(call))
+                || check_ahead_call(source_fs, files, load, call)
         }
     }
 }
@@ -562,10 +609,15 @@ fn replay_ahead_call(source_fs: &SourceFS, load: &AheadCheck, call: &AheadCall) 
         | AheadCall::Realpath { .. }
         | AheadCall::Read { .. } => {}
         AheadCall::PackageJson(group) => {
-            if load.package_jsons.borrow_mut().insert(group_key(group)) {
+            if load.groups.borrow_mut().insert(group_key(group)) {
                 for call in group.iter() {
                     replay_ahead_call(source_fs, load, call);
                 }
+            }
+        }
+        AheadCall::Shared(call) => {
+            if load.groups.borrow_mut().insert(shared_key(call)) {
+                replay_ahead_call(source_fs, load, call);
             }
         }
     }
@@ -573,4 +625,8 @@ fn replay_ahead_call(source_fs: &SourceFS, load: &AheadCheck, call: &AheadCall) 
 
 fn group_key(group: &Arc<[AheadCall]>) -> usize {
     Arc::as_ptr(group).cast::<AheadCall>() as usize
+}
+
+fn shared_key(call: &Arc<AheadCall>) -> usize {
+    Arc::as_ptr(call) as usize
 }

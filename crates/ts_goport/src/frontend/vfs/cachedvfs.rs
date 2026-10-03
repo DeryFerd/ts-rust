@@ -65,57 +65,32 @@ impl CachedFs {
     }
 }
 
-// PORT: not in Go. A language server load takes the answers of the
-// resolve-ahead workers (compiler/resolve_ahead.rs, project/compilerhost.rs)
-// as if its own call had made them: each method gives true when `answer`
-// is the answer of this cache for `path`, and stores it when the cache has
-// none yet. So the load has one answer per path, as with Go's calls. With
-// the cache off it asks the file system, as Go's call would.
+// PORT: not in Go. The cached answer for `path`, with no call: `None` when
+// the cache has none or is off. A language server load compares the
+// answers of its resolve-ahead workers with it (project/compilerhost.rs).
 impl CachedFs {
-    pub fn agree_file_exists(&self, path: &str, answer: bool) -> bool {
-        self.agree(&self.file_exists_cache, path, answer, || {
-            self.fs.file_exists(path)
-        })
+    pub fn cached_file_exists(&self, path: &str) -> Option<bool> {
+        self.cached(&self.file_exists_cache, path)
     }
 
-    pub fn agree_directory_exists(&self, path: &str, answer: bool) -> bool {
-        self.agree(&self.directory_exists_cache, path, answer, || {
-            self.fs.directory_exists(path)
-        })
+    pub fn cached_directory_exists(&self, path: &str) -> Option<bool> {
+        self.cached(&self.directory_exists_cache, path)
     }
 
-    pub fn agree_realpath(&self, path: &str, answer: &str) -> bool {
+    pub fn cached_realpath(&self, path: &str) -> Option<String> {
+        self.cached(&self.realpath_cache, path)
+    }
+
+    /// The file system that the cache asks.
+    pub fn wrapped(&self) -> &Rc<dyn Fs> {
+        &self.fs
+    }
+
+    fn cached<V: Clone>(&self, cache: &RefCell<FxHashMap<String, V>>, path: &str) -> Option<V> {
         if !self.enabled.get() {
-            return self.fs.realpath(path) == answer;
+            return None;
         }
-        let mut cache = self.realpath_cache.borrow_mut();
-        match cache.get(path) {
-            Some(cached) => cached == answer,
-            None => {
-                cache.insert(path.to_string(), answer.to_string());
-                true
-            }
-        }
-    }
-
-    fn agree(
-        &self,
-        cache: &RefCell<FxHashMap<String, bool>>,
-        path: &str,
-        answer: bool,
-        ask: impl FnOnce() -> bool,
-    ) -> bool {
-        if !self.enabled.get() {
-            return ask() == answer;
-        }
-        let mut cache = cache.borrow_mut();
-        match cache.get(path) {
-            Some(&cached) => cached == answer,
-            None => {
-                cache.insert(path.to_string(), answer);
-                true
-            }
-        }
+        cache_load(cache, path)
     }
 }
 
