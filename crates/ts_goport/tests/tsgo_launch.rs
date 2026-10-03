@@ -515,6 +515,102 @@ fn a_launcher_does_not_hold_a_signal_behind_another() {
     }
 }
 
+/// SIGHUP ends tsgo by SIGHUP, as Go's `dieFromSignal` does: sent to tsgo
+/// without a worker, to a launcher and to its worker. Where `env
+/// --default-signal` cannot run, the test says so and passes.
+#[test]
+fn a_sighup_ends_tsgo_by_sighup() {
+    let probe = Command::new("env").args(DEFAULT_HUP).arg("true").status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `env --default-signal=HUP` cannot run here");
+        return;
+    }
+    // `env` execs tsgo; the worker is its child.
+    for (launch, depth, case) in [
+        ("0", 0, "SIGHUP to tsgo without a worker"),
+        ("1", 0, "SIGHUP to the launcher"),
+        ("1", 1, "SIGHUP to the worker"),
+    ] {
+        let mut command = Command::new(DEFAULT_HUP[0]);
+        command
+            .args(&DEFAULT_HUP[1..])
+            .arg(env!("CARGO_BIN_EXE_tsgo"));
+        let (status, stderr, ended) = signal_run(command, launch, &[(depth, Signal::HUP)], case);
+        assert_eq!(status.signal(), Some(1), "{case}: {status} {stderr}");
+        assert_eq!(stderr, "", "{case}: stderr");
+        assert!(
+            ended < Duration::from_secs(1),
+            "{case}: ended {ended:?} after the signal"
+        );
+    }
+}
+
+/// tsgo catches SIGURG and SIGWINCH and drops them, as Go does (bin/tsgo.rs
+/// `GO_DROPPED`), also when they were ignored at start: Go sets its handler
+/// for them anyway, so a process that tsgo starts gets their default
+/// actions. /proc shows them caught and not ignored in tsgo, in a launcher
+/// and in its worker, and when they come the run goes on; SIGQUIT then ends
+/// it with Go's text and exit 2. Where `env --ignore-signal` cannot run,
+/// the test says so and passes.
+#[test]
+fn tsgo_catches_sigurg_and_sigwinch() {
+    const IGNORE: [&str; 2] = ["env", "--ignore-signal=URG,WINCH"];
+    let probe = Command::new(IGNORE[0])
+        .args(&IGNORE[1..])
+        .arg("true")
+        .status();
+    if !probe.is_ok_and(|status| status.success()) {
+        eprintln!("skipped: `env --ignore-signal=URG,WINCH` cannot run here");
+        return;
+    }
+    let dropped = bit(Signal::URG) | bit(Signal::WINCH);
+    let runs: [(&str, &[(usize, Signal)]); 2] = [
+        (
+            "0",
+            &[(0, Signal::URG), (0, Signal::WINCH), (0, Signal::QUIT)],
+        ),
+        (
+            "1",
+            &[
+                (0, Signal::URG),
+                (0, Signal::WINCH),
+                (1, Signal::URG),
+                (1, Signal::WINCH),
+                (0, Signal::QUIT),
+            ],
+        ),
+    ];
+    for (launch, signals) in runs {
+        let case = format!("SIGURG and SIGWINCH ignored at start, GOPORT_LAUNCH={launch}");
+        // `env` execs tsgo; the worker is its child.
+        let mut command = Command::new(IGNORE[0]);
+        command.args(&IGNORE[1..]).arg(env!("CARGO_BIN_EXE_tsgo"));
+        let check = |pid: u32| {
+            let mut pids = vec![pid];
+            if launch == "1" {
+                pids.extend(child_of(pid));
+                assert_eq!(pids.len(), 2, "{case}: no worker");
+            }
+            for pid in pids {
+                let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+                assert_eq!(
+                    mask(&status, "SigCgt:") & dropped,
+                    dropped,
+                    "{case}: {pid} caught"
+                );
+                assert_eq!(
+                    mask(&status, "SigIgn:") & dropped,
+                    0,
+                    "{case}: {pid} ignored"
+                );
+            }
+        };
+        let (status, stderr, _) = signal_run_with(command, launch, signals, &case, check);
+        assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
+        assert!(quit_once(&stderr), "{case}: {stderr}");
+    }
+}
+
 /// A launcher whose worker cannot start runs the work itself (bin/tsgo.rs
 /// `launch`), as a run that never was a launcher: a plain compile goes on
 /// after SIGINT and SIGTERM, and SIGQUIT ends it with Go's text and exit 2.
@@ -548,6 +644,60 @@ fn a_launcher_whose_worker_cannot_start() {
     });
     assert_eq!(status.code(), Some(2), "{case}: {status} {stderr}");
     assert!(quit_once(&stderr), "{case}: {stderr}");
+}
+
+/// A worker opens the launcher's end of the pipe only after it has checked
+/// the file at the number: a FIFO with the device and inode that the
+/// launcher passed (bin/tsgo.rs `send_code`). The first open (`O_PATH`)
+/// opens no end of a FIFO. Here the file at the number is a named FIFO
+/// with a reader or a writer that waits in its open for the other end:
+/// with the inode of another file, the worker must not wake them. With its
+/// own inode, the worker sends the code to the reader.
+#[test]
+fn a_worker_opens_only_the_launchers_pipe() {
+    use rustix::fs::{Mode, OFlags};
+    let this = std::process::id();
+    let dir = TempDir::new(std::env::temp_dir().join(format!("tsgo_launch-open-{this}")));
+    let path = dir.0.join("fifo");
+    rustix::fs::mkfifoat(rustix::fs::CWD, &path, Mode::RUSR | Mode::WUSR).unwrap();
+    // The launcher's file: the FIFO, by a file that opens neither end.
+    let named = rustix::fs::open(&path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap();
+    let stat = rustix::fs::fstat(&named).unwrap();
+    let runs = [
+        (
+            "a waiting reader, another inode",
+            false,
+            stat.st_ino + 1,
+            None,
+        ),
+        (
+            "a waiting writer, another inode",
+            true,
+            stat.st_ino + 1,
+            None,
+        ),
+        ("a waiting reader, its inode", false, stat.st_ino, Some(0)),
+    ];
+    for (case, writer, ino, sent) in runs {
+        let waiting = waiting_open(&path, writer);
+        let arg0 = fields_arg0(this, &named, stat.st_dev, ino);
+        let (status, stdout) = run(&arg0, &["--version"], "0", case);
+        assert_eq!(status.code(), Some(0), "{case}: {stdout}");
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            waiting.is_finished(),
+            sent.is_some(),
+            "{case}: the worker opened the FIFO"
+        );
+        // Opens the other end, so an open that still waits ends.
+        let _ = std::fs::File::options()
+            .read(writer)
+            .write(!writer)
+            .custom_flags(OFlags::NONBLOCK.bits().cast_signed())
+            .open(&path);
+        let expected = sent.map_or_else(Vec::new, |code: i32| code.to_le_bytes().to_vec());
+        assert_eq!(waiting.join().unwrap(), expected, "{case}: sent");
+    }
 }
 
 /// Starts `command` with `--all` and `GOPORT_LAUNCH=1`, sends SIGQUIT to
@@ -723,6 +873,38 @@ fn has_thread(pid: u32, name: &str) -> bool {
         std::fs::read(task.path().join("comm"))
             .is_ok_and(|comm| comm.strip_suffix(b"\n") == Some(name))
     })
+}
+
+/// A thread that opens the FIFO at `path` for writing (`writer`) or for
+/// reading and waits there for the other end. A reader then reads to the
+/// end of file. The thread returns what it read. This returns once the
+/// thread waits (its state in /proc is sleeping).
+fn waiting_open(path: &Path, writer: bool) -> std::thread::JoinHandle<Vec<u8>> {
+    let path = path.to_path_buf();
+    let (send, receive) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        send.send(nix::unistd::gettid().as_raw()).unwrap();
+        let mut file = std::fs::File::options()
+            .read(!writer)
+            .write(writer)
+            .open(&path)
+            .unwrap();
+        let mut read = Vec::new();
+        if !writer {
+            file.read_to_end(&mut read).unwrap();
+        }
+        read
+    });
+    let tid = receive.recv().unwrap();
+    let start = Instant::now();
+    loop {
+        let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status")).unwrap();
+        if field(&status, "State:").starts_with('S') {
+            return thread;
+        }
+        assert!(start.elapsed() < LIMIT, "the open does not wait");
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// `env` with the default action of SIGHUP, also when the test runs under
