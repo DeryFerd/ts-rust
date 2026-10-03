@@ -14,6 +14,12 @@
 //! - `notify` gives no event IDs. The events go in with the event list's own
 //!   sequence, as on the other backends, and the watcher has no `sequence`
 //!   (Go: FSEventsGetCurrentEventId).
+//! - `notify` gives no batches. Go notifies each touched watch once, after
+//!   it has routed every record of a callback; the debouncer fires at once
+//!   on the first notify after a quiet time, so a notify per event would
+//!   deliver a record's first flag alone. The port notifies the touched
+//!   watches once no event has come for 1 ms (Go's stream latency), and at
+//!   the latest 20 ms after the first event.
 //! - `notify` gives each FSEvents record as one event per flag. Go classifies
 //!   the whole record: a remove with no create is a delete with no syscall;
 //!   a rename, or a remove with a create, is an update when the path exists
@@ -23,9 +29,17 @@
 //!   the update of the next record.
 //! - `notify` watches only paths that exist, and it reports no stream create
 //!   or start failure. A watch root that is gone when the stream set is made
-//!   again is left out (Go keeps it in the stream). So the fallback to
-//!   streams of `FSEVENTS_PATHS_PER_STREAM` paths runs only when `notify`
-//!   cannot make a watcher at all.
+//!   again is left out, so its watch gets no events until it is made again
+//!   (Go keeps the path in the stream). A stream that fails to start leaves
+//!   its watches silent, with no error, and the fallback to streams of
+//!   `FSEVENTS_PATHS_PER_STREAM` paths does not run in practice.
+//! - `notify` aborts the process on an event path that is not UTF-8. APFS and
+//!   HFS+ reject such names.
+//! - The old streams stop on a thread of their own: `notify` waits for an
+//!   idle run loop, which can take long while the tree changes fast (Go waits
+//!   only for the callbacks already queued). Their late events reach the
+//!   new watches twice, which the event lists merge, and skip the closed
+//!   watches, which are marked terminated.
 //! - `notify` routes events by the canonical path of each watch root.
 //!   `DirWatch::physical_dir` is the root with its symlinks resolved, so the
 //!   routing below matches Go's.
@@ -47,18 +61,19 @@ use crate::fswatch::syscall;
 use crate::fswatch::walkdir::path_error;
 use crate::gostd::errors;
 
-// Go: fsevents_darwin.go:219 errCFStringCreateNull and the other stream
-// errors. PORT: `notify` reports only that it could not make a watcher.
+// Go: fsevents_darwin.go:215 errStreamCreateNull (and the other stream
+// errors). PORT: `notify` reports no stream create or start failure, so the
+// port uses only this one, for a `notify` watcher it cannot make.
 pub static ERR_STREAM_CREATE_NULL: LazyLock<GoError> =
     LazyLock::new(|| errors::new("FSEventStreamCreate returned NULL"));
 
-// Go: fsevents_darwin.go:226 errFSEventsUserDropped
+// Go: fsevents_darwin.go:220 errFSEventsUserDropped
 pub static ERR_FSEVENTS_USER_DROPPED: LazyLock<GoError> =
     LazyLock::new(|| overflow_error("events were dropped by the FSEvents client"));
-// Go: fsevents_darwin.go:227 errFSEventsKernelDropped
+// Go: fsevents_darwin.go:221 errFSEventsKernelDropped
 pub static ERR_FSEVENTS_KERNEL_DROPPED: LazyLock<GoError> =
     LazyLock::new(|| overflow_error("events were dropped by the kernel"));
-// Go: fsevents_darwin.go:228 errFSEventsTooMany
+// Go: fsevents_darwin.go:222 errFSEventsTooMany
 pub static ERR_FSEVENTS_TOO_MANY: LazyLock<GoError> =
     LazyLock::new(|| overflow_error("too many events"));
 
@@ -81,30 +96,30 @@ fn watched_directory_removed() -> GoError {
     )
 }
 
-// Go: fsevents_darwin.go:230 fseventsPathsPerStream
+// Go: fsevents_darwin.go:225 fseventsPathsPerStream
 pub const FSEVENTS_PATHS_PER_STREAM: usize = 512;
 
-// Go: fsevents_darwin.go:160 fseventsState
+// Go: fsevents_darwin.go:161 fseventsState
 #[derive(Default)]
 pub struct FseventsState {
     pub terminated: AtomicBool,
 }
 
-// Go: fsevents_darwin.go:232 fseventsWatchSnapshot
+// Go: fsevents_darwin.go:227 fseventsWatchSnapshot
 #[derive(Clone)]
 pub struct FseventsWatchSnapshot {
     pub w: Arc<DirWatch>,
     pub state: Arc<FseventsState>,
 }
 
-// Go: fsevents_darwin.go:164 fseventsStream
+// Go: fsevents_darwin.go:165 fseventsStream
 /// PORT: the `notify` watcher is the stream and its callback. Dropping it
 /// stops the run loop and joins its thread (Go: teardownStream).
 pub struct FseventsStream {
     watcher: Mutex<Option<FsEventWatcher>>,
 }
 
-// Go: fsevents_darwin.go:172 fsEventsBackend
+// Go: fsevents_darwin.go:174 fsEventsBackend
 pub struct FsEventsBackend {
     pub base: WatcherBase,
     mu: Mutex<FsEventsBackendLocked>,
@@ -119,7 +134,7 @@ struct FsEventsBackendLocked {
     streams: Vec<Arc<FseventsStream>>,
 }
 
-// Go: fsevents_darwin.go:180 init
+// Go: fsevents_darwin.go:182 init
 // PORT: Go also sets `fseventsWatcher.sequence`; the port has no event IDs
 // (see the file comment).
 pub fn init(fsevents_watcher: &mut WatcherStruct) {
@@ -127,7 +142,7 @@ pub fn init(fsevents_watcher: &mut WatcherStruct) {
     fsevents_watcher.factory = Some(factory);
 }
 
-// Go: fsevents_darwin.go:185 newFSEventsBackend
+// Go: fsevents_darwin.go:187 newFSEventsBackend
 pub fn new_fs_events_backend() -> Arc<FsEventsBackend> {
     Arc::new_cyclic(|self_: &std::sync::Weak<FsEventsBackend>| {
         let b = FsEventsBackend {
@@ -140,7 +155,7 @@ pub fn new_fs_events_backend() -> Arc<FsEventsBackend> {
     })
 }
 
-// Go: fsevents_darwin.go:198 checkWatcher
+// Go: fsevents_darwin.go:201 checkWatcher
 pub fn check_watcher(w: &Arc<DirWatch>) -> Result<(), GoError> {
     let dir_watch_error = |err| DirWatchError {
         err,
@@ -155,7 +170,7 @@ pub fn check_watcher(w: &Arc<DirWatch>) -> Result<(), GoError> {
     }
 }
 
-// Go: fsevents_darwin.go:237 fsEventsBackend.activeWatchesLocked
+// Go: fsevents_darwin.go:232 fsEventsBackend.activeWatchesLocked
 fn active_watches_locked(l: &FsEventsBackendLocked) -> Vec<FseventsWatchSnapshot> {
     l.watches
         .iter()
@@ -164,7 +179,7 @@ fn active_watches_locked(l: &FsEventsBackendLocked) -> Vec<FseventsWatchSnapshot
         .collect()
 }
 
-// Go: fsevents_darwin.go:252 startFSEventsStreams
+// Go: fsevents_darwin.go:247 startFSEventsStreams
 /// One stream for all the physical watch roots, sorted; streams of
 /// `FSEVENTS_PATHS_PER_STREAM` roots when that one cannot start. `start` is a
 /// parameter for the tests, as in Go.
@@ -192,7 +207,7 @@ pub fn start_fs_events_streams<S>(
     Ok(streams)
 }
 
-// Go: fsevents_darwin.go:290 watchesForFSEventsPaths
+// Go: fsevents_darwin.go:284 watchesForFSEventsPaths
 /// The watches whose physical root is in `paths` (sorted).
 pub fn watches_for_fs_events_paths(
     watches: &[FseventsWatchSnapshot],
@@ -205,7 +220,7 @@ pub fn watches_for_fs_events_paths(
         .collect()
 }
 
-// Go: fsevents_darwin.go:304 fsEventsBackend.startStream
+// Go: fsevents_darwin.go:298 fsEventsBackend.startStream
 /// One stream over `paths`, routing to `watches`.
 ///
 /// PORT: Go builds the CFArray of paths and starts the stream on a GCD
@@ -217,11 +232,38 @@ fn start_stream(
     watches: &[FseventsWatchSnapshot],
 ) -> Result<Arc<FseventsStream>, GoError> {
     let routes = watches.to_vec();
+    let (touched_tx, touched_rx) = std::sync::mpsc::channel::<Arc<DirWatch>>();
     let handler = move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res {
-            fs_events_callback(&routes, &event);
+            for w in fs_events_callback(&routes, &event) {
+                let _ = touched_tx.send(w);
+            }
         }
     };
+    // Notifies the touched watches once no event has come for 1 ms, and at
+    // the latest 20 ms after the first. It ends when the stream drops the
+    // handler.
+    crate::core::GoThread::new().spawn(move || {
+        use std::time::{Duration, Instant};
+        while let Ok(first) = touched_rx.recv() {
+            let last = Instant::now() + Duration::from_millis(20);
+            let mut touched = vec![first];
+            while let Some(wait) = last
+                .checked_duration_since(Instant::now())
+                .map(|left| left.min(Duration::from_millis(1)))
+            {
+                let Ok(w) = touched_rx.recv_timeout(wait) else {
+                    break;
+                };
+                if !touched.iter().any(|t| Arc::ptr_eq(t, &w)) {
+                    touched.push(w);
+                }
+            }
+            for w in &touched {
+                w.notify();
+            }
+        }
+    });
     let mut watcher = FsEventWatcher::new(handler, notify::Config::default())
         .map_err(|_| ERR_STREAM_CREATE_NULL.clone())?;
     let mut batch = watcher.paths_mut();
@@ -234,16 +276,21 @@ fn start_stream(
     }))
 }
 
-// Go: fsevents_darwin.go:385 stopFSEventsStreams
-/// PORT: Go's atomic swap makes a second stop a no-op; `take` does that.
+// Go: fsevents_darwin.go:383 stopFSEventsStreams
+/// PORT: Go's atomic swap makes a second stop a no-op; `take` does that. The
+/// streams stop on a thread of their own (see the file comment).
 fn stop_fs_events_streams(streams: Vec<Arc<FseventsStream>>) {
-    for stream in streams {
-        drop(stream.watcher.lock().unwrap().take());
+    let watchers: Vec<FsEventWatcher> = streams
+        .iter()
+        .filter_map(|stream| stream.watcher.lock().unwrap().take())
+        .collect();
+    if !watchers.is_empty() {
+        crate::core::GoThread::new().spawn(move || drop(watchers));
     }
 }
 
 impl FsEventsBackend {
-    // Go: fsevents_darwin.go:411 fsEventsBackend.subscribeMany
+    // Go: fsevents_darwin.go:408 fsEventsBackend.subscribeMany
     fn subscribe_watches(&self, watches_to_add: &[Arc<DirWatch>]) -> Result<(), GoError> {
         if watches_to_add.is_empty() {
             return Ok(());
@@ -307,23 +354,23 @@ impl FsEventsBackend {
 }
 
 impl WatcherImpl for FsEventsBackend {
-    // Go: fsevents_darwin.go:193 fsEventsBackend.start
+    // Go: fsevents_darwin.go:195 fsEventsBackend.start
     fn start(&self) -> Result<(), GoError> {
         self.base.notify_started();
         Ok(())
     }
 
-    // Go: fsevents_darwin.go:407 fsEventsBackend.subscribe
+    // Go: fsevents_darwin.go:404 fsEventsBackend.subscribe
     fn subscribe(&self, w: &Arc<DirWatch>) -> Result<(), GoError> {
         self.subscribe_watches(std::slice::from_ref(w))
     }
 
-    // Go: fsevents_darwin.go:411 fsEventsBackend.subscribeMany
+    // Go: fsevents_darwin.go:408 fsEventsBackend.subscribeMany
     fn subscribe_many(&self, watches: &[Arc<DirWatch>]) -> Option<Result<(), GoError>> {
         Some(self.subscribe_watches(watches))
     }
 
-    // Go: fsevents_darwin.go:449 fsEventsBackend.closeWatch
+    // Go: fsevents_darwin.go:450 fsEventsBackend.closeWatch
     fn close_watch(&self, w: &Arc<DirWatch>) -> Result<(), GoError> {
         let state = w.state.lock().unwrap().take();
         let Some(state) = state.and_then(|s| s.downcast::<Arc<FseventsState>>().ok()) else {
@@ -355,12 +402,17 @@ enum Change {
     Updated,
 }
 
-// Go: fsevents_darwin.go:479 fsEventsCallback
+// Go: fsevents_darwin.go:482 fsEventsCallback
 /// Routes one `notify` event to the watches of its stream.
 ///
 /// PORT: called on the stream's run loop thread with one flag of one
 /// FSEvents record (Go: one batch of records on the event loop goroutine).
-pub fn fs_events_callback(watches: &[FseventsWatchSnapshot], event: &notify::Event) {
+/// It returns the touched watches; `start_stream` notifies them (see the
+/// file comment).
+pub fn fs_events_callback(
+    watches: &[FseventsWatchSnapshot],
+    event: &notify::Event,
+) -> Vec<Arc<DirWatch>> {
     let change = match event.kind {
         // `notify` reports an unmount as a remove (Go: an update).
         EventKind::Remove(_) if event.info() != Some("mount") => Change::RemovedOrRenamed,
@@ -384,7 +436,8 @@ pub fn fs_events_callback(watches: &[FseventsWatchSnapshot], event: &notify::Eve
             continue;
         }
 
-        if event.flag() == Some(Flag::Rescan) {
+        // Go also routes a MustScanSubDirs record as an update below.
+        let change = if event.flag() == Some(Flag::Rescan) {
             let overflow = match event.info() {
                 Some("rescan: user dropped") => &ERR_FSEVENTS_USER_DROPPED,
                 Some("rescan: kernel dropped") => &ERR_FSEVENTS_KERNEL_DROPPED,
@@ -398,8 +451,10 @@ pub fn fs_events_callback(watches: &[FseventsWatchSnapshot], event: &notify::Eve
                     touch(&watch.w);
                 }
             }
-            continue;
-        }
+            Change::Updated
+        } else {
+            change
+        };
 
         let mut path_exists: Option<bool> = None;
         for watch in watches {
@@ -449,12 +504,10 @@ pub fn fs_events_callback(watches: &[FseventsWatchSnapshot], event: &notify::Eve
         }
     }
 
-    for w in &touched {
-        w.notify();
-    }
+    touched
 }
 
-// Go: fsevents_darwin.go:618 fseventsDisplayPath
+// Go: fsevents_darwin.go:626 fseventsDisplayPath
 /// `raw_path` under the watch's physical root (or its logical root), as a
 /// path under the logical root `w.dir`.
 pub fn fs_events_display_path(w: &DirWatch, raw_path: &str) -> Option<String> {
@@ -485,7 +538,7 @@ pub fn fs_events_display_path(w: &DirWatch, raw_path: &str) -> Option<String> {
     None
 }
 
-// Go: fsevents_darwin.go:640 fseventsOverflowMatches
+// Go: fsevents_darwin.go:643 fseventsOverflowMatches
 /// True when the overflow at `raw_path` is in the watched tree or above it.
 pub fn fs_events_overflow_matches(w: &DirWatch, raw_path: &str) -> bool {
     let mut raw = ComparisonPath {

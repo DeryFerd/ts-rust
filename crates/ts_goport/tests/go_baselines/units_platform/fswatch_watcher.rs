@@ -1808,13 +1808,7 @@ fn test_default_backend_matches_platform() {
             }
         }
         "android" => "inotify",
-        "macos" => {
-            if fswatch::fs_events().available() {
-                "fsevents"
-            } else {
-                "kqueue"
-            }
-        }
+        "macos" => "fsevents",
         "windows" => "windows",
         "freebsd" | "openbsd" | "netbsd" | "dragonfly" => "kqueue",
         _ => {
