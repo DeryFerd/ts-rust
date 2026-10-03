@@ -337,7 +337,6 @@ impl ResolveAhead {
             queue: job.as_ref().map(|job| job.queue.clone()),
             cursor: Cell::new(0),
             stats: Cell::new(AheadStats::default()),
-            package_jsons: RefCell::default(),
         });
         if mode() == Mode::Force
             && let Some((job, workers)) = job.as_ref().zip(Workers::get())

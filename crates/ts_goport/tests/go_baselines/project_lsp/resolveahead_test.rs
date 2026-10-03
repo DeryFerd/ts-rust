@@ -692,9 +692,10 @@ os_child_test! {
     /// the package.json files stay on the workers. A later lookup of the
     /// program's resolver (`Program::get_package_json_info`, as auto-imports
     /// make) must find the package.json lookups of the taken answers, as Go's
-    /// one cache of the load's resolutions has them, with no file system
-    /// call: here the disk changed after the load and the snapshot's lookup
-    /// cache is empty, so a call would find the new disk. `broken` has a
+    /// one cache of the load's resolutions has them. Here the disk changed
+    /// after the load and the snapshot's lookup cache is empty, so only the
+    /// load job's lookups (`AheadLookupLayer`) give the taken answers; a disk
+    /// call would find the new disk. `broken` has a
     /// package.json but no types file, and `not-installed` has no directory;
     /// no file of the program is in them, so the loader did not look them up
     /// itself.
