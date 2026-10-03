@@ -731,7 +731,7 @@ fn has_dot_or_empty_segment(b: &[u8]) -> bool {
         || SLASH_DOT.find_iter(b).any(|i| dot_segment(i + 1))
 }
 
-// Go: tspath/path.go:531 hasRelativePathSegment (the debug check of
+// Go: tspath/path.go:532 hasRelativePathSegment (the debug check of
 // `has_relative_path_segment`).
 fn has_relative_path_segment_go(p: &str) -> bool {
     let b = p.as_bytes();

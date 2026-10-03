@@ -827,7 +827,7 @@ impl Fs for AheadFs {
         self.os.use_case_sensitive_file_names()
     }
 
-    // Go: project/overlayfs.go:276 overlayFS.FileExists
+    // Go: project/overlayfs.go:271 overlayFS.FileExists
     // PORT: a file that earlier jobs found is known to exist with no OS
     // call; the loader checks that answer (`AheadCall::FileExists`).
     fn file_exists(&self, path: &str) -> bool {
@@ -854,7 +854,7 @@ impl Fs for AheadFs {
         exists
     }
 
-    // Go: project/overlayfs.go:285 overlayFS.ReadFile
+    // Go: project/overlayfs.go:280 overlayFS.ReadFile
     fn read_file(&self, path: &str) -> (String, bool) {
         let canonical = self.path(path);
         let view = &self.job.view;
@@ -897,7 +897,7 @@ impl Fs for AheadFs {
         self.os.chtimes(path, a_time, m_time)
     }
 
-    // Go: project/overlayfs.go:302 overlayFS.DirectoryExists
+    // Go: project/overlayfs.go:297 overlayFS.DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {
         let (exists, canonical) = self.directory_lookup(path);
         if !exists {
@@ -918,7 +918,7 @@ impl Fs for AheadFs {
         self.os.stat(path)
     }
 
-    // Go: project/overlayfs.go:361 overlayFS.Realpath
+    // Go: project/overlayfs.go:360 overlayFS.Realpath
     fn realpath(&self, path: &str) -> String {
         self.job.stats.realpath(path, || self.os.realpath(path))
     }
