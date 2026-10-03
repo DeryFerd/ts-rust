@@ -21,7 +21,7 @@ use ts_goport::frontend::tspath::Path;
 use ts_goport::prelude::*;
 use ts_goport::program::{note_parsed_source_file, publish_parsed_files};
 
-// Go: scanner/scanner_test.go:11 TestScanStringPreservesLoneSurrogates
+// Go: scanner/scanner_test.go:13 TestScanStringPreservesLoneSurrogates
 // PORT: Go strings hold lone surrogates as WTF-8 bytes. The port keeps them
 // in its Go string form (`scanner_util::GO_STRING_MARKER`), which
 // `encode_js_string_rune` also writes.
@@ -38,7 +38,7 @@ fn test_scan_string_preserves_lone_surrogates() {
     assert_eq!(s.token_value(), expected);
 }
 
-// Go: parser/parser_test.go:166 TestHeritageClauseElementKinds
+// Go: parser/parser_test.go:158 TestHeritageClauseElementKinds
 #[test]
 fn test_heritage_clause_element_kinds() {
     let source_text = r#"
@@ -104,7 +104,7 @@ class MissingImplements implements B. {}
     );
 }
 
-// Go: parser/parser_test.go:164 TestJSDocImportTypeParentChain
+// Go: parser/parser_test.go:189 TestJSDocImportTypeParentChain
 // PORT: `GetSourceFileOfNode` reads the Go file data of the file, which
 // exists once its node store is published. Publishing is process-wide, so
 // the test runs in a child process of its own.
@@ -176,7 +176,7 @@ test("", async function () {
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
-// Go: parser/parser_test.go:244 TestJSDocTypeSourceSurvivesReparse
+// Go: parser/parser_test.go:236 TestJSDocTypeSourceSurvivesReparse
 // PORT: `GetTextOfNode` reads the source file of the node, which exists once
 // its node store is published, so the test runs in a child process (see
 // `test_js_doc_import_type_parent_chain`).
@@ -243,7 +243,65 @@ const value = 0;"#;
     t.finish();
 }
 
-// Go: parser/parser_test.go:292 TestJSDocTypeSourcePropagatesToConstructedReparse
+// PORT: no Go counterpart. Go cuts a JSDoc comment that ends the file 2
+// bytes before its end (jsdoc.go:163), here inside the 3 bytes of `日`. The
+// string literal type keeps the first byte of the char, so its node ends
+// inside the char, and Go `GetTextOfNodeFromSourceText` (utilities.go:72)
+// slices the bytes there. Declaration emit of the reparsed type alias reads
+// it: the d.ts holds `"` and the byte E6, as Go writes it. R159 panicked on
+// the `&str` slice (CLI exit 70).
+#[test]
+fn test_text_of_js_doc_node_that_ends_inside_a_char() {
+    let source_text = "/** @typedef {\"日";
+    let opts = SourceFileParseOptions {
+        file_name: "/index.js".to_string(),
+        path: Path("/index.js".to_string()),
+        ..Default::default()
+    };
+    let file = parse_source_file(&opts, leak(source_text), ScriptKind::JS);
+    let type_alias = file
+        .statements()
+        .nodes()
+        .iter()
+        .find(|&s| is_js_type_alias_declaration(s))
+        .expect("the reparsed @typedef");
+    let literal = type_alias.type_().literal();
+    assert!(is_string_literal(literal));
+    // Go: the literal ends 1 byte into `日` (bytes 15 to 18).
+    assert_eq!((literal.pos(), literal.end()), (14, 16));
+    assert_eq!(
+        get_text_of_node_from_source_text(source_text, literal, false),
+        go_string_from_bytes(b"\"\xE6".to_vec())
+    );
+}
+
+// PORT: no Go counterpart. A missing `@typedef` name reports "Identifier
+// expected" on the char before the name (reparser.go:49), Go `pos-1`: one
+// Go byte back. The char before is the invalid byte FF, 1 Go byte and 7
+// port bytes (`scanner_util::GO_STRING_MARKER`), so the error starts at the
+// unit, not 1 port byte back inside it. Go N: (15, 16) in Go bytes. The
+// port's start inside the unit ended after its start, and `--pretty` then
+// panicked (a negative squiggle length).
+#[test]
+fn test_missing_typedef_name_error_starts_one_go_byte_back() {
+    let source_text = go_string_from_bytes(b"/** @typedef {\"\xFFyz".to_vec());
+    let opts = SourceFileParseOptions {
+        file_name: "/index.js".to_string(),
+        path: Path("/index.js".to_string()),
+        ..Default::default()
+    };
+    let file = parse_source_file(&opts, leak(&source_text), ScriptKind::JS);
+    let found: Vec<_> = file
+        .diagnostics
+        .iter()
+        .filter(|d| d.code() == 1003)
+        .map(|d| (d.pos(), d.end()))
+        .collect();
+    // The unit of FF is port bytes 15 to 22.
+    assert_eq!(found, [(15, 22)]);
+}
+
+// Go: parser/parser_test.go:284 TestJSDocTypeSourcePropagatesToConstructedReparse
 #[test]
 fn test_js_doc_type_source_propagates_to_constructed_reparse() {
     in_child(
@@ -341,7 +399,7 @@ fn check_lazy_js_doc_calls(file: Node) {
     assert_eq!(f.eager_js_doc(file).to_vec(), first);
 }
 
-// Go: parser/parser_test.go:319 TestSourceFilePositionMapWithNonASCIIStringLiteral
+// Go: parser/parser_test.go:311 TestSourceFilePositionMapWithNonASCIIStringLiteral
 // PORT: renamed from TestSourceFileContainsNonASCIIInStringLiteralFastPath
 // (old Rust name `test_source_file_contains_non_ascii_in_string_literal_fast_path`)
 // by tsgo#4776, which also dropped the `ContainsNonASCII` assert.

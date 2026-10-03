@@ -49,7 +49,7 @@ fn as_kind(node: Node, kind: SyntaxKind) -> Node {
     node
 }
 
-// Go: api/encoder/decoder_test.go:16 parseSourceFile
+// Go: api/encoder/decoder_test.go:17 parseSourceFile
 // PORT: the encoder tests call `parser.ParseSourceFile` with the same
 // options inline; they use this helper too. Go returns the `*ast.SourceFile`
 // with its parser fields. Here the parse is recorded
@@ -462,15 +462,15 @@ fn test_build_node_index_table_matches_encode() {
 }
 
 // Go: api/encoder/encoder_test.go:144 BenchmarkEncodeSourceFile
-// Go: api/encoder/encoder_test.go:160 BenchmarkBuildNodeIndexTable
+// Go: api/encoder/encoder_test.go:159 BenchmarkBuildNodeIndexTable
 // PORT: not ported (benchmarks).
 
-// Go: api/encoder/encoder_test.go:175 readUint32
+// Go: api/encoder/encoder_test.go:173 readUint32
 fn read_uint32(buf: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(buf[offset..offset + 4].try_into().expect("four bytes"))
 }
 
-// Go: api/encoder/encoder_test.go:179 formatEncodedSourceFile
+// Go: api/encoder/encoder_test.go:177 formatEncodedSourceFile
 fn format_encoded_source_file(encoded: &[u8]) -> String {
     let mut result = String::new();
     let offset_nodes = read_uint32(encoded, HEADER_OFFSET_NODES);
@@ -548,7 +548,7 @@ fn first_variable_declaration(decoded: Node, i: usize) -> Node {
     )
 }
 
-// Go: api/encoder/decoder_test.go:23 TestDecodeSourceFile_Basic
+// Go: api/encoder/decoder_test.go:24 TestDecodeSourceFile_Basic
 #[test]
 fn test_decode_source_file_basic() {
     let sf = parse_source_file("let x = 1;");
@@ -621,7 +621,7 @@ fn test_decode_source_file_metadata() {
     t.finish();
 }
 
-// Go: api/encoder/decoder_test.go:38 TestDecodeSourceFile_Statements
+// Go: api/encoder/decoder_test.go:72 TestDecodeSourceFile_Statements
 #[test]
 fn test_decode_source_file_statements() {
     let sf = parse_source_file("let a = 1;\nlet b = 2;\nlet c = 3;");
@@ -634,7 +634,7 @@ fn test_decode_source_file_statements() {
     }
 }
 
-// Go: api/encoder/decoder_test.go:52 TestDecodeSourceFile_VariableDeclaration
+// Go: api/encoder/decoder_test.go:86 TestDecodeSourceFile_VariableDeclaration
 #[test]
 fn test_decode_source_file_variable_declaration() {
     let sf = parse_source_file("let x = 1;");
@@ -665,7 +665,7 @@ fn test_decode_source_file_variable_declaration() {
     );
 }
 
-// Go: api/encoder/decoder_test.go:75 TestDecodeSourceFile_VariableDeclarationListFlags
+// Go: api/encoder/decoder_test.go:109 TestDecodeSourceFile_VariableDeclarationListFlags
 #[test]
 fn test_decode_source_file_variable_declaration_list_flags() {
     struct Test {
@@ -716,7 +716,7 @@ fn test_decode_source_file_variable_declaration_list_flags() {
     t.finish();
 }
 
-// Go: api/encoder/decoder_test.go:105 TestDecodeSourceFile_FunctionDeclaration
+// Go: api/encoder/decoder_test.go:139 TestDecodeSourceFile_FunctionDeclaration
 #[test]
 fn test_decode_source_file_function_declaration() {
     let sf = parse_source_file("function add(a: number, b: number): number { return a + b; }");
@@ -740,7 +740,7 @@ fn test_decode_source_file_function_declaration() {
     assert!(param0.type_().is_some());
 }
 
-// Go: api/encoder/decoder_test.go:127 TestDecodeSourceFile_ImportDeclaration
+// Go: api/encoder/decoder_test.go:161 TestDecodeSourceFile_ImportDeclaration
 #[test]
 fn test_decode_source_file_import_declaration() {
     let sf = parse_source_file(r#"import { bar } from "bar";"#);
@@ -765,7 +765,7 @@ fn test_decode_source_file_import_declaration() {
     assert_eq!(as_kind(spec.name(), SyntaxKind::Identifier).text(), "bar");
 }
 
-// Go: api/encoder/decoder_test.go:150 TestDecodeSourceFile_IfStatement
+// Go: api/encoder/decoder_test.go:184 TestDecodeSourceFile_IfStatement
 #[test]
 fn test_decode_source_file_if_statement() {
     let sf = parse_source_file("if (true) { } else { }");
@@ -781,7 +781,7 @@ fn test_decode_source_file_if_statement() {
     assert_eq!(if_stmt.else_statement().kind(), SyntaxKind::Block);
 }
 
-// Go: api/encoder/decoder_test.go:167 TestDecodeSourceFile_TemplateExpression
+// Go: api/encoder/decoder_test.go:201 TestDecodeSourceFile_TemplateExpression
 #[test]
 fn test_decode_source_file_template_expression() {
     let sf = parse_source_file("let x = `hello ${name} world`;");
@@ -812,7 +812,7 @@ fn test_decode_source_file_template_expression() {
     );
 }
 
-// Go: api/encoder/decoder_test.go:190 TestDecodeSourceFile_ExportModifier
+// Go: api/encoder/decoder_test.go:224 TestDecodeSourceFile_ExportModifier
 #[test]
 fn test_decode_source_file_export_modifier() {
     let sf = parse_source_file("export function foo() {}");
@@ -829,7 +829,7 @@ fn test_decode_source_file_export_modifier() {
     );
 }
 
-// Go: api/encoder/decoder_test.go:205 TestDecodeSourceFile_Positions
+// Go: api/encoder/decoder_test.go:239 TestDecodeSourceFile_Positions
 #[test]
 fn test_decode_source_file_positions() {
     let code = "let x = 1;";
@@ -842,7 +842,7 @@ fn test_decode_source_file_positions() {
     assert_eq!(decoded.end(), code.len() as i32);
 }
 
-// Go: api/encoder/decoder_test.go:219 TestDecodeSourceFile_ClassDeclaration
+// Go: api/encoder/decoder_test.go:253 TestDecodeSourceFile_ClassDeclaration
 #[test]
 fn test_decode_source_file_class_declaration() {
     let sf = parse_source_file("class Foo { bar(): void {} }");
@@ -864,7 +864,7 @@ fn test_decode_source_file_class_declaration() {
     );
 }
 
-// Go: api/encoder/decoder_test.go:236 TestDecodeNodes_SubtreeRoundTrip
+// Go: api/encoder/decoder_test.go:270 TestDecodeNodes_SubtreeRoundTrip
 #[test]
 fn test_decode_nodes_subtree_round_trip() {
     let sf = parse_source_file("function greet(name: string) { return `Hello, ${name}!`; }");
@@ -903,7 +903,7 @@ fn test_decode_nodes_subtree_round_trip() {
     assert!(func_decl.body().is_some());
 }
 
-// Go: api/encoder/decoder_test.go:266 TestDecodeSourceFile_BinaryExpression
+// Go: api/encoder/decoder_test.go:300 TestDecodeSourceFile_BinaryExpression
 #[test]
 fn test_decode_source_file_binary_expression() {
     let sf = parse_source_file("let x = 1 + 2;");
@@ -920,7 +920,7 @@ fn test_decode_source_file_binary_expression() {
     assert_eq!(bin_expr.right().kind(), SyntaxKind::NumericLiteral);
 }
 
-// Go: api/encoder/decoder_test.go:284 TestDecodeSourceFile_KeywordExpressions
+// Go: api/encoder/decoder_test.go:318 TestDecodeSourceFile_KeywordExpressions
 #[test]
 fn test_decode_source_file_keyword_expressions() {
     // "this" must decode as KeywordExpression, not Token, or the printer panics
@@ -941,7 +941,7 @@ fn test_decode_source_file_keyword_expressions() {
     )));
 }
 
-// Go: api/encoder/decoder_test.go:302 TestDecodeSourceFile_EmptyModuleBlock
+// Go: api/encoder/decoder_test.go:336 TestDecodeSourceFile_EmptyModuleBlock
 #[test]
 fn test_decode_source_file_empty_module_block() {
     let sf = parse_source_file("namespace N { }");
@@ -958,7 +958,7 @@ fn test_decode_source_file_empty_module_block() {
     assert_eq!(block.statements().len(), 0);
 }
 
-// Go: api/encoder/decoder_test.go:320 TestDecodeSourceFile_EmptyBlockAndParams
+// Go: api/encoder/decoder_test.go:354 TestDecodeSourceFile_EmptyBlockAndParams
 #[test]
 fn test_decode_source_file_empty_block_and_params() {
     // Empty blocks and parameter lists must decode with non-nil NodeLists (not nil),
@@ -983,7 +983,7 @@ fn test_decode_source_file_empty_block_and_params() {
     assert_eq!(block.statements().len(), 0);
 }
 
-// Go: api/encoder/decoder_test.go:340 TestDecodeSourceFile_ArrowFunctionEmptyParams
+// Go: api/encoder/decoder_test.go:374 TestDecodeSourceFile_ArrowFunctionEmptyParams
 #[test]
 fn test_decode_source_file_arrow_function_empty_params() {
     // `() => {}` must decode with non-nil Parameters (empty NodeList),
@@ -1009,7 +1009,7 @@ fn test_decode_source_file_arrow_function_empty_params() {
     assert_eq!(block.statements().len(), 0);
 }
 
-// Go: api/encoder/decoder_test.go:361 TestDecodeSourceFile_FunctionExpressionEmptyParams
+// Go: api/encoder/decoder_test.go:395 TestDecodeSourceFile_FunctionExpressionEmptyParams
 #[test]
 fn test_decode_source_file_function_expression_empty_params() {
     // `function() {}` must decode with non-nil Parameters (empty NodeList).
@@ -1027,7 +1027,7 @@ fn test_decode_source_file_function_expression_empty_params() {
     assert_eq!(func_expr.parameters().len(), 0);
 }
 
-// Go: api/encoder/decoder_test.go:377 TestDecodeSourceFile_PostfixUnaryOperator
+// Go: api/encoder/decoder_test.go:411 TestDecodeSourceFile_PostfixUnaryOperator
 #[test]
 fn test_decode_source_file_postfix_unary_operator() {
     let sf = parse_source_file("let i = 0; i++;");
@@ -1041,7 +1041,7 @@ fn test_decode_source_file_postfix_unary_operator() {
     assert_eq!(postfix.operand().kind(), SyntaxKind::Identifier);
 }
 
-// Go: api/encoder/decoder_test.go:392 TestDecodeSourceFile_PrefixUnaryOperator
+// Go: api/encoder/decoder_test.go:426 TestDecodeSourceFile_PrefixUnaryOperator
 #[test]
 fn test_decode_source_file_prefix_unary_operator() {
     let sf = parse_source_file("let x = true; !x;");
@@ -1055,7 +1055,7 @@ fn test_decode_source_file_prefix_unary_operator() {
     assert_eq!(prefix.operand().kind(), SyntaxKind::Identifier);
 }
 
-// Go: api/encoder/decoder_test.go:407 TestDecodeSourceFile_PostfixDecrement
+// Go: api/encoder/decoder_test.go:441 TestDecodeSourceFile_PostfixDecrement
 #[test]
 fn test_decode_source_file_postfix_decrement() {
     let sf = parse_source_file("let n = 5; n--;");
@@ -1068,5 +1068,5 @@ fn test_decode_source_file_postfix_decrement() {
     assert_eq!(postfix.operator(), SyntaxKind::MinusMinusToken);
 }
 
-// Go: api/encoder/decoder_test.go:421 BenchmarkDecodeSourceFile
+// Go: api/encoder/decoder_test.go:455 BenchmarkDecodeSourceFile
 // PORT: not ported (benchmark).

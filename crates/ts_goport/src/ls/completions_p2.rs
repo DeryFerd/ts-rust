@@ -1649,9 +1649,13 @@ pub static WORD_SEPARATORS: [i32; 29] = [
 // e.g. for "abc def.ghi|jkl", the word length is 3 and the word start is 'g'.
 // PORT: Go cuts `text := sourceFile.Text()[:position]`. The decoders read the
 // whole text and stop at `position`, so no `&str` is cut inside a character.
+// A position past the text panics there with Go's text
+// (`go_check_slice_bounds`): the API in an LSP server with JSDoc completions
+// off reaches it (with them on, the JSDoc snippet check panics first).
 pub fn get_word_length_and_start(source_file: Node, position: i32) -> (i32, i32) {
     // !!! Port other case of vscode's `DEFAULT_WORD_REGEXP` that covers words that start like numbers, e.g. -123.456abcd.
     let text = source_file_text(source_file);
+    crate::ls::utilities::go_check_slice_bounds(&text, 0, position);
     let text_len = position as usize;
     let mut total_size: i32 = 0;
     let mut first_rune: i32 = 0;

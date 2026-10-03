@@ -301,13 +301,19 @@ impl FileSource for SnapshotFS {
 
 /// Go `dirty.CloneableMap[tspath.Path, string]` of `cacheDirectories`: the
 /// cached children of one directory, by path, with their base names.
-// PORT: Go ranges over it (`mergeCachedDirectoryEntries`), and a small Go
-// map gives a rotation of its insertion order. It is an `IndexMap`
-// (insertion order), one of Go's answers. The FxHashMap of
-// `dirty::CloneableMap` gives the order of the path hashes, which Go can
-// miss (editfuzz2 R1, as for `OverlayDirectories`). A delete keeps the
-// order of the other children (`shift_remove`), as a Go map delete keeps
-// their slots.
+// PORT: Go ranges over it (`mergeCachedDirectoryEntries`). A Go map of at
+// most 8 entries is one group of 8 slots: an insert takes the first free
+// slot, a delete frees its slot, and a range starts at a random slot and
+// wraps. `dirty.CloneableMap.Clone` (`maps.Clone`) keeps the slots. It is an
+// `IndexMap` (insertion order). With no delete, the port gives the rotation
+// that starts at the first slot, which Go can give. A delete keeps the order
+// of the other children (`shift_remove`), as Go keeps their slots. Go can
+// differ in two cases:
+// - A delete and then an add: Go puts the new child in the first free slot,
+//   which can be the slot of the deleted child, but the port puts it last.
+// - Above 8 children: Go's order depends on the hash seed of the map.
+// The FxHashMap of `dirty::CloneableMap` gave the order of the path hashes,
+// which Go can miss (editfuzz2 R1, as for `OverlayDirectories`).
 pub type CachedDirectory = Rc<RefCell<IndexMap<tspath::Path, String>>>;
 
 impl dirty::Cloneable for CachedDirectory {
