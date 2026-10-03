@@ -1030,6 +1030,10 @@ impl Orchestrator {
         // A task that did not read its build info leaves its read unused.
         self.build_info_prefetch.borrow_mut().take();
         self.status_prefetch.borrow_mut().take();
+        // No prefetched mtime outlives this build (see `drop_status_prefetch`).
+        for path in &paths {
+            self.get_task(path).borrow_mut().drop_status_prefetch();
+        }
     }
 
     // Go: build/orchestrator.go:959 (*Orchestrator).buildOrCleanProject,
