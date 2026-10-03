@@ -12,8 +12,7 @@
 
 use crate::contentmapper::{self, Mapper, Project, SourceFiles};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
-use crate::execute::build::config_prefetch::ConfigPrefetch;
-use crate::execute::build::orchestrator::MTimePrefetch;
+use crate::execute::build::config_prefetch::{MTimePrefetch, PrefetchPool};
 use crate::execute::build::parse_cache::ParseCache;
 use crate::execute::incremental::incremental;
 use crate::execute::tsc::compile::System;
@@ -204,12 +203,13 @@ pub struct BuildHost {
     // caches that stay as long as they are needed
     pub resolved_references: ParseCache<Path, Rc<ParsedCommandLine>>,
     // PORT: not in Go (perf). The threads that parse the configs of the
-    // graph ahead of `get_resolved_project_reference` (config_prefetch.rs).
-    pub config_prefetch: RefCell<Option<ConfigPrefetch>>,
+    // graph ahead of `get_resolved_project_reference` (config_prefetch.rs),
+    // until the graph is made.
+    pub config_prefetch: RefCell<Option<PrefetchPool>>,
     // PORT: Go `*collections.SyncMap`. The task `writeFile` stores into it
     // from the checker threads.
     pub m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
-    // PORT: not in Go (perf). The mtimes that the build info threads read
+    // PORT: not in Go (perf). The mtimes that the prefetch threads read
     // for the up-to-date checks of this build cycle (orchestrator.rs
     // `BuildInfoPrefetch`). `load_or_store_m_time` takes one where it would
     // read the file system.
@@ -333,7 +333,7 @@ impl BuildHost {
             }
         }
         if !found {
-            // PORT: perf. An mtime that a build info thread read.
+            // PORT: perf. An mtime that a prefetch thread read.
             let prefetched = self.m_time_prefetch.borrow().as_ref().and_then(|m_times| {
                 m_times
                     .lock()
@@ -529,7 +529,7 @@ impl ParseConfigHost for BuildHost {
         self.host.get_current_directory()
     }
 
-    // PORT: not in Go (perf). The file names that a config thread matched
+    // PORT: not in Go (perf). The file names that a prefetch thread matched
     // (config_prefetch.rs), else Go `getFileNamesFromConfigSpecs`.
     fn get_file_names_from_config_specs(
         &self,

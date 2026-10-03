@@ -80,14 +80,14 @@ pub struct BuildInfoEntry {
     pub path: Path,
     pub m_time: Option<SystemTime>,
     pub dts_time: Option<Option<SystemTime>>,
-    // PORT: not in Go (perf). What a build info thread made from
+    // PORT: not in Go (perf). What a prefetch thread made from
     // `build_info` for the up-to-date check (`StatusPrefetch`), until the
     // check takes it.
     pub status_prefetch: Option<Arc<StatusPrefetch>>,
 }
 
-/// PORT: not in Go (perf). The parts of `getUpToDateStatus` that a build
-/// info thread computes from the build info it read, ahead of the check
+/// PORT: not in Go (perf). The parts of `getUpToDateStatus` that a
+/// prefetch thread computes from the build info it read, ahead of the check
 /// (see `BuildInfoPrefetch` in orchestrator.rs). Go computes them in the
 /// check, on the task's builder goroutine. The check uses them only when
 /// they were made for its build info directory and file lists.
@@ -115,9 +115,9 @@ pub struct StatusPrefetch {
 
 /// PORT: not in Go (perf). The options of a task that decide whether its
 /// up-to-date check returns before it reads the mtimes of its inputs. A
-/// build info thread reads for the check only what the check reads
+/// prefetch thread reads for the check only what the check reads
 /// (`reads_input_times`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct StatusCheckOptions {
     is_incremental: bool,
     emit_declarations: bool,
@@ -384,7 +384,7 @@ pub trait BuildTaskOrchestrator {
     // (uncached read from disk).
     fn read_build_info_file(&self, config: &ParsedCommandLine) -> Option<Rc<BuildInfo>>;
 
-    /// PORT: not in Go (perf). What a build info thread made for the check
+    /// PORT: not in Go (perf). What a prefetch thread made for the check
     /// from the build info that `read_build_info_file` just gave for
     /// `build_info_file_name` (`StatusPrefetch`).
     fn take_status_prefetch(&self, _build_info_file_name: &str) -> Option<StatusPrefetch> {
@@ -1283,7 +1283,7 @@ impl BuildTask {
             &build_info_path,
             &orchestrator.compare_paths_options().current_directory,
         ));
-        // PORT: perf. The parts that a build info thread computed, when
+        // PORT: perf. The parts that a prefetch thread computed, when
         // they are for this directory and these file lists. They free on a
         // thread when the check returns (`DropInBackground`).
         let mut prefetched = DropInBackground(
@@ -1344,7 +1344,7 @@ impl BuildTask {
             time: build_info_time,
         };
         let mut newest_input_file_and_time = FileAndTime::default();
-        // PORT: perf. With a prefetch, the build info thread made the set
+        // PORT: perf. With a prefetch, the prefetch thread made the set
         // (`StatusPrefetch::input_path_set`).
         let mut own_seen_roots: FxHashSet<Path> = FxHashSet::default();
         // Go `getBuildInfoRootInfoReader`, made once.
@@ -1644,7 +1644,7 @@ impl BuildTask {
         }
 
         // PORT: perf. Go normalizes each list twice, for the checks and for
-        // `t.packageJsons`; here once, or on the build info thread.
+        // `t.packageJsons`; here once, or on a prefetch thread.
         let (package_jsons, missing_package_jsons) =
             match prefetched.as_mut().and_then(Arc::get_mut) {
                 Some(prefetched) => (
