@@ -3724,11 +3724,11 @@ mod scanner_test;
 mod tests {
     use super::{
         GoUnit, combine_surrogate_pairs, compare_go_strings, compute_ecma_line_starts,
-        decode_js_string_rune, encode_js_string_rune, fuse_surrogate_bytes, go_byte_offset,
-        go_has_suffix, go_len, go_map_runes, go_runes, go_slice, go_string_bytes,
-        go_string_from_bytes, go_string_from_utf8, go_to_valid_utf8, go_unit_at, go_unit_before,
-        go_unit_cut_at, go_value, go_value_from_bytes, is_line_break, port_byte_offset, utf16_len,
-        utf16_len_of_range,
+        contains_go_string_marker, decode_js_string_rune, encode_js_string_rune,
+        fuse_surrogate_bytes, go_byte_offset, go_has_suffix, go_len, go_map_runes, go_runes,
+        go_slice, go_string_bytes, go_string_from_bytes, go_string_from_utf8, go_to_valid_utf8,
+        go_unit_at, go_unit_before, go_unit_cut_at, go_value, go_value_from_bytes, is_line_break,
+        port_byte_offset, utf16_len, utf16_len_of_range,
     };
     use super::{
         LevenshteinBuffers, get_spelling_suggestion_for_strings,
@@ -3784,6 +3784,22 @@ mod tests {
             let ga: Vec<u8> = ra.iter().flat_map(|&r| go_bytes(r)).collect();
             let gb: Vec<u8> = rb.iter().flat_map(|&r| go_bytes(r)).collect();
             assert_eq!(compare_go_strings(a, b), ga.cmp(&gb), "{a:?} {b:?}");
+        }
+    }
+
+    /// Long text (the `memchr` scan alone) and short text (core's
+    /// `contains` first) give the same answer, also when the lead byte 0xEF
+    /// starts a char that is not the marker.
+    #[test]
+    fn go_string_marker_found_in_long_and_short_text() {
+        let lone = encode_js_string_rune(0xD800);
+        for len in [0, 1, 254, 255, 256, 257, 300, 4096] {
+            let plain = "a".repeat(len) + "\u{F000}";
+            assert!(!contains_go_string_marker(&plain), "{len}");
+            assert_eq!(go_value(&plain), plain, "{len}");
+            let marked = plain.clone() + &lone;
+            assert!(contains_go_string_marker(&marked), "{len}");
+            assert!(contains_go_string_marker(&(lone.clone() + &plain)), "{len}");
         }
     }
 
