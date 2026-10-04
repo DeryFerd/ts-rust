@@ -1119,15 +1119,22 @@ impl Checker {
     // Return true if type might be of the given kind. A union or intersection type might be of a given
     // kind if at least one constituent type is of the given kind.
     // Go: checker/checker.go:28071 maybeTypeOfKind
-    pub fn maybe_type_of_kind(&mut self, t: TypeId, kind: TypeFlags) -> bool {
-        let flags = self.ty(t).flags;
-        if flags.intersects(kind) {
+    // PERF: unionfn1. It only reads flags and lists, so it takes `&self` and
+    // loops over the list in place. For a constituent that is not a union or
+    // intersection, Go's recursive call is its flags test, so the loop tests
+    // the flags here and only a nested union or intersection recurses.
+    pub fn maybe_type_of_kind(&self, t: TypeId, kind: TypeFlags) -> bool {
+        let ty = self.ty(t);
+        if ty.flags.intersects(kind) {
             return true;
         }
-        if flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
-            for i in 0..self.ty(t).types().len() {
-                let t = self.type_at(t, i);
-                if self.maybe_type_of_kind(t, kind) {
+        if ty.flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
+            for &m in ty.types() {
+                let flags = self.ty(m).flags;
+                if flags.intersects(kind)
+                    || (flags.intersects(TypeFlags::UNION_OR_INTERSECTION)
+                        && self.maybe_type_of_kind(m, kind))
+                {
                     return true;
                 }
             }

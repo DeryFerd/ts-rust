@@ -380,7 +380,10 @@ impl Checker {
             return true;
         }
         let global_function_type = self.global_function_type;
-        self.symbols.get(members, "bind").is_some()
+        // PERF: unionfn1. Looked up by its interned name: no text hash or
+        // text compare per call.
+        static BIND: std::sync::LazyLock<Name> = std::sync::LazyLock::new(|| Name::from("bind"));
+        self.symbols.get_name(members, &BIND).is_some()
             && self.is_type_subtype_of(t, global_function_type)
     }
 
@@ -1288,5 +1291,82 @@ impl Checker {
             }
             _ => SymbolId::NIL,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writes `aliases` as `type T<i> = <alias>;` lines of `a.ts` in a new
+    /// project, with `strictNullChecks` set to `strict`, and runs `f` on the
+    /// checker of `a.ts` with the type of each alias, in order.
+    fn with_alias_types<R: Send + 'static>(
+        label: &str,
+        aliases: &[&str],
+        strict: bool,
+        f: impl FnOnce(&mut Checker, &[TypeId]) -> R + Send + 'static,
+    ) -> R {
+        let dir =
+            std::env::temp_dir().join(format!("ts_goport_{label}_{strict}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source: String = aliases
+            .iter()
+            .enumerate()
+            .map(|(i, alias)| format!("type T{i} = {alias};\n"))
+            .collect();
+        std::fs::write(dir.join("a.ts"), source).unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            format!(
+                r#"{{ "compilerOptions": {{ "strictNullChecks": {strict}, "target": "es2020", "types": [] }}, "files": ["a.ts"] }}"#
+            ),
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = crate::program::try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scope = crate::core::enter_program(Some(program));
+        let file = program
+            .source_files()
+            .find(|file| file.info.file_name.ends_with("/a.ts"))
+            .expect("a.ts is not in the program")
+            .root;
+        let result = crate::program::with_type_checker_for_file(file, move |checker| {
+            let types: Vec<TypeId> = file
+                .statements()
+                .iter()
+                .map(|alias| checker.get_type_from_type_node(alias.type_()))
+                .collect();
+            f(checker, &types)
+        });
+        drop(scope);
+        crate::program::release_program(program);
+        result
+    }
+
+    /// Go `maybeTypeOfKind` recurses into a union or intersection
+    /// constituent (checker.go:28071). unionfn1 tests the flags of other
+    /// constituents in its loop.
+    #[test]
+    fn maybe_type_of_kind_looks_into_nested_constituents() {
+        let aliases = [
+            "(string & { a: 1 }) | { b: 1 }",
+            "{ a: 1 } | { b: 1 }",
+            "number | { b: 1 }",
+        ];
+        let got = with_alias_types("maybe_kind", &aliases, true, |checker, types| {
+            types
+                .iter()
+                .map(|&t| {
+                    (
+                        checker.maybe_type_of_kind(t, TypeFlags::STRING),
+                        checker.maybe_type_of_kind(t, TypeFlags::NUMBER),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(got, [(true, false), (false, false), (false, true)]);
     }
 }
