@@ -79,7 +79,12 @@
 //! Large frees (`gostd::local::drop_later`: a released program, the parse
 //! tasks of a load) wait until the message is done, and then run only
 //! while no message waits. Go's garbage collector does them in the
-//! background.
+//! background. The checkers and synthetic nodes of a released program wait
+//! in the same way only for the first release after a client pause, and
+//! only when the client has not sent its next edit yet
+//! (`gostd::local::drop_after_pause`), so at most one released checker set
+//! waits. Other releases free them at once, so that the next check reuses
+//! their memory.
 //!
 //! Cancellation is Go's: `$/cancelRequest` reaches only a request that the
 //! dispatch loop took (`pending_client_requests`); a cancel for a queued
@@ -518,7 +523,7 @@ pub struct Server {
     // runs the dispatch loop with them (`ApiConnProtocol`).
     pub dispatch_ctx: RefCell<Option<(Context, CancelCauseFunc)>>,
     // PORT: when the dispatch loop last finished a message (see
-    // `IDLE_QUIET_PERIOD`).
+    // `IDLE_QUIET_PERIOD` and `gostd::local::note_message_gap`).
     pub free_since: Cell<Instant>,
     // PORT: Go `progressDelay` and `projectProgress` are in `ServerShared`,
     // `startWatchdog` is `ServerShared::start_watchdog`.
@@ -2028,6 +2033,21 @@ impl Server {
         *self.dispatch_ctx.borrow_mut() = Some((ctx.clone(), lsp_exit.clone()));
         self.free_since.set(Instant::now());
         gostd::local::keep_garbage();
+        {
+            // A notification that waits (the next didChange, a cancel): the
+            // client sends a stream, not one burst of requests. Weak: the
+            // thread's queues do not keep the server alive.
+            let shared = Arc::downgrade(&self.shared);
+            gostd::local::set_stream_check(Box::new(move || {
+                shared.upgrade().is_some_and(|s| {
+                    s.request_queue.with_items(|items| {
+                        items.iter().any(
+                            |item| matches!(item, QueuedRequest::Request(req) if req.id.is_none()),
+                        )
+                    })
+                })
+            }));
+        }
         loop {
             self.dispatch_next(&ctx, &lsp_exit)?;
         }
@@ -2064,6 +2084,9 @@ impl Server {
         }
 
         let item = self.shared.request_queue.get(ctx)?;
+        if matches!(item, QueuedRequest::Request(_)) {
+            gostd::local::note_message_gap(self.free_since.get().elapsed());
+        }
         self.shared.queued_requests.fetch_sub(1, Ordering::SeqCst);
         let req = match item {
             QueuedRequest::Request(req) => Rc::new(req),
