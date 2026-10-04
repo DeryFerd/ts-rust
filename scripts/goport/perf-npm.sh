@@ -50,7 +50,8 @@ cells=(version query hono hono-noop)
 for cell in "${cells[@]}"; do
   hf=()
   for i in "${!names[@]}"; do hf+=(-n "${names[i]}" "${cmds[i]} ${args[$cell]//SIDE/${names[i]%%-*}}"); done
-  hyperfine -N --warmup 3 --runs "$runs" --export-json "$out/$cell.json" "${hf[@]}" > "$out/$cell.txt" 2>&1
+  # -i: tsc exits 2 on hono with --composite false at pin 673a5f17d713, as Go's tsc does (2 TS7031).
+  hyperfine -N -i --warmup 3 --runs "$runs" --export-json "$out/$cell.json" "${hf[@]}" > "$out/$cell.txt" 2>&1
 done
 echo "load at end $(cut -d' ' -f1 /proc/loadavg)" >> "$out/host.txt"
 
