@@ -24,7 +24,7 @@ pub use crate::frontend::tsoptions::SourceOutputAndProjectReference;
 pub use crate::frontend::compiler::{get_source_files_to_emit, source_file_may_be_emitted};
 pub use crate::frontend::module::types;
 pub use crate::frontend::parser::jsdoc;
-pub use crate::frontend::scanner::utilities;
+pub use crate::frontend::parser::utilities;
 pub use crate::modulespecifiers::symlinks::{KnownDirectoryLink, KnownSymlinks};
 pub use crate::modulespecifiers::util::get_package_name_from_directory;
 pub use crate::program::{get_default_resolution_mode_for_file, get_mode_for_usage_location};

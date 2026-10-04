@@ -1,9 +1,11 @@
+mod build_prefetch_rereads;
 mod checker_common_source_directory;
 mod contentmapper_watch;
 mod explain_files_cache;
 mod file_delete;
 mod jsdoc_cut;
 mod never_intersection_order;
+mod removed_reference_config;
 mod showconfig;
 mod tsbuild_a;
 mod tsbuild_b;
