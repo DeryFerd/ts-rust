@@ -58,13 +58,15 @@
 //! updates and publishDiagnostics) runs before the async part: Go starts it
 //! on a goroutine before the async part, and it usually ends before the
 //! answer (the publishDiagnostics of a changed tsconfig.json comes before
-//! the textDocument/diagnostic answer that picks up the change). Tasks
-//! queued later run at the message boundary, after the answer. Do not move
-//! them to another thread: the oracle compares where background
-//! publishDiagnostics land. Do not hold them back while messages wait
-//! either: a task queued by didOpen (the `update_watches`
-//! registerCapability) must go out before the answer of the next request,
-//! as Go's does.
+//! the textDocument/diagnostic answer that picks up the change). A request
+//! with no async part (`register_request_handler`: willRenameFiles, rename,
+//! workspace/symbol) runs the tasks it queued after its work and before its
+//! answer, for the same reason. Tasks queued later run at the message
+//! boundary, after the answer. Do not move them to another thread: the
+//! oracle compares where background publishDiagnostics land. Do not hold
+//! them back while messages wait either: a task queued by didOpen (the
+//! `update_watches` registerCapability) must go out before the answer of
+//! the next request, as Go's does.
 //!
 //! The one exception is idle work (`gostd::local::go_idle`): the clone of
 //! the auto-import warm, which sends nothing to the client. It starts only
@@ -2880,7 +2882,15 @@ pub fn register_notification_handler<
 }
 
 // Go: server.go:1317 registerRequestHandler
-// PORT: `params` as in `register_notification_handler`.
+// PORT: `params` as in `register_notification_handler`. The background
+// tasks that `fn` queues (a snapshot update's logging, watch updates and
+// publishDiagnostics, session.go:1396) run after `fn` and before the answer.
+// Go starts them on goroutines at once, and they usually end while `fn`
+// goes on with its work, as for the async part of the other handler kinds
+// (`dispatch_request`). So after willRenameFiles or rename the
+// registerCapability of a new watch comes before the answer, as in Go. In Go
+// it is a race: a handler that ends in about a millisecond (workspace/symbol
+// on a project of a few files) can answer first.
 pub fn register_request_handler<
     Req: crate::frontend::json::UnmarshalerFrom + Default + 'static,
     Resp: AnyValue,
@@ -2906,7 +2916,9 @@ pub fn register_request_handler<
                 }
 
                 let params = lsproto::unmarshal_params::<Req>(req)?;
-                let resp = fn_(s, ctx, Some(&params), req)?;
+                let result = fn_(s, ctx, Some(&params), req);
+                gostd::local::run_pending();
+                let resp = result?;
                 if let Some(err) = ctx.err() {
                     return Err(err);
                 }

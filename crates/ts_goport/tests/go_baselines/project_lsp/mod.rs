@@ -92,6 +92,7 @@ mod lsp_server_contentmapper_test;
 mod lsp_server_progress_test;
 mod lsp_server_projectinfo_test;
 mod lsp_server_projectreference_updates_test;
+mod lsp_server_request_order_test;
 mod lsp_server_semantictokens_test;
 mod lsp_server_shutdown_test;
 mod lsp_stack_sanitizer_test;
