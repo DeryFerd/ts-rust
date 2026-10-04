@@ -526,9 +526,17 @@ impl Checker {
         // that is not function-like (the API can pass any node). The port's
         // nil list reads as empty, so it would make and register a
         // signature. Nothing before Go's first read has a side effect.
-        if declaration.parameter_list().is_nil() {
+        let parameter_list = declaration.parameter_list();
+        if parameter_list.is_nil() {
             crate::core::go_nil_dereference();
         }
+        // PERF: chkport1 item 5. Go reads `declaration.Parameters()`,
+        // `declaration.Kind` and `param.Symbol()` as plain fields. Here each
+        // one is an AST store read, so they are read once: `params` for the
+        // untyped test, the loop and `hasRestParameter`, `kind` for the kind
+        // tests (`ast.IsXxx(declaration)`).
+        let params = parameter_list.nodes();
+        let kind = declaration.kind();
         let mut parameters: Vec<SymbolId> = Vec::new();
         let mut flags = SignatureFlags::NONE;
         let mut this_parameter = SymbolId::NIL;
@@ -537,23 +545,26 @@ impl Checker {
         let iife = get_immediately_invoked_function_expression(declaration);
         let is_untyped_signature_in_js_file = iife.is_nil()
             && is_in_js_file(declaration)
-            && (is_function_expression(declaration)
-                || is_arrow_function(declaration)
-                || is_method_or_accessor(declaration)
-                || is_function_declaration(declaration)
-                || is_constructor_declaration(declaration))
-            && declaration
-                .parameters()
-                .iter()
-                .all(|param| param.type_().is_nil())
+            && matches!(
+                kind,
+                SyntaxKind::FunctionExpression
+                    | SyntaxKind::ArrowFunction
+                    | SyntaxKind::MethodDeclaration
+                    | SyntaxKind::GetAccessor
+                    | SyntaxKind::SetAccessor
+                    | SyntaxKind::FunctionDeclaration
+                    | SyntaxKind::Constructor
+            )
+            && params.iter().all(|param| param.type_().is_nil())
             && self
                 .get_contextual_type(declaration, ContextFlags::SIGNATURE)
                 .is_nil();
         if is_untyped_signature_in_js_file {
             flags |= SignatureFlags::IS_UNTYPED_SIGNATURE_IN_JS_FILE;
         }
-        for (i, param) in declaration.parameters().iter().enumerate() {
-            let mut param_symbol = param.symbol();
+        for (i, param) in params.iter().enumerate() {
+            let param_node_symbol = param.symbol();
+            let mut param_symbol = param_node_symbol;
             let type_node = param.type_();
             // Include parameter symbol instead of property symbol in the signature
             if param_symbol.is_some()
@@ -578,7 +589,7 @@ impl Checker {
             }
             if i == 0 && self.sym(param_symbol).name == INTERNAL_SYMBOL_NAME_THIS {
                 has_this_parameter = true;
-                this_parameter = param.symbol();
+                this_parameter = param_node_symbol;
             } else {
                 parameters.push(param_symbol);
             }
@@ -597,11 +608,11 @@ impl Checker {
             }
         }
         // If only one accessor includes a this-type annotation, the other behaves as if it had the same type annotation
-        if (is_get_accessor_declaration(declaration) || is_set_accessor_declaration(declaration))
+        if (kind == SyntaxKind::GetAccessor || kind == SyntaxKind::SetAccessor)
             && self.has_bindable_name(declaration)
             && (!has_this_parameter || this_parameter.is_nil())
         {
-            let other_kind = if is_get_accessor_declaration(declaration) {
+            let other_kind = if kind == SyntaxKind::GetAccessor {
                 SyntaxKind::SetAccessor
             } else {
                 SyntaxKind::GetAccessor
@@ -613,7 +624,7 @@ impl Checker {
             }
         }
         let mut class_type = TypeId::NIL;
-        if is_constructor_declaration(declaration) {
+        if kind == SyntaxKind::Constructor {
             let merged = self.get_merged_symbol(declaration.parent().symbol());
             class_type = self.get_declared_type_of_class_or_interface(merged);
         }
@@ -630,18 +641,19 @@ impl Checker {
         } else {
             self.get_type_parameters_from_declaration_ex(declaration)
         };
-        if has_rest_parameter(declaration) {
+        // Go `hasRestParameter(declaration)` on the list read above.
+        if params.last().is_some_and(is_rest_parameter) {
             flags |= SignatureFlags::HAS_REST_PARAMETER;
         }
-        if is_constructor_type_node(declaration)
-            || is_constructor_declaration(declaration)
-            || is_construct_signature_declaration(declaration)
+        if kind == SyntaxKind::ConstructorType
+            || kind == SyntaxKind::Constructor
+            || kind == SyntaxKind::ConstructSignature
         {
             flags |= SignatureFlags::CONSTRUCT;
         }
-        if is_constructor_type_node(declaration)
+        if kind == SyntaxKind::ConstructorType
             && has_syntactic_modifier(declaration, ModifierFlags::ABSTRACT)
-            || is_constructor_declaration(declaration)
+            || kind == SyntaxKind::Constructor
                 && has_syntactic_modifier(declaration.parent(), ModifierFlags::ABSTRACT)
         {
             flags |= SignatureFlags::ABSTRACT;
