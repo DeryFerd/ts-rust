@@ -685,7 +685,7 @@ impl ModuleSpecifierGenerationHost for MockModuleSpecifierGenerationHost {
     fn get_nearest_ancestor_directory_with_package_json(&self, _dirname: &str) -> String {
         String::new()
     }
-    fn get_package_json_info(&self, _pkg_json_path: &str) -> Option<Rc<InfoCacheEntry>> {
+    fn get_package_json_info(&self, _pkg_json_path: &str) -> Option<Arc<InfoCacheEntry>> {
         None
     }
     fn get_default_resolution_mode_for_file(&self, _file: Node) -> ResolutionMode {

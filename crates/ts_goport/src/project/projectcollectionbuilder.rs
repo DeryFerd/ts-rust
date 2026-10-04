@@ -2058,6 +2058,24 @@ impl ProjectCollectionBuilder {
     }
 
     // Go: project/projectcollectionbuilder.go:1275 updateInferredProjectRoots
+    // PORT: Go reads `CommandLine.Errors` of an inferred or synthetic
+    // project here, in `update_or_create_synthetic_project`, in
+    // `update_or_create_inferred_project` and in snapshot.rs
+    // `Snapshot::clone_body`. The port form of Go `Errors` is
+    // `errors_with_common_source_directory_errors`, and these readers read
+    // the plain `errors`, which are the same on these command lines:
+    // - Go adds TS6059 to `Errors` only in `checkSourceFilesBelongToPath`
+    //   (tsoptions/parsedcommandline.go:181). Only
+    //   `(*ParsedCommandLine).CommonSourceDirectory` (:157) calls it, and
+    //   only checker.go:15547 calls that, on `redirect`, the command line of
+    //   a project reference (compiler/projectreferencefilemapper.go:90).
+    // - An inferred or synthetic command line comes from
+    //   `newInferredProjectCommandLine` (project/project.go:258), not from a
+    //   config file, so it is never a reference of a program. Its `Errors`
+    //   hold only the `configFileParsingDiagnostics` that this builder sets.
+    // - In the port, only the command line of a reference gets the flag
+    //   that records the errors (program/go_frontend.rs
+    //   `ProjectReferenceCopies`).
     // PORT: Go filters into a new slice; the port takes the `Vec` by value.
     pub fn update_inferred_project_roots(
         self: &Rc<Self>,
@@ -2079,6 +2097,8 @@ impl ProjectCollectionBuilder {
             // PORT: Go `CommandLine.ProjectReferences()` keeps nil apart
             // from an empty list; that is the `ParsedOptions` field here.
             project_references = command_line.parsed_config.project_references.clone();
+            // PORT: Go `CommandLine.Errors`; the plain `errors` (see the
+            // PORT note above).
             config_file_parsing_diagnostics = command_line.errors.clone();
         }
         self.update_inferred_project(
@@ -2181,6 +2201,8 @@ impl ProjectCollectionBuilder {
                         command_line.project_references(),
                         project_references.as_deref().unwrap_or_default(),
                     )
+                    // PORT: Go `p.CommandLine.Errors`; the plain `errors`
+                    // (see `update_inferred_project_roots`).
                     || !diagnostics_deep_equal(&command_line.errors, &config_file_parsing_diagnostics)
                     || !mappers_equal(command_line.content_mappers(), new_command_line.content_mappers())
                     // ts#64299
@@ -2333,6 +2355,8 @@ impl ProjectCollectionBuilder {
                         command_line.project_references(),
                         project_references.as_deref().unwrap_or_default(),
                     )
+                    // PORT: Go `p.CommandLine.Errors`; the plain `errors`
+                    // (see `update_inferred_project_roots`).
                     || !diagnostics_deep_equal(&command_line.errors, &config_file_parsing_diagnostics)
                     // PORT: Go `slices.Equal` on `[]*contentmapper.Mapper`
                     // compares the pointers.

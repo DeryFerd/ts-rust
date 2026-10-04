@@ -104,7 +104,6 @@ const SOURCES_HASH: u64 = {
         SOURCE_PARSER_UTILITIES,
         SOURCE_SCANNER_P1,
         SOURCE_SCANNER_P2,
-        SOURCE_SCANNER_UTILITIES,
         SOURCE_COMMENT_RANGES,
         SOURCE_FACTORY,
         SOURCE_FACTORY_P2,
@@ -141,7 +140,6 @@ const SOURCE_SOURCE_FILE: u64 = const_hash(include_bytes!("source_file.rs"));
 const SOURCE_PARSER_UTILITIES: u64 = const_hash(include_bytes!("utilities.rs"));
 const SOURCE_SCANNER_P1: u64 = const_hash(include_bytes!("../scanner/scanner_p1.rs"));
 const SOURCE_SCANNER_P2: u64 = const_hash(include_bytes!("../scanner/scanner_p2.rs"));
-const SOURCE_SCANNER_UTILITIES: u64 = const_hash(include_bytes!("../scanner/utilities.rs"));
 const SOURCE_COMMENT_RANGES: u64 = const_hash(include_bytes!("../scanner/comment_ranges.rs"));
 const SOURCE_FACTORY: u64 = const_hash(include_bytes!("../../ast/factory.rs"));
 const SOURCE_FACTORY_P2: u64 = const_hash(include_bytes!("../ast_factory_p2.rs"));

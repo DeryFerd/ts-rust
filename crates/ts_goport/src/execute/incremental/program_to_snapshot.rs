@@ -258,41 +258,60 @@ impl ToProgramSnapshot<'_> {
     }
 
     // Go: incremental/programtosnapshot.go:162 handleFileDelete
-    // PORT: Go ranges over the old `fileInfos` `SyncMap` (random order) and
-    // stops at the first gone file. If that file affects global scope, all
-    // files change. Else Go only sets `buildInfoEmitPending`, and unchanged
-    // files keep their old semantic diagnostics. So Go's answer is random
-    // when a gone file affects global scope and another does not (a
-    // `target` or `lib` change removes libs that hold only
-    // `/// <reference lib>` lines). `file_infos` keeps insertion order, so
-    // stopping at the first gone file would always take the stale branch for
-    // such libs (missing errors). The port walks all gone files: if any one
-    // affects global scope it takes the global branch once (Go's answer when
-    // it meets that file first). Else, if any file is gone, it sets
-    // `build_info_emit_pending`.
-    // TypeScript JS `forEachEntry` without `outFile` also stops at the first
-    // gone file that affects global scope, but it sets
-    // `buildInfoEmitPending` for each gone file that does not and comes
-    // before it. The global branch here does not set
-    // `build_info_emit_pending`. This differs from JS only when such a file
-    // comes first and the program has no file other than default libs,
-    // because `add_file_to_change_set` sets the flag for each other file.
+    // PORT: Go ranges over the old `fileInfos` `SyncMap` and stops at the
+    // first gone file. If that file affects global scope, all files change.
+    // Else Go only sets `buildInfoEmitPending`, and unchanged files keep
+    // their old semantic diagnostics and emit. The `SyncMap` order is random
+    // per process, so with `gone` files of which `gone_global` affect global
+    // scope, Go takes the global branch with chance `gone_global / gone`
+    // (measured on pin 673a5f17d713: 1 of 3 gone files global, 66 of 200
+    // runs; 1 of 4, 57 of 200; 3 of 4, 144 of 200; 1 of 93, 6 of 200). The
+    // port takes Go's more likely answer, so each port answer is also a Go
+    // answer: the global branch when more than half of the gone files affect
+    // global scope, else only `build_info_emit_pending`. A dependency change
+    // that removes many module `.d.ts` files and one global file does not
+    // check again (realworld3 docusaurus: 93 gone files, 1 global).
+    // Tie (exactly half of the gone files global): the port takes the global
+    // branch. Go takes it slightly less than half of the time (1 of 2, 89 of
+    // 200 runs; 346 of 740 runs over all tie cases measured), so neither
+    // answer is a clear Go majority. The global branch is the TypeScript JS
+    // answer (`forEachEntry` without `outFile` takes it when any gone file
+    // affects global scope), it checks again instead of keeping diagnostics
+    // that can be stale, and `tsctests::file_delete` keeps it for `lib`
+    // es2016 to es2015.
+    // Libs: a file with no statements does not affect global scope
+    // (`fileAffectsGlobalScope`). At pin 673a5f17d713 these bundled libs have
+    // no statements: `lib.d.ts`, `lib.es6.d.ts`, `lib.es20XX.d.ts`,
+    // `lib.es20XX.full.d.ts`, `lib.esnext.d.ts` and `lib.esnext.full.d.ts`
+    // (only `/// <reference lib>` lines), and `lib.dom.iterable.d.ts`,
+    // `lib.dom.asynciterable.d.ts`, `lib.webworker.iterable.d.ts` and
+    // `lib.webworker.asynciterable.d.ts` (only comments). So a `target`
+    // change mostly removes global libs and checks again (es2022 to es2021:
+    // 6 of 8 gone libs global), but a `lib` change can go either way. `lib`
+    // from es2022, dom, dom.iterable and dom.asynciterable to es2022 removes
+    // 1 global lib of 3 and does not check again: a use of `document` keeps
+    // its old diagnostics and gets no TS2584 (Go: the same in 43 of 60 runs,
+    // TS2584 in 17 of 60). Removing only dom and dom.iterable is a tie and
+    // checks again.
+    // TypeScript JS also sets `buildInfoEmitPending` for each gone file that
+    // does not affect global scope and comes before the first global one.
+    // The global branch here does not set `build_info_emit_pending`. This
+    // differs from JS only when the program has no file other than default
+    // libs, because `add_file_to_change_set` sets the flag for each other
+    // file.
     fn handle_file_delete(&mut self) {
         let Some(old_program) = self.old_program else {
             return;
         };
-        let mut file_removed = false;
-        let mut global_file_removed = false;
+        let mut gone = 0usize;
+        let mut gone_global = 0usize;
         for (file_path, old_info) in &old_program.snapshot.borrow().file_infos {
             if !self.snapshot.file_infos.contains_key(file_path) {
-                file_removed = true;
-                if old_info.affects_global_scope {
-                    global_file_removed = true;
-                    break;
-                }
+                gone += 1;
+                gone_global += usize::from(old_info.affects_global_scope);
             }
         }
-        if global_file_removed {
+        if gone > 0 && 2 * gone_global >= gone {
             // If the global file is removed, add all files as changed
             let files = self
                 .snapshot
@@ -303,7 +322,7 @@ impl ToProgramSnapshot<'_> {
                     .add_file_to_change_set(Path(source_file_info(file).path.clone()));
             }
             self.global_file_removed = true;
-        } else if file_removed {
+        } else if gone > 0 {
             self.snapshot.build_info_emit_pending = true;
         }
     }

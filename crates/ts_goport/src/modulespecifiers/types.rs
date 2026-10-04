@@ -95,7 +95,7 @@ pub struct ModulePath {
 
 // Go: modulespecifiers/types.go:48 ModuleSpecifierGenerationHost
 // PORT: methods that take `ast.HasFileName` or `*ast.StringLiteralLike`
-// take a `Node`. Package.json entries are shared through `Rc`, as Go
+// take a `Node`. Package.json entries are shared through `Arc`, as Go
 // shares the `*packagejson.InfoCacheEntry` pointer.
 pub trait ModuleSpecifierGenerationHost {
     // GetModuleResolutionCache() any // !!! TODO: adapt new resolution cache model
@@ -118,7 +118,7 @@ pub trait ModuleSpecifierGenerationHost {
     fn file_exists(&self, path: &str) -> bool;
 
     fn get_nearest_ancestor_directory_with_package_json(&self, dirname: &str) -> String;
-    fn get_package_json_info(&self, pkg_json_path: &str) -> Option<Rc<InfoCacheEntry>>;
+    fn get_package_json_info(&self, pkg_json_path: &str) -> Option<Arc<InfoCacheEntry>>;
     fn get_default_resolution_mode_for_file(&self, file: Node) -> ResolutionMode;
     fn get_resolved_module_from_module_specifier(
         &self,
