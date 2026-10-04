@@ -186,89 +186,114 @@ impl Checker {
     }
 
     // Go: checker/checker.go:31466 getTypeFactsWorker
+    // PERF: unionfn1. Go's switch is split in two, in Go's order. The arms
+    // that read only the type (flags, literal values, the false types, an
+    // object whose facts the caller does not need) are
+    // `type_facts_of_flags`, which inlines into the constituent loops, so
+    // most constituents need no call. The other arms (an object whose facts
+    // the caller needs, a union, an intersection) are `type_facts_slow`.
     pub fn get_type_facts_worker(&mut self, t: TypeId, caller_only_needs: TypeFacts) -> TypeFacts {
         let mut t = t;
-        if self
-            .ty(t)
-            .flags
-            .intersects(TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE)
-        {
+        let mut flags = self.ty(t).flags;
+        if flags.intersects(TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE) {
             t = self.get_base_constraint_of_type(t);
             if t.is_nil() {
                 t = self.unknown_type;
             }
+            flags = self.ty(t).flags;
         }
-        let flags = self.ty(t).flags;
+        match self.type_facts_of_flags(t, flags, caller_only_needs) {
+            Some(facts) => facts,
+            None => self.type_facts_slow(t, flags, caller_only_needs),
+        }
+    }
+
+    /// `get_type_facts_worker` of constituent `t`, whose flags are `flags`.
+    #[inline(always)]
+    fn constituent_type_facts(
+        &mut self,
+        t: TypeId,
+        flags: TypeFlags,
+        caller_only_needs: TypeFacts,
+    ) -> TypeFacts {
+        if flags.intersects(TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE) {
+            return self.get_type_facts_worker(t, caller_only_needs);
+        }
+        match self.type_facts_of_flags(t, flags, caller_only_needs) {
+            Some(facts) => facts,
+            None => self.type_facts_slow(t, flags, caller_only_needs),
+        }
+    }
+
+    /// The arms of Go `getTypeFactsWorker` that read only `t` (after its base
+    /// constraint step), in Go's order. `None` for the arms that
+    /// `type_facts_slow` takes: an object whose facts the caller needs, a
+    /// union and an intersection.
+    #[inline(always)]
+    fn type_facts_of_flags(
+        &self,
+        t: TypeId,
+        flags: TypeFlags,
+        caller_only_needs: TypeFacts,
+    ) -> Option<TypeFacts> {
         let strict = self.strict_null_checks;
-        if flags.intersects(TypeFlags::STRING | TypeFlags::STRING_MAPPING) {
+        let facts = if flags.intersects(TypeFlags::STRING | TypeFlags::STRING_MAPPING) {
             if strict {
-                return TypeFacts::STRING_STRICT_FACTS;
+                TypeFacts::STRING_STRICT_FACTS
+            } else {
+                TypeFacts::STRING_FACTS
             }
-            return TypeFacts::STRING_FACTS;
         } else if flags.intersects(TypeFlags::STRING_LITERAL | TypeFlags::TEMPLATE_LITERAL) {
             let is_empty = flags.intersects(TypeFlags::STRING_LITERAL)
                 && self.get_string_literal_value_ref(t).is_empty();
-            if strict {
-                if is_empty {
-                    return TypeFacts::EMPTY_STRING_STRICT_FACTS;
-                }
-                return TypeFacts::NON_EMPTY_STRING_STRICT_FACTS;
+            match (strict, is_empty) {
+                (true, true) => TypeFacts::EMPTY_STRING_STRICT_FACTS,
+                (true, false) => TypeFacts::NON_EMPTY_STRING_STRICT_FACTS,
+                (false, true) => TypeFacts::EMPTY_STRING_FACTS,
+                (false, false) => TypeFacts::NON_EMPTY_STRING_FACTS,
             }
-            if is_empty {
-                return TypeFacts::EMPTY_STRING_FACTS;
-            }
-            return TypeFacts::NON_EMPTY_STRING_FACTS;
         } else if flags.intersects(TypeFlags::NUMBER | TypeFlags::ENUM) {
             if strict {
-                return TypeFacts::NUMBER_STRICT_FACTS;
+                TypeFacts::NUMBER_STRICT_FACTS
+            } else {
+                TypeFacts::NUMBER_FACTS
             }
-            return TypeFacts::NUMBER_FACTS;
         } else if flags.intersects(TypeFlags::NUMBER_LITERAL) {
             let is_zero = self.get_number_literal_value(t).0 == 0.0;
-            if strict {
-                if is_zero {
-                    return TypeFacts::ZERO_NUMBER_STRICT_FACTS;
-                }
-                return TypeFacts::NON_ZERO_NUMBER_STRICT_FACTS;
+            match (strict, is_zero) {
+                (true, true) => TypeFacts::ZERO_NUMBER_STRICT_FACTS,
+                (true, false) => TypeFacts::NON_ZERO_NUMBER_STRICT_FACTS,
+                (false, true) => TypeFacts::ZERO_NUMBER_FACTS,
+                (false, false) => TypeFacts::NON_ZERO_NUMBER_FACTS,
             }
-            if is_zero {
-                return TypeFacts::ZERO_NUMBER_FACTS;
-            }
-            return TypeFacts::NON_ZERO_NUMBER_FACTS;
         } else if flags.intersects(TypeFlags::BIG_INT) {
             if strict {
-                return TypeFacts::BIG_INT_STRICT_FACTS;
+                TypeFacts::BIG_INT_STRICT_FACTS
+            } else {
+                TypeFacts::BIG_INT_FACTS
             }
-            return TypeFacts::BIG_INT_FACTS;
         } else if flags.intersects(TypeFlags::BIG_INT_LITERAL) {
             let is_zero = self.is_zero_big_int(t);
-            if strict {
-                if is_zero {
-                    return TypeFacts::ZERO_BIG_INT_STRICT_FACTS;
-                }
-                return TypeFacts::NON_ZERO_BIG_INT_STRICT_FACTS;
+            match (strict, is_zero) {
+                (true, true) => TypeFacts::ZERO_BIG_INT_STRICT_FACTS,
+                (true, false) => TypeFacts::NON_ZERO_BIG_INT_STRICT_FACTS,
+                (false, true) => TypeFacts::ZERO_BIG_INT_FACTS,
+                (false, false) => TypeFacts::NON_ZERO_BIG_INT_FACTS,
             }
-            if is_zero {
-                return TypeFacts::ZERO_BIG_INT_FACTS;
-            }
-            return TypeFacts::NON_ZERO_BIG_INT_FACTS;
         } else if flags.intersects(TypeFlags::BOOLEAN) {
             if strict {
-                return TypeFacts::BOOLEAN_STRICT_FACTS;
+                TypeFacts::BOOLEAN_STRICT_FACTS
+            } else {
+                TypeFacts::BOOLEAN_FACTS
             }
-            return TypeFacts::BOOLEAN_FACTS;
         } else if flags.intersects(TypeFlags::BOOLEAN_LIKE) {
             let is_false = t == self.false_type || t == self.regular_false_type;
-            if strict {
-                if is_false {
-                    return TypeFacts::FALSE_STRICT_FACTS;
-                }
-                return TypeFacts::TRUE_STRICT_FACTS;
+            match (strict, is_false) {
+                (true, true) => TypeFacts::FALSE_STRICT_FACTS,
+                (true, false) => TypeFacts::TRUE_STRICT_FACTS,
+                (false, true) => TypeFacts::FALSE_FACTS,
+                (false, false) => TypeFacts::TRUE_FACTS,
             }
-            if is_false {
-                return TypeFacts::FALSE_FACTS;
-            }
-            return TypeFacts::TRUE_FACTS;
         } else if flags.intersects(TypeFlags::OBJECT) {
             let possible_facts = if strict {
                 TypeFacts::EMPTY_OBJECT_STRICT_FACTS
@@ -277,11 +302,51 @@ impl Checker {
             } else {
                 TypeFacts::EMPTY_OBJECT_FACTS | TypeFacts::FUNCTION_FACTS | TypeFacts::OBJECT_FACTS
             };
-            if !caller_only_needs.intersects(possible_facts) {
-                // If the caller doesn't care about any of the facts that we could possibly produce,
-                // return zero so we can skip resolving members.
-                return TypeFacts::NONE;
+            if caller_only_needs.intersects(possible_facts) {
+                return None;
             }
+            // If the caller doesn't care about any of the facts that we could possibly produce,
+            // return zero so we can skip resolving members.
+            TypeFacts::NONE
+        } else if flags.intersects(TypeFlags::VOID) {
+            TypeFacts::VOID_FACTS
+        } else if flags.intersects(TypeFlags::UNDEFINED) {
+            TypeFacts::UNDEFINED_FACTS
+        } else if flags.intersects(TypeFlags::NULL) {
+            TypeFacts::NULL_FACTS
+        } else if flags.intersects(TypeFlags::ES_SYMBOL_LIKE) {
+            if strict {
+                TypeFacts::SYMBOL_STRICT_FACTS
+            } else {
+                TypeFacts::SYMBOL_FACTS
+            }
+        } else if flags.intersects(TypeFlags::NON_PRIMITIVE) {
+            if strict {
+                TypeFacts::OBJECT_STRICT_FACTS
+            } else {
+                TypeFacts::OBJECT_FACTS
+            }
+        } else if flags.intersects(TypeFlags::NEVER) {
+            TypeFacts::NONE
+        } else if flags.intersects(TypeFlags::UNION | TypeFlags::INTERSECTION) {
+            return None;
+        } else {
+            TypeFacts::UNKNOWN_FACTS
+        };
+        Some(facts)
+    }
+
+    /// The arms of Go `getTypeFactsWorker` that `type_facts_of_flags` leaves:
+    /// an object whose facts the caller needs, a union, an intersection.
+    #[inline(never)]
+    fn type_facts_slow(
+        &mut self,
+        t: TypeId,
+        flags: TypeFlags,
+        caller_only_needs: TypeFacts,
+    ) -> TypeFacts {
+        let strict = self.strict_null_checks;
+        if flags.intersects(TypeFlags::OBJECT) {
             if self.ty(t).object_flags.intersects(ObjectFlags::ANONYMOUS)
                 && self.is_empty_object_type(t)
             {
@@ -298,37 +363,19 @@ impl Checker {
                 return TypeFacts::OBJECT_STRICT_FACTS;
             }
             return TypeFacts::OBJECT_FACTS;
-        } else if flags.intersects(TypeFlags::VOID) {
-            return TypeFacts::VOID_FACTS;
-        } else if flags.intersects(TypeFlags::UNDEFINED) {
-            return TypeFacts::UNDEFINED_FACTS;
-        } else if flags.intersects(TypeFlags::NULL) {
-            return TypeFacts::NULL_FACTS;
-        } else if flags.intersects(TypeFlags::ES_SYMBOL_LIKE) {
-            if strict {
-                return TypeFacts::SYMBOL_STRICT_FACTS;
-            } else {
-                return TypeFacts::SYMBOL_FACTS;
-            }
-        } else if flags.intersects(TypeFlags::NON_PRIMITIVE) {
-            if strict {
-                return TypeFacts::OBJECT_STRICT_FACTS;
-            } else {
-                return TypeFacts::OBJECT_FACTS;
-            }
-        } else if flags.intersects(TypeFlags::NEVER) {
-            return TypeFacts::NONE;
-        } else if flags.intersects(TypeFlags::UNION) {
+        }
+        if flags.intersects(TypeFlags::UNION) {
+            // The list never changes after the type is made, so the loop
+            // keeps a handle (no copy of the elements).
+            let types = self.ty(t).as_union_or_intersection_type().types.clone();
             let mut facts = TypeFacts::NONE;
-            for i in 0..self.ty(t).types().len() {
-                let t = self.type_at(t, i);
-                facts = facts | self.get_type_facts_worker(t, caller_only_needs);
+            for &m in types.iter() {
+                let member_flags = self.ty(m).flags;
+                facts = facts | self.constituent_type_facts(m, member_flags, caller_only_needs);
             }
             return facts;
-        } else if flags.intersects(TypeFlags::INTERSECTION) {
-            return self.get_intersection_type_facts(t, caller_only_needs);
         }
-        TypeFacts::UNKNOWN_FACTS
+        self.get_intersection_type_facts(t, caller_only_needs)
     }
 
     // Go: checker/checker.go:31602 getIntersectionTypeFacts
@@ -344,10 +391,12 @@ impl Checker {
         // and others are computed as `or`.
         let mut ored_facts = TypeFacts::NONE;
         let mut anded_facts = TypeFacts::ALL;
-        for i in 0..self.ty(t).types().len() {
-            let t = self.type_at(t, i);
-            if !(ignore_objects && self.ty(t).flags.intersects(TypeFlags::OBJECT)) {
-                let f = self.get_type_facts_worker(t, caller_only_needs);
+        // PERF: unionfn1. A handle on the list, as in `type_facts_slow`.
+        let types = self.ty(t).as_union_or_intersection_type().types.clone();
+        for &m in types.iter() {
+            let member_flags = self.ty(m).flags;
+            if !(ignore_objects && member_flags.intersects(TypeFlags::OBJECT)) {
+                let f = self.constituent_type_facts(m, member_flags, caller_only_needs);
                 ored_facts = ored_facts | f;
                 anded_facts = anded_facts & f;
             }
@@ -1299,8 +1348,10 @@ mod tests {
     use super::*;
 
     /// Writes `aliases` as `type T<i> = <alias>;` lines of `a.ts` in a new
-    /// project, with `strictNullChecks` set to `strict`, and runs `f` on the
-    /// checker of `a.ts` with the type of each alias, in order.
+    /// project (`type T<i><alias>;` for an alias that starts with `<`, so it
+    /// can have type parameters), with `strictNullChecks` set to `strict`,
+    /// and runs `f` on the checker of `a.ts` with the type of each alias, in
+    /// order.
     fn with_alias_types<R: Send + 'static>(
         label: &str,
         aliases: &[&str],
@@ -1313,7 +1364,13 @@ mod tests {
         let source: String = aliases
             .iter()
             .enumerate()
-            .map(|(i, alias)| format!("type T{i} = {alias};\n"))
+            .map(|(i, alias)| {
+                if alias.starts_with('<') {
+                    format!("type T{i}{alias};\n")
+                } else {
+                    format!("type T{i} = {alias};\n")
+                }
+            })
             .collect();
         std::fs::write(dir.join("a.ts"), source).unwrap();
         std::fs::write(
@@ -1368,5 +1425,125 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert_eq!(got, [(true, false), (false, false), (false, true)]);
+    }
+
+    /// Go `getTypeFactsWorker` (checker.go:31466) and
+    /// `getIntersectionTypeFacts` (:31602) for each arm, with and without
+    /// `strictNullChecks`. unionfn1 split the switch in two and reads
+    /// union and intersection constituents in its own loops.
+    #[test]
+    fn type_facts_match_go_arms() {
+        type F = TypeFacts;
+        let object = |strict: bool| {
+            if strict {
+                F::OBJECT_STRICT_FACTS
+            } else {
+                F::OBJECT_FACTS
+            }
+        };
+        let function = |strict: bool| {
+            if strict {
+                F::FUNCTION_STRICT_FACTS
+            } else {
+                F::FUNCTION_FACTS
+            }
+        };
+        // (alias, facts with strictNullChecks, facts without).
+        let cases = [
+            ("string", F::STRING_STRICT_FACTS, F::STRING_FACTS),
+            (
+                r#""" | "a""#,
+                F::EMPTY_STRING_STRICT_FACTS | F::NON_EMPTY_STRING_STRICT_FACTS,
+                F::EMPTY_STRING_FACTS | F::NON_EMPTY_STRING_FACTS,
+            ),
+            (
+                "`a${string}`",
+                F::NON_EMPTY_STRING_STRICT_FACTS,
+                F::NON_EMPTY_STRING_FACTS,
+            ),
+            ("number", F::NUMBER_STRICT_FACTS, F::NUMBER_FACTS),
+            (
+                "0 | 1",
+                F::ZERO_NUMBER_STRICT_FACTS | F::NON_ZERO_NUMBER_STRICT_FACTS,
+                F::ZERO_NUMBER_FACTS | F::NON_ZERO_NUMBER_FACTS,
+            ),
+            ("bigint", F::BIG_INT_STRICT_FACTS, F::BIG_INT_FACTS),
+            (
+                "0n | 1n",
+                F::ZERO_BIG_INT_STRICT_FACTS | F::NON_ZERO_BIG_INT_STRICT_FACTS,
+                F::ZERO_BIG_INT_FACTS | F::NON_ZERO_BIG_INT_FACTS,
+            ),
+            ("boolean", F::BOOLEAN_STRICT_FACTS, F::BOOLEAN_FACTS),
+            ("false", F::FALSE_STRICT_FACTS, F::FALSE_FACTS),
+            ("true", F::TRUE_STRICT_FACTS, F::TRUE_FACTS),
+            (
+                r#""" | 0 | 0n | false | "a""#,
+                F::EMPTY_STRING_STRICT_FACTS
+                    | F::ZERO_NUMBER_STRICT_FACTS
+                    | F::ZERO_BIG_INT_STRICT_FACTS
+                    | F::FALSE_STRICT_FACTS
+                    | F::NON_EMPTY_STRING_STRICT_FACTS,
+                F::EMPTY_STRING_FACTS
+                    | F::ZERO_NUMBER_FACTS
+                    | F::ZERO_BIG_INT_FACTS
+                    | F::FALSE_FACTS
+                    | F::NON_EMPTY_STRING_FACTS,
+            ),
+            ("void", F::VOID_FACTS, F::VOID_FACTS),
+            ("undefined", F::UNDEFINED_FACTS, F::UNDEFINED_FACTS),
+            ("null", F::NULL_FACTS, F::NULL_FACTS),
+            ("symbol", F::SYMBOL_STRICT_FACTS, F::SYMBOL_FACTS),
+            ("object", object(true), object(false)),
+            ("never", F::NONE, F::NONE),
+            ("unknown", F::UNKNOWN_FACTS, F::UNKNOWN_FACTS),
+            ("{}", F::EMPTY_OBJECT_STRICT_FACTS, F::EMPTY_OBJECT_FACTS),
+            ("{ a: 1 }", object(true), object(false)),
+            ("() => void", function(true), function(false)),
+            // A primitive in an intersection: the object constituent is ignored.
+            (
+                r#"string & { __kind: "name" }"#,
+                F::STRING_STRICT_FACTS,
+                F::STRING_FACTS,
+            ),
+            // No primitive: facts are or-ed and and-ed by the two masks.
+            (
+                "{ a: 1 } & (() => void)",
+                ((object(true) | function(true)) & F::OR_FACTS_MASK)
+                    | (object(true) & function(true) & F::AND_FACTS_MASK),
+                ((object(false) | function(false)) & F::OR_FACTS_MASK)
+                    | (object(false) & function(false) & F::AND_FACTS_MASK),
+            ),
+            // The base constraint step: a constraint, and none (unknown).
+            (
+                r#"<X extends "" | 0> = X"#,
+                F::EMPTY_STRING_STRICT_FACTS | F::ZERO_NUMBER_STRICT_FACTS,
+                F::EMPTY_STRING_FACTS | F::ZERO_NUMBER_FACTS,
+            ),
+            ("<X> = X", F::UNKNOWN_FACTS, F::UNKNOWN_FACTS),
+            // An intersection constituent of a union.
+            (
+                "(string & { a: 1 }) | number",
+                F::STRING_STRICT_FACTS | F::NUMBER_STRICT_FACTS,
+                F::STRING_FACTS | F::NUMBER_FACTS,
+            ),
+        ];
+        let aliases: Vec<&str> = cases.iter().map(|case| case.0).collect();
+        for strict in [true, false] {
+            let got = with_alias_types("type_facts", &aliases, strict, |checker, types| {
+                types
+                    .iter()
+                    .map(|&t| checker.get_type_facts(t, TypeFacts::ALL))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(got.len(), cases.len());
+            for (case, got) in cases.iter().zip(got) {
+                let want = if strict { case.1 } else { case.2 };
+                assert_eq!(
+                    got.0, want.0,
+                    "facts of {} (strictNullChecks {strict})",
+                    case.0
+                );
+            }
+        }
     }
 }
