@@ -282,15 +282,16 @@ const KEY_DONE: u8 = 2;
 /// The loader resolves the key itself.
 const KEY_LOADER: u8 = 3;
 
-/// How long the loader spins on a key that a worker resolves before it
-/// sleeps (`AheadQueue::wait_or_take`). A key takes about 25 microseconds
-/// of worker CPU on query-core, and a sleep adds the wake: the worker's
-/// `done` call and the loader's core coming out of idle.
-const WAIT_SPIN: std::time::Duration = std::time::Duration::from_micros(50);
-
-/// How many times the loader checks the key between two reads of the clock
-/// while it spins: about 2 to 4 microseconds.
-const SPINS_PER_CLOCK_READ: u32 = 64;
+/// How many times the loader checks a key that a worker resolves before
+/// it sleeps (`AheadQueue::wait_or_take`): about 2 to 4 microseconds.
+///
+/// A longer spin does not make the waits shorter. On import edits (effect
+/// and query-core, two hosts, 200 loads each) the loader waited 14 to 28
+/// times per load, 30 to 40 microseconds each, 0.4 to 1.0 ms per load in
+/// all. A spin of up to 50 or 200 microseconds took the sleeps away but
+/// not the wait time: the loader has caught up with the workers there, so
+/// it waits for their work, not for the wake (loadcuts1, cut 4).
+const WAIT_SPINS: u32 = 64;
 
 /// How many keys after the cursor `AheadQueue::find` looks at. The loader
 /// meets the keys of the previous load in its order, less removed keys
@@ -381,21 +382,17 @@ impl AheadQueue {
         match state.compare_exchange(KEY_FREE, KEY_LOADER, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) | Err(KEY_LOADER) => false,
             Err(_) => {
-                // Most resolutions end within tens of microseconds: spin
-                // for up to `WAIT_SPIN`, then sleep until the worker ends
-                // the key (`done`).
+                // Most resolutions end within a few microseconds: spin a
+                // little, then sleep until the worker ends the key (`done`).
                 let start = std::time::Instant::now();
-                let ended = 'spin: loop {
-                    for _ in 0..SPINS_PER_CLOCK_READ {
-                        if state.load(Ordering::Acquire) != KEY_WORKER {
-                            break 'spin true;
-                        }
-                        std::hint::spin_loop();
+                let mut ended = false;
+                for _ in 0..WAIT_SPINS {
+                    if state.load(Ordering::Acquire) != KEY_WORKER {
+                        ended = true;
+                        break;
                     }
-                    if start.elapsed() >= WAIT_SPIN {
-                        break false;
-                    }
-                };
+                    std::hint::spin_loop();
+                }
                 if !ended {
                     stats.slept += 1;
                     self.waiting.store(index, Ordering::SeqCst);
@@ -1328,5 +1325,45 @@ mod tests {
         let entries = package_json_entries(&loader);
         std::fs::remove_dir_all(&root).unwrap();
         assert_eq!(entries, expected);
+    }
+
+    /// The loader's wait for a key in a worker's hands (`wait_or_take`): a
+    /// free key is the loader's, an ended key needs no sleep, and a key
+    /// that a worker holds past the spin makes the loader sleep until the
+    /// worker's `done`. The load stats count the waits, the sleeps and the
+    /// time.
+    #[test]
+    fn loader_waits_spin_then_sleep() {
+        let mut keys = KeyList::default();
+        for name in ["./a", "./b", "./c"] {
+            keys.push("/p/", name, ResolutionMode::NONE);
+        }
+        let queue = Arc::new(AheadQueue::new(Arc::new(keys)));
+        let mut stats = AheadStats::default();
+
+        // Key 0 is free: the loader takes it, and no worker starts it.
+        assert!(!queue.wait_or_take(0, &mut stats));
+        assert_eq!(stats, AheadStats::default());
+        assert_eq!(queue.take_next().map(|(index, _)| index), Some(1));
+
+        // Key 1 ended: the answer is there, with no sleep.
+        queue.done(1);
+        assert!(queue.wait_or_take(1, &mut stats));
+        assert_eq!((stats.waited, stats.slept), (1, 0));
+
+        // Key 2 stays with a worker for 20 ms: the loader spins, then
+        // sleeps until the worker ends it.
+        assert_eq!(queue.take_next().map(|(index, _)| index), Some(2));
+        let worker = {
+            let queue = queue.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                queue.done(2);
+            })
+        };
+        assert!(queue.wait_or_take(2, &mut stats));
+        worker.join().unwrap();
+        assert_eq!((stats.waited, stats.slept), (2, 1));
+        assert!(stats.wait_ns >= 10_000_000, "{stats:?}");
     }
 }
