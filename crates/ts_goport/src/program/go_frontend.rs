@@ -1406,9 +1406,9 @@ impl GoSharedState {
         };
         let source_to_project_reference = copy_map(&mapper.source_to_project_reference);
         let output_dts_to_project_reference = copy_map(&mapper.output_dts_to_project_reference);
-        // The load released the mapper's loader, so Go adds no entry after
-        // it (`getSourceToDtsIfSymlink`), and an entry with no source finds
-        // nothing.
+        // The load released the mapper's loader (Go fileloader.go:223), so
+        // no entry is added after it (`getSourceToDtsIfSymlink`, :163), and
+        // an entry with no source finds nothing.
         let realpath_dts_to_source: FxHashMap<_, _> = mapper
             .realpath_dts_to_source
             .borrow()
@@ -1424,7 +1424,7 @@ impl GoSharedState {
         // so with the same references a file that `p` shares keeps its
         // redirect. The map is built again unless no file has one. With no
         // project reference entries, Go finds no redirect for any file
-        // (projectreferencefilemapper.go:47 getRedirectForResolution).
+        // (projectreferencefilemapper.go:90 getRedirectForResolution).
         let no_redirects = source_to_project_reference.is_empty()
             && output_dts_to_project_reference.is_empty()
             && realpath_dts_to_source.is_empty();
