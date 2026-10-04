@@ -1,7 +1,7 @@
 use crate::contentmapper;
 use crate::emitter::program_emit::{EmitOptions, WriteFile, WriteFileData};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
-use crate::execute::build::host::{BuildCompilerHost, BuildHost};
+use crate::execute::build::host::{BuildCompilerHost, BuildHost, WrittenPaths};
 use crate::execute::build::up_to_date_status::*;
 use crate::execute::incremental::build_info::{
     BuildInfoRootInfoReader, content_mapper_identities, is_build_info_file_name_default_library,
@@ -242,13 +242,23 @@ impl StatusPrefetch {
     /// (`input_files`, the names of `input_paths`) and the files of the
     /// build info that are TypeScript sources (`is_typescript_source`), as
     /// `BuildHost::get_m_time` reads them (`incremental.GetMTime`) on `fs`.
-    /// No task of a build writes such a file, so the mtime is the one that
-    /// the check of the same build would read later. The build drops what
-    /// its checks did not take (`BuildTask::drop_status_prefetch`), so a
-    /// later build reads the file system. Each path is read once: the build info
-    /// lists the root files too. `os_fs`: `fs` is the wrapped OS file
-    /// system (`is_wrapped_os_fs`), so the OS paths are read together
-    /// (`os_mod_times`).
+    /// A build writes no TypeScript source as an output, so the mtime is
+    /// most often the one that the check of the same build would read
+    /// later. The exceptions, where a task writes the file (or its target)
+    /// after this read and before the check, as Go reads it:
+    /// - a build info file whose name has a TypeScript source extension
+    ///   (`tsBuildInfoFile` `x.ts`). The check reads again each file that a
+    ///   task of the build wrote (`BuildHost::get_m_time_of_path`).
+    /// - a name that is a symbolic link to an output of another task. On
+    ///   the OS file system a link is not read here
+    ///   (`os_mod_times_of_non_links`), so the check reads it.
+    /// - a link in a directory part of the name, to the output directory of
+    ///   another task: not found, and the prefetched mtime stays.
+    /// The build drops what its checks did not take
+    /// (`BuildTask::drop_status_prefetch`), so a later build reads the file
+    /// system. Each path is read once: the build info lists the root files
+    /// too. `os_fs`: `fs` is the wrapped OS file system (`is_wrapped_os_fs`),
+    /// so the OS paths are read together.
     pub fn read_m_times(&mut self, fs: &dyn Fs, os_fs: bool, input_files: &[String]) {
         /// The index in `files` of the mtime of `file`, when it is read.
         fn index_of<'a>(
@@ -278,24 +288,25 @@ impl StatusPrefetch {
             .map(|(file, path)| index_of(&mut files, &mut indexes, file, path))
             .collect();
         drop(indexes);
-        let m_times: Vec<Option<SystemTime>> =
+        let m_times: Vec<Option<Option<SystemTime>>> =
             if os_fs && files.iter().all(|file| file.starts_with('/')) {
-                os_mod_times(files)
+                os_mod_times_of_non_links(files)
             } else {
                 files
                     .iter()
-                    .map(|file| fs.stat(file).and_then(|stat| stat.mod_time()))
+                    .map(|file| Some(fs.stat(file).and_then(|stat| stat.mod_time())))
                     .collect()
             };
-        let m_time_at = |index: &Option<usize>| index.map(|index| m_times[index]);
+        let m_time_at = |index: &Option<usize>| index.and_then(|index| m_times[index]);
         self.input_m_times = input_indexes.iter().map(m_time_at).collect();
         self.file_m_times = file_indexes.iter().map(m_time_at).collect();
     }
 }
 
 /// True for a TypeScript file that is not a declaration file. A build
-/// never writes one (its outputs are JavaScript, declaration, map, JSON
-/// and build info files).
+/// writes one only as a build info file with such a name (its outputs are
+/// JavaScript, declaration, map, JSON and build info files; see
+/// `StatusPrefetch::read_m_times`).
 fn is_typescript_source(file_name: &str) -> bool {
     file_extension_is_one_of(
         file_name,
@@ -971,6 +982,7 @@ impl BuildTask {
             deferred_writes.clone(),
             self.store_output_time_stamp(orchestrator),
             host.m_times.clone(),
+            host.written.clone(),
             orchestrator.compare_paths_options().clone(),
         );
         let emit_started = testing.is_none();
@@ -2121,10 +2133,12 @@ impl BuildTask {
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
     ) -> Option<SystemTime> {
-        let entry = self
-            .build_info_entry
-            .as_mut()
-            .expect("buildInfoEntry is set");
+        // Go reads `t.buildInfoEntry.dtsTime` and panics on a nil entry (an
+        // upstream task whose config file is gone or cannot be read, so its
+        // check never loaded a build info).
+        let Some(entry) = self.build_info_entry.as_mut() else {
+            crate::core::go_nil_dereference()
+        };
         if let Some(dts_time) = entry.dts_time {
             return dts_time;
         }
@@ -2211,16 +2225,27 @@ type WrittenBuildInfo = Arc<Mutex<Option<(String, Arc<BuildInfo>, SystemTime)>>>
 // watch-only `storeMTime` branch stores into the build host `m_times` at
 // once (Go `SyncMap`), before the test `OnEmittedFiles` reads it.
 // With `deferred` (`System::emit_writes_through_osvfs` is false) it writes
-// through the system file system instead (see `DeferredWrites`).
+// through the system file system instead (see `DeferredWrites`). Each
+// written path goes into `written_paths`, the build host's `written` (not
+// in Go).
 fn new_task_write_file(
     written: WrittenBuildInfo,
     deferred: Option<DeferredWrites>,
     store_output_time_stamp: bool,
     m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
+    written_paths: Arc<WrittenPaths>,
     compare_paths_options: ComparePathsOptions,
 ) -> WriteFile {
     Arc::new(
         move |file_name: &str, text: &str, data: &mut WriteFileData| -> Result<(), String> {
+            let path = || {
+                to_path(
+                    file_name,
+                    &compare_paths_options.current_directory,
+                    compare_paths_options.use_case_sensitive_file_names,
+                )
+            };
+            written_paths.insert(path());
             match &deferred {
                 None => osvfs_fs()
                     .write_file(file_name, text)
@@ -2237,15 +2262,10 @@ fn new_task_write_file(
                 // Store time stamps
                 // Go: orchestrator.host.storeMTime(fileName, orchestrator.opts.Sys.Now())
                 let m_time = task_write_file_now();
-                let path = to_path(
-                    file_name,
-                    &compare_paths_options.current_directory,
-                    compare_paths_options.use_case_sensitive_file_names,
-                );
                 m_times
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert(path, Some(m_time));
+                    .insert(path(), Some(m_time));
             }
             Ok(())
         },

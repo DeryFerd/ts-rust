@@ -19,7 +19,7 @@ rc=0
 ssh_opts=()
 case $HOST in
   mini-743d) ssh_opts=(-e "ssh -o HostName=mini-743d.local -o HostKeyAlias=mini-743d.<tailnet>.ts.net") ;;
-  mini-abf9) ssh_opts=(-e "ssh -o HostName=mini-abf9.local -o HostKeyAlias=mini-abf9-1.<tailnet>.ts.net") ;;
+  mini-abf9) echo "mini-abf9 is Theo's machine since 2026-10-04. Do not use it." >&2; exit 2 ;;
 esac
 if [[ $S == setup ]]; then
   "$REPO/scripts/goport/remote.sh" sync-scripts "$HOST" > /dev/null || rc=$?

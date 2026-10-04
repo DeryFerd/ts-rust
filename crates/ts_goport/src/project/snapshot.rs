@@ -987,6 +987,9 @@ impl Snapshot {
                 (
                     command_line.file_names().to_vec(),
                     command_line.parsed_config.project_references.clone(),
+                    // PORT: Go `CommandLine.Errors`; the plain `errors` (see
+                    // projectcollectionbuilder.rs
+                    // `update_inferred_project_roots`).
                     command_line.errors.clone(),
                     command_line.content_mappers().to_vec(),
                 )

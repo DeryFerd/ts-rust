@@ -398,9 +398,31 @@ impl Fs for OsFs {
 /// by its full path, as `stat` does. So is a path whose name is a symbolic
 /// link: `stat` fails with ELOOP after 40 links on the whole path, and the
 /// open of the directory and a stat of the name would each follow 40.
-/// Linux only: `statx` and `O_PATH` are not on macOS.
-#[cfg(target_os = "linux")]
 pub fn os_mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<SystemTime>> {
+    mod_times(paths, false)
+        .into_iter()
+        .map(|m_time| m_time.expect("a link name is stat'ed"))
+        .collect()
+}
+
+/// PORT: not in Go (perf). `os_mod_times`, but None (not read) for a path
+/// whose name is a symbolic link, and `Some` of the mtime for every other
+/// path. The `tsc -b` prefetch (build_task.rs `StatusPrefetch`) leaves a
+/// link to the check: its target can be an output that a task of the build
+/// writes before the check.
+pub fn os_mod_times_of_non_links<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Vec<Option<Option<SystemTime>>> {
+    mod_times(paths, true)
+}
+
+/// `os_mod_times` with `skip_links` false, `os_mod_times_of_non_links` with
+/// it true.
+#[cfg(target_os = "linux")]
+fn mod_times<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    skip_links: bool,
+) -> Vec<Option<Option<SystemTime>>> {
     use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, StatxFlags, openat, statx};
     use std::os::fd::OwnedFd;
     const PATH_MAX: usize = 4096;
@@ -420,6 +442,7 @@ pub fn os_mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<
     let mut m_times = Vec::new();
     for path in paths {
         let mut m_time = None;
+        let mut link = false;
         if let Some(slash) = path.rfind('/')
             && path.len() < PATH_MAX
         {
@@ -436,27 +459,48 @@ pub fn os_mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<
                 && name != ".."
                 && let Ok(stat) = statx(fd, &*os_path(name), AtFlags::SYMLINK_NOFOLLOW, wanted)
                 && stat.stx_mask & wanted.bits() == wanted.bits()
-                && FileType::from_raw_mode(u32::from(stat.stx_mode)) != FileType::Symlink
             {
-                m_time = system_time(stat.stx_mtime.tv_sec, stat.stx_mtime.tv_nsec).map(Some);
+                if FileType::from_raw_mode(u32::from(stat.stx_mode)) == FileType::Symlink {
+                    link = true;
+                } else {
+                    m_time = system_time(stat.stx_mtime.tv_sec, stat.stx_mtime.tv_nsec).map(Some);
+                }
             }
         }
-        m_times.push(m_time.unwrap_or_else(|| {
+        if m_time.is_none()
+            && skip_links
+            && (link || std::fs::symlink_metadata(os_path(path)).is_ok_and(|md| md.is_symlink()))
+        {
+            m_times.push(None);
+            continue;
+        }
+        m_times.push(Some(m_time.unwrap_or_else(|| {
             std::fs::metadata(os_path(path))
                 .ok()
                 .and_then(|md| md.modified().ok())
-        }));
+        })));
     }
     m_times
 }
 
-/// PORT: not in Go (perf). Off Linux, `stat` of each path.
+/// PORT: not in Go (perf). Off Linux, `stat` of each path (after an
+/// `lstat` with `skip_links`).
 #[cfg(not(target_os = "linux"))]
-pub fn os_mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<SystemTime>> {
+fn mod_times<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    skip_links: bool,
+) -> Vec<Option<Option<SystemTime>>> {
     let fs = osvfs_fs();
     paths
         .into_iter()
-        .map(|path| fs.stat(path).and_then(|stat| stat.mod_time()))
+        .map(|path| {
+            if skip_links
+                && std::fs::symlink_metadata(os_path(path)).is_ok_and(|md| md.is_symlink())
+            {
+                return None;
+            }
+            Some(fs.stat(path).and_then(|stat| stat.mod_time()))
+        })
         .collect()
 }
 

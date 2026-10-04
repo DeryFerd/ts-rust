@@ -1,12 +1,11 @@
 //! Go package `scanner`.
+//!
+//! PORT: Go scanner/utilities.go is ported in `crate::scanner_util` only.
+pub mod comment_ranges;
 pub mod regexp;
 pub mod scanner_p1;
 pub mod scanner_p2;
 pub mod unicode_properties;
-// PORT: scanner/utilities.go is also in crate::scanner_util, so this copy is
-// not glob-exported.
-pub mod comment_ranges;
-pub mod utilities;
 // Language-service scanner helpers. Not glob-exported.
 pub mod scanner_ls;
 pub use comment_ranges::*;

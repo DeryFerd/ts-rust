@@ -5,8 +5,8 @@
 # side the same way. Compare binaries only within one perf.sh run.
 # Timing on a loaded host is noise: the script refuses to start when the 1-minute load
 # is over PERF_MAX_LOAD (default 1.5). PERF_WAIT=1 waits up to 30 minutes for a quiet
-# host instead. zbook is rarely quiet while agents build: run it on mini-abf9 or
-# mini-743d through remote.sh (dbook-lan is kept for revision evidence), with every
+# host instead. zbook is rarely quiet while agents build: run it on mini-743d
+# through remote.sh (dbook-lan is kept for revision evidence), with every
 # side on the same host.
 # Output: target/continuation-r97-goport/perf/<label>/ (per-run .time files, load.txt).
 set -uo pipefail
