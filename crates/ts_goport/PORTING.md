@@ -23,9 +23,16 @@ the most literal port and add a `// PORT:` comment that explains the choice.
 - If you cannot port something (a missing dependency such as the node builder,
   printer, or node factory), call `unported!("goFunctionName")` at that point.
   Never return a guessed value.
-- Skip Go code only for: tracing, `debug.Assert*` (port as `debug_assert!`),
-  language-service-only exported APIs (`GetXxx` wrappers used only by
-  `ls`/`services`), and concurrency (mutexes, `sync.Once` become plain code).
+- Skip Go code only for: tracing, language-service-only exported APIs
+  (`GetXxx` wrappers used only by `ls`/`services`), and concurrency (mutexes,
+  `sync.Once` become plain code).
+- Port a Go `debug.*` call (`debug.Assert`, `debug.Fail`, `debug.AssertNever`,
+  `debug.FailBadSyntaxKind`) with `gostd/debug.rs` (`go_assert!` and
+  `debug::*`): the check stays on in release builds and fails with Go's
+  "panic: Debug failure. ..." text and exit 2. A check that only the port
+  has stays `debug_assert!`. Older ports keep `debug_assert!` at some Go
+  `debug.Assert` sites (47 checker, 15 ls and 3 compiler sites, state notes
+  `sweepN3-go-assert-2026-10-01` and `portgaps1-decisions-2026-10-04`).
 
 ## Names
 

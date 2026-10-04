@@ -1739,10 +1739,9 @@ pub fn get_text_of_node_from_source_text(
         // Only the above node kinds are currently transformed into one another by the reparser, requiring the textual remapping.
         // (Any reamppings done by emit transforms are handled by `getLiteralTextOfNode` in the printer)
         // Fail on any other kinds.
-        // PORT: Go `debug.FailBadSyntaxKind` panics.
-        panic!(
-            "Unexpected reparser-transformed node kind: {:?}",
-            node.kind()
+        crate::gostd::debug::fail_bad_syntax_kind(
+            node.kind(),
+            Some("Unexpected reparser-transformed node kind"),
         );
     }
     text.into_owned()
@@ -4504,5 +4503,34 @@ mod tests {
         for (r, expected) in cases {
             assert_eq!(special_casing_mapping(r), expected, "{r:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_site_tests {
+    use super::get_text_of_node_from_source_text;
+    use crate::core::go_panic_text;
+    use crate::prelude::*;
+
+    // Go `GetTextOfNodeFromSourceText` (scanner/utilities.go:97) runs
+    // `debug.FailBadSyntaxKind(node, "Unexpected reparser-transformed node kind")`
+    // for a reparser-transformed literal that is not a string literal or an
+    // identifier. The reparser makes no such node, so the test sets the flag
+    // on a synthetic numeric literal (the nodes of a parsed file are frozen).
+    #[test]
+    fn reparser_transformed_numeric_literal_is_a_go_debug_failure() {
+        let literal = NodeFactory::new().new_numeric_literal("1", TokenFlags::NONE);
+        set_node_loc(literal, TextRange::new(0, 1));
+        set_node_flags(
+            literal,
+            literal.flags() | NodeFlags::REPARSER_TRANSFORMED_LITERAL,
+        );
+        let got = go_panic_text(|| {
+            get_text_of_node_from_source_text("1;", literal, false);
+        });
+        assert_eq!(
+            got,
+            "Debug failure. Unexpected reparser-transformed node kind\nNode KindNumericLiteral was unexpected."
+        );
     }
 }
