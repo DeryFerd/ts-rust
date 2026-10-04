@@ -38,6 +38,16 @@ pub trait CompilerHost {
         path: &Path,
     ) -> Option<Rc<ParsedCommandLine>>;
 
+    /// Runs `f` with no tracking of the file system calls of `fs()`. Only
+    /// the language server's project host tracks them (Go `sourceFS`
+    /// `tracking`); Go stops that when it freezes the host
+    /// (project/compilerhost.go:57), so a lazy program value that Go
+    /// computes after the freeze makes no tracked calls.
+    // PORT: not in Go. Go computes such values on first use.
+    fn without_fs_tracking(&self, f: &mut dyn FnMut()) {
+        f();
+    }
+
     /// True when `fs()` shows the plain OS file system (Go `sys.FS()`,
     /// maybe behind `cachedvfs`), so a parse worker thread reads the same
     /// files, directories and bytes as this host. Then the loader can use

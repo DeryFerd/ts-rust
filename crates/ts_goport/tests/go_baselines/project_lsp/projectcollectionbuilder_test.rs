@@ -712,6 +712,42 @@ child_test! {
     }
 }
 
+child_test! {
+    // PORT: Go builds the symlink cache on first use (compiler/program.go:2300),
+    // after the project host is frozen (project/compilerhost.go:57), so the
+    // resolution of a package.json dependency that is not installed is not
+    // tracked. A Created event for node_modules/<dependency> then does not
+    // mark the project dirty (projectcollectionbuilder.go:1574, editfuzz3 H3).
+    fn created_dependency_directory_keeps_program() {
+        let index = "export const x = 1;";
+        let (session, _) = projecttestutil::setup(files(&[
+            ("/home/projects/myproject/tsconfig.json", "{}"),
+            (
+                "/home/projects/myproject/package.json",
+                r#"{ "name": "myproject", "dependencies": { "zlibx": "^1.0.0" } }"#,
+            ),
+            (
+                "/home/projects/myproject/node_modules/other/package.json",
+                r#"{ "name": "other" }"#,
+            ),
+            ("/home/projects/myproject/src/index.ts", index),
+        ]));
+        let index_uri = "file:///home/projects/myproject/src/index.ts";
+        open(&session, index_uri, index);
+        let before = program(&session, index_uri);
+
+        watch(
+            &session,
+            &[(CREATED, "file:///home/projects/myproject/node_modules/zlibx")],
+        );
+        let after = program(&session, index_uri);
+        assert!(
+            same_program(&before, &after),
+            "a Created event for an uninstalled dependency should not rebuild the program"
+        );
+    }
+}
+
 // Go: projectcollectionbuilder_test.go:602 filesForSolutionConfigFile
 fn files_for_solution_config_file(
     solution_refs: &[&str],

@@ -144,6 +144,13 @@ impl compiler::CompilerHost for CompilerHost {
         self.source_fs.clone()
     }
 
+    // PORT: not in Go (see `compiler::CompilerHost::without_fs_tracking`).
+    fn without_fs_tracking(&self, f: &mut dyn FnMut()) {
+        let tracking = self.source_fs.tracking.replace(false);
+        f();
+        self.source_fs.tracking.set(tracking);
+    }
+
     // Go: project/compilerhost.go:79 compilerHost.GetCurrentDirectory
     // GetCurrentDirectory implements compiler.CompilerHost.
     fn get_current_directory(&self) -> String {

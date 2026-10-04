@@ -298,7 +298,25 @@ pub(super) fn known_symlinks() -> Arc<crate::modulespecifiers::symlinks::KnownSy
     let frontend = FRONTENDS
         .with(|frontends| frontends.borrow().get(&id).cloned())
         .expect("the symlink cache is built on the loading thread (`build_lazy_shared_state`)");
-    let copy = Arc::new((*frontend.get_symlink_cache()).clone());
+    // PORT: the parallel bind seeds threads while the project host still
+    // tracks its file system calls, before Go makes any use of the cache. A
+    // Go first use after the host is frozen (project/compilerhost.go:57)
+    // makes no tracked calls. So when the frontend has not built its value,
+    // the copy is built with the tracking paused, and the frontend's own
+    // value is left for its first use (the auto-import registry, which can
+    // come before the freeze, as in Go). Else a node_modules/<dependency>
+    // Created event marks the project dirty where Go only clones the
+    // snapshot (editfuzz3 H3).
+    let copy = match frontend.symlink_cache_if_built() {
+        Some(built) => Arc::new((*built).clone()),
+        None => {
+            let mut built = None;
+            frontend
+                .host()
+                .without_fs_tracking(&mut || built = Some(frontend.build_symlink_cache()));
+            Arc::new(built.expect("without_fs_tracking runs its callback"))
+        }
+    };
     with_go(|go| Arc::clone(go.known_symlinks.get_or_init(|| copy)))
 }
 
