@@ -478,7 +478,7 @@ pub fn format_message(message: &'static crate::diagnostics::Message, args: &[Str
     };
     match message.format(args) {
         Ok(text) => text,
-        Err(_) => panic!("Invalid formatting placeholder"),
+        Err(_) => crate::core::go_panic("Invalid formatting placeholder".to_string()),
     }
 }
 

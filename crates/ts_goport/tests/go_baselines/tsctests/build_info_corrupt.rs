@@ -204,3 +204,16 @@ fn module_option_of_another_json_type_panics_interface_conversion() {
         "interface conversion: interface {} is string, not float64",
     );
 }
+
+// Go: diagnostics/diagnostics.go:142 `Format`, when the message is printed
+// with fewer `messageArgs` than it has placeholders.
+#[test]
+fn too_few_message_args_panic_when_printed() {
+    check(
+        "few-args",
+        r#""messageArgs":["number","string"]"#,
+        r#""messageArgs":["number"]"#,
+        "src/b.ts(1,39): error TS2322: ",
+        "Invalid formatting placeholder",
+    );
+}

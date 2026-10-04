@@ -229,14 +229,16 @@ pub fn format(text: &str, args: &[String]) -> String {
                 .take_while(|c| c.is_ascii_digit())
                 .count();
             if digits > 0 && bytes.get(i + 1 + digits) == Some(&b'}') {
-                let Ok(index) = text[i + 1..i + 1 + digits].parse::<i64>() else {
-                    panic!("Invalid formatting placeholder");
-                };
-                let Some(arg) = usize::try_from(index)
+                // Go panics when the index does not parse or has no arg,
+                // for example on a `.tsbuildinfo` diagnostic with too few
+                // `messageArgs`.
+                let Some(arg) = text[i + 1..i + 1 + digits]
+                    .parse::<i64>()
                     .ok()
+                    .and_then(|index| usize::try_from(index).ok())
                     .and_then(|index| args.get(index))
                 else {
-                    panic!("Invalid formatting placeholder");
+                    crate::core::go_panic("Invalid formatting placeholder".to_string());
                 };
                 result.push_str(&text[last..i]);
                 result.push_str(arg);
