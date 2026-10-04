@@ -225,21 +225,21 @@ impl NodeFactory {
         })
     }
 
-    // Go: ast/ast.go:145 (list *NodeList) Clone
-    // PORT: a synthetic list fixes its `Loc` at creation, so it is passed to
-    // `new_synthetic_node_list` instead of being set after `NewNodeList`.
+    // Go: ast/ast.go:147 (list *NodeList) Clone
+    // PORT: a factory list fixes its `Loc` at creation, so it is passed to
+    // `new_node_list_with_loc` instead of being set after `NewNodeList`.
     #[must_use]
     pub fn clone_node_list(&self, list: NodeList) -> NodeList {
-        new_synthetic_node_list(&list.nodes().to_vec(), list.loc())
+        self.new_node_list_with_loc(&list.nodes().to_vec(), list.loc())
     }
 
-    // Go: ast/ast.go:166 (list *ModifierList) Clone
-    // PORT: Go copies `ModifierFlags`; `new_synthetic_modifier_list`
+    // Go: ast/ast.go:168 (list *ModifierList) Clone
+    // PORT: Go copies `ModifierFlags`; `new_modifier_list_with_loc`
     // recomputes `ModifiersToFlags(nodes)`, which is the same value for a
     // list the factory or the parser made.
     #[must_use]
     pub fn clone_modifier_list(&self, list: ModifierList) -> ModifierList {
-        new_synthetic_modifier_list(&list.nodes().to_vec(), list.loc())
+        self.new_modifier_list_with_loc(&list.nodes().to_vec(), list.loc())
     }
 
     // Go: ast/ast_generated.go:604 (node *Token) Clone
@@ -2347,5 +2347,47 @@ impl NodeFactory {
     #[must_use]
     pub fn deep_clone_reparse_modifiers(&self, modifiers: ModifierList) -> ModifierList {
         get_deep_clone_visitor(self, false /*syntheticLocation*/).visit_modifiers(modifiers)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file_detached};
+    use crate::prelude::*;
+
+    /// A parse worker's parse of a JS file whose JSDoc the reparser deep
+    /// clones with lists of nodes (`@import`, `@overload`, a function type in
+    /// `@type`, an object type in `@typedef`) makes no synthetic slot and no
+    /// id, so the loader can adopt it (`files_parser.rs` `prefetch_parse`).
+    /// Go makes those lists with the parser's factory (ast/visitor.go
+    /// `VisitNodes`, `VisitModifiers`).
+    #[test]
+    fn reparsed_jsdoc_lists_stay_in_the_detached_store() {
+        let text = "/** @import { a } from \"./b.js\" */\n\
+            /** @overload @param {number} x @returns {void} */\n\
+            /** @param {any} x */\nexport function o(x) {}\n\
+            /** @type {(x: number) => void} */\nexport const fn = (x) => {};\n\
+            /** @typedef {{x: number}} T */\n";
+        let opts = SourceFileParseOptions {
+            file_name: "/a.js".to_string(),
+            ..Default::default()
+        };
+        std::thread::spawn(move || {
+            let before = (
+                crate::ast::synthetic::synthetic_slot_count(),
+                crate::ast::utilities_p1::next_ids(),
+            );
+            let parse = parse_source_file_detached(0, &opts, text, ScriptKind::JS);
+            assert!(parse.store.is_self_contained());
+            assert_eq!(
+                (
+                    crate::ast::synthetic::synthetic_slot_count(),
+                    crate::ast::utilities_p1::next_ids(),
+                ),
+                before
+            );
+        })
+        .join()
+        .unwrap();
     }
 }
