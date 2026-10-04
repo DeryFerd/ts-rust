@@ -3,6 +3,7 @@ mod contentmapper_watch;
 mod explain_files_cache;
 mod file_delete;
 mod jsdoc_cut;
+mod removed_reference_config;
 mod showconfig;
 mod tsbuild_a;
 mod tsbuild_b;

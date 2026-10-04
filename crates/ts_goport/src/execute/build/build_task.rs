@@ -2121,10 +2121,12 @@ impl BuildTask {
         &mut self,
         orchestrator: &dyn BuildTaskOrchestrator,
     ) -> Option<SystemTime> {
-        let entry = self
-            .build_info_entry
-            .as_mut()
-            .expect("buildInfoEntry is set");
+        // Go reads `t.buildInfoEntry.dtsTime` and panics on a nil entry (an
+        // upstream task whose config file is gone or cannot be read, so its
+        // check never loaded a build info).
+        let Some(entry) = self.build_info_entry.as_mut() else {
+            crate::core::go_nil_dereference()
+        };
         if let Some(dts_time) = entry.dts_time {
             return dts_time;
         }
