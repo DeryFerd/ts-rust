@@ -1300,7 +1300,10 @@ fn get_ambient_module_completions(
     let mut non_relative_module_names = Vec::new();
     for sym in ambient_modules {
         let module_name = get_ambient_module_name(&type_checker.symbols, sym);
-        if module_name.starts_with(fragment) && !module_name.contains('*') {
+        // PORT: Go `strings.HasPrefix` on Go bytes (`go_has_prefix`). The
+        // fragment of a closed file can end in the raw bytes of a cut char,
+        // which are a prefix of the char's bytes in Go only.
+        if go_has_prefix(&module_name, fragment) && !module_name.contains('*') {
             non_relative_module_names.push(module_name);
         }
     }
@@ -2075,7 +2078,8 @@ impl LanguageService {
                                       kind: ModuleCompletionKind,
                                       extension: &str|
          -> Vec<ModuleCompletionNameAndKind> {
-            if name.starts_with(fragment) {
+            // PORT: on Go bytes, as `get_ambient_module_completions`.
+            if go_has_prefix(name, fragment) {
                 let mut name = tspath::remove_trailing_directory_separator(name).to_string();
                 if !fragment_directory.is_empty()
                     && let Some(rest) = name.strip_prefix(fragment_directory.as_str())
@@ -2109,7 +2113,8 @@ impl LanguageService {
         if !fragment.starts_with(path_prefix) {
             // Fragment doesn't match the path mapping prefix at all:
             // we cannot extend it via this path.
-            if !path_prefix.starts_with(fragment) {
+            // PORT: on Go bytes, as `get_ambient_module_completions`.
+            if !go_has_prefix(path_prefix, fragment) {
                 return Vec::new();
             }
             let star_is_full_path_component = path.ends_with("/*");

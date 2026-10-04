@@ -27,7 +27,7 @@ fn chain(selection: &lsproto::SelectionRange) -> Vec<((u32, u32), (u32, u32))> {
 
 child_test! {
     // followups12 skeptic problem 4: the inner stop of an unterminated
-    // template literal ends at Go `end-1` (selectionranges.go:358), one Go
+    // template literal ends at Go `end-1` (selectionranges.go:359), one Go
     // byte before the literal's end. The literal ends after a real U+FDD0,
     // 3 Go bytes and 6 port bytes, so `end - 1` on port offsets ended 3
     // characters later, at (0,17), past the line end (0,15).

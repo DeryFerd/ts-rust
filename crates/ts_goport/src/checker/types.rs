@@ -163,7 +163,30 @@ impl<T: Copy + Default> SharedList<T> {
             SharedListRepr::Inline { .. } => unreachable!(),
         }
     }
+
+    /// The elements as a slice that does not borrow the list, so a caller
+    /// can read them across a `&mut Checker` call: an arena list itself, or
+    /// an inline list copied into `buf`. `None` for an owned list (a
+    /// multi-program process): clone it instead.
+    ///
+    /// PERF: no `SharedList` copy. A clone kept on the stack can be moved
+    /// as its bytes 2 to 16, and the reads of that copy then miss store
+    /// forwarding (`has_base_type`: about 25% of its time).
+    #[inline(always)]
+    pub fn detach<'a>(&self, buf: &'a mut SharedListBuf<T>) -> Option<&'a [T]> {
+        match &*self.repr {
+            SharedListRepr::Arena(items) => Some(items),
+            SharedListRepr::Inline { len, items } => {
+                *buf = *items;
+                Some(&buf[..*len as usize])
+            }
+            SharedListRepr::Owned(_) => None,
+        }
+    }
 }
+
+/// Room for the elements of an inline `SharedList` (`SharedList::detach`).
+pub type SharedListBuf<T> = [T; SHARED_LIST_INLINE];
 
 impl<T: Copy> Clone for SharedList<T> {
     #[inline]

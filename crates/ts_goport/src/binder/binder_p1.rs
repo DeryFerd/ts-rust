@@ -77,6 +77,11 @@ pub struct Binder {
     /// Go `file.CommonJSModuleIndicator` while binding. It is copied to
     /// `file_bind` when the bind ends.
     pub common_js_module_indicator: Node,
+    /// Rust-only: the child link column of `file` when it is a freeable
+    /// file version (`ast::version_child_links`), for `bind_each_child`.
+    /// The guard pins the version while the binder runs. `None` for a
+    /// static file, whose block has the column.
+    pub version_links: Option<crate::ast::VersionChildLinks>,
 }
 
 // Go: binder/binder.go:84 ActiveLabel
@@ -363,6 +368,7 @@ pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile
         symbols: std::mem::take(symbols),
         node_bind,
         flow_nodes,
+        version_links: crate::ast::version_child_links(file_index),
         ..Binder::default()
     };
     b.unreachable_flow = b.new_flow_node(FlowFlags::UNREACHABLE);
