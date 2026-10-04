@@ -982,14 +982,16 @@ fn reused_tables(np: &NewProgram, old: &PreviousVersion, replaced: &[Replaced]) 
 
 /// The tables of `np`, a new load whose file names are those of version
 /// `old`: the same program file paths in the same order and the same
-/// redirect paths (Go `filesByPath`, `redirectFilesByPath`). They start
-/// from the old tables where they are equal: the paths and slots
-/// (`file_by_path`), and the program-set fields while each file keeps
-/// them. They equal `full_tables` of `np` (`check_version_tables`). None
-/// when the file names differ.
-// PERF: Go builds the maps of each load once. These tables are port-only
-// copies of them, so a load that keeps the file names (an import of a
-// file that is already in the program) keeps the copies (lspedit1 cut 3).
+/// redirect paths (Go `filesByPath`, `redirectFilesByPath`). They share
+/// the old paths and slots (`file_by_path`). They equal `full_tables` of
+/// `np` (`check_version_tables`). None when the file names differ.
+// PERF: Go builds the maps of each load once. `file_by_path` is a
+// port-only copy of them, so a load that keeps the file names (an import
+// of a file that is already in the program) keeps the copy (lspedit1 cut
+// 3). Most files are the same parse, so the check compares pointers. The
+// program-set fields are copied again from the new load's maps: a compare
+// with the old copies reads cold memory and cost more than the copy
+// (progtables1: +0.13 ms on a query-core import edit).
 fn same_names_tables(np: &NewProgram, old: &PreviousVersion) -> Option<VersionTables> {
     let (old_np, old) = (&*old.np, &*old.tables);
     let (files, old_files) = (np.source_files(), old_np.source_files());
@@ -1006,12 +1008,10 @@ fn same_names_tables(np: &NewProgram, old: &PreviousVersion) -> Option<VersionTa
         return None;
     }
     let source_file_order: Vec<usize> = files.iter().map(|file| file.store).collect();
-    let mut file_meta = Arc::clone(&old.file_meta);
-    for (slot, file) in files.iter().enumerate() {
-        if !program_meta_is(np, file, &old.file_meta[slot]) {
-            Arc::make_mut(&mut file_meta)[slot] = file_program_meta(np, file);
-        }
-    }
+    let file_meta = files
+        .iter()
+        .map(|file| file_program_meta(np, file))
+        .collect();
     let previous = old.go.as_ref().map(|old_shared| (old_np, old_shared));
     let mut go = GoSharedState::new(np, previous, None, &old.file_by_path);
     go.kept_file_names = true;
@@ -1025,7 +1025,7 @@ fn same_names_tables(np: &NewProgram, old: &PreviousVersion) -> Option<VersionTa
             source_file_order,
             Vec::new(),
             Arc::clone(&old.file_by_path),
-            file_meta,
+            Arc::new(file_meta),
         )
     })
 }
@@ -1046,17 +1046,6 @@ fn same_redirect_paths(np: &NewProgram, old_np: &NewProgram) -> bool {
         }
         _ => false,
     }
-}
-
-/// True when program file `file` of `np` has the program-set fields
-/// `meta` (`file_program_meta`), without a copy.
-fn program_meta_is(np: &NewProgram, file: &ParsedSourceFile, meta: &FileProgramMeta) -> bool {
-    let path = file.path();
-    let meta_data = np.processed_files.source_file_meta_datas.get(path);
-    meta_data.map_or_else(
-        || meta.meta_data == SourceFileMetaData::default(),
-        |meta_data| *meta_data == meta.meta_data,
-    ) && np.is_source_file_default_library(path) == meta.is_default_library
 }
 
 /// Go `SourceFile.Metadata` and `IsDefaultLibrary` of program file `file`.
@@ -1475,20 +1464,14 @@ impl GoSharedState {
         {
             let _ = known_symlinks.set(Arc::clone(copy));
         }
-        // A new load with the same files mostly finds the same ones.
-        let found = &files.source_files_found_searching_node_modules;
         let source_files_found_searching_node_modules = match previous {
             Some((old_p, old))
                 if Rc::ptr_eq(
-                    found,
+                    &files.source_files_found_searching_node_modules,
                     &old_p
                         .processed_files
                         .source_files_found_searching_node_modules,
-                ) || (found.len() == old.source_files_found_searching_node_modules.len()
-                    && found.iter().all(|path| {
-                        old.source_files_found_searching_node_modules
-                            .contains(&path.0)
-                    })) =>
+                ) =>
             {
                 Arc::clone(&old.source_files_found_searching_node_modules)
             }
@@ -2127,9 +2110,9 @@ mod tests {
 
     // progtables1 (lspedit1 cut 3): a new load with the file names of the
     // version before it (here index.ts imports b.ts, which the config
-    // already lists) keeps that version's paths and program-set fields.
-    // Its tables equal a build from its files alone. A load that adds a
-    // file builds them again.
+    // already lists) keeps that version's paths table. Its tables equal a
+    // build from its files alone. A load that adds a file builds them
+    // again.
     #[test]
     fn new_load_with_the_same_file_names_keeps_the_tables() {
         let dir = std::env::temp_dir().join(format!("goport-same-names-{}", std::process::id()));
@@ -2158,10 +2141,6 @@ mod tests {
         assert!(
             Arc::ptr_eq(&t1.file_by_path, &t2.file_by_path),
             "new paths table"
-        );
-        assert!(
-            Arc::ptr_eq(&t1.file_meta, &t2.file_meta),
-            "new program-set fields"
         );
         assert_ne!(
             t1.source_file_order, t2.source_file_order,
