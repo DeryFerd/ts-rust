@@ -1,9 +1,9 @@
-// Postinstall of the goport `typescript` package: lib/install.js. Go's package has no
-// install script; this is the only file the port adds to Go's layout.
+// Postinstall of the goport `typescript` and `tsc-rs` packages: lib/install.js. Go's package has
+// no install script; this is the only file the port adds to Go's layout.
 //
-// bin/tsc is Go's JS launcher: it starts Node, finds the platform package and execs its
-// native tsc. The Node start costs about 22 ms on every run. On POSIX this script replaces
-// bin/tsc with a relative symlink to the native tsc, so `tsc` runs without Node, as
+// The bin (bin/tsc, or bin/tsc-rs) is Go's JS launcher: it starts Node, finds the platform
+// package and execs its native tsc. The Node start costs about 22 ms on every run. On POSIX this
+// script replaces the bin with a relative symlink to the native tsc, so it runs without Node, as
 // esbuild's install script does. It is a symlink, not a copy or a hard link: the native tsc
 // reads the lib files from the dir of its real path (Go's noembed build), and through the
 // symlink that stays the platform package's lib dir.
@@ -19,7 +19,8 @@ import { fileURLToPath } from "node:url";
 import getExePath from "#getExePath";
 
 const pkgDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const binPath = path.join(pkgDir, "bin", "tsc");
+const pkg = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
+const binPath = path.join(pkgDir, Object.values(pkg.bin)[0]);
 
 function keepLauncherReason() {
     if (process.platform === "win32") return "Windows";
@@ -30,11 +31,12 @@ function keepLauncherReason() {
 
 function useNativeBin() {
     if (keepLauncherReason()) return;
-    const { version } = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf8"));
     const exe = getExePath();
     const out = execFileSync(exe, ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-    if (out !== `Version ${version}`) {
-        throw new Error(`${exe} reports "${out}", not "Version ${version}"`);
+    // tsc-rs records the version its tsc reports as tscVersion (npm/pack.mjs).
+    const want = `Version ${pkg.tscVersion ?? pkg.version}`;
+    if (out !== want) {
+        throw new Error(`${exe} reports "${out}", not "${want}"`);
     }
     const target = path.relative(fs.realpathSync(path.dirname(binPath)), fs.realpathSync(exe));
     const tmp = `${binPath}.${process.pid}.tmp`;
@@ -47,5 +49,5 @@ try {
     useNativeBin();
 }
 catch (e) {
-    console.warn(`typescript: bin/tsc keeps the Node launcher: ${e instanceof Error ? e.message : e}`);
+    console.warn(`${pkg.name}: ${path.relative(pkgDir, binPath)} keeps the Node launcher: ${e instanceof Error ? e.message : e}`);
 }
