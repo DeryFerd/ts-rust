@@ -561,9 +561,11 @@ os_child_test! {
     /// followups19 (R167 reviewer): a package.json that `file_exists` finds
     /// but that no read can open, here a Unix socket (as when a package is
     /// removed between the two calls). The worker resolves `sock` with a
-    /// failed read, and the check must not take that answer: the snapshot
+    /// failed read, and the load must not take that answer: the snapshot
     /// does not cache a failed read, so a later read in the load could find
-    /// the file. The loader resolves the key itself.
+    /// the file. The loader resolves the key itself. The workers do not
+    /// know the file from an earlier job, so the answer is not shared
+    /// (followups22, `AheadFs::read_file`), and no check rejects it.
     #[cfg(unix)]
     fn a_failed_package_json_read_is_not_taken() {
         let stats = same_with_and_without("fr", &|session, root| {
@@ -588,8 +590,59 @@ os_child_test! {
                 "{observed:?}"
             );
         });
-        assert_eq!(stats.loader.rejected, 1, "{stats:?}");
+        assert_eq!(stats.loader.rejected, 0, "{stats:?}");
+        assert_eq!(stats.loader.scopes_rejected, 0, "{stats:?}");
         assert_eq!(stats.loader.taken + 1, stats.keys, "{stats:?}");
+    }
+}
+
+os_child_test! {
+    /// followups22 (R169 reviewer): a package.json that is there but that
+    /// no read can open (no read permission). The worker read fails at each
+    /// load. The loader resolves the key itself, with Go's answer, as in a
+    /// serial load. No rejection drops what the workers keep: the next load
+    /// starts with the known files of the one before. When the check
+    /// rejected the answer, every load dropped them (`Workers::forget`).
+    #[cfg(unix)]
+    fn a_never_readable_package_json_does_not_drop_the_kept_state() {
+        let stats = same_with_and_without("locked", &|session, root| {
+            use std::os::unix::fs::PermissionsExt;
+            write(
+                root,
+                "node_modules/locked/index.d.ts",
+                "export declare const k: number;",
+            );
+            let package_json = format!("{root}/node_modules/locked/package.json");
+            write(root, "node_modules/locked/package.json", r#"{ "name": "locked" }"#);
+            std::fs::set_permissions(&package_json, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            let locked = std::fs::File::open(&package_json).is_err();
+            let uri = file_uri(root, "src/index.ts");
+            open(session, &uri, &format!("{INDEX}import {{ k }} from \"locked\";\n"));
+            program(session, &uri);
+            add_import(session, root);
+            if let Some(stats) = resolve_ahead::last_stats().filter(|_| locked) {
+                assert_eq!(stats.loader.rejected, 0, "{stats:?}");
+                assert_eq!(stats.loader.scopes_rejected, 0, "{stats:?}");
+                assert_eq!(stats.loader.taken + 1, stats.keys, "{stats:?}");
+            }
+            resolve_ahead::wait_for_frees();
+            edit_index(session, root, 3, "import { b as b2 } from \"./sub/b\";\n");
+            let observed = observe(session, root);
+            assert!(
+                observed
+                    .resolutions
+                    .iter()
+                    .any(|resolution| resolution.contains("\"locked\"")
+                        && resolution.contains("-> <root>/node_modules/locked/index.d.ts")),
+                "{observed:?}"
+            );
+            if !locked {
+                eprintln!("skipped: a file without read permission opens here");
+            }
+        });
+        assert_eq!(stats.loader.rejected, 0, "{stats:?}");
+        assert!(stats.known_files > 0, "{stats:?}");
     }
 }
 

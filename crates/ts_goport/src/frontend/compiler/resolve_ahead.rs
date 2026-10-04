@@ -1239,6 +1239,15 @@ impl Fs for AheadFs {
     }
 
     // Go: project/overlayfs.go:280 overlayFS.ReadFile
+    // PORT: a failed read of a file that the workers do not know from an
+    // earlier job (no read permission, or a file that went away after its
+    // `file_exists`) makes the answer unshareable: the loader resolves the
+    // key itself and gets Go's answer. Nothing that the workers keep made
+    // the answer, so they keep it (a rejection drops it, `Workers::forget`),
+    // and a package.json that no read can open does not drop it at each
+    // load. A failed read of a known file is logged, and the check rejects
+    // it (`AheadCall::Read`): the file may be gone, and the workers then
+    // drop the known files.
     fn read_file(&self, path: &str) -> (String, bool) {
         let canonical = self.path(path);
         let view = &self.job.view;
@@ -1252,6 +1261,10 @@ impl Fs for AheadFs {
         } else {
             self.os.read_file(path)
         };
+        if !ok && !self.job.known_files.contains(&canonical) {
+            note_ahead_unshareable(Some(path));
+            return (text, ok);
+        }
         note_ahead_read(path, ok.then(|| xxh3_128(text.as_bytes())));
         (text, ok)
     }
