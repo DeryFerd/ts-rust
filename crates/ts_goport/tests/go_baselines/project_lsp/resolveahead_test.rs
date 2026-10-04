@@ -7,7 +7,9 @@
 //!
 //! Resolve ahead runs only on the OS file system, so each test writes a
 //! project to a temp directory and runs with no OS override (not
-//! `child_test!`, which installs one).
+//! `child_test!`, which installs one). It is off on a case-insensitive file
+//! system (the default macOS volumes), where the tests are skipped
+//! (`resolve_ahead_off`).
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -23,7 +25,8 @@ use super::projecttestutil;
 use super::util::{CHANGED, bg, close, edit, generate_file_events, open, program, uri};
 
 /// A test in a child process with no OS override, with the environment
-/// variables `$env` set.
+/// variables `$env` set. It is skipped, with a message, where resolve ahead
+/// cannot run (`resolve_ahead_off`).
 macro_rules! os_child_test {
     ($(#[$meta:meta])* fn $name:ident() $body:block) => {
         os_child_test!(env &[]; $(#[$meta])* fn $name() $body);
@@ -34,9 +37,46 @@ macro_rules! os_child_test {
         fn $name() {
             let path = concat!(module_path!(), "::", stringify!($name));
             let test = path.split_once("::").map_or(path, |(_, rest)| rest);
+            if let Some(reason) = resolve_ahead_off() {
+                eprintln!("{test}: skipped: {reason}");
+                return;
+            }
             crate::support::child::run_test_in_child_with_env(test, $env, || $body);
         }
     };
+}
+
+/// Why resolve ahead cannot run in these tests, if it cannot. It is off on a
+/// case-insensitive file system (project/compilerhost.rs
+/// `CompilerHost::resolve_ahead`), which the OS file system decides from the
+/// executable's path (`use_case_sensitive_file_names`), and the tests write
+/// their projects to the temp dir, so both must be case-sensitive. The
+/// default macOS volumes are not; Linux file systems are, so the tests run
+/// there.
+// PORT: not in Go (resolve ahead is a port feature).
+fn resolve_ahead_off() -> Option<String> {
+    if !ts_goport::frontend::vfs::Fs::use_case_sensitive_file_names(&*osvfs_fs()) {
+        return Some(
+            "the OS file system is case-insensitive here, and resolve ahead is off".to_string(),
+        );
+    }
+    let probe = std::env::temp_dir().join(format!(
+        "ts_goport_resolve_ahead_Case_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&probe).ok()?;
+    let other = std::env::temp_dir().join(format!(
+        "ts_goport_resolve_ahead_cASE_{}",
+        std::process::id()
+    ));
+    let insensitive = other.exists();
+    let _ = std::fs::remove_dir(&probe);
+    insensitive.then(|| {
+        format!(
+            "the temp dir {} is case-insensitive, and the tests write their projects there",
+            std::env::temp_dir().display()
+        )
+    })
 }
 
 const INDEX: &str = r#"import { a } from "./a";
@@ -970,4 +1010,12 @@ os_child_test! {
         drop(session);
         std::fs::remove_dir_all(&root).unwrap();
     }
+}
+
+/// The skip of the tests above (`resolve_ahead_off`) must not hide them on
+/// Linux, whose file systems are case-sensitive.
+#[cfg(target_os = "linux")]
+#[test]
+fn resolve_ahead_runs_on_linux() {
+    assert_eq!(resolve_ahead_off(), None);
 }
