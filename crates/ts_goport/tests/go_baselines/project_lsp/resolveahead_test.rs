@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+use ts_goport::flags::ModuleKind;
 use ts_goport::frontend::bundled;
 use ts_goport::frontend::compiler::resolve_ahead::{self, LoadStats, Mode};
 use ts_goport::frontend::tspath;
@@ -358,6 +359,50 @@ os_child_test! {
         // `./sub/d` adds a file to a directory that the load had.
         assert_eq!(stats.new_scopes, stats.scopes, "{stats:?}");
         assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+    }
+}
+
+os_child_test! {
+    /// A load keeps the module names and their usages of each parse for the
+    /// next loads (compiler/file_loader.rs `import_names`): an import edit
+    /// in another file resolves the names of `src/modes.ts` with the modes
+    /// of a load that reads the nodes (a serial load keeps none).
+    fn keeps_the_module_names_and_modes_of_an_unchanged_file() {
+        same_with_and_without("modes", &|session, root| {
+            write(
+                root,
+                "src/modes.ts",
+                "import type { p } from \"pkg\" with { \"resolution-mode\": \"require\" };\n\
+                 export type O = typeof import(\"pkg/other\", { with: { \"resolution-mode\": \"import\" } });\n\
+                 export const lazy = () => import(\"./a\");\n\
+                 import b = require(\"./sub/b\");\n\
+                 export { p, b };\n",
+            );
+            let uri = file_uri(root, "src/index.ts");
+            open(session, &uri, &format!("{INDEX}import \"./modes\";\n"));
+            program(session, &uri);
+            add_import(session, root);
+            let program = program(session, &uri);
+            let modes = tspath::to_path(&format!("{root}/src/modes.ts"), root, true);
+            let mut names: Vec<(String, ModuleKind)> = program
+                .processed_files
+                .resolved_modules
+                .get(&modes)
+                .expect("resolutions of src/modes.ts")
+                .keys()
+                .map(|key| (key.name.clone(), key.mode))
+                .collect();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                names,
+                [
+                    ("./a".to_string(), ModuleKind::ES_NEXT),
+                    ("./sub/b".to_string(), ModuleKind::COMMON_JS),
+                    ("pkg".to_string(), ModuleKind::COMMON_JS),
+                    ("pkg/other".to_string(), ModuleKind::ES_NEXT),
+                ]
+            );
+        });
     }
 }
 
