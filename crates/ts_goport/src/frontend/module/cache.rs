@@ -282,9 +282,15 @@ const KEY_DONE: u8 = 2;
 /// The loader resolves the key itself.
 const KEY_LOADER: u8 = 3;
 
-/// How many times the loader checks a key that a worker resolves before
-/// it sleeps (`AheadQueue::wait_or_take`): about 2 to 4 microseconds.
-const WAIT_SPINS: u32 = 64;
+/// How long the loader spins on a key that a worker resolves before it
+/// sleeps (`AheadQueue::wait_or_take`). A key takes about 25 microseconds
+/// of worker CPU on query-core, and a sleep adds the wake: the worker's
+/// `done` call and the loader's core coming out of idle.
+const WAIT_SPIN: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// How many times the loader checks the key between two reads of the clock
+/// while it spins: about 2 to 4 microseconds.
+const SPINS_PER_CLOCK_READ: u32 = 64;
 
 /// How many keys after the cursor `AheadQueue::find` looks at. The loader
 /// meets the keys of the previous load in its order, less removed keys
@@ -368,31 +374,44 @@ impl AheadQueue {
     /// For the loader's key `index` that has no answer: true when a worker
     /// resolved it (it waits while a worker resolves it now), so the answer
     /// may be published now. False: the loader resolves it itself, and no
-    /// worker starts it.
-    fn wait_or_take(&self, index: usize) -> bool {
+    /// worker starts it. A wait counts in `stats`.
+    fn wait_or_take(&self, index: usize, stats: &mut AheadStats) -> bool {
         use std::sync::atomic::Ordering;
         let state = &self.states[index];
         match state.compare_exchange(KEY_FREE, KEY_LOADER, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) | Err(KEY_LOADER) => false,
             Err(_) => {
-                // Most resolutions end within a few microseconds: spin a
-                // little, then sleep until the worker ends the key (`done`).
-                for _ in 0..WAIT_SPINS {
-                    if state.load(Ordering::Acquire) != KEY_WORKER {
-                        return true;
+                // Most resolutions end within tens of microseconds: spin
+                // for up to `WAIT_SPIN`, then sleep until the worker ends
+                // the key (`done`).
+                let start = std::time::Instant::now();
+                let ended = 'spin: loop {
+                    for _ in 0..SPINS_PER_CLOCK_READ {
+                        if state.load(Ordering::Acquire) != KEY_WORKER {
+                            break 'spin true;
+                        }
+                        std::hint::spin_loop();
                     }
-                    std::hint::spin_loop();
+                    if start.elapsed() >= WAIT_SPIN {
+                        break false;
+                    }
+                };
+                if !ended {
+                    stats.slept += 1;
+                    self.waiting.store(index, Ordering::SeqCst);
+                    let mut done = self.lock_done();
+                    while state.load(Ordering::SeqCst) == KEY_WORKER {
+                        done = self
+                            .done_cv
+                            .wait(done)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                    drop(done);
+                    self.waiting.store(usize::MAX, Ordering::SeqCst);
                 }
-                self.waiting.store(index, Ordering::SeqCst);
-                let mut done = self.lock_done();
-                while state.load(Ordering::SeqCst) == KEY_WORKER {
-                    done = self
-                        .done_cv
-                        .wait(done)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                }
-                drop(done);
-                self.waiting.store(usize::MAX, Ordering::SeqCst);
+                stats.waited += 1;
+                let waited = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                stats.wait_ns = stats.wait_ns.saturating_add(waited);
                 true
             }
         }
@@ -470,6 +489,10 @@ pub struct AheadStats {
     pub missing: usize,
     /// Keys whose worker answer the loader waited for.
     pub waited: usize,
+    /// Of `waited`: the waits that slept after the spin.
+    pub slept: usize,
+    /// The time of all the waits, in nanoseconds.
+    pub wait_ns: u64,
 }
 
 impl Caches {
@@ -1061,9 +1084,8 @@ impl Caches {
             && let Some(index) =
                 queue.find(&ahead.cursor, (containing_directory, module_name, mode))
             && found.is_none()
-            && queue.wait_or_take(index)
+            && queue.wait_or_take(index, &mut stats)
         {
-            stats.waited += 1;
             found = answers.get_module(&key);
         }
         let accepted = match found
