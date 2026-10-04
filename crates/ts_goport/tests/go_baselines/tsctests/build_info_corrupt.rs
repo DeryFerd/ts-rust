@@ -191,3 +191,16 @@ fn unknown_message_key_panics_when_printed() {
         "Unknown diagnostic message: x",
     );
 }
+
+// Go: tsoptions/parsinghelpers.go:574 `value.(float64)` in
+// floatOrInt32ToFlag, when the build info options are read.
+#[test]
+fn module_option_of_another_json_type_panics_interface_conversion() {
+    check(
+        "bad-module",
+        r#""strict":true}"#,
+        r#""strict":true,"module":"x"}"#,
+        "",
+        "interface conversion: interface {} is string, not float64",
+    );
+}
