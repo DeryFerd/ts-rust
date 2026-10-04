@@ -402,8 +402,10 @@ pub(super) fn file_exists(path: &str) -> bool {
     if let Some(go) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned()) {
         return go.file_exists(path);
     }
-    super::with_host_fs_cache(|cache| {
-        cache.file_exists(path, || WORKER_FS.with(|fs| fs.file_exists(path)))
+    super::with_tables(|tables| {
+        tables
+            .host_fs_cache
+            .file_exists(path, || WORKER_FS.with(|fs| fs.file_exists(path)))
     })
 }
 
@@ -597,7 +599,9 @@ enum Entry {
 /// updated from, if it is still loaded; the new state shares its copies of
 /// unchanged frontend data (`GoSharedState::new`). When `np` replaced files
 /// of `previous` in place (Go `ReuseProgram`), the new tables start from
-/// its tables (`reused_tables`).
+/// its tables (`reused_tables`). When `np` keeps the frontend resolver of
+/// `previous`, the new tables share its package.json cache
+/// (`VersionTables::package_json_cache`).
 fn build_program(
     np: &Rc<NewProgram>,
     entry: Entry,
@@ -686,7 +690,7 @@ fn build_program(
     let previous_shared = previous
         .as_ref()
         .and_then(|old| Some((&*old.np, old.tables.go.as_ref()?)));
-    let (tables, common_source_directory) = match (&previous, &replaced) {
+    let (mut tables, common_source_directory) = match (&previous, &replaced) {
         (Some(old), Some(replaced)) => {
             let tables = reused_tables(np, old, replaced);
             // Go computes it from the file names and the options, which a
@@ -709,6 +713,15 @@ fn build_program(
             (tables, common_source_directory)
         }
     };
+    // Go: compiler/program.go:408 ReuseProgram keeps `processedFiles`, so
+    // the new program keeps the resolver and the package.json lookups of
+    // module specifier generation in its cache (program.go:147-169).
+    if let Some(old) = &previous
+        && let (Some(resolver), Some(old_resolver)) = (&np.resolver, &old.np.resolver)
+        && Rc::ptr_eq(resolver, old_resolver)
+    {
+        tables.package_json_cache = Arc::clone(&old.tables.package_json_cache);
+    }
     if check_version_tables() {
         tables
             .go
