@@ -104,9 +104,10 @@ type FrontendResolutions =
 /// it (output names with outDir or declarationDir, the checker for
 /// `rewriteRelativeImportExtensions`), and that call records TS6059 errors
 /// on the reference. The copy needs the value now, so it reads it without
-/// the check (`common_source_directory_unchecked`). The checker's call then
-/// records no error on the reference; Go records them there from a checker
-/// thread.
+/// the check (`common_source_directory_unchecked`). The checker's call on
+/// the copy marks the reference (`common_source_directory_read`), and the
+/// next reader of the reference's errors records them, as Go does from the
+/// checker thread.
 #[derive(Default)]
 struct ProjectReferenceCopies {
     resolved: FxHashMap<*const ParsedCommandLine, Arc<ResolvedProjectReference>>,
@@ -120,6 +121,7 @@ impl ProjectReferenceCopies {
                 Arc::new(ResolvedProjectReference::new(
                     (**parsed.compiler_options()).clone(),
                     parsed.common_source_directory_unchecked(),
+                    parsed.common_source_directory_read.clone(),
                 ))
             })
             .clone()
