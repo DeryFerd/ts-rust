@@ -124,9 +124,12 @@ fn main() {
         .name("tsgo".to_string())
         .stack_size(ts_goport::gostd::stack::max_stack_size())
         .spawn(move || exit(run_main(start)));
-    // Reached only when `run_main` panics.
+    // Reached only when `run_main` panics. The write drops its error, as
+    // the panic hook's do: `eprintln!` panics when stderr is a pipe with no
+    // reader, and this panic of the main thread ended the run with exit
+    // code 101 (`tests/tsgo_panic_hook.rs`).
     let _ = work.join();
-    eprintln!("tsgo: work thread failed");
+    let _ = writeln!(std::io::stderr(), "tsgo: work thread failed");
     std::process::exit(EXIT_UNPORTED);
 }
 
