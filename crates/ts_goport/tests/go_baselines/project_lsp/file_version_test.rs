@@ -16,7 +16,7 @@ use ts_goport::ast::{
     dead_file_versions, file_version_probe, file_versions_made, free_file_versions,
     node_block_addr, node_block_is_owned, owned_node_count, source_file_ecma_line_map,
     source_file_get_declaration_map, source_file_get_name_table, source_file_imports,
-    source_file_info, source_file_text,
+    source_file_info, source_file_text, version_child_links,
 };
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::core::Node;
@@ -203,6 +203,41 @@ child_test! {
         assert!(owned_node_count() > one_version, "the added import has nodes");
         assert_eq!(edited.statements().len(), 3);
         assert_eq!(sem_diag_count(&p5, INDEX_FILE), 0);
+    }
+}
+
+child_test! {
+    // bindfast1: the store of an edited version keeps its R2-5 child link
+    // column, so its bind walks the links (`Binder::bind_each_child`), not
+    // the node data. Every chain gives the children of `for_each_child`, in
+    // order. A static file has the column in its block and no version
+    // column.
+    fn edited_file_binds_through_its_child_links() {
+        let session = open_p1();
+        body_edit(&session, 2, "2");
+        let p2 = program(&session, INDEX_URI);
+        let edited = root(&p2, INDEX_FILE);
+        assert!(file_version_probe(edited).is_some(), "the edited version is freeable");
+        assert!(
+            version_child_links(root(&p2, A_FILE).file_index()).is_none(),
+            "a.ts is static"
+        );
+        let links = version_child_links(edited.file_index())
+            .expect("the edited version keeps its child links");
+        let nodes = tree(edited);
+        for &n in &nodes {
+            let children = links
+                .children(n)
+                .unwrap_or_else(|| panic!("the chain of {:?} is known", n.kind()));
+            assert_eq!(
+                children.collect::<Vec<_>>(),
+                n.iter_children().collect::<Vec<_>>(),
+                "the children of {:?}",
+                n.kind()
+            );
+        }
+        assert!(nodes.len() > 10);
+        assert_eq!(sem_diag_count(&p2, INDEX_FILE), 0);
     }
 }
 

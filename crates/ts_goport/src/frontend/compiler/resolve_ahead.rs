@@ -11,7 +11,8 @@
 //! loader's own call would go there, at the moment the loader's own
 //! resolution would make it:
 //!
-//! - a read is the loader's read, and its text must have the worker's hash;
+//! - a read is the loader's read, and its text must have the worker's hash
+//!   (a worker read that failed fails);
 //! - a `file_exists`, `directory_exists` or `realpath` must agree with the
 //!   snapshot's answer for the name, if it has one. The snapshot's lookup
 //!   cache takes each answer that it does not have from the workers' lookups
@@ -662,9 +663,15 @@ impl Workers {
         Some(job)
     }
 
-    /// Stops `job`: each worker ends it after its current key.
+    /// Stops `job`: each worker ends it after its current key. After this, no
+    /// worker of the job stores a lookup (`cached`): the snapshot keeps the
+    /// job's lookups as answers of the load (`ResolveAheadHost::attach`).
     fn end(&self, job: &Arc<Job>) {
         job.closed.store(true, Ordering::Relaxed);
+        // A worker tests `closed` under the shard lock before it stores. A
+        // store in a shard now ends before this takes the lock, and a later
+        // one sees `closed`.
+        job.stats.wait_for_stores();
         let mut state = lock_state(self);
         if state
             .job
@@ -987,24 +994,40 @@ struct WorkerStats {
 const STAT_SHARDS: usize = 16;
 
 impl WorkerStats {
-    fn file_exists(&self, path: &str, load: impl FnOnce() -> bool) -> bool {
-        cached(&self.file_exists, path, load)
+    /// `closed` is the job's flag (`Job::closed`): a closed job stores no
+    /// lookup (`cached`).
+    fn file_exists(&self, closed: &AtomicBool, path: &str, load: impl FnOnce() -> bool) -> bool {
+        cached(&self.file_exists, closed, path, load)
     }
 
     fn directory_exists(
         &self,
+        closed: &AtomicBool,
         path: &str,
         load: impl FnOnce() -> (bool, Option<Arc<AheadCall>>),
     ) -> (bool, Option<Arc<AheadCall>>) {
-        cached(&self.directory_exists, path, load)
+        cached(&self.directory_exists, closed, path, load)
     }
 
     fn realpath(
         &self,
+        closed: &AtomicBool,
         path: &str,
         load: impl FnOnce() -> (String, Arc<AheadCall>),
     ) -> (String, Arc<AheadCall>) {
-        cached(&self.realpath, path, load)
+        cached(&self.realpath, closed, path, load)
+    }
+
+    /// Takes and frees each shard lock once (`Workers::end`).
+    fn wait_for_stores(&self) {
+        fn each<V>(shards: &[Mutex<FxHashMap<String, V>>; STAT_SHARDS]) {
+            for shard in shards {
+                drop(shard.lock());
+            }
+        }
+        each(&self.file_exists);
+        each(&self.directory_exists);
+        each(&self.realpath);
     }
 }
 
@@ -1049,9 +1072,13 @@ fn lock_shard<'s, V>(
 }
 
 /// The cached value of `path` in its shard, or `load()` stored as it. The
-/// lock is not held while `load` runs; the first stored value wins.
+/// lock is not held while `load` runs; the first stored value wins. When the
+/// job has ended (`closed`), `load()` is not stored: the snapshot keeps the
+/// job's lookups as answers of its load, and an answer that a worker gets
+/// after the load is not one of them.
 fn cached<V: Clone>(
     shards: &[Mutex<FxHashMap<String, V>>; STAT_SHARDS],
+    closed: &AtomicBool,
     path: &str,
     load: impl FnOnce() -> V,
 ) -> V {
@@ -1059,10 +1086,12 @@ fn cached<V: Clone>(
         return value.clone();
     }
     let value = load();
-    lock_shard(shards, path)
-        .entry(path.to_string())
-        .or_insert(value)
-        .clone()
+    let mut shard = lock_shard(shards, path);
+    // Under the shard lock (`Workers::end`).
+    if closed.load(Ordering::Relaxed) {
+        return shard.get(path).cloned().unwrap_or(value);
+    }
+    shard.entry(path.to_string()).or_insert(value).clone()
 }
 
 /// Go `module.ResolutionHost` of a worker resolver.
@@ -1113,7 +1142,7 @@ impl AheadFs {
             });
             return (open, call);
         }
-        let (exists, call) = self.job.stats.directory_exists(path, || {
+        let (exists, call) = self.job.stats.directory_exists(&self.job.closed, path, || {
             let exists = self.os.directory_exists(path);
             let call = (canonical.as_str() == path).then(|| {
                 Arc::new(AheadCall::DirectoryExists {
@@ -1168,7 +1197,7 @@ impl Fs for AheadFs {
             let exists = self
                 .job
                 .stats
-                .file_exists(path, || self.os.file_exists(path));
+                .file_exists(&self.job.closed, path, || self.os.file_exists(path));
             (exists, false)
         };
         AheadFs::note_call(path, canonical, |path| AheadCall::FileExists {
@@ -1246,7 +1275,7 @@ impl Fs for AheadFs {
 
     // Go: project/overlayfs.go:360 overlayFS.Realpath
     fn realpath(&self, path: &str) -> String {
-        let (real, call) = self.job.stats.realpath(path, || {
+        let (real, call) = self.job.stats.realpath(&self.job.closed, path, || {
             let real = self.os.realpath(path);
             let call = Arc::new(AheadCall::Realpath {
                 name: path.to_string(),
@@ -1337,7 +1366,38 @@ fn describe(module: &ResolvedModule) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::write_debug_line;
+    use super::{AheadLookups, WorkerStats, write_debug_line};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // PORT: not in Go (resolve ahead). R167 reviewer (followups15a): a
+    // worker of an ended job must not store a lookup, since the snapshot
+    // keeps the job's lookups as answers of the load (`Workers::end`). A
+    // lookup that another worker stored before the end still answers.
+    #[test]
+    fn an_ended_job_stores_no_lookup() {
+        let stats = WorkerStats::default();
+        let closed = AtomicBool::new(false);
+        assert!(stats.file_exists(&closed, "/p/a.ts", || true));
+        assert!(stats.directory_exists(&closed, "/p", || (true, None)).0);
+        closed.store(true, Ordering::Relaxed);
+        stats.wait_for_stores();
+        assert!(stats.file_exists(&closed, "/p/a.ts", || false));
+        assert!(!stats.file_exists(&closed, "/p/b.ts", || false));
+        assert!(!stats.directory_exists(&closed, "/q", || (false, None)).0);
+        let real = stats.realpath(&closed, "/p/l", || {
+            let call = super::AheadCall::Realpath {
+                name: "/p/l".to_string(),
+                real: "/p/r".to_string(),
+            };
+            ("/p/r".to_string(), std::sync::Arc::new(call))
+        });
+        assert_eq!(real.0, "/p/r");
+        assert_eq!(AheadLookups::file_exists(&stats, "/p/a.ts"), Some(true));
+        assert_eq!(AheadLookups::directory_exists(&stats, "/p"), Some(true));
+        assert_eq!(AheadLookups::file_exists(&stats, "/p/b.ts"), None);
+        assert_eq!(AheadLookups::directory_exists(&stats, "/q"), None);
+        assert_eq!(AheadLookups::realpath(&stats, "/p/l"), None);
+    }
 
     // PORT: not in Go (the resolve-ahead debug log). The workers' panic
     // lines and the loader's counts go to one file at the same time

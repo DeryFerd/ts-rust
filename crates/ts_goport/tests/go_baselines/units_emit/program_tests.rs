@@ -444,6 +444,123 @@ fn test_lazy_js_doc_link_marks_its_target_used() {
     );
 }
 
+// PORT: no Go test (basetype1). `has_base_type` (Go `hasBaseType`,
+// checker.go:19888) reads resolved base types in place with
+// `Type::resolved_base_types` and calls `get_base_types_shared` (Go
+// `getBaseTypes`, checker.go:19504) only for a type whose base types are
+// not resolved yet. The in-place read must be `None` before resolution, so
+// the walk still runs `getBaseTypes` and its side effects in Go's order,
+// and must equal `get_base_types_shared` after it.
+#[test]
+fn test_has_base_type_reads_resolved_base_types_in_place() {
+    in_child(
+        module_path!(),
+        "test_has_base_type_reads_resolved_base_types_in_place",
+        || {
+            let map_fs = MapFs::from_map(
+                [
+                    (
+                        "/a.ts",
+                        "class A {}\ninterface I {}\nclass B extends A implements I {}\ninterface J extends B, I {}\nclass C extends B {}\nclass G<T> { x!: T }\nclass H extends G<string> {}\ndeclare const t: [string, number];\ninterface K extends A, B, C, I {}\n",
+                    ),
+                    (
+                        "/tsconfig.json",
+                        r#"{"compilerOptions":{"strict":true,"noEmit":true},"files":["a.ts"]}"#,
+                    ),
+                ],
+                false, /*useCaseSensitiveFileNames*/
+            );
+            install_map_fs(&map_fs, "/");
+            let fs = bundled::wrap_fs(map_fs.fs());
+            let host = new_compiler_host("/", fs, &bundled::lib_path(), None, None, None);
+            let (parsed, errors) = get_parsed_command_line_of_config_file(
+                "/tsconfig.json",
+                Some(&CompilerOptions::default()),
+                None,
+                &HostAsParseConfigHost(host),
+                None,
+            );
+            assert_eq!(errors.len(), 0, "Expected no errors in parsed command line");
+            let p =
+                new_program_with_config(map_fs.fs(), "/", Rc::new(parsed.expect("parsed config")));
+            let _current = ls_program::enter(&p);
+            ls_program::bind_source_files(&p);
+            let (checker, done) = ls_program::get_type_checker(&p, &context::background());
+            let statements = source_file(&p, "/a.ts").root.statements();
+            {
+                let mut c = checker.borrow_mut();
+                let c = &mut *c;
+                let mut declared = |i: usize| {
+                    let symbol = c.get_symbol_at_location_exported(statements.get(i).name());
+                    c.get_declared_type_of_symbol(symbol)
+                };
+                let [a, i, b, j, cc, g, h, k] = [0, 1, 2, 3, 4, 5, 6, 8].map(&mut declared);
+                let t_name = statements
+                    .get(7)
+                    .declaration_list()
+                    .declarations()
+                    .nodes()
+                    .get(0)
+                    .name();
+                let t_symbol = c.get_symbol_at_location_exported(t_name);
+                let t_type = c.get_type_of_symbol(t_symbol);
+                let tuple = c.ty(t_type).target();
+                let resolved =
+                    |c: &Checker, t: TypeId| c.ty(t).resolved_base_types().map(|l| l.to_vec());
+                for t in [a, i, b, j, cc, g, h, k, tuple] {
+                    assert_eq!(
+                        resolved(c, t),
+                        None,
+                        "base types of {t:?} resolved too early"
+                    );
+                }
+                // A type that is not a class, interface or tuple: no
+                // in-place read, and `getBaseTypes` gives nil.
+                assert_eq!(resolved(c, c.string_type), None);
+                assert!(c.get_base_types_shared(c.string_type).is_empty());
+
+                // C -> B -> A. The walk resolves C's base types; the
+                // circularity check in Go `resolveBaseTypesOfClass`
+                // (`hasBaseType(B, C)`, checker.go:19597) resolves B's and A's,
+                // so the walk then reads B's in place.
+                assert!(c.has_base_type(cc, a));
+                assert_eq!(resolved(c, cc), Some(vec![b]));
+                assert_eq!(resolved(c, b), Some(vec![a]));
+                assert!(!c.has_base_type(a, cc));
+                assert_eq!(resolved(c, a), Some(Vec::new()));
+                // The second walk takes the in-place read for C and B.
+                assert!(!c.has_base_type(cc, i));
+                assert_eq!(resolved(c, i), None);
+                assert!(c.has_base_type(j, i));
+                assert_eq!(resolved(c, j), Some(vec![b, i]));
+                // H's base is the reference G<string>; its target is G.
+                assert!(c.has_base_type(h, g));
+                assert!(!c.has_base_type(g, h));
+                let h_bases = resolved(c, h).expect("base types of H");
+                assert_eq!(h_bases.len(), 1);
+                assert_ne!(h_bases[0], g);
+                assert_eq!(c.get_target_type(h_bases[0]), g);
+                assert!(c.has_base_type(t_type, c.global_array_type));
+                // More base types than an inline list holds.
+                assert!(c.has_base_type(k, i));
+                assert_eq!(resolved(c, k), Some(vec![a, b, cc, i]));
+
+                for t in [a, b, j, cc, g, h, k, tuple] {
+                    let shared = c.get_base_types_shared(t).to_vec();
+                    assert_eq!(resolved(c, t), Some(shared.clone()), "base types of {t:?}");
+                    let mut buf = Default::default();
+                    let list = c.ty(t).resolved_base_types().expect("resolved");
+                    // `None` only for an owned list (a multi-program process).
+                    if let Some(items) = list.detach(&mut buf) {
+                        assert_eq!(items, &shared[..], "detached base types of {t:?}");
+                    }
+                }
+            }
+            done.call();
+        },
+    );
+}
+
 /// A compiler host used as a `tsoptions.ParseConfigHost`.
 struct HostAsParseConfigHost(Rc<dyn CompilerHost>);
 

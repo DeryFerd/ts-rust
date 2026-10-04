@@ -989,6 +989,31 @@ impl Checker {
     }
 }
 
+impl Type {
+    /// The resolved base types of a class, interface or tuple: Go
+    /// `getBaseTypes` (checker.go:19504) when it has no work to do. `None`
+    /// when they are not resolved yet or this is another kind of type; then
+    /// call `get_base_types_shared`, which has side effects.
+    ///
+    /// PERF: no arena read and no call. `has_base_type` uses it on each
+    /// step of its walk.
+    #[inline(always)]
+    pub fn resolved_base_types(&self) -> Option<&SharedList<TypeId>> {
+        if !self
+            .object_flags
+            .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::TUPLE)
+        {
+            return None;
+        }
+        match self.data.as_interface_type() {
+            Some(data) if data.base_types_resolved => Some(&data.resolved_base_types),
+            // PORT: data that is not an interface panics in
+            // `get_base_types_shared`, as Go `AsInterfaceType` does.
+            _ => None,
+        }
+    }
+}
+
 // Go: checker/checker.go:19495 findIndexInfo
 // PORT: package-level Go function that reads index info data, so it is a
 // `Checker` method (`&self`).
@@ -1007,7 +1032,8 @@ impl Checker {
         self.get_base_types_shared(t).to_vec()
     }
 
-    /// Go `getBaseTypes` as a shared list: no element copy.
+    /// Go `getBaseTypes` as a shared list: no element copy. `has_base_type`
+    /// tries `Type::resolved_base_types` first; keep the two in sync.
     pub fn get_base_types_shared(&mut self, t: TypeId) -> SharedList<TypeId> {
         if !self
             .ty(t)
