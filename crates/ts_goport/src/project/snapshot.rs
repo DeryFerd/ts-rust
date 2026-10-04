@@ -1223,6 +1223,33 @@ impl Snapshot {
                 }
             }
         }
+        // PORT: not in Go. A program that this clone made for a project that
+        // it then deleted or updated again is in no snapshot, so `dispose`
+        // never frees it, and its host still holds the builder (the
+        // `Project -> host -> builder` cycle). Go's GC frees it. The port
+        // freezes its host and frees its checker pool and program version,
+        // as `dispose` does for a program that no snapshot holds. Its parse
+        // cache counts stay, as in Go (no snapshot derefs them).
+        let kept: FxHashSet<*const compiler::NewProgram> = new_snapshot
+            .project_collection
+            .projects()
+            .iter()
+            .filter_map(|project| project.borrow().program.as_ref().map(Rc::as_ptr))
+            .collect();
+        for made in project_collection_builder.made_programs.take() {
+            if kept.contains(&Rc::as_ptr(&made.program)) {
+                continue;
+            }
+            if made.host.builder.borrow().is_some() {
+                made.host.freeze(
+                    snapshot_fs.clone(),
+                    new_snapshot.config_file_registry.clone(),
+                );
+            }
+            made.checker_pool.discard();
+            crate::ls::release_search_thread(&made.program);
+            crate::program::ls_program::release_program(&made.program);
+        }
         // PORT: Go map order is random; the registry map's order here (the
         // owner adds do not depend on the order).
         for config in new_snapshot.config_file_registry.configs.values() {

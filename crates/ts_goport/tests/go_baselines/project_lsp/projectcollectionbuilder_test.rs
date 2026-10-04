@@ -668,6 +668,50 @@ child_test! {
     }
 }
 
+child_test! {
+    // PORT: not in Go. The open in the layout above makes a program for the
+    // spec project, and the cleanup of the same snapshot clone deletes the
+    // project. No snapshot holds that program, so `dispose` never frees it.
+    // Go's GC frees it; the port frees it at the end of the clone
+    // (`Snapshot::clone`, `ProjectCollectionBuilder::made_programs`). Else
+    // each open in hono keeps a whole spec program.
+    fn deleted_project_of_a_clone_releases_its_program() {
+        let files = files(&[
+            (
+                "/user/username/projects/myproject/tsconfig.json",
+                r#"{
+			"files": [],
+			"references": [{ "path": "./tsconfig.build.json" }, { "path": "./tsconfig.spec.json" }]
+		}"#,
+            ),
+            (
+                "/user/username/projects/myproject/tsconfig.build.json",
+                r#"{ "include": ["src/**/*.ts"], "exclude": ["src/**/*.test.ts"] }"#,
+            ),
+            (
+                "/user/username/projects/myproject/tsconfig.spec.json",
+                r#"{ "include": ["src/**/*.ts"] }"#,
+            ),
+            (MAIN, "export const foo = 1;"),
+            (
+                "/user/username/projects/myproject/src/main.test.ts",
+                "import { foo } from './main';\nfoo;",
+            ),
+        ]);
+        let (session, _) = projecttestutil::setup(files.clone());
+        let content = file_text(&files, MAIN);
+
+        open(&session, MAIN_URI, &content);
+        assert!(!has_configured_project(&session, &cfg("tsconfig.spec.json")));
+        assert_eq!(projects_len(&session), 1);
+        assert_eq!(
+            ts_goport::program::ls_program::registered_programs(),
+            1,
+            "only the build project's program should stay registered"
+        );
+    }
+}
+
 // Go: projectcollectionbuilder_test.go:602 filesForSolutionConfigFile
 fn files_for_solution_config_file(
     solution_refs: &[&str],

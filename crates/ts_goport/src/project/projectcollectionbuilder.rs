@@ -70,8 +70,24 @@ pub struct ProjectCollectionBuilder {
     pub synthetic_projects: Rc<dirty::SyncMap<SyntheticProjectID, Rc<RefCell<Project>>>>,
     pub inferred_project: Rc<dirty::Box<Rc<RefCell<Project>>>>,
     pub created_programs: RefCell<Vec<Rc<RefCell<Project>>>>,
+    /// Each program that `update_program` made in this clone, with its host
+    /// and checker pool. The snapshot frees the ones that no project of the
+    /// new collection has (`Snapshot::clone`).
+    // PORT: not in Go. Go's GC frees a program that this clone made for a
+    // project that it then deleted (hono: tsconfig.spec.json at each file
+    // open) or updated again.
+    pub made_programs: RefCell<Vec<MadeProgram>>,
 
     pub api_state: RefCell<APIState>,
+}
+
+/// A program that the builder made, with the host and checker pool that it
+/// gave the project with it (`ProjectCollectionBuilder::made_programs`).
+// PORT: not in Go.
+pub struct MadeProgram {
+    pub program: Rc<compiler::NewProgram>,
+    pub host: Rc<CompilerHost>,
+    pub checker_pool: Rc<CheckerPool>,
 }
 
 // Go: project/projectcollectionbuilder.go:68 newProjectCollectionBuilder
@@ -138,6 +154,7 @@ pub fn new_project_collection_builder(
         synthetic_projects: dirty::new_sync_map(old_project_collection.synthetic_projects.clone()),
         inferred_project: dirty::new_box(old_project_collection.inferred_project.clone()),
         created_programs: RefCell::new(Vec::new()),
+        made_programs: RefCell::new(Vec::new()),
         api_state: RefCell::new(old_api_state.clone()),
         client,
         base: old_project_collection,
@@ -2538,6 +2555,15 @@ impl ProjectCollectionBuilder {
                     p.content_mapper_watched_files = Some(Rc::new(content_mapper_watched_files));
                     p.program = Some(Rc::clone(&result.program));
                     p.program_file_refs = Some(Rc::clone(&result.file_refs));
+                    self.made_programs.borrow_mut().push(MadeProgram {
+                        program: Rc::clone(&result.program),
+                        host: Rc::clone(
+                            p.host
+                                .as_ref()
+                                .unwrap_or_else(|| crate::core::go_nil_dereference()),
+                        ),
+                        checker_pool: Rc::clone(&checker_pool),
+                    });
                     p.checker_pool = Some(checker_pool);
                     p.program_update_kind = result.update_kind;
                     p.program_last_update = self.new_snapshot_id;
