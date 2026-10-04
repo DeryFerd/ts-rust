@@ -82,9 +82,9 @@
 //! background. The checkers and synthetic nodes of a released program wait
 //! in the same way only for the first release after a client pause, and
 //! only when the client has not sent its next edit yet
-//! (`gostd::local::drop_after_pause`), so at most one released checker set
-//! waits. Other releases free them at once, so that the next check reuses
-//! their memory.
+//! (`gostd::local::drop_after_pause`), so only the releases of one message
+//! wait (on an API connection, of one pipelined burst). Other releases free
+//! them at once, so that the next check reuses their memory.
 //!
 //! Cancellation is Go's: `$/cancelRequest` reaches only a request that the
 //! dispatch loop took (`pending_client_requests`); a cancel for a queued
@@ -2034,19 +2034,12 @@ impl Server {
         self.free_since.set(Instant::now());
         gostd::local::keep_garbage();
         {
-            // A notification that waits (the next didChange): the client
-            // sends a stream, not one burst of requests. `$/cancelRequest`
-            // never waits here: the read loop handles it. Weak: the
-            // thread's queues do not keep the server alive.
+            // Weak: the thread's queues do not keep the server alive.
             let shared = Arc::downgrade(&self.shared);
             gostd::local::set_stream_check(Box::new(move || {
-                shared.upgrade().is_some_and(|s| {
-                    s.request_queue.with_items(|items| {
-                        items.iter().any(
-                            |item| matches!(item, QueuedRequest::Request(req) if req.id.is_none()),
-                        )
-                    })
-                })
+                shared
+                    .upgrade()
+                    .is_some_and(|s| next_edit_waits(&s.request_queue))
             }));
         }
         loop {
@@ -5009,6 +5002,21 @@ impl ipc::Protocol for ApiConnProtocol {
     }
 }
 
+/// PORT: the stream check of `gostd::local::drop_after_pause`, which
+/// `dispatch_loop` installs: whether the client already sent its next edit,
+/// so a notification (the next didChange) waits in `queue`. Then the client
+/// sends a stream, not one burst of requests. A request, a `Wake` and an
+/// accepted API connection do not count. `$/cancelRequest` never waits
+/// here: the read loop handles it. An API message is in the inbox of its
+/// connection, not here (see `gostd::local::drop_after_pause`).
+fn next_edit_waits(queue: &DynamicQueue<QueuedRequest>) -> bool {
+    queue.with_items(|items| {
+        items
+            .iter()
+            .any(|item| matches!(item, QueuedRequest::Request(req) if req.id.is_none()))
+    })
+}
+
 /// PORT: what an API connection of the LSP server is doing, for its
 /// protocol (`ApiConnProtocol`) and its session connection
 /// (`ApiSessionConn`).
@@ -5369,4 +5377,41 @@ pub fn is_valid_contributed_content_mapper_extension(extension: &str) -> bool {
                 extension,
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A queued LSP message: a request with `id`, or a notification.
+    fn message(method: lsproto::Method, id: Option<i32>) -> QueuedRequest {
+        QueuedRequest::Request(lsproto::RequestMessage {
+            id: id.map(crate::jsonrpc::new_id_int),
+            method,
+            ..lsproto::RequestMessage::default()
+        })
+    }
+
+    // followups21 (R168 reviewer): the stream check of `drop_after_pause`
+    // (freecheck2) sees only a waiting notification. A waiting request or
+    // wake-up keeps the release after a pause; the next didChange drops it
+    // at once.
+    #[test]
+    fn stream_check_sees_only_a_waiting_notification() {
+        let ctx = context::background();
+        let queue: DynamicQueue<QueuedRequest> = new_dynamic_queue();
+        assert!(!next_edit_waits(&queue), "empty queue");
+        queue.put(&ctx, QueuedRequest::Wake).unwrap();
+        queue
+            .put(&ctx, message(lsproto::Method::TEXT_DOCUMENT_HOVER, Some(1)))
+            .unwrap();
+        assert!(!next_edit_waits(&queue), "a request and a wake-up");
+        queue
+            .put(
+                &ctx,
+                message(lsproto::Method::TEXT_DOCUMENT_DID_CHANGE, None),
+            )
+            .unwrap();
+        assert!(next_edit_waits(&queue), "the next didChange waits");
+    }
 }
