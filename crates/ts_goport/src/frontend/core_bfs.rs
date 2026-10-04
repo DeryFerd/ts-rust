@@ -2,9 +2,14 @@
 //!
 //! PORT: the language service runs on one dispatch thread
 //! (`project/dirty/interfaces.rs`, decision 1). Go runs each level's jobs in
-//! goroutines; the port runs them serially in queue order and keeps Go's
-//! index checks (`i >= lowestGoal`), so the result is Go's deterministic
-//! result and the side effects are those of the in-order schedule.
+//! goroutines; the port runs them serially in queue order. Go starts every
+//! goroutine of a level before a slow `visit` returns, so in Go's common
+//! schedule each job passes its start check (`core/bfs.go:102`) and is
+//! visited. The port follows that schedule: it visits every job of the
+//! level and keeps only the check after the visit (`core/bfs.go:128`), so
+//! the result and the next level are Go's deterministic ones. The side
+//! effects of `visit` (the project search creates and loads each project of
+//! the level) are those of Go's common schedule.
 
 use crate::frontend::prelude::*;
 use std::hash::Hash;
@@ -203,9 +208,10 @@ fn process_level<'o, K: Eq + Hash, N: Clone>(
     // Go: one goroutine per job, started in order with its index `i`.
     for (i, j) in jobs.values().enumerate() {
         let i = i as i64;
-        if i >= lowest_goal {
-            continue; // Stop processing if we already found a lower result
-        }
+        // Go: core/bfs.go:102 `if int64(i) >= lowestGoal.Load() { return }`.
+        // PORT: Go's common schedule starts every goroutine of the level
+        // before an earlier job's `visit` sets `lowestGoal`, so every job
+        // passes this check. The port has no check here (module comment).
 
         // If we have already visited this node, skip it.
         if !visited.borrow_mut().insert(get_key(&j.node)) {

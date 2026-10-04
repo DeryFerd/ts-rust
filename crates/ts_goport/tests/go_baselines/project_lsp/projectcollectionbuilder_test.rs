@@ -609,6 +609,65 @@ child_test! {
     }
 }
 
+child_test! {
+    // PORT: Go's project search starts every reference of a BFS level on its
+    // own goroutine (`core/bfs.go:102`), so after the build project finds a
+    // file, Go still creates the spec project that also includes it (hono's
+    // tsconfig.build.json and tsconfig.spec.json). After an open, the cleanup
+    // deletes it again. A project tree request for a closed file
+    // (willRenameFiles, `lsp/server.go` handleWillRenameFilesWorker) has no
+    // cleanup, so the spec project stays and the answer has the test files.
+    fn solution_search_creates_every_project_of_the_level() {
+        const HELPER_URI: &str = "file:///user/username/projects/myproject/src/helper.ts";
+        let files = files(&[
+            (
+                "/user/username/projects/myproject/tsconfig.json",
+                r#"{
+			"files": [],
+			"references": [{ "path": "./tsconfig.build.json" }, { "path": "./tsconfig.spec.json" }]
+		}"#,
+            ),
+            (
+                "/user/username/projects/myproject/tsconfig.build.json",
+                r#"{ "include": ["src/**/*.ts"], "exclude": ["src/**/*.test.ts"] }"#,
+            ),
+            (
+                "/user/username/projects/myproject/tsconfig.spec.json",
+                r#"{ "include": ["src/**/*.ts"] }"#,
+            ),
+            (MAIN, "export const foo = 1;"),
+            (
+                "/user/username/projects/myproject/src/helper.ts",
+                "export const bar = 2;",
+            ),
+            (
+                "/user/username/projects/myproject/src/main.test.ts",
+                "import { foo } from './main';\nfoo;",
+            ),
+        ]);
+        let (session, _) = projecttestutil::setup(files.clone());
+        let content = file_text(&files, MAIN);
+
+        // The open creates both projects; the cleanup keeps only the default one.
+        open(&session, MAIN_URI, &content);
+        let build_project =
+            configured_project(&session, &cfg("tsconfig.build.json")).expect("build project");
+        assert!(default_project_is(&session, MAIN_URI, &build_project));
+        assert!(!has_configured_project(&session, &cfg("tsconfig.spec.json")));
+        assert_eq!(projects_len(&session), 1);
+
+        // The search for a closed file visits every project of the level.
+        let services =
+            session.get_language_services_for_documents_loading_project_tree(&bg(), &[uri(HELPER_URI)]);
+        assert_eq!(services.len(), 2);
+        assert!(
+            has_configured_project(&session, &cfg("tsconfig.spec.json")),
+            "spec project should be created by the same search level"
+        );
+        assert_eq!(projects_len(&session), 2);
+    }
+}
+
 // Go: projectcollectionbuilder_test.go:602 filesForSolutionConfigFile
 fn files_for_solution_config_file(
     solution_refs: &[&str],
