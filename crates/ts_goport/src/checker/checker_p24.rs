@@ -945,11 +945,16 @@ impl Checker {
                 let entry = counts.entry(symbol.name.id()).or_insert((0, true));
                 entry.0 += 1;
                 if entry.1 {
+                    // PERF: a method is never synthetic, and Go drops the
+                    // accessibility modifiers of a member whose parent is no
+                    // class, so only a class method needs the modifier test.
                     entry.1 = symbol.flags & (SymbolFlags::METHOD | SymbolFlags::PROPERTY)
                         == SymbolFlags::METHOD
-                        && !self
-                            .get_declaration_modifier_flags_from_symbol(prop)
-                            .intersects(ModifierFlags::PRIVATE);
+                        && !(symbol.parent.is_some()
+                            && self.sym(symbol.parent).flags.intersects(SymbolFlags::CLASS)
+                            && self
+                                .get_declaration_modifier_flags_from_symbol(prop)
+                                .intersects(ModifierFlags::PRIVATE));
                 }
             }
         }
