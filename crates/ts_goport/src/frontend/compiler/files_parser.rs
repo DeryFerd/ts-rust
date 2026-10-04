@@ -255,7 +255,13 @@ impl ParseTask {
 
     // Go: filesparser.go:192 (*parseTask).addSubTask
     pub fn add_sub_task(&mut self, ref_: ResolvedRef, lib_file: Option<Rc<LibFile>>) {
-        let normalized_file_path = normalize_path(&ref_.file_name);
+        // PERF: a resolved name is normal already (Go normalizes it again);
+        // then the name moves, with no copy.
+        let normalized_file_path = if is_normalized_path(&ref_.file_name) {
+            ref_.file_name
+        } else {
+            normalize_path(&ref_.file_name)
+        };
         let sub_task = Rc::new(RefCell::new(ParseTask {
             normalized_file_path,
             lib_file,
@@ -486,7 +492,15 @@ impl FilesParser {
         let prefetch = PREFETCH.with(|p| p.borrow().clone());
         let mut requests = Vec::new();
         for task in tasks {
-            let path = loader.to_path(&task.borrow().normalized_file_path);
+            // PERF: Go `loader.toPath` asks the host for its current
+            // directory and case sensitivity each time; the loader keeps
+            // the same values (`compare_paths_options`), so no copy of the
+            // directory is made per task.
+            let path = to_path(
+                &task.borrow().normalized_file_path,
+                &loader.compare_paths_options.current_directory,
+                loader.compare_paths_options.use_case_sensitive_file_names,
+            );
             task.borrow_mut().path = path.clone();
             let (data, loaded) = match self.task_data_by_path.get(&path) {
                 Some(data) => {
