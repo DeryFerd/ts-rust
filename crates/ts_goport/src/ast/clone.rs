@@ -2352,40 +2352,59 @@ impl NodeFactory {
 
 #[cfg(test)]
 mod tests {
-    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file_detached};
+    use crate::ast::synthetic::synthetic_slot_count;
+    use crate::frontend::parser::{
+        SourceFileParseOptions, parse_source_file, parse_source_file_detached,
+    };
     use crate::prelude::*;
 
-    /// A parse worker's parse of a JS file whose JSDoc the reparser deep
-    /// clones with lists of nodes (`@import`, `@overload`, a function type in
-    /// `@type`, an object type in `@typedef`) makes no synthetic slot and no
-    /// id, so the loader can adopt it (`files_parser.rs` `prefetch_parse`).
-    /// Go makes those lists with the parser's factory (ast/visitor.go
+    /// JSDoc that the reparser deep clones with lists of nodes: `@import`,
+    /// `@overload`, a function type in `@type`, an object type in `@typedef`.
+    const TEXT: &str = "/** @import { a } from \"./b.js\" */\n\
+        /** @overload @param {number} x @returns {void} */\n\
+        /** @param {any} x */\nexport function o(x) {}\n\
+        /** @type {(x: number) => void} */\nexport const fn = (x) => {};\n\
+        /** @typedef {{x: number}} T */\n";
+
+    fn opts() -> SourceFileParseOptions {
+        SourceFileParseOptions {
+            file_name: "/a.js".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A parse worker's parse of `TEXT` makes no synthetic slot and no id,
+    /// so the loader can adopt it (`files_parser.rs` `prefetch_parse`). Go
+    /// makes those lists with the parser's factory (ast/visitor.go
     /// `VisitNodes`, `VisitModifiers`).
     #[test]
     fn reparsed_jsdoc_lists_stay_in_the_detached_store() {
-        let text = "/** @import { a } from \"./b.js\" */\n\
-            /** @overload @param {number} x @returns {void} */\n\
-            /** @param {any} x */\nexport function o(x) {}\n\
-            /** @type {(x: number) => void} */\nexport const fn = (x) => {};\n\
-            /** @typedef {{x: number}} T */\n";
-        let opts = SourceFileParseOptions {
-            file_name: "/a.js".to_string(),
-            ..Default::default()
-        };
-        std::thread::spawn(move || {
-            let before = (
-                crate::ast::synthetic::synthetic_slot_count(),
-                crate::ast::utilities_p1::next_ids(),
-            );
-            let parse = parse_source_file_detached(0, &opts, text, ScriptKind::JS);
+        std::thread::spawn(|| {
+            let before = (synthetic_slot_count(), crate::ast::utilities_p1::next_ids());
+            let parse = parse_source_file_detached(0, &opts(), TEXT, ScriptKind::JS);
             assert!(parse.store.is_self_contained());
             assert_eq!(
-                (
-                    crate::ast::synthetic::synthetic_slot_count(),
-                    crate::ast::utilities_p1::next_ids(),
-                ),
+                (synthetic_slot_count(), crate::ast::utilities_p1::next_ids()),
                 before
             );
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A language server parse of `TEXT` (a freeable parse, whose store owns
+    /// its nodes) puts those lists in its store too, not in the thread's
+    /// synthetic arena, so they are freed with the file version.
+    #[test]
+    fn reparsed_jsdoc_lists_stay_in_the_owned_store() {
+        std::thread::spawn(|| {
+            let before = synthetic_slot_count();
+            let file = {
+                let _scope = crate::ast::enter_owned_parse();
+                parse_source_file(&opts(), TEXT, ScriptKind::JS)
+            };
+            assert!(crate::ast::try_store_ast_node(file.root).is_none(), "owned");
+            assert_eq!(synthetic_slot_count(), before);
         })
         .join()
         .unwrap();
