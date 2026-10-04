@@ -313,6 +313,41 @@ child_test! {
 }
 
 child_test! {
+    // PORT: no Go counterpart (followups20 skeptic). The same for a request
+    // with an async part (foldingRange, which needs no checker): the task
+    // runs before the async part but sends its registerCapability only
+    // after the answer, as Go's goroutine reaches it after the handler.
+    fn an_async_request_with_no_checker_build_answers_before_its_new_watches() {
+        let seen: Arc<Mutex<Seen>> = Arc::default();
+        let (client, before) = open_and_import_outside(&seen);
+        let msg = send_watched(
+            &client,
+            &seen,
+            &lsproto::TEXT_DOCUMENT_FOLDING_RANGE_INFO,
+            lsproto::FoldingRangeParams {
+                text_document: lsproto::TextDocumentIdentifier {
+                    uri: lsconv::file_name_to_document_uri(INDEX),
+                },
+                ..Default::default()
+            },
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+        hover(&client);
+
+        let log = lock(&seen).log[before..].to_vec();
+        let answer = log.iter().position(|m| m == "answer").expect("the answer is logged");
+        assert!(
+            !log[..answer].iter().any(|m| m.starts_with("register ")),
+            "a watch registration before the answer: {log:?}"
+        );
+        assert!(
+            log[answer..].iter().any(|m| m.starts_with("register ")),
+            "no watch registration after the answer: {log:?}"
+        );
+    }
+}
+
+child_test! {
     // PORT: no Go counterpart (followups20 skeptic). An answer does not
     // wait for the client's reply to a registerCapability of the snapshot
     // task: in Go the task waits on its own goroutine. Here the client

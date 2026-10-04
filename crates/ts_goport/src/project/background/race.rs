@@ -41,9 +41,10 @@
 //! end before the next message (lsp/server.rs "Effects of the one dispatch
 //! thread").
 //!
-//! The async part of a request (`open_gates`) runs its tasks before it, up to
-//! their first wait for the client, as the port did before; a task with no
-//! client call runs to its end there.
+//! Before the async part of a request (`open_gates`) the tasks that the sync
+//! part queued run as the port ran them before, but stop before their
+//! first client call (`may_send`), which waits for a point above. A task
+//! with no client call runs to its end there.
 
 use crate::project::background::prelude::*;
 use std::cell::Cell;
@@ -122,6 +123,14 @@ pub fn in_request() -> bool {
 /// reply. False while a request is in flight: the call returns `Pending`.
 pub fn may_block() -> bool {
     !in_request() || WAITING.with(Cell::get) > 0
+}
+
+/// Whether the running snapshot task may send a client request now. While
+/// a request is in flight it sends only once it may start (a checker build,
+/// or the loop's `TASK_START_GO`), also after `open_gates`: Go's task sends
+/// its first registerCapability only after its start.
+pub fn may_send() -> bool {
+    may_block() || CURRENT.with(|c| c.borrow().as_ref().is_none_or(|info| info.start_ok.get()))
 }
 
 fn gates_open() -> bool {
@@ -295,12 +304,9 @@ impl Drop for RequestGuard {
 
 /// Runs `f` (the `run_pending` before the async part of a request) with
 /// the gates open: the tasks that the sync part queued run up to their
-/// first wait for the client, or to their end.
+/// first client call (`may_send`), or to their end.
 pub fn open_gates(f: impl FnOnce()) {
     FREE.with(|n| n.set(n.get() + 1));
-    for task in tasks() {
-        task.info.start_ok.set(true);
-    }
     f();
     FREE.with(|n| n.set(n.get() - 1));
 }
