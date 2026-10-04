@@ -519,11 +519,13 @@ fn test_has_base_type_reads_resolved_base_types_in_place() {
                 assert_eq!(resolved(c, c.string_type), None);
                 assert!(c.get_base_types_shared(c.string_type).is_empty());
 
-                // C -> B -> A: A is the base, so its own base types are not read.
+                // C -> B -> A. The walk resolves C's base types; the
+                // circularity check in Go `resolveBaseTypesOfClass`
+                // (`hasBaseType(B, C)`, checker.go:19597) resolves B's and A's,
+                // so the walk then reads B's in place.
                 assert!(c.has_base_type(cc, a));
                 assert_eq!(resolved(c, cc), Some(vec![b]));
                 assert_eq!(resolved(c, b), Some(vec![a]));
-                assert_eq!(resolved(c, a), None);
                 assert!(!c.has_base_type(a, cc));
                 assert_eq!(resolved(c, a), Some(Vec::new()));
                 // The second walk takes the in-place read for C and B.
