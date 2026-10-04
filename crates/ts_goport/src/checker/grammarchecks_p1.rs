@@ -327,10 +327,19 @@ impl Checker {
         &mut self,
         node: Node, /*Union[HasModifiers, HasDecorators, HasIllegalModifiers, HasIllegalDecorators]*/
     ) -> bool {
-        if node.modifiers().is_nil() {
+        let modifier_list = node.modifiers();
+        if modifier_list.is_nil() {
             return false;
         }
-        if self.report_obvious_decorator_errors(node) || self.report_obvious_modifier_errors(node) {
+        // PERF: chkport1 item 4. Go reads `node.Modifiers()`, `node.Kind`
+        // and `node.Parent` as plain fields. Here each one is an AST store
+        // read, so they are read once and passed on.
+        let modifiers = modifier_list.nodes();
+        let node_kind = node.kind();
+        let parent = node.parent();
+        if self.report_obvious_decorator_errors(node, modifiers)
+            || self.report_obvious_modifier_errors(node, node_kind, parent, modifiers)
+        {
             return true;
         }
         if is_this_parameter(node) {
@@ -355,17 +364,10 @@ impl Checker {
         // [...leadingDecorators, ...leadingModifiers, ...trailingDecorators, ...trailingModifiers]. It is an error to
         // have both leading and trailing decorators.
         let mut has_leading_decorators = false;
-        let modifiers = node.modifier_nodes();
         for modifier in modifiers {
             if is_decorator(modifier) {
-                if !node_can_be_decorated(
-                    self.legacy_decorators,
-                    node,
-                    node.parent(),
-                    node.parent().parent(),
-                ) {
-                    if node.kind() == SyntaxKind::MethodDeclaration && !node_is_present(node.body())
-                    {
+                if !node_can_be_decorated(self.legacy_decorators, node, parent, parent.parent()) {
+                    if node_kind == SyntaxKind::MethodDeclaration && !node_is_present(node.body()) {
                         return self.grammar_error_on_first_token(
                             node,
                             diag::A_decorator_can_only_decorate_a_method_implementation_not_an_overload,
@@ -379,8 +381,8 @@ impl Checker {
                         );
                     }
                 } else if self.legacy_decorators
-                    && (node.kind() == SyntaxKind::GetAccessor
-                        || node.kind() == SyntaxKind::SetAccessor)
+                    && (node_kind == SyntaxKind::GetAccessor
+                        || node_kind == SyntaxKind::SetAccessor)
                 {
                     let symbol = self.get_symbol_of_declaration(node);
                     let declarations = self.sym(symbol).declarations.clone();
@@ -449,8 +451,8 @@ impl Checker {
                 let modifier_kind = modifier.kind();
                 let not_reparsed = !modifier.flags().intersects(NodeFlags::REPARSED);
                 if modifier_kind != SyntaxKind::ReadonlyKeyword {
-                    if node.kind() == SyntaxKind::PropertySignature
-                        || node.kind() == SyntaxKind::MethodSignature
+                    if node_kind == SyntaxKind::PropertySignature
+                        || node_kind == SyntaxKind::MethodSignature
                     {
                         return self.grammar_error_on_node(
                             modifier,
@@ -458,9 +460,8 @@ impl Checker {
                             args![token_to_string(modifier_kind)],
                         );
                     }
-                    if node.kind() == SyntaxKind::IndexSignature
-                        && (modifier_kind != SyntaxKind::StaticKeyword
-                            || !is_class_like(node.parent()))
+                    if node_kind == SyntaxKind::IndexSignature
+                        && (modifier_kind != SyntaxKind::StaticKeyword || !is_class_like(parent))
                     {
                         return self.grammar_error_on_node(
                             modifier,
@@ -473,7 +474,7 @@ impl Checker {
                     && modifier_kind != SyntaxKind::OutKeyword
                     && modifier_kind != SyntaxKind::ConstKeyword
                 {
-                    if node.kind() == SyntaxKind::TypeParameter {
+                    if node_kind == SyntaxKind::TypeParameter {
                         return self.grammar_error_on_node(
                             modifier,
                             diag::X_0_modifier_cannot_appear_on_a_type_parameter,
@@ -483,8 +484,8 @@ impl Checker {
                 }
                 match modifier_kind {
                     SyntaxKind::ConstKeyword => {
-                        if node.kind() != SyntaxKind::EnumDeclaration
-                            && node.kind() != SyntaxKind::TypeParameter
+                        if node_kind != SyntaxKind::EnumDeclaration
+                            && node_kind != SyntaxKind::TypeParameter
                         {
                             return self.grammar_error_on_node(
                                 node,
@@ -492,8 +493,7 @@ impl Checker {
                                 args![token_to_string(SyntaxKind::ConstKeyword)],
                             );
                         }
-                        let parent = node.parent();
-                        if node.kind() == SyntaxKind::TypeParameter {
+                        if node_kind == SyntaxKind::TypeParameter {
                             if !(is_function_like_declaration(parent)
                                 || is_class_like(parent)
                                 || is_function_type_node(parent)
@@ -588,8 +588,8 @@ impl Checker {
                                 diag::X_0_modifier_must_precede_1_modifier,
                                 args![text, "async"],
                             );
-                        } else if node.parent().kind() == SyntaxKind::ModuleBlock
-                            || node.parent().kind() == SyntaxKind::SourceFile
+                        } else if parent.kind() == SyntaxKind::ModuleBlock
+                            || parent.kind() == SyntaxKind::SourceFile
                         {
                             return self.grammar_error_on_node(
                                 modifier,
@@ -644,15 +644,15 @@ impl Checker {
                                 diag::X_0_modifier_must_precede_1_modifier,
                                 args!["static", "accessor"],
                             );
-                        } else if node.parent().kind() == SyntaxKind::ModuleBlock
-                            || node.parent().kind() == SyntaxKind::SourceFile
+                        } else if parent.kind() == SyntaxKind::ModuleBlock
+                            || parent.kind() == SyntaxKind::SourceFile
                         {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::X_0_modifier_cannot_appear_on_a_module_or_namespace_element,
                                 args!["static"],
                             );
-                        } else if node.kind() == SyntaxKind::Parameter {
+                        } else if node_kind == SyntaxKind::Parameter {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::X_0_modifier_cannot_appear_on_a_parameter,
@@ -693,7 +693,7 @@ impl Checker {
                                 diag::X_0_modifier_cannot_be_used_with_1_modifier,
                                 args!["accessor", "declare"],
                             );
-                        } else if node.kind() != SyntaxKind::PropertyDeclaration {
+                        } else if node_kind != SyntaxKind::PropertyDeclaration {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::X_accessor_modifier_can_only_appear_on_a_property_declaration,
@@ -710,10 +710,10 @@ impl Checker {
                                 diag::X_0_modifier_already_seen,
                                 args!["readonly"],
                             );
-                        } else if node.kind() != SyntaxKind::PropertyDeclaration
-                            && node.kind() != SyntaxKind::PropertySignature
-                            && node.kind() != SyntaxKind::IndexSignature
-                            && node.kind() != SyntaxKind::Parameter
+                        } else if node_kind != SyntaxKind::PropertyDeclaration
+                            && node_kind != SyntaxKind::PropertySignature
+                            && node_kind != SyntaxKind::IndexSignature
+                            && node_kind != SyntaxKind::Parameter
                         {
                             // If node.kind === SyntaxKind.Parameter, checkParameter reports an error if it's not a parameter property.
                             return self.grammar_error_on_node(
@@ -733,10 +733,10 @@ impl Checker {
                     SyntaxKind::ExportKeyword => {
                         if self.compiler_options.verbatim_module_syntax == Tristate::True
                             && !node.flags().intersects(NodeFlags::AMBIENT)
-                            && node.kind() != SyntaxKind::TypeAliasDeclaration
-                            && node.kind() != SyntaxKind::InterfaceDeclaration
-                            && node.kind() != SyntaxKind::ModuleDeclaration
-                            && node.parent().kind() == SyntaxKind::SourceFile
+                            && node_kind != SyntaxKind::TypeAliasDeclaration
+                            && node_kind != SyntaxKind::InterfaceDeclaration
+                            && node_kind != SyntaxKind::ModuleDeclaration
+                            && parent.kind() == SyntaxKind::SourceFile
                             && get_emit_module_format_of_file(get_source_file_of_node(node))
                                 == ModuleKind::COMMON_JS
                         {
@@ -770,15 +770,13 @@ impl Checker {
                                 diag::X_0_modifier_must_precede_1_modifier,
                                 args!["export", "async"],
                             );
-                        } else if is_class_like(node.parent())
-                            && !is_js_type_alias_declaration(node)
-                        {
+                        } else if is_class_like(parent) && !is_js_type_alias_declaration(node) {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::X_0_modifier_cannot_appear_on_class_elements_of_this_kind,
                                 args!["export"],
                             );
-                        } else if node.kind() == SyntaxKind::Parameter {
+                        } else if node_kind == SyntaxKind::Parameter {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::X_0_modifier_cannot_appear_on_a_parameter,
@@ -800,10 +798,10 @@ impl Checker {
                         flags |= ModifierFlags::EXPORT;
                     }
                     SyntaxKind::DefaultKeyword => {
-                        let container = if node.parent().kind() == SyntaxKind::SourceFile {
-                            node.parent()
+                        let container = if parent.kind() == SyntaxKind::SourceFile {
+                            parent
                         } else {
-                            node.parent().parent()
+                            parent.parent()
                         };
                         if container.kind() == SyntaxKind::ModuleDeclaration
                             && !is_ambient_module(container)
@@ -860,13 +858,13 @@ impl Checker {
                                 diag::X_0_modifier_cannot_be_used_in_an_ambient_context,
                                 args!["override"],
                             );
-                        } else if is_class_like(node.parent()) && !is_property_declaration(node) {
+                        } else if is_class_like(parent) && !is_property_declaration(node) {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::X_0_modifier_cannot_appear_on_class_elements_of_this_kind,
                                 args!["declare"],
                             );
-                        } else if node.kind() == SyntaxKind::Parameter {
+                        } else if node_kind == SyntaxKind::Parameter {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::X_0_modifier_cannot_appear_on_a_parameter,
@@ -884,8 +882,8 @@ impl Checker {
                                 diag::X_0_modifier_cannot_appear_on_an_await_using_declaration,
                                 args!["declare"],
                             );
-                        } else if node.parent().flags().intersects(NodeFlags::AMBIENT)
-                            && node.parent().kind() == SyntaxKind::ModuleBlock
+                        } else if parent.flags().intersects(NodeFlags::AMBIENT)
+                            && parent.kind() == SyntaxKind::ModuleBlock
                         {
                             return self.grammar_error_on_node(
                                 modifier,
@@ -916,13 +914,13 @@ impl Checker {
                                 args!["abstract"],
                             );
                         }
-                        if node.kind() != SyntaxKind::ClassDeclaration
-                            && node.kind() != SyntaxKind::ConstructorType
+                        if node_kind != SyntaxKind::ClassDeclaration
+                            && node_kind != SyntaxKind::ConstructorType
                         {
-                            if node.kind() != SyntaxKind::MethodDeclaration
-                                && node.kind() != SyntaxKind::PropertyDeclaration
-                                && node.kind() != SyntaxKind::GetAccessor
-                                && node.kind() != SyntaxKind::SetAccessor
+                            if node_kind != SyntaxKind::MethodDeclaration
+                                && node_kind != SyntaxKind::PropertyDeclaration
+                                && node_kind != SyntaxKind::GetAccessor
+                                && node_kind != SyntaxKind::SetAccessor
                             {
                                 return self.grammar_error_on_node(
                                     modifier,
@@ -930,10 +928,10 @@ impl Checker {
                                     args![],
                                 );
                             }
-                            if !(node.parent().kind() == SyntaxKind::ClassDeclaration
-                                && has_syntactic_modifier(node.parent(), ModifierFlags::ABSTRACT))
+                            if !(parent.kind() == SyntaxKind::ClassDeclaration
+                                && has_syntactic_modifier(parent, ModifierFlags::ABSTRACT))
                             {
-                                let message = if node.kind() == SyntaxKind::PropertyDeclaration {
+                                let message = if node_kind == SyntaxKind::PropertyDeclaration {
                                     diag::Abstract_properties_can_only_appear_within_an_abstract_class
                                 } else {
                                     diag::Abstract_methods_can_only_appear_within_an_abstract_class
@@ -995,14 +993,14 @@ impl Checker {
                                 args!["async"],
                             );
                         } else if flags.intersects(ModifierFlags::AMBIENT)
-                            || node.parent().flags().intersects(NodeFlags::AMBIENT)
+                            || parent.flags().intersects(NodeFlags::AMBIENT)
                         {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::X_0_modifier_cannot_be_used_in_an_ambient_context,
                                 args!["async"],
                             );
-                        } else if node.kind() == SyntaxKind::Parameter {
+                        } else if node_kind == SyntaxKind::Parameter {
                             return self.grammar_error_on_node(
                                 modifier,
                                 diag::X_0_modifier_cannot_appear_on_a_parameter,
@@ -1030,8 +1028,7 @@ impl Checker {
                         } else {
                             "out"
                         };
-                        let parent = node.parent();
-                        if node.kind() != SyntaxKind::TypeParameter
+                        if node_kind != SyntaxKind::TypeParameter
                             || parent.is_some()
                                 && !(is_interface_declaration(parent)
                                     || is_class_like(parent)
@@ -1066,7 +1063,7 @@ impl Checker {
             }
         }
 
-        if node.kind() == SyntaxKind::Constructor {
+        if node_kind == SyntaxKind::Constructor {
             if flags.intersects(ModifierFlags::STATIC) {
                 return self.grammar_error_on_node(
                     last_static,
@@ -1089,9 +1086,9 @@ impl Checker {
                 );
             }
             return false;
-        } else if (node.kind() == SyntaxKind::ImportDeclaration
-            || node.kind() == SyntaxKind::JsImportDeclaration
-            || node.kind() == SyntaxKind::ImportEqualsDeclaration)
+        } else if (node_kind == SyntaxKind::ImportDeclaration
+            || node_kind == SyntaxKind::JsImportDeclaration
+            || node_kind == SyntaxKind::ImportEqualsDeclaration)
             && flags.intersects(ModifierFlags::AMBIENT)
         {
             return self.grammar_error_on_node(
@@ -1099,7 +1096,7 @@ impl Checker {
                 diag::A_0_modifier_cannot_be_used_with_an_import_declaration,
                 args!["declare"],
             );
-        } else if node.kind() == SyntaxKind::Parameter
+        } else if node_kind == SyntaxKind::Parameter
             && flags.intersects(ModifierFlags::PARAMETER_PROPERTY_MODIFIER)
             && is_binding_pattern(node.name())
         {
@@ -1108,7 +1105,7 @@ impl Checker {
                 diag::A_parameter_property_may_not_be_declared_using_a_binding_pattern,
                 args![],
             );
-        } else if node.kind() == SyntaxKind::Parameter
+        } else if node_kind == SyntaxKind::Parameter
             && flags.intersects(ModifierFlags::PARAMETER_PROPERTY_MODIFIER)
             && node.dot_dot_dot_token().is_some()
         {
@@ -1125,8 +1122,16 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:571 reportObviousModifierErrors
-    pub fn report_obvious_modifier_errors(&mut self, node: Node) -> bool {
-        let modifier = self.find_first_illegal_modifier(node);
+    // PERF: chkport1 item 4. The caller passes the node kind, the parent and
+    // the modifier nodes that it read once (`check_grammar_modifiers`).
+    pub fn report_obvious_modifier_errors(
+        &mut self,
+        node: Node,
+        node_kind: SyntaxKind,
+        parent: Node,
+        modifiers: NodeSlice,
+    ) -> bool {
+        let modifier = self.find_first_illegal_modifier(node, node_kind, parent, modifiers);
         if modifier.is_nil() {
             return false;
         }
@@ -1134,9 +1139,13 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:579 findFirstModifierExcept
-    pub fn find_first_modifier_except(&self, node: Node, allowed_modifier: SyntaxKind) -> Node {
-        let modifier = node
-            .modifier_nodes()
+    // PERF: chkport1 item 4. Takes `node.ModifierNodes()`, read once.
+    pub fn find_first_modifier_except(
+        &self,
+        modifiers: NodeSlice,
+        allowed_modifier: SyntaxKind,
+    ) -> Node {
+        let modifier = modifiers
             .iter()
             .find(|&m| is_modifier(m))
             .unwrap_or(Node::NIL);
@@ -1147,8 +1156,16 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:587 findFirstIllegalModifier
-    pub fn find_first_illegal_modifier(&self, node: Node) -> Node {
-        match node.kind() {
+    // PERF: chkport1 item 4. `node_kind`, `parent` and `modifiers` are
+    // `node.Kind`, `node.Parent` and `node.ModifierNodes()`, read once.
+    pub fn find_first_illegal_modifier(
+        &self,
+        node: Node,
+        node_kind: SyntaxKind,
+        parent: Node,
+        modifiers: NodeSlice,
+    ) -> Node {
+        match node_kind {
             SyntaxKind::GetAccessor
             | SyntaxKind::SetAccessor
             | SyntaxKind::Constructor
@@ -1172,42 +1189,40 @@ impl Checker {
             | SyntaxKind::PropertyAssignment
             | SyntaxKind::ShorthandPropertyAssignment
             | SyntaxKind::NamespaceExportDeclaration
-            | SyntaxKind::MissingDeclaration => node
-                .modifier_nodes()
+            | SyntaxKind::MissingDeclaration => modifiers
                 .iter()
                 .find(|&m| is_modifier(m))
                 .unwrap_or(Node::NIL),
             _ => {
-                if node.parent().kind() == SyntaxKind::ModuleBlock
-                    || node.parent().kind() == SyntaxKind::SourceFile
-                {
+                let parent_kind = parent.kind();
+                if parent_kind == SyntaxKind::ModuleBlock || parent_kind == SyntaxKind::SourceFile {
                     return Node::NIL;
                 }
-                match node.kind() {
+                match node_kind {
                     SyntaxKind::FunctionDeclaration => {
-                        self.find_first_modifier_except(node, SyntaxKind::AsyncKeyword)
+                        self.find_first_modifier_except(modifiers, SyntaxKind::AsyncKeyword)
                     }
                     SyntaxKind::ClassDeclaration | SyntaxKind::ConstructorType => {
-                        self.find_first_modifier_except(node, SyntaxKind::AbstractKeyword)
+                        self.find_first_modifier_except(modifiers, SyntaxKind::AbstractKeyword)
                     }
                     SyntaxKind::ClassExpression
                     | SyntaxKind::InterfaceDeclaration
-                    | SyntaxKind::TypeAliasDeclaration => node
-                        .modifier_nodes()
+                    | SyntaxKind::TypeAliasDeclaration => modifiers
                         .iter()
                         .find(|&m| is_modifier(m))
                         .unwrap_or(Node::NIL),
                     SyntaxKind::VariableStatement => {
                         if node.declaration_list().flags().intersects(NodeFlags::USING) {
-                            return self.find_first_modifier_except(node, SyntaxKind::AwaitKeyword);
+                            return self
+                                .find_first_modifier_except(modifiers, SyntaxKind::AwaitKeyword);
                         }
-                        node.modifier_nodes()
+                        modifiers
                             .iter()
                             .find(|&m| is_modifier(m))
                             .unwrap_or(Node::NIL)
                     }
                     SyntaxKind::EnumDeclaration => {
-                        self.find_first_modifier_except(node, SyntaxKind::ConstKeyword)
+                        self.find_first_modifier_except(modifiers, SyntaxKind::ConstKeyword)
                     }
                     _ => panic!("Unhandled case in findFirstIllegalModifier."),
                 }
@@ -1216,8 +1231,9 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:642 reportObviousDecoratorErrors
-    pub fn report_obvious_decorator_errors(&mut self, node: Node) -> bool {
-        let decorator = self.find_first_illegal_decorator(node);
+    // PERF: chkport1 item 4. Takes `node.ModifierNodes()`, read once.
+    pub fn report_obvious_decorator_errors(&mut self, node: Node, modifiers: NodeSlice) -> bool {
+        let decorator = self.find_first_illegal_decorator(node, modifiers);
         if decorator.is_nil() {
             return false;
         }
@@ -1225,10 +1241,10 @@ impl Checker {
     }
 
     // Go: checker/grammarchecks.go:650 findFirstIllegalDecorator
-    pub fn find_first_illegal_decorator(&self, node: Node) -> Node {
+    // PERF: chkport1 item 4. Takes `node.ModifierNodes()`, read once.
+    pub fn find_first_illegal_decorator(&self, node: Node, modifiers: NodeSlice) -> Node {
         if can_have_illegal_decorators(node) {
-            let decorator = node
-                .modifier_nodes()
+            let decorator = modifiers
                 .iter()
                 .find(|&m| is_decorator(m))
                 .unwrap_or(Node::NIL);
