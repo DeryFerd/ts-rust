@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "status": "active",
   "decision": "REVIEW",
-  "updated": "2026-10-04T03:30:20.049006+00:00",
-  "reason": "Batch recovery-continuation-go-checker-port-49 accepted at R165. Batch recovery-continuation-go-checker-port-50 opened at R166.",
+  "updated": "2026-10-04T05:16:04.919655+00:00",
+  "reason": "R167 bound in batch recovery-continuation-go-checker-port-50.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -841,12 +841,12 @@
     "ordinaryQuery": null,
     "localCheck": null,
     "acceptance": null,
-    "recoveryRevision": 166,
-    "hypothesis": "Six skeptic-checked lanes on R165 go in at pin 673a5f17d713 with no -p output change on the 4 projects: followups9e (Go start signal mask, pid 1 SIGPIPE 141, per-signal hold, bind TLS flake fix), followups15b (wasm-only follow-ups), followups16 (a d.ts transform panic writes .js and .js.map first as Go; PORTING.md lines), followups15a (resolve-ahead loader checks every worker lookup against the snapshot cache; wasm worker count 0; item 2 reverted), lspbig1 (LS reads share the file text: references, highlight and rename on a 5 MB file 1.06 to 1.10x Go, were 7 to 15x) and followups17 (Go-byte string literal ranges with an O(literal) check; tsgo panic hook writes without panicking): every R165 test name keeps its status, the gate has 0 regressions, the LSP and API oracles keep every class, np-suite keeps 879/879.",
-    "sourceFingerprint": "106aed7f513dfd647f4608a5c92c7a431bff936d3f74de981d0db6561bce7a08",
-    "beforeEditingSourceFingerprint": "7e8a7b5a48fb1b0e646f745ac341874e7656480bb71839f9c57fd8e4c4729e80",
+    "recoveryRevision": 167,
+    "hypothesis": "The R166 STOP repair on the R166 source goes in at pin 673a5f17d713 with no -p output change on the 4 projects: get_range_of_node counts the Go length of a string literal without a str slice at an end inside a char (Go cuts an unterminated JSDoc 2 bytes early), so references, documentHighlight and rename on a JSDoc literal cut at the end of a file answer as Go and R165 (R166 gave InternalError and, for rename, a server crash): every R165 test name keeps its status (R166's 16 new plus 3), the gate has 0 regressions, the LSP and API oracles keep every class, np-suite keeps 879/879; with R166's content (six lanes).",
+    "sourceFingerprint": "b1e608cccdcfca269a2b3a35b318bcc175f786967a66cf2b2e3c137fd8abdac1",
+    "beforeEditingSourceFingerprint": "106aed7f513dfd647f4608a5c92c7a431bff936d3f74de981d0db6561bce7a08",
     "sourceBindingStatus": "SOURCE_BOUND",
-    "commit": "579ab8db8",
+    "commit": "9ae54a560",
     "completedRuns": [],
     "compilerAccepted": false,
     "passingCredit": false,
@@ -860,7 +860,7 @@
       "agent": "a59fdd392847b6c3a",
       "verdict": "PENDING"
     },
-    "nextPermittedAction": "Run the R166 pipeline (candidate.sh side)."
+    "nextPermittedAction": "Run the R167 pipeline (candidate.sh side)."
   },
   "parallelModelPreference": {
     "model": "GPT-6 Astra",
