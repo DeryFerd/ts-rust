@@ -761,10 +761,11 @@ pub fn noop() {}
 // PERF (freecheck1): a language server edit frees the old program's pool on
 // the first request after the edit, before its answer: 1 or 2 checkers (hono
 // 36 MiB each; per edit hono 2.7 ms when the memory is hot and 6.5 ms after a
-// client pause, query-core 0.3 ms). After a client pause each checker waits
-// for `drop_garbage` (`gostd::local::drop_after_pause`). One value per
-// checker, so a message that comes during the frees waits for one checker at
-// most. A checker that is still held elsewhere is only decremented later.
+// client pause, query-core 0.3 ms). In the first release after a client pause
+// each checker waits for `drop_garbage` (`gostd::local::drop_after_pause`).
+// One value per checker, so a message that comes during the frees waits for
+// one checker at most. A checker that is still held elsewhere is only
+// decremented later.
 impl Drop for CheckerPool {
     fn drop(&mut self) {
         let checkers = std::mem::take(self.checkers.get_mut());

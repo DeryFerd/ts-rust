@@ -1064,11 +1064,14 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   background): on the dispatch thread the program tables and the frontend
   program wait for `gostd::local::drop_garbage` after the answer. The
   checkers of a released pool and the version's synthetic chunks wait in
-  the same way only when the client paused 20 ms or more before the
-  message (`gostd::local::drop_after_pause`). In a stream of messages they
-  are freed at once, because the next check then reuses their memory
-  (freecheck1). A synthetic entry leaves its table at the release in both
-  cases, so a read of it panics at once. Other threads free at once.
+  the same way only for the first release after a client pause of 20 ms or
+  more, and only when no other message waits and nothing from an earlier
+  message waits (`gostd::local::drop_after_pause`). So at most one released
+  checker set waits, and the check after a pause holds the old set too
+  (hono +30 to +35 MiB). Every other release frees them at once, because
+  the next check then reuses their memory (freecheck1, freecheck2). A
+  synthetic entry leaves its table at the release in both cases, so a read
+  of it panics at once. Other threads free at once.
 - Parse workers (`CompilerHost::prefetch_parses`, not in Go) run only for
   the first program load of a project. A later load gets its files from
   the parse cache.

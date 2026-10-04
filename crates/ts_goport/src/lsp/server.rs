@@ -80,9 +80,10 @@
 //! tasks of a load) wait until the message is done, and then run only
 //! while no message waits. Go's garbage collector does them in the
 //! background. The checkers and synthetic nodes of a released program wait
-//! in the same way only when the client paused before the message
-//! (`gostd::local::drop_after_pause`); in a stream of messages they are
-//! freed at once, so that the next check reuses their memory.
+//! in the same way only for the first release after a client pause, and
+//! only when no other message waits (`gostd::local::drop_after_pause`), so
+//! at most one released checker set waits. Other releases free them at
+//! once, so that the next check reuses their memory.
 //!
 //! Cancellation is Go's: `$/cancelRequest` reaches only a request that the
 //! dispatch loop took (`pending_client_requests`); a cancel for a queued
@@ -2031,6 +2032,15 @@ impl Server {
         *self.dispatch_ctx.borrow_mut() = Some((ctx.clone(), lsp_exit.clone()));
         self.free_since.set(Instant::now());
         gostd::local::keep_garbage();
+        {
+            // Weak: the thread's queues do not keep the server alive.
+            let shared = Arc::downgrade(&self.shared);
+            gostd::local::set_busy(Box::new(move || {
+                shared
+                    .upgrade()
+                    .is_some_and(|s| s.queued_requests.load(Ordering::SeqCst) != 0)
+            }));
+        }
         loop {
             self.dispatch_next(&ctx, &lsp_exit)?;
         }

@@ -34,8 +34,9 @@
 //! `keep_garbage`, the values wait until the loop calls `drop_garbage`
 //! after a message, so the free is not in the answer time. On other
 //! threads `drop_later` drops at once. `drop_after_pause` uses this queue
-//! only when the client paused before the current burst of messages
-//! (`note_message_gap`), and drops at once otherwise.
+//! only for the first release after a client pause (`note_message_gap`),
+//! and only when no message waits (`set_busy`). It drops at once otherwise,
+//! so at most one release waits.
 //!
 //! The queues are per thread: `go`, `post_later`, `go_idle`, `after_func`,
 //! `run_pending`, `run_idle`, `drop_later` and `drop_garbage` act on the
@@ -152,9 +153,23 @@ struct LocalState {
     idle: RefCell<VecDeque<Box<dyn FnOnce()>>>,
     /// Values from `drop_later`, oldest first. None until `keep_garbage`.
     garbage: RefCell<Option<VecDeque<Box<dyn Any>>>>,
-    /// Whether the client paused before the current burst of messages
-    /// (`note_message_gap`).
-    paused: Cell<bool>,
+    /// What `drop_after_pause` does (`note_message_gap`).
+    pause: Cell<Pause>,
+    /// Whether a message waits for the dispatch loop (`set_busy`).
+    busy: RefCell<Option<Box<dyn Fn() -> bool>>>,
+}
+
+/// The state of `drop_after_pause` on one thread.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pause {
+    /// It drops at once.
+    None,
+    /// The client paused before the current burst of messages, and nothing
+    /// was released since. The next release decides.
+    Paused,
+    /// The release after the pause waits for `drop_garbage`, and so do the
+    /// other values of its message, until `drop_garbage` starts.
+    Kept,
 }
 
 impl Drop for LocalState {
@@ -180,7 +195,8 @@ thread_local! {
         timers: RefCell::new(FxHashMap::default()),
         idle: RefCell::new(VecDeque::new()),
         garbage: RefCell::new(None),
-        paused: Cell::new(false),
+        pause: Cell::new(Pause::None),
+        busy: RefCell::new(None),
     };
 }
 
@@ -309,27 +325,57 @@ const CLIENT_PAUSE: Duration = Duration::from_millis(20);
 
 /// The dispatch loop calls it when it takes a message: `gap` is the time
 /// since it finished the last message. A gap of `BURST_GAP` or more starts
-/// a new burst, which is paused when the gap is `CLIENT_PAUSE` or more.
+/// a new burst. The burst is paused when the gap is `CLIENT_PAUSE` or more
+/// and nothing waits for `drop_garbage` (no release that `drop_after_pause`
+/// kept still waits).
 pub fn note_message_gap(gap: Duration) {
     if gap >= BURST_GAP {
-        LOCAL.with(|l| l.paused.set(gap >= CLIENT_PAUSE));
+        LOCAL.with(|l| {
+            let idle = l.garbage.borrow().as_ref().is_none_or(VecDeque::is_empty);
+            l.pause.set(if gap >= CLIENT_PAUSE && idle {
+                Pause::Paused
+            } else {
+                Pause::None
+            });
+        });
     }
 }
 
-/// `drop_later(value)` when the client paused before the current burst of
-/// messages (`note_message_gap`), else drops `value` now. No Go
-/// counterpart: Go's garbage collector frees old data in the background.
+/// Installs the function that tells whether a message waits for the
+/// dispatch loop (`drop_after_pause`). The dispatch loop calls it once.
+pub fn set_busy(f: Box<dyn Fn() -> bool>) {
+    LOCAL.with(|l| *l.busy.borrow_mut() = Some(f));
+}
+
+/// Drops `value` now, except for the first release after a client pause
+/// (`note_message_gap`) when no message waits (`set_busy`): then `value`
+/// and the other values of that message wait for `drop_garbage`
+/// (`drop_later`). So at most one release waits. No Go counterpart: Go's
+/// garbage collector frees old data in the background.
 // PERF (freecheck1): use it for a large free on the answer path that the
 // next check would otherwise reuse (the checkers of a released program).
-// In a burst, a free now is cheap (hot memory) and the next check reuses
-// its memory from the thread cache; a free after the answer made those
-// runs slower (+1% to +6%) and kept more memory. After a pause, the free
-// is cold (hono 6.5 ms, 12.7% of the edit) and the client waits for it, so
-// it goes after the answer.
+// In a stream of messages, a free now is cheap (hot memory) and the next
+// check reuses its memory from the thread cache; a free after the answer
+// made those runs slower (+1% to +6%) and kept more memory. After a pause,
+// the free is cold (hono 6.5 ms, 12.7% of the edit) and the client waits
+// for it, so it goes after the answer. A message that already waits would
+// keep the values until the stream ends (freecheck2: hono HWM x2.3 when
+// every release of a stream after a pause waited), so then they drop now.
 pub fn drop_after_pause(value: Box<dyn Any>) {
     // The thread may be ending, after its queues (a checker pool that
     // another thread-local holds): then `value` drops now.
-    if LOCAL.try_with(|l| l.paused.get()).unwrap_or(false) {
+    let keep = LOCAL
+        .try_with(|l| match l.pause.get() {
+            Pause::None => false,
+            Pause::Kept => true,
+            Pause::Paused => {
+                let keep = !l.busy.borrow().as_ref().is_some_and(|busy| busy());
+                l.pause.set(if keep { Pause::Kept } else { Pause::None });
+                keep
+            }
+        })
+        .unwrap_or(false);
+    if keep {
         drop_later(value);
     } else {
         drop(value);
@@ -344,8 +390,14 @@ pub fn garbage_len() -> usize {
 
 /// Drops the values of `drop_later`, oldest first, until none is left or
 /// `busy()` is true (a message waits). While more than `GARBAGE_LIMIT`
-/// values wait, it drops them even when busy.
+/// values wait, it drops them even when busy. It ends the message of a
+/// release that `drop_after_pause` kept: later releases drop at once.
 pub fn drop_garbage(busy: impl Fn() -> bool) {
+    LOCAL.with(|l| {
+        if l.pause.get() == Pause::Kept {
+            l.pause.set(Pause::None);
+        }
+    });
     loop {
         // The borrow ends before the drop: a drop can call `drop_later`.
         let value = LOCAL.with(|l| {
@@ -644,27 +696,55 @@ mod tests {
         .expect("timer test thread");
     }
 
-    // A value waits for `drop_garbage` only in a burst that comes after a
-    // client pause. A short gap continues the burst before it.
+    // Only the first release after a client pause waits for
+    // `drop_garbage`, with the other values of its message, and only when no
+    // message waits and no kept release waits.
     #[test]
-    fn drop_after_pause_waits_only_after_a_client_pause() {
+    fn drop_after_pause_keeps_one_release_after_a_client_pause() {
         std::thread::spawn(|| {
             keep_garbage();
-            let kept = |gap_ms: u64| {
-                note_message_gap(Duration::from_millis(gap_ms));
-                let value = Rc::new(());
-                drop_after_pause(Box::new(value.clone()));
-                let kept = Rc::strong_count(&value) == 2;
-                drop_garbage(|| false);
-                assert_eq!(Rc::strong_count(&value), 1, "drop_garbage keeps the value");
-                kept
+            let busy = Rc::new(Cell::new(false));
+            {
+                let busy = busy.clone();
+                set_busy(Box::new(move || busy.get()));
+            }
+            // A release of two values. Returns how many wait.
+            let release = || {
+                let values = [Rc::new(()), Rc::new(())];
+                for value in &values {
+                    drop_after_pause(Box::new(value.clone()));
+                }
+                values.iter().filter(|v| Rc::strong_count(v) == 2).count()
             };
-            assert!(!kept(0), "no pause before the first message");
-            assert!(kept(20), "a pause of 20 ms");
-            assert!(kept(0), "the burst after the pause goes on");
-            assert!(!kept(5), "a new burst with no pause");
-            assert!(!kept(0), "the burst with no pause goes on");
-            assert!(kept(500), "a pause of 500 ms");
+            // One message after `gap_ms` with a release, as the dispatch
+            // loop runs it.
+            let message = |gap_ms: u64| {
+                drop_garbage(|| busy.get());
+                note_message_gap(Duration::from_millis(gap_ms));
+                release()
+            };
+            assert_eq!(message(0), 0, "no pause before the first message");
+            assert_eq!(message(20), 2, "the first release after a pause of 20 ms");
+            assert_eq!(message(0), 0, "the next release of the burst");
+            assert_eq!(garbage_len(), 0, "drop_garbage after the answer");
+            assert_eq!(message(5), 0, "a new burst with no pause");
+
+            busy.set(true);
+            assert_eq!(message(500), 0, "a message waits at the release");
+            busy.set(false);
+
+            // A message came while the kept release was freed.
+            assert_eq!(message(500), 2);
+            drop_garbage(|| true);
+            note_message_gap(Duration::from_millis(500));
+            assert_eq!(release(), 0, "a kept release waits");
+
+            // A message with no release after the pause.
+            drop_garbage(|| false);
+            note_message_gap(Duration::from_millis(500));
+            assert_eq!(message(0), 2, "the first release of the burst");
+            drop_garbage(|| false);
+            assert_eq!(garbage_len(), 0);
         })
         .join()
         .expect("drop_after_pause test thread");

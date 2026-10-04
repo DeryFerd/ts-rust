@@ -790,8 +790,8 @@ pub fn open_synthetic_owner(id: u32) {
 /// Their handles must not be read again: a read panics. It does nothing
 /// when `id` is not an owner. A read that holds a node (`with_ast_data`)
 /// keeps the data chunk of that node until the read ends. The chunks leave
-/// the tables now; after a client pause their memory is freed after the
-/// answer (`gostd::local::drop_after_pause`).
+/// the tables now; in the first release after a client pause their memory
+/// is freed after the answer (`gostd::local::drop_after_pause`).
 // Not in Go: the GC frees the nodes that nothing reaches.
 // PERF (freecheck1): hono frees 30 MiB (4.1 ms) here on each edit once the
 // lsMix declaration of the long ls_edit_bench plan grows the Hono class type.
