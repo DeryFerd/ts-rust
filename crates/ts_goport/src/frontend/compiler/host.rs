@@ -82,9 +82,11 @@ pub trait CompilerHost {
     /// The files that `get_source_file` gives now from the host's own
     /// cache, with no read and no parse, by name, with their references.
     /// The parse workers of a program load do not parse these files; they
-    /// resolve and queue their references (`FilesParser::parse`). Only the
-    /// `tsc -b` host has such a cache: it shares the parsed `.d.ts` and
-    /// `.json` files between the programs of a build.
+    /// resolve and queue their references (`FilesParser::parse`). When the
+    /// map has every root file, the load starts no worker. The `tsc -b`
+    /// host shares the parsed `.d.ts` and `.json` files between the
+    /// programs of a build; the language server's project host has the
+    /// session's parse cache.
     // PORT: not in Go (see `prefetch_parses`). A name, not the full parse
     // options: the workers only guess the options. A cached parse with
     // other options is a cache miss, and the loader then parses the file

@@ -149,6 +149,20 @@ pub fn content_mapped_parse_cache_key_for_duplicate(
 pub struct HashedSourceFile {
     pub file: Rc<parser::ParsedSourceFile>,
     pub hash: u128,
+    /// The references of `file` for the parse workers, made on first use
+    /// (`refs`). The clones of one cache entry share it.
+    // PORT: not in Go (see `compiler::CompilerHost::cached_source_file_refs`).
+    pub file_refs: Rc<std::cell::OnceCell<std::sync::Arc<compiler::FileRefs>>>,
+}
+
+impl HashedSourceFile {
+    /// The references of the file for the parse workers
+    /// (`compiler::FileRefs::of_file`), made once per cache entry.
+    pub fn refs(&self) -> std::sync::Arc<compiler::FileRefs> {
+        self.file_refs
+            .get_or_init(|| std::sync::Arc::new(compiler::FileRefs::of_file(&self.file)))
+            .clone()
+    }
 }
 
 // Go: project/parsecache.go:72 ParseCache
@@ -215,7 +229,11 @@ pub fn new_parse_cache(options: RefCountCacheOptions) -> Rc<ParseCache> {
             // would bind in parse order and change the lineage ids. There is
             // one dispatch thread, so the Go race (two programs binding one
             // shared file at once) does not exist here.
-            HashedSourceFile { file, hash }
+            HashedSourceFile {
+                file,
+                hash,
+                file_refs: Rc::default(),
+            }
         },
     )
 }

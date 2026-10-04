@@ -96,6 +96,7 @@ mod lsp_server_semantictokens_test;
 mod lsp_server_shutdown_test;
 mod lsp_stack_sanitizer_test;
 mod overlayfs_test;
+mod parseahead_test;
 mod project_test;
 mod projectcollectionbuilder_test;
 mod projectcollectiondefaultproject_test;

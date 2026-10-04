@@ -102,19 +102,19 @@ fn make_project(label: &str) -> String {
         .replace('\\', "/")
 }
 
-fn write(root: &str, name: &str, text: &str) {
+pub(super) fn write(root: &str, name: &str, text: &str) {
     let path = std::path::Path::new(root).join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
 }
 
-fn file_uri(root: &str, name: &str) -> String {
+pub(super) fn file_uri(root: &str, name: &str) -> String {
     format!("file://{root}/{name}")
 }
 
 /// A session on the OS file system in `root`, with no client, watch or
 /// typings installer.
-fn os_session(root: &str) -> Rc<Session> {
+pub(super) fn os_session(root: &str) -> Rc<Session> {
     project::new_session(&SessionInit {
         background_ctx: bg(),
         options: Rc::new(SessionOptions {

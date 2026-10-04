@@ -4,7 +4,7 @@
 use crate::frontend::prelude::*;
 use crate::gostd::slices::stable_sort_by;
 use crate::program::ThreadBudget;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 // Go: filesparser.go:19 parseTask
@@ -375,6 +375,18 @@ pub struct ParseTaskData {
     pub package_id: PackageId,
 }
 
+/// True when `cached` has the file of every root task, and there is one.
+/// The task of the automatic type directives has no file.
+// PORT: not in Go (parse workers, `FilesParser::parse`).
+fn all_roots_cached(tasks: &[ParseTaskRef], cached: &FxHashMap<String, Arc<FileRefs>>) -> bool {
+    let mut files = tasks
+        .iter()
+        .map(|task| task.borrow())
+        .filter(|task| !task.is_for_automatic_type_directive)
+        .peekable();
+    files.peek().is_some() && files.all(|task| cached.contains_key(&task.normalized_file_path))
+}
+
 impl FilesParser {
     // Go: filesparser.go:240 (*filesParser).parse
     pub fn parse(&mut self, loader: &FileLoader, tasks: &[ParseTaskRef]) {
@@ -389,11 +401,30 @@ impl FilesParser {
         // A host with its own file cache (`CompilerHost::prefetch_parses`)
         // gets no workers. This does not set `single_threaded`, so the
         // queue order stays that of a parallel load.
-        let workers = if self.single_threaded || !loader.opts.host.prefetch_parses() {
+        let mut workers = if self.single_threaded || !loader.opts.host.prefetch_parses() {
             0
         } else {
             prefetch_worker_count()
         };
+        // PERF: a later `tsc -b` program gets its shared `.d.ts` and `.json`
+        // files from the build host's cache, and a language server project
+        // that is made again gets most files from the parse cache. A worker
+        // parse of such a file is not used: it takes CPU, the loader waits
+        // for running parses at the end, and its nodes stay in the worker's
+        // AST arena. The workers still resolve their references, as Go parse
+        // tasks do for a file that the host gives from its cache.
+        let cached = if workers == 0 {
+            FxHashMap::default()
+        } else {
+            loader.opts.host.cached_source_file_refs()
+        };
+        // When the host gives every root file from its cache, no worker
+        // parse can be used, so no worker starts. The loader parses the
+        // other files itself, as a load with no workers.
+        if !cached.is_empty() && all_roots_cached(tasks, &cached) {
+            CACHED_LOADS.fetch_add(1, AtomicOrdering::Relaxed);
+            workers = 0;
+        }
         if workers == 0 {
             if let Some(early) = early {
                 early.discard();
@@ -401,6 +432,7 @@ impl FilesParser {
             self.run(loader, tasks);
             return;
         }
+        POOL_LOADS.fetch_add(1, AtomicOrdering::Relaxed);
         let config = PrefetchConfig::of_loader(loader);
         let mut pool = match early {
             Some(pool) if pool.shared.config == config => pool,
@@ -430,13 +462,7 @@ impl FilesParser {
             .shared
             .resolve
             .set(WorkerResolveConfig::of_loader(loader));
-        // PERF: a later `tsc -b` program gets its shared `.d.ts` and `.json`
-        // files from the build host's cache. A worker parse of such a file
-        // is not used: it takes CPU from the checks of the earlier
-        // projects, and the loader waits for running parses at the end. The
-        // workers still resolve their references, as Go parse tasks do for
-        // a file that the host gives from its cache.
-        lock(&pool.shared.queue).cached = loader.opts.host.cached_source_file_refs();
+        lock(&pool.shared.queue).cached = cached;
         // A `tsc -b` program loads the output `.d.ts` files of its
         // references in place of their sources, so the workers parse those.
         if build_host && !loader.opts.can_use_project_reference_source() {
@@ -1628,6 +1654,10 @@ struct PrefetchStats {
     /// Running worker parses that the loader waited for, and the time.
     waited: usize,
     wait: std::time::Duration,
+    /// Worker reads and parses that the loader did not take, and their
+    /// text bytes (`PrefetchShared::untaken`).
+    untaken: usize,
+    untaken_bytes: u64,
 }
 
 impl PrefetchStats {
@@ -1651,13 +1681,15 @@ impl PrefetchStats {
         stable_sort_by(&mut own, |a, b| b.0.cmp(&a.0));
         let bytes: u64 = own.iter().map(|(size, _)| size).sum();
         eprintln!(
-            "goport prefetch: loader parsed {} files ({} KB): claimed {}, not queued {}, unusable {}; took {} worker parses; waited {} times ({:.1} ms); largest: {}",
+            "goport prefetch: loader parsed {} files ({} KB): claimed {}, not queued {}, unusable {}; took {} worker parses; untaken {} ({} KB); waited {} times ({:.1} ms); largest: {}",
             own.len(),
             bytes / 1024,
             self.claimed.len(),
             self.not_queued.len(),
             self.unusable.len(),
             self.taken,
+            self.untaken,
+            self.untaken_bytes / 1024,
             self.waited,
             self.wait.as_secs_f64() * 1e3,
             own.iter()
@@ -1666,6 +1698,48 @@ impl PrefetchStats {
                 .collect::<Vec<_>>()
                 .join(", "),
         );
+    }
+}
+
+/// Program loads of this process that started parse workers, and that
+/// started none because the host gave every root file from its cache
+/// (`FilesParser::parse`). Worker reads (`run_prefetch_worker`), and the
+/// reads and their text bytes that no loader took (`PrefetchPool::drop`).
+static POOL_LOADS: AtomicUsize = AtomicUsize::new(0);
+static CACHED_LOADS: AtomicUsize = AtomicUsize::new(0);
+static WORKER_READS: AtomicUsize = AtomicUsize::new(0);
+static UNTAKEN_READS: AtomicUsize = AtomicUsize::new(0);
+static UNTAKEN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// What the parse workers of this process read and parsed, and what of it
+/// no program load took. An untaken parse keeps its nodes in the worker's
+/// AST arena and its text, so `untaken` should stay 0 for loads that get
+/// their files from a cache (`CompilerHost::cached_source_file_refs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefetchCounts {
+    /// Program loads that started parse workers.
+    pub pool_loads: usize,
+    /// Program loads that started none because the host gave every root
+    /// file from its cache.
+    pub cached_loads: usize,
+    /// Files that a worker read (and parsed, when it could).
+    pub reads: usize,
+    /// Reads that the loader did not take when its pool stopped.
+    pub untaken: usize,
+    /// The text bytes of the untaken reads.
+    pub untaken_bytes: u64,
+}
+
+/// The counts of `PrefetchCounts` so far. The workers of a discarded early
+/// pool (`start_default_lib_prefetch`) are not in `untaken`.
+// PORT: not in Go (parse workers). For tests and debug runs.
+pub fn prefetch_counts() -> PrefetchCounts {
+    PrefetchCounts {
+        pool_loads: POOL_LOADS.load(AtomicOrdering::Relaxed),
+        cached_loads: CACHED_LOADS.load(AtomicOrdering::Relaxed),
+        reads: WORKER_READS.load(AtomicOrdering::Relaxed),
+        untaken: UNTAKEN_READS.load(AtomicOrdering::Relaxed),
+        untaken_bytes: UNTAKEN_BYTES.load(AtomicOrdering::Relaxed),
     }
 }
 
@@ -1709,6 +1783,20 @@ impl PrefetchShared {
         if let Some(counts) = &self.counts {
             update(&mut lock(counts));
         }
+    }
+
+    /// The jobs that a worker read (and parsed) and the loader did not
+    /// take, and their text bytes. Call it after the workers ended.
+    fn untaken(&self) -> (usize, u64) {
+        let queue = lock(&self.queue);
+        let mut untaken = (0, 0);
+        for job in queue.by_name.values() {
+            if let PrefetchState::Done(Some(result)) = &*lock(&job.state) {
+                untaken.0 += 1;
+                untaken.1 += result.text.len() as u64;
+            }
+        }
+        untaken
     }
 
     /// Asks the next free worker to move the `count` largest root files
@@ -1960,9 +2048,17 @@ impl Drop for PrefetchPool {
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
-        if used && let Some(counts) = &self.shared.counts {
-            lock(counts).print();
+        if !used {
+            return;
         }
+        let (untaken, untaken_bytes) = self.shared.untaken();
+        UNTAKEN_READS.fetch_add(untaken, AtomicOrdering::Relaxed);
+        UNTAKEN_BYTES.fetch_add(untaken_bytes, AtomicOrdering::Relaxed);
+        self.shared.count(|c| {
+            c.untaken = untaken;
+            c.untaken_bytes = untaken_bytes;
+            c.print();
+        });
     }
 }
 
@@ -2097,6 +2193,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// parse goes to the loader, so the loader does not wait for the
 /// resolution. The workers only guess with it: the loader checks every
 /// file and resolution it takes from them.
+#[derive(Debug)]
 pub struct FileRefs {
     file_name: String,
     referenced_files: Vec<FileReference>,
@@ -2106,8 +2203,9 @@ pub struct FileRefs {
 }
 
 impl FileRefs {
-    /// The references of a parsed file of this thread (the `tsc -b` host's
-    /// cache, `CompilerHost::cached_source_file_refs`).
+    /// The references of a parsed file of this thread (the caches of the
+    /// `tsc -b` host and the language server's project host,
+    /// `CompilerHost::cached_source_file_refs`).
     pub fn of_file(file: &ParsedSourceFile) -> Self {
         FileRefs {
             file_name: file.file_name().to_string(),
@@ -2183,6 +2281,9 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
             Some(refs) => (None, Some(refs.clone())),
             None => {
                 let mut result = prefetch_parse(&*fs, &job);
+                if result.is_some() {
+                    WORKER_READS.fetch_add(1, AtomicOrdering::Relaxed);
+                }
                 let refs = result
                     .as_mut()
                     .and_then(|result| result.parse.as_mut())

@@ -11,6 +11,7 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
+use crate::frontend::core_ext::get_script_kind_from_file_name;
 use crate::frontend::module::{AheadAnswer, AheadCall, KeyList};
 use crate::frontend::parser;
 use std::cell::Cell;
@@ -331,9 +332,56 @@ impl compiler::CompilerHost for CompilerHost {
     // worker parse only on a miss. Parse workers would parse the whole
     // program again for nothing, and those parses stay in the workers' AST
     // arenas (about 30 MiB for each Query core rebuild). The first load of
-    // a project still parses ahead.
+    // a project still parses ahead, except the files that the parse cache
+    // has (`cached_source_file_refs`).
     fn prefetch_parses(&self) -> bool {
         self.first_load
+    }
+
+    // PORT: not in Go (see `compiler::CompilerHost::cached_source_file_refs`).
+    // The parse cache files that `get_source_file` would give for a worker's
+    // guess of the parse: the script kind of the file name, the jsx option
+    // that this project's options give the name, and, when the text is
+    // known with no read, its hash. The loader then hits the cache and never
+    // takes a worker parse of these files, so the workers do not parse them.
+    // A project that one clone made and deleted keeps its files in the cache
+    // (as in Go), so when a later open makes it again (hono's
+    // tsconfig.spec.json), its load starts no worker parse. A guess that
+    // misses (another `force` option, a file whose language id gives another
+    // kind) only makes the loader parse the file itself.
+    fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<compiler::FileRefs>> {
+        let mut refs = FxHashMap::default();
+        let (Some(builder), Some(project)) =
+            (self.builder.borrow().clone(), self.project.borrow().clone())
+        else {
+            return refs;
+        };
+        let Some(command_line) = project.borrow().get_command_line_with_typings_files() else {
+            return refs;
+        };
+        let options = command_line.compiler_options();
+        let metadata = SourceFileMetaData::default();
+        for (key, entry) in builder.parse_cache.entries.borrow().iter() {
+            if key.script_kind != get_script_kind_from_file_name(&key.file_name)
+                || key.jsx
+                    != parser::get_external_module_indicator_options(
+                        &key.file_name,
+                        &options,
+                        &metadata,
+                    )
+                    .jsx
+                || builder
+                    .fs
+                    .known_file_hash(&key.path)
+                    .is_some_and(|hash| hash != key.hash)
+            {
+                continue;
+            }
+            if let Some(file) = &*entry.value.borrow() {
+                refs.insert(key.file_name.clone(), file.refs());
+            }
+        }
+        refs
     }
 
     // PORT: not in Go (see `compiler::CompilerHost::release`). Go frees the

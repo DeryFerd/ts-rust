@@ -1223,22 +1223,48 @@ impl SnapshotFSBuilder {
     /// `FileSource::file_exists` reads it, with no side effect (no reload,
     /// no entry made for the dirty map).
     pub fn cached_file_state(&self, path: &tspath::Path) -> CachedFileState {
-        let file = {
-            let dirty = self.cache_files.dirty.borrow();
-            match dirty.get(path) {
-                // `dirty::SyncMap::load` gives no entry for a deleted one.
-                Some(entry) if entry.map_entry.borrow().delete => return CachedFileState::Absent,
-                Some(entry) => entry.value(),
-                None => match self.cache_files.base.get(path) {
-                    Some(file) => Some(file.clone()),
-                    None => return CachedFileState::Absent,
-                },
+        match self.cache_file_value(path) {
+            None => CachedFileState::Absent,
+            Some(None) => CachedFileState::NoValue,
+            Some(Some(file)) if file.borrow().matches_disk_text() => CachedFileState::Live,
+            Some(Some(_)) => CachedFileState::NeedsReload,
+        }
+    }
+
+    /// The `cache_files` entry of `path` as `dirty::SyncMap::load` reads
+    /// it, with no side effect: `None` for no entry, `Some(None)` for an
+    /// entry with no value.
+    fn cache_file_value(&self, path: &tspath::Path) -> Option<Option<Rc<RefCell<CachedFile>>>> {
+        let dirty = self.cache_files.dirty.borrow();
+        match dirty.get(path) {
+            // `dirty::SyncMap::load` gives no entry for a deleted one.
+            Some(entry) if entry.map_entry.borrow().delete => None,
+            Some(entry) => Some(entry.value()),
+            None => self
+                .cache_files
+                .base
+                .get(path)
+                .map(|file| Some(file.clone())),
+        }
+    }
+
+    /// The hash of the text that `get_file_by_path` gives for `path` now,
+    /// when it is known with no read and no side effect: a cached file that
+    /// needs no reload, else an open file. `None` when it is not known.
+    // PORT: not in Go (parse workers, project/compilerhost.rs
+    // `cached_source_file_refs`).
+    pub fn known_file_hash(&self, path: &tspath::Path) -> Option<u128> {
+        match self.cache_file_value(path) {
+            Some(Some(file)) => {
+                let file = file.borrow();
+                file.matches_disk_text().then(|| file.file_base.hash())
             }
-        };
-        match file {
-            None => CachedFileState::NoValue,
-            Some(file) if file.borrow().matches_disk_text() => CachedFileState::Live,
-            Some(_) => CachedFileState::NeedsReload,
+            Some(None) => None,
+            None => {
+                let layered: &dyn vfs::Fs = &*self.cached_layered()?.layered;
+                let overlays = as_overlay_fs(layered)?.overlays.borrow();
+                Some(overlays.get(path)?.hash())
+            }
         }
     }
 
