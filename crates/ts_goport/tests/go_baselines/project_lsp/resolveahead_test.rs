@@ -14,6 +14,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+use ts_goport::flags::ModuleKind;
 use ts_goport::frontend::bundled;
 use ts_goport::frontend::compiler::resolve_ahead::{self, LoadStats, Mode};
 use ts_goport::frontend::tspath;
@@ -141,19 +142,19 @@ fn make_project(label: &str) -> String {
         .replace('\\', "/")
 }
 
-fn write(root: &str, name: &str, text: &str) {
+pub(super) fn write(root: &str, name: &str, text: &str) {
     let path = std::path::Path::new(root).join(name);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
 }
 
-fn file_uri(root: &str, name: &str) -> String {
+pub(super) fn file_uri(root: &str, name: &str) -> String {
     format!("file://{root}/{name}")
 }
 
 /// A session on the OS file system in `root`, with no client, watch or
 /// typings installer.
-fn os_session(root: &str) -> Rc<Session> {
+pub(super) fn os_session(root: &str) -> Rc<Session> {
     project::new_session(&SessionInit {
         background_ctx: bg(),
         options: Rc::new(SessionOptions {
@@ -176,13 +177,17 @@ fn os_session(root: &str) -> Rc<Session> {
     })
 }
 
-/// What a program load leaves: the program's files and module resolutions,
-/// the files that its host saw, the directories that it found missing and
-/// the snapshot's cached files. Paths are relative to the project root.
+/// What a program load leaves: the program's files, their package scopes
+/// and module resolutions, the files that its host saw, the directories
+/// that it found missing and the snapshot's cached files. Paths are
+/// relative to the project root.
 #[derive(Debug, PartialEq, Eq)]
 struct Observed {
     files: Vec<String>,
     missing_files: Vec<String>,
+    /// Per file: the package.json directory and type, and the implied node
+    /// format (`SourceFileMetaData`).
+    metadata: BTreeSet<String>,
     resolutions: BTreeSet<String>,
     seen: BTreeSet<String>,
     missing_directories: BTreeSet<String>,
@@ -229,6 +234,19 @@ fn observe(session: &Rc<Session>, root: &str) -> Observed {
             .missing_files
             .iter()
             .map(|name| relative(name))
+            .collect(),
+        metadata: processed
+            .source_file_meta_datas
+            .iter()
+            .map(|(file, meta)| {
+                relative(&format!(
+                    "{} {:?} {:?} {:?}",
+                    file.as_str(),
+                    meta.package_json_directory,
+                    meta.package_json_type,
+                    meta.implied_node_format,
+                ))
+            })
             .collect(),
         resolutions,
         seen: paths(
@@ -341,6 +359,90 @@ os_child_test! {
         assert_eq!(stats.loader.rejected, 0, "{stats:?}");
         assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
         assert_eq!(stats.new_keys, stats.keys + 1, "{stats:?}");
+    }
+}
+
+os_child_test! {
+    /// The workers find the package scope of each directory of the previous
+    /// load, and an import edit takes each of them: every file keeps the
+    /// package.json directory and type of a serial load. `src/sub` has a
+    /// package.json of its own, and the package `esm` has `"type":
+    /// "module"`, which its files read (they are in node_modules).
+    fn takes_the_package_scopes_of_the_previous_load() {
+        let stats = same_with_and_without("scopes", &|session, root| {
+            write(root, "src/sub/package.json", r#"{ "type": "commonjs" }"#);
+            write(
+                root,
+                "node_modules/esm/package.json",
+                r#"{ "name": "esm", "version": "1.0.0", "type": "module", "types": "index.d.ts" }"#,
+            );
+            write(root, "node_modules/esm/index.d.ts", "export declare const e: number;");
+            let uri = file_uri(root, "src/index.ts");
+            open(session, &uri, &format!("{INDEX}import {{ e }} from \"esm\";\n"));
+            program(session, &uri);
+            add_import(session, root);
+            let observed = observe(session, root);
+            for file in [
+                "<root>/src/sub/d.ts \"<root>/src/sub\" \"\"",
+                "<root>/node_modules/esm/index.d.ts \"<root>/node_modules/esm\" \"module\"",
+            ] {
+                assert!(
+                    observed.metadata.iter().any(|meta| meta.starts_with(file)),
+                    "{file}: {:?}",
+                    observed.metadata
+                );
+            }
+        });
+        assert!(stats.scopes > 0, "{stats:?}");
+        assert_eq!(stats.loader.scopes_rejected, 0, "{stats:?}");
+        assert_eq!(stats.loader.scopes_taken, stats.scopes, "{stats:?}");
+        // `./sub/d` adds a file to a directory that the load had.
+        assert_eq!(stats.new_scopes, stats.scopes, "{stats:?}");
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+    }
+}
+
+os_child_test! {
+    /// A load keeps the module names and their usages of each parse for the
+    /// next loads (compiler/file_loader.rs `import_names`): an import edit
+    /// in another file resolves the names of `src/modes.ts` with the modes
+    /// of a load that reads the nodes (a serial load keeps none).
+    fn keeps_the_module_names_and_modes_of_an_unchanged_file() {
+        same_with_and_without("modes", &|session, root| {
+            write(
+                root,
+                "src/modes.ts",
+                "import type { p } from \"pkg\" with { \"resolution-mode\": \"require\" };\n\
+                 export type O = typeof import(\"pkg/other\", { with: { \"resolution-mode\": \"import\" } });\n\
+                 export const lazy = () => import(\"./a\");\n\
+                 import b = require(\"./sub/b\");\n\
+                 export { p, b };\n",
+            );
+            let uri = file_uri(root, "src/index.ts");
+            open(session, &uri, &format!("{INDEX}import \"./modes\";\n"));
+            program(session, &uri);
+            add_import(session, root);
+            let program = program(session, &uri);
+            let modes = tspath::to_path(&format!("{root}/src/modes.ts"), root, true);
+            let mut names: Vec<(String, ModuleKind)> = program
+                .processed_files
+                .resolved_modules
+                .get(&modes)
+                .expect("resolutions of src/modes.ts")
+                .keys()
+                .map(|key| (key.name.clone(), key.mode))
+                .collect();
+            names.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                names,
+                [
+                    ("./a".to_string(), ModuleKind::ES_NEXT),
+                    ("./sub/b".to_string(), ModuleKind::COMMON_JS),
+                    ("pkg".to_string(), ModuleKind::COMMON_JS),
+                    ("pkg/other".to_string(), ModuleKind::ES_NEXT),
+                ]
+            );
+        });
     }
 }
 
@@ -792,6 +894,100 @@ os_child_test! {
         let stats = last_stats();
         assert!(stats.loader.taken > 0, "{stats:?}");
         assert_eq!(stats.known_files, 0, "{stats:?}");
+        resolve_ahead::set_mode(None);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+const SPEC_MAIN: &str = "import { p } from \"pkg\";\nexport const foo = p;\n";
+const SPEC_HELPER: &str = "export const bar = 2;\n";
+const SPEC_TEST: &str =
+    "import { foo } from \"./main\";\nimport { bar } from \"./helper\";\nfoo + bar;\n";
+
+/// A solution with a build and a spec project over one `src`, as in hono:
+/// the project search of a file open in the build project makes the spec
+/// project, loads it and deletes it.
+const SPEC_FILES: &[(&str, &str)] = &[
+    (
+        "tsconfig.json",
+        r#"{ "files": [], "references": [{ "path": "./tsconfig.build.json" }, { "path": "./tsconfig.spec.json" }] }"#,
+    ),
+    (
+        "tsconfig.build.json",
+        r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler", "noLib": true, "types": [] }, "include": ["src/**/*.ts"], "exclude": ["src/**/*.test.ts"] }"#,
+    ),
+    (
+        "tsconfig.spec.json",
+        r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler", "noLib": true, "types": [], "jsx": "react-jsx" }, "include": ["src/**/*.ts"] }"#,
+    ),
+    ("src/main.ts", SPEC_MAIN),
+    ("src/helper.ts", SPEC_HELPER),
+    ("src/main.test.ts", SPEC_TEST),
+    (
+        "node_modules/pkg/package.json",
+        r#"{ "name": "pkg", "version": "1.0.0", "types": "index.d.ts" }"#,
+    ),
+    (
+        "node_modules/pkg/index.d.ts",
+        "export declare const p: number;",
+    ),
+];
+
+os_child_test! {
+    /// A project that a clone made and deleted gives its keys and its
+    /// share in the kept state to the session's stash
+    /// (`project::ResolveAheadStash`). The clone that makes it again
+    /// resolves ahead the keys of its deleted load, and its workers keep
+    /// what the jobs of the deleted project found.
+    fn a_project_made_again_takes_the_answers_of_its_deleted_load() {
+        let root = std::env::temp_dir().join(format!(
+            "ts_goport_resolve_ahead_{}_made_again",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for (name, text) in SPEC_FILES {
+            write(&root.to_string_lossy(), name, text);
+        }
+        let root = std::fs::canonicalize(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        let spec = tspath::to_path(&format!("{root}/tsconfig.spec.json"), &root, true);
+        let spec_is_open = || {
+            session
+                .snapshot()
+                .project_collection
+                .configured_project(&spec)
+                .is_some()
+        };
+
+        // The first spec load has no keys; the clone deletes the project.
+        open(&session, &file_uri(&root, "src/main.ts"), SPEC_MAIN);
+        assert!(!spec_is_open(), "the first open keeps the spec project");
+
+        // The clone of the next open makes the spec project again, and its
+        // load takes every answer. The clone deletes it again.
+        resolve_ahead::wait_for_frees();
+        open(&session, &file_uri(&root, "src/helper.ts"), SPEC_HELPER);
+        assert!(!spec_is_open(), "the second open keeps the spec project");
+        let stats = last_stats();
+        assert!(stats.keys > 0, "{stats:?}");
+        assert_eq!(stats.loader.rejected, 0, "{stats:?}");
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+
+        // A file of the spec project only: the spec project made again
+        // keeps it. Its job starts with the files that the job of the
+        // deleted project found.
+        resolve_ahead::wait_for_frees();
+        open(&session, &file_uri(&root, "src/main.test.ts"), SPEC_TEST);
+        assert!(spec_is_open(), "the spec project is not open");
+        let stats = last_stats();
+        assert!(stats.keys > 0, "{stats:?}");
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+        assert!(stats.known_files > 0, "{stats:?}");
         resolve_ahead::set_mode(None);
         drop(session);
         std::fs::remove_dir_all(&root).unwrap();

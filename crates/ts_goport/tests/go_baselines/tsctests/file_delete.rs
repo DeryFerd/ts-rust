@@ -1,5 +1,5 @@
-//! Port-only test of `handle_file_delete` (Go `programtosnapshot.go:162
-//! handleFileDelete`).
+//! Port-only test of `handle_file_delete` (Go
+//! `incremental/programtosnapshot.go:162-179 handleFileDelete`).
 //!
 //! PORT: Go stops at the first gone file of a random-order `SyncMap`, so
 //! Go takes the global branch with chance (gone global files) / (gone
@@ -143,6 +143,58 @@ fn gone_files_mostly_modules_do_not_change_all_files() {
     assert_eq!(status, ExitStatus::Success, "{output}");
     assert!(
         !output.contains(&format!("TSFILE: {PROJECT}/out/a.js")),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!("TSFILE: {PROJECT}/tsconfig.tsbuildinfo")),
+        "{output}"
+    );
+}
+
+// Three files leave the program and two of them, `g1.d.ts` and `g2.d.ts`,
+// affect global scope: a strict global majority. Go meets a global file
+// first in 2 of 3 runs and adds every file to the change set, so the
+// unchanged `a.ts` is emitted again. The port takes that branch.
+#[test]
+fn gone_files_mostly_global_change_all_files() {
+    let source = |name: &str| format!("{PROJECT}/src/{name}");
+    let input = TscInput {
+        files: [
+            (
+                format!("{PROJECT}/tsconfig.json"),
+                r#"{"compilerOptions":{"incremental":true,"rootDir":"src","outDir":"out"},"include":["src"]}"#
+                    .into(),
+            ),
+            (source("a.ts"), "export const a = 1;\n".into()),
+            (source("g1.d.ts"), "declare const g1: number;\n".into()),
+            (source("g2.d.ts"), "declare const g2: number;\n".into()),
+            (source("m1.d.ts"), "export declare const m1: number;\n".into()),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let sys = new_test_sys(&input, false);
+    let fs = sys.fs_from_file_map();
+
+    let status = build_with(&sys, &["--listEmittedFiles"]);
+    let output = sys.output_text();
+    assert_eq!(status, ExitStatus::Success, "{output}");
+    assert!(
+        output.contains(&format!("TSFILE: {PROJECT}/out/a.js")),
+        "{output}"
+    );
+
+    for name in ["g1.d.ts", "g2.d.ts", "m1.d.ts"] {
+        fs.remove(&source(name))
+            .unwrap_or_else(|err| panic!("remove {name}: {err:?}"));
+    }
+    sys.clear_output();
+    let status = build_with(&sys, &["--listEmittedFiles"]);
+    let output = sys.output_text();
+    assert_eq!(status, ExitStatus::Success, "{output}");
+    assert!(
+        output.contains(&format!("TSFILE: {PROJECT}/out/a.js")),
         "{output}"
     );
     assert!(

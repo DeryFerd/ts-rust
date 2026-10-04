@@ -120,6 +120,35 @@ fn test_breadth_first_search_parallel() {
     }
 }
 
+// PORT: Go's common schedule starts every goroutine of a level before a
+// slow `visit` returns (`core/bfs.go:102`), so a job after the goal is still
+// visited. The check after the visit (`core/bfs.go:128`) keeps it from adding
+// next-level jobs, so the result does not change.
+#[test]
+fn test_breadth_first_search_parallel_visits_whole_level() {
+    let g = graph(&[
+        ("Root", &["A", "B"]),
+        ("A", &["C"]),
+        ("B", &["D"]),
+        ("C", &[]),
+        ("D", &[]),
+    ]);
+    let neighbor_calls: RefCell<Vec<&str>> = RefCell::new(Vec::new());
+    let mut children = |node: &&'static str| {
+        neighbor_calls.borrow_mut().push(node);
+        g[node].clone()
+    };
+    let mut visited_nodes: Vec<&str> = Vec::new();
+    let result = breadth_first_search_parallel("Root", &mut children, &mut |node| {
+        visited_nodes.push(node);
+        (*node == "A", true)
+    });
+    assert!(result.stopped, "Expected search to stop at A");
+    assert_eq!(result.path, vec!["A", "Root"]);
+    assert_eq!(visited_nodes, vec!["Root", "A", "B"]);
+    assert_eq!(*neighbor_calls.borrow(), vec!["Root"]);
+}
+
 // Go: pattern_test.go:5 TestPatternOverlappingMatch
 #[test]
 fn test_pattern_overlapping_match() {

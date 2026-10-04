@@ -12,9 +12,12 @@
 //!    iteration order reaches output). `core.WorkGroup`
 //!    (`frontend::core_workgroup::new_work_group`, always the
 //!    single-threaded group) and `core.BreadthFirstSearchParallelEx`
-//!    (`frontend::core_bfs`) run serially in queue order. The BFS keeps
-//!    Go's index checks, so it picks the in-order schedule. `go f()` over
-//!    dispatch-thread state is `gostd::local::go`; timers are
+//!    (`frontend::core_bfs`) run serially in queue order. The BFS follows
+//!    Go's common schedule: it visits every job of a level (each Go
+//!    goroutine passes its start check, `core/bfs.go:102`, before a slow
+//!    visit sets the lowest goal) and keeps only the check after the visit
+//!    (`core/bfs.go:128`), so the result and the next level are Go's.
+//!    `go f()` over dispatch-thread state is `gostd::local::go`; timers are
 //!    `gostd::local::after_func`.
 //! 2. Pointers. A Go pointer to a shared struct (`*Project`,
 //!    `*configFileEntry`, `*diskFile`, `*Snapshot`, ...) is `Rc<X>`, or

@@ -36,8 +36,9 @@
 //! threads `drop_later` drops at once. `drop_after_pause` uses this queue
 //! only for the first release after a client pause (`note_message_gap`),
 //! and only when the client has not sent its next edit yet
-//! (`set_stream_check`). It drops at once otherwise, so at most one release
-//! waits.
+//! (`set_stream_check`). It drops at once otherwise, so only the releases
+//! of one message wait (of one pipelined burst on an API connection: see
+//! `drop_after_pause`).
 //!
 //! The queues are per thread: `go`, `post_later`, `go_idle`, `after_func`,
 //! `run_pending`, `run_idle`, `drop_later` and `drop_garbage` act on the
@@ -353,9 +354,15 @@ pub fn set_stream_check(f: Box<dyn Fn() -> bool>) {
 /// Drops `value` now, except for the first release after a client pause
 /// (`note_message_gap`) when the client has not sent its next edit yet
 /// (`set_stream_check`): then `value` and the other values of that message
-/// wait for `drop_garbage` (`drop_later`). So at most one release waits.
-/// No Go counterpart: Go's garbage collector frees old data in the
-/// background.
+/// wait for `drop_garbage` (`drop_later`). So only the releases of one
+/// message wait. An API connection of the LSP server reads its messages
+/// from its inbox and runs the dispatch loop, and with it `drop_garbage`,
+/// only when the inbox is empty (lsp/server.rs `ApiConnProtocol`). Its
+/// messages do not call `note_message_gap`, and the stream check sees only
+/// LSP notifications. So when the pause state lets an API message keep its
+/// release, the releases of the rest of a pipelined API burst wait too,
+/// until the inbox is empty. No Go counterpart: Go's garbage collector
+/// frees old data in the background.
 // PERF (freecheck1): use it for a large free on the answer path that the
 // next check would otherwise reuse (the checkers of a released program).
 // In a stream of messages, a free now is cheap (hot memory) and the next
