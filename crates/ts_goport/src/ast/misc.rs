@@ -1034,20 +1034,24 @@ pub fn compare_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
     if c != 0 {
         return c;
     }
-    c = d1.pos() - d2.pos();
+    // PORT: Go subtracts these int32 values as Go ints (64 bits), so the
+    // sign is their true order. An `i32` difference can wrap on the values
+    // of a bad `.tsbuildinfo` (category -2147483648 and 1), so the port
+    // compares them.
+    c = ordering_to_int(d1.pos().cmp(&d2.pos()));
     if c != 0 {
         return c;
     }
-    c = d1.end() - d2.end();
+    c = ordering_to_int(d1.end().cmp(&d2.end()));
     if c != 0 {
         return c;
     }
-    c = d1.code() - d2.code();
+    c = ordering_to_int(d1.code().cmp(&d2.code()));
     if c != 0 {
         return c;
     }
     // tsgo#4712
-    c = d1.category().0 - d2.category().0;
+    c = ordering_to_int(d1.category().cmp(&d2.category()));
     if c != 0 {
         return c;
     }

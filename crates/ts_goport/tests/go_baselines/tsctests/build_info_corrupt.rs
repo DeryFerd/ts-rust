@@ -1,11 +1,12 @@
 //! Port-only tests of a `.tsbuildinfo` that is valid JSON with bad values
-//! (portgaps1 N2, N4). Go N panics where it reads or prints them and exits
-//! 2. The port hung on a negative diagnostic `pos` and exited 70 with Rust
-//! panic text on the other values.
+//! (portgaps1 N2, N4, and the bifix1 review). Go N panics where it reads or
+//! prints them and exits 2. The port hung on a negative diagnostic `pos`,
+//! exited 70 with Rust panic text on other values, and did not keep a bad
+//! category as Go does (sort order, build info written again).
 //!
 //! PORT: no Go counterpart. Each test makes the build info with `tsgo -p .`
-//! (the same bytes as Go N), changes one value and runs `tsgo -p .` and
-//! `tsgo -b` again. The expected exit code, stdout and first stderr line are
+//! (the same bytes as Go N), changes one value (or adds a changed copy of a
+//! diagnostic) and runs `tsgo -p .` and `tsgo -b` again. The expected exit code, stdout and first stderr line are
 //! Go N's (the pin N oracle). In `-b`, Go panics in a builder goroutine of
 //! `sync.WaitGroup.Go`, so its line ends with ` [recovered, repanicked]`,
 //! and the task output that it buffers is not written.
@@ -279,6 +280,19 @@ fn unhandled_category_is_written_again() {
         "bad-cat-written",
         r#""category":1,"#,
         r#""category":999,"#,
+        "src/b.ts(1,39): ",
+        "Unhandled diagnostic category",
+    );
+}
+
+// Go: ast/diagnostic.go:502 subtracts the categories as Go ints (64 bits),
+// so -2147483648 sorts before 1. An `i32` difference wraps.
+#[test]
+fn far_apart_categories_sort_as_go_ints() {
+    check(
+        "min-cat-sort",
+        B_DIAGNOSTIC,
+        &with_copy_of_category(i32::MIN),
         "src/b.ts(1,39): ",
         "Unhandled diagnostic category",
     );
