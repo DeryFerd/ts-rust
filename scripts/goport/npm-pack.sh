@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds a local linux-x64 npm package set in Go's layout at the pin, and never publishes:
 #   typescript                        Go's JS launcher (bin/tsc, lib/tsc.js) and JS API (dist).
-#                                     Rust: plus the postinstall npm/install.js, which swaps bin/tsc
-#                                     for a symlink to the native tsc on POSIX.
+#                                     Rust: plus the postinstall npm/install.js, which rewrites
+#                                     bin/tsc on POSIX to run the native tsc without Node.
 #   @typescript/typescript-linux-x64  lib/tsc (the native tsc) and the lib files next to it.
 # The layout follows the Go checkout's Herebyfile.mjs (npm/pack.mjs has the details).
 #
