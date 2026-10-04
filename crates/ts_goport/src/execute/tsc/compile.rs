@@ -323,12 +323,18 @@ pub struct OsSystem {
 
 // Go: cmd/tsc/sys.go:124 newSystem
 // PORT: Go exits with `ExitStatusInvalidProject_OutputsSkipped` when the
-// current directory cannot be read; this returns that status instead.
+// current directory cannot be read; this returns that status instead. The
+// error goes to Go `os.Stderr` (`stdio::Stderr`): with a stderr pipe that
+// has no reader, the write ends the process by SIGPIPE, as Go's
+// `epipecheck` does (`tests/tsgo_panic_hook.rs`).
 pub fn new_os_system() -> Result<OsSystem, ExitStatus> {
     let cwd = match crate::frontend::vfs::os_current_dir() {
         Ok(cwd) => cwd,
         Err(err) => {
-            eprintln!(
+            use std::io::Write as _;
+            // Go: fmt.Fprintf ignores the write error.
+            let _ = writeln!(
+                stdio::Stderr,
                 "Error getting current directory: {}",
                 crate::frontend::vfs::getwd_error_text(&err)
             );
