@@ -41,17 +41,93 @@ pub struct CompilerHost {
     pub first_load: bool,
 
     /// The module resolution keys of the last program load with this host,
-    /// or else of the project's host before it: the keys that the next load
-    /// resolves ahead (`compiler::CompilerHost::resolve_ahead`).
+    /// or else of the project's host before it, or else of the deleted
+    /// project of the same config (`ResolveAheadStash`): the keys that the
+    /// next load resolves ahead (`compiler::CompilerHost::resolve_ahead`).
     // PORT: not in Go (perf).
     pub resolution_keys: Rc<RefCell<Option<Arc<KeyList>>>>,
 
     /// The project's share in what the resolve-ahead workers keep from
-    /// load to load, from the project's host before this one. `release`
-    /// drops it; when no host of the project has it, the workers drop
-    /// what they keep (`compiler::resolve_ahead::KeptShare`).
+    /// load to load, from the project's host before this one or from the
+    /// stash (`ResolveAheadStash`). `release` drops it; when no host of the
+    /// project and no stash has it, the workers drop what they keep
+    /// (`compiler::resolve_ahead::KeptShare`).
     // PORT: not in Go (perf).
     pub kept_share: RefCell<Option<Rc<compiler::resolve_ahead::KeptShare>>>,
+}
+
+/// The resolve-ahead keys and kept share of the projects that a snapshot
+/// clone made and deleted, by config file path. The first host of a later
+/// project of the same config takes them (`new_compiler_host`), so its load
+/// resolves ahead the keys of the deleted project's last load. The project
+/// search of each hono file open makes and deletes tsconfig.spec.json; with
+/// no keys, its load resolves its 1338 module keys on the loading thread.
+/// The keys are hints only: the loader checks each answer
+/// (`accept_ahead_answer`), and resolves itself a key that it does not
+/// find. One per session (`SnapshotHost`), with at most `CAPACITY`
+/// projects; a new one drops the oldest.
+///
+/// Rule: only `Snapshot::clone` puts, for a program that it made for a
+/// project that its new collection does not have. A host that `release`
+/// frees (the old host of a live project, or the last host of a project
+/// whose files closed) drops its keys and share as before, so the kept
+/// state of a closed project goes as `KeptShare` says.
+// PORT: not in Go (perf; Go has no resolve ahead).
+#[derive(Default)]
+pub struct ResolveAheadStash {
+    projects: RefCell<Vec<StashedProject>>,
+}
+
+struct StashedProject {
+    config_file_path: tspath::Path,
+    keys: Arc<KeyList>,
+    share: Rc<compiler::resolve_ahead::KeptShare>,
+}
+
+impl ResolveAheadStash {
+    const CAPACITY: usize = 8;
+
+    /// Moves the keys and the share of `host` here, in place of older ones
+    /// of its config. Nothing when its loads recorded no keys.
+    pub fn put(&self, host: &CompilerHost) {
+        if host.resolution_keys.borrow().is_none() {
+            return;
+        }
+        let keys = host.resolution_keys.borrow_mut().take();
+        let share = host.kept_share.borrow_mut().take();
+        let (Some(keys), Some(share)) = (keys, share) else {
+            return;
+        };
+        let mut projects = self.projects.borrow_mut();
+        let older = projects
+            .iter()
+            .position(|project| project.config_file_path == host.config_file_path)
+            .map(|index| projects.remove(index));
+        projects.push(StashedProject {
+            config_file_path: host.config_file_path.clone(),
+            keys,
+            share,
+        });
+        let oldest = (projects.len() > Self::CAPACITY).then(|| projects.remove(0));
+        drop(projects);
+        // A dropped share can make the workers forget what they keep.
+        drop(older);
+        drop(oldest);
+    }
+
+    /// Takes the keys and the share of the deleted project of
+    /// `config_file_path`.
+    fn take(
+        &self,
+        config_file_path: &tspath::Path,
+    ) -> Option<(Arc<KeyList>, Rc<compiler::resolve_ahead::KeptShare>)> {
+        let mut projects = self.projects.borrow_mut();
+        let index = projects
+            .iter()
+            .position(|project| project.config_file_path == *config_file_path)?;
+        let project = projects.remove(index);
+        Some((project.keys, project.share))
+    }
 }
 
 // Go: project/compilerhost.go:29 newCompilerHost
@@ -66,12 +142,21 @@ pub fn new_compiler_host(
 ) -> Rc<CompilerHost> {
     let (config_file_path, first_load, resolution_keys, kept_share) = {
         let project = project.borrow();
-        let host = project.host.as_ref();
+        let (resolution_keys, kept_share) = match &project.host {
+            Some(host) => (
+                host.resolution_keys.borrow().clone(),
+                host.kept_share.borrow().clone(),
+            ),
+            None => builder
+                .resolve_ahead_stash
+                .take(&project.config_file_path)
+                .map_or((None, None), |(keys, share)| (Some(keys), Some(share))),
+        };
         (
             project.config_file_path.clone(),
             project.program.is_none(),
-            host.and_then(|host| host.resolution_keys.borrow().clone()),
-            host.and_then(|host| host.kept_share.borrow().clone()),
+            resolution_keys,
+            kept_share,
         )
     };
     let source_fs = new_source_fs(true, builder.fs.clone(), builder.to_path.clone());

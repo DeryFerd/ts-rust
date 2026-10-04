@@ -42,6 +42,10 @@ pub struct ProjectCollectionBuilder {
     pub content_mapped_parse_cache: Rc<ContentMappedParseCache>,
     pub extended_config_cache: Rc<ExtendedConfigCache>,
     pub content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
+    /// The session's stash of deleted projects' resolve-ahead keys, which
+    /// the hosts of the projects that this clone makes again take.
+    // PORT: not in Go (see `ResolveAheadStash`).
+    pub resolve_ahead_stash: Rc<ResolveAheadStash>,
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
 
     pub ctx: Context,
@@ -111,6 +115,7 @@ pub fn new_project_collection_builder(
     content_mapped_parse_cache: Rc<ContentMappedParseCache>,
     extended_config_cache: Rc<ExtendedConfigCache>,
     content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
+    resolve_ahead_stash: Rc<ResolveAheadStash>,
     client: Option<Rc<dyn Client>>,
 ) -> Rc<ProjectCollectionBuilder> {
     let open_files = open_file_paths(&overlays);
@@ -146,6 +151,7 @@ pub fn new_project_collection_builder(
         content_mapped_parse_cache,
         extended_config_cache,
         content_mapper_host,
+        resolve_ahead_stash,
         config_file_registry_builder,
         new_snapshot_id,
         configured_projects: dirty::new_sync_map(

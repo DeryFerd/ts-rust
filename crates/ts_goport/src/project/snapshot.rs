@@ -964,6 +964,7 @@ impl Snapshot {
             store.content_mapped_parse_cache.clone(),
             store.extended_config_cache.clone(),
             store.content_mapper_host.clone(),
+            store.resolve_ahead_stash.clone(),
             client,
         );
 
@@ -1232,12 +1233,18 @@ impl Snapshot {
         // `Project -> host -> builder` cycle). Go's GC frees it. The port
         // freezes its host and frees its checker pool and program version,
         // as `dispose` does for a program that no snapshot holds. Its parse
-        // cache counts stay, as in Go (no snapshot derefs them).
-        let kept: FxHashSet<*const compiler::NewProgram> = new_snapshot
-            .project_collection
-            .projects()
+        // cache counts stay, as in Go (no snapshot derefs them). The host of
+        // a project that the clone deleted gives its resolve-ahead keys to
+        // the stash, for a later clone that makes the project again
+        // (`ResolveAheadStash`).
+        let projects = new_snapshot.project_collection.projects();
+        let kept: FxHashSet<*const compiler::NewProgram> = projects
             .iter()
             .filter_map(|project| project.borrow().program.as_ref().map(Rc::as_ptr))
+            .collect();
+        let kept_configs: FxHashSet<tspath::Path> = projects
+            .iter()
+            .map(|project| project.borrow().config_file_path.clone())
             .collect();
         for made in project_collection_builder.made_programs.take() {
             if kept.contains(&Rc::as_ptr(&made.program)) {
@@ -1248,6 +1255,9 @@ impl Snapshot {
                     snapshot_fs.clone(),
                     new_snapshot.config_file_registry.clone(),
                 );
+            }
+            if !kept_configs.contains(&made.host.config_file_path) {
+                store.resolve_ahead_stash.put(&made.host);
             }
             made.checker_pool.discard();
             crate::ls::release_search_thread(&made.program);

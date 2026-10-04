@@ -719,6 +719,100 @@ os_child_test! {
     }
 }
 
+const SPEC_MAIN: &str = "import { p } from \"pkg\";\nexport const foo = p;\n";
+const SPEC_HELPER: &str = "export const bar = 2;\n";
+const SPEC_TEST: &str =
+    "import { foo } from \"./main\";\nimport { bar } from \"./helper\";\nfoo + bar;\n";
+
+/// A solution with a build and a spec project over one `src`, as in hono:
+/// the project search of a file open in the build project makes the spec
+/// project, loads it and deletes it.
+const SPEC_FILES: &[(&str, &str)] = &[
+    (
+        "tsconfig.json",
+        r#"{ "files": [], "references": [{ "path": "./tsconfig.build.json" }, { "path": "./tsconfig.spec.json" }] }"#,
+    ),
+    (
+        "tsconfig.build.json",
+        r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler", "noLib": true, "types": [] }, "include": ["src/**/*.ts"], "exclude": ["src/**/*.test.ts"] }"#,
+    ),
+    (
+        "tsconfig.spec.json",
+        r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler", "noLib": true, "types": [], "jsx": "react-jsx" }, "include": ["src/**/*.ts"] }"#,
+    ),
+    ("src/main.ts", SPEC_MAIN),
+    ("src/helper.ts", SPEC_HELPER),
+    ("src/main.test.ts", SPEC_TEST),
+    (
+        "node_modules/pkg/package.json",
+        r#"{ "name": "pkg", "version": "1.0.0", "types": "index.d.ts" }"#,
+    ),
+    (
+        "node_modules/pkg/index.d.ts",
+        "export declare const p: number;",
+    ),
+];
+
+os_child_test! {
+    /// A project that a clone made and deleted gives its keys and its
+    /// share in the kept state to the session's stash
+    /// (`project::ResolveAheadStash`). The clone that makes it again
+    /// resolves ahead the keys of its deleted load, and its workers keep
+    /// what the jobs of the deleted project found.
+    fn a_project_made_again_takes_the_answers_of_its_deleted_load() {
+        let root = std::env::temp_dir().join(format!(
+            "ts_goport_resolve_ahead_{}_made_again",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for (name, text) in SPEC_FILES {
+            write(&root.to_string_lossy(), name, text);
+        }
+        let root = std::fs::canonicalize(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        let spec = tspath::to_path(&format!("{root}/tsconfig.spec.json"), &root, true);
+        let spec_is_open = || {
+            session
+                .snapshot()
+                .project_collection
+                .configured_project(&spec)
+                .is_some()
+        };
+
+        // The first spec load has no keys; the clone deletes the project.
+        open(&session, &file_uri(&root, "src/main.ts"), SPEC_MAIN);
+        assert!(!spec_is_open(), "the first open keeps the spec project");
+
+        // The clone of the next open makes the spec project again, and its
+        // load takes every answer. The clone deletes it again.
+        resolve_ahead::wait_for_frees();
+        open(&session, &file_uri(&root, "src/helper.ts"), SPEC_HELPER);
+        assert!(!spec_is_open(), "the second open keeps the spec project");
+        let stats = last_stats();
+        assert!(stats.keys > 0, "{stats:?}");
+        assert_eq!(stats.loader.rejected, 0, "{stats:?}");
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+
+        // A file of the spec project only: the spec project made again
+        // keeps it. Its job starts with the files that the job of the
+        // deleted project found.
+        resolve_ahead::wait_for_frees();
+        open(&session, &file_uri(&root, "src/main.test.ts"), SPEC_TEST);
+        assert!(spec_is_open(), "the spec project is not open");
+        let stats = last_stats();
+        assert!(stats.keys > 0, "{stats:?}");
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
+        assert!(stats.known_files > 0, "{stats:?}");
+        resolve_ahead::set_mode(None);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
 /// The import of `rpkg`, a package whose node_modules directory is a
 /// symlink (`symlinked_rpkg`).
 const RPKG_INDEX: &str = "import { r } from \"rpkg\";\n";

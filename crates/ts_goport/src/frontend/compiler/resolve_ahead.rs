@@ -210,11 +210,14 @@ pub struct ResolveAheadHost {
 
 /// A project's share in what the workers keep from job to job: the known
 /// files and the package.json parses. Each host of the project's loads
-/// gives it to the next one (project/compilerhost.rs). When the last one
-/// drops it (the project's programs are released) after a load of the
-/// project gave the workers a job, the workers drop what they keep
+/// gives it to the next one (project/compilerhost.rs). A project that a
+/// snapshot clone made and deleted gives it to the session's stash, and the
+/// project of the same config that a later clone makes takes it
+/// (`ResolveAheadStash`). When the last one drops it (the project's
+/// programs are released, or the stash drops the project) after a load of
+/// the project gave the workers a job, the workers drop what they keep
 /// (`Workers::forget`). So the kept state holds only what the loads of
-/// live projects found, and the next loads find it again.
+/// live and stashed projects found, and the next loads find it again.
 // PORT: not in Go (perf).
 #[derive(Default)]
 pub struct KeptShare {
