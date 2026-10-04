@@ -1590,9 +1590,9 @@ struct BlockPool {
     /// The given-back blocks with the pin epoch from which they are free,
     /// in the order they came back (the epochs only grow).
     quarantine: VecDeque<(usize, PoolBlock)>,
-    /// The kind columns of the last `RECENT_KINDS` node shells, newest
-    /// first (`shell_kinds`).
-    recent_kinds: VecDeque<&'static [SyntaxKind]>,
+    /// Each kind column that `shell_kinds` leaked, by the hash of its
+    /// kinds.
+    kind_columns: FxHashMap<u64, Vec<&'static [SyntaxKind]>>,
 }
 
 /// The number of program releases a given-back block waits
@@ -1605,29 +1605,33 @@ const QUARANTINE_RELEASES: usize = 2;
 static POOL: Mutex<BlockPool> = Mutex::new(BlockPool {
     free: Vec::new(),
     quarantine: VecDeque::new(),
-    recent_kinds: VecDeque::new(),
+    kind_columns: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
 });
 
-/// The number of kind columns `shell_kinds` compares.
-const RECENT_KINDS: usize = 4;
-
-/// The kind column of a node shell whose store has kinds `kinds`: a column
-/// of one of the last `RECENT_KINDS` shells when it is equal (a column
-/// never changes, so shells can share it), else `kinds`, leaked. An edit
-/// inside a token or a literal keeps every kind of the file, so its shell
-/// leaks no column. A column is 2 bytes per slot; a pooled block cannot
-/// hold it (`NodeRecord`).
+/// The kind column of a node shell whose store has kinds `kinds`: an equal
+/// column that an earlier shell leaked (a column never changes, so shells
+/// can share it), else `kinds`, leaked. An edit inside a token or a literal
+/// keeps every kind of the file, and a file parsed again with the same text
+/// (a `tsc --watch` build after a config change) has the same kinds, so
+/// their shells leak no column. A column is 2 bytes per slot; a pooled
+/// block cannot hold it (`NodeRecord`).
+// PERF: watchfree1. The last 4 columns were kept before, so a config
+// change in `tsc --watch` leaked a column for each file (0.54 MiB per
+// change on query-core). A column is hashed and compared once, about the
+// cost of the compare with the last column before.
 fn shell_kinds(kinds: Vec<SyntaxKind>) -> &'static [SyntaxKind] {
+    let hash = {
+        let mut hasher = rustc_hash::FxHasher::default();
+        std::hash::Hash::hash(kinds.as_slice(), &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    };
     let mut pool = lock_pool();
-    let recent = &mut pool.recent_kinds;
-    if let Some(i) = recent.iter().position(|column| **column == *kinds) {
-        let column = recent.remove(i).expect("a recent kind column");
-        recent.push_front(column);
+    let columns = pool.kind_columns.entry(hash).or_default();
+    if let Some(column) = columns.iter().find(|column| ***column == *kinds) {
         return column;
     }
     let column: &'static [SyntaxKind] = Vec::leak(kinds);
-    recent.push_front(column);
-    recent.truncate(RECENT_KINDS);
+    columns.push(column);
     column
 }
 
@@ -1692,7 +1696,7 @@ fn clear_block_pool() {
     let mut pool = lock_pool();
     pool.free.clear();
     pool.quarantine.clear();
-    pool.recent_kinds.clear();
+    pool.kind_columns.clear();
 }
 
 /// Test hook (AST node records, step 4): the address of the records of the
@@ -7229,5 +7233,47 @@ mod tests {
         assert!([d_block, d1_block].contains(&addr(g_nodes[0])));
         assert_eq!(g_nodes[0].kind(), SyntaxKind::Identifier);
         drop((e, f, g));
+    }
+
+    // watchfree1: a node shell shares the kind column of any earlier shell
+    // with equal kinds, not only of the last few (`shell_kinds`): a
+    // `tsc --watch` build after a config change parses every file again.
+    // It publishes, so no other test may build or publish stores while it
+    // runs (the runner uses one thread).
+    #[test]
+    fn node_shells_share_any_equal_kind_column() {
+        use super::super::file_version::FileVersion;
+        // Publishes a freeable version of `count` identifiers, and gives
+        // the address of its kind column.
+        let column = |count: usize| {
+            let names: Vec<String> = (0..count).map(|i| format!("n{i}")).collect();
+            let text: &'static str = Box::leak(names.join(";").into_boxed_str());
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let name: &'static str = Box::leak(format!("/kinds/{id}.ts").into_boxed_str());
+            let file = new_file_store(name, text);
+            let factory = NodeFactory::for_file(file);
+            let node = names
+                .iter()
+                .map(|n| factory.new_identifier(n.as_str()))
+                .last()
+                .expect("one name");
+            freeze_file_store(file);
+            let version = FileVersion::new(file);
+            crate::program::publish_parsed_files("/");
+            let kinds = registry_block(node.file_index())
+                .expect("a published store node")
+                .kinds
+                .as_ptr();
+            (version, kinds)
+        };
+        let (_first, first) = column(1);
+        let others: Vec<_> = (2..9).map(column).collect();
+        assert!(
+            others.iter().all(|(_, kinds)| *kinds != first),
+            "other kinds, other columns"
+        );
+        let (_again, again) = column(1);
+        assert_eq!(again, first, "equal kinds share the first column");
     }
 }
