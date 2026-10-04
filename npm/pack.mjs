@@ -191,8 +191,10 @@ for (const { nodeOs, nodeArch, exe, packageName } of platforms) {
         exports: { "./package.json": "./package.json" },
     };
     fs.cpSync(libs, path.join(platformDir, "lib"), { recursive: true });
-    fs.copyFileSync(exe, path.join(platformDir, "lib", "tsc"));
-    fs.chmodSync(path.join(platformDir, "lib", "tsc"), 0o755);
+    // getExePath.js looks for lib/tsc.exe on Windows.
+    const exeName = nodeOs === "win32" ? "tsc.exe" : "tsc";
+    fs.copyFileSync(exe, path.join(platformDir, "lib", exeName));
+    fs.chmodSync(path.join(platformDir, "lib", exeName), 0o755);
     writeJson(path.join(platformDir, "package.json"), platformPackage);
     fs.copyFileSync(licenseFile, path.join(platformDir, "LICENSE"));
     fs.copyFileSync(noticeFile, path.join(platformDir, "NOTICE.txt"));
