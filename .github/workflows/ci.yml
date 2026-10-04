@@ -86,6 +86,14 @@ jobs:
           echo "COMPILER_RUNNER_TMP=$RUNNER_TEMP/compiler-runner" >> "$GITHUB_ENV"
         env:
           SUBDIR: ${{ steps.pin.outputs.subdir }}
+      # The astnav tests run the JS TypeScript of the Go repo's lockfile under Node (Go
+      # testutil/jstest: <repo>/node_modules/typescript). Only that package, not the repo's npm ci.
+      - name: Install the Go repo's typescript package
+        run: |
+          url=$(jq -r '.packages["node_modules/typescript"].resolved' go-pin/package-lock.json)
+          mkdir -p go-pin/node_modules/typescript
+          curl -sSfL "$url" | tar xz -C go-pin/node_modules/typescript --strip-components=1
+          jq -r .version go-pin/node_modules/typescript/package.json
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
