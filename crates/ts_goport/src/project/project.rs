@@ -891,6 +891,7 @@ impl Project {
                     skip_module_resolution: false,
                 },
                 Some(create_checker_pool),
+                self.program.as_deref(),
             );
         }
 

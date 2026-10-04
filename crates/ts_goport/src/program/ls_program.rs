@@ -252,6 +252,16 @@ pub fn version_tables_reused(version: &'static GoProgram) -> bool {
         .is_some_and(|go| go.from_old_tables)
 }
 
+/// Not in Go: true when `version` is a new load with the file names of the
+/// version before it, so its tables started from that one's (progtables1).
+/// Tests pin the path with it.
+pub fn version_tables_kept_file_names(version: &'static GoProgram) -> bool {
+    held_tables(version)
+        .go
+        .as_ref()
+        .is_some_and(|go| go.kept_file_names)
+}
+
 /// The parsed file whose root is `file`, from any program made here that
 /// is not released, or None. Go `*ast.SourceFile` is one object in every
 /// program that has it; here the programs hold the `ParsedSourceFile`.
@@ -389,15 +399,27 @@ impl Drop for ProgramGuard {
 // pool is set up after the program is built. Neither step reads the other.
 // #4712: Go `collectContentMapperOptionDiagnostics` runs when the program
 // version is built (`go_frontend::content_mapper_option_diagnostics_of`).
+// Not in Go: `previous` is the program that this one replaces, if any. The
+// new version's tables start from that version's when the file names are
+// the same (progtables1); Go builds new maps either way.
 pub fn new_program(
     opts: ProgramOptions,
     create_checker_pool: Option<CreateCheckerPool>,
+    previous: Option<&NewProgram>,
 ) -> Rc<NewProgram> {
     let p = {
         let _scope = crate::core::enter_program(None);
         Rc::new(crate::frontend::compiler::new_program(opts))
     };
-    let version = new_program_version(&p, None);
+    let previous = previous.and_then(|old| {
+        PROGRAM_CHECKERS.with(|programs| {
+            programs
+                .borrow()
+                .get(&program_key(old))
+                .map(|checkers| checkers.version)
+        })
+    });
+    let version = new_program_version(&p, previous);
     init_checker_pool(&p, version, create_checker_pool, p.host().clone());
     p
 }
