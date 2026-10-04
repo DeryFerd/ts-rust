@@ -12,6 +12,9 @@ on:
       - "scripts/goport/npm-pack.sh"
       - ".github/workflows/tsc-rs-darwin.yml"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -24,6 +27,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       # The shipped profile (fat LTO) with Go's noembed mode, as build-release.sh builds Linux. No
       # GOPORT_BUILD_VERSION: the tsc reports the TypeScript version, which typesVersions matching
