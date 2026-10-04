@@ -46,20 +46,43 @@ impl Checker {
     // Go: checker/checker.go:19888 hasBaseType
     pub fn has_base_type(&mut self, t: TypeId, check_base: TypeId) -> bool {
         // PORT: the Go recursive closure `check` is a nested fn.
+        // PERF: Go has no memo here, so a chain of classes that each list
+        // all the classes before it makes an exponential walk (corpus case
+        // intersectionConstructorReductionCrash.ts). Each step reads the
+        // arena once for `t` (once more for a reference to another type),
+        // inlines `getTargetType`, and reads resolved base types in place
+        // with no list copy.
         fn check(c: &mut Checker, t: TypeId, check_base: TypeId) -> bool {
-            if c.ty(t)
-                .object_flags
-                .intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE)
-            {
-                let target = c.get_target_type(t);
+            let ty = c.ty(t);
+            let object_flags = ty.object_flags;
+            if object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE) {
+                // Go: checker/checker.go:19903 getTargetType
+                let (target, target_ty) = if object_flags.intersects(ObjectFlags::REFERENCE) {
+                    // A generic class or interface is its own target.
+                    // PERF: its target without the `Type::target` dispatch.
+                    let target = match &ty.data {
+                        TypeData::Interface(data) => data.reference.object.target,
+                        _ => ty.target(),
+                    };
+                    (target, if target == t { ty } else { c.ty(target) })
+                } else {
+                    (t, ty)
+                };
                 if target == check_base {
                     return true;
+                }
+                let mut buf: SharedListBuf<TypeId> = Default::default();
+                if let Some(base_types) = target_ty
+                    .resolved_base_types()
+                    .and_then(|base_types| base_types.detach(&mut buf))
+                {
+                    return base_types.iter().any(|&b| check(c, b, check_base));
                 }
                 let base_types = c.get_base_types_shared(target);
                 return base_types.iter().any(|&b| check(c, b, check_base));
             }
-            if c.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
-                let types = c.ty(t).types_list();
+            if ty.flags.intersects(TypeFlags::INTERSECTION) {
+                let types = ty.types_list();
                 return types.iter().any(|&t| check(c, t, check_base));
             }
             false
