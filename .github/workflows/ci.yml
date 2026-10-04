@@ -78,7 +78,12 @@ jobs:
           path: go-pin
           sparse-checkout: ${{ steps.pin.outputs.subdir }}
           persist-credentials: false
-      - run: echo "TS_GO_REPO=$GITHUB_WORKSPACE/go-pin${SUBDIR:+/$SUBDIR}" >> "$GITHUB_ENV"
+      # The go_baselines temp roots default to zbook paths on Linux (/tmp on macOS).
+      - name: Set the test paths
+        run: |
+          echo "TS_GO_REPO=$GITHUB_WORKSPACE/go-pin${SUBDIR:+/$SUBDIR}" >> "$GITHUB_ENV"
+          echo "TSCTEST_TMP=$RUNNER_TEMP/tsctest" >> "$GITHUB_ENV"
+          echo "COMPILER_RUNNER_TMP=$RUNNER_TEMP/compiler-runner" >> "$GITHUB_ENV"
         env:
           SUBDIR: ${{ steps.pin.outputs.subdir }}
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
