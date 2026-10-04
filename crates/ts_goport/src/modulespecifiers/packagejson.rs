@@ -13,6 +13,7 @@
 use crate::prelude::*;
 
 use super::semver;
+use std::sync::Arc;
 
 // Go: packagejson/jsonvalue.go:10 JSONValueType
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -385,11 +386,13 @@ impl VersionPaths {
 }
 
 // Go: packagejson/cache.go:123 InfoCacheEntry
+// PORT: Go `Contents *PackageJson` is an `Arc`, so the copy that
+// `with_package_directory` makes shares it, as Go's shallow copy does.
 #[derive(Debug, Default)]
 pub struct InfoCacheEntry {
     pub package_directory: String,
     pub directory_exists: bool,
-    pub contents: Option<PackageJson>,
+    pub contents: Option<Arc<PackageJson>>,
 }
 
 impl InfoCacheEntry {
@@ -400,12 +403,30 @@ impl InfoCacheEntry {
 
     // Go: packagejson/cache.go:133 GetContents
     pub fn get_contents(&self) -> Option<&PackageJson> {
-        self.contents.as_ref()
+        self.contents.as_deref()
     }
 
     // Go: packagejson/cache.go:140 GetDirectory
     pub fn get_directory(&self) -> &str {
         &self.package_directory
+    }
+
+    // Go: packagejson/cache.go:158 WithPackageDirectory
+    // WithPackageDirectory returns an entry whose PackageDirectory matches the
+    // caller's value. The package.json info cache is keyed by the canonical
+    // path of the package.json file, so a lookup with another spelling of
+    // the directory (another case on a case-insensitive file system, or a
+    // trailing separator) gets the entry of the first spelling.
+    #[must_use]
+    pub fn with_package_directory(self: &Arc<Self>, package_directory: &str) -> Arc<Self> {
+        if self.package_directory == package_directory {
+            return self.clone();
+        }
+        Arc::new(InfoCacheEntry {
+            package_directory: package_directory.to_string(),
+            directory_exists: self.directory_exists,
+            contents: self.contents.clone(),
+        })
     }
 }
 
