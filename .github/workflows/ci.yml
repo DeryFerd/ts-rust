@@ -30,7 +30,7 @@ env:
 jobs:
   lint:
     name: fmt, codegen, clippy
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
@@ -47,19 +47,17 @@ jobs:
       - run: cargo clippy --locked -p ts_goport -p goport_util -p goport_lsproto --all-targets -- -D warnings
 
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.runner }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
-    runs-on: ${{ matrix.os }}
+        # Blacksmith runners (the pingdotgg org has the app), as T3 Code uses.
+        runner: [blacksmith-16vcpu-ubuntu-2404, blacksmith-12vcpu-macos-26]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     env:
       # One test thread, as goport-tests.sh runs them.
       RUST_TEST_THREADS: 1
-      # The emit pool is off when the cores are not more than the checkers (program.rs
-      # emit_thread_count), and these runners have 2 or 3 cores. tests/emit_pool.rs needs it on.
-      GOPORT_EMIT_THREADS: 2
     steps:
       - uses: actions/checkout@v5
       # main's Go pin is the saved state's batch.upstreamPin.to. UPSTREAM.json "current" can be an older
@@ -105,8 +103,8 @@ jobs:
       - name: Unit and integration tests
         run: cargo test --release --locked --workspace --no-fail-fast
       # go_baselines has `test = false`, so --workspace skips it. TestLocal (about 12,700 compiler
-      # cases) runs in 4 shards in goport-tests.sh and is too slow for these runners; the rest of the
-      # default go_baselines set runs here.
+      # cases) runs in 4 shards in goport-tests.sh, in the revision pipeline; the rest of the default
+      # go_baselines set runs here.
       - name: Go baselines
         run: |
           skip=(--skip compiler_runner::test_local)
