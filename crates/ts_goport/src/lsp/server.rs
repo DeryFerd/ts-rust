@@ -62,9 +62,9 @@
 //! request's checker builds, in the workspace/symbol loop and just before
 //! the answer, and its wait for the client's watch reply does not block
 //! the request. A task that the sync part of a request with an async part
-//! queues runs before the async part, up to its first client call (to its
-//! end when it does not call the client: the publishDiagnostics of a
-//! changed tsconfig.json comes before the textDocument/diagnostic answer
+//! queues runs before the async part, up to its first wait for the client
+//! (to its end when it does not call the client: the publishDiagnostics of
+//! a changed tsconfig.json comes before the textDocument/diagnostic answer
 //! that picks up the change). Tasks queued later, and the rest of a task
 //! after the answer, run at the message boundary. Do not move them to
 //! another thread: the oracle compares where background publishDiagnostics
@@ -2262,8 +2262,9 @@ impl Server {
                 // part queued (a snapshot update's logging, watch
                 // updates and publishDiagnostics) before this goroutine,
                 // and they usually end before its answer. Run them
-                // first, up to their first client call: the rest runs
-                // at the points of the async part (`background::race`).
+                // first, up to their first wait for the client: the
+                // rest runs at the points of the async part
+                // (`background::race`).
                 project::background::race::open_gates(gostd::local::run_pending);
                 // PORT: Go runs the async work on a goroutine
                 // (`go func() {...}()`); it runs here, on the dispatch
@@ -2371,10 +2372,9 @@ pub fn send_client_request<
 pub type Reply = (lsproto::ResponseMessage, Instant);
 
 /// PORT: Go `sendClientRequest` from a snapshot task (`background::race`).
-/// While a request is in flight on the dispatch thread, the send waits for
-/// the task's start (`race::may_send`), and the wait for the response
-/// returns `Pending`, so the request goes on, as Go's handler does while
-/// the task's goroutine works. Elsewhere it blocks as
+/// While a request is in flight on the dispatch thread, the wait for the
+/// response returns `Pending`, so the request goes on, as Go's handler does
+/// while the task's goroutine waits. Elsewhere it blocks as
 /// `send_client_request`.
 pub async fn send_client_request_async<
     Req: AnyValue,
@@ -2385,15 +2385,6 @@ pub async fn send_client_request_async<
     info: lsproto::RequestInfo<Req, Resp>,
     params: Req,
 ) -> Result<Resp, GoError> {
-    // The task may not send yet while a request is in flight.
-    std::future::poll_fn(|_| {
-        if crate::project::background::race::may_send() {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await;
     let id = crate::jsonrpc::new_id_string(&format!(
         "ts{}",
         s.client_seq.fetch_add(1, Ordering::SeqCst) + 1
