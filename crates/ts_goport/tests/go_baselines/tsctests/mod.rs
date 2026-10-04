@@ -7,6 +7,7 @@ mod jsdoc_cut;
 mod never_intersection_order;
 mod removed_reference_config;
 mod showconfig;
+mod spelling_memo;
 mod tsbuild_a;
 mod tsbuild_b;
 mod tsbuild_contentmapper;

@@ -876,6 +876,9 @@ pub struct Checker {
     pub class_expression_name_tables: FxHashMap<Node, SymbolTable>,
     pub resolve_name: ResolveNameFn,
     pub resolve_name_for_symbol_suggestion: ResolveNameFn,
+    /// PORT: port-only memo of the spelling suggestion from the globals
+    /// table, by name id and meaning (`get_suggestion_for_symbol_name_lookup`).
+    pub global_spelling_suggestions: FxHashMap<(u32, SymbolFlags), GlobalSpellingSuggestion>,
     pub tuple_types: CacheKeyMap<TypeId>,
     pub union_types: FxHashMap<CacheHashKey, TypeId>,
     pub union_of_union_types: FxHashMap<UnionOfUnionKey, TypeId>,
@@ -1362,6 +1365,7 @@ impl Checker {
             class_expression_name_tables: FxHashMap::default(),
             resolve_name: nil_resolve_name_fn(),
             resolve_name_for_symbol_suggestion: nil_resolve_name_fn(),
+            global_spelling_suggestions: FxHashMap::default(),
             tuple_types: CacheKeyMap::default(),
             union_types: FxHashMap::default(),
             union_of_union_types: FxHashMap::default(),
