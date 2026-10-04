@@ -2362,11 +2362,12 @@ pub fn get_resolved_project_references() -> Vec<Option<Arc<ResolvedProjectRefere
 }
 
 // Go: compiler/program.go:2300 GetSymlinkCache
-// PORT: the Go frontend program has the port, and this is its value.
+// PORT: the Go frontend program has the port, and this is a copy of its
+// value, built on first use (`go_frontend::known_symlinks`).
 pub fn get_go_symlink_cache() -> Option<Arc<crate::modulespecifiers::symlinks::KnownSymlinks>> {
     // Go: ls/autoimport/aliasresolver.go:143 (unimplemented)
     alias_resolver_unimplemented();
-    Some(with_go(go_frontend::GoSharedState::known_symlinks))
+    Some(go_frontend::known_symlinks())
 }
 
 // Go: compiler/program.go:181 GetSourceOfProjectReferenceIfOutputIncluded
@@ -3110,6 +3111,8 @@ pub(crate) struct WorkerSeed {
 
 impl WorkerSeed {
     pub(crate) fn take() -> Self {
+        // The new thread cannot build them: it has no frontend program.
+        go_frontend::build_lazy_shared_state();
         Self {
             program: prog(),
             tables: current_tables(),

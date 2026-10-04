@@ -58,6 +58,12 @@ impl<T: Clone> LazyValue<T> {
         self.value.get_or_init(compute)
     }
 
+    /// The value when it is computed, else None (Go `initialized.Load()`,
+    /// as `tryReuse` reads it).
+    pub fn get(&self) -> Option<&T> {
+        self.value.get()
+    }
+
     // Go: program.go:66 (*lazyValue[T]).tryReuse
     pub fn try_reuse(&mut self, from: &LazyValue<T>) {
         if let Some(value) = from.value.get() {
