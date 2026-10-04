@@ -43,8 +43,9 @@
 //!   clean) fire at the next `run_pending`: before the async part of the
 //!   running request or after its answer. Go fires them on time.
 //! - A background client request (`update_watches` registerCapability, 1 s
-//!   timeout) blocks the dispatch thread until the client answers. Go waits
-//!   on a goroutine.
+//!   timeout) blocks the dispatch thread until the client answers, except
+//!   while a request is in flight (below). Go waits on a goroutine. So the
+//!   next message waits for the reply.
 //! - A request that arrives while the auto-import warm runs waits for it,
 //!   unless it is a file event, which cancels the warm (below). Go runs
 //!   the request at the same time.
@@ -53,20 +54,23 @@
 //!   connection that opens while another is connected holds the other's
 //!   requests until it closes (`ApiConnProtocol`).
 //!
-//! Background tasks and timers stay on the dispatch thread. A task that the
-//! sync part of a request queues (the snapshot update's logging, watch
-//! updates and publishDiagnostics) runs before the async part: Go starts it
-//! on a goroutine before the async part, and it usually ends before the
-//! answer (the publishDiagnostics of a changed tsconfig.json comes before
-//! the textDocument/diagnostic answer that picks up the change). A request
-//! with no async part (`register_request_handler`: willRenameFiles, rename,
-//! workspace/symbol) runs the tasks it queued after its work and before its
-//! answer, for the same reason. Tasks queued later run at the message
-//! boundary, after the answer. Do not move them to another thread: the
-//! oracle compares where background publishDiagnostics land. Do not hold
-//! them back while messages wait either: a task queued by didOpen (the
-//! `update_watches` registerCapability) must go out before the answer of
-//! the next request, as Go's does.
+//! Background tasks and timers stay on the dispatch thread. The snapshot
+//! task that a request queues (the snapshot update's logging, watch updates
+//! and publishDiagnostics) races the request's answer in Go: it runs on a
+//! goroutine while the handler works. `project::background::race` gives
+//! Go's orders: while the request is in flight, the task runs at the
+//! request's checker builds, in the workspace/symbol loop and just before
+//! the answer, and its wait for the client's watch reply does not block
+//! the request. A task that the sync part of a request with an async part
+//! queues runs before the async part, up to its first wait for the client
+//! (to its end when it does not call the client: the publishDiagnostics of
+//! a changed tsconfig.json comes before the textDocument/diagnostic answer
+//! that picks up the change). Tasks queued later, and the rest of a task
+//! after the answer, run at the message boundary. Do not move them to
+//! another thread: the oracle compares where background publishDiagnostics
+//! land. Do not hold them back while messages wait either: a task queued by
+//! didOpen (the `update_watches` registerCapability) must go out before the
+//! answer of the next request, as Go's does.
 //!
 //! The one exception is idle work (`gostd::local::go_idle`): the clone of
 //! the auto-import warm, which sends nothing to the client. It starts only
@@ -432,8 +436,9 @@ pub struct ServerShared {
     // response channel; `None` on that channel is the context wake-up of
     // `send_client_request`.
     pub pending_client_requests: Mutex<FxHashMap<crate::jsonrpc::ID, PendingClientRequest>>,
-    pub pending_server_requests:
-        Mutex<FxHashMap<crate::jsonrpc::ID, SyncSender<Option<lsproto::ResponseMessage>>>>,
+    // The response channel also carries the arrival time of the response
+    // (`background::race`).
+    pub pending_server_requests: Mutex<FxHashMap<crate::jsonrpc::ID, SyncSender<Option<Reply>>>>,
 
     pub cwd: String,
 
@@ -730,6 +735,38 @@ impl Server {
     }
 }
 
+/// Go `lsproto.RegistrationParams` of `WatchFiles` (server.go:263).
+fn watch_registration(
+    id: &project::WatcherID,
+    watchers: &[lsproto::FileSystemWatcher],
+) -> lsproto::RegistrationParams {
+    lsproto::RegistrationParams {
+        registrations: vec![lsproto::Registration {
+            id: id.0.clone(),
+            register_options: Some(lsproto::RegisterOptions {
+                workspace_did_change_watched_files: Some(
+                    lsproto::DidChangeWatchedFilesRegistrationOptions {
+                        watchers: watchers.to_vec(),
+                    },
+                ),
+                ..Default::default()
+            }),
+        }],
+    }
+}
+
+/// Go `lsproto.UnregistrationParams` of `UnwatchFiles` (server.go:292).
+fn watch_unregistration(id: &project::WatcherID) -> lsproto::UnregistrationParams {
+    lsproto::UnregistrationParams {
+        unregisterations: vec![lsproto::Unregistration {
+            id: id.0.clone(),
+            method: lsproto::Method::WORKSPACE_DID_CHANGE_WATCHED_FILES
+                .0
+                .to_string(),
+        }],
+    }
+}
+
 impl project::Client for Server {
     // Go: server.go:263 WatchFiles
     // WatchFiles implements project.Client.
@@ -754,19 +791,7 @@ impl project::Client for Server {
             ctx,
             &self.shared,
             &lsproto::CLIENT_REGISTER_CAPABILITY_INFO,
-            lsproto::RegistrationParams {
-                registrations: vec![lsproto::Registration {
-                    id: id.0.clone(),
-                    register_options: Some(lsproto::RegisterOptions {
-                        workspace_did_change_watched_files: Some(
-                            lsproto::DidChangeWatchedFilesRegistrationOptions {
-                                watchers: watchers.to_vec(),
-                            },
-                        ),
-                        ..Default::default()
-                    }),
-                }],
-            },
+            watch_registration(&id, watchers),
         );
         if let Err(err) = result {
             return Err(errors::errorf(
@@ -777,6 +802,66 @@ impl project::Client for Server {
 
         self.watchers.borrow_mut().insert(id);
         Ok(())
+    }
+
+    // Go: server.go:263 WatchFiles, from a snapshot task
+    // PORT: as `watch_files`; the wait for the client's reply does not block
+    // a request in flight (`send_client_request_async`).
+    fn watch_files_async<'a>(
+        &'a self,
+        ctx: &Context,
+        id: project::WatcherID,
+        watchers: &[lsproto::FileSystemWatcher],
+    ) -> project::ClientCall<'a> {
+        if self.builtin_watcher.borrow().is_some() {
+            return Box::pin(std::future::ready(self.watch_files(ctx, id, watchers)));
+        }
+        let call = send_client_request_async(
+            ctx.clone(),
+            &self.shared,
+            lsproto::CLIENT_REGISTER_CAPABILITY_INFO,
+            watch_registration(&id, watchers),
+        );
+        Box::pin(async move {
+            if let Err(err) = call.await {
+                return Err(errors::errorf(
+                    format!("failed to register file watcher: {}", err.error()),
+                    vec![err],
+                ));
+            }
+
+            self.watchers.borrow_mut().insert(id);
+            Ok(())
+        })
+    }
+
+    // Go: server.go:292 UnwatchFiles, from a snapshot task
+    // PORT: as `watch_files_async`.
+    fn unwatch_files_async<'a>(
+        &'a self,
+        ctx: &Context,
+        id: project::WatcherID,
+    ) -> project::ClientCall<'a> {
+        if self.builtin_watcher.borrow().is_some() || !self.watchers.borrow().contains(&id) {
+            return Box::pin(std::future::ready(self.unwatch_files(ctx, id)));
+        }
+        let call = send_client_request_async(
+            ctx.clone(),
+            &self.shared,
+            lsproto::CLIENT_UNREGISTER_CAPABILITY_INFO,
+            watch_unregistration(&id),
+        );
+        Box::pin(async move {
+            if let Err(err) = call.await {
+                return Err(errors::errorf(
+                    format!("failed to unregister file watcher: {}", err.error()),
+                    vec![err],
+                ));
+            }
+
+            self.watchers.borrow_mut().remove(&id);
+            Ok(())
+        })
     }
 
     // Go: server.go:292 UnwatchFiles
@@ -804,14 +889,7 @@ impl project::Client for Server {
                 ctx,
                 &self.shared,
                 &lsproto::CLIENT_UNREGISTER_CAPABILITY_INFO,
-                lsproto::UnregistrationParams {
-                    unregisterations: vec![lsproto::Unregistration {
-                        id: id.0.clone(),
-                        method: lsproto::Method::WORKSPACE_DID_CHANGE_WATCHED_FILES
-                            .0
-                            .to_string(),
-                    }],
-                },
+                watch_unregistration(&id),
             );
             if let Err(err) = result {
                 return Err(errors::errorf(
@@ -1869,7 +1947,7 @@ impl ServerShared {
                     .unwrap_or_else(|| crate::core::go_nil_dereference());
                 // Go: respChan <- resp; close(respChan); delete(...)
                 if let Some(resp_chan) = pending_server_requests.remove(&id) {
-                    let _ = resp_chan.try_send(Some(resp));
+                    let _ = resp_chan.try_send(Some((resp, Instant::now())));
                 }
             } else {
                 let req = msg.into_request();
@@ -2168,6 +2246,12 @@ impl Server {
             }
         };
 
+        // PORT: the snapshot tasks that the request starts run at its
+        // checker builds and at its answer (`background::race`).
+        let _request = req
+            .id
+            .is_some()
+            .then(project::background::race::begin_request);
         match self.handle_request_or_notification(&request_ctx, req) {
             Err(err) => {
                 handle_error(err);
@@ -2178,8 +2262,10 @@ impl Server {
                 // part queued (a snapshot update's logging, watch
                 // updates and publishDiagnostics) before this goroutine,
                 // and they usually end before its answer. Run them
-                // first.
-                gostd::local::run_pending();
+                // first, up to their first wait for the client: the
+                // rest runs at the points of the async part
+                // (`background::race`).
+                project::background::race::open_gates(gostd::local::run_pending);
                 // PORT: Go runs the async work on a goroutine
                 // (`go func() {...}()`); it runs here, on the dispatch
                 // thread, before the next message.
@@ -2255,7 +2341,7 @@ pub fn send_client_request<
     ));
     let req = info.new_request_message(Some(id.clone()), params);
 
-    let (response_tx, response_chan) = sync_channel::<Option<lsproto::ResponseMessage>>(2);
+    let (response_tx, response_chan) = sync_channel::<Option<Reply>>(2);
     lock(&s.pending_server_requests).insert(id.clone(), response_tx.clone());
 
     let result = (|| {
@@ -2266,7 +2352,7 @@ pub fn send_client_request<
         //	case <-ctx.Done():
         //		return *new(Resp), ctx.Err()
         //	case resp := <-responseChan:
-        let resp = recv_or_done(ctx, &response_tx, &response_chan)?;
+        let (resp, _) = recv_or_done(ctx, &response_tx, &response_chan)?;
         if resp.error.is_some() {
             return Err(errors::new(format!(
                 "request failed: {}",
@@ -2280,6 +2366,64 @@ pub fn send_client_request<
     lock(&s.pending_server_requests).remove(&id);
 
     result
+}
+
+/// PORT: a response of the client and the time the read loop got it.
+pub type Reply = (lsproto::ResponseMessage, Instant);
+
+/// PORT: Go `sendClientRequest` from a snapshot task (`background::race`).
+/// While a request is in flight on the dispatch thread, the wait for the
+/// response returns `Pending`, so the request goes on, as Go's handler does
+/// while the task's goroutine waits. Elsewhere it blocks as
+/// `send_client_request`.
+pub async fn send_client_request_async<
+    Req: AnyValue,
+    Resp: crate::frontend::json::UnmarshalerFrom + Default + 'static,
+>(
+    ctx: Context,
+    s: &ServerShared,
+    info: lsproto::RequestInfo<Req, Resp>,
+    params: Req,
+) -> Result<Resp, GoError> {
+    let id = crate::jsonrpc::new_id_string(&format!(
+        "ts{}",
+        s.client_seq.fetch_add(1, Ordering::SeqCst) + 1
+    ));
+    let req = info.new_request_message(Some(id.clone()), params);
+
+    let (response_tx, response_chan) = sync_channel::<Option<Reply>>(2);
+    lock(&s.pending_server_requests).insert(id.clone(), response_tx.clone());
+    // Go: defer: close(respChan); delete(s.pendingServerRequests, *id)
+    struct Pending<'a>(&'a ServerShared, crate::jsonrpc::ID);
+    impl Drop for Pending<'_> {
+        fn drop(&mut self) {
+            lock(&self.0.pending_server_requests).remove(&self.1);
+        }
+    }
+    let _pending = Pending(s, id);
+
+    s.send(req.message())?;
+    let (resp, at) = std::future::poll_fn(|_| {
+        if let Some(err) = ctx.err() {
+            return std::task::Poll::Ready(Err(err));
+        }
+        if let Ok(Some(reply)) = response_chan.try_recv() {
+            return std::task::Poll::Ready(Ok(reply));
+        }
+        if crate::project::background::race::may_block() {
+            return std::task::Poll::Ready(recv_or_done(&ctx, &response_tx, &response_chan));
+        }
+        std::task::Poll::Pending
+    })
+    .await?;
+    crate::project::background::race::note_reply(at);
+    if resp.error.is_some() {
+        return Err(errors::new(format!(
+            "request failed: {}",
+            crate::jsonrpc::ResponseError::string(resp.error.as_ref())
+        )));
+    }
+    info.unmarshal_result(resp.result)
 }
 
 // Go: server.go:1090 sendClientRequestFireAndForget
@@ -2373,7 +2517,11 @@ pub fn send_notification<Params: AnyValue>(
 
 impl ServerShared {
     // Go: server.go:1133 sendResponse
+    // PORT: on the dispatch thread this is the answer of the request in
+    // flight; its snapshot tasks first run as far as Go's would have
+    // (`background::race::answer_point`).
     pub fn send_response(&self, resp: lsproto::ResponseMessage) -> Result<(), GoError> {
+        project::background::race::answer_point();
         self.send(resp.message())
     }
 
@@ -2882,15 +3030,13 @@ pub fn register_notification_handler<
 }
 
 // Go: server.go:1317 registerRequestHandler
-// PORT: `params` as in `register_notification_handler`. The background
-// tasks that `fn` queues (a snapshot update's logging, watch updates and
-// publishDiagnostics, session.go:1396) run after `fn` and before the answer.
-// Go starts them on goroutines at once, and they usually end while `fn`
-// goes on with its work, as for the async part of the other handler kinds
-// (`dispatch_request`). So after willRenameFiles or rename the
-// registerCapability of a new watch comes before the answer, as in Go. In Go
-// it is a race: a handler that ends in about a millisecond (workspace/symbol
-// on a project of a few files) can answer first.
+// PORT: `params` as in `register_notification_handler`. The snapshot tasks
+// that `fn` queues (a snapshot update's logging, watch updates and
+// publishDiagnostics, session.go:1396) run during `fn` and at the answer as
+// far as Go's goroutines would (`project::background::race`): after
+// willRenameFiles or rename the registerCapability of a new watch comes
+// before the answer, and a handler that builds no checker (rename at a
+// keyword, workspace/symbol on a few files) answers first.
 pub fn register_request_handler<
     Req: crate::frontend::json::UnmarshalerFrom + Default + 'static,
     Resp: AnyValue,
@@ -2916,9 +3062,7 @@ pub fn register_request_handler<
                 }
 
                 let params = lsproto::unmarshal_params::<Req>(req)?;
-                let result = fn_(s, ctx, Some(&params), req);
-                gostd::local::run_pending();
-                let resp = result?;
+                let resp = fn_(s, ctx, Some(&params), req)?;
                 if let Some(err) = ctx.err() {
                     return Err(err);
                 }

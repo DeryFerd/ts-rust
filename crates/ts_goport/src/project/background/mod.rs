@@ -1,6 +1,7 @@
 //! Go package `internal/project/background`.
 
 pub mod queue;
+pub mod race;
 
 pub use queue::*;
 

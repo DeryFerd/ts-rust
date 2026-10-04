@@ -854,6 +854,8 @@ pub fn provide_workspace_symbols(
         if ctx.err().is_some() {
             return Ok(lsproto::SymbolInformationsOrWorkspaceSymbolsOrNull::default());
         }
+        // PORT: Go's snapshot tasks run while this loop works.
+        crate::project::background::race::loop_point();
         // PORT: Go iterates the declaration map in random order; the infos
         // are sorted below.
         let declaration_map = &*source_file_get_declaration_map(source_file);

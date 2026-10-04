@@ -6,7 +6,8 @@
 //! in a `gostd::local::after_func` timer; it takes a `TaskHold` so that it
 //! still counts as running until then. `Wait` runs
 //! `gostd::local::run_pending`, and waits for due timers, until this queue's
-//! tasks have finished. `mu` is dropped (one thread).
+//! tasks have finished. `mu` is dropped (one thread). A snapshot task
+//! (`enqueue_task`) is a future that `race` runs.
 
 use crate::project::background::prelude::*;
 use std::cell::Cell;
@@ -74,6 +75,40 @@ impl Queue {
         }));
     }
 
+    /// PORT: `Enqueue` of a snapshot task, whose goroutine waits for the
+    /// client. The task is a future that `race` runs: it does not wait for
+    /// the client while a request is in flight (see `race`). `make` gets
+    /// the context and the task's gates.
+    pub fn enqueue_task(
+        &self,
+        ctx: &Context,
+        make: impl FnOnce(Context, super::race::Gates) -> super::race::TaskFuture + 'static,
+    ) {
+        if self.closed.get() {
+            return;
+        }
+
+        // Don't start new tasks if context is already cancelled
+        if ctx.err().is_some() {
+            return;
+        }
+
+        // Go: q.wg.Go(func() { ... })
+        self.wg.set(self.wg.get() + 1);
+        let done = WaitGroupDone(self.wg.clone());
+        let ctx = ctx.clone();
+        super::race::spawn(move |gates| {
+            Box::pin(async move {
+                let _done = done;
+                // Check context again before executing
+                if ctx.err().is_some() {
+                    return;
+                }
+                make(ctx, gates).await;
+            })
+        });
+    }
+
     /// PORT: called by a running task whose rest runs later (see
     /// `TaskHold`). No Go counterpart: the Go task is one goroutine.
     pub fn hold(&self) -> TaskHold {
@@ -87,6 +122,12 @@ impl Queue {
     // Wait waits for all active tasks to complete.
     // It does not prevent new tasks from being enqueued while waiting.
     pub fn wait(&self) {
+        // PORT: a snapshot task that waits at a gate of the request in
+        // flight goes on, and its client calls block (`race::waiting`).
+        super::race::waiting(|| self.wait_tasks());
+    }
+
+    fn wait_tasks(&self) {
         while self.wg.get() > 0 {
             // PORT: a task that sleeps waits for its timer. Go blocks forever
             // when the tasks can never finish (for example, Wait called from
