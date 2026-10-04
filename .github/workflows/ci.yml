@@ -16,6 +16,9 @@ on:
       - "UPSTREAM.json"
       - ".github/workflows/ci.yml"
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -34,6 +37,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal -c rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -60,6 +65,8 @@ jobs:
       RUST_TEST_THREADS: 1
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       # main's Go pin is the saved state's batch.upstreamPin.to. UPSTREAM.json "current" can be an older
       # pin until the default pin switch (AGENTS.md, "Pin").
       - name: Resolve the Go pin
