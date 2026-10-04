@@ -943,4 +943,18 @@ mod tests {
             );
         }
     }
+
+    // Go `naturalCollationKey` (ls/lsutil/organizeimports.go:133) at pin N
+    // runs on go1.27.1 and x/text v0.42.0 (Unicode 17.0.0): U+A7CB lowers to
+    // U+0264, U+105C9 decomposes to U+105D2 U+0307 (Mn) and U+0897 is Mn.
+    // The values are Go's; Unicode 15.0.0 kept all three.
+    #[test]
+    fn natural_collation_key_uses_unicode_17() {
+        assert_eq!(natural_collation_key("\u{A7CB}a"), "\u{264}a");
+        assert_eq!(natural_collation_key("\u{105C9}"), "\u{105D2}");
+        assert_eq!(natural_collation_key("a\u{897}b"), "ab");
+        let comparer =
+            get_organize_imports_unicode_string_comparer(true, &UserPreferences::default());
+        assert_eq!(comparer("./\u{A7CB}a", "./\u{264}b").signum(), -1);
+    }
 }

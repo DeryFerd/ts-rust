@@ -1,12 +1,15 @@
-//! Go `golang.org/x/text/collate` v0.38.0 and the parts of
+//! Go `golang.org/x/text/collate` v0.42.0 and the parts of
 //! `golang.org/x/text/internal/colltab` that `Collator.CompareString` uses.
+//! Its `tables.go` and `internal/colltab` are the same as in v0.38.0, and
+//! `collate.go` differs only in a comment.
 //! The only caller is `ls/lsutil/organizeimports.rs`
 //! (`getOrganizeImportsUnicodeStringComparer`).
 //!
 //! PORT: Go's `tables.go` (CLDR 23, 95 locales) is dumped as little-endian
 //! binary files in `data/` (`collate_main_*.bin`, 1.25 MB) by
 //! `target/continuation-r97-goport/complete/gen/collate/gen.sh`
-//! (zz_dump_test.go in a copy of x/text v0.38.0). The small tables
+//! (zz_dump_test.go in a copy of x/text v0.38.0; the data is the same in
+//! v0.42.0). The small tables
 //! (`availableLocales`, `locales`, `varTop`) are at the end of this file.
 //! Do not edit the data by hand. `norm` is `gostd::norm` and the Go
 //! `unicode` tables are `gostd::unicode_tables`.

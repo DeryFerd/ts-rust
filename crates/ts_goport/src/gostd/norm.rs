@@ -1,18 +1,21 @@
-//! Go `golang.org/x/text/unicode/norm` v0.38.0 with the Unicode 15.0.0
-//! tables (`tables15.0.0.go`, the `!go1.27` build that the pinned oracle
-//! uses), as far as `gostd::collate` (x/text `internal/colltab`) calls it:
-//! `Form.Properties`, the `Properties` getters, `Form.FirstBoundary` and
-//! `Form.Append` with an empty `out`.
+//! Go `golang.org/x/text/unicode/norm` v0.42.0 with the Unicode 17.0.0
+//! tables (`tables17.0.0.go`, the `go1.27` build that the pin N oracle
+//! uses: go.mod `go 1.27`, built with go1.27.1), as far as `gostd::collate`
+//! (x/text `internal/colltab`) and `ls/lsutil/organizeimports.rs`
+//! (`norm.NFD.String`) call it: `Form.Properties`, the `Properties`
+//! getters, `Form.FirstBoundary` and `Form.Append` with an empty `out`.
+//! These are the decomposing forms only, so the v0.42.0 fixes in
+//! `composition.go` (`compose`, NFC and NFKC) do not apply here.
 //!
 //! PORT: Go keeps `string` and `[]byte` variants of the lookups (`input`).
 //! colltab passes bytes here, so there is one `&[u8]` version.
 //!
 //! PORT: the tables are the Go values, dumped as little-endian binary files
-//! in `data/` by `target/continuation-r97-goport/complete/gen/collate/gen.sh`
-//! (zz_dump_test.go in a copy of x/text v0.38.0, go1.26.8). Do not edit
-//! them by hand.
+//! in `data/` by `scripts/goport/gen/unicode/gen.sh` (its
+//! `norm/zz_dump_test.go` in a copy of the x/text v0.42.0 norm package,
+//! go1.27.1). Do not edit them by hand.
 
-// Go: unicode/norm/normalize.go:36 Form
+// Go: unicode/norm/normalize.go:35 Form
 /// A Form denotes a canonical representation of Unicode code points.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Form {
@@ -45,25 +48,25 @@ pub const MAX_SEGMENT_SIZE: usize = MAX_BYTE_BUFFER_SIZE;
 const GRAPHEME_JOINER: &str = "\u{034F}";
 
 // ---------------------------------------------------------------------------
-// tables15.0.0.go
+// tables17.0.0.go
 // ---------------------------------------------------------------------------
 
-// Go: unicode/norm/tables15.0.0.go:20 ccc
+// Go: unicode/norm/tables17.0.0.go:20 ccc
 static CCC: [u8; 56] = [
     0, 1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
     29, 30, 31, 32, 33, 34, 35, 36, 84, 91, 103, 107, 118, 122, 129, 130, 132, 202, 214, 216, 218,
     220, 222, 224, 226, 228, 230, 232, 233, 234, 240,
 ];
 
-// Go: unicode/norm/tables15.0.0.go:30
+// Go: unicode/norm/tables17.0.0.go:30
 const FIRST_MULTI: u16 = 0x199A;
 const FIRST_CCC: u16 = 0x2DD5;
 const END_MULTI: u16 = 0x2EBF;
-const FIRST_LEADING_CCC: u16 = 0x4AEF;
-const FIRST_CCC_ZERO_EXCEPT: u16 = 0x4BB9;
-const FIRST_STARTER_WITH_N_LEAD: u16 = 0x4BE0;
+const FIRST_LEADING_CCC: u16 = 0x4B3F;
+const FIRST_CCC_ZERO_EXCEPT: u16 = 0x4C99;
+const FIRST_STARTER_WITH_N_LEAD: u16 = 0x4CC0;
 
-// Go: unicode/norm/tables15.0.0.go:42 decomps (19426 bytes)
+// Go: unicode/norm/tables17.0.0.go:42 decomps (19650 bytes)
 static DECOMPS: &[u8] = include_bytes!("data/norm_decomps.bin");
 
 /// Go `[]uint16` table stored as little-endian bytes.
@@ -155,7 +158,7 @@ impl SparseBlocks {
     }
 }
 
-/// Go `nfcTrie` and `nfkcTrie` (tables15.0.0.go:2781 and :4496): generated
+/// Go `nfcTrie` and `nfkcTrie` (tables17.0.0.go:2813 and :4597): generated
 /// tries that share one code shape.
 struct NormTrie {
     values: U16s,
@@ -166,8 +169,8 @@ struct NormTrie {
     cutoff: u32,
 }
 
-// Go: unicode/norm/tables15.0.0.go:2968 nfcValues, :3487 nfcIndex,
-// :3594 nfcSparseOffset, :3597 nfcSparseValues; trie.go:17 nfcSparse
+// Go: unicode/norm/tables17.0.0.go:3000 nfcValues, :3519 nfcIndex,
+// :3630 nfcSparseOffset, :3633 nfcSparseValues; trie.go:17 nfcSparse
 static NFC_DATA: NormTrie = NormTrie {
     values: U16s(include_bytes!("data/norm_nfc_values.bin")),
     index: TrieIndex::U8(include_bytes!("data/norm_nfc_index.bin")),
@@ -178,8 +181,8 @@ static NFC_DATA: NormTrie = NormTrie {
     cutoff: 46,
 };
 
-// Go: unicode/norm/tables15.0.0.go:4683 nfkcValues, :5744 nfkcIndex,
-// :5859 nfkcSparseOffset, :5862 nfkcSparseValues; trie.go:22 nfkcSparse
+// Go: unicode/norm/tables17.0.0.go:4784 nfkcValues, :5845 nfkcIndex,
+// :5966 nfkcSparseOffset, :5969 nfkcSparseValues; trie.go:22 nfkcSparse
 static NFKC_DATA: NormTrie = NormTrie {
     values: U16s(include_bytes!("data/norm_nfkc_values.bin")),
     index: TrieIndex::U16(U16s(include_bytes!("data/norm_nfkc_index.bin"))),
@@ -191,8 +194,8 @@ static NFKC_DATA: NormTrie = NormTrie {
 };
 
 impl NormTrie {
-    // Go: unicode/norm/tables15.0.0.go:2781 (*nfcTrie).lookup
-    // Go: unicode/norm/tables15.0.0.go:4496 (*nfkcTrie).lookup
+    // Go: unicode/norm/tables17.0.0.go:2813 (*nfcTrie).lookup
+    // Go: unicode/norm/tables17.0.0.go:4597 (*nfkcTrie).lookup
     /// lookup returns the trie value for the first UTF-8 encoding in s and
     /// the width in bytes of this encoding. The size will be 0 if s does not
     /// hold enough bytes to complete the encoding. len(s) must be greater than 0.
@@ -259,8 +262,8 @@ impl NormTrie {
         (0, 1)
     }
 
-    // Go: unicode/norm/tables15.0.0.go:2956 (*nfcTrie).lookupValue
-    // Go: unicode/norm/tables15.0.0.go:4671 (*nfkcTrie).lookupValue
+    // Go: unicode/norm/tables17.0.0.go:2988 (*nfcTrie).lookupValue
+    // Go: unicode/norm/tables17.0.0.go:4772 (*nfkcTrie).lookupValue
     /// lookupValue determines the type of block n and looks up the value for b.
     fn lookup_value(&self, n: u32, b: u8) -> u16 {
         if n < self.cutoff {
@@ -350,7 +353,7 @@ fn form_table(f: Form) -> &'static FormInfo {
 }
 
 impl Properties {
-    // Go: unicode/norm/forminfo.go:95 (Properties).BoundaryBefore
+    // Go: unicode/norm/forminfo.go:98 (Properties).BoundaryBefore
     /// BoundaryBefore returns true if this rune starts a new segment and
     /// cannot combine with any rune on the left.
     pub fn boundary_before(self) -> bool {
@@ -363,7 +366,7 @@ impl Properties {
         false
     }
 
-    // Go: unicode/norm/forminfo.go:107 (Properties).BoundaryAfter
+    // Go: unicode/norm/forminfo.go:110 (Properties).BoundaryAfter
     /// BoundaryAfter returns true if runes cannot combine with or otherwise
     /// interact with this or previous runes.
     pub fn boundary_after(self) -> bool {
@@ -371,7 +374,13 @@ impl Properties {
         self.is_inert()
     }
 
-    // Go: unicode/norm/forminfo.go:124
+    // Go: unicode/norm/forminfo.go:128 (Properties).isInvalid
+    /// We set flags to 0x80 (high bit 7 unused in quick check data) to indicate an invalid rune.
+    fn is_invalid(self) -> bool {
+        self.flags == 0x80
+    }
+
+    // Go: unicode/norm/forminfo.go:130
     #[allow(dead_code)]
     fn is_yes_c(self) -> bool {
         self.flags & 0x10 == 0
@@ -394,28 +403,28 @@ impl Properties {
         self.flags & 0x4 != 0 // == isNoD
     }
 
-    // Go: unicode/norm/forminfo.go:131 (Properties).isInert
+    // Go: unicode/norm/forminfo.go:137 (Properties).isInert
     fn is_inert(self) -> bool {
         self.flags & QC_INFO_MASK == 0 && self.ccc == 0
     }
 
-    // Go: unicode/norm/forminfo.go:135 (Properties).multiSegment
+    // Go: unicode/norm/forminfo.go:141 (Properties).multiSegment
     #[allow(dead_code)]
     fn multi_segment(self) -> bool {
         self.index >= FIRST_MULTI && self.index < END_MULTI
     }
 
-    // Go: unicode/norm/forminfo.go:139 (Properties).nLeadingNonStarters
+    // Go: unicode/norm/forminfo.go:145 (Properties).nLeadingNonStarters
     fn n_leading_non_starters(self) -> u8 {
         self.n_lead
     }
 
-    // Go: unicode/norm/forminfo.go:143 (Properties).nTrailingNonStarters
+    // Go: unicode/norm/forminfo.go:149 (Properties).nTrailingNonStarters
     fn n_trailing_non_starters(self) -> u8 {
         self.flags & 0x03
     }
 
-    // Go: unicode/norm/forminfo.go:149 (Properties).Decomposition
+    // Go: unicode/norm/forminfo.go:155 (Properties).Decomposition
     /// Decomposition returns the decomposition for the underlying rune
     /// or nil if there is none.
     pub fn decomposition(self) -> Option<&'static [u8]> {
@@ -432,13 +441,13 @@ impl Properties {
         Some(&DECOMPS[i..i + n])
     }
 
-    // Go: unicode/norm/forminfo.go:163 (Properties).Size
+    // Go: unicode/norm/forminfo.go:170 (Properties).Size
     /// Size returns the length of UTF-8 encoding of the rune.
     pub fn size(self) -> usize {
         usize::from(self.size)
     }
 
-    // Go: unicode/norm/forminfo.go:168 (Properties).CCC
+    // Go: unicode/norm/forminfo.go:175 (Properties).CCC
     /// CCC returns the canonical combining class of the underlying rune.
     pub fn ccc(self) -> u8 {
         if self.index >= FIRST_CCC_ZERO_EXCEPT {
@@ -447,14 +456,14 @@ impl Properties {
         CCC[usize::from(self.ccc)]
     }
 
-    // Go: unicode/norm/forminfo.go:177 (Properties).LeadCCC
+    // Go: unicode/norm/forminfo.go:184 (Properties).LeadCCC
     /// LeadCCC returns the CCC of the first rune in the decomposition.
     /// If there is no decomposition, LeadCCC equals CCC.
     pub fn lead_ccc(self) -> u8 {
         CCC[usize::from(self.ccc)]
     }
 
-    // Go: unicode/norm/forminfo.go:183 (Properties).TrailCCC
+    // Go: unicode/norm/forminfo.go:190 (Properties).TrailCCC
     /// TrailCCC returns the CCC of the last rune in the decomposition.
     /// If there is no decomposition, TrailCCC equals CCC.
     pub fn trail_ccc(self) -> u8 {
@@ -462,20 +471,20 @@ impl Properties {
     }
 }
 
-// Go: unicode/norm/forminfo.go:225 lookupInfoNFC
+// Go: unicode/norm/forminfo.go:224 lookupInfoNFC
 fn lookup_info_nfc(b: &[u8], i: usize) -> Properties {
     let (v, sz) = NFC_DATA.lookup(&b[i..]);
     comp_info(v, sz)
 }
 
-// Go: unicode/norm/forminfo.go:230 lookupInfoNFKC
+// Go: unicode/norm/forminfo.go:229 lookupInfoNFKC
 fn lookup_info_nfkc(b: &[u8], i: usize) -> Properties {
     let (v, sz) = NFKC_DATA.lookup(&b[i..]);
     comp_info(v, sz)
 }
 
 impl Form {
-    // Go: unicode/norm/forminfo.go:236 (Form).Properties
+    // Go: unicode/norm/forminfo.go:235 (Form).Properties
     /// Properties returns properties for the first rune in s.
     pub fn properties(self, s: &[u8]) -> Properties {
         if self == NFC || self == NFD {
@@ -487,11 +496,18 @@ impl Form {
     }
 }
 
-// Go: unicode/norm/forminfo.go:254 compInfo
+// Go: unicode/norm/forminfo.go:253 compInfo
 /// compInfo converts the information contained in v and sz
 /// to a Properties.  See the comment at the top of the file
 /// for more information on the format.
 fn comp_info(mut v: u16, sz: usize) -> Properties {
+    if sz == 0 {
+        return Properties {
+            flags: 0x80,
+            size: 1,
+            ..Properties::default()
+        };
+    }
     if v == 0 {
         return Properties {
             size: sz as u8,
@@ -502,7 +518,7 @@ fn comp_info(mut v: u16, sz: usize) -> Properties {
             size: sz as u8,
             ccc: v as u8,
             tccc: v as u8,
-            flags: (v >> 8) as u8,
+            flags: (v >> 8) as u8 & 0x3f,
             ..Properties::default()
         };
         if p.ccc > 0 || p.combines_backward() {
@@ -957,7 +973,7 @@ impl Form {
         // CGJ insertion points correctly. Luckily it doesn't have to.
         loop {
             let info = (fd.info)(src, i);
-            if info.size == 0 {
+            if info.is_invalid() {
                 return -1;
             }
             if ss.next(info) != SsState::Success {
@@ -1006,7 +1022,7 @@ fn quick_span(f: &FormInfo, src: &[u8], mut i: usize, end: usize, at_eof: bool) 
             continue;
         }
         let info = (f.info)(src, i);
-        if info.size == 0 {
+        if info.is_invalid() {
             if at_eof {
                 // include incomplete runes
                 return (n, true);
@@ -1050,8 +1066,11 @@ fn quick_span(f: &FormInfo, src: &[u8], mut i: usize, end: usize, at_eof: bool) 
 fn decompose_segment(rb: &mut ReorderBuffer<'_>, mut sp: usize, at_eof: bool) -> i32 {
     // Force one character to be consumed.
     let mut info = (rb.f.info)(rb.src, sp);
-    if info.size == 0 {
-        return 0;
+    if info.is_invalid() {
+        // Consume the invalid character.
+        // Perhaps this should return iShortSrc instead?
+        // May not matter, this path does not appear to be reachable in practice.
+        return (sp + 1) as i32;
     }
     // PORT: Go `goto end` is the labeled block `body`.
     'body: {
@@ -1078,7 +1097,7 @@ fn decompose_segment(rb: &mut ReorderBuffer<'_>, mut sp: usize, at_eof: bool) ->
                 break;
             }
             info = (rb.f.info)(rb.src, sp);
-            if info.size == 0 {
+            if info.is_invalid() {
                 if !at_eof {
                     return -2; // iShortSrc
                 }
@@ -1133,6 +1152,44 @@ mod tests {
         assert_eq!(
             NFKD.properties("ﬁ".as_bytes()).decomposition(),
             Some("fi".as_bytes())
+        );
+    }
+
+    // x/text v0.42.0 with go1.27.1 (tables17.0.0.go). The Unicode 16.0
+    // decompositions (Todhri U+105C9, Tulu-Tigalari U+11383) and the Unicode
+    // 17.0 compatibility mapping of U+A7F1 are not in tables15.0.0.go.
+    #[test]
+    fn unicode_17_decompositions() {
+        assert_eq!(
+            NFD.append("\u{105C9}".as_bytes()),
+            "\u{105D2}\u{307}".as_bytes()
+        );
+        assert_eq!(
+            NFD.append("\u{11383}".as_bytes()),
+            "\u{11382}\u{113C9}".as_bytes()
+        );
+        assert_eq!(
+            NFD.append("\u{16126}".as_bytes()),
+            "\u{1611E}\u{1611E}\u{1611F}".as_bytes()
+        );
+        assert_eq!(NFD.append("\u{A7F1}".as_bytes()), "\u{A7F1}".as_bytes());
+        assert_eq!(NFKD.append("\u{A7F1}".as_bytes()), b"S");
+    }
+
+    // x/text v0.42.0: an incomplete rune is invalid (flags 0x80) with size 1;
+    // v0.38.0 gave size 0. The NFD output keeps the invalid bytes.
+    #[test]
+    fn invalid_rune_properties() {
+        assert_eq!(NFD.properties(b"\xE0").size(), 1);
+        assert_eq!(NFD.properties(b"\xC3").size(), 1);
+        assert_eq!(NFD.first_boundary(b"\xE0"), -1);
+        assert_eq!(NFD.append(b"\xE0"), b"\xE0");
+        // U+00E9 then an incomplete rune.
+        assert_eq!(NFD.append(b"\xC3\xA9\xC3"), b"e\xCC\x81\xC3");
+        // U+D55C then an incomplete rune: U+1112 U+1161 U+11AB \xE1\x84.
+        assert_eq!(
+            NFD.append(b"\xED\x95\x9C\xE1\x84"),
+            b"\xE1\x84\x92\xE1\x85\xA1\xE1\x86\xAB\xE1\x84"
         );
     }
 

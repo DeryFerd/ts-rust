@@ -1640,3 +1640,28 @@ mod relative_segment_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod unicode_case_tests {
+    use super::{compare_strings_case_insensitive, to_path};
+
+    // Go `ToPath` on a case-insensitive host (macOS, Windows) lowers with
+    // `unicode.ToLower` (tspath/path.go:674 ToFileNameLowerCase). The pin N
+    // oracle is go1.27.1 (Unicode 17.0.0), where U+A7CB lowers to U+0264 and
+    // U+10D50 to U+10D70. go1.26.8 (Unicode 15.0.0) kept them.
+    #[test]
+    fn to_path_lowers_unicode_17_letters() {
+        assert_eq!(
+            to_path("/Proj/\u{A7CB}\u{10D50}.ts", "/", false).0,
+            "/proj/\u{264}\u{10D70}.ts"
+        );
+        assert_eq!(
+            to_path("/Proj/\u{A7CB}.ts", "/", true).0,
+            "/Proj/\u{A7CB}.ts"
+        );
+        assert_eq!(
+            compare_strings_case_insensitive("/a/\u{A7CB}", "/a/\u{264}"),
+            0
+        );
+    }
+}

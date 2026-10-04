@@ -1,7 +1,6 @@
-//! Go `regexp` and `regexp/syntax` (go1.26.8 `src/regexp`), as far as
+//! Go `regexp` and `regexp/syntax` (go1.27.1 `src/regexp`), as far as
 //! `regexp.Compile` and `(*Regexp).MatchString` need them, and the
-//! `unicode.SimpleFold` tables they use (go1.26.8 `src/unicode`, Unicode
-//! 15.0.0).
+//! `unicode.SimpleFold` they use (go1.27.1 `src/unicode`, Unicode 17.0.0).
 //!
 //! PORT: not ported, because they do not change a `MatchString` result:
 //! the one-pass and backtrack engines (Go picks them only for speed; the
@@ -14,7 +13,7 @@
 //! `ErrInvalidUTF8` checks (`checkUTF8`, `nextRune` errors) never fail here.
 //!
 //! `\p{Name}` and `\P{Name}` read the `unicode` category and script tables
-//! in `unicode_tables.rs` (generated from go1.26.8, Unicode 15.0.0).
+//! in `unicode_tables.rs` (generated from go1.27.1, Unicode 17.0.0).
 
 use crate::prelude::*;
 
@@ -22,7 +21,7 @@ use crate::gostd::errors::{self, GoError};
 
 use self::syntax::{EmptyOp, Rune};
 
-// Go: regexp/regexp.go:80 Regexp
+// Go: regexp/regexp.go:79 Regexp
 /// Regexp is the representation of a compiled regular expression.
 /// A Regexp is safe for concurrent use by multiple threads.
 pub struct Regexp {
@@ -43,13 +42,13 @@ pub struct Regexp {
 }
 
 impl Regexp {
-    // Go: regexp/regexp.go:103 String
+    // Go: regexp/regexp.go:102 String
     /// String returns the source text used to compile the regular expression.
     pub fn string(&self) -> &str {
         &self.expr
     }
 
-    // Go: regexp/regexp.go:506 MatchString
+    // Go: regexp/regexp.go:505 MatchString
     /// MatchString reports whether the string s
     /// contains any match of the regular expression re.
     pub fn match_string(&self, s: &str) -> bool {
@@ -63,8 +62,8 @@ impl Regexp {
         self.do_execute(s, 0)
     }
 
-    // Go: regexp/exec.go:521 doExecute
-    /// doExecute reports whether there is a match in the input.
+    // Go: regexp/exec.go:521 find
+    /// find reports whether there is a match in the input.
     // PORT: Go returns the capture positions (nil for no match). With
     // `ncap == 0` the result is only "match or not", so this returns a bool.
     // Go runs the one-pass or backtrack engine when it can; both give the
@@ -80,7 +79,7 @@ impl Regexp {
     }
 }
 
-// Go: regexp/regexp.go:130 Compile
+// Go: regexp/regexp.go:129 Compile
 /// Compile parses a regular expression and returns, if successful,
 /// a [`Regexp`] object that can be used to match against text.
 ///
@@ -96,7 +95,7 @@ pub fn compile_exported(expr: &str) -> Result<Regexp, GoError> {
     compile(expr, syntax::PERL, false)
 }
 
-// Go: regexp/regexp.go:167 compile
+// Go: regexp/regexp.go:166 compile
 fn compile(expr: &str, mode: syntax::Flags, longest: bool) -> Result<Regexp, GoError> {
     let (mut nodes, re) = match syntax::parse_exported(expr, mode) {
         Ok(tree) => tree,
@@ -127,7 +126,7 @@ fn compile(expr: &str, mode: syntax::Flags, longest: bool) -> Result<Regexp, GoE
     })
 }
 
-// Go: regexp/regexp.go:268 minInputLen
+// Go: regexp/regexp.go:267 minInputLen
 /// minInputLen walks the regexp to find the minimum length of any matchable input.
 fn min_input_len(nodes: &[syntax::Regexp], re: usize) -> isize {
     let re = &nodes[re];
@@ -184,17 +183,17 @@ fn utf8_rune_len(r: Rune) -> isize {
     }
 }
 
-// Go: regexp/regexp.go:368 endOfText
+// Go: regexp/regexp.go:367 endOfText
 const END_OF_TEXT: Rune = -1;
 
-// Go: regexp/regexp.go:381 inputString
+// Go: regexp/regexp.go:380 inputString
 /// inputString scans a string.
 struct InputString<'a> {
     str_: &'a str,
 }
 
 impl InputString<'_> {
-    // Go: regexp/regexp.go:385 step
+    // Go: regexp/regexp.go:384 step
     fn step(&self, pos: usize) -> (Rune, usize) {
         if pos < self.str_.len() {
             return decode_rune_in_string(&self.str_[pos..]);
@@ -202,19 +201,19 @@ impl InputString<'_> {
         (END_OF_TEXT, 0)
     }
 
-    // Go: regexp/regexp.go:392 canCheckPrefix
+    // Go: regexp/regexp.go:391 canCheckPrefix
     fn can_check_prefix(&self) -> bool {
         true
     }
 
-    // Go: regexp/regexp.go:400 index
+    // Go: regexp/regexp.go:399 index
     fn index(&self, re: &Regexp, pos: usize) -> isize {
         self.str_[pos..]
             .find(re.prefix.as_str())
             .map_or(-1, |i| i as isize)
     }
 
-    // Go: regexp/regexp.go:404 context
+    // Go: regexp/regexp.go:403 context
     fn context(&self, pos: usize) -> LazyFlag {
         let (mut r1, mut r2) = (END_OF_TEXT, END_OF_TEXT);
         // 0 < pos && pos <= len(i.str)
@@ -338,7 +337,7 @@ impl LazyFlag {
 }
 
 impl<'a> Machine<'a> {
-    // Go: regexp/regexp.go:232 get
+    // Go: regexp/regexp.go:231 get
     /// get returns a machine to use for matching re.
     // PORT: Go takes the machine from a pool; the port makes a new one.
     fn new(re: &'a Regexp) -> Self {
@@ -2032,7 +2031,7 @@ pub mod syntax {
             }
         }
 
-        // Go: regexp/syntax/parse.go:1751 parseUnicodeClass
+        // Go: regexp/syntax/parse.go:1760 parseUnicodeClass
         /// parseUnicodeClass parses a leading Unicode character class like \p{Han}
         /// from the beginning of s. If one is present, it appends the characters to r
         /// and returns the remainder of the string.
@@ -2108,7 +2107,7 @@ pub mod syntax {
             Ok(Some(t))
         }
 
-        // Go: regexp/syntax/parse.go:1827 parseClass
+        // Go: regexp/syntax/parse.go:1836 parseClass
         /// parseClass parses a character class at the beginning of s
         /// and pushes it onto the parse stack.
         fn parse_class<'a>(&mut self, s: &'a str) -> Result<&'a str, Error> {
@@ -2709,24 +2708,34 @@ pub mod syntax {
         latin_offset: 0,
     };
 
-    // Go: regexp/syntax/parse.go:1657 categoryAliases
-    /// categoryAliases is a lazily constructed copy of unicode.CategoryAliases
+    // Go: regexp/syntax/parse.go:1657 aliases
+    /// aliases is a lazily constructed copy of unicode.CategoryAliases and unicode.Scripts
     /// but with the keys passed through canonicalName, to support inexact matches.
     // PORT: a LazyLock replaces the struct's sync.Once.
-    static CATEGORY_ALIASES: LazyLock<HashMap<String, &'static str>> =
-        LazyLock::new(init_category_aliases);
-
-    // Go: regexp/syntax/parse.go:1663 initCategoryAliases
-    /// initCategoryAliases initializes categoryAliases by canonicalizing unicode.CategoryAliases.
-    fn init_category_aliases() -> HashMap<String, &'static str> {
-        let mut m = HashMap::new();
-        for &(name, actual) in unicode_tables::CATEGORY_ALIASES {
-            m.insert(canonical_name(name), actual);
-        }
-        m
+    struct Aliases {
+        categories: HashMap<String, &'static str>,
+        scripts: HashMap<String, &'static str>,
     }
 
-    // Go: regexp/syntax/parse.go:1675 canonicalName
+    static ALIASES: LazyLock<Aliases> = LazyLock::new(init_aliases);
+
+    // Go: regexp/syntax/parse.go:1664 initAliases
+    /// initAliases initializes categoryAliases by canonicalizing unicode.CategoryAliases.
+    fn init_aliases() -> Aliases {
+        let mut aliases = Aliases {
+            categories: HashMap::new(),
+            scripts: HashMap::new(),
+        };
+        for &(name, actual) in unicode_tables::CATEGORY_ALIASES {
+            aliases.categories.insert(canonical_name(name), actual);
+        }
+        for &(name, _) in unicode_tables::SCRIPTS {
+            aliases.scripts.insert(canonical_name(name), name);
+        }
+        aliases
+    }
+
+    // Go: regexp/syntax/parse.go:1680 canonicalName
     /// canonicalName returns the canonical lookup string for name.
     /// The canonical name has a leading uppercase letter and then lowercase letters,
     /// and it omits all underscores, spaces, and hyphens.
@@ -2766,7 +2775,7 @@ pub mod syntax {
         }
     }
 
-    // Go: regexp/syntax/parse.go:1715 unicodeTable
+    // Go: regexp/syntax/parse.go:1720 unicodeTable
     /// unicodeTable returns the unicode.RangeTable identified by name
     /// and the table of additional fold-equivalent code points.
     /// If sign < 0, the result should be inverted.
@@ -2801,19 +2810,23 @@ pub mod syntax {
         // unicode.CategoryAliases makes liberal use of underscores in its names
         // (they are defined that way by Unicode), but we want to match ignoring
         // the underscores, so make our own map with canonical names.
-        if let Some(&actual) = CATEGORY_ALIASES.get(&name) {
+        if let Some(&actual) = ALIASES.categories.get(&name) {
             let t = map_get(unicode_tables::CATEGORIES, actual)?;
             return Some((t, map_get(unicode_tables::FOLD_CATEGORY, actual), 1));
+        }
+        if let Some(&actual) = ALIASES.scripts.get(&name) {
+            let t = map_get(unicode_tables::SCRIPTS, actual)?;
+            return Some((t, map_get(unicode_tables::FOLD_SCRIPT, actual), 1));
         }
         None
     }
 
-    // Go: regexp/syntax/parse.go:1923 cleanClass
+    // Go: regexp/syntax/parse.go:1932 cleanClass
     /// cleanClass sorts the ranges (pairs of elements of r),
     /// merges them, and eliminates duplicates.
     fn clean_class(r: &mut Vec<Rune>) {
         // Sort by lo increasing, hi decreasing to break ties.
-        // Go: regexp/syntax/parse.go:1926 sort.Sort(ranges{rp})
+        // Go: regexp/syntax/parse.go:1935 sort.Sort(ranges{rp})
         // PORT: the pairs of `r` are one slice of pairs here.
         let mut pairs: Vec<(Rune, Rune)> = r.chunks_exact(2).map(|p| (p[0], p[1])).collect();
         crate::gostd::slices::sort_slice(&mut pairs, |a, b| a.0 < b.0 || a.0 == b.0 && a.1 > b.1);
@@ -2848,7 +2861,7 @@ pub mod syntax {
         r.truncate(w);
     }
 
-    // Go: regexp/syntax/parse.go:1970 appendLiteral
+    // Go: regexp/syntax/parse.go:1979 appendLiteral
     /// appendLiteral appends the literal x to the class r.
     fn append_literal(r: &mut Vec<Rune>, x: Rune, flags: Flags) {
         if flags & FOLD_CASE != 0 {
@@ -2858,7 +2871,7 @@ pub mod syntax {
         }
     }
 
-    // Go: regexp/syntax/parse.go:1978 appendRange
+    // Go: regexp/syntax/parse.go:1987 appendRange
     /// appendRange appends the range lo-hi to the class r.
     fn append_range(r: &mut Vec<Rune>, lo: Rune, hi: Rune) {
         // Expand last range or next to last range if it overlaps or abuts.
@@ -2891,7 +2904,7 @@ pub mod syntax {
     const MIN_FOLD: Rune = 0x0041;
     const MAX_FOLD: Rune = 0x1e943;
 
-    // Go: regexp/syntax/parse.go:2011 appendFoldedRange
+    // Go: regexp/syntax/parse.go:2020 appendFoldedRange
     /// appendFoldedRange appends the range lo-hi
     /// and its case folding-equivalent runes to the class r.
     fn append_folded_range(r: &mut Vec<Rune>, mut lo: Rune, mut hi: Rune) {
@@ -2928,7 +2941,7 @@ pub mod syntax {
         }
     }
 
-    // Go: regexp/syntax/parse.go:2046 appendClass
+    // Go: regexp/syntax/parse.go:2055 appendClass
     /// appendClass appends the class x to the class r.
     /// It assume x is clean.
     fn append_class(r: &mut Vec<Rune>, x: &[Rune]) {
@@ -2937,7 +2950,7 @@ pub mod syntax {
         }
     }
 
-    // Go: regexp/syntax/parse.go:2054 appendFoldedClass
+    // Go: regexp/syntax/parse.go:2063 appendFoldedClass
     /// appendFoldedClass appends the case folding of the class x to the class r.
     fn append_folded_class(r: &mut Vec<Rune>, x: &[Rune]) {
         for p in x.chunks_exact(2) {
@@ -2945,7 +2958,7 @@ pub mod syntax {
         }
     }
 
-    // Go: regexp/syntax/parse.go:2063 appendNegatedClass
+    // Go: regexp/syntax/parse.go:2072 appendNegatedClass
     /// appendNegatedClass appends the negation of the class x to the class r.
     /// It assumes x is clean.
     fn append_negated_class(r: &mut Vec<Rune>, x: &[Rune]) {
@@ -2975,7 +2988,7 @@ pub mod syntax {
         r16.chain(r32)
     }
 
-    // Go: regexp/syntax/parse.go:2079 appendTable
+    // Go: regexp/syntax/parse.go:2088 appendTable
     /// appendTable appends x to the class r.
     fn append_table(r: &mut Vec<Rune>, x: &RangeTable) {
         for (lo, hi, stride) in table_ranges(x) {
@@ -2991,7 +3004,7 @@ pub mod syntax {
         }
     }
 
-    // Go: regexp/syntax/parse.go:2104 appendNegatedTable
+    // Go: regexp/syntax/parse.go:2113 appendNegatedTable
     /// appendNegatedTable appends the negation of x to the class r.
     fn append_negated_table(r: &mut Vec<Rune>, x: &RangeTable) {
         let mut next_lo: Rune = 0; // lo end of next class to add
@@ -3017,7 +3030,7 @@ pub mod syntax {
         }
     }
 
-    // Go: regexp/syntax/parse.go:2146 negateClass
+    // Go: regexp/syntax/parse.go:2155 negateClass
     /// negateClass overwrites r with its negation.
     /// It assumes the class r is already clean.
     fn negate_class(r: &mut Vec<Rune>) {
@@ -3043,7 +3056,7 @@ pub mod syntax {
         }
     }
 
-    // Go: regexp/syntax/parse.go:2204 nextRune
+    // Go: regexp/syntax/parse.go:2213 nextRune
     /// nextRune returns the first rune of s and the rest of s.
     // PORT: s is valid UTF-8, so there is no ErrInvalidUTF8. For an empty s,
     // Go's utf8.DecodeRuneInString gives RuneError and an empty rest.
@@ -3054,12 +3067,12 @@ pub mod syntax {
         }
     }
 
-    // Go: regexp/syntax/parse.go:2212 isalnum
+    // Go: regexp/syntax/parse.go:2221 isalnum
     fn isalnum(c: char) -> bool {
         c.is_ascii_alphanumeric()
     }
 
-    // Go: regexp/syntax/parse.go:2216 unhex
+    // Go: regexp/syntax/parse.go:2225 unhex
     fn unhex(c: char) -> Rune {
         match c {
             '0'..='9' => c as Rune - '0' as Rune,
@@ -3849,26 +3862,15 @@ pub mod syntax {
     }
 }
 
-/// Go `unicode`: the simple case folding that `regexp/syntax` uses.
+/// Go `unicode`: the simple case folding that `regexp/syntax` uses, over
+/// the generated tables of `unicode_tables` (`CaseRanges`, `caseOrbit` and
+/// `asciiFold`).
 mod unicode {
     use super::syntax::{MAX_RUNE, Rune};
-
-    // Go: unicode/letter.go:56 CaseRange
-    /// (Lo, Hi, Delta): the case mapping of the runes Lo through Hi.
-    /// Delta is indexed by UpperCase, LowerCase, TitleCase.
-    type CaseRange = (u32, u32, [Rune; 3]);
-
-    // Go: unicode/letter.go:331 foldPair
-    type FoldPair = (u16, u16);
+    use crate::gostd::unicode_tables::{ASCII_FOLD, CASE_ORBIT, CASE_RANGES, CaseRange};
 
     const UPPER_CASE: usize = 0;
     const LOWER_CASE: usize = 1;
-
-    /// If the Delta field of a [`CaseRange`] is UpperLower, it means
-    /// this CaseRange represents a sequence of the form (say)
-    /// [Upper] [Lower] [Upper] [Lower].
-    /// (Cannot be a valid delta.)
-    const UPPER_LOWER: Rune = MAX_RUNE + 1;
 
     /// Go `unicode.MaxASCII`.
     const MAX_ASCII: Rune = 0x7F;
@@ -3906,7 +3908,7 @@ mod unicode {
         // No folding specified. This is a one- or two-element
         // equivalence class containing rune and ToLower(rune)
         // and ToUpper(rune) if they are different from rune.
-        if let Some(cr) = lookup_case_range(r, &CASE_RANGES) {
+        if let Some(cr) = lookup_case_range(r, CASE_RANGES) {
             let l = convert_case(LOWER_CASE, r, cr);
             if l != r {
                 return l;
@@ -3958,444 +3960,30 @@ mod unicode {
         }
         r + delta
     }
+}
 
-    // Go: unicode/tables.go _CaseRanges (go1.26.8, Unicode 15.0.0)
-    static CASE_RANGES: [CaseRange; 328] = [
-        (0x0041, 0x005A, [0, 32, 0]),
-        (0x0061, 0x007A, [-32, 0, -32]),
-        (0x00B5, 0x00B5, [743, 0, 743]),
-        (0x00C0, 0x00D6, [0, 32, 0]),
-        (0x00D8, 0x00DE, [0, 32, 0]),
-        (0x00E0, 0x00F6, [-32, 0, -32]),
-        (0x00F8, 0x00FE, [-32, 0, -32]),
-        (0x00FF, 0x00FF, [121, 0, 121]),
-        (0x0100, 0x012F, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x0130, 0x0130, [0, -199, 0]),
-        (0x0131, 0x0131, [-232, 0, -232]),
-        (0x0132, 0x0137, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x0139, 0x0148, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x014A, 0x0177, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x0178, 0x0178, [0, -121, 0]),
-        (0x0179, 0x017E, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x017F, 0x017F, [-300, 0, -300]),
-        (0x0180, 0x0180, [195, 0, 195]),
-        (0x0181, 0x0181, [0, 210, 0]),
-        (0x0182, 0x0185, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x0186, 0x0186, [0, 206, 0]),
-        (0x0187, 0x0188, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x0189, 0x018A, [0, 205, 0]),
-        (0x018B, 0x018C, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x018E, 0x018E, [0, 79, 0]),
-        (0x018F, 0x018F, [0, 202, 0]),
-        (0x0190, 0x0190, [0, 203, 0]),
-        (0x0191, 0x0192, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x0193, 0x0193, [0, 205, 0]),
-        (0x0194, 0x0194, [0, 207, 0]),
-        (0x0195, 0x0195, [97, 0, 97]),
-        (0x0196, 0x0196, [0, 211, 0]),
-        (0x0197, 0x0197, [0, 209, 0]),
-        (0x0198, 0x0199, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x019A, 0x019A, [163, 0, 163]),
-        (0x019C, 0x019C, [0, 211, 0]),
-        (0x019D, 0x019D, [0, 213, 0]),
-        (0x019E, 0x019E, [130, 0, 130]),
-        (0x019F, 0x019F, [0, 214, 0]),
-        (0x01A0, 0x01A5, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x01A6, 0x01A6, [0, 218, 0]),
-        (0x01A7, 0x01A8, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x01A9, 0x01A9, [0, 218, 0]),
-        (0x01AC, 0x01AD, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x01AE, 0x01AE, [0, 218, 0]),
-        (0x01AF, 0x01B0, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x01B1, 0x01B2, [0, 217, 0]),
-        (0x01B3, 0x01B6, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x01B7, 0x01B7, [0, 219, 0]),
-        (0x01B8, 0x01B9, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x01BC, 0x01BD, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x01BF, 0x01BF, [56, 0, 56]),
-        (0x01C4, 0x01C4, [0, 2, 1]),
-        (0x01C5, 0x01C5, [-1, 1, 0]),
-        (0x01C6, 0x01C6, [-2, 0, -1]),
-        (0x01C7, 0x01C7, [0, 2, 1]),
-        (0x01C8, 0x01C8, [-1, 1, 0]),
-        (0x01C9, 0x01C9, [-2, 0, -1]),
-        (0x01CA, 0x01CA, [0, 2, 1]),
-        (0x01CB, 0x01CB, [-1, 1, 0]),
-        (0x01CC, 0x01CC, [-2, 0, -1]),
-        (0x01CD, 0x01DC, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x01DD, 0x01DD, [-79, 0, -79]),
-        (0x01DE, 0x01EF, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x01F1, 0x01F1, [0, 2, 1]),
-        (0x01F2, 0x01F2, [-1, 1, 0]),
-        (0x01F3, 0x01F3, [-2, 0, -1]),
-        (0x01F4, 0x01F5, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x01F6, 0x01F6, [0, -97, 0]),
-        (0x01F7, 0x01F7, [0, -56, 0]),
-        (0x01F8, 0x021F, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x0220, 0x0220, [0, -130, 0]),
-        (0x0222, 0x0233, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x023A, 0x023A, [0, 10795, 0]),
-        (0x023B, 0x023C, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x023D, 0x023D, [0, -163, 0]),
-        (0x023E, 0x023E, [0, 10792, 0]),
-        (0x023F, 0x0240, [10815, 0, 10815]),
-        (0x0241, 0x0242, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x0243, 0x0243, [0, -195, 0]),
-        (0x0244, 0x0244, [0, 69, 0]),
-        (0x0245, 0x0245, [0, 71, 0]),
-        (0x0246, 0x024F, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x0250, 0x0250, [10783, 0, 10783]),
-        (0x0251, 0x0251, [10780, 0, 10780]),
-        (0x0252, 0x0252, [10782, 0, 10782]),
-        (0x0253, 0x0253, [-210, 0, -210]),
-        (0x0254, 0x0254, [-206, 0, -206]),
-        (0x0256, 0x0257, [-205, 0, -205]),
-        (0x0259, 0x0259, [-202, 0, -202]),
-        (0x025B, 0x025B, [-203, 0, -203]),
-        (0x025C, 0x025C, [42319, 0, 42319]),
-        (0x0260, 0x0260, [-205, 0, -205]),
-        (0x0261, 0x0261, [42315, 0, 42315]),
-        (0x0263, 0x0263, [-207, 0, -207]),
-        (0x0265, 0x0265, [42280, 0, 42280]),
-        (0x0266, 0x0266, [42308, 0, 42308]),
-        (0x0268, 0x0268, [-209, 0, -209]),
-        (0x0269, 0x0269, [-211, 0, -211]),
-        (0x026A, 0x026A, [42308, 0, 42308]),
-        (0x026B, 0x026B, [10743, 0, 10743]),
-        (0x026C, 0x026C, [42305, 0, 42305]),
-        (0x026F, 0x026F, [-211, 0, -211]),
-        (0x0271, 0x0271, [10749, 0, 10749]),
-        (0x0272, 0x0272, [-213, 0, -213]),
-        (0x0275, 0x0275, [-214, 0, -214]),
-        (0x027D, 0x027D, [10727, 0, 10727]),
-        (0x0280, 0x0280, [-218, 0, -218]),
-        (0x0282, 0x0282, [42307, 0, 42307]),
-        (0x0283, 0x0283, [-218, 0, -218]),
-        (0x0287, 0x0287, [42282, 0, 42282]),
-        (0x0288, 0x0288, [-218, 0, -218]),
-        (0x0289, 0x0289, [-69, 0, -69]),
-        (0x028A, 0x028B, [-217, 0, -217]),
-        (0x028C, 0x028C, [-71, 0, -71]),
-        (0x0292, 0x0292, [-219, 0, -219]),
-        (0x029D, 0x029D, [42261, 0, 42261]),
-        (0x029E, 0x029E, [42258, 0, 42258]),
-        (0x0345, 0x0345, [84, 0, 84]),
-        (0x0370, 0x0373, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x0376, 0x0377, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x037B, 0x037D, [130, 0, 130]),
-        (0x037F, 0x037F, [0, 116, 0]),
-        (0x0386, 0x0386, [0, 38, 0]),
-        (0x0388, 0x038A, [0, 37, 0]),
-        (0x038C, 0x038C, [0, 64, 0]),
-        (0x038E, 0x038F, [0, 63, 0]),
-        (0x0391, 0x03A1, [0, 32, 0]),
-        (0x03A3, 0x03AB, [0, 32, 0]),
-        (0x03AC, 0x03AC, [-38, 0, -38]),
-        (0x03AD, 0x03AF, [-37, 0, -37]),
-        (0x03B1, 0x03C1, [-32, 0, -32]),
-        (0x03C2, 0x03C2, [-31, 0, -31]),
-        (0x03C3, 0x03CB, [-32, 0, -32]),
-        (0x03CC, 0x03CC, [-64, 0, -64]),
-        (0x03CD, 0x03CE, [-63, 0, -63]),
-        (0x03CF, 0x03CF, [0, 8, 0]),
-        (0x03D0, 0x03D0, [-62, 0, -62]),
-        (0x03D1, 0x03D1, [-57, 0, -57]),
-        (0x03D5, 0x03D5, [-47, 0, -47]),
-        (0x03D6, 0x03D6, [-54, 0, -54]),
-        (0x03D7, 0x03D7, [-8, 0, -8]),
-        (0x03D8, 0x03EF, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x03F0, 0x03F0, [-86, 0, -86]),
-        (0x03F1, 0x03F1, [-80, 0, -80]),
-        (0x03F2, 0x03F2, [7, 0, 7]),
-        (0x03F3, 0x03F3, [-116, 0, -116]),
-        (0x03F4, 0x03F4, [0, -60, 0]),
-        (0x03F5, 0x03F5, [-96, 0, -96]),
-        (0x03F7, 0x03F8, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x03F9, 0x03F9, [0, -7, 0]),
-        (0x03FA, 0x03FB, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x03FD, 0x03FF, [0, -130, 0]),
-        (0x0400, 0x040F, [0, 80, 0]),
-        (0x0410, 0x042F, [0, 32, 0]),
-        (0x0430, 0x044F, [-32, 0, -32]),
-        (0x0450, 0x045F, [-80, 0, -80]),
-        (0x0460, 0x0481, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x048A, 0x04BF, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x04C0, 0x04C0, [0, 15, 0]),
-        (0x04C1, 0x04CE, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x04CF, 0x04CF, [-15, 0, -15]),
-        (0x04D0, 0x052F, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x0531, 0x0556, [0, 48, 0]),
-        (0x0561, 0x0586, [-48, 0, -48]),
-        (0x10A0, 0x10C5, [0, 7264, 0]),
-        (0x10C7, 0x10C7, [0, 7264, 0]),
-        (0x10CD, 0x10CD, [0, 7264, 0]),
-        (0x10D0, 0x10FA, [3008, 0, 0]),
-        (0x10FD, 0x10FF, [3008, 0, 0]),
-        (0x13A0, 0x13EF, [0, 38864, 0]),
-        (0x13F0, 0x13F5, [0, 8, 0]),
-        (0x13F8, 0x13FD, [-8, 0, -8]),
-        (0x1C80, 0x1C80, [-6254, 0, -6254]),
-        (0x1C81, 0x1C81, [-6253, 0, -6253]),
-        (0x1C82, 0x1C82, [-6244, 0, -6244]),
-        (0x1C83, 0x1C84, [-6242, 0, -6242]),
-        (0x1C85, 0x1C85, [-6243, 0, -6243]),
-        (0x1C86, 0x1C86, [-6236, 0, -6236]),
-        (0x1C87, 0x1C87, [-6181, 0, -6181]),
-        (0x1C88, 0x1C88, [35266, 0, 35266]),
-        (0x1C90, 0x1CBA, [0, -3008, 0]),
-        (0x1CBD, 0x1CBF, [0, -3008, 0]),
-        (0x1D79, 0x1D79, [35332, 0, 35332]),
-        (0x1D7D, 0x1D7D, [3814, 0, 3814]),
-        (0x1D8E, 0x1D8E, [35384, 0, 35384]),
-        (0x1E00, 0x1E95, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x1E9B, 0x1E9B, [-59, 0, -59]),
-        (0x1E9E, 0x1E9E, [0, -7615, 0]),
-        (0x1EA0, 0x1EFF, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x1F00, 0x1F07, [8, 0, 8]),
-        (0x1F08, 0x1F0F, [0, -8, 0]),
-        (0x1F10, 0x1F15, [8, 0, 8]),
-        (0x1F18, 0x1F1D, [0, -8, 0]),
-        (0x1F20, 0x1F27, [8, 0, 8]),
-        (0x1F28, 0x1F2F, [0, -8, 0]),
-        (0x1F30, 0x1F37, [8, 0, 8]),
-        (0x1F38, 0x1F3F, [0, -8, 0]),
-        (0x1F40, 0x1F45, [8, 0, 8]),
-        (0x1F48, 0x1F4D, [0, -8, 0]),
-        (0x1F51, 0x1F51, [8, 0, 8]),
-        (0x1F53, 0x1F53, [8, 0, 8]),
-        (0x1F55, 0x1F55, [8, 0, 8]),
-        (0x1F57, 0x1F57, [8, 0, 8]),
-        (0x1F59, 0x1F59, [0, -8, 0]),
-        (0x1F5B, 0x1F5B, [0, -8, 0]),
-        (0x1F5D, 0x1F5D, [0, -8, 0]),
-        (0x1F5F, 0x1F5F, [0, -8, 0]),
-        (0x1F60, 0x1F67, [8, 0, 8]),
-        (0x1F68, 0x1F6F, [0, -8, 0]),
-        (0x1F70, 0x1F71, [74, 0, 74]),
-        (0x1F72, 0x1F75, [86, 0, 86]),
-        (0x1F76, 0x1F77, [100, 0, 100]),
-        (0x1F78, 0x1F79, [128, 0, 128]),
-        (0x1F7A, 0x1F7B, [112, 0, 112]),
-        (0x1F7C, 0x1F7D, [126, 0, 126]),
-        (0x1F80, 0x1F87, [8, 0, 8]),
-        (0x1F88, 0x1F8F, [0, -8, 0]),
-        (0x1F90, 0x1F97, [8, 0, 8]),
-        (0x1F98, 0x1F9F, [0, -8, 0]),
-        (0x1FA0, 0x1FA7, [8, 0, 8]),
-        (0x1FA8, 0x1FAF, [0, -8, 0]),
-        (0x1FB0, 0x1FB1, [8, 0, 8]),
-        (0x1FB3, 0x1FB3, [9, 0, 9]),
-        (0x1FB8, 0x1FB9, [0, -8, 0]),
-        (0x1FBA, 0x1FBB, [0, -74, 0]),
-        (0x1FBC, 0x1FBC, [0, -9, 0]),
-        (0x1FBE, 0x1FBE, [-7205, 0, -7205]),
-        (0x1FC3, 0x1FC3, [9, 0, 9]),
-        (0x1FC8, 0x1FCB, [0, -86, 0]),
-        (0x1FCC, 0x1FCC, [0, -9, 0]),
-        (0x1FD0, 0x1FD1, [8, 0, 8]),
-        (0x1FD8, 0x1FD9, [0, -8, 0]),
-        (0x1FDA, 0x1FDB, [0, -100, 0]),
-        (0x1FE0, 0x1FE1, [8, 0, 8]),
-        (0x1FE5, 0x1FE5, [7, 0, 7]),
-        (0x1FE8, 0x1FE9, [0, -8, 0]),
-        (0x1FEA, 0x1FEB, [0, -112, 0]),
-        (0x1FEC, 0x1FEC, [0, -7, 0]),
-        (0x1FF3, 0x1FF3, [9, 0, 9]),
-        (0x1FF8, 0x1FF9, [0, -128, 0]),
-        (0x1FFA, 0x1FFB, [0, -126, 0]),
-        (0x1FFC, 0x1FFC, [0, -9, 0]),
-        (0x2126, 0x2126, [0, -7517, 0]),
-        (0x212A, 0x212A, [0, -8383, 0]),
-        (0x212B, 0x212B, [0, -8262, 0]),
-        (0x2132, 0x2132, [0, 28, 0]),
-        (0x214E, 0x214E, [-28, 0, -28]),
-        (0x2160, 0x216F, [0, 16, 0]),
-        (0x2170, 0x217F, [-16, 0, -16]),
-        (0x2183, 0x2184, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x24B6, 0x24CF, [0, 26, 0]),
-        (0x24D0, 0x24E9, [-26, 0, -26]),
-        (0x2C00, 0x2C2F, [0, 48, 0]),
-        (0x2C30, 0x2C5F, [-48, 0, -48]),
-        (0x2C60, 0x2C61, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x2C62, 0x2C62, [0, -10743, 0]),
-        (0x2C63, 0x2C63, [0, -3814, 0]),
-        (0x2C64, 0x2C64, [0, -10727, 0]),
-        (0x2C65, 0x2C65, [-10795, 0, -10795]),
-        (0x2C66, 0x2C66, [-10792, 0, -10792]),
-        (0x2C67, 0x2C6C, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x2C6D, 0x2C6D, [0, -10780, 0]),
-        (0x2C6E, 0x2C6E, [0, -10749, 0]),
-        (0x2C6F, 0x2C6F, [0, -10783, 0]),
-        (0x2C70, 0x2C70, [0, -10782, 0]),
-        (0x2C72, 0x2C73, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x2C75, 0x2C76, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x2C7E, 0x2C7F, [0, -10815, 0]),
-        (0x2C80, 0x2CE3, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x2CEB, 0x2CEE, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x2CF2, 0x2CF3, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0x2D00, 0x2D25, [-7264, 0, -7264]),
-        (0x2D27, 0x2D27, [-7264, 0, -7264]),
-        (0x2D2D, 0x2D2D, [-7264, 0, -7264]),
-        (0xA640, 0xA66D, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA680, 0xA69B, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA722, 0xA72F, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA732, 0xA76F, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA779, 0xA77C, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA77D, 0xA77D, [0, -35332, 0]),
-        (0xA77E, 0xA787, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA78B, 0xA78C, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA78D, 0xA78D, [0, -42280, 0]),
-        (0xA790, 0xA793, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA794, 0xA794, [48, 0, 48]),
-        (0xA796, 0xA7A9, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA7AA, 0xA7AA, [0, -42308, 0]),
-        (0xA7AB, 0xA7AB, [0, -42319, 0]),
-        (0xA7AC, 0xA7AC, [0, -42315, 0]),
-        (0xA7AD, 0xA7AD, [0, -42305, 0]),
-        (0xA7AE, 0xA7AE, [0, -42308, 0]),
-        (0xA7B0, 0xA7B0, [0, -42258, 0]),
-        (0xA7B1, 0xA7B1, [0, -42282, 0]),
-        (0xA7B2, 0xA7B2, [0, -42261, 0]),
-        (0xA7B3, 0xA7B3, [0, 928, 0]),
-        (0xA7B4, 0xA7C3, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA7C4, 0xA7C4, [0, -48, 0]),
-        (0xA7C5, 0xA7C5, [0, -42307, 0]),
-        (0xA7C6, 0xA7C6, [0, -35384, 0]),
-        (0xA7C7, 0xA7CA, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA7D0, 0xA7D1, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA7D6, 0xA7D9, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xA7F5, 0xA7F6, [UPPER_LOWER, UPPER_LOWER, UPPER_LOWER]),
-        (0xAB53, 0xAB53, [-928, 0, -928]),
-        (0xAB70, 0xABBF, [-38864, 0, -38864]),
-        (0xFF21, 0xFF3A, [0, 32, 0]),
-        (0xFF41, 0xFF5A, [-32, 0, -32]),
-        (0x10400, 0x10427, [0, 40, 0]),
-        (0x10428, 0x1044F, [-40, 0, -40]),
-        (0x104B0, 0x104D3, [0, 40, 0]),
-        (0x104D8, 0x104FB, [-40, 0, -40]),
-        (0x10570, 0x1057A, [0, 39, 0]),
-        (0x1057C, 0x1058A, [0, 39, 0]),
-        (0x1058C, 0x10592, [0, 39, 0]),
-        (0x10594, 0x10595, [0, 39, 0]),
-        (0x10597, 0x105A1, [-39, 0, -39]),
-        (0x105A3, 0x105B1, [-39, 0, -39]),
-        (0x105B3, 0x105B9, [-39, 0, -39]),
-        (0x105BB, 0x105BC, [-39, 0, -39]),
-        (0x10C80, 0x10CB2, [0, 64, 0]),
-        (0x10CC0, 0x10CF2, [-64, 0, -64]),
-        (0x118A0, 0x118BF, [0, 32, 0]),
-        (0x118C0, 0x118DF, [-32, 0, -32]),
-        (0x16E40, 0x16E5F, [0, 32, 0]),
-        (0x16E60, 0x16E7F, [-32, 0, -32]),
-        (0x1E900, 0x1E921, [0, 34, 0]),
-        (0x1E922, 0x1E943, [-34, 0, -34]),
-    ];
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // Go: unicode/tables.go caseOrbit
-    static CASE_ORBIT: [FoldPair; 88] = [
-        (0x004B, 0x006B),
-        (0x0053, 0x0073),
-        (0x006B, 0x212A),
-        (0x0073, 0x017F),
-        (0x00B5, 0x039C),
-        (0x00C5, 0x00E5),
-        (0x00DF, 0x1E9E),
-        (0x00E5, 0x212B),
-        (0x0130, 0x0130),
-        (0x0131, 0x0131),
-        (0x017F, 0x0053),
-        (0x01C4, 0x01C5),
-        (0x01C5, 0x01C6),
-        (0x01C6, 0x01C4),
-        (0x01C7, 0x01C8),
-        (0x01C8, 0x01C9),
-        (0x01C9, 0x01C7),
-        (0x01CA, 0x01CB),
-        (0x01CB, 0x01CC),
-        (0x01CC, 0x01CA),
-        (0x01F1, 0x01F2),
-        (0x01F2, 0x01F3),
-        (0x01F3, 0x01F1),
-        (0x0345, 0x0399),
-        (0x0392, 0x03B2),
-        (0x0395, 0x03B5),
-        (0x0398, 0x03B8),
-        (0x0399, 0x03B9),
-        (0x039A, 0x03BA),
-        (0x039C, 0x03BC),
-        (0x03A0, 0x03C0),
-        (0x03A1, 0x03C1),
-        (0x03A3, 0x03C2),
-        (0x03A6, 0x03C6),
-        (0x03A9, 0x03C9),
-        (0x03B2, 0x03D0),
-        (0x03B5, 0x03F5),
-        (0x03B8, 0x03D1),
-        (0x03B9, 0x1FBE),
-        (0x03BA, 0x03F0),
-        (0x03BC, 0x00B5),
-        (0x03C0, 0x03D6),
-        (0x03C1, 0x03F1),
-        (0x03C2, 0x03C3),
-        (0x03C3, 0x03A3),
-        (0x03C6, 0x03D5),
-        (0x03C9, 0x2126),
-        (0x03D0, 0x0392),
-        (0x03D1, 0x03F4),
-        (0x03D5, 0x03A6),
-        (0x03D6, 0x03A0),
-        (0x03F0, 0x039A),
-        (0x03F1, 0x03A1),
-        (0x03F4, 0x0398),
-        (0x03F5, 0x0395),
-        (0x0412, 0x0432),
-        (0x0414, 0x0434),
-        (0x041E, 0x043E),
-        (0x0421, 0x0441),
-        (0x0422, 0x0442),
-        (0x042A, 0x044A),
-        (0x0432, 0x1C80),
-        (0x0434, 0x1C81),
-        (0x043E, 0x1C82),
-        (0x0441, 0x1C83),
-        (0x0442, 0x1C84),
-        (0x044A, 0x1C86),
-        (0x0462, 0x0463),
-        (0x0463, 0x1C87),
-        (0x1C80, 0x0412),
-        (0x1C81, 0x0414),
-        (0x1C82, 0x041E),
-        (0x1C83, 0x0421),
-        (0x1C84, 0x1C85),
-        (0x1C85, 0x0422),
-        (0x1C86, 0x042A),
-        (0x1C87, 0x0462),
-        (0x1C88, 0xA64A),
-        (0x1E60, 0x1E61),
-        (0x1E61, 0x1E9B),
-        (0x1E9B, 0x1E60),
-        (0x1E9E, 0x00DF),
-        (0x1FBE, 0x0345),
-        (0x2126, 0x03A9),
-        (0x212A, 0x004B),
-        (0x212B, 0x00C5),
-        (0xA64A, 0xA64B),
-        (0xA64B, 0x1C88),
-    ];
+    // go1.27.1 `unicodeTable` (regexp/syntax/parse.go:1720) also finds a
+    // script by its canonical name, so `\p{Old_Italic}` compiles. go1.26.8
+    // said "invalid character class range". Garay is a Unicode 16.0 script.
+    #[test]
+    fn script_names_match_inexactly() {
+        for p in [r"\p{Old_Italic}", r"\p{olditalic}"] {
+            let re = compile_exported(p).expect(p);
+            assert!(re.match_string("\u{10300}"), "{p}");
+            assert!(!re.match_string("\u{264}"), "{p}");
+        }
+        let re = compile_exported(r"\p{Garay}").expect("Garay");
+        assert!(re.match_string("\u{10D40}"));
+    }
 
-    // Go: unicode/tables.go asciiFold
-    static ASCII_FOLD: [u16; 128] = [
-        0x0000, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008, 0x0009, 0x000A,
-        0x000B, 0x000C, 0x000D, 0x000E, 0x000F, 0x0010, 0x0011, 0x0012, 0x0013, 0x0014, 0x0015,
-        0x0016, 0x0017, 0x0018, 0x0019, 0x001A, 0x001B, 0x001C, 0x001D, 0x001E, 0x001F, 0x0020,
-        0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027, 0x0028, 0x0029, 0x002A, 0x002B,
-        0x002C, 0x002D, 0x002E, 0x002F, 0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036,
-        0x0037, 0x0038, 0x0039, 0x003A, 0x003B, 0x003C, 0x003D, 0x003E, 0x003F, 0x0040, 0x0061,
-        0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067, 0x0068, 0x0069, 0x006A, 0x006B, 0x006C,
-        0x006D, 0x006E, 0x006F, 0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,
-        0x0078, 0x0079, 0x007A, 0x005B, 0x005C, 0x005D, 0x005E, 0x005F, 0x0060, 0x0041, 0x0042,
-        0x0043, 0x0044, 0x0045, 0x0046, 0x0047, 0x0048, 0x0049, 0x004A, 0x212A, 0x004C, 0x004D,
-        0x004E, 0x004F, 0x0050, 0x0051, 0x0052, 0x017F, 0x0054, 0x0055, 0x0056, 0x0057, 0x0058,
-        0x0059, 0x005A, 0x007B, 0x007C, 0x007D, 0x007E, 0x007F,
-    ];
+    // go1.27.1 SimpleFold (Unicode 17.0.0) folds U+A7CB and U+0264.
+    #[test]
+    fn case_folding_uses_unicode_17() {
+        let re = compile_exported(r"(?i)\x{A7CB}").expect("compile");
+        assert!(re.match_string("\u{264}"));
+    }
 }
