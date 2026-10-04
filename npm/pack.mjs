@@ -7,8 +7,17 @@
 // Go's local build does. With --native-bin it adds one thing to the main package: the
 // postinstall npm/install.js (as lib/install.js), which swaps bin/tsc for the native tsc.
 //
-// usage: node npm/pack.mjs --layout <typescript|typescript-go> --go-dir <dir> --exe <tsc>
+// PORT: not in Go. `--name tsc-rs` writes the port's own package set from the same input:
+// `tsc-rs` (bin `tsc-rs`, npm/getExePath.js as lib/getExePath.js, npm/tsc-rs-readme.md) and one
+// platform package `@tsc-rs/<os>-<arch>` per --exe. The default name `typescript` is Go's set.
+//
+// usage: node npm/pack.mjs --layout <typescript|typescript-go> --go-dir <dir> --exe <tsc>...
 //          --libs <dir> --dist <dir> --version <v> --git-head <sha> --out <dir> [--native-bin]
+//          [--name <typescript|tsc-rs>]
+//
+// --exe is <os>-<arch>=<tsc> (Node's process.platform and process.arch, for example
+// darwin-arm64=<path>), or a plain <tsc> for linux-x64. Repeat it for more platforms. It is not
+// run here, so a cross-built tsc works.
 //
 // --layout is the pin layout (scripts/upstream/pin.py). "typescript" (microsoft/TypeScript, pin N
 // on): --go-dir is <repo>/tsc, the input is <repo>/packages/typescript (it already has bin/tsc and
@@ -23,7 +32,8 @@ const { values: args } = parseArgs({
     options: {
         layout: { type: "string" },
         "go-dir": { type: "string" },
-        exe: { type: "string" },
+        exe: { type: "string", multiple: true },
+        name: { type: "string", default: "typescript" },
         libs: { type: "string" },
         dist: { type: "string" },
         version: { type: "string" },
@@ -36,24 +46,33 @@ const { values: args } = parseArgs({
 for (const name of ["layout", "go-dir", "exe", "libs", "dist", "version", "git-head", "out"]) {
     if (!args[name]) throw new Error(`missing --${name}`);
 }
-const { layout, "go-dir": goDir, exe, libs, dist, version, "git-head": gitHead, out } = args;
+const { layout, "go-dir": goDir, libs, dist, version, "git-head": gitHead, out, name } = args;
 if (layout !== "typescript" && layout !== "typescript-go") throw new Error(`unknown --layout ${layout}`);
+if (name !== "typescript" && name !== "tsc-rs") throw new Error(`unknown --name ${name}`);
+const asTypescript = name === "typescript";
+const binName = asTypescript ? "tsc" : name;
 const atN = layout === "typescript";
 const root = atN ? path.dirname(goDir) : goDir;
 const inputDir = atN ? path.join(root, "packages", "typescript") : path.join(goDir, "_packages", "native-preview");
 const licenseFile = path.join(root, atN ? "LICENSE.txt" : "LICENSE");
 const noticeFile = path.join(root, "NOTICE.txt");
 
-// Go: Herebyfile.mjs getPlatforms (local build: only the current platform).
-const nodeOs = "linux";
-const nodeArch = "x64";
-if (process.platform !== nodeOs || process.arch !== nodeArch) {
-    throw new Error(`only ${nodeOs}-${nodeArch} is supported, not ${process.platform}-${process.arch}`);
-}
-const platformPackageName = `@typescript/typescript-${nodeOs}-${nodeArch}`;
+// Go: Herebyfile.mjs getPlatforms. PORT: the platforms are the --exe values, not only the current
+// platform as in Go's local build.
+const platforms = args.exe.map(value => {
+    const match = value.match(/^([a-z0-9]+)-([a-z0-9]+)=(.+)$/);
+    const [nodeOs, nodeArch, exe] = match ? match.slice(1) : ["linux", "x64", value];
+    return {
+        nodeOs,
+        nodeArch,
+        exe,
+        packageName: asTypescript ? `@typescript/typescript-${nodeOs}-${nodeArch}` : `@${name}/${nodeOs}-${nodeArch}`,
+    };
+});
 
 // Go: Herebyfile.mjs getPublishTag (publishAsTypescript). Go's nativePreviewReleaseVersion is
 // undefined at both layouts, so a version with no dev, beta or rc part is refused.
+// PORT: tsc-rs has no such rule; `npm publish --tag` picks its tag.
 function publishTag() {
     const match = version.match(/-(dev|beta|rc)(?:[.-]|$)/);
     if (match?.[1]) return match[1] === "dev" ? "next" : match[1];
@@ -76,26 +95,38 @@ const input = JSON.parse(fs.readFileSync(path.join(inputDir, "package.json"), "u
 input.version = version;
 delete input.private;
 input.files = [...new Set([...(input.files ?? []), "NOTICE.txt"])];
-input.bin = { tsc: "./bin/tsc" };
-input.description = "TypeScript is a language for application scale JavaScript development";
-input.homepage = "https://www.typescriptlang.org/";
-input.keywords = ["TypeScript", "Microsoft", "compiler", "language", "javascript"];
-input.bugs = { url: "https://github.com/microsoft/TypeScript/issues" };
-input.repository = { type: "git", url: "https://github.com/microsoft/TypeScript.git" };
+input.bin = { [binName]: `./bin/${binName}` };
+if (asTypescript) {
+    input.description = "TypeScript is a language for application scale JavaScript development";
+    input.homepage = "https://www.typescriptlang.org/";
+    input.keywords = ["TypeScript", "Microsoft", "compiler", "language", "javascript"];
+    input.bugs = { url: "https://github.com/microsoft/TypeScript/issues" };
+    input.repository = { type: "git", url: "https://github.com/microsoft/TypeScript.git" };
+}
+else {
+    // PORT: the port's own package. LICENSE and NOTICE.txt stay TypeScript's (Apache-2.0).
+    input.author = "Theo Browne";
+    input.description = "A Rust port of the TypeScript 7 compiler";
+    input.keywords = ["typescript", "tsc", "compiler", "rust"];
+    delete input.homepage;
+    delete input.bugs;
+    delete input.repository;
+}
 delete input.scripts;
 delete input.devDependencies;
 for (const field of ["exports", "imports"]) input[field] = stripConditions(input[field]);
 input.gitHead = gitHead;
-input.publishConfig = { access: "public", tag: publishTag() };
+input.publishConfig = asTypescript ? { access: "public", tag: publishTag() } : { access: "public" };
 
 fs.rmSync(out, { recursive: true, force: true });
 
-// The main package `typescript`.
-const mainDir = path.join(out, "typescript");
+// The main package (`typescript`, or `tsc-rs`).
+const mainDir = path.join(out, name);
+const here = path.dirname(fileURLToPath(import.meta.url));
 const mainPackage = {
     ...input,
-    name: "typescript",
-    optionalDependencies: { [platformPackageName]: version },
+    name,
+    optionalDependencies: Object.fromEntries(platforms.map(p => [p.packageName, version])),
 };
 if (atN) {
     // Go copies the whole input but node_modules and dist; its filter sees the path from the repo.
@@ -115,43 +146,52 @@ else {
     fs.renameSync(path.join(mainDir, "lib", "tsgo.js"), path.join(mainDir, "lib", "tsc.js"));
 }
 fs.cpSync(dist, path.join(mainDir, "dist"), { recursive: true });
-fs.writeFileSync(path.join(mainDir, "bin", "tsc"), '#!/usr/bin/env node\nimport "../lib/tsc.js";\n');
-fs.chmodSync(path.join(mainDir, "bin", "tsc"), 0o755);
-fs.copyFileSync(path.join(inputDir, "typescript-package-readme.md"), path.join(mainDir, "README.md"));
+fs.rmSync(path.join(mainDir, "bin"), { recursive: true, force: true });
+fs.mkdirSync(path.join(mainDir, "bin"));
+fs.writeFileSync(path.join(mainDir, "bin", binName), '#!/usr/bin/env node\nimport "../lib/tsc.js";\n');
+fs.chmodSync(path.join(mainDir, "bin", binName), 0o755);
+if (asTypescript) {
+    fs.copyFileSync(path.join(inputDir, "typescript-package-readme.md"), path.join(mainDir, "README.md"));
+}
+else {
+    fs.copyFileSync(path.join(here, `${name}-readme.md`), path.join(mainDir, "README.md"));
+    fs.copyFileSync(path.join(here, "getExePath.js"), path.join(mainDir, "lib", "getExePath.js"));
+}
 if (args["native-bin"]) {
     // PORT: not in Go. The native bin on POSIX (npm/install.js).
     mainPackage.scripts = { postinstall: "node lib/install.js" };
-    const here = path.dirname(fileURLToPath(import.meta.url));
     fs.copyFileSync(path.join(here, "install.js"), path.join(mainDir, "lib", "install.js"));
 }
 writeJson(path.join(mainDir, "package.json"), mainPackage);
 fs.copyFileSync(licenseFile, path.join(mainDir, "LICENSE"));
 fs.copyFileSync(noticeFile, path.join(mainDir, "NOTICE.txt"));
 
-// The platform package: the lib files and the native tsc in lib/.
-const platformDir = path.join(out, `typescript-${nodeOs}-${nodeArch}`);
-const platformPackage = {
-    ...input,
-    bin: undefined,
-    files: ["lib", "NOTICE.txt"],
-    imports: undefined,
-    dependencies: undefined,
-    name: platformPackageName,
-    os: [nodeOs],
-    cpu: [nodeArch],
-    exports: { "./package.json": "./package.json" },
-};
-fs.cpSync(libs, path.join(platformDir, "lib"), { recursive: true });
-fs.copyFileSync(exe, path.join(platformDir, "lib", "tsc"));
-fs.chmodSync(path.join(platformDir, "lib", "tsc"), 0o755);
-writeJson(path.join(platformDir, "package.json"), platformPackage);
-fs.copyFileSync(licenseFile, path.join(platformDir, "LICENSE"));
-fs.copyFileSync(noticeFile, path.join(platformDir, "NOTICE.txt"));
-fs.writeFileSync(
-    path.join(platformDir, "README.md"),
-    [
-        `# \`${platformPackageName}\``,
-        "",
-        `This package provides ${nodeOs}-${nodeArch} support for [typescript](https://www.npmjs.com/package/typescript).`,
-    ].join("\n") + "\n",
-);
+// The platform packages: the lib files and the native tsc in lib/.
+for (const { nodeOs, nodeArch, exe, packageName } of platforms) {
+    const platformDir = path.join(out, `${name}-${nodeOs}-${nodeArch}`);
+    const platformPackage = {
+        ...input,
+        bin: undefined,
+        files: ["lib", "NOTICE.txt"],
+        imports: undefined,
+        dependencies: undefined,
+        name: packageName,
+        os: [nodeOs],
+        cpu: [nodeArch],
+        exports: { "./package.json": "./package.json" },
+    };
+    fs.cpSync(libs, path.join(platformDir, "lib"), { recursive: true });
+    fs.copyFileSync(exe, path.join(platformDir, "lib", "tsc"));
+    fs.chmodSync(path.join(platformDir, "lib", "tsc"), 0o755);
+    writeJson(path.join(platformDir, "package.json"), platformPackage);
+    fs.copyFileSync(licenseFile, path.join(platformDir, "LICENSE"));
+    fs.copyFileSync(noticeFile, path.join(platformDir, "NOTICE.txt"));
+    fs.writeFileSync(
+        path.join(platformDir, "README.md"),
+        [
+            `# \`${packageName}\``,
+            "",
+            `This package provides ${nodeOs}-${nodeArch} support for [${name}](https://www.npmjs.com/package/${name}).`,
+        ].join("\n") + "\n",
+    );
+}
