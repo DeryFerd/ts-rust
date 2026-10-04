@@ -1506,6 +1506,13 @@ impl Checker {
             .flags
             .intersects(TypeFlags::TEMPLATE_LITERAL)
         {
+            // PERF (chkmid1): most pairs fail the start and end text test,
+            // so it runs before the template and the comparer are cloned.
+            if self.ty(t).flags.intersects(TypeFlags::STRING_LITERAL)
+                && self.string_literal_misses_template_literal_ends(t, template)
+            {
+                return false;
+            }
             let template_literal = self.ty(template).as_template_literal_type().clone();
             let comparer = self.compare_types_assignable.clone();
             return self.is_type_matched_by_template_literal_type(
