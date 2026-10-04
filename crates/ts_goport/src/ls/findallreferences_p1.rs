@@ -474,11 +474,11 @@ pub fn get_range_of_node(node: Node, mut source_file: Node, end_node: Node) -> T
     // unterminated literal can end in a marker unit (see
     // `GO_STRING_MARKER`), which has more port bytes than Go bytes, so a
     // port length of 2 or less is also a Go length of 2 or less.
-    // PERF: `go_len` reads only the literal (both ends are token bounds, so
-    // char boundaries), not the file text before it.
+    // PERF: `go_len_of_literal` reads only the literal, not the file text
+    // before it.
     if is_string_literal_like(node) && end - start > 2 {
         let text = source_file_text(source_file);
-        if go_len(&text[start as usize..end as usize]) > 2 {
+        if go_len_of_literal(&text, start as usize, end as usize) > 2 {
             if end_node.is_some() {
                 crate::core::go_panic("endNode is not nil for stringLiteralLike".to_string());
             }
@@ -490,6 +490,20 @@ pub fn get_range_of_node(node: Node, mut source_file: Node, end_node: Node) -> T
         end = end_node.pos();
     }
     TextRange::new(start, end)
+}
+
+/// Go `end - start` for the literal at port offsets `start` to `end` of the
+/// port form `text`: its length in Go bytes. `start` is the literal's quote.
+/// `end` can be inside a char: Go cuts an unterminated JSDoc comment at the
+/// end of the file 2 bytes early (parser/jsdoc.go:163), so a literal in it
+/// can end in the first bytes of the file's last char or unit
+/// (`jsdoc_text_cut`). An end `k` bytes into a unit of `g` Go bytes counts
+/// `min(k, g)` of them, as `go_byte_offset` does.
+fn go_len_of_literal(text: &str, start: usize, end: usize) -> usize {
+    match crate::scanner_util::go_unit_cut_at(text, end) {
+        Some((at, unit, _)) => go_len(&text[start..at]) + (end - at).min(unit.go_len()),
+        None => go_len(&text[start..end]),
+    }
 }
 
 // Go: ls/findallreferences.go:354 isValidReferencePosition
