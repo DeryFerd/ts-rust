@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Generate the Go Unicode data of crates/ts_goport/src/gostd from the Go that
-# the pin N oracle uses: go1.27.1 (`unicode`, Unicode 17.0.0) and
-# golang.org/x/text v0.42.0 (`unicode/norm`, tables17.0.0.go).
+# the pin N oracle uses: go1.27.1 (`unicode`, Unicode 17.0.0, and the
+# `strconv` IsPrint tables) and golang.org/x/text v0.42.0 (`unicode/norm`,
+# tables17.0.0.go).
 #
 #   gen.sh help    print this text
-#   gen.sh         write gostd/unicode_tables.rs and gostd/data/norm_*.bin
-#                  of the checkout that holds this script
+#   gen.sh         write gostd/unicode_tables.rs, gostd/strconv_isprint.rs and
+#                  gostd/data/norm_*.bin of the checkout that holds this script
 #
 # Steps:
-#   1. go1.27.1 runs main.go: writes unicode_tables.rs and a text dump.
+#   1. go1.27.1 runs main.go: writes unicode_tables.rs and a text dump, and
+#      strconv_isprint.rs from src/strconv/isprint.go (checked against
+#      strconv.IsPrint and strconv.IsGraphic for every rune).
 #   2. rustc builds checkrs/main.rs with unicode_tables.rs as a module (no
 #      cargo, no crate target dir) and prints the same dump. rustfmt formats
 #      the file. The two dumps must be equal.
@@ -51,8 +54,8 @@ export GOTOOLCHAIN=local GOFLAGS= GO111MODULE=on GOPROXY=off GOWORK=off
 
 # 1 and 2: unicode_tables.rs.
 OUT="$GOSTD/unicode_tables.rs"
-(cd "$HERE" && "$GO" run main.go -out "$OUT" -dump "$WORK/go-dump.txt")
-rustfmt --edition 2024 "$OUT"
+(cd "$HERE" && "$GO" run main.go -out "$OUT" -dump "$WORK/go-dump.txt" -isprint "$GOSTD/strconv_isprint.rs")
+rustfmt --edition 2024 "$OUT" "$GOSTD/strconv_isprint.rs"
 cat >"$WORK/checkrs_main.rs" <<RS
 #[path = "$OUT"]
 #[allow(dead_code)]
