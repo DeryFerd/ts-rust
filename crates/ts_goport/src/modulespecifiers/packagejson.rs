@@ -303,7 +303,7 @@ fn expected_string_map(v: JSONValue) -> Expected<IndexMap<String, String>> {
 pub struct PackageJson {
     pub fields: Fields,
     pub parseable: bool,
-    version_paths: std::cell::OnceCell<VersionPaths>,
+    version_paths: std::sync::OnceLock<VersionPaths>,
 }
 
 impl PackageJson {
@@ -311,7 +311,7 @@ impl PackageJson {
         PackageJson {
             fields,
             parseable,
-            version_paths: std::cell::OnceCell::new(),
+            version_paths: std::sync::OnceLock::new(),
         }
     }
 

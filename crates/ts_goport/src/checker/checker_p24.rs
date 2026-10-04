@@ -912,33 +912,91 @@ impl Checker {
     }
 
     // Go: checker/checker.go:22216 somePropertyReducesToNever
-    // PORT: Go ranges over a map, so its order is random. Here the counts keep
-    // the order in which each name is first seen (constituent order, then
-    // property order), so the result and the types it makes are deterministic.
+    // PORT: Go ranges over a map, so its order is random. Every order gives
+    // the same answer; the order only decides how many synthetic properties
+    // are made before the first match. The port's order is deterministic:
+    // first the names that are not a public method in some constituent, then
+    // the names that are a public method in every constituent, each group in
+    // the order in which the names are first seen (constituent order, then
+    // property order). A method's type is a function type, never a literal
+    // type, so a method is no discriminant. A method reduces to never only as
+    // a conflicting private member, so a method that can be private (the
+    // `getDeclarationModifierFlagsFromSymbol` test that sets
+    // `CheckFlagsContainsPrivate`) stays in the first group, and a
+    // conflicting private method is found as early as in first-seen order.
+    // A `#private` name sets no such flag and is unique to its class, so it is
+    // no conflicting private member. In first-seen order alone, the `length`
+    // of a tuple intersection (`[] & [a: A] & ...`) came after the array
+    // methods, and the mongodb test check made 2.2 times Go's symbols.
+    // PERF: the counts are keyed by the name id with FxHash, and each lookup
+    // passes the `Name`, so no name text is hashed, compared or copied (Go
+    // hashes the text).
     pub fn some_property_reduces_to_never(&mut self, t: TypeId) -> bool {
         // Collect declaration counts for each property across all constituent types of the intersection.
-        let mut counts: IndexMap<Name, i32> = IndexMap::new();
-        let types = self.ty(t).types().to_vec();
-        for u in types {
+        // PORT: with each count, whether every declaration of the name is a
+        // public method (`is_public_method`), and the parent of the first
+        // declaration.
+        // PERF: a name seen again with the parent of its first declaration is
+        // not tested again. It is almost always the same member (an instance
+        // and a static member of one class can share a name), and the order
+        // changes no answer. The tuples of an intersection share the parent
+        // of their array methods, so this saves a test for each method of
+        // each tuple (mongodb test check: 6.5% more instructions than without
+        // the test, 1.6% with this).
+        let mut counts: FxIndexMap<u32, (i32, bool, SymbolId)> = FxIndexMap::default();
+        for i in 0..self.ty(t).types().len() {
+            let u = self.type_at(t, i);
             let props = self.get_properties_of_type(u);
             for &prop in props.iter() {
-                *counts.entry(self.sym(prop).name.clone()).or_insert(0) += 1;
+                let symbol = self.sym(prop);
+                match counts.entry(symbol.name.id()) {
+                    indexmap::map::Entry::Occupied(entry) => {
+                        let entry = entry.into_mut();
+                        entry.0 += 1;
+                        if entry.1 && symbol.parent != entry.2 {
+                            entry.1 = self.is_public_method(prop);
+                        }
+                    }
+                    indexmap::map::Entry::Vacant(entry) => {
+                        entry.insert((1, self.is_public_method(prop), symbol.parent));
+                    }
+                }
             }
         }
         // Check if any property appears in more than one constituent type and reduces to 'never'.
-        for (prop_name, count) in counts {
-            if count > 1 {
-                let prop = self.get_property_of_union_or_intersection_type(
-                    t,
-                    prop_name.as_str(),
-                    true, /*skipObjectFunctionPropertyAugment*/
-                );
-                if prop.is_some() && self.is_never_reduced_property(prop) {
-                    return true;
+        for public_methods in [false, true] {
+            for (&id, &(count, all_public_methods, _)) in &counts {
+                if count > 1 && all_public_methods == public_methods {
+                    let prop_name = Name::from_id(id);
+                    let prop = self.get_property_of_union_or_intersection_type_key(
+                        t,
+                        TableKey::Name(&prop_name),
+                        true, /*skipObjectFunctionPropertyAugment*/
+                    );
+                    if prop.is_some() && self.is_never_reduced_property(prop) {
+                        return true;
+                    }
                 }
             }
         }
         false
+    }
+
+    /// Whether `prop` is a method that cannot be private, for the name order
+    /// of `some_property_reduces_to_never`.
+    // PORT: no Go counterpart. A method is never synthetic, and Go
+    // `getDeclarationModifierFlagsFromSymbol` drops the accessibility
+    // modifiers of a member whose parent is no class, so only a class method
+    // needs the modifier test. A method that is also a property takes the
+    // property's type, so it does not count as a method.
+    fn is_public_method(&self, prop: SymbolId) -> bool {
+        let symbol = self.sym(prop);
+        symbol.flags & (SymbolFlags::METHOD | SymbolFlags::PROPERTY) == SymbolFlags::METHOD
+            && !(symbol.parent.is_some()
+                && self.sym(symbol.parent).flags.intersects(SymbolFlags::CLASS)
+                && self
+                    .get_declaration_modifier_flags_from_symbol(prop)
+                    .intersects(ModifierFlags::PRIVATE))
     }
 
     // Go: checker/checker.go:22235 getReducedUnionType

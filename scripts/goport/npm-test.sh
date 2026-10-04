@@ -2,8 +2,10 @@
 # Installs an npm-pack.sh package set into a fresh project and checks that tsc through npm gives
 # the same output as the native tsc run directly.
 #
-# usage: npm-test.sh <pkg-dir> <work-dir>
-#   <pkg-dir>   npm-pack.sh output (the two .tgz files)
+# usage: npm-test.sh [--name tsc-rs] <pkg-dir> <work-dir>
+#   --name      the package set of npm-pack.sh --name (default typescript). tsc-rs: the main package
+#               tsc-rs, bin tsc-rs, platform package @tsc-rs/linux-x64.
+#   <pkg-dir>   npm-pack.sh output (the main and the linux-x64 .tgz files)
 #   <work-dir>  made fresh: <work-dir>/proj (the npm project) and <work-dir>/out (tsc output)
 # Checks:
 #   - bin/tsc: a symlink to the platform package's tsc when the package has the postinstall
@@ -15,12 +17,21 @@
 # Prints one line per check and ends with "npm-test: PASS" or "npm-test: FAIL (<n>)".
 set -uo pipefail
 repo=/home/theo/Code/sandbox/ts-rust
-[[ $# == 2 ]] || { sed -n '5,7p' "$0" >&2; exit 2; }
+usage() { sed -n '5,9p' "$0" >&2; exit 2; }
+name=typescript
+if [[ ${1:-} == --name ]]; then [[ $# -ge 2 ]] || usage; name=$2; shift 2; fi
+case $name in
+  typescript) plat=@typescript/typescript-linux-x64 bin=tsc ;;
+  tsc-rs) plat=@tsc-rs/linux-x64 bin=tsc-rs ;;
+  *) usage ;;
+esac
+[[ $# == 2 ]] || usage
 pkg=$(realpath "$1") work=$(realpath -m "$2")
 proj="$work/proj" out="$work/out"
 rm -rf "$work"
 mkdir -p "$proj" "$out"
-tgz=("$pkg"/typescript-typescript-linux-x64-*.tgz "$pkg"/typescript-[0-9]*.tgz)
+plat_tgz=${plat#@}
+tgz=("$pkg/${plat_tgz/\//-}"-*.tgz "$pkg/$name"-[0-9]*.tgz)
 [[ ${#tgz[@]} == 2 && -f ${tgz[0]} && -f ${tgz[1]} ]] || { echo "no package set in $pkg" >&2; exit 2; }
 echo '{"name":"npm-test","private":true}' > "$proj/package.json"
 (cd "$proj" && npm install --offline --no-audit --no-fund --silent "${tgz[@]}") || { echo "npm install failed" >&2; exit 1; }
@@ -30,15 +41,15 @@ check() { # check <name> <ok 0|1> [detail]
   if [[ $2 == 0 ]]; then echo "ok   $1"; else echo "FAIL $1${3:+: $3}"; fails=$((fails + 1)); fi
 }
 nm="$proj/node_modules"
-direct="$nm/@typescript/typescript-linux-x64/lib/tsc"
-declare -A ways=([direct]="$direct" [npm]="$nm/.bin/tsc" [js]="node $nm/typescript/lib/tsc.js")
+direct="$nm/$plat/lib/tsc"
+declare -A ways=([direct]="$direct" [npm]="$nm/.bin/$bin" [js]="node $nm/$name/lib/tsc.js")
 
-if grep -q '"postinstall"' "$nm/typescript/package.json"; then
-  [[ -L $nm/typescript/bin/tsc && $(realpath "$nm/typescript/bin/tsc") == "$(realpath "$direct")" ]]
-  check "bin/tsc is a symlink to the platform tsc" $? "$(ls -l "$nm/typescript/bin/tsc")"
+if grep -q '"postinstall"' "$nm/$name/package.json"; then
+  [[ -L $nm/$name/bin/$bin && $(realpath "$nm/$name/bin/$bin") == "$(realpath "$direct")" ]]
+  check "bin/$bin is a symlink to the platform tsc" $? "$(ls -l "$nm/$name/bin/$bin")"
 else
-  [[ ! -L $nm/typescript/bin/tsc ]] && head -1 "$nm/typescript/bin/tsc" | grep -q node
-  check "bin/tsc is Go's JS launcher" $?
+  [[ ! -L $nm/$name/bin/$bin ]] && head -1 "$nm/$name/bin/$bin" | grep -q node
+  check "bin/$bin is Go's JS launcher" $?
 fi
 
 want=$("$direct" --version)
