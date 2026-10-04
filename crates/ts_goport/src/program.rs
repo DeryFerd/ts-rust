@@ -781,10 +781,22 @@ pub(crate) struct VersionTables {
     file_associations: OnceLock<Vec<usize>>,
     /// Go `Program.declarationDiagnosticCache`.
     declaration_diagnostic_cache: Mutex<FxHashMap<Node, Vec<Diagnostic>>>,
-    /// The file system answers of Go `p.Host().FS()` and of the resolver's
-    /// package.json cache that module specifier generation reads on any
-    /// thread (`with_host_fs_cache`).
+    /// The file system answers of Go `p.Host().FS()`, a `cachedvfs.FS`
+    /// (compiler/host.go:52), that worker threads read
+    /// (`go_frontend::file_exists`). Only its `file_exists` part is used.
+    /// Each version has its own: Go watch gives each build a new host cache
+    /// (execute/watcher.go:431 and :462 `cachedvfs.From`).
     host_fs_cache: crate::modulespecifiers::host::HostFsCache,
+    /// The entries of the resolver's package.json cache that module
+    /// specifier generation reads and fills on any thread
+    /// (`with_host_fs_cache`). Only its package.json part is used. A version
+    /// that keeps the frontend resolver of the version it was updated from
+    /// shares it (`go_frontend::build_program`): Go `ReuseProgram` keeps
+    /// `processedFiles` (compiler/program.go:408), so the new program keeps
+    /// the resolver and its cache (compiler/program.go:147-169).
+    // PORT: two `HostFsCache`s, so a version can share the package.json
+    // entries without the `file_exists` answers.
+    package_json_cache: Arc<crate::modulespecifiers::host::HostFsCache>,
     /// The thread-safe copy of the Go frontend data that the checker reads.
     /// None for an alias resolver program. The frontend program itself is
     /// in `FRONTENDS`, on the loading thread only.
@@ -840,6 +852,7 @@ impl VersionTables {
             file_associations: OnceLock::new(),
             declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
             host_fs_cache: Default::default(),
+            package_json_cache: Arc::default(),
             go: None,
             file_versions: Vec::new(),
             bound_symbols: OnceLock::new(),
@@ -2261,12 +2274,13 @@ pub fn file_exists(path: &str) -> bool {
     go_frontend::file_exists(path)
 }
 
-/// Runs `f` with the file system cache of the current program (`prog()`),
+/// Runs `f` with the package.json cache of module specifier generation of
+/// the current program (`prog()`, `VersionTables::package_json_cache`),
 /// which every thread of the program shares.
 pub(crate) fn with_host_fs_cache<R>(
     f: impl FnOnce(&crate::modulespecifiers::host::HostFsCache) -> R,
 ) -> R {
-    with_tables(|tables| f(&tables.host_fs_cache))
+    with_tables(|tables| f(&tables.package_json_cache))
 }
 
 // Go: compiler/program.go:134 GetCurrentDirectory
@@ -2362,11 +2376,12 @@ pub fn get_resolved_project_references() -> Vec<Option<Arc<ResolvedProjectRefere
 }
 
 // Go: compiler/program.go:2300 GetSymlinkCache
-// PORT: the Go frontend program has the port, and this is its value.
+// PORT: the Go frontend program has the port, and this is a copy of its
+// value, built on first use (`go_frontend::known_symlinks`).
 pub fn get_go_symlink_cache() -> Option<Arc<crate::modulespecifiers::symlinks::KnownSymlinks>> {
     // Go: ls/autoimport/aliasresolver.go:143 (unimplemented)
     alias_resolver_unimplemented();
-    Some(with_go(go_frontend::GoSharedState::known_symlinks))
+    Some(go_frontend::known_symlinks())
 }
 
 // Go: compiler/program.go:181 GetSourceOfProjectReferenceIfOutputIncluded
@@ -3110,6 +3125,8 @@ pub(crate) struct WorkerSeed {
 
 impl WorkerSeed {
     pub(crate) fn take() -> Self {
+        // The new thread cannot build them: it has no frontend program.
+        go_frontend::build_lazy_shared_state();
         Self {
             program: prog(),
             tables: current_tables(),

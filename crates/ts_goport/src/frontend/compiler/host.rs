@@ -38,6 +38,16 @@ pub trait CompilerHost {
         path: &Path,
     ) -> Option<Rc<ParsedCommandLine>>;
 
+    /// Runs `f` with no tracking of the file system calls of `fs()`. Only
+    /// the language server's project host tracks them (Go `sourceFS`
+    /// `tracking`); Go stops that when it freezes the host
+    /// (project/compilerhost.go:57), so a lazy program value that Go
+    /// computes after the freeze makes no tracked calls.
+    // PORT: not in Go. Go computes such values on first use.
+    fn without_fs_tracking(&self, f: &mut dyn FnMut()) {
+        f();
+    }
+
     /// True when `fs()` shows the plain OS file system (Go `sys.FS()`,
     /// maybe behind `cachedvfs`), so a parse worker thread reads the same
     /// files, directories and bytes as this host. Then the loader can use
@@ -82,9 +92,11 @@ pub trait CompilerHost {
     /// The files that `get_source_file` gives now from the host's own
     /// cache, with no read and no parse, by name, with their references.
     /// The parse workers of a program load do not parse these files; they
-    /// resolve and queue their references (`FilesParser::parse`). Only the
-    /// `tsc -b` host has such a cache: it shares the parsed `.d.ts` and
-    /// `.json` files between the programs of a build.
+    /// resolve and queue their references (`FilesParser::parse`). When the
+    /// map has every root file, the load starts no worker. The `tsc -b`
+    /// host shares the parsed `.d.ts` and `.json` files between the
+    /// programs of a build; the language server's project host has the
+    /// session's parse cache.
     // PORT: not in Go (see `prefetch_parses`). A name, not the full parse
     // options: the workers only guess the options. A cached parse with
     // other options is a cache miss, and the loader then parses the file

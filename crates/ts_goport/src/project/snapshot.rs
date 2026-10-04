@@ -964,6 +964,7 @@ impl Snapshot {
             store.content_mapped_parse_cache.clone(),
             store.extended_config_cache.clone(),
             store.content_mapper_host.clone(),
+            store.resolve_ahead_stash.clone(),
             client,
         );
 
@@ -1225,6 +1226,42 @@ impl Snapshot {
                         );
                 }
             }
+        }
+        // PORT: not in Go. A program that this clone made for a project that
+        // it then deleted or updated again is in no snapshot, so `dispose`
+        // never frees it, and its host still holds the builder (the
+        // `Project -> host -> builder` cycle). Go's GC frees it. The port
+        // freezes its host and frees its checker pool and program version,
+        // as `dispose` does for a program that no snapshot holds. Its parse
+        // cache counts stay, as in Go (no snapshot derefs them). The host of
+        // a project that the clone deleted gives its resolve-ahead keys to
+        // the stash, for a later clone that makes the project again
+        // (`ResolveAheadStash`).
+        let projects = new_snapshot.project_collection.projects();
+        let kept: FxHashSet<*const compiler::NewProgram> = projects
+            .iter()
+            .filter_map(|project| project.borrow().program.as_ref().map(Rc::as_ptr))
+            .collect();
+        let kept_configs: FxHashSet<tspath::Path> = projects
+            .iter()
+            .map(|project| project.borrow().config_file_path.clone())
+            .collect();
+        for made in project_collection_builder.made_programs.take() {
+            if kept.contains(&Rc::as_ptr(&made.program)) {
+                continue;
+            }
+            if made.host.builder.borrow().is_some() {
+                made.host.freeze(
+                    snapshot_fs.clone(),
+                    new_snapshot.config_file_registry.clone(),
+                );
+            }
+            if !kept_configs.contains(&made.host.config_file_path) {
+                store.resolve_ahead_stash.put(&made.host);
+            }
+            made.checker_pool.discard();
+            crate::ls::release_search_thread(&made.program);
+            crate::program::ls_program::release_program(&made.program);
         }
         // PORT: Go map order is random; the registry map's order here (the
         // owner adds do not depend on the order).

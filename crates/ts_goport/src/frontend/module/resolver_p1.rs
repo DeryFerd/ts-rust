@@ -303,6 +303,34 @@ impl DefaultResolver {
             .get_package_scope_for_path(directory)
     }
 
+    /// A resolve-ahead worker's resolver (compiler/resolve_ahead.rs): finds
+    /// the package scope of `directory` (`get_package_scope_for_path`) and
+    /// publishes it with the package.json lookups and the file system calls
+    /// that found it, for the loader (`Caches::package_scope_ahead`). A
+    /// scope that the loader cannot check is not published.
+    // PORT: not in Go (perf). Go `loadSourceFileMetaData` finds the scope
+    // in each parse task.
+    pub fn publish_package_scope(&self, directory: &str) {
+        let Some(shared) = self.caches.shared.as_ref().filter(|shared| shared.publish) else {
+            return;
+        };
+        self.caches.start_package_json_log();
+        let scope = PackageScope::of(self.get_package_scope_for_path(directory).as_deref());
+        let package_jsons = self.caches.take_package_json_log();
+        let lookups = self.caches.take_worker_lookup_log();
+        if let AheadLogEnd::Logged(calls) = self.caches.take_ahead_log() {
+            shared.cache.set_scope(
+                directory.to_string(),
+                SharedResolution {
+                    value: scope,
+                    package_jsons,
+                    lookups,
+                    ahead: Some(calls),
+                },
+            );
+        }
+    }
+
     // Go: module/resolver.go:215 PackageJsonCacheEntries (tsgo#4301)
     // PORT: the entries include the package.json lookups of the parse
     // worker answers that this resolver took (`Caches::worker_package_jsons`),
