@@ -176,4 +176,81 @@ mod tests {
             );
         }
     }
+
+    // followups21 (R168 reviewer): Go ReuseProgram keeps `processedFiles`
+    // (compiler/program.go:408), so the new program keeps the resolver, and
+    // its cache keeps the package.json lookups of module specifier
+    // generation of earlier builds. A --watch --incremental fast-path build
+    // then lists them in the build info. Before, the new version started
+    // with no lookups. Go gives each build a new host cache, so the worker
+    // `file_exists` answers are not kept.
+    #[test]
+    fn reused_version_keeps_module_specifier_package_json_lookups() {
+        let dir = write_project(
+            "goport-reused-specifier-package-jsons",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions":{"types":[]},"files":["index.ts"]}"#,
+                ),
+                ("index.ts", "export const x = 1;\n"),
+                ("node_modules/pkg/package.json", r#"{"name":"pkg"}"#),
+                ("node_modules/pkg/dist/index.d.ts", "export {};\n"),
+            ],
+        );
+        let index = format!("{dir}/index.ts");
+        let later = format!("{dir}/later.ts");
+        let old = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        let dist = format!("{dir}/node_modules/pkg/dist");
+        let later_probe = later.clone();
+        let (nearest, later_before) = std::thread::spawn(move || {
+            crate::core::set_thread_program(Some(old));
+            (
+                ProgramHost.get_nearest_ancestor_directory_with_package_json(&dist),
+                crate::program::file_exists(&later_probe),
+            )
+        })
+        .join()
+        .unwrap();
+
+        std::fs::write(&index, "export const x = 2;\n").unwrap();
+        std::fs::write(&later, "").unwrap();
+        let (new, reused) = crate::program::update_program_version(old, &index);
+        let later_after = std::thread::spawn(move || {
+            crate::core::set_thread_program(Some(new));
+            crate::program::file_exists(&later)
+        })
+        .join()
+        .unwrap();
+        let _scope = crate::core::enter_program(Some(new));
+        let mut entries = Vec::new();
+        package_json_cache_entries(|key, entry| {
+            entries.push((key.0.clone(), entry.directory_exists, entry.exists));
+            true
+        });
+        drop(_scope);
+        crate::program::release_program(new);
+        crate::program::release_program(old);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(nearest, format!("{dir}/node_modules/pkg"));
+        assert!(!later_before);
+        assert!(
+            reused,
+            "the edit keeps the imports, so the program is reused"
+        );
+        let expected = (
+            format!("{dir}/node_modules/pkg/dist/package.json"),
+            true,
+            false,
+        );
+        assert!(
+            entries.contains(&expected),
+            "{expected:?} is not in the package.json entries of the reused version {entries:?}"
+        );
+        assert!(
+            later_after,
+            "the reused version kept a file_exists answer of the old version"
+        );
+    }
 }
