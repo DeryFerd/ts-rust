@@ -969,11 +969,11 @@ impl Binder {
     }
 
     // Go: binder/binder.go:1392 checkStrictModeBinaryExpression
-    pub fn check_strict_mode_binary_expression(&mut self, node: Node) {
-        let left = node.left();
-        if is_left_hand_side_expression(left)
-            && is_assignment_operator(node.operator_token().kind())
-        {
+    // PERF: binderview1. `bin` holds the fields of `node`, which `bind` read
+    // once. The operator test goes first: both tests are pure.
+    pub fn check_strict_mode_binary_expression(&mut self, node: Node, bin: &BinaryView) {
+        let left = bin.left;
+        if is_assignment_operator(bin.operator) && is_left_hand_side_expression(left) {
             // ECMA 262 (Annex C) The identifier eval or arguments may not appear as the LeftHandSideExpression of an
             // Assignment operator(11.13) or of a PostfixExpression(11.3)
             self.check_strict_mode_eval_or_arguments(node, left);
@@ -1173,7 +1173,7 @@ impl Binder {
             self.active_label_list = None;
             self.has_explicit_return = false;
             self.seen_this_keyword = false;
-            self.bind_children_of_kind(node, kind);
+            self.bind_children_of_kind(node, kind, None);
             // Reset flags (for incremental scenarios)
             {
                 let data = bound_mut(self, node);
@@ -1233,7 +1233,7 @@ impl Binder {
         } else if container_flags.intersects(ContainerFlags::IS_INTERFACE) {
             let save_seen_this_keyword = self.seen_this_keyword;
             self.seen_this_keyword = false;
-            self.bind_children_of_kind(node, kind);
+            self.bind_children_of_kind(node, kind, None);
             // ContainsThis cannot overlap with HasExtendedUnicodeEscape on Identifier
             let seen_this_keyword = self.seen_this_keyword;
             let data = bound_mut(self, node);
@@ -1244,7 +1244,7 @@ impl Binder {
             }
             self.seen_this_keyword = save_seen_this_keyword;
         } else {
-            self.bind_children_of_kind(node, kind);
+            self.bind_children_of_kind(node, kind, None);
         }
         if is_source_file(node) && is_in_js_file(node) {
             // Binding of top-level JSTypeAliasDeclaration nodes is deferred to ensure CommonJS module
@@ -1313,11 +1313,18 @@ impl Binder {
 
     // Go: binder/binder.go:1646 bindChildren
     pub fn bind_children(&mut self, node: Node) {
-        self.bind_children_of_kind(node, node.kind());
+        self.bind_children_of_kind(node, node.kind(), None);
     }
 
-    /// `bind_children` for a caller that already read `node.kind()`.
-    pub fn bind_children_of_kind(&mut self, node: Node, kind: SyntaxKind) {
+    /// `bind_children` for a caller that already read `node.kind()`, and,
+    /// for a BinaryExpression, maybe its fields (`binary`, which `bind`
+    /// read for its own arm).
+    pub fn bind_children_of_kind(
+        &mut self,
+        node: Node,
+        kind: SyntaxKind,
+        binary: Option<&BinaryView>,
+    ) {
         let save_in_assignment_pattern = self.in_assignment_pattern;
         // Most nodes aren't valid in an assignment pattern, so we clear the value here
         // and set it before we descend into nodes that could actually be part of an assignment pattern.
@@ -1366,14 +1373,18 @@ impl Binder {
             SyntaxKind::PrefixUnaryExpression => self.bind_prefix_unary_expression_flow(node),
             SyntaxKind::PostfixUnaryExpression => self.bind_postfix_unary_expression_flow(node),
             SyntaxKind::BinaryExpression => {
-                if is_destructuring_assignment(node) {
+                let bin = match binary {
+                    Some(bin) => *bin,
+                    None => self.binary_view(node),
+                };
+                if bin.is_destructuring_assignment() {
                     // Carry over whether we are in an assignment pattern to
                     // binary expressions that could actually be an initializer
                     self.in_assignment_pattern = save_in_assignment_pattern;
-                    self.bind_destructuring_assignment_flow(node);
+                    self.bind_destructuring_assignment_flow(&bin);
                     return;
                 }
-                self.bind_binary_expression_flow(node);
+                self.bind_binary_expression_flow(node, &bin);
             }
             SyntaxKind::DeleteExpression => self.bind_delete_expression_flow(node),
             SyntaxKind::ConditionalExpression => self.bind_conditional_expression_flow(node),
