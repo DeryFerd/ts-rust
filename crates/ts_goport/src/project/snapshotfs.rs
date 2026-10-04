@@ -1469,81 +1469,19 @@ impl SourceFS {
         }
     }
 
-    /// Runs `replay` once for all the calls of a resolve-ahead answer, with
-    /// the seen files and the missing directories borrowed once. `None`
-    /// when the file system does not track: the calls note nothing.
-    pub fn replay_tracked<R>(&self, replay: impl FnOnce(Option<&mut TrackedPaths<'_>>) -> R) -> R {
+    /// What `directory_exists` notes when it gives false for a name whose
+    /// path is `path`.
+    pub fn note_missing_directory(&self, path: &tspath::Path) {
         if !self.tracking.get() {
-            return replay(None);
+            return;
         }
-        let seen_files = self.seen_files.borrow();
-        let mut seen_files = seen_files
-            .as_ref()
-            .unwrap_or_else(|| crate::core::go_nil_dereference())
-            .borrow_mut();
         let mut missing_directories = self
             .missing_directories
             .as_ref()
             .unwrap_or_else(|| crate::core::go_nil_dereference())
             .borrow_mut();
-        replay(Some(&mut TrackedPaths {
-            seen_files: &mut seen_files,
-            missing_directories: &mut missing_directories,
-        }))
-    }
-
-    /// The number of seen files and of missing directories, for the next
-    /// host's `reserve_tracked`: 0 for a set that the file system does not
-    /// keep (no tracking, or released).
-    pub fn tracked_len(&self) -> (usize, usize) {
-        let seen = self
-            .seen_files
-            .borrow()
-            .as_ref()
-            .map_or(0, |seen_files| seen_files.borrow().len());
-        let missing = self
-            .missing_directories
-            .as_ref()
-            .map_or(0, |missing| missing.borrow().len());
-        (seen, missing)
-    }
-
-    /// Makes room for `seen` seen files and `missing` missing directories,
-    /// so that a load that tracks about as many paths as the last one does
-    /// not grow the sets step by step. The room changes only the order of
-    /// a set's iteration, which no reader depends on (the watch globs of
-    /// `create_resolution_lookup_glob_mapper` are sorted).
-    pub fn reserve_tracked(&self, (seen, missing): (usize, usize)) {
-        if let Some(seen_files) = self.seen_files.borrow().as_ref() {
-            seen_files.borrow_mut().reserve(seen);
-        }
-        if let Some(missing_directories) = &self.missing_directories {
-            missing_directories.borrow_mut().reserve(missing);
-        }
-    }
-}
-
-/// The tracked sets of a `SourceFS` during the replay of one resolve-ahead
-/// answer (`SourceFS::replay_tracked`).
-// PORT: not in Go.
-pub struct TrackedPaths<'a> {
-    seen_files: &'a mut FxHashSet<tspath::Path>,
-    missing_directories: &'a mut FxHashSet<tspath::Path>,
-}
-
-impl TrackedPaths<'_> {
-    /// `track` of a name whose path is `path`.
-    pub fn seen_file(&mut self, path: &tspath::Path) {
-        if !self.seen_files.contains(path) {
-            self.seen_files.insert(path.clone());
-        }
-    }
-
-    /// What `directory_exists` notes when it gives false for a name whose
-    /// path is `path`.
-    pub fn missing_directory(&mut self, path: &tspath::Path) {
-        if !self.missing_directories.contains(path) {
-            self.missing_directories.insert(path.clone());
+        if !missing_directories.contains(path) {
+            missing_directories.insert(path.clone());
         }
     }
 }

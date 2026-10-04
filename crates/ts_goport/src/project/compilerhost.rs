@@ -63,7 +63,7 @@ pub fn new_compiler_host(
     builder: &Rc<ProjectCollectionBuilder>,
     logger: Option<Rc<logging::LogTree>>,
 ) -> Rc<CompilerHost> {
-    let (config_file_path, first_load, resolution_keys, kept_share, tracked) = {
+    let (config_file_path, first_load, resolution_keys, kept_share) = {
         let project = project.borrow();
         let host = project.host.as_ref();
         (
@@ -71,15 +71,9 @@ pub fn new_compiler_host(
             project.program.is_none(),
             host.and_then(|host| host.resolution_keys.borrow().clone()),
             host.and_then(|host| host.kept_share.borrow().clone()),
-            host.map_or((0, 0), |host| host.source_fs.tracked_len()),
         )
     };
     let source_fs = new_source_fs(true, builder.fs.clone(), builder.to_path.clone());
-    // PERF: room for as many seen files and missing directories as the
-    // project's last host tracked, so a new load does not grow the sets step
-    // by step (Go's sync maps grow; the port notes thousands of paths per
-    // load, most in the replay of resolve-ahead answers).
-    source_fs.reserve_tracked(tracked);
     Rc::new(CompilerHost {
         config_file_path,
         current_directory: current_directory.to_string(),
@@ -536,12 +530,9 @@ fn accept_ahead_answer(
     {
         return false;
     }
-    // PERF: one borrow of the tracked sets for all the calls of the answer.
-    source_fs.replay_tracked(|mut tracked| {
-        for call in calls {
-            replay_ahead_call(tracked.as_deref_mut(), load, call);
-        }
-    });
+    for call in calls {
+        replay_ahead_call(source_fs, load, call);
+    }
     true
 }
 
@@ -606,40 +597,27 @@ fn check_ahead_call(
     }
 }
 
-/// Notes the side effects of `call` in `tracked`, the tracked sets of the
-/// host's file system (`None`: it does not track) (`accept_ahead_answer`).
-fn replay_ahead_call(
-    mut tracked: Option<&mut TrackedPaths<'_>>,
-    load: &AheadCheck,
-    call: &AheadCall,
-) {
+/// Notes the side effects of `call` (`accept_ahead_answer`).
+fn replay_ahead_call(source_fs: &SourceFS, load: &AheadCheck, call: &AheadCall) {
     match call {
-        AheadCall::FileExists { path, .. } => {
-            if let Some(tracked) = tracked {
-                tracked.seen_file(path);
-            }
-        }
+        AheadCall::FileExists { path, .. } => source_fs.track_path(path),
         AheadCall::DirectoryExists {
             path,
             exists: false,
-        } => {
-            if let Some(tracked) = tracked {
-                tracked.missing_directory(path);
-            }
-        }
+        } => source_fs.note_missing_directory(path),
         AheadCall::DirectoryExists { exists: true, .. }
         | AheadCall::Realpath { .. }
         | AheadCall::Read { .. } => {}
         AheadCall::PackageJson(group) => {
             if load.groups.borrow_mut().insert(group_key(group)) {
                 for call in group.iter() {
-                    replay_ahead_call(tracked.as_deref_mut(), load, call);
+                    replay_ahead_call(source_fs, load, call);
                 }
             }
         }
         AheadCall::Shared(call) => {
             if load.groups.borrow_mut().insert(shared_key(call)) {
-                replay_ahead_call(tracked, load, call);
+                replay_ahead_call(source_fs, load, call);
             }
         }
     }
