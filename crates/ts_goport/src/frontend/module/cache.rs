@@ -252,6 +252,9 @@ pub struct AheadLink {
     /// found there (`AheadQueue::find`).
     pub cursor: Cell<usize>,
     pub stats: Cell<AheadStats>,
+    /// The package scope of each directory that the load asked for, by
+    /// directory (`Caches::package_scope_ahead`).
+    pub scopes: RefCell<FxHashMap<String, Option<PackageScope>>>,
 }
 
 /// The keys of the previous load, which the resolve-ahead workers resolve
@@ -415,14 +418,65 @@ impl AheadQueue {
     }
 }
 
-/// The check of a worker answer (`AheadLink::accept`): the key, the answer
-/// and the file system calls of its resolution.
-pub type AheadAccept = Rc<dyn Fn(ModuleKeyParts<'_>, &ResolvedModule, &[AheadCall]) -> bool>;
+/// The check of a worker answer (`AheadLink::accept`): the answer and the
+/// file system calls that made it.
+pub type AheadAccept = Rc<dyn Fn(AheadAnswer<'_>, &[AheadCall]) -> bool>;
+
+/// A worker answer that the loader checks (`AheadAccept`).
+#[derive(Clone, Copy)]
+pub enum AheadAnswer<'a> {
+    /// The answer for a module resolution key.
+    Module(ModuleKeyParts<'a>, &'a ResolvedModule),
+    /// The package scope of a directory (`Caches::package_scope_ahead`).
+    Scope(&'a str, Option<&'a PackageScope>),
+}
+
+impl std::fmt::Debug for AheadAnswer<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AheadAnswer::Module(key, _) => write!(f, "module key {key:?}"),
+            AheadAnswer::Scope(directory, _) => write!(f, "package scope of {directory:?}"),
+        }
+    }
+}
+
+/// The parts of a package scope (Go `GetPackageScopeForPath`) that Go
+/// `loadSourceFileMetaData` reads: the directory of the package.json and
+/// its `type` field. `None` (no scope) when no package.json exists in the
+/// directory or above it.
+// PORT: not in Go (resolve ahead). A worker sends these parts to the loader,
+// as its package.json parses stay on the worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageScope {
+    /// Go `GetDirectory()` of the scope.
+    pub package_directory: String,
+    /// The `type` field, when it is there and valid.
+    pub type_: Option<String>,
+}
+
+impl PackageScope {
+    /// The parts of `entry`, a result of `get_package_scope_for_path`.
+    #[must_use]
+    pub fn of(entry: Option<&InfoCacheEntry>) -> Option<PackageScope> {
+        let entry = entry.filter(|entry| entry.exists())?;
+        let contents = entry
+            .contents
+            .as_ref()
+            .expect("an existing package.json scope has contents");
+        let (value, ok) = contents.fields.header_fields.type_.get_value();
+        Some(PackageScope {
+            package_directory: entry.package_directory.clone(),
+            type_: ok.then_some(value),
+        })
+    }
+}
 
 /// The module resolution keys of one program load that have no redirect,
-/// in the load's order (`AheadLink::keys`). The keys share one text, so
-/// the loader records a key with no allocation of its own, and the list
-/// frees in two.
+/// and the directories whose package scope it found, in the load's order
+/// (`AheadLink::keys`). A package scope key has an empty module name (a
+/// module key never has one) and no mode (`push_scope`). The keys share
+/// one text, so the loader records a key with no allocation of its own,
+/// and the list frees in two.
 // PORT: not in Go (perf).
 #[derive(Default)]
 pub struct KeyList {
@@ -431,6 +485,8 @@ pub struct KeyList {
     /// in `text`, and its resolution mode. A key starts where the one
     /// before it ends.
     ends: Vec<(usize, usize, ResolutionMode)>,
+    /// How many of the keys are package scope keys.
+    scopes: usize,
 }
 
 impl KeyList {
@@ -440,6 +496,7 @@ impl KeyList {
         KeyList {
             text: String::with_capacity(like.text.len()),
             ends: Vec::with_capacity(like.ends.len()),
+            scopes: 0,
         }
     }
 
@@ -450,9 +507,22 @@ impl KeyList {
         self.ends.push((directory_end, self.text.len(), mode));
     }
 
+    /// Records the package scope key of `directory`.
+    pub fn push_scope(&mut self, directory: &str) {
+        self.push(directory, "", RESOLUTION_MODE_NONE);
+        self.scopes += 1;
+    }
+
+    /// The number of keys, package scope keys included.
     #[must_use]
     pub fn len(&self) -> usize {
         self.ends.len()
+    }
+
+    /// The number of package scope keys.
+    #[must_use]
+    pub fn scopes(&self) -> usize {
+        self.scopes
     }
 
     #[must_use]
@@ -490,6 +560,11 @@ pub struct AheadStats {
     pub slept: usize,
     /// The time of all the waits, in nanoseconds.
     pub wait_ns: u64,
+    /// `taken`, `rejected` and `missing` of the package scope keys (the
+    /// other counts have both kinds of keys).
+    pub scopes_taken: usize,
+    pub scopes_rejected: usize,
+    pub scopes_missing: usize,
 }
 
 impl Caches {
@@ -563,6 +638,9 @@ pub struct SharedResolutionCache {
             SharedResolution<Arc<ResolvedTypeReferenceDirective>>,
         >,
     >,
+    /// The package scopes that resolve-ahead workers found, by directory
+    /// (`DefaultResolver::publish_package_scope`).
+    scopes: std::sync::Mutex<FxHashMap<String, SharedResolution<Option<PackageScope>>>>,
 }
 
 /// A parse worker's answer in the `SharedResolutionCache`.
@@ -944,12 +1022,29 @@ impl SharedResolutionCache {
         lock_shared(&self.modules).get(key).cloned()
     }
 
-    /// Calls `f` with each module answer.
+    /// Calls `f` with the resolve-ahead calls of each module answer and
+    /// package scope (`SharedResolution::ahead`).
     // PORT: not in Go (resolve ahead, compiler/resolve_ahead.rs).
-    pub fn for_each_module(&self, mut f: impl FnMut(&SharedResolution<Arc<ResolvedModule>>)) {
+    pub fn for_each_ahead_calls(&self, mut f: impl FnMut(&[AheadCall])) {
         for value in lock_shared(&self.modules).values() {
-            f(value);
+            f(value.ahead.as_deref().unwrap_or_default());
         }
+        for value in lock_shared(&self.scopes).values() {
+            f(value.ahead.as_deref().unwrap_or_default());
+        }
+    }
+
+    /// The package scope of `directory` that a worker found.
+    // PORT: not in Go (resolve ahead).
+    #[must_use]
+    pub fn get_scope(&self, directory: &str) -> Option<SharedResolution<Option<PackageScope>>> {
+        lock_shared(&self.scopes).get(directory).cloned()
+    }
+
+    /// Publishes the package scope of `directory` (the first value wins).
+    // PORT: not in Go (resolve ahead).
+    pub fn set_scope(&self, directory: String, value: SharedResolution<Option<PackageScope>>) {
+        lock_shared(&self.scopes).entry(directory).or_insert(value);
     }
 
     /// Go `moduleResolutionCache.Set` (`LoadOrStore`: the first value wins).
@@ -1060,6 +1155,12 @@ impl Caches {
         let ahead = self.ahead.borrow();
         let ahead = ahead.as_ref()?;
         let (containing_directory, module_name, mode, redirect_config_name) = key;
+        // An empty name is a package scope key (`KeyList`). The loader
+        // resolves no empty name (`resolveImportsAndModuleAugmentations`
+        // skips it).
+        if module_name.is_empty() {
+            return None;
+        }
         // A key with a redirect needs its project reference; only the
         // loader resolves it.
         if redirect_config_name.is_empty() {
@@ -1094,7 +1195,7 @@ impl Caches {
                 false
             }
             Some((found, calls)) => {
-                let accepted = (ahead.accept)(key, &found.value, calls);
+                let accepted = (ahead.accept)(AheadAnswer::Module(key, &found.value), calls);
                 if accepted {
                     stats.taken += 1;
                 } else {
@@ -1105,6 +1206,79 @@ impl Caches {
         };
         ahead.stats.set(stats);
         let found = found.filter(|_| accepted)?;
+        self.note_worker_package_jsons(&found.package_jsons);
+        Some(found.value)
+    }
+
+    /// The loader's resolver in a resolve-ahead load: the package scope of
+    /// `directory`, as Go `loadSourceFileMetaData` reads it
+    /// (`GetPackageScopeForPath`). `None` when the load does not resolve
+    /// ahead.
+    ///
+    /// The first file of a directory in the load records the directory for
+    /// the workers of the next load (`KeyList::push_scope`). It takes the
+    /// workers' scope when the answer passes the check (`AheadLink::accept`),
+    /// as a module answer; else `find` finds the scope. The later files of
+    /// the directory get the same scope with no call: Go's lookups for them
+    /// find each package.json of the first lookup in the cache.
+    // PORT: not in Go (perf). Go finds the scope in each parse task.
+    pub fn package_scope_ahead(
+        &self,
+        directory: &str,
+        find: impl FnOnce() -> Option<PackageScope>,
+    ) -> Option<Option<PackageScope>> {
+        let ahead = self.ahead.borrow();
+        let ahead = ahead.as_ref()?;
+        if let Some(scope) = ahead.scopes.borrow().get(directory) {
+            return Some(scope.clone());
+        }
+        ahead.keys.borrow_mut().push_scope(directory);
+        let scope = self.take_scope_ahead(ahead, directory).unwrap_or_else(find);
+        ahead
+            .scopes
+            .borrow_mut()
+            .insert(directory.to_string(), scope.clone());
+        Some(scope)
+    }
+
+    /// The workers' package scope of `directory`, when there is one and it
+    /// passes the check (`package_scope_ahead`).
+    fn take_scope_ahead(&self, ahead: &AheadLink, directory: &str) -> Option<Option<PackageScope>> {
+        let answers = ahead.answers.as_ref()?;
+        let mut stats = ahead.stats.get();
+        let mut found = None;
+        if !ahead.queue.as_ref().is_some_and(|queue| queue.failed()) {
+            found = answers.get_scope(directory);
+            if let Some(queue) = &ahead.queue
+                && let Some(index) =
+                    queue.find(&ahead.cursor, (directory, "", RESOLUTION_MODE_NONE))
+                && found.is_none()
+                && queue.wait_or_take(index, &mut stats)
+            {
+                found = answers.get_scope(directory);
+            }
+        }
+        let taken = match found
+            .as_ref()
+            .and_then(|found| Some((found, found.ahead.as_ref()?)))
+        {
+            None => {
+                stats.scopes_missing += 1;
+                false
+            }
+            Some((found, calls)) => {
+                let accepted =
+                    (ahead.accept)(AheadAnswer::Scope(directory, found.value.as_ref()), calls);
+                if accepted {
+                    stats.scopes_taken += 1;
+                } else {
+                    stats.scopes_rejected += 1;
+                }
+                accepted
+            }
+        };
+        ahead.stats.set(stats);
+        let found = found.filter(|_| taken)?;
         self.note_worker_package_jsons(&found.package_jsons);
         Some(found.value)
     }

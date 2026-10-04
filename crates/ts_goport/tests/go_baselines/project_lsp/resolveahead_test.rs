@@ -136,13 +136,17 @@ fn os_session(root: &str) -> Rc<Session> {
     })
 }
 
-/// What a program load leaves: the program's files and module resolutions,
-/// the files that its host saw, the directories that it found missing and
-/// the snapshot's cached files. Paths are relative to the project root.
+/// What a program load leaves: the program's files, their package scopes
+/// and module resolutions, the files that its host saw, the directories
+/// that it found missing and the snapshot's cached files. Paths are
+/// relative to the project root.
 #[derive(Debug, PartialEq, Eq)]
 struct Observed {
     files: Vec<String>,
     missing_files: Vec<String>,
+    /// Per file: the package.json directory and type, and the implied node
+    /// format (`SourceFileMetaData`).
+    metadata: BTreeSet<String>,
     resolutions: BTreeSet<String>,
     seen: BTreeSet<String>,
     missing_directories: BTreeSet<String>,
@@ -189,6 +193,19 @@ fn observe(session: &Rc<Session>, root: &str) -> Observed {
             .missing_files
             .iter()
             .map(|name| relative(name))
+            .collect(),
+        metadata: processed
+            .source_file_meta_datas
+            .iter()
+            .map(|(file, meta)| {
+                relative(&format!(
+                    "{} {:?} {:?} {:?}",
+                    file.as_str(),
+                    meta.package_json_directory,
+                    meta.package_json_type,
+                    meta.implied_node_format,
+                ))
+            })
             .collect(),
         resolutions,
         seen: paths(
@@ -301,6 +318,46 @@ os_child_test! {
         assert_eq!(stats.loader.rejected, 0, "{stats:?}");
         assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
         assert_eq!(stats.new_keys, stats.keys + 1, "{stats:?}");
+    }
+}
+
+os_child_test! {
+    /// The workers find the package scope of each directory of the previous
+    /// load, and an import edit takes each of them: every file keeps the
+    /// package.json directory and type of a serial load. `src/sub` has a
+    /// package.json of its own, and the package `esm` has `"type":
+    /// "module"`, which its files read (they are in node_modules).
+    fn takes_the_package_scopes_of_the_previous_load() {
+        let stats = same_with_and_without("scopes", &|session, root| {
+            write(root, "src/sub/package.json", r#"{ "type": "commonjs" }"#);
+            write(
+                root,
+                "node_modules/esm/package.json",
+                r#"{ "name": "esm", "version": "1.0.0", "type": "module", "types": "index.d.ts" }"#,
+            );
+            write(root, "node_modules/esm/index.d.ts", "export declare const e: number;");
+            let uri = file_uri(root, "src/index.ts");
+            open(session, &uri, &format!("{INDEX}import {{ e }} from \"esm\";\n"));
+            program(session, &uri);
+            add_import(session, root);
+            let observed = observe(session, root);
+            for file in [
+                "<root>/src/sub/d.ts \"<root>/src/sub\" \"\"",
+                "<root>/node_modules/esm/index.d.ts \"<root>/node_modules/esm\" \"module\"",
+            ] {
+                assert!(
+                    observed.metadata.iter().any(|meta| meta.starts_with(file)),
+                    "{file}: {:?}",
+                    observed.metadata
+                );
+            }
+        });
+        assert!(stats.scopes > 0, "{stats:?}");
+        assert_eq!(stats.loader.scopes_rejected, 0, "{stats:?}");
+        assert_eq!(stats.loader.scopes_taken, stats.scopes, "{stats:?}");
+        // `./sub/d` adds a file to a directory that the load had.
+        assert_eq!(stats.new_scopes, stats.scopes, "{stats:?}");
+        assert_eq!(stats.loader.taken, stats.keys, "{stats:?}");
     }
 }
 

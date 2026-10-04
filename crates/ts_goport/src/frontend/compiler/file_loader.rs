@@ -1821,24 +1821,28 @@ impl FileLoader {
 /// resolver and options as parameters, so a parse worker can run it with
 /// its own resolver (`files_parser.rs`).
 // Go: fileloader.go:341 (*fileLoader).loadSourceFileMetaData
+// PORT: the scope is the parts of it that this function reads
+// (`PackageScope`). In a resolve-ahead load, the loader takes the scope that
+// the workers found, or the scope that it found for the directory before
+// (`Caches::package_scope_ahead`).
 pub(crate) fn source_file_meta_data(
     resolver: &dyn Resolver,
     options: &CompilerOptions,
     file_name: &str,
 ) -> SourceFileMetaData {
-    let package_json_scope = resolver.get_package_scope_for_path(&get_directory_path(file_name));
+    let directory = get_directory_path(file_name);
+    let find = || PackageScope::of(resolver.get_package_scope_for_path(&directory).as_deref());
+    let package_json_scope = resolver
+        .as_default_resolver()
+        .and_then(|default| default.caches.package_scope_ahead(&directory, find))
+        .unwrap_or_else(find);
     let module_resolution_kind = options.get_module_resolution_kind();
 
     let mut package_json_type = String::new();
     let mut package_json_directory = String::new();
-    if let Some(scope) = package_json_scope.as_ref().filter(|scope| scope.exists()) {
-        package_json_directory = scope.package_directory.clone();
-        let contents = scope
-            .contents
-            .as_ref()
-            .expect("an existing package.json scope has contents");
-        let (value, ok) = contents.fields.header_fields.type_.get_value();
-        if ok
+    if let Some(scope) = package_json_scope {
+        package_json_directory = scope.package_directory;
+        if let Some(value) = scope.type_
             && (!file_extension_is_one_of(
                 file_name,
                 &[EXTENSION_MTS, EXTENSION_CTS, EXTENSION_MJS, EXTENSION_CJS],
