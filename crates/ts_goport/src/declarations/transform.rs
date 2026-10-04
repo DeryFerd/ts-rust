@@ -901,7 +901,7 @@ impl DeclarationTransformer {
             );
         }
         self.state.borrow_mut().error_name_node = node.name();
-        assert!(has_dynamic_name(node)); // Should only be called with dynamic names
+        go_assert!(has_dynamic_name(node)); // Should only be called with dynamic names
         let entity_name = node.name().expression();
         let enclosing_declaration = self.enclosing_declaration;
         self.check_entity_name_visibility(entity_name, enclosing_declaration);

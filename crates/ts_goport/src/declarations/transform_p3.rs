@@ -276,7 +276,7 @@ impl DeclarationTransformer {
                 emit_tracker(self),
             )
         } else {
-            panic!("Unhandled node kind in ensureType: {:?}", node.kind()); // Go: debug.AssertNever(node)
+            crate::gostd::debug::assert_never(&crate::gostd::debug::kind_string(node.kind()), None)
         };
 
         self.state.borrow_mut().error_name_node = old_error_name_node;
