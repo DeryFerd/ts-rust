@@ -1522,9 +1522,9 @@ impl PoolBlock {
 
 /// AST node records, step 4: the blocks of the node shells of dead freeable
 /// file versions, for the node shells of later versions. An edit then
-/// reuses the 48 bytes per node (a record and its kids) of an older version
-/// of the file, where each shell leaked them before. The blocks never go
-/// back to the allocator.
+/// reuses the 40 bytes per node (a record and its kids, 24 + 16) of an
+/// older version of the file, where each shell leaked them before. The
+/// blocks never go back to the allocator.
 /// - A version gives its block back when it dies (`VersionStore`). The
 ///   block waits in `quarantine` until `QUARANTINE_RELEASES` more program
 ///   releases (`file_version::pin_epoch`) have happened, then goes to the
@@ -3932,7 +3932,7 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
 // and 1.5 to 2 ms with only the kind column static
 // (lsshells/m3/repair/prof): an edit reads the nodes of the edited file
 // about 400,000 times. The node columns that the header and child reads
-// need (50 bytes per node: 32 + 16 + 2 with the node records and the kind
+// need (42 bytes per node: 24 + 16 + 2 with the node records and the kind
 // column) are leaked and read inline, as a static file.
 // Without the children and modifier columns, the child reads of the edited
 // file read the node data, and edits were about 0.3 ms slower

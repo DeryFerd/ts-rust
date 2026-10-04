@@ -1,11 +1,11 @@
-//! The tsgo panic hook (bin/tsgo.rs `install_panic_hook`) with stderr a pipe
-//! that has no reader, so each write gets EPIPE. With `eprintln!` the hook
-//! panicked again, and a panic inside the hook aborts the process (SIGABRT),
-//! also for a panic that a caller catches (a resolve-ahead worker panic in
-//! `run_task`). The hook must drop its write errors, and the run then ends
-//! as it does with a reader.
+//! The tsgo panic hook (bin/tsgo.rs `install_panic_hook`) and the work
+//! thread failure write with stderr a pipe that has no reader, so each write
+//! gets EPIPE. With `eprintln!` the hook panicked again, and a panic inside
+//! the hook aborts the process (SIGABRT), also for a panic that a caller
+//! catches (a resolve-ahead worker panic in `run_task`). The hook must drop
+//! its write errors, and the run then ends as it does with a reader.
 //!
-//! The panic: tsgo reads the current directory again when it installs the
+//! The panic of the hook test: tsgo reads the current directory again when it installs the
 //! program (`execute_tsc::install_program`), and a removed directory panics
 //! there ("cannot load program: getwd: ..."). Go reads it once, in
 //! `newSystem`, so this is a port gap; the test uses it only as a panic that
@@ -53,6 +53,68 @@ fn a_printed_panic_with_no_stderr_reader_does_not_abort() {
         Some(EXIT_UNPORTED),
         "closed stderr: {status}"
     );
+}
+
+/// The work thread's failure (bin/tsgo.rs `main`: "tsgo: work thread
+/// failed") with stderr a pipe that has no reader. With `eprintln!` that
+/// write panicked on the main thread, and the run ended with exit code 101.
+///
+/// The panic that ends the work thread: tsgo runs in a removed directory, so
+/// `new_os_system` cannot get the current directory, and it writes that
+/// error with `eprintln!`, outside the `catch_unwind` of `run_main`. With no
+/// reader, that write panics. With a reader, the port writes the error and
+/// exits 3, as Go N does (cmd/tsc/sys.go:127 `newSystem`); the control run
+/// checks that. When a change removes this panic, the closed run fails: then
+/// use another panic outside `catch_unwind`.
+#[test]
+fn a_failed_work_thread_with_no_stderr_reader_ends_unported() {
+    // Control: with a reader, the getwd error and exit code 3.
+    let (status, stderr) = run_in_removed_cwd("wtcontrol", Stdio::piped());
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert_eq!(status.code(), Some(3), "control: {status} {stderr}");
+    assert!(
+        stderr.starts_with("Error getting current directory: getwd: "),
+        "control: {stderr}"
+    );
+    // No reader: the unported exit code, not 101 or a signal.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let (status, _) = run_in_removed_cwd("wtclosed", Stdio::from(writer));
+    assert_eq!(status.signal(), None, "closed stderr: {status}");
+    assert_eq!(
+        status.code(),
+        Some(EXIT_UNPORTED),
+        "closed stderr: {status}"
+    );
+}
+
+/// Runs `tsgo` with no arguments in a directory that `sh` removes before it
+/// starts tsgo, with no `PWD`, and returns the exit status and the stderr
+/// (empty when `stderr` is not a pipe to this process).
+fn run_in_removed_cwd(case: &str, stderr: Stdio) -> (ExitStatus, Vec<u8>) {
+    let dir = TempDir::new(
+        std::env::temp_dir().join(format!("tsgo_panic_hook-{}-{case}", std::process::id())),
+    );
+    let cwd = dir.0.join("cwd");
+    std::fs::create_dir(&cwd).unwrap();
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(r#"cd "$1" && rmdir "$1" && unset PWD && exec "$2""#)
+        .arg("sh")
+        .arg(&cwd)
+        .arg(env!("CARGO_BIN_EXE_tsgo"))
+        .env_remove("GOPORT_TRACE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let status = wait(&mut child, case);
+    let mut out = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        std::io::Read::read_to_end(&mut pipe, &mut out).unwrap();
+    }
+    (status, out)
 }
 
 /// Runs `tsgo -p <FIFO>` in a directory that the test removes while tsgo

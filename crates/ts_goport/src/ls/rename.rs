@@ -740,7 +740,10 @@ pub fn get_rename_info_success(
     if is_string_literal_like(node) {
         // Exclude the quotes
         start += 1;
-        end -= 1;
+        // PORT: Go `end--` steps back one Go byte (`go_offset_before`). An
+        // unterminated literal can end in a marker unit (see
+        // `GO_STRING_MARKER`), which has more port bytes than Go bytes.
+        end = go_offset_before(&source_file_text(source_file), end);
     }
     let (trigger_span, fidelity) =
         converters.to_lsp_range(&source_file, TextRange::new(start, end));

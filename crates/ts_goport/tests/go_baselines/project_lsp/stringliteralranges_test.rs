@@ -2,8 +2,10 @@
 //! and `textDocument/documentHighlight` (Go `getRangeOfNode`,
 //! ls/findallreferences.go:335). Go cuts an unterminated JSDoc comment at
 //! the end of the file 2 bytes early (parser/jsdoc.go:163), so a literal in
-//! it can end inside the file's last char. Each expected range is Go N's
-//! answer (tsgo-oracle-673a5f17d713, a UTF-16 client).
+//! it can end inside the file's last char. Also prepareRename spans and
+//! module name completions of unterminated literals whose port form is
+//! longer than their Go bytes (see `scanner_util::GO_STRING_MARKER`). Each
+//! expected answer is Go N's (tsgo-oracle-673a5f17d713, a UTF-16 client).
 
 use ts_goport::lsp::lsproto;
 use ts_goport::project;
@@ -120,5 +122,210 @@ child_test! {
     fn literal_that_ends_inside_a_marker_unit() {
         let text = go_string_from_bytes("/** @typedef {\"ab\u{FDD0}x".as_bytes().to_vec());
         check_literal_range(&text, 14..=17, ((0, 15), (0, 18)));
+    }
+}
+
+/// A session on `entries` (a UTF-16 client, as VS Code is) with `open`
+/// open, and the language service of `file`, which can stay closed: its
+/// text is then the file's raw bytes (see `go_string_from_bytes`).
+fn session_for(
+    entries: &[(&str, &str)],
+    open: &str,
+    file: &str,
+) -> (
+    std::rc::Rc<project::Session>,
+    ts_goport::ls::LanguageService,
+    lsproto::DocumentUri,
+) {
+    let (session, _) = projecttestutil::setup_with_options(
+        files(entries),
+        project::SessionOptions {
+            position_encoding: lsproto::PositionEncodingKind::UTF16,
+            ..projecttestutil::default_session_options()
+        },
+    );
+    let ctx = projecttestutil::with_request_id(&bg());
+    let text = entries
+        .iter()
+        .find(|(name, _)| *name == open)
+        .map(|(_, text)| *text)
+        .expect("the open file");
+    session.did_open_file(
+        &ctx,
+        &uri(&format!("file://{open}")),
+        1,
+        text,
+        &lsproto::LanguageKind::TYPE_SCRIPT,
+    );
+    let file_uri = uri(&format!("file://{file}"));
+    let language_service = session
+        .get_language_service(&ctx, &file_uri)
+        .unwrap_or_else(|err| panic!("{}", err.error()));
+    (session, language_service, file_uri)
+}
+
+/// Checks that prepareRename (Go `GetRenameInfo`) at each of `chars` on
+/// line 0 of `file` gives the trigger span `want`.
+fn check_rename_span(
+    entries: &[(&str, &str)],
+    open: &str,
+    file: &str,
+    chars: std::ops::RangeInclusive<u32>,
+    want: Span,
+) {
+    let (session, language_service, file_uri) = session_for(entries, open, file);
+    let ctx = projecttestutil::with_request_id(&bg());
+    for character in chars {
+        let info = language_service.get_rename_info(
+            &ctx,
+            "", /*newName*/
+            &file_uri,
+            lsproto::Position { line: 0, character },
+        );
+        assert!(info.can_rename, "prepareRename at {character}");
+        assert_eq!(
+            span(&info.trigger_span),
+            want,
+            "prepareRename at {character}"
+        );
+    }
+    session.close();
+}
+
+child_test! {
+    // followups19 item 2: Go `getRenameInfoSuccess` steps the end of a
+    // literal back one Go byte (rename.go:443 `end--`). The literal
+    // `"ab` + a real U+FDD0 (3 Go bytes, two marker chars in the port
+    // form) ends 2 bytes into the U+FDD0 there, and Go counts each of
+    // those bytes as 1 UTF-16 unit: (0,8)-(0,12). `end -= 1` on port
+    // offsets gave (0,8)-(0,15).
+    fn rename_span_of_a_literal_that_ends_in_a_real_fdd0() {
+        let text = go_string_from_bytes("let s: \"ab\u{FDD0}".as_bytes().to_vec());
+        check_rename_span(
+            &[
+                ("/home/projects/p/tsconfig.json", "{}"),
+                ("/home/projects/p/a.ts", &text),
+            ],
+            "/home/projects/p/a.ts",
+            "/home/projects/p/a.ts",
+            7..=12,
+            ((0, 8), (0, 12)),
+        );
+    }
+}
+
+child_test! {
+    // followups19 item 2: a closed file whose literal `"ab` ends in the
+    // raw byte FF, one marker unit. Go's end is before the byte:
+    // (0,8)-(0,10). `end -= 1` on port offsets gave (0,8)-(0,16).
+    fn rename_span_of_a_closed_literal_that_ends_in_a_raw_byte() {
+        let text = go_string_from_bytes(b"let s: \"ab\xff".to_vec());
+        check_rename_span(
+            &[
+                ("/home/projects/p/tsconfig.json", "{}"),
+                ("/home/projects/p/o.ts", "export {};\n"),
+                ("/home/projects/p/a.ts", &text),
+            ],
+            "/home/projects/p/o.ts",
+            "/home/projects/p/a.ts",
+            7..=12,
+            ((0, 8), (0, 10)),
+        );
+    }
+}
+
+/// The labels of the completion items at each of `chars` on line 0 of
+/// `file`, which must be the same at each.
+fn completion_labels(
+    entries: &[(&str, &str)],
+    open: &str,
+    file: &str,
+    chars: std::ops::RangeInclusive<u32>,
+) -> Vec<String> {
+    let (session, language_service, file_uri) = session_for(entries, open, file);
+    let ctx = projecttestutil::with_request_id(&bg());
+    let mut all: Option<Vec<String>> = None;
+    for character in chars {
+        let response = language_service
+            .provide_completion(
+                &ctx,
+                &file_uri,
+                lsproto::Position { line: 0, character },
+                None,
+            )
+            .unwrap_or_else(|err| panic!("ProvideCompletion at {character}: {}", err.error()));
+        let items = response
+            .list
+            .map(|list| list.items)
+            .or(response.items)
+            .unwrap_or_default();
+        let mut labels: Vec<String> = items.into_iter().map(|item| item.label).collect();
+        labels.sort();
+        if let Some(all) = &all {
+            assert_eq!(&labels, all, "completion at {character}");
+        }
+        all = Some(labels);
+    }
+    session.close();
+    all.unwrap_or_default()
+}
+
+/// Ambient modules for the module name completions below.
+const AMBIENT_MODULES: &str = "declare module \"ab\u{65E5}\" {}\n\
+     declare module \"ab\u{65E5}x\" {}\n\
+     declare module \"ab\u{1F600}\" {}\n\
+     declare module \"abc\" {}\n";
+
+child_test! {
+    // followups19 item 3 (R165 repair skeptic): a closed JS file ends in
+    // `require("ab` and the first 2 bytes of 日. Go's fragment is those
+    // raw bytes, and `getAmbientModuleCompletions` matches the module
+    // names by byte prefix (string_completions.go:909 `strings.HasPrefix`),
+    // so "ab日" and "ab日x" are completions (Go N, positions 9 to 14).
+    // The port form of a cut byte is a marker unit, and `starts_with` on
+    // it found none.
+    fn module_name_completion_after_a_cut_char_matches_go_bytes() {
+        let text = go_string_from_bytes(b"require(\"ab\xe6\x97".to_vec());
+        let labels = completion_labels(
+            &[
+                (
+                    "/home/projects/p/tsconfig.json",
+                    r#"{"compilerOptions":{"allowJs":true,"checkJs":true}}"#,
+                ),
+                ("/home/projects/p/m.d.ts", AMBIENT_MODULES),
+                ("/home/projects/p/a.js", &text),
+            ],
+            "/home/projects/p/m.d.ts",
+            "/home/projects/p/a.js",
+            9..=14,
+        );
+        assert_eq!(labels, ["ab\u{65E5}", "ab\u{65E5}x"]);
+    }
+}
+
+child_test! {
+    // followups19 item 3: the `paths` keys match by Go byte prefix too
+    // (string_completions.go:1515 `justPathMappingName` and :1546). Go N
+    // gives "ab日" (a file), "ab日x" (the directory of `ab日x/*`) and
+    // "ab日yz" (`ab日y*` with the files of src/y) at positions 9 to 14.
+    fn path_mapping_completion_after_a_cut_char_matches_go_bytes() {
+        let text = go_string_from_bytes(b"require(\"ab\xe6\x97".to_vec());
+        let labels = completion_labels(
+            &[
+                (
+                    "/home/projects/p/tsconfig.json",
+                    r#"{"compilerOptions":{"allowJs":true,"checkJs":true,
+                        "module":"esnext","moduleResolution":"bundler",
+                        "paths":{"ab日":["./src/x.ts"],"ab日x/*":["./src/y/*"],"ab日y*":["./src/y/*"]}}}"#,
+                ),
+                ("/home/projects/p/src/x.ts", "export {};\n"),
+                ("/home/projects/p/src/y/z.ts", "export {};\n"),
+                ("/home/projects/p/a.js", &text),
+            ],
+            "/home/projects/p/src/x.ts",
+            "/home/projects/p/a.js",
+            9..=14,
+        );
+        assert_eq!(labels, ["ab\u{65E5}", "ab\u{65E5}x", "ab\u{65E5}yz"]);
     }
 }

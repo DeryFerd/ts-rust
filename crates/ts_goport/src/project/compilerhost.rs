@@ -479,7 +479,7 @@ impl compiler::CompilerHost for CompilerHost {
 ///   the moment the loader would make it, since every call before it gave
 ///   the same answer. Its text must have the worker's hash. `reads` keeps
 ///   the reads of this load, so a later answer that reads the file again
-///   only compares the hash.
+///   only compares the hash. A worker read that failed fails the check.
 /// - then each `file_exists` path becomes a seen file and each missing
 ///   directory a missing directory, as the loader's calls would note them.
 /// - the calls of a package.json cache entry (`AheadCall::PackageJson`)
@@ -575,14 +575,23 @@ fn check_ahead_call(
             |lookups| lookups.realpath(name),
             real,
         ),
-        AheadCall::Read { file_name, hash } => {
+        // A read that failed is not taken: the disk changed during the load
+        // (a package.json that `file_exists` found was gone), or the file
+        // cannot be read. The snapshot does not cache a failed read, so a
+        // later read in the load can find the file, and then the worker's
+        // resolution without its text is not the loader's.
+        AheadCall::Read { hash: None, .. } => false,
+        AheadCall::Read {
+            file_name,
+            hash: Some(hash),
+        } => {
             let known = load.reads.borrow().get(file_name).copied();
             let read = known.unwrap_or_else(|| {
                 let read = source_fs.get_file(file_name).map(|file| file.hash());
                 load.reads.borrow_mut().insert(file_name.clone(), read);
                 read
             });
-            read == *hash
+            read == Some(*hash)
         }
         AheadCall::PackageJson(group) => {
             load.groups.borrow().contains(&group_key(group))
