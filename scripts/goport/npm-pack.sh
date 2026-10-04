@@ -16,11 +16,11 @@
 #          getReleaseBuildFlags and buildTsc: -trimpath, -ldflags "-s -w -X core.version=<version>",
 #          tag noembed, CGO_ENABLED=0; the Go toolchain of the pin's oracle) and packs it with Go's
 #          launcher only.
-#        npm-pack.sh --name tsc-rs [--also <os>-<arch>=<tsc>]... <out-dir> <tsc>
-#          Rust, the port's own set (npm/pack.mjs --name tsc-rs): tsc-rs (bin tsc-rs) and
-#          @tsc-rs/linux-x64 from <tsc>, plus @tsc-rs/<os>-<arch> for each --also, a tsc built for
-#          that platform (for example darwin-arm64=<path>). It does not run here, so only <tsc> is
-#          checked.
+#        npm-pack.sh --name tsc-rs --package-version <v> [--also <os>-<arch>=<tsc>]... <out-dir> <tsc>
+#          Rust, the port's own set (npm/pack.mjs --name tsc-rs) at npm version <v>: tsc-rs (bin
+#          tsc-rs) and @tsc-rs/linux-x64 from <tsc>, plus @tsc-rs/<os>-<arch> for each --also, a
+#          tsc built for that platform (for example darwin-arm64=<path>). It does not run here, so
+#          only <tsc> is checked. <tsc> reports the TypeScript version (not stamped with <v>).
 # The pin is GOPORT_PIN, else the current pin (scripts/upstream/pin.py path goCheckout). Both pin
 # layouts work. "typescript" (microsoft/TypeScript, pin N on): the Go module is <repo>/tsc
 # (./cmd/tsc, module github.com/microsoft/TypeScript/tsc) and the package input is
@@ -33,13 +33,18 @@ set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 usage() { sed -n '9,28p' "$0" >&2; exit 2; }
 
-go_version="" name=typescript also=()
-while [[ ${1:-} == --name || ${1:-} == --also ]]; do
+go_version="" name=typescript also=() package_version=()
+while [[ ${1:-} == --name || ${1:-} == --also || ${1:-} == --package-version ]]; do
   [[ $# -ge 2 ]] || usage
-  if [[ $1 == --name ]]; then name=$2; else also+=(--exe "$2"); fi
+  case $1 in
+    --name) name=$2 ;;
+    --also) also+=(--exe "$2") ;;
+    --package-version) package_version=(--package-version "$2") ;;
+  esac
   shift 2
 done
 [[ $name == typescript || $name == tsc-rs ]] || usage
+[[ $name == typescript || ${#package_version[@]} == 2 ]] || usage
 if [[ ${1:-} == --go ]]; then
   [[ $name == typescript && ${#also[@]} == 0 ]] || usage
   [[ $# == 3 ]] || usage
@@ -111,7 +116,8 @@ ln -s "$input_modules" "$src/node_modules"
 native_bin=()
 [[ -n $go_version ]] || native_bin=(--native-bin)
 node "$repo/npm/pack.mjs" --layout "$layout" --go-dir "$go_dir" --exe "$bin/tsc" "${also[@]}" --libs "$libs" \
-  --dist "$src/dist" --version "$version" --git-head "$git_head" --out "$out/pkg" --name "$name" "${native_bin[@]}"
+  --dist "$src/dist" --version "$version" --git-head "$git_head" --out "$out/pkg" --name "$name" \
+  "${package_version[@]}" "${native_bin[@]}"
 rm -rf "$out/$name" "$out/$name"-*-*/ "$out"/*.tgz
 for d in "$out"/pkg/*; do
   mv "$d" "$out/"
@@ -119,5 +125,5 @@ for d in "$out"/pkg/*; do
 done
 rmdir "$out/pkg"
 rm -rf "$build"
-echo "packed $version ($([[ -n $go_version ]] && echo Go || echo Rust), pin $pin):"
+echo "packed ${package_version[1]:-$version} (tsc $version, $([[ -n $go_version ]] && echo Go || echo Rust), pin $pin):"
 ls -1 "$out"/*.tgz

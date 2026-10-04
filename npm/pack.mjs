@@ -10,10 +10,17 @@
 // PORT: not in Go. `--name tsc-rs` writes the port's own package set from the same input:
 // `tsc-rs` (bin `tsc-rs`, npm/getExePath.js as lib/getExePath.js, npm/tsc-rs-readme.md) and one
 // platform package `@tsc-rs/<os>-<arch>` per --exe. The default name `typescript` is Go's set.
+// tsc-rs has its own --package-version. The tsc keeps reporting the TypeScript version (--version):
+// the compiler matches `typesVersions` against it, so a tsc that reported 0.1.0 would pick the
+// typings that packages keep for TypeScript 5.6 and older. The main package records it as
+// `tscVersion`, for the postinstall check.
 //
 // usage: node npm/pack.mjs --layout <typescript|typescript-go> --go-dir <dir> --exe <tsc>...
 //          --libs <dir> --dist <dir> --version <v> --git-head <sha> --out <dir> [--native-bin]
-//          [--name <typescript|tsc-rs>]
+//          [--name <typescript|tsc-rs>] [--package-version <v>]
+//
+// --version is the version the tsc reports. --package-version is the npm version (default
+// --version).
 //
 // --exe is <os>-<arch>=<tsc> (Node's process.platform and process.arch, for example
 // darwin-arm64=<path>), or a plain <tsc> for linux-x64. Repeat it for more platforms. It is not
@@ -34,6 +41,7 @@ const { values: args } = parseArgs({
         "go-dir": { type: "string" },
         exe: { type: "string", multiple: true },
         name: { type: "string", default: "typescript" },
+        "package-version": { type: "string" },
         libs: { type: "string" },
         dist: { type: "string" },
         version: { type: "string" },
@@ -51,6 +59,7 @@ if (layout !== "typescript" && layout !== "typescript-go") throw new Error(`unkn
 if (name !== "typescript" && name !== "tsc-rs") throw new Error(`unknown --name ${name}`);
 const asTypescript = name === "typescript";
 const binName = asTypescript ? "tsc" : name;
+const packageVersion = args["package-version"] ?? version;
 const atN = layout === "typescript";
 const root = atN ? path.dirname(goDir) : goDir;
 const inputDir = atN ? path.join(root, "packages", "typescript") : path.join(goDir, "_packages", "native-preview");
@@ -92,7 +101,7 @@ const writeJson = (file, value) => fs.writeFileSync(file, JSON.stringify(value, 
 
 // Go: Herebyfile.mjs buildNativePreviewPackages, inputPackageJson with publishAsTypescript.
 const input = JSON.parse(fs.readFileSync(path.join(inputDir, "package.json"), "utf8"));
-input.version = version;
+input.version = packageVersion;
 delete input.private;
 input.files = [...new Set([...(input.files ?? []), "NOTICE.txt"])];
 input.bin = { [binName]: `./bin/${binName}` };
@@ -126,7 +135,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const mainPackage = {
     ...input,
     name,
-    optionalDependencies: Object.fromEntries(platforms.map(p => [p.packageName, version])),
+    ...(asTypescript ? {} : { tscVersion: version }),
+    optionalDependencies: Object.fromEntries(platforms.map(p => [p.packageName, packageVersion])),
 };
 if (atN) {
     // Go copies the whole input but node_modules and dist; its filter sees the path from the repo.

@@ -48,19 +48,26 @@ is not the default.
 `tsc-rs` is the same set under the port's own names: the main package `tsc-rs` (bin `tsc-rs`, so it
 does not clash with the `tsc` of a `typescript` install) and one platform package per platform,
 `@tsc-rs/linux-x64` and `@tsc-rs/darwin-arm64`. Its `lib/getExePath.js` finds
-`@tsc-rs/<platform>-<arch>`. The tsc reports the package version.
+`@tsc-rs/<platform>-<arch>`.
 
-1. Linux, on a host with BOLT (zbook): `RELEASE_VERSION=<v> RELEASE_LIBC=musl RELEASE_PIE=0
-   crates/ts_goport/scripts/build-release.sh <out>/linux-x64`. Static musl: it starts on any x86-64
-   Linux.
-2. macOS: the workflow `tsc-rs darwin build` (`.github/workflows/tsc-rs-darwin.yml`, version input
-   `<v>`) builds on a Mac and uploads the artifact `tsc-darwin-arm64`. jemalloc does not cross-build
-   for macOS with zig. `gh run download <run> -n tsc-darwin-arm64 -D <out>/darwin-arm64`.
+The npm version (`--package-version`) is the port's own. The tsc is not stamped with it: it reports
+the TypeScript version of the source (`7.1.0-dev`), because the compiler matches `typesVersions`
+against that version. A tsc that reported 0.1.0 picked the `<=5.6` typings of zod's dependencies
+and lost 2 of Go's 21 zod errors. The main package records the tsc version as `tscVersion` for the
+postinstall check.
+
+1. Linux, on a host with BOLT (zbook): `RELEASE_FEATURES=noembed RELEASE_LIBC=musl RELEASE_PIE=0
+   crates/ts_goport/scripts/build-release.sh <out>/linux-x64` (no `RELEASE_VERSION`). Static musl:
+   it starts on any x86-64 Linux.
+2. macOS: the workflow `tsc-rs darwin build` (`.github/workflows/tsc-rs-darwin.yml`) builds on a Mac
+   and uploads the artifact `tsc-darwin-arm64`. jemalloc does not cross-build for macOS with zig.
+   `gh run download <run> -n tsc-darwin-arm64 -D <out>/darwin-arm64`. Both tsc builds must come
+   from the same source.
 3. Pack and test:
 
    ```sh
-   GOPORT_PIN=<pin> scripts/goport/npm-pack.sh --name tsc-rs --also darwin-arm64=<out>/darwin-arm64/tsgo \
-     <out>/pkg <out>/linux-x64/bin/tsgo
+   GOPORT_PIN=<pin> scripts/goport/npm-pack.sh --name tsc-rs --package-version <v> \
+     --also darwin-arm64=<out>/darwin-arm64/tsgo <out>/pkg <out>/linux-x64/bin/tsgo
    scripts/goport/npm-test.sh --name tsc-rs <out>/pkg <out>/test
    ```
 

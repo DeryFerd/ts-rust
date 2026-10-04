@@ -33,8 +33,10 @@ function useNativeBin() {
     if (keepLauncherReason()) return;
     const exe = getExePath();
     const out = execFileSync(exe, ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-    if (out !== `Version ${pkg.version}`) {
-        throw new Error(`${exe} reports "${out}", not "Version ${pkg.version}"`);
+    // tsc-rs records the version its tsc reports as tscVersion (npm/pack.mjs).
+    const want = `Version ${pkg.tscVersion ?? pkg.version}`;
+    if (out !== want) {
+        throw new Error(`${exe} reports "${out}", not "${want}"`);
     }
     const target = path.relative(fs.realpathSync(path.dirname(binPath)), fs.realpathSync(exe));
     const tmp = `${binPath}.${process.pid}.tmp`;

@@ -6,10 +6,6 @@ name: tsc-rs darwin build
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: Package version that the tsc reports
-        required: true
   pull_request:
     paths:
       - "npm/**"
@@ -21,8 +17,6 @@ env:
   CARGO_INCREMENTAL: 0
   # The toolchain of crates/ts_goport/scripts/build-release.sh.
   RUSTUP_TOOLCHAIN: 1.95.0
-  # The next release when the workflow runs for a pull request.
-  GOPORT_BUILD_VERSION: ${{ inputs.version || '0.1.0' }}
 
 jobs:
   build:
@@ -31,14 +25,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
-      # The shipped profile (fat LTO) with Go's noembed mode, as build-release.sh builds Linux.
+      # The shipped profile (fat LTO) with Go's noembed mode, as build-release.sh builds Linux. No
+      # GOPORT_BUILD_VERSION: the tsc reports the TypeScript version, which typesVersions matching
+      # reads (npm/pack.mjs).
       - run: cargo build --profile goport --locked -p ts_goport --bin tsgo --features noembed
       - name: Check the tsc
         run: |
           out="$RUNNER_TEMP/tsc"
           crates/ts_goport/scripts/copy-libs.sh "$out"
           cp target/goport/tsgo "$out/tsc"
-          [[ $("$out/tsc" --version) == "Version $GOPORT_BUILD_VERSION" ]]
+          "$out/tsc" --version
+          [[ $("$out/tsc" --version) == "Version 7."* ]]
           cd "$RUNNER_TEMP"
           echo 'const x: number = "a";' > a.ts
           "$out/tsc" --listFilesOnly --lib es5 a.ts | grep -qx "$out/lib.es5.d.ts"
