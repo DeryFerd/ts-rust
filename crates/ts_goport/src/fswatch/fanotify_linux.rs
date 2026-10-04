@@ -895,10 +895,6 @@ impl FanotifyBackend {
                         Ok(())
                     }),
                 );
-                // PORT: not in Go (`report_made_dir_entries`).
-                if mask & unix::FAN_CREATE != 0 {
-                    report_made_dir_entries(w, &w.physical_path(&path));
-                }
             }
             touched = true;
         }
@@ -1062,32 +1058,4 @@ pub fn parse_fanotify_fid_record(data: &[u8], has_name: bool) -> Option<Fanotify
     }
 
     Some(FanotifyDfidName { key, name })
-}
-
-/// PORT: not in Go. Reports each file and directory in `dir`, a directory
-/// that was made (not moved in) under the recursive watch `w`, after its
-/// walk marked it and the directories in it.
-///
-/// Go marks the new directories only, so a file that is made in one before
-/// its mark gives no event. Go usually wins that race, because its emit
-/// writes a project's `.js` and `.d.ts` some time apart; the port writes
-/// them right after each other, so it lost most times: after an outDir
-/// switch in `tsc -b -w`, its next cycle missed the new upstream `.d.ts`
-/// files and reset fewer downstream projects than Go (followups18 item 4).
-/// Everything in a made directory was made after it, so Go reports it
-/// whenever its mark comes first. This is a second walk because a listing
-/// can leave out the entries made after the directory was opened (btrfs),
-/// and the first walk opens each directory before it marks it. A file made
-/// after the mark can be reported twice, which the event list joins.
-pub(crate) fn report_made_dir_entries(w: &DirWatch, dir: &str) {
-    let _ = walk_dir(
-        dir,
-        true,
-        Some(&mut |p: &str, _: bool| -> Result<(), GoError> {
-            if p != dir {
-                w.events.create(&w.display_path(p));
-            }
-            Ok(())
-        }),
-    );
 }

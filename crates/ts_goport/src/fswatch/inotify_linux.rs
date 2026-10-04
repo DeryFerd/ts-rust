@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::frontend::vfs::osvfs::go_string_from_os;
-use crate::fswatch::fanotify_linux::report_made_dir_entries;
 use crate::fswatch::unix;
 use crate::fswatch::walkdir_unix::walk_dir;
 use crate::gostd::errors;
@@ -534,11 +533,6 @@ impl InotifyBackend {
                         Ok(())
                     }),
                 );
-                // PORT: not in Go (see fanotify_linux.rs
-                // `report_made_dir_entries`).
-                if ev.mask & unix::IN_CREATE != 0 {
-                    report_made_dir_entries(w, &watch_path);
-                }
             }
         } else if ev.mask & unix::IN_MODIFY != 0 {
             w.events.update(&path);

@@ -298,37 +298,3 @@ fn recursive_watch_sees_a_subdirectory_file_update() {
         expect_contains(&r, EventKind::Update, &f);
     });
 }
-
-// PORT: not in Go (followups18 item 4). A recursive watch reports each file
-// that is made in a new directory, also when the file is made before the
-// watcher marks the directory (fanotify_linux.rs `report_made_dir_entries`).
-// `tsc -b` writes the outputs of a project right after it makes their
-// directory. Go reports a file only when its mark comes first, which its
-// slower emit usually lets it do; the port lost that race for most files.
-#[test]
-fn recursive_watch_sees_files_made_right_after_their_directory() {
-    run_with_retry("NewDirectoryFiles", |attempt| {
-        let (_tmp, dir) = new_tmp_dir();
-        let (r, _watch) = subscribe_for(attempt, &dir);
-        let mut want = Vec::new();
-        for _ in 0..8 {
-            let sub = sub_path(&dir);
-            let nested = format!("{sub}/nested");
-            std::fs::create_dir_all(&nested).unwrap_or_else(|e| panic!("Mkdir {nested}: {e}"));
-            for f in [
-                format!("{sub}/a.js"),
-                format!("{sub}/a.d.ts"),
-                format!("{nested}/b.js"),
-            ] {
-                write_file(&f, "x");
-                want.push((EventKind::Update, f));
-            }
-        }
-        let got = r.wait_for_all(r.deadline(), &want);
-        let missing: Vec<&W> = want
-            .iter()
-            .filter(|(k, p)| !got.iter().any(|e| e.kind == *k && e.path == *p))
-            .collect();
-        assert!(missing.is_empty(), "no event for {missing:?}");
-    });
-}
