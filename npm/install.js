@@ -10,12 +10,17 @@
 //   import "../lib/tsc.js";
 //
 // sh (the shebang, npm's .bin symlink, pnpm's shim) runs line 2, where `":" //` is the no-op `:`.
-// It follows $0 through symlinks to the bin's real dir and execs the native tsc by its path
-// relative to that dir, so a moved project still works. Node (`node bin/tsc`, tools that start a
-// bin with process.execPath) reads line 2 as a string and a comment and runs line 3, Go's
-// launcher, as with Go. The loop reads one link at a time, as pnpm's shim does, because old macOS
-// has no `readlink -f`. The exec path keeps the real path of the native tsc in the platform
-// package, where it reads the lib files (Go's noembed build).
+// It finds the bin's real dir from $0 and execs the native tsc by its path relative to that dir,
+// so a moved project still works. Node (`node bin/tsc`, tools that start a bin with
+// process.execPath) reads line 2 as a string and a comment and runs line 3, Go's launcher, as
+// with Go. The exec path keeps the real path of the native tsc in the platform package, where it
+// reads the lib files (Go's noembed build).
+//
+// To find the real dir, sh first tries npm's node_modules/.bin/tsc link, with no fork: when $0 is
+// a symlink and ../typescript/bin/tsc from its dir (npm's link target) is the same file (test
+// -ef) and not a symlink, that path is the bin. Else it follows $0 one link at a time, as pnpm's
+// shim does (old macOS has no `readlink -f`). A readlink is a fork and an exec, about 1 ms on the
+// .bin path, which runs for every npx and package.json script.
 //
 // Every failure keeps the JS launcher, which still works. It stays on Windows (npm's cmd
 // shim runs bin/tsc with Node), under Yarn (Yarn runs bins with Node), outside a
@@ -48,14 +53,21 @@ function useNativeBin() {
         throw new Error(`${exe} reports "${out}", not "${want}"`);
     }
     const target = path.relative(fs.realpathSync(path.dirname(binPath)), fs.realpathSync(exe));
-    // The path goes in a sh "..." string on a JS line comment.
-    if (/["$`\\\n\r\u2028\u2029]/.test(target)) {
-        throw new Error(`cannot quote the path ${JSON.stringify(target)}`);
+    // npm links node_modules/.bin/<bin> to this path.
+    const npmLink = path.relative(path.join(path.dirname(pkgDir), ".bin"), binPath);
+    // The paths go in sh "..." strings on a JS line comment.
+    for (const p of [target, npmLink]) {
+        if (/["$`\\\n\r\u2028\u2029]/.test(p)) {
+            throw new Error(`cannot quote the path ${JSON.stringify(p)}`);
+        }
     }
-    // p is $0 with its symlinks followed. A relative link target is relative to the link's dir.
+    // p becomes a path of the bin that is not a symlink. A relative link target is relative to the
+    // link's dir.
     const resolve = [
-        "p=$0; case $p in */*) ;; *) p=./$p ;; esac",
-        'while [ -L "$p" ]; do t=$(readlink "$p"); case $t in /*) p=$t ;; *) p=${p%/*}/$t ;; esac; done',
+        `p=$0; g="\${p%/*}/${npmLink}"`,
+        'if [ -L "$p" ] && [ ! -L "$g" ] && [ "$p" -ef "$g" ]; then p=$g',
+        "else case $p in */*) ;; *) p=./$p ;; esac",
+        'while [ -L "$p" ]; do t=$(readlink "$p"); case $t in /*) p=$t ;; *) p=${p%/*}/$t ;; esac; done; fi',
     ].join("; ");
     const polyglot = `#!/bin/sh\n":" //; ${resolve}; exec "\${p%/*}/${target}" "$@"\nimport "../lib/tsc.js";\n`;
     const tmp = `${binPath}.${process.pid}.tmp`;
