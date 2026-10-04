@@ -318,7 +318,7 @@ pub fn format_status_time(now: SystemTime) -> String {
 static LOCAL_LOC: OnceLock<jiff::tz::TimeZone> = OnceLock::new();
 
 /// Go `time.Local`.
-fn local_location() -> &'static jiff::tz::TimeZone {
+pub(crate) fn local_location() -> &'static jiff::tz::TimeZone {
     LOCAL_LOC.get_or_init(init_local)
 }
 
