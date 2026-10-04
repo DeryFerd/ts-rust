@@ -257,7 +257,7 @@ impl ToProgramSnapshot<'_> {
         }
     }
 
-    // Go: incremental/programtosnapshot.go:162 handleFileDelete
+    // Go: incremental/programtosnapshot.go:162-179 handleFileDelete
     // PORT: Go ranges over the old `fileInfos` `SyncMap` and stops at the
     // first gone file. If that file affects global scope, all files change.
     // Else Go only sets `buildInfoEmitPending`, and unchanged files keep
