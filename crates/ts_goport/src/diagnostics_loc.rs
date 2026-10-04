@@ -139,7 +139,7 @@ pub fn localize(
         message = crate::diag::key_to_message(key);
     }
     let Some(message) = message else {
-        panic!("Unknown diagnostic message: {key}");
+        crate::core::go_panic(format!("Unknown diagnostic message: {key}"));
     };
 
     let mut text = message.text();

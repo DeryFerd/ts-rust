@@ -141,3 +141,53 @@ fn diagnostic_pos_past_the_text_panics_slice_bounds_out_of_range() {
         "runtime error: slice bounds out of range [:999] with length 53",
     );
 }
+
+// Go: execute/incremental/buildinfotosnapshot.go:62 `t.filePaths[fileId-1]`.
+#[test]
+fn file_id_past_the_file_names_panics_index_out_of_range() {
+    check(
+        "big-id",
+        r#""referencedMap":[[5,"#,
+        r#""referencedMap":[[999,"#,
+        "",
+        "runtime error: index out of range [998] with length 5",
+    );
+}
+
+// Go: execute/incremental/buildinfotosnapshot.go:62, a file id 0.
+#[test]
+fn file_id_zero_panics_index_out_of_range() {
+    check(
+        "zero-id",
+        r#""semanticDiagnosticsPerFile":[[5,"#,
+        r#""semanticDiagnosticsPerFile":[[0,"#,
+        "",
+        "runtime error: index out of range [-1]",
+    );
+}
+
+// Go: diagnostics/diagnostics.go:38 `Category.Name`, when the diagnostic is
+// printed (after its location).
+#[test]
+fn unhandled_category_panics_when_printed() {
+    check(
+        "bad-cat",
+        r#""category":1,"#,
+        r#""category":999,"#,
+        "src/b.ts(1,39): ",
+        "Unhandled diagnostic category",
+    );
+}
+
+// Go: diagnostics/diagnostics.go:88 `Localize`, when the message is printed
+// (after the location, category and code).
+#[test]
+fn unknown_message_key_panics_when_printed() {
+    check(
+        "bad-key",
+        r#""messageKey":"Type_0_is_not_assignable_to_type_1_2322""#,
+        r#""messageKey":"x""#,
+        "src/b.ts(1,39): error TS2322: ",
+        "Unknown diagnostic message: x",
+    );
+}

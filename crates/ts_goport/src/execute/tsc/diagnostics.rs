@@ -994,13 +994,13 @@ fn diagnostic_prefix(diagnostic: AstDiagnostic<'_>) -> &str {
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:387 getCategoryFormat
-// PORT: Go panics on an unhandled category. The Rust match is exhaustive.
 fn get_category_format(category: Category) -> &'static str {
     match category {
         Category::Error => FOREGROUND_COLOR_ESCAPE_RED,
         Category::Warning => FOREGROUND_COLOR_ESCAPE_YELLOW,
         Category::Suggestion => FOREGROUND_COLOR_ESCAPE_GREY,
         Category::Message => FOREGROUND_COLOR_ESCAPE_BLUE,
+        Category::Unhandled => crate::core::go_panic("Unhandled diagnostic category".to_string()),
     }
 }
 

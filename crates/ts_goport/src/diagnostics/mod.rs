@@ -16,16 +16,25 @@ pub enum Category {
     Error = 1,
     Suggestion = 2,
     Message = 3,
+    /// Any other Go `diagnostics.Category` (an `int32`) value. Only a bad
+    /// `.tsbuildinfo` has one. Go keeps the value until it prints the
+    /// diagnostic, and panics there ("Unhandled diagnostic category").
+    // PORT: the raw value is not kept. A build info written with such a
+    // diagnostic has category 4 where Go writes the value it read, and two
+    // diagnostics at one place with two such values sort as equal.
+    Unhandled = 4,
 }
 
 impl Category {
+    // Go: diagnostics/diagnostics.go:26 (Category).Name
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Warning => "warning",
             Self::Error => "error",
             Self::Suggestion => "suggestion",
             Self::Message => "message",
+            Self::Unhandled => crate::core::go_panic("Unhandled diagnostic category".to_string()),
         }
     }
 }

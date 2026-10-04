@@ -24,6 +24,8 @@ use std::cell::OnceCell;
 pub type RepopulateInfoRef = std::sync::Arc<RepopulateDiagnosticInfo>;
 
 /// Go `diagnostics.Category(raw)`. The build info keeps the raw Go value.
+/// Go keeps any value; one that it does not handle panics when the
+/// diagnostic is printed (`Category::Unhandled`).
 #[must_use]
 pub fn category_from_raw(raw: i32) -> crate::diagnostics::Category {
     match raw {
@@ -31,7 +33,7 @@ pub fn category_from_raw(raw: i32) -> crate::diagnostics::Category {
         1 => crate::diagnostics::Category::Error,
         2 => crate::diagnostics::Category::Suggestion,
         3 => crate::diagnostics::Category::Message,
-        _ => panic!("invalid diagnostic category {raw}"),
+        _ => crate::diagnostics::Category::Unhandled,
     }
 }
 
