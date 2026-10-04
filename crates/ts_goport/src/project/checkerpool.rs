@@ -185,15 +185,6 @@ pub fn new_checker_pool(
     })
 }
 
-/// Go `checker.NewChecker(p.program, nil)` under `p.mu`. PORT: Go's
-/// snapshot tasks run during the build (`background::race`).
-fn new_checker(program: &Rc<compiler::NewProgram>) -> Checker {
-    super::background::race::build_start();
-    let c = ls_program::new_checker(program);
-    super::background::race::build_end();
-    c
-}
-
 // Go: project/checkerpool.go:116 holdTag
 // holdTag returns the value to store in heldBy for the given request ID.
 pub fn hold_tag(request_id: &str) -> String {
@@ -348,7 +339,7 @@ impl CheckerPool {
         let missing = self.checkers.borrow()[DIAG_INDEX as usize].is_none();
         if missing {
             (self.log)("checkerpool: Creating diagnostics checker");
-            let c = Rc::new(RefCell::new(new_checker(&self.program)));
+            let c = Rc::new(RefCell::new(ls_program::new_checker(&self.program)));
             self.checkers.borrow_mut()[DIAG_INDEX as usize] = Some(c);
         }
 
@@ -463,7 +454,7 @@ impl CheckerPool {
             let empty = self.checkers.borrow()[i].is_none();
             if empty {
                 (self.log)(&format!("checkerpool: Creating query checker {i}"));
-                let c = Rc::new(RefCell::new(new_checker(&self.program)));
+                let c = Rc::new(RefCell::new(ls_program::new_checker(&self.program)));
                 self.checkers.borrow_mut()[i] = Some(c.clone());
                 return (c, i as i32);
             }
@@ -481,7 +472,7 @@ impl CheckerPool {
         let missing = self.persistent_checker.borrow().is_none();
         if missing {
             (self.log)("checkerpool: Creating persistent checker");
-            let c = Rc::new(RefCell::new(new_checker(&self.program)));
+            let c = Rc::new(RefCell::new(ls_program::new_checker(&self.program)));
             *self.persistent_checker.borrow_mut() = Some(c);
         }
 

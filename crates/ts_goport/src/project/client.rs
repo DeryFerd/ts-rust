@@ -6,10 +6,6 @@
 
 use crate::project::prelude::*;
 
-/// PORT: the future of a client call from a snapshot task.
-pub type ClientCall<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), GoError>> + 'a>>;
-
 // Go: project/client.go:11 Client
 // PORT: `watchers []*lsproto.FileSystemWatcher` is `&[..]` (PORTING
 // "Types"). `params *lsproto.PublishDiagnosticsParams` is passed by value,
@@ -23,24 +19,6 @@ pub trait Client {
         watchers: &[lsproto::FileSystemWatcher],
     ) -> Result<(), GoError>;
     fn unwatch_files(&self, ctx: &Context, id: WatcherID) -> Result<(), GoError>;
-    /// PORT: `WatchFiles` from a snapshot task (`Session::update_watches`).
-    /// The LSP server waits for the client's reply without blocking while a
-    /// request is in flight (`background::race`). The default calls
-    /// `watch_files`.
-    fn watch_files_async<'a>(
-        &'a self,
-        ctx: &Context,
-        id: WatcherID,
-        watchers: &[lsproto::FileSystemWatcher],
-    ) -> ClientCall<'a> {
-        let result = self.watch_files(ctx, id, watchers);
-        Box::pin(std::future::ready(result))
-    }
-    /// PORT: `UnwatchFiles` from a snapshot task, as `watch_files_async`.
-    fn unwatch_files_async<'a>(&'a self, ctx: &Context, id: WatcherID) -> ClientCall<'a> {
-        let result = self.unwatch_files(ctx, id);
-        Box::pin(std::future::ready(result))
-    }
     // tsgo#4712
     fn register_content_mapper_extensions(
         &self,
