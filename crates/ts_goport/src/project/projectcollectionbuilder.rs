@@ -2066,9 +2066,19 @@ impl ProjectCollectionBuilder {
     // the plain `errors`, which are the same on these command lines:
     // - Go adds TS6059 to `Errors` only in `checkSourceFilesBelongToPath`
     //   (tsoptions/parsedcommandline.go:181). Only
-    //   `(*ParsedCommandLine).CommonSourceDirectory` (:157) calls it, and
-    //   only checker.go:15547 calls that, on `redirect`, the command line of
-    //   a project reference (compiler/projectreferencefilemapper.go:90).
+    //   `(*ParsedCommandLine).CommonSourceDirectory` (:157) calls it. Its
+    //   callers:
+    //   - checker.go:15547, on `redirect`, the command line of a project
+    //     reference (compiler/projectreferencefilemapper.go:90);
+    //   - outputpaths (outputpaths.go:141, :167, :191), with the command
+    //     line as its `OutputPathsHost` (parsedcommandline.go:117), from
+    //     `getOutputDeclarationAndSourceFileNames` (:197) and
+    //     `GetOutputFileNames` (:211). Only `ParseInputOutputNames` (:135)
+    //     calls the first, on a reference
+    //     (compiler/projectreferenceparser.go:28, ls/autoimport/util.go:189).
+    //     Only tsc -b calls the second, on the command line of a config
+    //     file (execute/build/buildtask.go:290, :520, :782, :797, :824,
+    //     orchestrator.go:398).
     // - An inferred or synthetic command line comes from
     //   `newInferredProjectCommandLine` (project/project.go:258), not from a
     //   config file, so it is never a reference of a program. Its `Errors`

@@ -388,41 +388,27 @@ impl Fs for OsFs {
     }
 }
 
-/// PORT: not in Go (perf). The mtime of each normalized absolute path of
-/// `paths` on the OS file system, as `osvfs_fs().stat(path)` gives it
-/// (Go os.go:112 Stat, `os.Stat`; `FileInfo::mod_time`, None when the stat
-/// fails). A run of paths in one directory is stat'ed through one open of
-/// the directory, so the OS walks the directory part of the path once. A
-/// path that this cannot stat so (no directory part, a directory that does
-/// not open, a failed stat, a path of `PATH_MAX` bytes or more) is stat'ed
-/// by its full path, as `stat` does. So is a path whose name is a symbolic
-/// link: `stat` fails with ELOOP after 40 links on the whole path, and the
-/// open of the directory and a stat of the name would each follow 40.
-pub fn os_mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<SystemTime>> {
-    mod_times(paths, false)
-        .into_iter()
-        .map(|m_time| m_time.expect("a link name is stat'ed"))
-        .collect()
-}
-
-/// PORT: not in Go (perf). `os_mod_times`, but None (not read) for a path
-/// whose name is a symbolic link, and `Some` of the mtime for every other
-/// path. The `tsc -b` prefetch (build_task.rs `StatusPrefetch`) leaves a
-/// link to the check: its target can be an output that a task of the build
-/// writes before the check.
+/// PORT: not in Go (perf). None (not read) for each normalized absolute
+/// path of `paths` whose name is a symbolic link, and `Some` of the mtime
+/// for every other path, on the OS file system, as `osvfs_fs().stat(path)`
+/// gives it (Go os.go:112 Stat, `os.Stat`; `FileInfo::mod_time`, None when
+/// the stat fails). The `tsc -b` prefetch (build_task.rs `StatusPrefetch`)
+/// leaves a link to the check: its target can be an output that a task of
+/// the build writes before the check. A run of paths in one directory is
+/// stat'ed through one open of the directory, so the OS walks the
+/// directory part of the path once. A path that this cannot stat so (no
+/// directory part, a directory that does not open, a failed stat, a path
+/// of `PATH_MAX` bytes or more) is stat'ed by its full path, as `stat`
+/// does, unless an `lstat` finds that its name is a link.
 pub fn os_mod_times_of_non_links<'a>(
     paths: impl IntoIterator<Item = &'a str>,
 ) -> Vec<Option<Option<SystemTime>>> {
-    mod_times(paths, true)
+    mod_times(paths)
 }
 
-/// `os_mod_times` with `skip_links` false, `os_mod_times_of_non_links` with
-/// it true.
+/// `os_mod_times_of_non_links`.
 #[cfg(target_os = "linux")]
-fn mod_times<'a>(
-    paths: impl IntoIterator<Item = &'a str>,
-    skip_links: bool,
-) -> Vec<Option<Option<SystemTime>>> {
+fn mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<Option<SystemTime>>> {
     use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, StatxFlags, openat, statx};
     use std::os::fd::OwnedFd;
     const PATH_MAX: usize = 4096;
@@ -468,7 +454,6 @@ fn mod_times<'a>(
             }
         }
         if m_time.is_none()
-            && skip_links
             && (link || std::fs::symlink_metadata(os_path(path)).is_ok_and(|md| md.is_symlink()))
         {
             m_times.push(None);
@@ -483,20 +468,15 @@ fn mod_times<'a>(
     m_times
 }
 
-/// PORT: not in Go (perf). Off Linux, `stat` of each path (after an
-/// `lstat` with `skip_links`).
+/// PORT: not in Go (perf). Off Linux, `stat` of each path after an
+/// `lstat`.
 #[cfg(not(target_os = "linux"))]
-fn mod_times<'a>(
-    paths: impl IntoIterator<Item = &'a str>,
-    skip_links: bool,
-) -> Vec<Option<Option<SystemTime>>> {
+fn mod_times<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<Option<Option<SystemTime>>> {
     let fs = osvfs_fs();
     paths
         .into_iter()
         .map(|path| {
-            if skip_links
-                && std::fs::symlink_metadata(os_path(path)).is_ok_and(|md| md.is_symlink())
-            {
+            if std::fs::symlink_metadata(os_path(path)).is_ok_and(|md| md.is_symlink()) {
                 return None;
             }
             Some(fs.stat(path).and_then(|stat| stat.mod_time()))
@@ -1214,12 +1194,15 @@ mod tests {
         assert_eq!(modified, m_time);
     }
 
-    // PORT: not in Go. `os_mod_times` gives the mtime that `stat` gives for
-    // each path: files in one directory and in another, a directory reached
-    // through a link, a link to a file, a missing file, a missing
-    // directory, a time before 1970, a path with no file name, and paths
-    // through 30 directory links to a chain of 30 file links (ELOOP: more
-    // than 40 links) and to one file link.
+    // PORT: not in Go. `os_mod_times_of_non_links` gives None for a path
+    // whose name is a link, and else the mtime that `stat` gives: files in
+    // one directory and in another, a directory reached through a link and
+    // through 30 links, a link to a file, a missing file, a missing
+    // directory, a time before 1970, a path with no file name, names
+    // through 30 directory links that are a chain of 30 file links (more
+    // than 40 links) and one file link, and a file through 41 directory
+    // links (ELOOP). The test keeps the name of the removed `os_mod_times`
+    // (followups21), so the protected name stays.
     #[test]
     fn os_mod_times_matches_stat() {
         let dir = std::env::temp_dir().join(format!("ts_goport_mod_times_{}", std::process::id()));
@@ -1237,6 +1220,9 @@ mod tests {
             std::os::unix::fs::symlink(format!("d{}", i - 1), dir.join(format!("d{i}"))).unwrap();
             std::os::unix::fs::symlink(format!("f{}.ts", i - 1), dir.join(format!("a/f{i}.ts")))
                 .unwrap();
+        }
+        for i in 30..41 {
+            std::os::unix::fs::symlink(format!("d{}", i - 1), dir.join(format!("d{i}"))).unwrap();
         }
         let old = SystemTime::UNIX_EPOCH - std::time::Duration::new(1000, 0)
             + std::time::Duration::new(0, 7);
@@ -1257,20 +1243,30 @@ mod tests {
             "a",
             "d29/f29.ts",
             "d29/f0.ts",
+            "d29/x.ts",
+            "d40/x.ts",
         ]
         .iter()
         .map(|name| format!("{root}/{name}"))
         .collect();
-        let m_times = os_mod_times(paths.iter().map(String::as_str));
+        let m_times = os_mod_times_of_non_links(paths.iter().map(String::as_str));
         let fs = osvfs_fs();
-        let want: Vec<Option<SystemTime>> = paths
+        let want: Vec<Option<Option<SystemTime>>> = paths
             .iter()
-            .map(|path| fs.stat(path).and_then(|stat| stat.mod_time()))
+            .map(|path| {
+                let link = std::fs::symlink_metadata(path).is_ok_and(|md| md.is_symlink());
+                (!link).then(|| fs.stat(path).and_then(|stat| stat.mod_time()))
+            })
             .collect();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(m_times, want);
-        assert_eq!(want[1], Some(old));
-        assert!(want[6].is_none() && want[7].is_none());
-        assert!(want[10].is_none() && want[11].is_some());
+        assert_eq!(want[1], Some(Some(old)));
+        assert_eq!(want[2], None);
+        assert!(want[4].is_some_and(|m_time| m_time.is_some()));
+        assert!(want[6] == Some(None) && want[7] == Some(None));
+        assert!(want[10].is_none() && want[11].is_none());
+        assert!(want[12].is_some_and(|m_time| m_time.is_some()));
+        assert_eq!(want[12], want[0]);
+        assert_eq!(want[13], Some(None));
     }
 }
