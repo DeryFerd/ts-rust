@@ -149,7 +149,8 @@ thread_local! {
     /// dead file version go, and so do its JSDoc nodes (a file scope,
     /// `resolve_lazy_js_doc`).
     static LAZY_JSDOC: RefCell<PerFileMap<&'static [Node]>> = const { RefCell::new(PerFileMap::new()) };
-    /// The file system of a checker worker thread (Go `host.FS()`, without the cache).
+    /// The file system of a checker worker thread (Go `host.FS()` without
+    /// the cache; the program's `HostFsCache` caches its answers).
     static WORKER_FS: Rc<dyn Fs> = bundled::wrap_fs(osvfs_fs());
 }
 
@@ -390,14 +391,20 @@ pub(crate) fn cached_lazy_js_doc(node: Node) -> Option<&'static [Node]> {
 }
 
 // Go: compiler/program.go:129 FileExists (the Go frontend program)
-// PORT: the loading thread asks the program host (with its cache). A
-// checker worker asks its own uncached copy of the same file system.
+// PORT: the loading thread asks the program host (with its cache). Another
+// thread (a checker worker) cannot read that cache. It asks the program's
+// thread-safe cache (Go `cachedvfs.FS`, compiler/host.go:52), which asks
+// this thread's copy of the file system on a miss. Module specifier
+// generation probes the same paths for many types (`tryGetAnyFileFromPath`):
+// realworld3 lexical made 8.6M uncached stat calls, Go 8,768.
 pub(super) fn file_exists(path: &str) -> bool {
     let id = prog().id;
     if let Some(go) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned()) {
         return go.file_exists(path);
     }
-    WORKER_FS.with(|fs| fs.file_exists(path))
+    super::with_host_fs_cache(|cache| {
+        cache.file_exists(path, || WORKER_FS.with(|fs| fs.file_exists(path)))
+    })
 }
 
 /// The Go files of this thread's unpublished stores, in store id order
@@ -1806,5 +1813,59 @@ mod tests {
                 .expect("a file at the redirect path");
             assert_eq!(target.path(), &redirect.target);
         }
+    }
+
+    /// Writes `files` (path, text) to a new dir under the system temp dir
+    /// and returns the dir with `/` separators. `name` names the dir.
+    fn write_project(name: &str, files: &[(&str, &str)]) -> String {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        dir.to_string_lossy().replace('\\', "/")
+    }
+
+    // specstat1 (realworld3 gap 1): a thread without the frontend program
+    // (a checker worker) asks the program's `HostFsCache`, as Go checkers
+    // ask the program host's `cachedvfs.FS` (compiler/host.go:52). So the
+    // first answer for a path stays for the program version. Before, each
+    // call asked the disk: lexical made 8.6M stat calls, Go 8,768.
+    #[test]
+    fn worker_file_exists_keeps_the_first_answer() {
+        let dir = write_project(
+            "goport-worker-file-exists",
+            &[
+                (
+                    "tsconfig.json",
+                    r#"{"compilerOptions":{"types":[]},"files":["index.ts"]}"#,
+                ),
+                ("index.ts", "export const x = 1;\n"),
+            ],
+        );
+        let program = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        let probe = |path: String| {
+            std::thread::spawn(move || {
+                crate::core::set_thread_program(Some(program));
+                crate::program::file_exists(&path)
+            })
+            .join()
+            .unwrap()
+        };
+        let later = format!("{dir}/later.ts");
+        assert!(!probe(later.clone()));
+        std::fs::write(&later, "").unwrap();
+        let after_write = probe(later.clone());
+        let index = probe(format!("{dir}/index.ts"));
+        crate::program::release_program(program);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !after_write,
+            "a worker asked the disk again: the program cache keeps the first answer"
+        );
+        assert!(index);
     }
 }
