@@ -16,9 +16,9 @@
 #        remote.sh sync-pin <host> [pin]       scripts/upstream/pin.py sync over this host's route
 #        remote.sh push <host> <path>...       copy files or dir trees to the same absolute path (never deletes)
 #        remote.sh fetch <host> <dir>...       copy result dirs back to zbook; adds new files, never replaces one
-# <host> is alvin, cup2, dbook-lan, mini-743d, mini-abf9, "all" (sync-*: every host at the same time) or "auto"
+# <host> is alvin, cup2, dbook-lan, mini-743d, "all" (sync-*: every host at the same time) or "auto"
 # (run and job: the first host whose lock is free and whose load is under half its cores; when none is free,
-# it checks again every 30 s). Host order is alvin, cup2, dbook-lan, mini-743d, mini-abf9 (REMOTE_HOSTS overrides it).
+# it checks again every 30 s). Host order is alvin, cup2, dbook-lan, mini-743d (REMOTE_HOSTS overrides it).
 # Locks: run and job hold the zbook lock /tmp/goport-remote-<host>.lock until the command ends, and wait for it.
 # A caller that holds the lock already (flock FILE cmd, or exec 9>FILE; flock 9) passes the open lock file on to
 # its children; run sees it and does not lock again. So a script under `job`, and the older
@@ -26,8 +26,9 @@
 # take the lock itself: it would wait for its own lock.
 # Reserved: dbook-lan is kept for revision evidence (candidate.sh side runs the gate and the oracles there). auto
 # skips it, and run and job refuse it unless REMOTE_USE_RESERVED=1 (candidate.sh sets it; the auditor and reviewer
-# set it to repeat a revision run). Time on mini-abf9 or mini-743d. On 2026-09-30 the 11-minute R148 and R149
+# set it to repeat a revision run). Time on mini-743d. On 2026-09-30 the 11-minute R148 and R149
 # gates waited 104 and 45 minutes for skeptic timing jobs on dbook. REMOTE_RESERVED overrides the list ("" for none).
+# Retired: mini-abf9 is Theo's machine since 2026-10-04. Every command refuses it.
 # dbook and the minis are on zbook's LAN and always go over it, never Tailscale. Relative dirs are relative to the repo root.
 set -uo pipefail
 REPO=/home/theo/Code/sandbox/ts-rust
@@ -36,7 +37,6 @@ T=$REPO/target
 # the host key that ~/.ssh/known_hosts has for the Tailscale name. dbook-lan is a LAN alias in the ssh config.
 declare -A SSH_OPTS=(
   [mini-743d]="-o HostName=mini-743d.local -o HostKeyAlias=mini-743d.<tailnet>.ts.net"
-  [mini-abf9]="-o HostName=mini-abf9.local -o HostKeyAlias=mini-abf9-1.<tailnet>.ts.net"
 )
 # The name remote.sh uses for a host. Tailscale names of LAN hosts map to their LAN route.
 canon() {
@@ -47,7 +47,7 @@ canon() {
     *) echo "$1" ;;
   esac
 }
-read -ra HOSTS <<< "${REMOTE_HOSTS:-alvin cup2 dbook-lan mini-743d mini-abf9}"
+read -ra HOSTS <<< "${REMOTE_HOSTS:-alvin cup2 dbook-lan mini-743d}"
 for i in "${!HOSTS[@]}"; do HOSTS[i]=$(canon "${HOSTS[i]}"); done
 read -ra RESERVED <<< "${REMOTE_RESERVED-dbook-lan}"
 # True when host $1 is kept for revision evidence (see Reserved above).
@@ -209,6 +209,8 @@ esac
 [[ $# -ge 1 ]] || die "$cmd needs a host"
 # dbook and the minis are on the same LAN as zbook: always use the LAN route, never the Tailscale name.
 host=$(canon "$1"); shift
+# mini-abf9 is Theo's own machine again since 2026-10-04: no command may use it.
+[[ $host == mini-abf9 ]] && die "mini-abf9 is Theo's machine since 2026-10-04. Do not use it. Time on mini-743d."
 [[ $cmd == sync-scripts || $cmd == sync-pin || $# -ge 1 ]] || die "$cmd needs more arguments"
 if [[ $host == auto ]]; then
   [[ $cmd == run || $cmd == job ]] || die "'auto' only works with run and job; inside a job, use \$REMOTE_HOST"
@@ -216,7 +218,7 @@ if [[ $host == auto ]]; then
   pick; host=$HOST
 fi
 if [[ ($cmd == run || $cmd == job) && ${REMOTE_USE_RESERVED:-0} != 1 ]] && reserved "$host"; then
-  die "$host is kept for revision evidence (candidate.sh side). Use auto, or mini-abf9 or mini-743d for timing. The auditor and reviewer set REMOTE_USE_RESERVED=1 to repeat a revision run."
+  die "$host is kept for revision evidence (candidate.sh side). Use auto, or mini-743d for timing. The auditor and reviewer set REMOTE_USE_RESERVED=1 to repeat a revision run."
 fi
 if [[ $host == all ]]; then
   [[ $cmd == sync-* ]] || die "'all' only works with sync-bins, sync-scripts and sync-pin"

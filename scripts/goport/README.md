@@ -8,7 +8,7 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
 - `measure.sh`, `measure-extra.sh`, `sweep.sh`: the project comparisons that `bound2.sh` and `gate.sh` use.
 - `perf.sh <label> <bin>...`: median of 3 wall time and peak RSS on Query, Hono, zod and effect,
   runs interleaved across the binaries. It refuses to start above load 1.5 (`PERF_WAIT=1` waits
-  for a quiet host). zbook is rarely quiet: run it on mini-abf9 or mini-743d.
+  for a quiet host). zbook is rarely quiet: run it on mini-743d.
 - `facts [section...]`: in one call, the paths and versions agents look up before their first edit: main
   against origin, the accepted revision (commit, bins checked against the gate manifest, gate, evidence),
   the Go pins with checkouts and oracles, the project tsconfigs, the newest lane bins, active `goport-*`
@@ -280,12 +280,11 @@ revision evidence (`remote.sh help`, "Reserved"): timing that needs zbook-class 
   Every dbook job takes the same lock, timing included, so the two never overlap.
   dbook is on the same LAN as zbook: always use `dbook-lan` (dbook.local), never the Tailscale
   name `dbook`. `remote.sh` maps `dbook` to `dbook-lan`.
-- mini-743d (Ryzen 7 8845HS) and mini-abf9 (ssh alias `mini-abf9-1`, Ryzen 7 255): LAN minis with
-  16 threads and 28 GB RAM each. They run gates and checks. Both are wired since 2026-09-28
-  (mini-743d about 215 MB/s over ssh), so both are also good for quiet timing and the editor
-  benchmark (`ls_edit_bench.py`, every side on the same host). Every job takes the host's own lock,
-  timing included. `remote.sh` always reaches them by the LAN names mini-743d.local and
-  mini-abf9.local, never Tailscale. It maps `mini-abf9-1` and the `-ts` names to `mini-abf9` and
-  `mini-743d`.
-- dbook-lan and the minis: `sudo -n`, perf_event_paranoid 4 (use `sudo perf`), THP madvise, and
+- mini-743d (Ryzen 7 8845HS): LAN mini with 16 threads and 28 GB RAM. It runs gates and checks.
+  It is wired since 2026-09-28 (about 215 MB/s over ssh), so it is also good for quiet timing and
+  the editor benchmark (`ls_edit_bench.py`, every side on the same host). Every job takes the
+  host's own lock, timing included. `remote.sh` always reaches it by the LAN name
+  mini-743d.local, never Tailscale. It maps the `-ts` name to `mini-743d`.
+- mini-abf9 is Theo's own machine again since 2026-10-04. `remote.sh` refuses every command on it.
+- dbook-lan and mini-743d: `sudo -n`, perf_event_paranoid 4 (use `sudo perf`), THP madvise, and
   perf, bpftrace and strace installed.
