@@ -1392,13 +1392,18 @@ impl GoSharedState {
             .collect();
         // Go builds the symlink cache on first use (`known_symlinks`), and
         // `ReuseProgram` takes the old program's cache when it is built
-        // (`tryReuse`, program.go:415). The frontend program did that, so
-        // the copy is shared when the frontend shares the cache.
+        // (`tryReuse`, program.go:415). The copy stands for that cache: it
+        // is shared when `p` replaced files of `previous` in place, or when
+        // the frontend shares its built cache.
+        // PORT: the copy can be built while the frontend's own value is not
+        // (`known_symlinks` builds it with the fs tracking paused, H3).
         let known_symlinks = OnceLock::new();
         if let Some((old_p, old)) = previous
-            && let (Some(symlinks), Some(old_symlinks)) =
-                (p.known_symlinks.get(), old_p.known_symlinks.get())
-            && Rc::ptr_eq(symlinks, old_symlinks)
+            && (reused.is_some()
+                || matches!(
+                    (p.known_symlinks.get(), old_p.known_symlinks.get()),
+                    (Some(symlinks), Some(old_symlinks)) if Rc::ptr_eq(symlinks, old_symlinks)
+                ))
             && let Some(copy) = old.known_symlinks.get()
         {
             let _ = known_symlinks.set(Arc::clone(copy));
