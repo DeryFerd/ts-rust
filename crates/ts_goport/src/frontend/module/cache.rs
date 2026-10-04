@@ -320,7 +320,9 @@ impl AheadQueue {
 
     /// A worker panicked outside a resolution (compiler/resolve_ahead.rs
     /// `run_task`): the loader takes no more answers of this load and
-    /// resolves the rest of its keys itself.
+    /// resolves the rest of its keys itself, and the workers take no more
+    /// keys. It does not close the job: the workers still store their
+    /// lookups until the load ends.
     pub fn fail(&self) {
         self.failed
             .store(true, std::sync::atomic::Ordering::Relaxed);
