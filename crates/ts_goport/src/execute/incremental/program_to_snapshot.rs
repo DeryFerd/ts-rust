@@ -264,15 +264,35 @@ impl ToProgramSnapshot<'_> {
     // their old semantic diagnostics and emit. The `SyncMap` order is random
     // per process, so with `gone` files of which `gone_global` affect global
     // scope, Go takes the global branch with chance `gone_global / gone`
-    // (measured on pin 673a5f17d713: 1 of 2 gone files global, 89 of 200
+    // (measured on pin 673a5f17d713: 1 of 3 gone files global, 66 of 200
     // runs; 1 of 4, 57 of 200; 3 of 4, 144 of 200; 1 of 93, 6 of 200). The
-    // port takes Go's more likely answer: the global branch when at least
-    // half of the gone files affect global scope. On a tie it takes the
-    // global branch, the TypeScript JS answer (`forEachEntry` without
-    // `outFile` stops at the first gone global file). A `target` or `lib`
-    // change mostly removes global libs, so it rechecks. A dependency change
+    // port takes Go's more likely answer, so each port answer is also a Go
+    // answer: the global branch when more than half of the gone files affect
+    // global scope, else only `build_info_emit_pending`. A dependency change
     // that removes many module `.d.ts` files and one global file does not
-    // (realworld3 docusaurus: 93 gone files, 1 global).
+    // check again (realworld3 docusaurus: 93 gone files, 1 global).
+    // Tie (exactly half of the gone files global): the port takes the global
+    // branch. Go takes it slightly less than half of the time (1 of 2, 89 of
+    // 200 runs; 346 of 740 runs over all tie cases measured), so neither
+    // answer is a clear Go majority. The global branch is the TypeScript JS
+    // answer (`forEachEntry` without `outFile` takes it when any gone file
+    // affects global scope), it checks again instead of keeping diagnostics
+    // that can be stale, and `tsctests::file_delete` keeps it for `lib`
+    // es2016 to es2015.
+    // Libs: a file with no statements does not affect global scope
+    // (`fileAffectsGlobalScope`). At pin 673a5f17d713 these bundled libs have
+    // no statements: `lib.d.ts`, `lib.es6.d.ts`, `lib.es20XX.d.ts`,
+    // `lib.es20XX.full.d.ts`, `lib.esnext.d.ts` and `lib.esnext.full.d.ts`
+    // (only `/// <reference lib>` lines), and `lib.dom.iterable.d.ts`,
+    // `lib.dom.asynciterable.d.ts`, `lib.webworker.iterable.d.ts` and
+    // `lib.webworker.asynciterable.d.ts` (only comments). So a `target`
+    // change mostly removes global libs and checks again (es2022 to es2021:
+    // 6 of 8 gone libs global), but a `lib` change can go either way. `lib`
+    // from es2022, dom, dom.iterable and dom.asynciterable to es2022 removes
+    // 1 global lib of 3 and does not check again: a use of `document` keeps
+    // its old diagnostics and gets no TS2584 (Go: the same in 43 of 60 runs,
+    // TS2584 in 17 of 60). Removing only dom and dom.iterable is a tie and
+    // checks again.
     // TypeScript JS also sets `buildInfoEmitPending` for each gone file that
     // does not affect global scope and comes before the first global one.
     // The global branch here does not set `build_info_emit_pending`. This

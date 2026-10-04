@@ -150,3 +150,77 @@ fn gone_files_mostly_modules_do_not_change_all_files() {
         "{output}"
     );
 }
+
+// `lib` goes from es2022, dom, dom.iterable and dom.asynciterable to es2022,
+// and `a.ts` uses `document` (the incrjs1 skeptic's `libdom.sh`). Three libs
+// leave the program. Only `lib.dom.d.ts` affects global scope: at pin
+// 673a5f17d713 `lib.dom.iterable.d.ts` and `lib.dom.asynciterable.d.ts`
+// hold only comments (the bundled texts below). `lib` does not affect
+// semantic diagnostics, so only a gone global file makes the program check
+// `a.ts` again. 1 gone lib of 3 is global, so the port only writes the build
+// info again and keeps the old diagnostics of `a.ts` (none).
+// Go gives one of two answers (pin 673a5f17d713):
+// - Go meets a lib with no statements first (tsc -p 43 of 60 runs, tsc -b 30
+//   of 40): the port's answer. Exit 0, only `tsconfig.tsbuildinfo` written.
+// - Go meets `lib.dom.d.ts` first (tsc -p 17 of 60, tsc -b 10 of 40): every
+//   file is checked and emitted again. `a.ts` gets TS2584 (Cannot find name
+//   'document'), exit 2, and `out/a.js`, `out/b.js` and the build info are
+//   written.
+#[test]
+fn lib_dom_removal_does_not_recheck_when_most_gone_libs_have_no_statements() {
+    let lib = |name: &str| format!("{TSC_LIB_PATH}/{name}");
+    let source = |name: &str| format!("{PROJECT}/src/{name}");
+    let config = |lib: &str| {
+        format!(
+            r#"{{"compilerOptions":{{"incremental":true,"target":"es2022","module":"esnext","lib":[{lib}],"rootDir":"src","outDir":"out"}},"include":["src"]}}"#
+        )
+    };
+    let input = TscInput {
+        files: [
+            (
+                format!("{PROJECT}/tsconfig.json"),
+                config(r#""es2022","dom","dom.iterable","dom.asynciterable""#).into(),
+            ),
+            (source("a.ts"), "export const t = document.title;\n".into()),
+            (source("b.ts"), "export const b = 1;\n".into()),
+            (
+                lib("lib.dom.d.ts"),
+                "declare var document: { title: string };\n".into(),
+            ),
+            (
+                lib("lib.dom.iterable.d.ts"),
+                include_str!("../../../libs/lib.dom.iterable.d.ts").into(),
+            ),
+            (
+                lib("lib.dom.asynciterable.d.ts"),
+                include_str!("../../../libs/lib.dom.asynciterable.d.ts").into(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let sys = new_test_sys(&input, false);
+    let fs = sys.fs_from_file_map();
+
+    let status = build_with(&sys, &["--listEmittedFiles"]);
+    let output = sys.output_text();
+    assert_eq!(status, ExitStatus::Success, "{output}");
+    assert!(
+        output.contains(&format!("TSFILE: {PROJECT}/out/a.js")),
+        "{output}"
+    );
+
+    fs.write_file(&format!("{PROJECT}/tsconfig.json"), &config(r#""es2022""#))
+        .expect("write tsconfig.json");
+    sys.clear_output();
+    let status = build_with(&sys, &["--listEmittedFiles"]);
+    let output = sys.output_text();
+    assert_eq!(status, ExitStatus::Success, "{output}");
+    assert!(!output.contains("TS2584"), "{output}");
+    assert!(!output.contains(&format!("{PROJECT}/out/")), "{output}");
+    assert!(
+        output.contains(&format!("TSFILE: {PROJECT}/tsconfig.tsbuildinfo")),
+        "{output}"
+    );
+}
