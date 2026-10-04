@@ -3,6 +3,8 @@ use crate::frontend::prelude::*;
 use crate::frontend::stringutil_ls::equate_string_case_insensitive;
 use std::cell::OnceCell;
 use std::rc::Weak;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // This file ports tsoptions/parsedcommandline.go. `ParsedOptions` is in
 // `parsed_options.rs` (tsgo#4712 moves it from core to tsoptions).
@@ -449,6 +451,13 @@ pub struct ParsedCommandLine {
     /// Go `Errors` read `errors` and then these
     /// (`errors_with_common_source_directory_errors`).
     pub common_source_directory_errors: RefCell<Vec<Diagnostic>>,
+    /// Set when a checker thread read `CommonSourceDirectory` of this
+    /// command line through its thread-safe copy
+    /// (`program::ResolvedProjectReference`). Go records the TS6059 errors
+    /// on that thread; the copy cannot reach this command line there, so
+    /// the next reader of the errors records them
+    /// (`errors_with_common_source_directory_errors`).
+    pub common_source_directory_read: Arc<AtomicBool>,
 
     pub resolved_project_reference_paths: OnceCell<Vec<String>>,
 
@@ -616,7 +625,8 @@ impl ParsedCommandLine {
     /// no error is recorded. Not in Go: the port reads it where it copies a
     /// referenced project for the checker threads
     /// (`ProjectReferenceCopies::resolved`), which Go does not do. The check
-    /// does not change the value.
+    /// does not change the value. A checker's read of the copy records the
+    /// errors later (`common_source_directory_read`).
     pub fn common_source_directory_unchecked(&self) -> String {
         if let Some(common_source_directory) = self.common_source_directory.get() {
             return common_source_directory.clone();
@@ -948,7 +958,12 @@ impl ParsedCommandLine {
     /// `CommonSourceDirectory` appended (Go appends them to `Errors`, so they
     /// come last). Go reads `p.Errors` when it is called, so a reader after
     /// `CommonSourceDirectory` sees them and a reader before it does not.
+    /// A checker's call through a copy (`common_source_directory_read`)
+    /// counts as a call: its errors are recorded here first.
     pub fn errors_with_common_source_directory_errors(&self) -> Vec<Diagnostic> {
+        if self.common_source_directory_read.load(Ordering::Acquire) {
+            self.common_source_directory();
+        }
         let mut errors = self.errors.clone();
         errors.extend(self.common_source_directory_errors.borrow().iter().cloned());
         errors

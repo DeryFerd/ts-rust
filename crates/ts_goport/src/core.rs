@@ -2942,8 +2942,8 @@ impl FileNodeBind {
         }
     }
 
-    /// The extras entry whose index + 1 is `extra` (the `bind` word of a
-    /// record without `ast::BIND_EXTRA`, not 0).
+    /// The extras entry whose index + 1 is `extra`: the `bind` word of a
+    /// record that has `ast::BIND_EXTRA`, with that bit cleared (never 0).
     #[inline]
     #[must_use]
     pub fn extra(&self, extra: u32) -> &NodeBindExtra {
