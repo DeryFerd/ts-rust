@@ -10,6 +10,10 @@
 //! before `kind` makes one symbol and one intersection type. The counts must
 //! not depend on where `kind` is declared. In first-seen order alone, `kind`
 //! after the methods made 30 more symbols and 30 more types.
+//!
+//! A method that can be private stays with the properties, in first-seen
+//! order, so a conflicting private method declared first is found before the
+//! properties are checked.
 
 use crate::support::child::run_command_in_child;
 use crate::support::runner::TscInput;
@@ -35,6 +39,12 @@ fn counts(kind_first: bool) -> (String, String) {
         interface("A", "string", "a"),
         interface("B", "number", "b")
     );
+    counts_of(text)
+}
+
+/// The `Symbols` and `Types` lines of `tsc --extendedDiagnostics` on the
+/// project with the one file `a.ts`.
+fn counts_of(text: String) -> (String, String) {
     let input = TscInput {
         files: [
             (format!("{PROJECT}/a.ts"), text.into()),
@@ -67,4 +77,34 @@ fn never_intersection_checks_properties_before_methods() {
     let first = counts(true);
     let last = counts(false);
     assert_eq!(first, last, "kind declared first, then last");
+}
+
+/// The `Symbols` count on `A & B` of two classes whose `private m()` is
+/// declared before or after 30 properties of different types.
+fn private_symbols(method_first: bool) -> u64 {
+    let class = |name: &str, ty: &str| {
+        let method = "    private m(): void {}\n";
+        let fields: String = (0..30).map(|i| format!("    f{i}!: {ty};\n")).collect();
+        if method_first {
+            format!("class {name} {{\n{method}{fields}}}\n")
+        } else {
+            format!("class {name} {{\n{fields}{method}}}\n")
+        }
+    };
+    let text = format!(
+        "{}{}declare const ab: A & B;\nexport const n: number = ab;\n",
+        class("A", "string"),
+        class("B", "number")
+    );
+    let (symbols, _) = counts_of(text);
+    symbols["Symbols:".len()..]
+        .trim()
+        .parse()
+        .unwrap_or_else(|err| panic!("{symbols:?}: {err}"))
+}
+
+#[test]
+fn never_intersection_checks_private_methods_with_properties() {
+    // Each property checked before `m` makes one synthetic property.
+    assert_eq!(private_symbols(false) - private_symbols(true), 30);
 }
