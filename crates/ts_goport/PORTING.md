@@ -432,12 +432,16 @@ The batch that adds it is not accepted until Theo approves.
   released version's tables on a thread with no copy panics ("program
   version N is released"). `GOPORT_KEEP_VERSION_TABLES=1` keeps them (A/B
   runs and a field fallback). The `GoProgram` shell and the static file
-  versions stay leaked for now. A one-program process forgets its checkers and the
+  versions (the first version of each file) stay leaked for now. A
+  one-program process forgets its checkers and the
   synthetic nodes of both pools at the end, like Go. Watch mode uses
   `program::release_program_in_background`: the old checker pool stops
   without a wait, and the old checkers are freed on the pool threads while
   the new build runs. A full build keeps the old frontend program until
-  after the status report, so its free is not in the rebuild time.
+  after the status report, so its free is not in the rebuild time. From
+  its second build on, `tsc --watch` makes the new parses of published
+  paths freeable file versions (below, watchfree1), so a rebuild frees the
+  versions it replaced, as Go's GC does.
 - The parse tasks of a load go with the loader. Go's garbage collector
   frees them. Here the `sub_tasks` and `loaded_task` links make an `Rc`
   cycle when files import each other, so the `FilesParser` drop takes
@@ -453,7 +457,16 @@ The batch that adds it is not accepted until Theo approves.
 - Freeable file versions (lsshells M3a to M3d, `ast/file_version.rs`). In
   a language server or API process (`project::new_session`), a parse cache
   parse of a path that a publish on this thread published before gets a
-  `FileVersion`. Its parse holds it (`ParsedSourceFile::version`), and so
+  `FileVersion`. In a `tsc --watch` process (`Watcher::start`,
+  `ast::set_watch_process`; watchfree1) each build does the same for its
+  new parses (`program::mark_freeable_parses`), and parses ahead
+  (prefetch) only in its first build, so a config change parses every file
+  into owned stores on the loading thread, libs too: the watch file system
+  is not the plain OS file system, so a lib is a live parse, not a
+  `lib_parse.bin` load. A diagnostic that a watch build copies from the
+  last build (Go `repopulateDiagnosticsOfFile`) points at the file
+  versions of the build that made it, and Go prints it from them: the new
+  snapshot holds them (`Snapshot::held_file_versions`). Its parse holds it (`ParsedSourceFile::version`), and so
   do the `VersionTables` of each program version that has the file, so a
   seeded thread keeps it too. A thread that reads it pins it until the
   next program release (`release_file_version_pins`, run when a
@@ -496,7 +509,8 @@ The batch that adds it is not accepted until Theo approves.
   symbol or table ids panics (index out of bounds). Its pooled block goes
   back to the pool (see "Pooled node blocks" above); its small `BlockFile`,
   its foreign parents and its text stay leaked for now. The first publish, the
-  first version of each file and every CLI publish never get one.
+  first version of each file and every CLI publish except `tsc --watch`
+  never get one.
   `GOPORT_FREE_FILE_VERSIONS=0` turns this off, `=1` turns it on in any
   process; there `update_program_version` (`goport_multiprog`) also gives
   each new parse of a published path a version, so a leak record can

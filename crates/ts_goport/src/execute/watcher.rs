@@ -20,7 +20,7 @@
 
 use crate::contentmapper::{self, Mapper, SourceFiles};
 use crate::execute::build::host::TscExtendedConfigCache;
-use crate::execute::execute_tsc::{get_trace_from_sys, new_program_version, os_write_file};
+use crate::execute::execute_tsc::{get_trace_from_sys, new_frontend_program, os_write_file};
 use crate::execute::incremental;
 use crate::execute::tsc::compile::{
     CommandLineTesting, CompileAndEmitResult, CompileTimes, System, SystemParseConfigHost,
@@ -54,6 +54,9 @@ pub struct CachedSourceFile {
 pub struct WatchCompilerHost {
     pub compiler_host: Rc<dyn CompilerHost>,
     pub cache: Rc<RefCell<FxHashMap<Path, Rc<CachedSourceFile>>>>,
+    /// PORT: not in Go. False when parse workers must not parse ahead (see
+    /// `prefetch_parses`).
+    pub prefetch: bool,
 }
 
 impl CompilerHost for WatchCompilerHost {
@@ -130,10 +133,13 @@ impl CompilerHost for WatchCompilerHost {
     // gets the files that did not change from `cache`, so parse workers
     // would parse them again for nothing, and those parses stay in the
     // workers' AST arenas (about 38 MiB for each query-core rebuild). The
-    // first build, and a build after an overflow or a config change (both
-    // empty the cache), still parse ahead.
+    // first build parses ahead. A build after an overflow or a config
+    // change (both empty the cache) parses ahead only while
+    // `ast::free_file_versions` is off (`prefetch`): a worker parse keeps
+    // its nodes in the worker's AST arena, so a freeable file version of it
+    // would leak them.
     fn prefetch_parses(&self) -> bool {
-        self.cache.borrow().is_empty() && self.compiler_host.prefetch_parses()
+        self.prefetch && self.cache.borrow().is_empty() && self.compiler_host.prefetch_parses()
     }
 }
 
@@ -289,6 +295,12 @@ pub fn create_watcher(
 impl Watcher {
     // Go: execute/watcher.go:136 (*Watcher).start
     pub fn start(&mut self, ctx: &Context) {
+        // PORT: not in Go. From the second build on, a new parse of a file
+        // that an earlier build published is a freeable file version
+        // (`ast::set_watch_process`, `program::mark_freeable_parses`), so
+        // it is freed with its last holder, as Go's GC frees an old
+        // `*ast.SourceFile`. The first version of each file stays static.
+        crate::ast::set_watch_process();
         self.content_mapper_host =
             new_content_mapper_host(ctx, &self.sys, self.config.compiler_options());
         let config = self.config.clone();
@@ -686,6 +698,7 @@ impl Watcher {
             let host: Rc<dyn CompilerHost> = Rc::new(WatchCompilerHost {
                 compiler_host: inner_host,
                 cache: self.source_file_cache.clone(),
+                prefetch: self.prefetch_parses(),
             });
 
             if self.try_update_program(&host) {
@@ -751,6 +764,7 @@ impl Watcher {
         let host: Rc<dyn CompilerHost> = Rc::new(WatchCompilerHost {
             compiler_host: inner_host,
             cache: self.source_file_cache.clone(),
+            prefetch: self.prefetch_parses(),
         });
 
         if self.config.config_file.is_some() {
@@ -776,7 +790,12 @@ impl Watcher {
 
         // Go: compiler.NewProgram(compiler.ProgramOptions{Config, Host})
         // PORT: a new program version, current for the rest of the build.
-        let version = new_program_version(host.clone(), self.config.clone());
+        // Its new parses of files that an earlier build published are
+        // freeable file versions (see `start`).
+        let np = new_frontend_program(host.clone(), self.config.clone());
+        crate::program::mark_freeable_parses(&np);
+        let version = crate::program::new_program_version(&np, None);
+        drop(np);
         let _program = crate::core::enter_program(Some(version));
         let mut program = incremental::program::new_program(
             self.program.as_ref(),
@@ -794,7 +813,9 @@ impl Watcher {
         // with the last of them. The rest of the old program
         // (`retire_program`) and the old frontend program are kept until
         // after the status report below, so their free is not in the
-        // rebuild time. Its `GoProgram` and file versions stay leaked.
+        // rebuild time. Its `GoProgram` and the static file versions (the
+        // first version of each file) stay leaked; a freeable file version
+        // is freed with its last holder (see `start`).
         let released = self
             .program
             .as_ref()
@@ -882,6 +903,14 @@ impl Watcher {
         }
     }
 
+    /// PORT: not in Go. True when the parse workers of the next build may
+    /// parse ahead (`WatchCompilerHost::prefetch_parses`): in the first
+    /// build, whose parses are static, or while `ast::free_file_versions`
+    /// is off.
+    fn prefetch_parses(&self) -> bool {
+        !self.program_ready || !crate::ast::free_file_versions()
+    }
+
     /// Frees the snapshot of the program that the last build replaced,
     /// after the build reported its status, so the free is not in the
     /// rebuild time.
@@ -938,6 +967,9 @@ impl Watcher {
         let (new_program, _, reused) = old_program.reuse_program(changed_path, host.clone(), None);
         if reused {
             let np = Rc::new(new_program.expect("ReuseProgram returns the reused program"));
+            // The new parse of the changed file is a freeable file version
+            // (see `start`).
+            crate::program::mark_freeable_parses(&np);
             let version = crate::program::new_program_version(&np, Some(old_version));
             let _program = crate::core::enter_program(Some(version));
             let mut program = incremental::program::new_program(

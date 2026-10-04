@@ -271,12 +271,12 @@ impl CompilerHost for CompilerHostImpl {
                 Prefetched::Nothing => FileText::new(text, freeable),
             }
         };
-        // Not in Go: with `GOPORT_FREE_FILE_VERSIONS=1`, a new parse of a
-        // path that this thread published keeps its nodes in its store
-        // (lsshells M3c), as the language server parse cache does;
-        // `program::update_program_version` gives it a `FileVersion`. A
-        // store that gets none is published static (its nodes are then
-        // leaked).
+        // Not in Go: while `ast::free_file_versions` is on (`tsc --watch`,
+        // or `GOPORT_FREE_FILE_VERSIONS=1`), a new parse of a path that this
+        // thread published keeps its nodes in its store (lsshells M3c), as
+        // the language server parse cache does;
+        // `program::mark_freeable_parses` gives it a `FileVersion`. A store
+        // that gets none is published static (its nodes are then leaked).
         let _owned_nodes = freeable.then(crate::ast::enter_freeable_parse);
         Some(Rc::new(parse_source_file(opts, text, script_kind)))
     }

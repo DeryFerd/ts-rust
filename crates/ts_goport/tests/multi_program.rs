@@ -12,8 +12,8 @@
 //! report must equal a fresh `goport` or `goport_emit` run of that project
 //! alone.
 //!
-//! The watch test runs `tsc --watch` through `goport_watch` and edits
-//! `src/a.ts` between builds.
+//! The watch tests run `tsc --watch` through `goport_watch` and edit
+//! `src/a.ts` (and `src/c.ts` or `tsconfig.json`) between builds.
 //!
 //! The build test runs `goport_build -b` on `fixtures/multiprog/build-dedup`,
 //! whose projects share parsed files in one process, as Go `tsc -b` does.
@@ -41,6 +41,11 @@ const FIXTURE: &str = concat!(
 );
 
 const EMIT_FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/multiprog/emit");
+
+const WATCH_HELD_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/multiprog/watch-held"
+);
 
 const BUILD_DEDUP_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -481,6 +486,255 @@ fn watch_builds_report_like_fresh_runs() {
         );
     }
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+}
+
+/// watchfree1: from its second build on, `tsc --watch` frees the old file
+/// versions (`ast::set_watch_process`). The builds: a body edit of
+/// `src/a.ts`, a touch (the same text again), an edit that changes its
+/// imports (a full build), a `tsconfig.json` edit (a full build that parses
+/// every file again, libs too) and the original text. The errors of each
+/// build equal a fresh `goport` run on the same files. At exit each file
+/// version that the last program does not have is dead: the four replaced
+/// versions of `src/a.ts`. The first version of each file is static, so no
+/// other version dies.
+// PORT: no Go counterpart.
+#[test]
+fn watch_frees_file_versions() {
+    let root = scratch_dir("watch-free");
+    // Go `CanWatchDirectory` does not watch `/tmp/<dir>/project`, so the
+    // config file is one level deeper than in the other tests.
+    let project = root.join("work").join("project");
+    copy_dir(Path::new(FIXTURE), &project);
+    let changed = project.join(CHANGED);
+    let config = project.join("tsconfig.json");
+    let original = read(&changed);
+    let original_config = read(&config);
+    let original_file = root.join("original.ts");
+    write(&original_file, &original);
+    // `newLine` changes the parsed config, so the build parses every file
+    // again, and changes no error.
+    let new_config = original_config.replace(
+        "\"declaration\": true",
+        "\"declaration\": true,\n    \"newLine\": \"lf\"",
+    );
+    assert_ne!(new_config, original_config);
+    let new_config_file = root.join("tsconfig.json");
+    write(&new_config_file, &new_config);
+    let config_edit = format!("{}={}", config.display(), new_config_file.display());
+    let edits = [
+        project.join("edits/a.ts").into_os_string(),
+        project.join("edits/a.ts").into_os_string(),
+        project.join("edits/a-imports.ts").into_os_string(),
+        config_edit.into(),
+        original_file.into_os_string(),
+    ];
+    let out = root.join("watch.txt");
+    let run = Command::new(env!("CARGO_BIN_EXE_goport_watch"))
+        .arg(&out)
+        .arg(CHANGED)
+        .args(&edits)
+        .args(["--", "--watch", "-p", "tsconfig.json", "--noEmit"])
+        .env_remove("GOPORT_FREE_FILE_VERSIONS")
+        .current_dir(&project)
+        .output()
+        .expect("run goport_watch");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(
+        run.status.success(),
+        "goport_watch failed ({}) in {}:\n{stdout}\n{}",
+        run.status,
+        root.display(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        read(&changed),
+        original,
+        "goport_watch must restore {CHANGED}"
+    );
+    assert_eq!(
+        read(&config),
+        original_config,
+        "goport_watch must restore tsconfig.json"
+    );
+
+    let watch = read(&out);
+    let builds: Vec<&str> = watch
+        .split_inclusive("Watching for file changes.")
+        .filter(|build| build.contains("Watching for file changes."))
+        .collect();
+    assert_eq!(
+        builds.len(),
+        6,
+        "one build per edit after the first:\n{watch}"
+    );
+    let edited = read(&project.join("edits/a.ts"));
+    let states = [
+        (&original, &original_config),
+        (&edited, &original_config),
+        (&edited, &original_config),
+        (&read(&project.join("edits/a-imports.ts")), &original_config),
+        (&read(&project.join("edits/a-imports.ts")), &new_config),
+        (&original, &new_config),
+    ];
+    for (i, (build, (text, config_text))) in builds.iter().zip(states).enumerate() {
+        write(&changed, text);
+        write(&config, config_text);
+        let fresh = goport(&project, Path::new("tsconfig.json"));
+        assert_eq!(
+            error_lines(build),
+            error_lines(&fresh.stdout),
+            "build {i} against goport ({})",
+            root.display()
+        );
+    }
+    let (made, dead) = file_version_counts(&stdout);
+    assert_eq!(
+        dead, 4,
+        "each replaced version of {CHANGED} dies, and no other (made {made})"
+    );
+    assert!(
+        made > dead + 4,
+        "the config edit parses every file again (made {made})"
+    );
+    fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+}
+
+/// watchfree1: a diagnostic that a watch build copies from the last build
+/// (Go `repopulateDiagnosticsOfFile`, an unchanged file) points at the file
+/// versions of the build that made it, and Go prints it from them. `c.ts`
+/// has TS2741, whose related information points into `a.ts`. An edit that
+/// changes the signature of `a.ts` checks `c.ts` again; two edits that move
+/// its lines and keep its signature copy the error, which still points at
+/// the first edited version. A comment in `c.ts` checks it again, and a
+/// touch of `c.ts` copies the error, which points at the version before the
+/// touch. `--pretty` prints the lines of each version. The output (times
+/// and clear-screen codes removed) equals `expected.txt`, the output of
+/// `tsgo-oracle-673a5f17d713 -w -p tsconfig.json --pretty` for the same
+/// edits. The emitted files equal a fresh `goport_emit` of the last texts.
+/// At exit the four versions that no copied error holds are dead.
+// PORT: no Go counterpart for the file versions; the output is Go's.
+#[test]
+fn watch_copied_errors_read_their_file_versions() {
+    let root = scratch_dir("watch-held");
+    let project = root.join("project");
+    copy_dir(Path::new(WATCH_HELD_FIXTURE), &project);
+    let out = root.join("watch.txt");
+    let run = Command::new(env!("CARGO_BIN_EXE_goport_watch"))
+        .arg(&out)
+        .arg(CHANGED)
+        .args([
+            "edits/a-y.ts",
+            "edits/a-y-2.ts",
+            "edits/a-y-3.ts",
+            "src/c.ts=edits/c-note.ts",
+            "src/c.ts=edits/c-note.ts",
+            "edits/a-y-4.ts",
+        ])
+        .args(["--", "--watch", "-p", "tsconfig.json", "--pretty"])
+        .env_remove("GOPORT_FREE_FILE_VERSIONS")
+        .current_dir(&project)
+        .output()
+        .expect("run goport_watch");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(
+        run.status.success(),
+        "goport_watch failed ({}) in {}:\n{stdout}\n{}",
+        run.status,
+        root.display(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        normalize_watch_output(&read(&out)),
+        read(&project.join("expected.txt")),
+        "watch output against tsgo ({})",
+        root.display()
+    );
+
+    let watched = read_tree(&project.join("out"));
+    // The last texts, as the edits left them.
+    write(
+        &project.join(CHANGED),
+        &read(&project.join("edits/a-y-4.ts")),
+    );
+    write(
+        &project.join("src/c.ts"),
+        &read(&project.join("edits/c-note.ts")),
+    );
+    fs::remove_dir_all(project.join("out")).expect("remove the watch out dir");
+    // `--writeRoot`: the config's `outDir` is inside the project.
+    let emit = Command::new(env!("CARGO_BIN_EXE_goport_emit"))
+        .args([
+            "-p",
+            "tsconfig.json",
+            "--outDir",
+            "out",
+            "--writeRoot",
+            "out",
+        ])
+        .current_dir(&project)
+        .output()
+        .expect("run goport_emit");
+    assert_eq!(
+        emit.status.code(),
+        Some(2),
+        "goport_emit reports the c.ts error and writes the outputs ({}):\n{}",
+        root.display(),
+        String::from_utf8_lossy(&emit.stdout)
+    );
+    let fresh = read_tree(&project.join("out"));
+    let outputs = |tree: BTreeMap<String, String>| -> BTreeMap<String, String> {
+        tree.into_iter()
+            .filter(|(name, _)| !name.ends_with(".tsbuildinfo"))
+            .collect()
+    };
+    assert_eq!(
+        outputs(watched),
+        outputs(fresh),
+        "watch outputs against goport_emit ({})",
+        root.display()
+    );
+
+    let (made, dead) = file_version_counts(&stdout);
+    assert_eq!(
+        (made, dead),
+        (6, 4),
+        "a.ts v2 to v5 and c.ts v2 and v3 are versions; the last a.ts and c.ts live"
+    );
+    fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+}
+
+/// The counts of the last stdout line of `goport_watch`,
+/// `file_versions made=<n> dead=<m>`.
+fn file_version_counts(stdout: &str) -> (usize, usize) {
+    stdout
+        .lines()
+        .last()
+        .and_then(|line| line.strip_prefix("file_versions made="))
+        .and_then(|rest| rest.split_once(" dead="))
+        .and_then(|(made, dead)| Some((made.parse().ok()?, dead.parse().ok()?)))
+        .unwrap_or_else(|| panic!("no file_versions line in the goport_watch output:\n{stdout}"))
+}
+
+/// A `--pretty` watch output without the clear-screen codes, and with each
+/// status time (`[<esc>[90m3:41:35 PM<esc>[0m] `) as `[<time>] `.
+fn normalize_watch_output(output: &str) -> String {
+    const TIME_START: &str = "[\x1b[90m";
+    const TIME_END: &str = "\x1b[0m] ";
+    let output = output.replace("\x1b[2J\x1b[3J\x1b[H", "");
+    let mut normalized = String::with_capacity(output.len());
+    for line in output.split_inclusive('\n') {
+        match line
+            .strip_prefix(TIME_START)
+            .and_then(|rest| rest.split_once(TIME_END))
+        {
+            Some((_, rest)) => {
+                normalized.push_str("[<time>] ");
+                normalized.push_str(rest);
+            }
+            None => normalized.push_str(line),
+        }
+    }
+    normalized
 }
 
 /// `goport_build -b` makes the program of each project in one process, and

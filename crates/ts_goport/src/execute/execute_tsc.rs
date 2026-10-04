@@ -577,14 +577,22 @@ pub(crate) fn new_program_version(
     host: Rc<dyn CompilerHost>,
     config: Rc<ParsedCommandLine>,
 ) -> &'static crate::core::GoProgram {
-    let np = {
-        // The frontend parses with no current program, like the first load.
-        let _scope = crate::core::enter_program(None);
-        Rc::new(crate::frontend::compiler::new_program(program_options(
-            host, config,
-        )))
-    };
-    crate::program::new_program_version(&np, None)
+    crate::program::new_program_version(&new_frontend_program(host, config), None)
+}
+
+/// The frontend part of `new_program_version`: Go
+/// `compiler.NewProgram(compiler.ProgramOptions{Config, Host})` with no
+/// program version yet. Watch mode marks its new parses freeable
+/// (`program::mark_freeable_parses`) before it makes the version.
+pub(crate) fn new_frontend_program(
+    host: Rc<dyn CompilerHost>,
+    config: Rc<ParsedCommandLine>,
+) -> Rc<NewProgram> {
+    // The frontend parses with no current program, like the first load.
+    let _scope = crate::core::enter_program(None);
+    Rc::new(crate::frontend::compiler::new_program(program_options(
+        host, config,
+    )))
 }
 
 /// The Go `compiler.ProgramOptions` of a tsc program.

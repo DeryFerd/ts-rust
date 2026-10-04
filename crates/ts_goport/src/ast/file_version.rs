@@ -51,16 +51,18 @@
 //! check, `ast::store::file_block`).
 //!
 //! Freeable rule (`free_file_versions`, `freeable_path`): only a parse of
-//! the language server parse cache (project/parsecache.rs), in a language
-//! server or API process, of a path that a publish on this thread published
-//! before. So the first publish, the first version of each file and every
-//! CLI publish never get a `FileVersion`. `GOPORT_FREE_FILE_VERSIONS=0` turns it off
-//! (the behavior before M3a); `=1` turns it on in any process, and then
+//! a path that a publish on this thread published before, in a language
+//! server or API process (the parse cache, project/parsecache.rs) or a
+//! `tsc --watch` process (each build, `program::mark_freeable_parses`;
+//! watchfree1). So the first publish, the first version of each file and
+//! every other CLI publish never get a `FileVersion`.
+//! `GOPORT_FREE_FILE_VERSIONS=0` turns it off (the behavior before M3a);
+//! `=1` turns it on in any process, and then
 //! `program::update_program_version` (`goport_multiprog`) applies the same
 //! rule to its new parses (the compiler host opens the freeable parse scope
 //! for them, M3c). A parse that a parse worker made (prefetch) keeps its
 //! nodes in the leaked AST arena; its version still frees its store and
-//! `GoFile`.
+//! `GoFile`. Watch mode parses ahead only in its first build.
 
 use super::store::VersionStore;
 use crate::prelude::*;
@@ -101,7 +103,8 @@ impl std::fmt::Debug for FileVersion {
 
 impl FileVersion {
     /// The owner of file version `file`, registered in the registry. The
-    /// language server parse cache makes it (`freeable_path`).
+    /// language server parse cache and `program::mark_freeable_parses`
+    /// make it (`freeable_path`).
     pub(crate) fn new(file: usize) -> Arc<Self> {
         let version = Arc::new(FileVersion {
             file,
@@ -193,6 +196,10 @@ static MADE: AtomicUsize = AtomicUsize::new(0);
 /// the API.
 static EDITOR_PROCESS: AtomicBool = AtomicBool::new(false);
 
+/// Set by `Watcher::start`: this process runs `tsc --watch` (without
+/// `--build`).
+static WATCH_PROCESS: AtomicBool = AtomicBool::new(false);
+
 /// Set when the first freeable version is published. Until then a registry
 /// read (`with_version_store` in `ast/store.rs`) never looks for a version.
 static FREEABLE_PUBLISHED: AtomicBool = AtomicBool::new(false);
@@ -212,14 +219,28 @@ pub fn set_editor_process() {
     EDITOR_PROCESS.store(true, Ordering::Relaxed);
 }
 
-/// True in a language server or API process (`set_editor_process`).
-pub(crate) fn is_editor_process() -> bool {
-    EDITOR_PROCESS.load(Ordering::Relaxed)
+/// Marks this process as a `tsc --watch` process, where
+/// `free_file_versions` and owned nodes are on by default, as in a
+/// language server. `Watcher::start` calls it before the first build.
+// PORT: not in Go. Go frees an old `*ast.SourceFile` of a watch rebuild
+// with its GC (execute/watcher.go:482, :567). Every tsc command of the
+// go_baselines tests runs in a child process of its own, so the flag never
+// reaches another test.
+pub fn set_watch_process() {
+    WATCH_PROCESS.store(true, Ordering::Relaxed);
 }
 
-/// True when this process frees the file versions that the language server
-/// publishes again. `GOPORT_FREE_FILE_VERSIONS` is read once: `0` is off,
-/// `1` is on; else it is on in a language server or API process only.
+/// True in a process where `free_file_versions` and owned nodes are on by
+/// default: a language server or API process (`set_editor_process`) or a
+/// `tsc --watch` process (`set_watch_process`).
+pub(crate) fn frees_file_versions_by_default() -> bool {
+    EDITOR_PROCESS.load(Ordering::Relaxed) || WATCH_PROCESS.load(Ordering::Relaxed)
+}
+
+/// True when this process frees the file versions that it publishes again.
+/// `GOPORT_FREE_FILE_VERSIONS` is read once: `0` is off, `1` is on; else it
+/// is on in a language server, API or `tsc --watch` process only
+/// (`frees_file_versions_by_default`).
 pub fn free_file_versions() -> bool {
     static FLAG: OnceLock<Option<bool>> = OnceLock::new();
     let flag = *FLAG.get_or_init(
@@ -229,7 +250,7 @@ pub fn free_file_versions() -> bool {
             _ => None,
         },
     );
-    flag.unwrap_or_else(is_editor_process)
+    flag.unwrap_or_else(frees_file_versions_by_default)
 }
 
 thread_local! {

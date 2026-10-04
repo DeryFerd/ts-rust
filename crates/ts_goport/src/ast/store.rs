@@ -2121,9 +2121,10 @@ thread_local! {
 /// owned nodes on (`owned_nodes_enabled`) the stores that
 /// `new_file_store` makes until the scope ends own their astdata nodes,
 /// pending lists and parse lists (`OwnedAst`), so they are freed with the
-/// store, not leaked in the AST arena. The language server parse cache
-/// opens it for a new version of a published path (`ast::freeable_path`),
-/// the version that gets a `FileVersion`.
+/// store, not leaked in the AST arena. The language server parse cache and
+/// the compiler host (`tsc --watch`, `goport_multiprog`) open it for a new
+/// version of a published path (`ast::freeable_path`), the version that
+/// gets a `FileVersion`.
 // PORT: Go nodes are heap objects that the GC frees with their file. A
 // static parse keeps its nodes in the leaked AST arena, so its node reads
 // stay `'static`.
@@ -2138,10 +2139,11 @@ pub fn enter_freeable_parse() -> FreeableParseScope {
 /// True when a freeable parse owns its nodes (lsshells M3c). Off, it is a
 /// static parse (its nodes stay in the leaked AST arena, and its node shell
 /// has a node column), as before M3c. `GOPORT_OWNED_NODES` is read once:
-/// `0` is off, `1` is on; else it is on in a language server or API process
-/// only (`ast::set_editor_process`), where the freeable versions are. A CLI
-/// process makes freeable parses only with `GOPORT_FREE_FILE_VERSIONS=1`
-/// (`goport_multiprog`), and they stay static there by default.
+/// `0` is off, `1` is on; else it is on in a language server, API or
+/// `tsc --watch` process only (`ast::frees_file_versions_by_default`),
+/// where the freeable versions are. Another CLI process makes freeable
+/// parses only with `GOPORT_FREE_FILE_VERSIONS=1` (`goport_multiprog`), and
+/// they stay static there by default.
 // PERF: on by default since lsshells M3g (root decision
 // m3-owned-default-2026-09-29). Only with it on do 1000-edit sessions pass
 // memory (M3f, mini-abf9: effect 0.46 MiB/edit and +480 MiB, off 1.23 and
@@ -2162,7 +2164,7 @@ fn owned_nodes_enabled() -> bool {
         Ok("1") => Some(true),
         _ => None,
     });
-    flag.unwrap_or_else(crate::ast::is_editor_process)
+    flag.unwrap_or_else(crate::ast::frees_file_versions_by_default)
 }
 
 /// `enter_freeable_parse` with owned nodes on, whatever the flag, for the
