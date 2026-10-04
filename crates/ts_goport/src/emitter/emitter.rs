@@ -255,6 +255,7 @@ impl Emitter {
             source_file = transformer.transform_source_file(source_file);
             diags.extend(transformer.get_diagnostics());
         }
+        emit_test_panic(EmitTestPanic::DeclarationTransforms, self.source_file);
         (source_file, diags)
     }
 
@@ -332,6 +333,7 @@ impl Emitter {
 
     /// The rest of Go `emitJSFile`: the printer and the print of `print`.
     fn print_js_file(&mut self, print: JsPrint, js_file_path: &str, source_map_file_path: &str) {
+        emit_test_panic(EmitTestPanic::JsPrint, self.source_file);
         let options = options();
         let JsPrint {
             source_file,
@@ -1187,4 +1189,52 @@ pub fn add_utf8_byte_order_mark(text: String) -> String {
         return text;
     }
     format!("\u{FEFF}{text}")
+}
+
+/// A step of a file's emit where `set_emit_test_panic` makes it panic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmitTestPanic {
+    /// After the declaration transforms of the file, on the thread that runs
+    /// them (its checker thread).
+    DeclarationTransforms,
+    /// At the start of the JS print of the file, on the thread that prints
+    /// it (its checker thread, the emit pool or the twin of its checker).
+    JsPrint,
+}
+
+/// The panic that `set_emit_test_panic` set: the step and the end of the
+/// file name.
+static EMIT_TEST_PANIC: std::sync::Mutex<Option<(EmitTestPanic, String)>> =
+    std::sync::Mutex::new(None);
+
+/// True while `EMIT_TEST_PANIC` holds a panic, so the emit reads only this
+/// flag when no test set one.
+static EMIT_TEST_PANIC_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// PORT: not in Go. Tests: makes the emit panic at `step` in each file whose
+/// name ends with the given text, or with `None` stops it. The panic tests
+/// of the twins use it (`tests/emit_pool.rs`).
+pub fn set_emit_test_panic(panic: Option<(EmitTestPanic, &str)>) {
+    let mut set = EMIT_TEST_PANIC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *set = panic.map(|(step, file_name_end)| (step, file_name_end.to_string()));
+    EMIT_TEST_PANIC_ON.store(set.is_some(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Panics when `set_emit_test_panic` set `step` for `source_file`.
+fn emit_test_panic(step: EmitTestPanic, source_file: Node) {
+    if !EMIT_TEST_PANIC_ON.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let file_name = source_file_file_name(source_file);
+    let hit = EMIT_TEST_PANIC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|(at, end)| *at == step && file_name.ends_with(end.as_str()));
+    if hit {
+        panic!("emit test panic: {step:?} in {file_name}");
+    }
 }

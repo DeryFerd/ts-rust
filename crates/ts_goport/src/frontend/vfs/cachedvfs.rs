@@ -65,6 +65,35 @@ impl CachedFs {
     }
 }
 
+// PORT: not in Go. The cached answer for `path`, with no call: `None` when
+// the cache has none or is off. A language server load compares the
+// answers of its resolve-ahead workers with it (project/compilerhost.rs).
+impl CachedFs {
+    pub fn cached_file_exists(&self, path: &str) -> Option<bool> {
+        self.cached(&self.file_exists_cache, path)
+    }
+
+    pub fn cached_directory_exists(&self, path: &str) -> Option<bool> {
+        self.cached(&self.directory_exists_cache, path)
+    }
+
+    pub fn cached_realpath(&self, path: &str) -> Option<String> {
+        self.cached(&self.realpath_cache, path)
+    }
+
+    /// The file system that the cache asks.
+    pub fn wrapped(&self) -> &Rc<dyn Fs> {
+        &self.fs
+    }
+
+    fn cached<V: Clone>(&self, cache: &RefCell<FxHashMap<String, V>>, path: &str) -> Option<V> {
+        if !self.enabled.get() {
+            return None;
+        }
+        cache_load(cache, path)
+    }
+}
+
 impl Fs for CachedFs {
     // Go: cachedvfs.go:48 DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {

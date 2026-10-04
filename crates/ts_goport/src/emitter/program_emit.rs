@@ -860,6 +860,25 @@ fn twin_can_print(target: &EmitterOptions) -> bool {
 /// around the transforms on the checker and around the prints on the twin:
 /// a panic in either gives the file `wrap`'s result, as the emit of the
 /// whole file on the checker does.
+///
+/// A panic in the declaration transforms goes on in the twin's `wrap`
+/// after the twin printed and wrote the JS part, so the file's map and JS
+/// are written, as in Go (`emitJSFile` writes before `emitDeclarationFile`
+/// starts) and on the checker with the twins off.
+///
+/// One case is different from Go and from the twins off: a panic in the
+/// JS print on the twin. In Go, that panic stops the file's emit before its
+/// declaration transforms start. Here the checker ran them before the twin
+/// printed. So the checker made their checker calls: they can add to its
+/// caches and make types, and later files on that checker see these. A
+/// panic or an unported hit in these transforms also shows: the panic hook
+/// prints it and the unported counts get it. The writes are the same: the
+/// file has no d.ts output, and its JS outputs are what the JS print wrote
+/// before its panic. To keep Go's calls in this case, the checker must wait
+/// for each JS print before the declaration transforms. That takes away
+/// what the twin gains. With `DtsTwinMode::Check` the checker also prints
+/// the JS part before the declaration transforms, so a panic in that print
+/// comes first, as with the twins off.
 fn emit_on_twin(
     source_file: Node,
     target: &EmitterOptions,
@@ -883,12 +902,15 @@ fn emit_on_twin(
             }
         });
         let dts = matches!(target.emit_only, EmitOnly::All | EmitOnly::Dts).then(|| {
-            let mut emitter =
-                new_emitter(host.clone(), source_file, &part_target(EmitOnly::Dts), None);
-            match emitter.transform_declaration_part() {
-                Some(print) => TwinPart::Print(TwinPrint::declaration(emitter, print, check)),
-                None => TwinPart::Done(emitter.emit_result),
-            }
+            catch_unwind(AssertUnwindSafe(|| {
+                let mut emitter =
+                    new_emitter(host.clone(), source_file, &part_target(EmitOnly::Dts), None);
+                match emitter.transform_declaration_part() {
+                    Some(print) => TwinPart::Print(TwinPrint::declaration(emitter, print, check)),
+                    None => TwinPart::Done(emitter.emit_result),
+                }
+            }))
+            .unwrap_or_else(TwinPart::Panicked)
         });
         let file = TwinFile {
             js: js.unwrap_or_default(),
@@ -922,6 +944,9 @@ enum TwinPart {
     Done(EmitResult),
     /// The twin prints the part.
     Print(TwinPrint),
+    /// The transforms of the d.ts part panicked on the checker thread with
+    /// this payload. The panic goes on after the JS part is printed.
+    Panicked(Box<dyn std::any::Any + Send>),
 }
 
 impl Default for TwinPart {
@@ -938,23 +963,31 @@ struct TwinFile {
 }
 
 impl TwinFile {
-    /// The merged result when no part has a print, else the file.
+    /// The merged result when no part has a print, else the file. When the
+    /// JS part has no print and the d.ts transforms panicked, the panic goes
+    /// on here.
     fn done(self) -> Result<EmitResult, TwinFile> {
         match self {
             TwinFile {
                 js: TwinPart::Done(js),
                 dts: TwinPart::Done(dts),
             } => Ok(merge_emit_parts(js, dts)),
+            TwinFile {
+                js: TwinPart::Done(_),
+                dts: TwinPart::Panicked(payload),
+            } => resume_unwind(payload),
             file => Err(file),
         }
     }
 
     /// On the twin: prints and writes the JS part, then the d.ts part, and
-    /// returns their merged result.
+    /// returns their merged result. A panic of the d.ts transforms goes on
+    /// after the JS part is written.
     fn run(self) -> EmitResult {
         let js = match self.js {
             TwinPart::Done(result) => result,
             TwinPart::Print(print) => print.print(None),
+            TwinPart::Panicked(payload) => resume_unwind(payload),
         };
         let js_part = Rc::new(RefCell::new(PoolJsPart {
             job: None,
@@ -963,6 +996,7 @@ impl TwinFile {
         let dts = match self.dts {
             TwinPart::Done(result) => result,
             TwinPart::Print(print) => print.print(Some(js_part.clone())),
+            TwinPart::Panicked(payload) => resume_unwind(payload),
         };
         let js = js_part
             .borrow_mut()

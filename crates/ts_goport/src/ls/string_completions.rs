@@ -815,11 +815,8 @@ impl LanguageService {
         program: &compiler::NewProgram,
         checker: &mut Checker,
     ) -> Option<StringLiteralCompletions> {
-        let text_start = astnav::get_start_of_node(node, file, false /*includeJSDoc*/) + 1;
-        let (replacement_span, ok) = self.path_completion_replacement_span(
-            file,
-            get_directory_fragment_range(node.text(), text_start),
-        );
+        let (replacement_span, ok) =
+            self.path_completion_replacement_span(file, module_name_fragment_range(file, node));
         if !ok {
             return None;
         }
@@ -833,6 +830,29 @@ impl LanguageService {
             ..Default::default()
         })
     }
+}
+
+/// The range of the module name `node` of `file` that the path completions
+/// replace: Go `getDirectoryFragmentRange(node.Text(), textStart)` in
+/// `getStringLiteralCompletionsFromModuleNames` (string_completions.go:593).
+// PORT: Go adds byte offsets of `node.Text()`, the literal's value, to
+// `textStart`, a byte offset of the source. The value's port form can differ
+// from the source's (an escape, a WTF-8 surrogate fused into one unit), and
+// a marker unit (see `GO_STRING_MARKER`) has more port bytes than Go bytes.
+// So the range is Go's in Go bytes, then port offsets of the source.
+fn module_name_fragment_range(file: Node, node: Node) -> Option<TextRange> {
+    let text_start = astnav::get_start_of_node(node, file, false /*includeJSDoc*/) + 1;
+    let source = source_file_text(file);
+    get_directory_fragment_range(
+        &go_string_bytes(node.text()),
+        go_byte_offset(&source, text_start),
+    )
+    .map(|range| {
+        TextRange::new(
+            port_byte_offset(&source, range.pos()),
+            port_byte_offset(&source, range.end()),
+        )
+    })
 }
 
 // Go: ls/string_completions.go:612 toPathCompletions
@@ -888,8 +908,14 @@ fn is_any_directory_separator(r: char) -> bool {
 
 // Go: ls/string_completions.go:650 getDirectoryFragmentRange
 // Replace everything after the last directory separator that appears
-fn get_directory_fragment_range(text: &str, text_start: i32) -> Option<TextRange> {
-    let index = text.rfind(is_any_directory_separator);
+// PORT: Go works on the bytes of `text`. `text` is the Go bytes
+// (`go_string_bytes`), and `text_start` and the range are Go byte offsets.
+// A separator is ASCII, so the last separator byte is Go's last separator
+// rune.
+fn get_directory_fragment_range(text: &[u8], text_start: i32) -> Option<TextRange> {
+    let index = text
+        .iter()
+        .rposition(|&b| is_any_directory_separator(char::from(b)));
     let mut offset = 0;
     if let Some(index) = index {
         offset = index + 1;
@@ -2931,10 +2957,13 @@ impl LanguageService {
         }
         // PORT: Go's range ends at `position`, the end of `text`. The invalid
         // byte units of a cut char are longer than its Go bytes, so the end
-        // is `position`, not the end of `to_complete` in port bytes.
-        let fragment_range =
-            get_directory_fragment_range(to_complete, found_range.pos() + prefix.len() as i32)
-                .map(|range| TextRange::new(range.pos(), position));
+        // is `position`, not the end of `to_complete` in port bytes. The
+        // start is a Go offset before the cut, mapped back to the port.
+        let fragment_range = get_directory_fragment_range(
+            &go_string_bytes(to_complete),
+            go_byte_offset(&file_text, found_range.pos()) + go_len(prefix) as i32,
+        )
+        .map(|range| TextRange::new(port_byte_offset(&file_text, range.pos()), position));
         let (replacement_span, ok) = self.path_completion_replacement_span(file, fragment_range);
         if !ok {
             return None;
@@ -3063,8 +3092,11 @@ T2 6 false 0 \"\"  nil \n\
             for p in from..=to {
                 let slice = go_text_slice(text, 0, p);
                 let (prefix, kind, to_complete, ok) = parse_triple_slash_directive_fragment(&slice);
-                let range = get_directory_fragment_range(to_complete, prefix.len() as i32)
-                    .map_or("nil".to_string(), |range| format!("{}-{p}", range.pos()));
+                let range = get_directory_fragment_range(
+                    &go_string_bytes(to_complete),
+                    go_len(prefix) as i32,
+                )
+                .map_or("nil".to_string(), |range| format!("{}-{p}", range.pos()));
                 writeln!(
                     port,
                     "T{i} {p} {ok} {} {kind:?} {} {range} {}",
@@ -3074,6 +3106,78 @@ T2 6 false 0 \"\"  nil \n\
                 )
                 .unwrap();
             }
+        }
+        assert_eq!(port, go);
+    }
+
+    /// The range that module name completions replace is Go's: Go adds byte
+    /// offsets of the literal's value to the source offset of its text, so
+    /// a value whose port form differs from the source's (an escape, a WTF-8
+    /// surrogate that the value fuses into one unit) or that has a marker
+    /// unit must be counted in Go bytes. The expected lines are from a Go
+    /// test at pin N with Go 1.27.1 (`followups17/tools/gomodel` in the lane
+    /// dir, an overlay test file in package `ls`) that prints
+    /// `getDirectoryFragmentRange(node.Text(), textStart)` of
+    /// `getStringLiteralCompletionsFromModuleNames` for the module specifier,
+    /// in Go bytes. It numbers these texts after its 13 texts of
+    /// `findallreferences_p1::tests::range_of_a_string_literal_counts_go_bytes`.
+    #[test]
+    fn module_name_fragment_range_counts_go_bytes() {
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+        use crate::frontend::tspath::Path;
+        use crate::scanner_util::go_string_from_bytes;
+        let go = "\
+M13 22-23
+M14 21-25
+M15 22-23
+M16 21-25
+M17 21-25
+M18 22-26
+M19 22-26
+M20 21-23
+M21 20-22
+M22 21-23
+M23 21-22
+M24 21-26
+";
+        let texts: [&[u8]; 12] = [
+            b"import a from \"./d\xed\xa0\x80/f\";\n",
+            b"import b from \"./sub/a\xed\xa0\x80\";\n",
+            b"import c from \"./d\\uD800/f\";\n",
+            b"import d from \"./sub/a\\uD800\";\n",
+            b"import e from \"./sub/a\\uFDD0\";\n",
+            b"import f from \"./d\\uFDD0/a\\uFDD0\";\n",
+            b"import g from \"./d\xef\xb7\x90/a\xef\xb7\x90\";\n",
+            b"import h from \"./sub/a\xff\";\n",
+            b"import i from \"./d\xff/a\xff\";\n",
+            b"import j from \"./sub/\\xFF\";\n",
+            b"import k from \"./sub/\xff\n",
+            b"import l from \"./sub/\\uD83D\\uDE00x\";\n",
+        ];
+        let mut port = String::new();
+        for (i, bytes) in texts.into_iter().enumerate() {
+            let text = go_string_from_bytes(bytes.to_vec());
+            let file = parse_source_file(
+                &SourceFileParseOptions {
+                    file_name: "/a.ts".to_string(),
+                    path: Path("/a.ts".to_string()),
+                    ..Default::default()
+                },
+                crate::ast::FileText::new(text.clone(), false),
+                ScriptKind::TS,
+            );
+            let specifier = file.root.statements().get(0).module_specifier();
+            let range = module_name_fragment_range(file.root, specifier).map_or(
+                "nil".to_string(),
+                |range| {
+                    format!(
+                        "{}-{}",
+                        go_byte_offset(&text, range.pos()),
+                        go_byte_offset(&text, range.end())
+                    )
+                },
+            );
+            writeln!(port, "M{} {range}", i + 13).unwrap();
         }
         assert_eq!(port, go);
     }

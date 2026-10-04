@@ -131,12 +131,16 @@ variant that embeds `X` (panic otherwise). Every other Go method on `*Type`
   symbols, `program::bound_symbols()`).
   Access: `self.symbols.sym(s)`, `self.symbols.sym_mut(s)`; shorthand
   methods `self.sym(s) -> &Symbol` and `self.sym_mut(s)`.
-- `types: Vec<Type>` -> `self.ty(t) -> &Type`, `self.ty_mut(t) -> &mut Type`.
+- `types: ChunkedArena<Type>` -> `self.ty(t) -> &Type`, `self.ty_mut(t) -> &mut Type`.
 - `signatures: Vec<Signature>` -> `self.sig(s)`, `self.sig_mut(s)`.
 - `index_infos: Vec<IndexInfo>` -> `self.index_info(i)`, `self.index_info_mut(i)`.
 - `type_predicates: Vec<TypePredicate>` -> `self.pred(p)`, `self.pred_mut(p)`.
-- `mappers: Vec<TypeMapper>` -> `self.mapper(m)`, `self.mapper_mut(m)`.
-- `inference_contexts: Vec<InferenceContext>` -> `self.inference_context(c)`, `self.inference_context_mut(c)`.
+- `mappers: ChunkedArena<TypeMapper>` -> `self.mapper(m)`, `self.mapper_mut(m)`.
+- `inference_contexts: ChunkedArena<InferenceContext>` -> `self.inference_context(c)`, `self.inference_context_mut(c)`.
+A `ChunkedArena` (`checker/types.rs`) keeps its entries in chunks of
+8,192, so it does not copy every entry when it grows, as a doubling `Vec`
+does (infermem1: the `inference_contexts` `Vec` kept buffers of 512 and
+256 MiB on typebox).
 Each arena has a dummy entry at index 0. New entries are pushed; ids are
 `TypeId(len as u32)` etc. Go `c.newType`, `c.newSignature`,
 `newIndexInfo`, `newTypePredicate`, mapper constructors push into these.
@@ -150,6 +154,24 @@ keys have, goes in a `Box` (`type_node_links: LinkStore<Node, Box<TypeNodeLinks>
 and its constructors. Go `m.Map(t)` -> `self.mapper_map(m, t)`,
 `m.Kind()` -> `self.mapper(m).kind()`, `m.MapsThisOnly()` ->
 `self.mapper(m).maps_this_only()`.
+
+The port keeps every mapper and inference context of a run (typebox: 21.4M
+mappers, about 3.9M contexts), so these types are small (infermem1). A
+compile-time assert holds each size on 64-bit targets. Keep the asserts: a
+new field that few values set goes in the box.
+- `TypeMapper` is 16 bytes. The `Array`, `ArrayToSingle`, `Deferred` and
+  `Function` payloads are boxed. The `Array` bool (the cached Go
+  `MapsThisOnly`) is outside its box, so the box is 48 bytes. Mapper ids
+  and their order do not change.
+- `InferenceContext` is 56 bytes. The fields that only signature inference
+  sets (the return mappers, the inferred type parameters and their origin,
+  the intra-expression inference sites) are in `rare`, a box made on the
+  first write (`rare_mut`). Their accessors (`return_mapper()` and the
+  others) give Go's zero values while it is absent. `inferences` is a boxed
+  slice: its length never changes.
+- `InferenceInfo` is 32 bytes. Its two candidate lists are in one box
+  (`candidate_lists`) that the first candidate makes. `candidates()` and
+  `contra_candidates()` give Go's nil lists while it is absent.
 
 ## AST (owned by ast/node.rs, ast/fields.rs, ast/misc.rs, ast/utilities_*)
 
@@ -275,9 +297,10 @@ methods reach the AST through it.
   calls: a call there made `Node::parent` go out of line (AST node records
   step 2b). A node shell has no link column, so `frozen_store_children`
   gives `None` and the caller reads the node data.
-- Node records (AST node records plan steps 1 to 4, `ast/store.rs`).
-  Each store slot has one 32-byte `NodeRecord` (bits, flags, loc,
-  `up` and `bind`), a `SyntaxKind` in the kind column (`FileStore::kinds`)
+- Node records (AST node records plan steps 1 to 4 and astmem1 P3,
+  `ast/store.rs`).
+  Each store slot has one 24-byte `NodeRecord` (`flags`, `bind`, `loc`
+  and `up`), a `SyntaxKind` in the kind column (`FileStore::kinds`)
   and one 16-byte `NodeKids` (the U4 and C2 child ids,
   and a word with the U1 name of an identifier or the U1 (b) modifier
   bits of any other slot). They replace the header, kind, name, modifier
@@ -285,13 +308,24 @@ methods reach the AST through it.
   code (0 nil, slot + 1 for a parent in the store, the top bit and an
   index into the store's foreign parent table for any other parent) and
   the Go symbol; `up` of the nil slot or an alias slot holds its target.
-  `bind` holds the low half of the flow node (always in the same file)
-  and the index + 1 of the node's `NodeBindExtra` (local symbol, locals,
-  next container, end and return flow nodes) in `GoFile::node_bind`. The
-  record flags are the parser flags, and after the bind also the
-  binder-added bits (`BINDER_ADDED_FLAGS`), so `parser_flags(mask)` stays
-  exact for a mask without them, and the parser flags of a published file
-  are the ones in its `GoFile`. The words are atomics that the reads load
+  `bind` is 32 bits: the low half of the flow node (always in the same
+  file), or with `BIND_EXTRA` (bit 31) the index + 1 of the node's
+  `NodeBindExtra` (flow node, local symbol, locals, next container, end
+  and return flow nodes) in `GoFile::node_bind`. About 6% of the slots
+  have extras (locals containers, exported declarations, function-like
+  nodes), so the flow read of every other node is one load. The record
+  flags are the parser flags, and after the bind also the binder-added
+  bits (`BINDER_ADDED_FLAGS`), so `parser_flags(mask)` stays exact for a
+  mask without them, and the parser flags of a published file are the
+  ones in its `GoFile`. The record bits (`SOURCE_FILE_ROOT`,
+  `TEXT_IS_KEYWORD`, `NO_NODE`) are bits 29 to 31 of `flags`: Go
+  `NodeFlags` ends at bit 28. `NodeRecord::flags` masks them, and a parse
+  flags write checks that no Go flag is in them (`checked_flags`). The
+  node column (`FileStore::nodes`, `BlockFile`) names a leaked `NodeData`
+  (16 bytes) for each node slot, not a whole `astdata::Node` (astmem1
+  P1): the kind is in the kind column and the header in the record, so no
+  read needs the rest. The node reads (`static_ast_node`,
+  `frozen_store_ast_node`) give `&NodeData`. The words are atomics that the reads load
   with `Relaxed`. The parse writes them through `get_mut`; after the
   publish only `BoundFile::install` writes a record (`bind_store_records`:
   symbol, added flags, `bind`), through a shared ref, before any other
@@ -318,7 +352,7 @@ methods reach the AST through it.
 - Pooled node blocks and the owner check (AST node records step 4,
   `BlockPool` in `ast/store.rs`). The node shell of a freeable version
   copies its records and kids into a pooled block (a leaked block of
-  records and kids, 48 bytes per slot, with room for about 1/8 more slots
+  records and kids, 40 bytes per slot, with room for about 1/8 more slots
   and 64 more). The version gives the block back when it dies; it waits
   in a quarantine until 2 more program releases (`pin_epoch`), then a
   later node shell of a size it fits (`len` to `2 * len + 64` slots) takes
@@ -426,7 +460,7 @@ The batch that adds it is not accepted until Theo approves.
   `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The
   registry keeps a `Weak`. At publish the version takes its `FileStore`
   and its `GoFile` (M3b). Its node records and kids (`NodeRecord`,
-  `NodeKids`; 48 bytes per node, and 2 in the kind column) are in its node shell, the registry
+  `NodeKids`; 40 bytes per node, and 2 in the kind column) are in its node shell, the registry
   block of its id (a pooled block, AST node records step 4), so a header or child
   read of the edited file stays inline (a pinned read per node read made
   edits 3 to 4 ms slower); the child link column is dropped, and the
@@ -534,7 +568,7 @@ goroutine.
 ## Process start
 
 `tsgo` starts as the Go runtime and the Go `syscall` package start a Go
-process (bin/tsgo.rs `go_runtime_start`).
+process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
 
 - Signals (Linux, Go runtime/sigtab_linux_generic.go): the signals that Go
   drops when nothing asks for them (USR1, USR2, ALRM, CHLD, URG, XCPU,
@@ -551,6 +585,14 @@ process (bin/tsgo.rs `go_runtime_start`).
   keeps it ignored, so a process that tsgo starts gets it ignored too).
   PORT: SIGABRT and SIGTRAP keep their default actions. Other systems keep
   the default actions.
+- A failed exec of `set_malloc_tunables` (a binary that is gone, for
+  example) leaves SIGPIPE with its default action (std `Command` sets it
+  for the new image). tsgo then gives SIGPIPE a handler that does nothing,
+  so a write to a closed pipe or socket gets EPIPE again, as after std's
+  start and as in Go (a write to fd 1 or 2 still ends the run,
+  execute/tsc/stdio.rs `sigpipe`). Before, a second SIGINT or SIGTERM
+  ended such a run by SIGPIPE: `notify_context` writes to its closed
+  self-pipe.
 - The pid 1 of a PID namespace (`docker run` without `--init`, `unshare
   -pf`, `bwrap --as-pid-1`): the kernel drops each signal with the default
   action that such a process gets from its namespace or sends itself. Go
@@ -561,10 +603,9 @@ process (bin/tsgo.rs `go_runtime_start`).
   whose worker a signal ended exits 128 + N. PORT: std and rustix have no
   safe `SIG_DFL`, and signal-hook's default action calls `abort` when the
   raise returns, which ends a pid 1 by SIGSEGV (rc 139). So a pid 1 does
-  not raise the signal; it exits 128 + N at once. PORT: the SIGPIPE of a
-  broken stdout or stderr (execute/tsc/stdio.rs `sigpipe`) still uses
-  signal-hook's default action, so a pid 1 that runs the work itself
-  (no worker) ends there by SIGSEGV (139) where Go exits 141.
+  not raise the signal; it exits 128 + N at once. So does the SIGPIPE of
+  a broken stdout or stderr (execute/tsc/stdio.rs `sigpipe`): a pid 1 that
+  runs the work itself (no worker) exits 141, as Go does.
 - PORT: SIGILL, SIGBUS, SIGFPE and SIGSEGV keep their default actions,
   also when another process sends them (`kill`). Go throws a sent one
   (`sigFromUser`) as it throws SIGQUIT: it prints the name (`SIGSEGV:
@@ -572,14 +613,29 @@ process (bin/tsgo.rs `go_runtime_start`).
   the port the process ends by the signal (128 + N, a core dump where the
   limit allows it). A SIGILL, SIGBUS, SIGFPE, SIGABRT or SIGTRAP that was
   ignored at start stays ignored, also in a process that tsgo starts; Go
-  catches it, so a process that Go starts gets the default action.
-- PORT: the signal mask. On each thread Go unblocks the signals that it
-  must get (sigtab `_SigUnblock`, `_SigKill` or `_SigThrow`: SIGHUP,
-  SIGINT, SIGTERM, SIGQUIT, SIGILL, SIGSEGV and others), and a process that
-  it starts gets the mask that Go inherited. The port does not change the
-  mask: an inherited blocked SIGINT or SIGTERM stays blocked in tsgo, and a
-  process that the port starts with std `Command` (the content mapper, npm,
-  the launcher's worker) gets an empty mask.
+  catches it, so a process that Go starts gets the default action. There
+  is no safe way to give the child the default actions: std `Command` has
+  no attribute for them (it resets only SIGPIPE), rustix has no
+  `posix_spawn`, a `pre_exec` hook is `unsafe`, and signal-hook refuses a
+  handler for SIGILL and SIGFPE (and a handler that returns from a real
+  fault runs the fault again). nix's `posix_spawn` (with
+  `PosixSpawnAttr::set_sigdefault`) is safe, but its file actions have no
+  `chdir`, which the content mapper start needs (Go `cmd.Dir`).
+- The signal mask. At start, before any thread, tsgo unblocks the signals
+  that Go unblocks on each of its threads (`GO_UNBLOCKED`: sigtab
+  `_SigUnblock`, `_SigKill` or `_SigThrow`, and SIGURG: SIGHUP, SIGINT,
+  SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGTERM,
+  SIGSTKFLT, SIGCHLD, SIGURG, SIGPROF and SIGSYS), so every thread of a
+  launcher and of its worker gets them, as Go's threads do. Other blocked
+  signals stay blocked. A process that tsgo starts gets the mask of the
+  thread that starts it (std `Command` keeps it): the caller's mask
+  without these signals, as Go gives its children the mask of the thread
+  before the fork (`syscall_runtime_BeforeFork`). PORT: Go also unblocks
+  the signals 32 to 34; nix's `SigSet` has no real-time signals, so a
+  caller's blocked signal 34 stays blocked in tsgo and its children
+  (glibc does not block 32 and 33). PORT: Go lets a caller block SIGURG
+  under `GODEBUG=asyncpreemptoff=1`; tsgo does not read `GODEBUG`, and
+  both drop SIGURG.
 - PORT: `GOTRACEBACK` does nothing. With `GOTRACEBACK=crash`, Go ends a
   thrown signal or a fatal panic with SIGABRT (`crash`, a core dump) after
   the goroutines; the port exits 2 as with the default setting.
@@ -599,7 +655,18 @@ process (bin/tsgo.rs `go_runtime_start`).
     it does in Go after the start: a plain compile goes on after SIGINT
     and SIGTERM, and SIGQUIT prints its name and exits 2. The wait ends
     2 s after the worker starts (`HOLD_LIMIT`); a later signal goes on at
-    once.
+    once. Each signal waits on its own, so one that waits does not hold a
+    later one: a SIGQUIT that comes after a SIGINT that came before the
+    worker's `notify_context` goes on once the worker catches SIGQUIT.
+    PORT: signal-hook sets the handler (the bit) a moment before it
+    publishes the action that the handler runs, so a signal sent on in
+    between does nothing. Followups9 round b also waited for the worker's
+    thread that starts after the registration (`go-signals`,
+    `signal.NotifyContext`). A thread gets its name only when it first
+    runs, so that wait held signals longer: with a launcher, an up-to-date
+    `tsgo -b` under CPU load (zbook) lost 110 and 134 of 1000 SIGQUIT and
+    SIGHUP that came in its first 9 or 19 ms, where the same build without
+    that wait (goport-int35) lost 81 and 90 (followups9e).
   - The worker ends with its launcher: a parent-death SIGKILL, and a
     worker whose launcher died before that (its parent is not the named
     launcher, and the named launcher is gone or a zombie) kills itself. A
@@ -714,6 +781,25 @@ process (bin/tsgo.rs `go_runtime_start`).
   With `noEmit` or `emitDeclarationOnly` no JS part moves. An emit that
   moves no JS part runs as with the pool off and makes no pool. The
   language server does not emit through `program_emit`.
+- While the emit pool is on, each checker thread also has a twin (not in
+  Go; `program::send_dts_twin_job`): a thread with no checker that prints
+  and writes the parts whose transforms ran on the checker, so the
+  checker goes on with its next file. The d.ts part of a split file prints
+  there. So do both parts of a file whose JS transforms call the checker
+  (jstwin1, `program_emit::emit_on_twin`): the checker runs the JS
+  transforms, then the declaration transforms, as before, and the twin
+  prints and writes the JS part, then the d.ts part, in Go's order (map,
+  JS, declaration map, d.ts). Each job brings the transformed tree, a copy
+  of the synthetic nodes that it reaches (`PrintPack`) and the side
+  tables of its emit context. The twin's emit host has no checker, so a
+  checker call in a print ends the run (exit 70). A panic in the
+  declaration transforms goes on after the twin wrote the JS part, as in
+  Go. A panic in the JS print on the twin comes after the checker ran the
+  declaration transforms, which Go does not run then (`emit_on_twin` says
+  what differs). A forced emit and a builder signature emit stay on the
+  checker. `GOPORT_DTS_TWIN=0` turns the twins off.
+  `GOPORT_DTS_TWIN_CHECK=1` also prints each part on the checker, and the
+  twin panics when its writes differ.
 - A thread that runs Go code (the work thread of a binary, the parse,
   bind, checker, emit, search and goroutine threads, the `tsc -b` config
   and build info threads, the file watcher thread and the LSP read thread)
