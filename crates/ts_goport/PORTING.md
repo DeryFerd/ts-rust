@@ -1155,7 +1155,8 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   notification waits) and nothing from an earlier message waits
   (`gostd::local::drop_after_pause`). So at most one released checker set
   waits, and the check after a pause holds the old set too (hono HWM +31
-  to +39 MiB in paced edits). Every other release frees them at once, because
+  to +39 MiB in paced typing and errfix rounds, up to about +71 MiB in
+  paced mix and long rounds). Every other release frees them at once, because
   the next check then reuses their memory (freecheck1, freecheck2). A
   synthetic entry leaves its table at the release in both cases, so a read
   of it panics at once. Other threads free at once.

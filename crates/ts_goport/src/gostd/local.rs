@@ -343,9 +343,9 @@ pub fn note_message_gap(gap: Duration) {
 }
 
 /// Installs the function that tells whether the client already sent more
-/// than the requests of the current burst: a notification (its next edit, a
-/// cancel) waits for the dispatch loop. `drop_after_pause` then drops at
-/// once. The dispatch loop calls it once.
+/// than the requests of the current burst: a notification (its next edit)
+/// waits for the dispatch loop. `drop_after_pause` then drops at once. The
+/// dispatch loop calls it once.
 pub fn set_stream_check(f: Box<dyn Fn() -> bool>) {
     LOCAL.with(|l| *l.stream.borrow_mut() = Some(f));
 }

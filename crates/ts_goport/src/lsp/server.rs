@@ -2034,8 +2034,9 @@ impl Server {
         self.free_since.set(Instant::now());
         gostd::local::keep_garbage();
         {
-            // A notification that waits (the next didChange, a cancel): the
-            // client sends a stream, not one burst of requests. Weak: the
+            // A notification that waits (the next didChange): the client
+            // sends a stream, not one burst of requests. `$/cancelRequest`
+            // never waits here: the read loop handles it. Weak: the
             // thread's queues do not keep the server alive.
             let shared = Arc::downgrade(&self.shared);
             gostd::local::set_stream_check(Box::new(move || {
