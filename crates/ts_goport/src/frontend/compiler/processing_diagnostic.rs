@@ -193,9 +193,7 @@ impl ProcessingDiagnostic {
             redirect_info = Some(
                 program
                     .include_processor
-                    .explain_redirect_and_implied_format(program, &diag.file, |file_name| {
-                        file_name.to_string()
-                    }),
+                    .explain_redirect_and_implied_format_for_collection(program, &diag.file),
             );
         }
         if let Some(reason) = &diag.diagnostic_reason {

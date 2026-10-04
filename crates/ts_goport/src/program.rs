@@ -119,15 +119,24 @@ impl ResolvedModule {
 pub struct ResolvedProjectReference {
     compiler_options: CompilerOptions,
     common_source_directory: String,
+    /// `ParsedCommandLine::common_source_directory_read` of the command
+    /// line this copies.
+    common_source_directory_read: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ResolvedProjectReference {
     /// A copy of the parts of a referenced project's command line that the
-    /// checker reads.
-    pub(crate) fn new(compiler_options: CompilerOptions, common_source_directory: String) -> Self {
+    /// checker reads. `common_source_directory_read` is the command line's
+    /// flag of the same name.
+    pub(crate) fn new(
+        compiler_options: CompilerOptions,
+        common_source_directory: String,
+        common_source_directory_read: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         ResolvedProjectReference {
             compiler_options,
             common_source_directory,
+            common_source_directory_read,
         }
     }
 
@@ -137,9 +146,19 @@ impl ResolvedProjectReference {
         &self.compiler_options
     }
 
-    // Go: tsoptions/parsedcommandline.go CommonSourceDirectory
+    // Go: tsoptions/parsedcommandline.go:157 (*ParsedCommandLine).CommonSourceDirectory
+    // PORT: Go's first call appends the TS6059 errors to the command line's
+    // `Errors` (`checkSourceFilesBelongToPath`), here on a checker thread.
+    // The copy holds the value; it marks the command line, and its next
+    // reader of the errors records them
+    // (`ParsedCommandLine::errors_with_common_source_directory_errors`).
     #[must_use]
     pub fn common_source_directory(&self) -> &str {
+        use std::sync::atomic::Ordering;
+        if !self.common_source_directory_read.load(Ordering::Relaxed) {
+            self.common_source_directory_read
+                .store(true, Ordering::Release);
+        }
         &self.common_source_directory
     }
 }
@@ -3792,6 +3811,8 @@ pub fn get_program_diagnostics() -> Vec<Diagnostic> {
     let Some(go) = go_frontend() else {
         return Vec::new();
     };
+    // Go builds the include processor diagnostics here.
+    go.include_processor.mark_diagnostics_read();
     let mut diagnostics = go.program_diagnostics.clone();
     // #4712
     diagnostics.extend(content_mapper_diagnostics());

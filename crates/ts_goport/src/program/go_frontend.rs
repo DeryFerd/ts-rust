@@ -43,6 +43,9 @@ pub(super) struct GoSharedState {
     import_helpers_import_specifiers: FxHashMap<String, Node>,
     /// Go include processor diagnostics of each program file, by file index.
     include_diagnostics: FxHashMap<usize, Vec<Diagnostic>>,
+    /// The frontend `IncludeProcessor::diagnostics_read`: set where Go builds
+    /// the include processor diagnostics (`get_include_processor_diagnostics`).
+    include_diagnostics_read: Arc<std::sync::atomic::AtomicBool>,
     /// Go `GetParseFileRedirect` of each resolved module file name that is
     /// not a program file and has a redirect. Shared like `resolved_modules`.
     parse_file_redirects: Arc<FxHashMap<String, String>>,
@@ -97,6 +100,14 @@ type FrontendResolutions =
 
 /// Thread-safe copies of the frontend project references. Go shares one
 /// `*ParsedCommandLine` per referenced project, so each is copied once.
+/// PORT: Go reads `CommonSourceDirectory` of a reference only when it needs
+/// it (output names with outDir or declarationDir, the checker for
+/// `rewriteRelativeImportExtensions`), and that call records TS6059 errors
+/// on the reference. The copy needs the value now, so it reads it without
+/// the check (`common_source_directory_unchecked`). The checker's call on
+/// the copy marks the reference (`common_source_directory_read`), and the
+/// next reader of the reference's errors records them, as Go does from the
+/// checker thread.
 #[derive(Default)]
 struct ProjectReferenceCopies {
     resolved: FxHashMap<*const ParsedCommandLine, Arc<ResolvedProjectReference>>,
@@ -109,7 +120,8 @@ impl ProjectReferenceCopies {
             .or_insert_with(|| {
                 Arc::new(ResolvedProjectReference::new(
                     (**parsed.compiler_options()).clone(),
-                    parsed.common_source_directory().to_string(),
+                    parsed.common_source_directory_unchecked(),
+                    parsed.common_source_directory_read.clone(),
                 ))
             })
             .clone()
@@ -1367,6 +1379,7 @@ impl GoSharedState {
             jsx_runtime_import_specifiers,
             import_helpers_import_specifiers,
             include_diagnostics,
+            include_diagnostics_read: Arc::clone(&p.include_processor.diagnostics_read),
             parse_file_redirects,
             redirect_targets,
             references,
@@ -1527,6 +1540,9 @@ impl GoSharedState {
     // Go: compiler/program.go:840 GetIncludeProcessorDiagnostics (the
     // include processor part)
     pub(super) fn get_include_processor_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
+        // Go builds the collection here (`includeProcessor.getDiagnostics`).
+        self.include_diagnostics_read
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.include_diagnostics
             .get(&file.file_index())
             .cloned()
