@@ -35,8 +35,9 @@
 //! after a message, so the free is not in the answer time. On other
 //! threads `drop_later` drops at once. `drop_after_pause` uses this queue
 //! only for the first release after a client pause (`note_message_gap`),
-//! and only when no message waits (`set_busy`). It drops at once otherwise,
-//! so at most one release waits.
+//! and only when the client has not sent its next edit yet
+//! (`set_stream_check`). It drops at once otherwise, so at most one release
+//! waits.
 //!
 //! The queues are per thread: `go`, `post_later`, `go_idle`, `after_func`,
 //! `run_pending`, `run_idle`, `drop_later` and `drop_garbage` act on the
@@ -155,8 +156,8 @@ struct LocalState {
     garbage: RefCell<Option<VecDeque<Box<dyn Any>>>>,
     /// What `drop_after_pause` does (`note_message_gap`).
     pause: Cell<Pause>,
-    /// Whether a message waits for the dispatch loop (`set_busy`).
-    busy: RefCell<Option<Box<dyn Fn() -> bool>>>,
+    /// Whether the client sent more than its burst (`set_stream_check`).
+    stream: RefCell<Option<Box<dyn Fn() -> bool>>>,
 }
 
 /// The state of `drop_after_pause` on one thread.
@@ -196,7 +197,7 @@ thread_local! {
         idle: RefCell::new(VecDeque::new()),
         garbage: RefCell::new(None),
         pause: Cell::new(Pause::None),
-        busy: RefCell::new(None),
+        stream: RefCell::new(None),
     };
 }
 
@@ -341,26 +342,33 @@ pub fn note_message_gap(gap: Duration) {
     }
 }
 
-/// Installs the function that tells whether a message waits for the
-/// dispatch loop (`drop_after_pause`). The dispatch loop calls it once.
-pub fn set_busy(f: Box<dyn Fn() -> bool>) {
-    LOCAL.with(|l| *l.busy.borrow_mut() = Some(f));
+/// Installs the function that tells whether the client already sent more
+/// than the requests of the current burst: a notification (its next edit, a
+/// cancel) waits for the dispatch loop. `drop_after_pause` then drops at
+/// once. The dispatch loop calls it once.
+pub fn set_stream_check(f: Box<dyn Fn() -> bool>) {
+    LOCAL.with(|l| *l.stream.borrow_mut() = Some(f));
 }
 
 /// Drops `value` now, except for the first release after a client pause
-/// (`note_message_gap`) when no message waits (`set_busy`): then `value`
-/// and the other values of that message wait for `drop_garbage`
-/// (`drop_later`). So at most one release waits. No Go counterpart: Go's
-/// garbage collector frees old data in the background.
+/// (`note_message_gap`) when the client has not sent its next edit yet
+/// (`set_stream_check`): then `value` and the other values of that message
+/// wait for `drop_garbage` (`drop_later`). So at most one release waits.
+/// No Go counterpart: Go's garbage collector frees old data in the
+/// background.
 // PERF (freecheck1): use it for a large free on the answer path that the
 // next check would otherwise reuse (the checkers of a released program).
 // In a stream of messages, a free now is cheap (hot memory) and the next
 // check reuses its memory from the thread cache; a free after the answer
 // made those runs slower (+1% to +6%) and kept more memory. After a pause,
 // the free is cold (hono 6.5 ms, 12.7% of the edit) and the client waits
-// for it, so it goes after the answer. A message that already waits would
-// keep the values until the stream ends (freecheck2: hono HWM x2.3 when
-// every release of a stream after a pause waited), so then they drop now.
+// for it, so it goes after the answers of the burst (also after a
+// codeAction that comes with the diagnostics). When the client already
+// sent its next edit (pipelined, or typing faster than the server), the
+// values would wait until the stream ends (freecheck2: hono HWM x2.3 when
+// every release of a stream after a pause waited), so they drop now. A
+// check for any waiting request, not only a notification, also dropped
+// them in the errfix rounds (hono errfix-paced 0.946 instead of 0.902).
 pub fn drop_after_pause(value: Box<dyn Any>) {
     // The thread may be ending, after its queues (a checker pool that
     // another thread-local holds): then `value` drops now.
@@ -369,7 +377,7 @@ pub fn drop_after_pause(value: Box<dyn Any>) {
             Pause::None => false,
             Pause::Kept => true,
             Pause::Paused => {
-                let keep = !l.busy.borrow().as_ref().is_some_and(|busy| busy());
+                let keep = !l.stream.borrow().as_ref().is_some_and(|stream| stream());
                 l.pause.set(if keep { Pause::Kept } else { Pause::None });
                 keep
             }
@@ -697,16 +705,16 @@ mod tests {
     }
 
     // Only the first release after a client pause waits for
-    // `drop_garbage`, with the other values of its message, and only when no
-    // message waits and no kept release waits.
+    // `drop_garbage`, with the other values of its message, and only when the
+    // client has not sent its next edit and no kept release waits.
     #[test]
     fn drop_after_pause_keeps_one_release_after_a_client_pause() {
         std::thread::spawn(|| {
             keep_garbage();
-            let busy = Rc::new(Cell::new(false));
+            let stream = Rc::new(Cell::new(false));
             {
-                let busy = busy.clone();
-                set_busy(Box::new(move || busy.get()));
+                let stream = stream.clone();
+                set_stream_check(Box::new(move || stream.get()));
             }
             // A release of two values. Returns how many wait.
             let release = || {
@@ -719,7 +727,7 @@ mod tests {
             // One message after `gap_ms` with a release, as the dispatch
             // loop runs it.
             let message = |gap_ms: u64| {
-                drop_garbage(|| busy.get());
+                drop_garbage(|| stream.get());
                 note_message_gap(Duration::from_millis(gap_ms));
                 release()
             };
@@ -729,9 +737,9 @@ mod tests {
             assert_eq!(garbage_len(), 0, "drop_garbage after the answer");
             assert_eq!(message(5), 0, "a new burst with no pause");
 
-            busy.set(true);
-            assert_eq!(message(500), 0, "a message waits at the release");
-            busy.set(false);
+            stream.set(true);
+            assert_eq!(message(500), 0, "the next edit waits at the release");
+            stream.set(false);
 
             // A message came while the kept release was freed.
             assert_eq!(message(500), 2);

@@ -81,9 +81,10 @@
 //! while no message waits. Go's garbage collector does them in the
 //! background. The checkers and synthetic nodes of a released program wait
 //! in the same way only for the first release after a client pause, and
-//! only when no other message waits (`gostd::local::drop_after_pause`), so
-//! at most one released checker set waits. Other releases free them at
-//! once, so that the next check reuses their memory.
+//! only when the client has not sent its next edit yet
+//! (`gostd::local::drop_after_pause`), so at most one released checker set
+//! waits. Other releases free them at once, so that the next check reuses
+//! their memory.
 //!
 //! Cancellation is Go's: `$/cancelRequest` reaches only a request that the
 //! dispatch loop took (`pending_client_requests`); a cancel for a queued
@@ -2033,12 +2034,18 @@ impl Server {
         self.free_since.set(Instant::now());
         gostd::local::keep_garbage();
         {
-            // Weak: the thread's queues do not keep the server alive.
+            // A notification that waits (the next didChange, a cancel): the
+            // client sends a stream, not one burst of requests. Weak: the
+            // thread's queues do not keep the server alive.
             let shared = Arc::downgrade(&self.shared);
-            gostd::local::set_busy(Box::new(move || {
-                shared
-                    .upgrade()
-                    .is_some_and(|s| s.queued_requests.load(Ordering::SeqCst) != 0)
+            gostd::local::set_stream_check(Box::new(move || {
+                shared.upgrade().is_some_and(|s| {
+                    s.request_queue.with_items(|items| {
+                        items.iter().any(
+                            |item| matches!(item, QueuedRequest::Request(req) if req.id.is_none()),
+                        )
+                    })
+                })
             }));
         }
         loop {
