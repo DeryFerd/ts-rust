@@ -160,7 +160,7 @@ impl<P: ProgramView> LanguageService<P> {
     }
 
     // Go: ls/languageservice.go:81 ReadFile
-    pub fn read_file(&self, file_name: &str) -> (String, bool) {
+    pub fn read_file(&self, file_name: &str) -> (FileText, bool) {
         self.host.read_file(file_name)
     }
 
@@ -283,6 +283,7 @@ impl<P: ProgramView> sourcemap::Host for LanguageService<P> {
     }
 
     fn read_file(&self, file_name: &str) -> (String, bool) {
-        LanguageService::read_file(self, file_name)
+        let (text, ok) = LanguageService::read_file(self, file_name);
+        (text.to_string(), ok)
     }
 }

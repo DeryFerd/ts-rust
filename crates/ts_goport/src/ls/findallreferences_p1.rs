@@ -470,17 +470,40 @@ pub fn get_range_of_node(node: Node, mut source_file: Node, end_node: Node) -> T
     }
     let mut start = get_token_pos_of_node(node, source_file, false /*includeJsDoc*/);
     let mut end = if end_node.is_some() { end_node } else { node }.end();
-    if is_string_literal_like(node) && (end - start) > 2 {
-        if end_node.is_some() {
-            crate::core::go_panic("endNode is not nil for stringLiteralLike".to_string());
+    // PORT: Go counts the length and steps `end` back in Go bytes. An
+    // unterminated literal can end in a marker unit (see
+    // `GO_STRING_MARKER`), which has more port bytes than Go bytes, so a
+    // port length of 2 or less is also a Go length of 2 or less.
+    // PERF: `go_len_of_literal` reads only the literal, not the file text
+    // before it.
+    if is_string_literal_like(node) && end - start > 2 {
+        let text = source_file_text(source_file);
+        if go_len_of_literal(&text, start as usize, end as usize) > 2 {
+            if end_node.is_some() {
+                crate::core::go_panic("endNode is not nil for stringLiteralLike".to_string());
+            }
+            start += 1;
+            end = go_offset_before(&text, end);
         }
-        start += 1;
-        end -= 1;
     }
     if end_node.is_some() && end_node.kind() == SyntaxKind::CaseBlock {
         end = end_node.pos();
     }
     TextRange::new(start, end)
+}
+
+/// Go `end - start` for the literal at port offsets `start` to `end` of the
+/// port form `text`: its length in Go bytes. `start` is the literal's quote.
+/// `end` can be inside a char: Go cuts an unterminated JSDoc comment at the
+/// end of the file 2 bytes early (parser/jsdoc.go:163), so a literal in it
+/// can end in the first bytes of the file's last char or unit
+/// (`jsdoc_text_cut`). An end `k` bytes into a unit of `g` Go bytes counts
+/// `min(k, g)` of them, as `go_byte_offset` does.
+fn go_len_of_literal(text: &str, start: usize, end: usize) -> usize {
+    match crate::scanner_util::go_unit_cut_at(text, end) {
+        Some((at, unit, _)) => go_len(&text[start..at]) + (end - at).min(unit.go_len()),
+        None => go_len(&text[start..end]),
+    }
 }
 
 // Go: ls/findallreferences.go:354 isValidReferencePosition
@@ -2293,5 +2316,97 @@ impl<P: ProgramView> LanguageService<P> {
                 module_references_of_export_target.unwrap_or_default(),
             ],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+    use crate::frontend::tspath::Path;
+    use crate::scanner_util::go_string_from_bytes;
+    use std::fmt::Write;
+
+    // PORT: no Go test. `getRangeOfNode` counts the length of a literal and
+    // steps its end back in Go bytes. An unterminated literal can end in a
+    // marker unit (an invalid byte, a byte of a WTF-8 surrogate or a real
+    // U+FDD0), which has more port bytes than Go bytes. The expected lines
+    // are from a Go test at pin N with Go 1.27.1 (`followups17/tools/gomodel`
+    // in the lane dir, an overlay test file in package `ls`) that prints, for
+    // each string literal like node in `ForEachChild` order, its pos and end
+    // and the range of `getRangeOfNode`, in Go bytes.
+    #[test]
+    fn range_of_a_string_literal_counts_go_bytes() {
+        let go = "\
+R0 17-20 18-20
+R1 17-21 19-20
+R2 2-6 3-5
+R3 2-7 3-6
+R4 2-6 3-5
+R5 2-7 3-6
+R6 2-5 3-4
+R7 2-5 3-4
+R8 2-7 3-6
+R9 2-7 3-6
+R9 12-14 12-14
+R9 19-22 20-21
+R10 2-4 2-4
+R11 2-7 3-6
+R12 14-17 15-17
+";
+        let texts: [&[u8]; 13] = [
+            b"import { v } from \"\xff\n",
+            b"import { v } from \"a\xff\n",
+            b"o[\"\xed\xa0\x80\n];\n",
+            b"o[\"p\xed\xa0\x80\n];\n",
+            b"o[\"\xef\xb7\x90\n];\n",
+            b"o[\"p\xef\xb7\x90\n];\n",
+            b"o[\"\\\xff\n];\n",
+            b"o['\xc3\xa9\n];\n",
+            b"o['\xf0\x9f\x98\x80\n];\n",
+            b"o[\"a\xffb\"];\no[\"\"];\no[\"x\"];\n",
+            b"o[`\xff",
+            b"o[`p\xef\xb7\x90",
+            b"declare module \"\xff\n{ }\n",
+        ];
+        let mut port = String::new();
+        for (i, bytes) in texts.into_iter().enumerate() {
+            let text = go_string_from_bytes(bytes.to_vec());
+            let file = parse_source_file(
+                &SourceFileParseOptions {
+                    file_name: "/a.ts".to_string(),
+                    path: Path("/a.ts".to_string()),
+                    ..Default::default()
+                },
+                crate::ast::FileText::new(text.clone(), false),
+                ScriptKind::TS,
+            );
+            let go = |pos: i32| go_byte_offset(&text, pos);
+            fn visit(node: Node, f: &mut dyn FnMut(Node)) {
+                f(node);
+                node.for_each_child(|child| {
+                    visit(child, f);
+                    false
+                });
+            }
+            file.root.for_each_child(|child| {
+                visit(child, &mut |node| {
+                    if is_string_literal_like(node) {
+                        let range = get_range_of_node(node, file.root, Node::NIL);
+                        writeln!(
+                            port,
+                            "R{i} {}-{} {}-{}",
+                            go(node.pos()),
+                            go(node.end()),
+                            go(range.pos()),
+                            go(range.end())
+                        )
+                        .unwrap();
+                    }
+                });
+                false
+            });
+        }
+        assert_eq!(port, go);
     }
 }

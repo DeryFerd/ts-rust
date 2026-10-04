@@ -429,10 +429,17 @@ impl Snapshot {
 
     // Go: project/snapshot.go:285 ReadFile
     pub fn read_file(&self, file_name: &str) -> (String, bool) {
+        let (text, ok) = self.read_file_shared(file_name);
+        (text.to_string(), ok)
+    }
+
+    /// Go `ReadFile` without the copy: the text the file holds (the
+    /// `ls::Host` read).
+    pub fn read_file_shared(&self, file_name: &str) -> (FileText, bool) {
         let Some(handle) = self.get_file(file_name) else {
-            return (String::new(), false);
+            return (FileText::default(), false);
         };
-        (handle.content(), true)
+        (FileText::Shared(handle.shared_content()), true)
     }
 
     // Go: project/snapshot.go:293 DirectoryExists
@@ -496,8 +503,8 @@ impl ls::Host for Snapshot {
         Snapshot::use_case_sensitive_file_names(self)
     }
 
-    fn read_file(&self, path: &str) -> (String, bool) {
-        Snapshot::read_file(self, path)
+    fn read_file(&self, path: &str) -> (FileText, bool) {
+        Snapshot::read_file_shared(self, path)
     }
 
     fn converters(&self) -> Rc<lsconv::Converters> {

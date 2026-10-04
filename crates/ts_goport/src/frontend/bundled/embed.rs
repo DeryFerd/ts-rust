@@ -386,7 +386,7 @@ const fn snapshot_text_hash(text: &str) -> u64 {
     }
 }
 
-// Go: embed_generated.go:13 (the go:embed variables)
+// Go: embed_generated.go:9 (the go:embed variables)
 static EMBEDDED_CONTENTS: &[EmbeddedLib] = &[
     bundled_lib!("lib.d.ts"),
     bundled_lib!("lib.decorators.d.ts"),

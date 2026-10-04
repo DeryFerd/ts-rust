@@ -10,7 +10,9 @@
 
 use crate::project::prelude::*;
 
+use crate::frontend::compiler::resolve_ahead::AheadLookups;
 use std::cell::{Cell, OnceCell};
+use std::sync::Arc;
 use std::time::SystemTime;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -43,13 +45,122 @@ pub struct CachedLayeredFileSystem {
 }
 
 // Go: project/snapshotfs.go:38 newCachedLayeredFileSystem
+// PORT: the cache asks `layered` through an `AheadLookupLayer`.
 pub fn new_cached_layered_file_system(
     file_system: Rc<dyn LayeredFileSystem>,
 ) -> Rc<dyn LayeredFileSystem> {
+    let ahead = Rc::new(AheadLookupLayer {
+        layered: file_system.clone(),
+        jobs: RefCell::default(),
+    });
     Rc::new(CachedLayeredFileSystem {
-        fs: vfs::cachedvfs_from(file_system.clone()),
+        fs: vfs::cachedvfs_from(ahead),
         layered: file_system,
     })
+}
+
+/// The layer under a snapshot's lookup cache (`CachedLayeredFileSystem`)
+/// that answers `file_exists`, `directory_exists` and `realpath` from the
+/// lookups of the resolve-ahead jobs of the snapshot's program loads
+/// (compiler/resolve_ahead.rs `AheadLookups`) before it asks the layered
+/// file system. The workers made these calls during the loads, as Go's
+/// parse tasks make theirs on the one cache of the snapshot, so the
+/// snapshot has their answers with no copy. The job that was attached first
+/// gives the answer.
+// PORT: not in Go (perf).
+pub struct AheadLookupLayer {
+    layered: Rc<dyn LayeredFileSystem>,
+    jobs: RefCell<Vec<Arc<dyn AheadLookups>>>,
+}
+
+impl AheadLookupLayer {
+    /// Adds the lookups of a load's job (`ResolveAheadHost::attach`), and
+    /// gives their index.
+    pub fn attach(&self, lookups: Arc<dyn AheadLookups>) -> usize {
+        let mut jobs = self.jobs.borrow_mut();
+        jobs.push(lookups);
+        jobs.len() - 1
+    }
+
+    /// The first answer of `get` in the jobs attached before job `index`.
+    pub fn before<T>(
+        &self,
+        index: usize,
+        get: impl Fn(&dyn AheadLookups) -> Option<T>,
+    ) -> Option<T> {
+        self.jobs
+            .borrow()
+            .iter()
+            .take(index)
+            .find_map(|lookups| get(&**lookups))
+    }
+
+    fn first<T>(&self, get: impl Fn(&dyn AheadLookups) -> Option<T>) -> Option<T> {
+        self.before(usize::MAX, get)
+    }
+}
+
+impl Drop for AheadLookupLayer {
+    /// The workers allocated the lookups, and they free them.
+    fn drop(&mut self) {
+        let jobs = std::mem::take(&mut *self.jobs.borrow_mut());
+        if !jobs.is_empty() {
+            crate::frontend::compiler::resolve_ahead::drop_on_worker(Box::new(jobs));
+        }
+    }
+}
+
+impl vfs::Fs for AheadLookupLayer {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.layered.use_case_sensitive_file_names()
+    }
+    fn file_exists(&self, path: &str) -> bool {
+        self.first(|lookups| lookups.file_exists(path))
+            .unwrap_or_else(|| self.layered.file_exists(path))
+    }
+    fn read_file(&self, path: &str) -> (String, bool) {
+        self.layered.read_file(path)
+    }
+    fn write_file(&self, path: &str, data: &str) -> Result<(), vfs::FsError> {
+        self.layered.write_file(path, data)
+    }
+    fn append_file(&self, path: &str, data: &str) -> Result<(), vfs::FsError> {
+        self.layered.append_file(path, data)
+    }
+    fn remove(&self, path: &str) -> Result<(), vfs::FsError> {
+        self.layered.remove(path)
+    }
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<SystemTime>,
+        m_time: Option<SystemTime>,
+    ) -> Result<(), vfs::FsError> {
+        self.layered.chtimes(path, a_time, m_time)
+    }
+    fn directory_exists(&self, path: &str) -> bool {
+        self.first(|lookups| lookups.directory_exists(path))
+            .unwrap_or_else(|| self.layered.directory_exists(path))
+    }
+    fn get_accessible_entries(&self, path: &str) -> vfs::Entries {
+        self.layered.get_accessible_entries(path)
+    }
+    fn stat(&self, path: &str) -> Option<vfs::FileInfo> {
+        self.layered.stat(path)
+    }
+    fn realpath(&self, path: &str) -> String {
+        self.first(|lookups| lookups.realpath(path))
+            .unwrap_or_else(|| self.layered.realpath(path))
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+}
+
+/// The `AheadLookupLayer` under the lookup cache `cached` of a snapshot
+/// (`new_cached_layered_file_system`).
+pub fn ahead_lookup_layer(cached: &vfs::CachedFs) -> Option<&AheadLookupLayer> {
+    vfs::Fs::as_any(&**cached.wrapped())?.downcast_ref::<AheadLookupLayer>()
 }
 
 impl FileHandleSource for CachedLayeredFileSystem {
@@ -323,7 +434,7 @@ impl dirty::Cloneable for CachedDirectory {
     }
 }
 
-// Go: project/snapshotfs.go:143 mergeCachedDirectoryEntries (ts#64291)
+// Go: project/snapshotfs.go:144 mergeCachedDirectoryEntries (ts#64291)
 // PORT: Go ranges over the cached entries map (random order); insertion
 // order here (`CachedDirectory`).
 pub fn merge_cached_directory_entries(
@@ -556,7 +667,7 @@ impl SnapshotFSBuilder {
         path: &tspath::Path,
         source: &Rc<dyn FileHandle>,
     ) -> Option<Rc<dyn FileHandle>> {
-        let file = new_cached_file(file_name, source.content());
+        let file = new_cached_file(file_name, source.shared_content());
         file.borrow().file_base.hash.set(source.hash());
         let (entry, loaded) = self.cache_files.load_or_store(path.clone(), file);
         let entry = entry?;
@@ -647,7 +758,7 @@ impl SnapshotFSBuilder {
             if ok {
                 e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                     let mut file = file.borrow_mut();
-                    file.file_base.content = content.clone();
+                    file.file_base.content = content.as_str().into();
                     file.file_base.hash.set(xxh3_128(content.as_bytes()));
                     file.needs_reload = false;
                 });
@@ -685,7 +796,7 @@ impl SnapshotFSBuilder {
                 if ok {
                     e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                         let mut file = file.borrow_mut();
-                        file.file_base.content = content.clone();
+                        file.file_base.content = content.as_str().into();
                         file.file_base.hash.set(xxh3_128(content.as_bytes()));
                         file.needs_reload = false;
                     });
@@ -813,7 +924,7 @@ impl SnapshotFSBuilder {
                 e.delete();
                 return;
             }
-            if content == cur.borrow().file_base.content {
+            if *content == *cur.borrow().file_base.content {
                 changed = false;
                 if !cur.borrow().matches_disk_text() {
                     e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
@@ -824,7 +935,7 @@ impl SnapshotFSBuilder {
             }
             e.change(&mut |file: &Rc<RefCell<CachedFile>>| {
                 let mut file = file.borrow_mut();
-                file.file_base.content = content.clone();
+                file.file_base.content = content.as_str().into();
                 file.file_base.hash.set(xxh3_128(content.as_bytes()));
                 file.needs_reload = false;
             });
@@ -1131,12 +1242,23 @@ impl SnapshotFSBuilder {
         }
     }
 
+    /// The cache of this snapshot's file system lookups (Go
+    /// `cachedLayeredFileSystem`'s `*cachedvfs.FS`), over the layer that
+    /// takes the answers of the resolve-ahead jobs (`ahead_lookup_layer`).
+    pub fn cached_fs(&self) -> Option<Rc<vfs::CachedFs>> {
+        Some(self.cached_layered()?.fs.clone())
+    }
+
+    fn cached_layered(&self) -> Option<&CachedLayeredFileSystem> {
+        vfs::Fs::as_any(&*self.fs)?.downcast_ref::<CachedLayeredFileSystem>()
+    }
+
     /// When the layered file system is the overlay file system over the
     /// OS file system of this thread (`bundled::is_wrapped_os_fs`), as in
     /// the language server: the paths of its open files and of the
     /// directories that have open files in them. Else `None`.
     pub fn open_files_over_os(&self) -> Option<(FxHashSet<tspath::Path>, FxHashSet<tspath::Path>)> {
-        let cached = vfs::Fs::as_any(&*self.fs)?.downcast_ref::<CachedLayeredFileSystem>()?;
+        let cached = self.cached_layered()?;
         let layered: &dyn vfs::Fs = &*cached.layered;
         let overlay = as_overlay_fs(layered)?;
         if !crate::frontend::bundled::is_wrapped_os_fs(&overlay.host) {

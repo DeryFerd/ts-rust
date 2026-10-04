@@ -25,15 +25,22 @@
 //! async generators that target ES2017 lowers (helpers and generated
 //! names), so every file's JS part needs the checker. Each file's outputs
 //! are written in Go's order: map, JS, declaration map, d.ts.
+//!
+//! A panic in a file's declaration transforms or in its JS print
+//! (`set_emit_test_panic`) writes the same files and returns the same with
+//! the twins on as with the twins off, with a guard around each file (as the
+//! goport bin has) and without one.
 
 use std::collections::BTreeMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ts_goport::core::enter_program;
-use ts_goport::emitter::emitter::EmitOnly;
+use ts_goport::emitter::emitter::{EmitOnly, EmitTestPanic, set_emit_test_panic};
 use ts_goport::emitter::program_emit::{
     DtsTwinMode, EmitOptions, EmitResult, WriteFile, WriteFileData, combine_emit_results, emit,
-    emit_batch, js_twin_print_count, set_dts_twin_mode,
+    emit_batch, emit_with, js_twin_print_count, set_dts_twin_mode,
 };
 use ts_goport::options::{CompilerOptions, Tristate};
 use ts_goport::program::{
@@ -198,6 +205,138 @@ fn twins_print_js_like_the_checker_threads() {
         );
         assert_same(&twins, &checkers, "twins against the checker threads");
     }
+}
+
+#[test]
+fn twin_panics_write_like_the_checker_threads() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for step in [EmitTestPanic::DeclarationTransforms, EmitTestPanic::JsPrint] {
+        set_emit_test_panic(Some((step, "/src/model.ts")));
+        set_dts_twin_mode(Some(DtsTwinMode::On));
+        let js_prints = js_twin_print_count();
+        let twins = run_panic(JS_TWIN_CONFIG);
+        let js_prints = js_twin_print_count() - js_prints;
+        set_dts_twin_mode(Some(DtsTwinMode::Off));
+        let checkers = run_panic(JS_TWIN_CONFIG);
+        set_dts_twin_mode(None);
+        set_emit_test_panic(None);
+
+        assert!(js_prints > 0, "{step:?}: the twins printed no JS file");
+        assert_eq!(twins.guard_panics, 1, "{step:?}: guarded panics");
+        assert!(
+            twins.panic.as_deref().is_some_and(
+                |message| message.starts_with(&format!("emit test panic: {step:?} in "))
+            ),
+            "{step:?}: the emit without a guard must go on with the test panic: {:?}",
+            twins.panic
+        );
+        assert_eq!(
+            twins.guarded.files, twins.unguarded.files,
+            "{step:?}: the guard must not change the writes"
+        );
+        let model = |extension: &str| {
+            twins
+                .guarded
+                .files
+                .keys()
+                .any(|name| name.ends_with(&format!("/out/model{extension}")))
+        };
+        let written: Vec<bool> = GO_ORDER.iter().map(|extension| model(extension)).collect();
+        let expected = match step {
+            // Go writes the map and the JS before the declaration transforms.
+            EmitTestPanic::DeclarationTransforms => [true, true, false, false],
+            EmitTestPanic::JsPrint => [false; 4],
+        };
+        assert_eq!(written, expected, "{step:?}: model outputs {GO_ORDER:?}");
+        assert!(
+            twins
+                .guarded
+                .files
+                .keys()
+                .any(|name| name.ends_with("/out/shape.d.ts")),
+            "{step:?}: the other files must emit: {:?}",
+            twins.guarded.files.keys()
+        );
+        assert_eq!(
+            twins, checkers,
+            "{step:?}: twins against the checker threads"
+        );
+    }
+}
+
+/// What one load of a fixture wrote and returned with a test panic
+/// (`set_emit_test_panic`).
+#[derive(Debug, PartialEq)]
+struct PanicRun {
+    /// `emit_with` with a guard around each file.
+    guarded: Written,
+    /// The panics that the guard caught.
+    guard_panics: usize,
+    /// `emit` without a guard, which panics.
+    unguarded: Written,
+    /// The message of the panic of `emit`, if it panicked.
+    panic: Option<String>,
+}
+
+/// The panics that `guard` caught.
+static GUARD_PANICS: AtomicUsize = AtomicUsize::new(0);
+
+/// The guard around each file's emit, as the goport bin has: a panic gives
+/// the file an empty result.
+fn guard(emit_file: &dyn Fn() -> EmitResult) -> EmitResult {
+    catch_unwind(AssertUnwindSafe(emit_file)).unwrap_or_else(|_| {
+        GUARD_PANICS.fetch_add(1, Ordering::Relaxed);
+        EmitResult::default()
+    })
+}
+
+/// Loads `config`, emits it with `emit_with` and `guard`, then with `emit`,
+/// and releases it.
+fn run_panic(config: &str) -> PanicRun {
+    let program = try_load_version(config, |_| {})
+        .unwrap_or_else(|error| panic!("cannot load {config}: {error}"));
+    let run = {
+        let _scope = enter_program(Some(program));
+        let guard_panics = GUARD_PANICS.load(Ordering::Relaxed);
+        let guarded = record_writes(|write_file| {
+            emit_with(
+                EmitOptions {
+                    write_file: Some(write_file),
+                    ..EmitOptions::default()
+                },
+                guard,
+            )
+        });
+        let guard_panics = GUARD_PANICS.load(Ordering::Relaxed) - guard_panics;
+        let mut panic = None;
+        let unguarded = record_writes(|write_file| {
+            catch_unwind(AssertUnwindSafe(|| {
+                emit(EmitOptions {
+                    write_file: Some(write_file),
+                    ..EmitOptions::default()
+                })
+            }))
+            .unwrap_or_else(|payload| {
+                panic = Some(
+                    payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                EmitResult::default()
+            })
+        });
+        PanicRun {
+            guarded,
+            guard_panics,
+            unguarded,
+            panic,
+        }
+    };
+    release_program(program);
+    run
 }
 
 /// Asserts that two runs wrote and returned the same, for `emit` and for

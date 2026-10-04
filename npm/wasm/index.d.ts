@@ -1,7 +1,15 @@
-import type { Diagnostic } from "./core.js";
+import type { Diagnostic, WasmModule } from "./core.js";
 
-export type { Diagnostic, HostFileSystem, MemoryFileSystem, Position, RunOptions } from "./core.js";
+export type { Diagnostic, HostFileSystem, MemoryFileSystem, Position, RunOptions, WasmModule } from "./core.js";
 export { memoryFileSystem, runTsc, runTscAsync } from "./core.js";
+
+/**
+ * The instance type of the global class `Name` (`URL`, `Response`) when the
+ * program has it (lib `dom` or `webworker`, or `@types/node`), else `never`.
+ */
+type GlobalClass<Name extends string> = typeof globalThis extends Record<Name, abstract new (...args: never) => infer T>
+    ? T
+    : never;
 
 export interface TscOptions {
     /**
@@ -21,7 +29,7 @@ export interface TscOptions {
     /** Node: the stack of the run's worker thread, in MB (default 256). */
     stackSizeMb?: number;
     /** Browser: where to load the module from (see `loadModule`). */
-    wasm?: string | URL | Response | BufferSource | WebAssembly.Module;
+    wasm?: string | GlobalClass<"URL"> | GlobalClass<"Response"> | ArrayBuffer | ArrayBufferView | WasmModule;
 }
 
 export interface TscResult {
@@ -38,4 +46,4 @@ export interface TscResult {
 export function tsc(args: string[], options?: TscOptions): Promise<TscResult>;
 
 /** The compiled module. The browser entry takes where to load it from. */
-export function loadModule(source?: TscOptions["wasm"]): Promise<WebAssembly.Module>;
+export function loadModule(source?: TscOptions["wasm"]): Promise<WasmModule>;

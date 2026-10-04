@@ -4,18 +4,29 @@
 //! a `OnceCell`; `mu` is dropped. Go `xxh3.Uint128` is `u128`. A Go
 //! `FileHandle` is `Rc<dyn FileHandle>` (nil is `None`): an `*Overlay` is
 //! `Rc<Overlay>` and a `*cachedFile` is `Rc<RefCell<CachedFile>>` (the dirty maps
-//! change it after sharing). Go `string` results are owned `String`s.
+//! change it after sharing). Go `string` results are owned `String`s, except
+//! the file text: a file keeps it as an `Arc<str>`, which a Go string is (an
+//! immutable shared value), so a reader that only reads it takes
+//! `shared_content` and does not copy it.
 
 use crate::project::prelude::*;
 
 use crate::frontend::core_ext::get_script_kind_from_file_name;
 use crate::frontend::core_textchange::TextChange;
 use std::cell::{Cell, OnceCell};
+use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
 
 // Go: project/overlayfs.go:22 FileContent
 pub trait FileContent {
-    fn content(&self) -> String;
+    /// Go `Content`: an owned copy of the text.
+    fn content(&self) -> String {
+        self.shared_content().to_string()
+    }
+    /// Go `Content` without the copy: the text that the file holds. Use it
+    /// where the text is read per result (a language service reads a file
+    /// once per location it converts).
+    fn shared_content(&self) -> Arc<str>;
     fn hash(&self) -> u128;
 }
 
@@ -32,11 +43,13 @@ pub trait FileHandle: FileContent {
 
 // Go: project/overlayfs.go:38 fileBase
 // PORT: `hash` is a `Cell` because Go writes it on an overlay that may be
-// shared (processChanges).
+// shared (processChanges). `content` is an `Arc<str>`: a Go string is shared,
+// and a clone of the file (Go `Clone`, a new overlay with the same text)
+// shares it too.
 #[derive(Debug, Default)]
 pub struct FileBase {
     pub file_name: String,
-    pub content: String,
+    pub content: Arc<str>,
     pub hash: Cell<u128>,
 
     pub line_map: OnceCell<Rc<lsconv::LSPLineMap>>,
@@ -56,7 +69,12 @@ impl FileBase {
 
     // Go: project/overlayfs.go:57 fileBase.Content
     pub fn content(&self) -> String {
-        self.content.clone()
+        self.content.to_string()
+    }
+
+    /// Go `fileBase.Content` without the copy (`FileContent::shared_content`).
+    pub fn shared_content(&self) -> Arc<str> {
+        Arc::clone(&self.content)
     }
 
     // Go: project/overlayfs.go:61 fileBase.LSPLineMap
@@ -90,8 +108,10 @@ pub struct CachedFile {
 }
 
 // Go: project/overlayfs.go:82 newCachedFile
-// PORT: `content` is owned because the file keeps it.
-pub fn new_cached_file(file_name: &str, content: String) -> Rc<RefCell<CachedFile>> {
+// PORT: the file keeps `content`. An `Arc<str>` is shared, a `String` or
+// `&str` is copied once.
+pub fn new_cached_file(file_name: &str, content: impl Into<Arc<str>>) -> Rc<RefCell<CachedFile>> {
+    let content: Arc<str> = content.into();
     let hash = xxh3_128(content.as_bytes());
     Rc::new(RefCell::new(CachedFile {
         file_base: FileBase {
@@ -105,7 +125,7 @@ pub fn new_cached_file(file_name: &str, content: String) -> Rc<RefCell<CachedFil
 }
 
 // Go: project/overlayfs.go:90 NewCachedFileHandle (ts#64291)
-pub fn new_cached_file_handle(file_name: &str, content: String) -> Rc<dyn FileHandle> {
+pub fn new_cached_file_handle(file_name: &str, content: impl Into<Arc<str>>) -> Rc<dyn FileHandle> {
     new_cached_file(file_name, content)
 }
 
@@ -139,7 +159,7 @@ impl CachedFile {
             realpath_path: self.realpath_path.clone(),
             file_base: FileBase {
                 file_name: self.file_base.file_name.clone(),
-                content: self.file_base.content.clone(),
+                content: Arc::clone(&self.file_base.content),
                 hash: Cell::new(self.file_base.hash.get()),
                 ..FileBase::default()
             },
@@ -158,8 +178,8 @@ impl dirty::Cloneable for Rc<RefCell<CachedFile>> {
 // Go: project/overlayfs.go:96 `var _ FileHandle = (*cachedFile)(nil)`
 // PORT: the methods of `fileBase` are promoted through the embedding.
 impl FileContent for RefCell<CachedFile> {
-    fn content(&self) -> String {
-        self.borrow().file_base.content()
+    fn shared_content(&self) -> Arc<str> {
+        self.borrow().file_base.shared_content()
     }
 
     fn hash(&self) -> u128 {
@@ -210,8 +230,15 @@ pub struct Overlay {
 }
 
 // Go: project/overlayfs.go:130 newOverlay
-// PORT: `content` is owned because the overlay keeps it.
-pub fn new_overlay(file_name: &str, content: String, version: i32, kind: ScriptKind) -> Overlay {
+// PORT: the overlay keeps `content`. An `Arc<str>` is shared, a `String` or
+// `&str` is copied once.
+pub fn new_overlay(
+    file_name: &str,
+    content: impl Into<Arc<str>>,
+    version: i32,
+    kind: ScriptKind,
+) -> Overlay {
+    let content: Arc<str> = content.into();
     let hash = xxh3_128(content.as_bytes());
     Overlay {
         file_base: FileBase {
@@ -229,7 +256,7 @@ pub fn new_overlay(file_name: &str, content: String, version: i32, kind: ScriptK
 impl Overlay {
     // Go: project/overlayfs.go:144 Overlay.Text
     pub fn text(&self) -> String {
-        self.file_base.content.clone()
+        self.file_base.content.to_string()
     }
 
     // Go: project/overlayfs.go:163 Overlay.computeMatchesDiskText
@@ -253,8 +280,8 @@ impl Overlay {
 // Go: project/overlayfs.go:116 `var _ FileHandle = (*Overlay)(nil)`
 // PORT: the methods of `fileBase` are promoted through the embedding.
 impl FileContent for Overlay {
-    fn content(&self) -> String {
-        self.file_base.content()
+    fn shared_content(&self) -> Arc<str> {
+        self.file_base.shared_content()
     }
 
     fn hash(&self) -> u128 {
@@ -848,7 +875,7 @@ impl OverlayFS {
                     );
                 }
                 if o.as_ref()
-                    .is_some_and(|o| o.file_base.content != open_change.content)
+                    .is_some_and(|o| *o.file_base.content != *open_change.content)
                 {
                     result.changed.insert(uri.clone());
                 } else if o.is_none() {
@@ -865,7 +892,7 @@ impl OverlayFS {
                     path,
                     Rc::new(new_overlay(
                         &uri.file_name(),
-                        open_change.content.clone(),
+                        open_change.content.as_str(),
                         open_change.version,
                         script_kind,
                     )),
@@ -888,7 +915,7 @@ impl OverlayFS {
                         if matches_disk_text != cur.matches_disk_text.get() {
                             let next = new_overlay(
                                 &cur.file_base.file_name,
-                                cur.file_base.content.clone(),
+                                Arc::clone(&cur.file_base.content),
                                 cur.version.get(),
                                 cur.kind,
                             );
@@ -954,7 +981,7 @@ impl OverlayFS {
                         } else if let Some(whole_change) = &text_change.whole_document {
                             *o_cell.borrow_mut() = Some(Rc::new(new_overlay(
                                 &cur.file_base.file_name,
-                                whole_change.text.clone(),
+                                whole_change.text.as_str(),
                                 change.version,
                                 cur.kind,
                             )));
@@ -980,7 +1007,7 @@ impl OverlayFS {
                 if let Some(cur) = o.clone() {
                     let next = new_overlay(
                         &cur.file_base.file_name,
-                        cur.file_base.content.clone(),
+                        Arc::clone(&cur.file_base.content),
                         cur.version.get(),
                         cur.kind,
                     );

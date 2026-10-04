@@ -27,9 +27,21 @@ opt="${WASM_OPT:---flatten --rereloop -Oz -Oz}"
 # At opt-level "s", LLVM inlines `#[inline]` functions up to cost 325; the
 # faster build above lowers that to 150.
 rustflags="${WASM_RUSTFLAGS:-}"
-if [[ -n "$rustflags" ]]; then
-  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$rustflags"
-fi
+# The module keeps the source path of each panic location. Map the paths
+# that name the build host, as cargo's trim-paths does: the repo to
+# relative paths, a registry crate to `<name>-<version>/...`, and the
+# toolchain's library source to `/rustc/<commit>`. RUSTFLAGS splits at
+# spaces, so a path with a space keeps its name.
+sysroot="$(rustc --print sysroot)"
+commit="$(rustc -vV | sed -n 's/^commit-hash: //p')"
+remaps=("$repo/=" "$sysroot/lib/rustlib/src/rust=/rustc/$commit")
+for registry in "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/; do
+  [[ -d "$registry" ]] && remaps+=("$registry=")
+done
+for remap in "${remaps[@]}"; do
+  [[ "$remap" == *[[:space:]]* ]] || rustflags="${rustflags:+$rustflags }--remap-path-prefix=$remap"
+done
+export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$rustflags"
 
 cargo_cmd=(cargo)
 # The capped runner needs a systemd user session (Linux hosts such as
@@ -72,6 +84,15 @@ else
   wasm-opt -s 2 --reorder-functions-by-name "${features[@]}" --strip-debug --strip-producers \
     "$tmp/keyed.wasm" -o "$out"
 fi
+
+# The module must not hold a mapped build path (see remaps above).
+for remap in "${remaps[@]}"; do
+  from="${remap%=*}"
+  if [[ "$from" != *[[:space:]]* ]] && grep -qaF "${from%/}/" "$out"; then
+    echo "error: $out holds the build path ${from%/}" >&2
+    exit 1
+  fi
+done
 
 size() { wc -c <"$1" | tr -d ' '; }
 echo "built:  $(size "$built") bytes ($built)"

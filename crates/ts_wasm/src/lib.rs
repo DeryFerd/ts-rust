@@ -211,7 +211,9 @@ mod exports {
     }
 }
 
-#[cfg(test)]
+// Native only: the test runs over `host::test_host`. A wasm build has no
+// test host, because its file system is the JavaScript host's.
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
 
