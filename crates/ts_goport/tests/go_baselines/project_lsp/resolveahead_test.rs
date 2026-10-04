@@ -416,6 +416,147 @@ os_child_test! {
 }
 
 os_child_test! {
+    /// followups19 (R167 reviewer): a package.json that `file_exists` finds
+    /// but that no read can open, here a Unix socket (as when a package is
+    /// removed between the two calls). The worker resolves `sock` with a
+    /// failed read, and the check must not take that answer: the snapshot
+    /// does not cache a failed read, so a later read in the load could find
+    /// the file. The loader resolves the key itself.
+    #[cfg(unix)]
+    fn a_failed_package_json_read_is_not_taken() {
+        let stats = same_with_and_without("fr", &|session, root| {
+            write(
+                root,
+                "node_modules/sock/index.d.ts",
+                "export declare const k: number;",
+            );
+            std::os::unix::net::UnixListener::bind(format!("{root}/node_modules/sock/package.json"))
+                .unwrap();
+            let uri = file_uri(root, "src/index.ts");
+            open(session, &uri, &format!("{INDEX}import {{ k }} from \"sock\";\n"));
+            program(session, &uri);
+            add_import(session, root);
+            let observed = observe(session, root);
+            assert!(
+                observed
+                    .resolutions
+                    .iter()
+                    .any(|resolution| resolution.contains("\"sock\"")
+                        && resolution.contains("-> <root>/node_modules/sock/index.d.ts")),
+                "{observed:?}"
+            );
+        });
+        assert_eq!(stats.loader.rejected, 1, "{stats:?}");
+        assert_eq!(stats.loader.taken + 1, stats.keys, "{stats:?}");
+    }
+}
+
+/// The second project of `the_snapshot_lookups_of_an_earlier_load_reject_an_answer`.
+const P2_FILES: &[(&str, &str)] = &[
+    (
+        "p2/tsconfig.json",
+        r#"{ "compilerOptions": { "module": "esnext", "moduleResolution": "bundler", "noLib": true, "strict": true }, "include": ["src"] }"#,
+    ),
+    (
+        "p2/src/index.ts",
+        "import { o } from \"pkg/other\";\nexport const v = o;\n",
+    ),
+];
+
+os_child_test! {
+    /// R167 reviewer (followups15a): a test where `agrees` rejects. One
+    /// snapshot loads two projects that both resolve `pkg/other`. The disk
+    /// changes after the workers of the first load (a test hook):
+    /// `node_modules/pkg/other.ts` appears. The workers of the second load
+    /// find it, but the snapshot has the first load's answer for the path
+    /// (its job's lookups, `AheadLookupLayer::before`), so the check rejects
+    /// the answer, and the loader's own resolution finds that answer too. As
+    /// in Go, whose snapshot caches the first answer of each call, both
+    /// projects resolve `pkg/other` to `other.d.ts`.
+    fn the_snapshot_lookups_of_an_earlier_load_reject_an_answer() {
+        let root = make_project("agrees");
+        for (name, text) in P2_FILES {
+            write(&root, name, text);
+        }
+        resolve_ahead::set_mode(Some(Mode::Force));
+        let session = os_session(&root);
+        let uris = [
+            file_uri(&root, "src/index.ts"),
+            file_uri(&root, "p2/src/index.ts"),
+        ];
+        open(&session, &uris[0], INDEX);
+        program(&session, &uris[0]);
+        open(&session, &uris[1], P2_FILES[1].1);
+        program(&session, &uris[1]);
+        // New imports, so each project loads its program again.
+        edit(
+            &session,
+            &uris[0],
+            2,
+            (0, 0),
+            (0, 0),
+            "import { d } from \"./sub/d\";\n",
+        );
+        edit(
+            &session,
+            &uris[1],
+            2,
+            (0, 0),
+            (0, 0),
+            "import { p } from \"pkg\";\n",
+        );
+        let loads = Rc::new(std::cell::Cell::new(0));
+        let hook_loads = loads.clone();
+        let hook_root = root.clone();
+        resolve_ahead::set_after_workers(Some(Rc::new(move || {
+            hook_loads.set(hook_loads.get() + 1);
+            write(&hook_root, "node_modules/pkg/other.ts", "export const o = 5;");
+        })));
+        session.get_snapshot(
+            &bg(),
+            project::ResourceRequest {
+                documents: uris.iter().map(|u| uri(u)).collect(),
+                ..Default::default()
+            },
+            false, /*callerRef*/
+        );
+        resolve_ahead::set_after_workers(None);
+        assert_eq!(loads.get(), 2, "the two loads of one snapshot");
+        let stats = last_stats();
+        assert_eq!(stats.loader.rejected, 1, "{stats:?}");
+        let snapshot = session.snapshot();
+        for (config, file) in [
+            ("tsconfig.json", "src/index.ts"),
+            ("p2/tsconfig.json", "p2/src/index.ts"),
+        ] {
+            let config = tspath::to_path(&format!("{root}/{config}"), &root, true);
+            let project = snapshot
+                .project_collection
+                .configured_project(&config)
+                .expect("configured project");
+            let project = project.borrow();
+            let program = project.program.as_ref().expect("program");
+            let index = tspath::to_path(&format!("{root}/{file}"), &root, true);
+            let (_, module) = program
+                .processed_files
+                .resolved_modules
+                .get(&index)
+                .and_then(|modules| modules.iter().find(|(key, _)| key.name == "pkg/other"))
+                .expect("the resolution of pkg/other");
+            assert_eq!(
+                module.resolved_file_name,
+                format!("{root}/node_modules/pkg/other.d.ts"),
+                "{file}"
+            );
+        }
+        resolve_ahead::set_mode(None);
+        drop(snapshot);
+        drop(session);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+os_child_test! {
     /// Open files that are not on disk: a new file in a new directory, which
     /// the workers see through the open file paths, and an open
     /// package.json, whose text the workers do not have (its answers are
