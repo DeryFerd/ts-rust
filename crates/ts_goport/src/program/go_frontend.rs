@@ -91,11 +91,6 @@ pub(super) struct GoSharedState {
     /// they were built from its files alone (`full_tables`). Tests read it
     /// (`ls_program::version_tables_reused`).
     pub(super) from_old_tables: bool,
-    /// Not in Go: true when this version is a new load with the file names
-    /// of the version before it, and its tables started from that one's
-    /// (`same_names_tables`). Tests read it
-    /// (`ls_program::version_tables_kept_file_names`).
-    pub(super) kept_file_names: bool,
 }
 
 type FrontendSourceOutput = crate::frontend::tsoptions::SourceOutputAndProjectReference;
@@ -732,21 +727,8 @@ fn build_program(
             }
             (tables, common_source_directory)
         }
-        (Some(old), None) => {
-            let tables = match same_names_tables(np, old) {
-                Some(tables) => {
-                    if check_version_tables() {
-                        assert_same_tables(&tables, &full_tables(np, previous_shared));
-                    }
-                    tables
-                }
-                None => full_tables(np, previous_shared),
-            };
-            let common_source_directory = intern_program_str(&common_source_directory_of(np));
-            (tables, common_source_directory)
-        }
-        (None, _) => {
-            let tables = full_tables(np, None);
+        _ => {
+            let tables = full_tables(np, previous_shared);
             let common_source_directory = intern_program_str(&common_source_directory_of(np));
             (tables, common_source_directory)
         }
@@ -977,74 +959,6 @@ fn reused_tables(np: &NewProgram, old: &PreviousVersion, replaced: &[Replaced]) 
             Arc::clone(&old.file_by_path),
             file_meta,
         )
-    }
-}
-
-/// The tables of `np`, a new load whose file names are those of version
-/// `old`: the same program file paths in the same order and the same
-/// redirect paths (Go `filesByPath`, `redirectFilesByPath`). They share
-/// the old paths and slots (`file_by_path`). They equal `full_tables` of
-/// `np` (`check_version_tables`). None when the file names differ.
-// PERF: Go builds the maps of each load once. `file_by_path` is a
-// port-only copy of them, so a load that keeps the file names (an import
-// of a file that is already in the program) keeps the copy (lspedit1 cut
-// 3). Most files are the same parse, so the check compares pointers. The
-// program-set fields are copied again from the new load's maps: a compare
-// with the old copies reads cold memory and cost more than the copy
-// (progtables1: +0.13 ms on a query-core import edit).
-fn same_names_tables(np: &NewProgram, old: &PreviousVersion) -> Option<VersionTables> {
-    let (old_np, old) = (&*old.np, &*old.tables);
-    let (files, old_files) = (np.source_files(), old_np.source_files());
-    let same_names = files.len() == old_files.len()
-        && old.source_file_order.len() == files.len()
-        && old.other_files.is_empty()
-        && np.files_by_path().len() == old_np.files_by_path().len()
-        && files
-            .iter()
-            .zip(old_files)
-            .all(|(file, old_file)| Rc::ptr_eq(file, old_file) || file.path() == old_file.path())
-        && same_redirect_paths(np, old_np);
-    if !same_names {
-        return None;
-    }
-    let source_file_order: Vec<usize> = files.iter().map(|file| file.store).collect();
-    let file_meta = files
-        .iter()
-        .map(|file| file_program_meta(np, file))
-        .collect();
-    let previous = old.go.as_ref().map(|old_shared| (old_np, old_shared));
-    let mut go = GoSharedState::new(np, previous, None, &old.file_by_path);
-    go.kept_file_names = true;
-    Some(VersionTables {
-        go: Some(go),
-        file_versions: files
-            .iter()
-            .filter_map(|file| file.version.get().cloned())
-            .collect(),
-        ..VersionTables::from_parts(
-            source_file_order,
-            Vec::new(),
-            Arc::clone(&old.file_by_path),
-            Arc::new(file_meta),
-        )
-    })
-}
-
-/// True when `np` and `old_np` have the same redirect paths, each to the
-/// same target (Go `redirectFilesByPath`). The files at the redirect paths
-/// of `filesByPath` are their targets.
-fn same_redirect_paths(np: &NewProgram, old_np: &NewProgram) -> bool {
-    match (&np.redirect_files_by_path, &old_np.redirect_files_by_path) {
-        (None, None) => true,
-        (Some(redirects), Some(old_redirects)) => {
-            redirects.len() == old_redirects.len()
-                && redirects.iter().all(|(path, redirect)| {
-                    old_redirects
-                        .get(path)
-                        .is_some_and(|old| old.target == redirect.target)
-                })
-        }
-        _ => false,
     }
 }
 
@@ -1512,7 +1426,6 @@ impl GoSharedState {
             known_symlinks,
             source_files_found_searching_node_modules,
             from_old_tables: reused.is_some(),
-            kept_file_names: false,
         }
     }
 
@@ -2105,61 +2018,6 @@ mod tests {
         assert!(redirected > 0, "no name has a redirect");
         drop(frontend);
         crate::program::release_program(program);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // progtables1 (lspedit1 cut 3): a new load with the file names of the
-    // version before it (here index.ts imports b.ts, which the config
-    // already lists) keeps that version's paths table. Its tables equal a
-    // build from its files alone. A load that adds a file builds them
-    // again.
-    #[test]
-    fn new_load_with_the_same_file_names_keeps_the_tables() {
-        let dir = std::env::temp_dir().join(format!("goport-same-names-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
-        write("tsconfig.json", r#"{"compilerOptions":{"types":[]}}"#);
-        write("index.ts", "export const x = 1;\n");
-        write("b.ts", "export const b = 1;\n");
-        let config = format!("{}/tsconfig.json", dir.to_string_lossy().replace('\\', "/"));
-        let load = || {
-            let _scope = crate::core::enter_program(None);
-            let opts = load_config(&config, |_| {}, &mut CompileTimes::default()).unwrap();
-            Rc::new(new_program(opts))
-        };
-        let v1 = new_program_version(&load(), None);
-
-        write(
-            "index.ts",
-            "import { b } from \"./b\";\nexport const x = b;\n",
-        );
-        let np = load();
-        let v2 = new_program_version(&np, Some(v1));
-        let (t1, t2) = (held_tables(v1), held_tables(v2));
-        assert!(t2.go.as_ref().is_some_and(|go| go.kept_file_names));
-        assert!(
-            Arc::ptr_eq(&t1.file_by_path, &t2.file_by_path),
-            "new paths table"
-        );
-        assert_ne!(
-            t1.source_file_order, t2.source_file_order,
-            "index.ts was not parsed again"
-        );
-        {
-            let _scope = crate::core::enter_program(Some(v2));
-            assert_same_tables(&t2, &full_tables(&np, None));
-        }
-
-        write("c.ts", "export const c = 1;\n");
-        let v3 = new_program_version(&load(), Some(v2));
-        let t3 = held_tables(v3);
-        assert!(!t3.go.as_ref().is_some_and(|go| go.kept_file_names));
-        assert_eq!(t3.source_file_order.len(), t2.source_file_order.len() + 1);
-        drop((t1, t2, t3));
-        for version in [v1, v2, v3] {
-            crate::program::release_program(version);
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

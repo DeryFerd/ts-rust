@@ -83,7 +83,6 @@ pub(crate) fn new_program_with_config(
             skip_module_resolution: false,
         },
         None,
-        None,
     )
 }
 

@@ -228,33 +228,3 @@ child_test! {
         assert!(program::get_source_file(B_FILE).is_some());
     }
 }
-
-child_test! {
-    env &[("GOPORT_CHECK_VERSION_TABLES", "1")];
-    // progtables1: an import edit is a new load. When it keeps the file
-    // names (b.ts is already a program file), the new version's tables
-    // start from the old version's. With GOPORT_CHECK_VERSION_TABLES=1 they
-    // are also compared with a build from the files alone.
-    fn import_edit_with_the_same_file_names_keeps_the_tables() {
-        let session = open_p1();
-        let p1 = program(&session, INDEX_URI);
-        assert!(!ls_program::version_tables_kept_file_names(
-            ls_program::program_version(&p1)
-        ));
-        let count = p1.source_files().len();
-        drop(p1);
-
-        import_edit(&session, 2);
-        let p2 = program(&session, INDEX_URI);
-        assert_eq!(p2.source_files().len(), count, "b.ts was a program file");
-        let version = ls_program::program_version(&p2);
-        assert!(!ls_program::version_tables_reused(version), "an import edit is a new load");
-        assert!(
-            ls_program::version_tables_kept_file_names(version),
-            "a load with the same file names starts from the old tables"
-        );
-        assert_eq!(sem_diag_count(&p2, "/home/projects/TS/p1/index.ts"), 0);
-        let _program = ls_program::enter(&p2);
-        assert!(program::get_source_file("/home/projects/TS/p1/b.ts").is_some());
-    }
-}

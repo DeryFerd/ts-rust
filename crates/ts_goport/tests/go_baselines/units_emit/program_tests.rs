@@ -673,7 +673,6 @@ fn new_content_mapper_program_with_options(
             skip_module_resolution: false,
         },
         None,
-        None,
     )
 }
 
