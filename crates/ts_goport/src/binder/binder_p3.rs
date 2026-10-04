@@ -554,9 +554,8 @@ impl Binder {
         // A top level or comma expression call expression with a dotted function name and at least one argument
         // is potentially an assertion and is therefore included in the control flow.
         if is_call_expression(node) {
-            if node.expression().kind() != SyntaxKind::SuperKeyword
-                && is_dotted_name(node.expression())
-            {
+            let expression = node.expression();
+            if expression.kind() != SyntaxKind::SuperKeyword && is_dotted_name(expression) {
                 self.current_flow = self.create_flow_call(self.current_flow, node);
             }
         }
@@ -1247,16 +1246,28 @@ pub fn is_narrowable_reference(node: Node) -> bool {
         SyntaxKind::PropertyAccessExpression
         | SyntaxKind::ParenthesizedExpression
         | SyntaxKind::NonNullExpression => is_narrowable_reference(node.expression()),
+        // PERF: binderview1. Go `IsStringOrNumericLiteralLike(arg) ||
+        // IsEntityNameExpression(arg) && isNarrowableReference(Expression)`
+        // with the kind of `arg` read once: a literal is no entity name, and
+        // an entity name is an identifier or a property access.
         SyntaxKind::ElementAccessExpression => {
             let argument_expression = node.argument_expression();
-            is_string_or_numeric_literal_like(argument_expression)
-                || is_entity_name_expression(argument_expression)
-                    && is_narrowable_reference(node.expression())
+            match argument_expression.kind() {
+                SyntaxKind::StringLiteral
+                | SyntaxKind::NoSubstitutionTemplateLiteral
+                | SyntaxKind::NumericLiteral => true,
+                SyntaxKind::Identifier => is_narrowable_reference(node.expression()),
+                SyntaxKind::PropertyAccessExpression => {
+                    is_entity_name_expression(argument_expression)
+                        && is_narrowable_reference(node.expression())
+                }
+                _ => false,
+            }
         }
         SyntaxKind::BinaryExpression => {
-            let operator = node.operator_token().kind();
-            operator == SyntaxKind::CommaToken && is_narrowable_reference(node.right())
-                || is_assignment_operator(operator) && is_left_hand_side_expression(node.left())
+            let expr = BinaryView::new(node);
+            expr.operator == SyntaxKind::CommaToken && is_narrowable_reference(expr.right)
+                || is_assignment_operator(expr.operator) && is_left_hand_side_expression(expr.left)
         }
         _ => false,
     }

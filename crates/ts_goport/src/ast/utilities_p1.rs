@@ -860,8 +860,14 @@ pub fn is_string_literal_like(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:331 IsStringOrNumericLiteralLike
+// PERF: binderview1. The kind is read once (see `is_access_expression`).
 pub fn is_string_or_numeric_literal_like(node: Node) -> bool {
-    is_string_literal_like(node) || is_numeric_literal(node)
+    matches!(
+        node.kind(),
+        SyntaxKind::StringLiteral
+            | SyntaxKind::NoSubstitutionTemplateLiteral
+            | SyntaxKind::NumericLiteral
+    )
 }
 
 // Go: ast/utilities.go:335 IsSignedNumericLiteral
@@ -978,7 +984,14 @@ fn is_left_hand_side_expression_kind(kind: SyntaxKind) -> bool {
 
 // Determines whether a node is a LeftHandSideExpression based only on its kind.
 // Go: ast/utilities.go:411 IsLeftHandSideExpression
+// PERF: binderview1. The kind is read once. Only a PartiallyEmittedExpression
+// is an outer expression of `OEK_PARTIALLY_EMITTED_EXPRESSIONS`, so any other
+// node is its own `SkipPartiallyEmittedExpressions`.
 pub fn is_left_hand_side_expression(node: Node) -> bool {
+    let kind = node.kind();
+    if kind != SyntaxKind::PartiallyEmittedExpression {
+        return is_left_hand_side_expression_kind(kind);
+    }
     is_left_hand_side_expression_kind(skip_partially_emitted_expressions(node).kind())
 }
 
@@ -1053,9 +1066,13 @@ pub fn is_iteration_statement(node: Node, look_in_labeled_statements: bool) -> b
 
 // Determines if a node is a property or element access expression
 // Go: ast/utilities.go:479 IsAccessExpression
+// PERF: binderview1. The kind is read once: a kind read is a store lookup
+// that the compiler does not merge with a second one.
 pub fn is_access_expression(node: Node) -> bool {
-    node.kind() == SyntaxKind::PropertyAccessExpression
-        || node.kind() == SyntaxKind::ElementAccessExpression
+    matches!(
+        node.kind(),
+        SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression
+    )
 }
 
 /// A fixed set of `SyntaxKind`s, one bit per kind, built at compile time.
@@ -1516,15 +1533,24 @@ pub fn is_outer_expression(node: Node, kinds: OuterExpressionKinds) -> bool {
         SyntaxKind::PartiallyEmittedExpression => {
             return kinds.intersects(OuterExpressionKinds::OEK_PARTIALLY_EMITTED_EXPRESSIONS);
         }
-        SyntaxKind::BinaryExpression => match node.operator_token().kind() {
-            SyntaxKind::EqualsToken => {
-                return kinds.intersects(OuterExpressionKinds::OEK_ASSIGNMENTS);
+        // PERF: binderview1. With neither the assignment nor the comma bit in
+        // `kinds` the answer is false for every operator, so the operator
+        // token is not read (`skip_partially_emitted_expressions`).
+        SyntaxKind::BinaryExpression
+            if kinds.intersects(
+                OuterExpressionKinds::OEK_ASSIGNMENTS | OuterExpressionKinds::OEK_COMMA,
+            ) =>
+        {
+            match node.operator_token().kind() {
+                SyntaxKind::EqualsToken => {
+                    return kinds.intersects(OuterExpressionKinds::OEK_ASSIGNMENTS);
+                }
+                SyntaxKind::CommaToken => {
+                    return kinds.intersects(OuterExpressionKinds::OEK_COMMA);
+                }
+                _ => {}
             }
-            SyntaxKind::CommaToken => {
-                return kinds.intersects(OuterExpressionKinds::OEK_COMMA);
-            }
-            _ => {}
-        },
+        }
         _ => {}
     }
     false

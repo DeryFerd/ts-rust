@@ -1050,9 +1050,14 @@ static ARGUMENTS_NAME: std::sync::LazyLock<Name> =
 
 // Go: binder/binder.go:1449 isEvalOrArgumentsIdentifier
 // PERF: U1 (a). Compares name ids (`Node::text_is`), with no text load.
+// PERF: binderview1. A published identifier reads its name once for both
+// compares (`frozen_store_text_name`).
 pub fn is_eval_or_arguments_identifier(node: Node) -> bool {
     if is_identifier(node) {
-        return node.text_is(&EVAL_NAME) || node.text_is(&ARGUMENTS_NAME);
+        return match frozen_store_text_name(node) {
+            Some(name) => name == *EVAL_NAME || name == *ARGUMENTS_NAME,
+            None => node.text_is(&EVAL_NAME) || node.text_is(&ARGUMENTS_NAME),
+        };
     }
     false
 }
