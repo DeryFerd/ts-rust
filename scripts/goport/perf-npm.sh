@@ -2,7 +2,7 @@
 # Times tsc run directly and through npm, for a Rust and a Go package set (npm-pack.sh) installed
 # with npm (npm-test.sh makes <work-dir>/proj). Cells, with hyperfine -N (mean of the runs):
 #   rs-direct   <rs-proj>/node_modules/@typescript/typescript-linux-x64/lib/tsc
-#   rs-npm      <rs-proj>/node_modules/.bin/tsc (the native tsc, after the postinstall)
+#   rs-npm      <rs-proj>/node_modules/.bin/tsc (sh, then the native tsc, after the postinstall)
 #   rs-npm-js   /usr/bin/env node <rs-proj>/node_modules/typescript/lib/tsc.js (Go's JS launcher, as
 #               without the postinstall: the same exec chain as a shebang bin/tsc)
 #   go-direct   <go-proj>/node_modules/@typescript/typescript-linux-x64/lib/tsc
@@ -22,7 +22,7 @@
 # Output: target/continuation-r97-goport/perf-npm/<label>/ (hyperfine JSON and text, table.txt).
 set -euo pipefail
 cd /home/theo/Code/sandbox/ts-rust
-[[ $# == 3 ]] || { sed -n '15p' "$0" >&2; exit 2; }
+[[ $# == 3 ]] || { sed -n '21p' "$0" >&2; exit 2; }
 label=$1 rs=$(realpath "$2") go=$(realpath "$3")
 out=target/continuation-r97-goport/perf-npm/$label
 mkdir -p "$out"

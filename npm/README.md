@@ -9,10 +9,11 @@ published set `tsc-rs` (see "tsc-rs releases" below).
   [wasm/README.md](wasm/README.md).
 
 The port adds one file to Go's layout: `install.js`, the postinstall (`lib/install.js`). On POSIX it
-replaces `bin/tsc` with a relative symlink to the platform package's `lib/tsc`. Then `tsc` runs
-without Node, which saves about 20 ms on every run. A symlink keeps the real path of the binary
-in the platform package, where it reads the lib files. When the swap cannot happen, `bin/tsc`
-stays Go's JS launcher, which still works.
+rewrites `bin/tsc` as a sh and JS polyglot. sh runs it as an exec of the platform package's
+`lib/tsc` by a relative path, so `tsc` runs without Node, which saves about 20 ms on every run.
+Node (`node node_modules/typescript/bin/tsc`) runs it as Go's JS launcher. The exec keeps the real
+path of the binary in the platform package, where it reads the lib files. When the rewrite cannot
+happen, `bin/tsc` stays Go's JS launcher, which still works.
 
 Files:
 
