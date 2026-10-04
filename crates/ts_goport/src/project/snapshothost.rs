@@ -32,6 +32,10 @@ pub struct SnapshotHost {
     // `AutoImportRegistryCloneHost::dispose`). No Go counterpart. It moved
     // from `Session` with the caches it belongs to.
     pub auto_import_parse_keys: Rc<AutoImportParseKeys>,
+
+    // PORT: not in Go (perf). The resolve-ahead keys of the projects that a
+    // clone made and deleted (`ResolveAheadStash`).
+    pub resolve_ahead_stash: Rc<ResolveAheadStash>,
 }
 
 // Go: project/snapshothost.go:34 SourceFileLease (ts#64434)
@@ -132,6 +136,7 @@ pub fn new_snapshot_host(init: &SessionInit) -> Rc<SnapshotHost> {
         content_mapper_host: new_content_mapper_host(init),
         snapshot_id: Cell::new(0),
         auto_import_parse_keys: Rc::new(RefCell::new(FxHashMap::default())),
+        resolve_ahead_stash: Rc::default(),
     })
 }
 

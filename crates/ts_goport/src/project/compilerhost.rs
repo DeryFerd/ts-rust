@@ -11,7 +11,8 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
-use crate::frontend::module::{AheadCall, KeyList, ModuleKeyParts};
+use crate::frontend::core_ext::get_script_kind_from_file_name;
+use crate::frontend::module::{AheadAnswer, AheadCall, KeyList};
 use crate::frontend::parser;
 use std::cell::Cell;
 use std::sync::Arc;
@@ -40,17 +41,93 @@ pub struct CompilerHost {
     pub first_load: bool,
 
     /// The module resolution keys of the last program load with this host,
-    /// or else of the project's host before it: the keys that the next load
-    /// resolves ahead (`compiler::CompilerHost::resolve_ahead`).
+    /// or else of the project's host before it, or else of the deleted
+    /// project of the same config (`ResolveAheadStash`): the keys that the
+    /// next load resolves ahead (`compiler::CompilerHost::resolve_ahead`).
     // PORT: not in Go (perf).
     pub resolution_keys: Rc<RefCell<Option<Arc<KeyList>>>>,
 
     /// The project's share in what the resolve-ahead workers keep from
-    /// load to load, from the project's host before this one. `release`
-    /// drops it; when no host of the project has it, the workers drop
-    /// what they keep (`compiler::resolve_ahead::KeptShare`).
+    /// load to load, from the project's host before this one or from the
+    /// stash (`ResolveAheadStash`). `release` drops it; when no host of the
+    /// project and no stash has it, the workers drop what they keep
+    /// (`compiler::resolve_ahead::KeptShare`).
     // PORT: not in Go (perf).
     pub kept_share: RefCell<Option<Rc<compiler::resolve_ahead::KeptShare>>>,
+}
+
+/// The resolve-ahead keys and kept share of the projects that a snapshot
+/// clone made and deleted, by config file path. The first host of a later
+/// project of the same config takes them (`new_compiler_host`), so its load
+/// resolves ahead the keys of the deleted project's last load. The project
+/// search of each hono file open makes and deletes tsconfig.spec.json; with
+/// no keys, its load resolves its 1338 module keys on the loading thread.
+/// The keys are hints only: the loader checks each answer
+/// (`accept_ahead_answer`), and resolves itself a key that it does not
+/// find. One per session (`SnapshotHost`), with at most `CAPACITY`
+/// projects; a new one drops the oldest.
+///
+/// Rule: only `Snapshot::clone` puts, for a program that it made for a
+/// project that its new collection does not have. A host that `release`
+/// frees (the old host of a live project, or the last host of a project
+/// whose files closed) drops its keys and share as before, so the kept
+/// state of a closed project goes as `KeptShare` says.
+// PORT: not in Go (perf; Go has no resolve ahead).
+#[derive(Default)]
+pub struct ResolveAheadStash {
+    projects: RefCell<Vec<StashedProject>>,
+}
+
+struct StashedProject {
+    config_file_path: tspath::Path,
+    keys: Arc<KeyList>,
+    share: Rc<compiler::resolve_ahead::KeptShare>,
+}
+
+impl ResolveAheadStash {
+    const CAPACITY: usize = 8;
+
+    /// Moves the keys and the share of `host` here, in place of older ones
+    /// of its config. Nothing when its loads recorded no keys.
+    pub fn put(&self, host: &CompilerHost) {
+        if host.resolution_keys.borrow().is_none() {
+            return;
+        }
+        let keys = host.resolution_keys.borrow_mut().take();
+        let share = host.kept_share.borrow_mut().take();
+        let (Some(keys), Some(share)) = (keys, share) else {
+            return;
+        };
+        let mut projects = self.projects.borrow_mut();
+        let older = projects
+            .iter()
+            .position(|project| project.config_file_path == host.config_file_path)
+            .map(|index| projects.remove(index));
+        projects.push(StashedProject {
+            config_file_path: host.config_file_path.clone(),
+            keys,
+            share,
+        });
+        let oldest = (projects.len() > Self::CAPACITY).then(|| projects.remove(0));
+        drop(projects);
+        // A dropped share can make the workers forget what they keep.
+        drop(older);
+        drop(oldest);
+    }
+
+    /// Takes the keys and the share of the deleted project of
+    /// `config_file_path`.
+    fn take(
+        &self,
+        config_file_path: &tspath::Path,
+    ) -> Option<(Arc<KeyList>, Rc<compiler::resolve_ahead::KeptShare>)> {
+        let mut projects = self.projects.borrow_mut();
+        let index = projects
+            .iter()
+            .position(|project| project.config_file_path == *config_file_path)?;
+        let project = projects.remove(index);
+        Some((project.keys, project.share))
+    }
 }
 
 // Go: project/compilerhost.go:29 newCompilerHost
@@ -65,12 +142,21 @@ pub fn new_compiler_host(
 ) -> Rc<CompilerHost> {
     let (config_file_path, first_load, resolution_keys, kept_share) = {
         let project = project.borrow();
-        let host = project.host.as_ref();
+        let (resolution_keys, kept_share) = match &project.host {
+            Some(host) => (
+                host.resolution_keys.borrow().clone(),
+                host.kept_share.borrow().clone(),
+            ),
+            None => builder
+                .resolve_ahead_stash
+                .take(&project.config_file_path)
+                .map_or((None, None), |(keys, share)| (Some(keys), Some(share))),
+        };
         (
             project.config_file_path.clone(),
             project.program.is_none(),
-            host.and_then(|host| host.resolution_keys.borrow().clone()),
-            host.and_then(|host| host.kept_share.borrow().clone()),
+            resolution_keys,
+            kept_share,
         )
     };
     let source_fs = new_source_fs(true, builder.fs.clone(), builder.to_path.clone());
@@ -141,6 +227,13 @@ impl compiler::CompilerHost for CompilerHost {
     // FS implements compiler.CompilerHost.
     fn fs(&self) -> Rc<dyn vfs::Fs> {
         self.source_fs.clone()
+    }
+
+    // PORT: not in Go (see `compiler::CompilerHost::without_fs_tracking`).
+    fn without_fs_tracking(&self, f: &mut dyn FnMut()) {
+        let tracking = self.source_fs.tracking.replace(false);
+        f();
+        self.source_fs.tracking.set(tracking);
     }
 
     // Go: project/compilerhost.go:79 compilerHost.GetCurrentDirectory
@@ -331,9 +424,56 @@ impl compiler::CompilerHost for CompilerHost {
     // worker parse only on a miss. Parse workers would parse the whole
     // program again for nothing, and those parses stay in the workers' AST
     // arenas (about 30 MiB for each Query core rebuild). The first load of
-    // a project still parses ahead.
+    // a project still parses ahead, except the files that the parse cache
+    // has (`cached_source_file_refs`).
     fn prefetch_parses(&self) -> bool {
         self.first_load
+    }
+
+    // PORT: not in Go (see `compiler::CompilerHost::cached_source_file_refs`).
+    // The parse cache files that `get_source_file` would give for a worker's
+    // guess of the parse: the script kind of the file name, the jsx option
+    // that this project's options give the name, and, when the text is
+    // known with no read, its hash. The loader then hits the cache and never
+    // takes a worker parse of these files, so the workers do not parse them.
+    // A project that one clone made and deleted keeps its files in the cache
+    // (as in Go), so when a later open makes it again (hono's
+    // tsconfig.spec.json), its load starts no worker parse. A guess that
+    // misses (another `force` option, a file whose language id gives another
+    // kind) only makes the loader parse the file itself.
+    fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<compiler::FileRefs>> {
+        let mut refs = FxHashMap::default();
+        let (Some(builder), Some(project)) =
+            (self.builder.borrow().clone(), self.project.borrow().clone())
+        else {
+            return refs;
+        };
+        let Some(command_line) = project.borrow().get_command_line_with_typings_files() else {
+            return refs;
+        };
+        let options = command_line.compiler_options();
+        let metadata = SourceFileMetaData::default();
+        for (key, entry) in builder.parse_cache.entries.borrow().iter() {
+            if key.script_kind != get_script_kind_from_file_name(&key.file_name)
+                || key.jsx
+                    != parser::get_external_module_indicator_options(
+                        &key.file_name,
+                        &options,
+                        &metadata,
+                    )
+                    .jsx
+                || builder
+                    .fs
+                    .known_file_hash(&key.path)
+                    .is_some_and(|hash| hash != key.hash)
+            {
+                continue;
+            }
+            if let Some(file) = &*entry.value.borrow() {
+                refs.insert(key.file_name.clone(), file.refs());
+            }
+        }
+        refs
     }
 
     // PORT: not in Go (see `compiler::CompilerHost::release`). Go frees the
@@ -408,11 +548,9 @@ impl compiler::CompilerHost for CompilerHost {
         let accept = {
             let source_fs = self.source_fs.clone();
             let files = files.clone();
-            Rc::new(
-                move |_key: ModuleKeyParts<'_>, _value: &ResolvedModule, calls: &[AheadCall]| {
-                    accept_ahead_answer(&source_fs, &files, &load, calls)
-                },
-            )
+            Rc::new(move |_answer: AheadAnswer<'_>, calls: &[AheadCall]| {
+                accept_ahead_answer(&source_fs, &files, &load, calls)
+            })
         };
         let keys = self.resolution_keys.clone();
         let scratch = cfg!(debug_assertions).then(|| {

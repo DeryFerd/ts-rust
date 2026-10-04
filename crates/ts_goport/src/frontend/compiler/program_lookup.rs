@@ -424,100 +424,101 @@ impl NewProgram {
     // PORT: `known_symlinks` is Go `knownSymlinks lazyValue[*symlinks.KnownSymlinks]`.
     pub fn get_symlink_cache(&self) -> Rc<KnownSymlinks> {
         self.known_symlinks
-            .get_value(|| {
-                let mut known_symlinks = KnownSymlinks::new(
-                    &self.get_current_directory(),
-                    self.use_case_sensitive_file_names(),
-                );
+            .get_value(|| Rc::new(self.build_symlink_cache()))
+            .clone()
+    }
 
-                // Resolved modules store realpath information when they're resolved inside node_modules
-                if !self.processed_files.resolved_modules.is_empty()
-                    || !self.processed_files.type_resolutions_in_file.is_empty()
+    /// The symlink cache when the program has computed it (Go
+    /// `knownSymlinks.initialized`).
+    pub fn symlink_cache_if_built(&self) -> Option<Rc<KnownSymlinks>> {
+        self.known_symlinks.get().cloned()
+    }
+
+    /// The value that Go `GetSymlinkCache` computes on first use, without
+    /// storing it in the program.
+    // Go: program.go:2301 (the getValue callback)
+    pub fn build_symlink_cache(&self) -> KnownSymlinks {
+        let mut known_symlinks = KnownSymlinks::new(
+            &self.get_current_directory(),
+            self.use_case_sensitive_file_names(),
+        );
+
+        // Resolved modules store realpath information when they're resolved inside node_modules
+        if !self.processed_files.resolved_modules.is_empty()
+            || !self.processed_files.type_resolutions_in_file.is_empty()
+        {
+            known_symlinks.set_symlinks_from_resolutions(
+                &|callback: &mut ResolutionCallback<'_, Arc<ResolvedModule>>,
+                  file: Option<&ParsedSourceFile>| {
+                    self.for_each_resolved_module(callback, file);
+                },
+                &|callback: &mut ResolutionCallback<'_, Rc<ResolvedTypeReferenceDirective>>,
+                  file: Option<&ParsedSourceFile>| {
+                    self.for_each_resolved_type_reference_directive(callback, file);
+                },
+            );
+        }
+
+        // Check other dependencies for symlinks
+        let resolver = self
+            .processed_files
+            .resolver
+            .as_ref()
+            .expect("program has a resolver");
+        let mut seen_package_jsons: FxHashSet<Path> = FxHashSet::default();
+        for (file_path, meta) in self.processed_files.source_file_meta_datas.iter() {
+            if meta.package_json_directory.is_empty() {
+                continue;
+            }
+            // PORT: Go passes a possibly nil file to `SourceFileMayBeEmitted`.
+            let source_file = self.get_source_file_by_path(file_path);
+            if !source_file.is_some_and(|f| self.source_file_may_be_emitted(&f, false))
+                || !seen_package_jsons.insert(self.to_path(&meta.package_json_directory))
+            {
+                continue;
+            }
+            let package_json_name = combine_paths(&meta.package_json_directory, &["package.json"]);
+            let info = self.get_package_json_info(&package_json_name);
+            let Some(contents) = info.as_ref().and_then(|info| info.get_contents()) else {
+                continue;
+            };
+
+            for dep in contents.get_runtime_dependency_names() {
+                // Skip work in common case: we already saved a symlink for this package directory
+                // in the node_modules adjacent to this package.json
+                let possible_directory_path = self.to_path(&combine_paths(
+                    &meta.package_json_directory,
+                    &["node_modules", &dep],
+                ));
+                if known_symlinks.has_directory(&possible_directory_path) {
+                    continue;
+                }
+                if !dep.starts_with("@types") {
+                    let possible_types_directory_path = self.to_path(&combine_paths(
+                        &meta.package_json_directory,
+                        &["node_modules", &get_types_package_name(&dep)],
+                    ));
+                    if known_symlinks.has_directory(&possible_types_directory_path) {
+                        continue;
+                    }
+                }
+
+                if let Some(package_resolution) = resolver.resolve_package_directory(
+                    &dep,
+                    &package_json_name,
+                    RESOLUTION_MODE_COMMON_JS,
+                    None,
+                ) && package_resolution.is_resolved()
+                    && !package_resolution.original_path.is_empty()
                 {
-                    known_symlinks.set_symlinks_from_resolutions(
-                        &|callback: &mut ResolutionCallback<'_, Arc<ResolvedModule>>,
-                          file: Option<&ParsedSourceFile>| {
-                            self.for_each_resolved_module(callback, file);
-                        },
-                        &|callback: &mut ResolutionCallback<
-                            '_,
-                            Rc<ResolvedTypeReferenceDirective>,
-                        >,
-                          file: Option<&ParsedSourceFile>| {
-                            self.for_each_resolved_type_reference_directive(callback, file);
-                        },
+                    known_symlinks.process_resolution(
+                        &combine_paths(&package_resolution.original_path, &["package.json"]),
+                        &combine_paths(&package_resolution.resolved_file_name, &["package.json"]),
                     );
                 }
-
-                // Check other dependencies for symlinks
-                let resolver = self
-                    .processed_files
-                    .resolver
-                    .as_ref()
-                    .expect("program has a resolver");
-                let mut seen_package_jsons: FxHashSet<Path> = FxHashSet::default();
-                for (file_path, meta) in self.processed_files.source_file_meta_datas.iter() {
-                    if meta.package_json_directory.is_empty() {
-                        continue;
-                    }
-                    // PORT: Go passes a possibly nil file to `SourceFileMayBeEmitted`.
-                    let source_file = self.get_source_file_by_path(file_path);
-                    if !source_file.is_some_and(|f| self.source_file_may_be_emitted(&f, false))
-                        || !seen_package_jsons.insert(self.to_path(&meta.package_json_directory))
-                    {
-                        continue;
-                    }
-                    let package_json_name =
-                        combine_paths(&meta.package_json_directory, &["package.json"]);
-                    let info = self.get_package_json_info(&package_json_name);
-                    let Some(contents) = info.as_ref().and_then(|info| info.get_contents()) else {
-                        continue;
-                    };
-
-                    for dep in contents.get_runtime_dependency_names() {
-                        // Skip work in common case: we already saved a symlink for this package directory
-                        // in the node_modules adjacent to this package.json
-                        let possible_directory_path = self.to_path(&combine_paths(
-                            &meta.package_json_directory,
-                            &["node_modules", &dep],
-                        ));
-                        if known_symlinks.has_directory(&possible_directory_path) {
-                            continue;
-                        }
-                        if !dep.starts_with("@types") {
-                            let possible_types_directory_path = self.to_path(&combine_paths(
-                                &meta.package_json_directory,
-                                &["node_modules", &get_types_package_name(&dep)],
-                            ));
-                            if known_symlinks.has_directory(&possible_types_directory_path) {
-                                continue;
-                            }
-                        }
-
-                        if let Some(package_resolution) = resolver.resolve_package_directory(
-                            &dep,
-                            &package_json_name,
-                            RESOLUTION_MODE_COMMON_JS,
-                            None,
-                        ) && package_resolution.is_resolved()
-                            && !package_resolution.original_path.is_empty()
-                        {
-                            known_symlinks.process_resolution(
-                                &combine_paths(
-                                    &package_resolution.original_path,
-                                    &["package.json"],
-                                ),
-                                &combine_paths(
-                                    &package_resolution.resolved_file_name,
-                                    &["package.json"],
-                                ),
-                            );
-                        }
-                    }
-                }
-                Rc::new(known_symlinks)
-            })
-            .clone()
+            }
+        }
+        known_symlinks
     }
 
     // Go: program.go:644 (*Program).ModuleResolutionError (ts#64299)
