@@ -884,11 +884,7 @@ impl Orchestrator {
         let testing = self.opts.testing.is_some();
         let paths: Vec<Path> = order.iter().map(|c| self.to_path(c)).collect();
         let pool = self.prefetch_pool.borrow_mut().take();
-        self.host
-            .written
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.host.written.clear();
         if !clean {
             *self.build_info_prefetch.borrow_mut() = self.start_build_info_prefetch(&paths, pool);
         }
@@ -1039,11 +1035,7 @@ impl Orchestrator {
         for path in &paths {
             self.get_task(path).borrow_mut().drop_status_prefetch();
         }
-        self.host
-            .written
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.host.written.clear();
     }
 
     // Go: build/orchestrator.go:959 (*Orchestrator).buildOrCleanProject,

@@ -214,7 +214,43 @@ pub struct BuildHost {
     // a file again, as Go does, in place of what the build info prefetch
     // read before the write (orchestrator.rs `BuildInfoPrefetch`). The
     // orchestrator clears it at the start and the end of each build.
-    pub written: Arc<Mutex<FxHashSet<Path>>>,
+    pub written: Arc<WrittenPaths>,
+}
+
+/// PORT: not in Go (perf). A set of paths (`BuildHost::written`), with a
+/// check that takes no lock while the set is empty (a build that writes
+/// nothing, such as a noop build).
+#[derive(Default)]
+pub struct WrittenPaths {
+    any: std::sync::atomic::AtomicBool,
+    paths: Mutex<FxHashSet<Path>>,
+}
+
+impl WrittenPaths {
+    pub fn insert(&self, path: Path) {
+        self.paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path);
+        self.any.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn contains(&self, path: &Path) -> bool {
+        self.any.load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .paths
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(path)
+    }
+
+    pub fn clear(&self) {
+        self.any.store(false, std::sync::atomic::Ordering::Release);
+        self.paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
 }
 
 impl BuildHost {
@@ -306,19 +342,13 @@ impl BuildHost {
     /// PORT: not in Go (perf). True when a task of this build wrote or
     /// touched `path` (`written`).
     pub fn was_written(&self, path: &Path) -> bool {
-        self.written
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .contains(path)
+        self.written.contains(path)
     }
 
     // Go: build/host.go:98 (*host).SetMTime
     // PORT: it also notes the file in `written`.
     pub fn set_m_time(&self, file: &str, m_time: Option<SystemTime>) -> Result<(), FsError> {
-        self.written
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(self.to_path(file));
+        self.written.insert(self.to_path(file));
         CompilerHost::fs(self).chtimes(file, None, m_time)
     }
 

@@ -1,7 +1,7 @@
 use crate::contentmapper;
 use crate::emitter::program_emit::{EmitOptions, WriteFile, WriteFileData};
 use crate::execute::build::command_line::ParsedBuildCommandLine;
-use crate::execute::build::host::{BuildCompilerHost, BuildHost};
+use crate::execute::build::host::{BuildCompilerHost, BuildHost, WrittenPaths};
 use crate::execute::build::up_to_date_status::*;
 use crate::execute::incremental::build_info::{
     BuildInfoRootInfoReader, content_mapper_identities, is_build_info_file_name_default_library,
@@ -2233,7 +2233,7 @@ fn new_task_write_file(
     deferred: Option<DeferredWrites>,
     store_output_time_stamp: bool,
     m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
-    written_paths: Arc<Mutex<FxHashSet<Path>>>,
+    written_paths: Arc<WrittenPaths>,
     compare_paths_options: ComparePathsOptions,
 ) -> WriteFile {
     Arc::new(
@@ -2245,10 +2245,7 @@ fn new_task_write_file(
                     compare_paths_options.use_case_sensitive_file_names,
                 )
             };
-            written_paths
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(path());
+            written_paths.insert(path());
             match &deferred {
                 None => osvfs_fs()
                     .write_file(file_name, text)
