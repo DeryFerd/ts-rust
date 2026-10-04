@@ -1291,7 +1291,8 @@ struct BlockFile {
     /// AST node records, step 2: `FileStore::foreign_parents`
     /// (`ParentCode`).
     foreign: &'static [Node],
-    /// R2-5: `FileStore::links`. Empty in a node shell.
+    /// R2-5: `FileStore::links`. Empty in a node shell: the store of the
+    /// version keeps it (`version_child_links`).
     links: &'static [SlotLinks],
     /// The store of a static publish. `None` in a node shell: the freeable
     /// file version owns the store (`with_published_store`).
@@ -3921,9 +3922,9 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
 /// nodes, and the shell has none (`FileBlock::node_column`), so a node data
 /// read reads the version (`static_store_node`, `StaticNode::Scoped`); a
 /// store with leaked nodes moves its node column into the shell.
-/// The binder's child walk (`frozen_store_children`) reads the node data:
-/// the link column is dropped here. Every read of the store or the `GoFile`
-/// finds no static one in the shell and reads the version
+/// The store keeps its link column, and the binder walks it through
+/// `version_child_links` (bindfast1). Every read of the store or the
+/// `GoFile` finds no static one in the shell and reads the version
 /// (`with_published_store`, `try_with_go_file`). The caller sets the block
 /// after the version is published.
 // PERF: lsshells M3 repair. A pinned read of the version (a thread-local
@@ -3944,6 +3945,10 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
 // version (a panic with debug assertions, `file_block`); a stale binder
 // field read after the reuse (`check_block_owner`) and a stale node data
 // read panic.
+// PERF: bindfast1. The link column stays in the store (8 bytes per node,
+// freed with the version): the bind of an edited file walked its children
+// through the node data (`for_each_child`, scoped reads), and took 0.39 ms
+// on effect's Option.ts against Go's 0.26 ms.
 fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
     debug_assert_eq!(
         record_resolve(file, NIL_SLOT as usize, &store.records),
@@ -3980,7 +3985,6 @@ fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
     store.kids = Vec::new();
     let kinds = shell_kinds(std::mem::take(&mut store.kinds));
     let foreign: &'static [Node] = Vec::leak(std::mem::take(&mut store.foreign_parents));
-    store.links = Box::default();
     let shell = FileBlock {
         kinds,
         records,
@@ -4764,12 +4768,13 @@ pub fn frozen_store_lacks_type_arguments(n: Node) -> bool {
 
 /// R2-5: the children of a published store node in Go
 /// `ForEachChild` order, from the link column of its store (`SlotLinks`),
-/// without its node data. `None` when the chain of `n` is not known (a
-/// node shell has no link column) and for any other node (nil, synthetic,
+/// without its node data. `None` when the chain of `n` is not known, for
+/// a node of a node shell (the binder reads its version's column,
+/// `version_child_links`) and for any other node (nil, synthetic,
 /// unpublished): the caller uses `for_each_child`.
 #[inline]
 #[must_use]
-pub fn frozen_store_children(n: Node) -> Option<StoreChildren> {
+pub fn frozen_store_children(n: Node) -> Option<StoreChildren<'static>> {
     if n.is_nil() {
         return None;
     }
@@ -4783,17 +4788,70 @@ pub fn frozen_store_children(n: Node) -> Option<StoreChildren> {
     })
 }
 
-/// R2-5: the iterator of `frozen_store_children`. A chain holds only node
-/// slots of its store, so each child is the handle of its slot.
-#[derive(Clone, Copy, Debug)]
-pub struct StoreChildren {
+/// R2-5: the link column of freeable file version `file` (`node_shell`
+/// keeps it in the version's store), pinned while the guard lives, for the
+/// binder's child walk (`Binder::bind_each_child`). `None` for any other
+/// file (a static publish has its column in its block, and
+/// `frozen_store_children` reads it) and for a store with no link column.
+#[must_use]
+pub fn version_child_links(file: usize) -> Option<VersionChildLinks> {
+    if file_block(file)?.file.store.is_some() {
+        return None;
+    }
+    let links: FileRef<[SlotLinks]> = FileRef::Pinned {
+        version: published_version(file)?,
+        key: 0,
+        get: |version, _| {
+            &version
+                .published()
+                .expect("a pinned file version is published")
+                .store
+                .links
+        },
+    };
+    (!links.is_empty()).then_some(VersionChildLinks { file, links })
+}
+
+/// R2-5: the link column of one freeable file version
+/// (`version_child_links`). A clone shares the pin.
+#[derive(Clone)]
+pub struct VersionChildLinks {
     file: usize,
-    links: &'static [SlotLinks],
+    links: FileRef<[SlotLinks]>,
+}
+
+impl VersionChildLinks {
+    /// `frozen_store_children` for node `n` of this version: its children
+    /// in Go `ForEachChild` order. `None` for a node of another file and
+    /// when the chain of `n` is not known: the caller uses `for_each_child`.
+    #[inline]
+    #[must_use]
+    pub fn children(&self, n: Node) -> Option<StoreChildren<'_>> {
+        if n.is_nil() || n.file_index() != self.file {
+            return None;
+        }
+        let links: &[SlotLinks] = &self.links;
+        let first = links.get(slot_index(n))?.first_child;
+        (first != LINK_NONE).then_some(StoreChildren {
+            file: self.file,
+            links,
+            next: first,
+        })
+    }
+}
+
+/// R2-5: the iterator of `frozen_store_children` and
+/// `VersionChildLinks::children`. A chain holds only node slots of its
+/// store, so each child is the handle of its slot.
+#[derive(Clone, Copy, Debug)]
+pub struct StoreChildren<'a> {
+    file: usize,
+    links: &'a [SlotLinks],
     /// The next child, `LINK_END` at the end.
     next: u32,
 }
 
-impl Iterator for StoreChildren {
+impl Iterator for StoreChildren<'_> {
     type Item = Node;
 
     #[inline]

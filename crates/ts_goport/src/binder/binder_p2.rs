@@ -1411,9 +1411,20 @@ impl Binder {
     // `for_each_child`, from the first child and next sibling of each slot,
     // so a node that the binder only passes through (type references,
     // unions) never loads its data.
+    // bindfast1: a node of a freeable file version (an edited file) walks
+    // the link column of its version (`version_links`), so its walk skips
+    // the scoped node data reads too.
     // Debug builds compare the walk with `for_each_child`.
     pub fn bind_each_child(&mut self, node: Node) {
-        if let Some(children) = frozen_store_children(node) {
+        // A clone of the guard (`None` for a static file), so the walk does
+        // not borrow `self`.
+        let version_links = self.version_links.clone();
+        let children = frozen_store_children(node).or_else(|| {
+            version_links
+                .as_ref()
+                .and_then(|links| links.children(node))
+        });
+        if let Some(children) = children {
             debug_assert!(
                 children.eq(node.iter_children()),
                 "R2-5 child links differ from for_each_child"
