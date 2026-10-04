@@ -11,7 +11,7 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
-use crate::frontend::module::{AheadCall, KeyList, ModuleKeyParts};
+use crate::frontend::module::{AheadAnswer, AheadCall, KeyList};
 use crate::frontend::parser;
 use std::cell::Cell;
 use std::sync::Arc;
@@ -408,11 +408,9 @@ impl compiler::CompilerHost for CompilerHost {
         let accept = {
             let source_fs = self.source_fs.clone();
             let files = files.clone();
-            Rc::new(
-                move |_key: ModuleKeyParts<'_>, _value: &ResolvedModule, calls: &[AheadCall]| {
-                    accept_ahead_answer(&source_fs, &files, &load, calls)
-                },
-            )
+            Rc::new(move |_answer: AheadAnswer<'_>, calls: &[AheadCall]| {
+                accept_ahead_answer(&source_fs, &files, &load, calls)
+            })
         };
         let keys = self.resolution_keys.clone();
         let scratch = cfg!(debug_assertions).then(|| {

@@ -818,6 +818,16 @@ pub fn normalize_path(path: &str) -> String {
     normalized
 }
 
+/// True when `normalize_path(path)` is `path` itself: it has no backslash
+/// and no "." or ".." segment or empty segment. (False does not mean that
+/// normalizing changes it.)
+// PORT: not in Go (perf). The names that the resolver and the loader make
+// are normal already, and Go normalizes them again; with this test a
+// caller can keep the name and skip the copy.
+pub fn is_normalized_path(path: &str) -> bool {
+    !path.as_bytes().contains(&b'\\') && !has_relative_path_segment(path)
+}
+
 // Go: tspath/path.go:612 GetCanonicalFileName
 pub fn get_canonical_file_name(file_name: &str, use_case_sensitive_file_names: bool) -> String {
     if use_case_sensitive_file_names {
@@ -941,6 +951,14 @@ pub fn to_file_name_lower_case(file_name: &str) -> String {
 
 // Go: tspath/path.go:723 ToPath
 pub fn to_path(file_name: &str, base_path: &str, use_case_sensitive_file_names: bool) -> Path {
+    // PERF: a rooted name that is normal already is its own normal path
+    // (`normalize_path`), so only the canonical copy is made.
+    if is_rooted_disk_path(file_name) && is_normalized_path(file_name) {
+        return Path(get_canonical_file_name(
+            file_name,
+            use_case_sensitive_file_names,
+        ));
+    }
     let non_canonicalized_path = if is_rooted_disk_path(file_name) {
         normalize_path(file_name)
     } else {
@@ -1618,7 +1636,46 @@ pub fn contains_ignored_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod relative_segment_tests {
-    use super::{has_dot_or_empty_segment, has_relative_path_segment_go};
+    use super::{
+        has_dot_or_empty_segment, has_relative_path_segment_go, is_normalized_path, normalize_path,
+        to_path,
+    };
+
+    /// `is_normalized_path` is true only for a name that `normalize_path`
+    /// keeps, and the `to_path` fast path for it gives the path of the slow
+    /// path, for every name of up to 6 bytes over '.', '/', '\\', ':', 'a'
+    /// and 'B' (so rooted, drive-rooted and relative names), on both kinds
+    /// of file system.
+    #[test]
+    fn normalized_path_fast_paths_match() {
+        let slow_to_path = |name: &str, base: &str, case_sensitive: bool| {
+            let normal = if super::is_rooted_disk_path(name) {
+                normalize_path(name)
+            } else {
+                super::get_normalized_absolute_path(name, base)
+            };
+            super::get_canonical_file_name(&normal, case_sensitive)
+        };
+        let mut level = vec![String::new()];
+        for _ in 0..6 {
+            level = level
+                .iter()
+                .flat_map(|path| ['.', '/', '\\', ':', 'a', 'B'].map(|c| format!("{path}{c}")))
+                .collect();
+            for path in &level {
+                if is_normalized_path(path) {
+                    assert_eq!(normalize_path(path), *path, "{path}");
+                }
+                for case_sensitive in [true, false] {
+                    assert_eq!(
+                        to_path(path, "/base/Dir", case_sensitive).0,
+                        slow_to_path(path, "/base/Dir", case_sensitive),
+                        "{path} {case_sensitive}"
+                    );
+                }
+            }
+        }
+    }
 
     /// The fast `has_relative_path_segment` gives Go's answer for every path
     /// of up to 8 bytes over '.', '/' and 'a'.
