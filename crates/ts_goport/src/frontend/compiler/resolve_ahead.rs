@@ -1,6 +1,9 @@
 //! Resolve ahead: worker threads resolve again, in the same order, the
 //! module names that the previous program load of a language server project
 //! resolved, while the loader of the new load runs (lspp95 plan, step 1).
+//! They also find again the package scope of each directory whose files the
+//! previous load read (Go `loadSourceFileMetaData`), and the loader takes a
+//! scope as it takes a module answer (`Caches::package_scope_ahead`).
 //!
 //! The loader stays serial. It takes a worker answer only when the answer
 //! passes its host's check (`ResolveAheadHost::accept`). The worker logs
@@ -81,10 +84,15 @@ pub fn mode() -> Mode {
 /// The counts of one resolve-ahead load.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadStats {
-    /// Keys of the previous load that the workers had.
+    /// Module keys of the previous load that the workers had.
     pub keys: usize,
-    /// Keys that this load resolved or took.
+    /// Module keys that this load resolved or took.
     pub new_keys: usize,
+    /// Package scope keys of the previous load that the workers had
+    /// (`KeyList::push_scope`).
+    pub scopes: usize,
+    /// Package scope keys of this load.
+    pub new_scopes: usize,
     pub loader: AheadStats,
     /// The known files that the workers of this load started with
     /// (`WorkerState::known_files`). 0 when the load had no workers.
@@ -203,11 +211,14 @@ pub struct ResolveAheadHost {
 
 /// A project's share in what the workers keep from job to job: the known
 /// files and the package.json parses. Each host of the project's loads
-/// gives it to the next one (project/compilerhost.rs). When the last one
-/// drops it (the project's programs are released) after a load of the
-/// project gave the workers a job, the workers drop what they keep
+/// gives it to the next one (project/compilerhost.rs). A project that a
+/// snapshot clone made and deleted gives it to the session's stash, and the
+/// project of the same config that a later clone makes takes it
+/// (`ResolveAheadStash`). When the last one drops it (the project's
+/// programs are released, or the stash drops the project) after a load of
+/// the project gave the workers a job, the workers drop what they keep
 /// (`Workers::forget`). So the kept state holds only what the loads of
-/// live projects found, and the next loads find it again.
+/// live and stashed projects found, and the next loads find it again.
 // PORT: not in Go (perf).
 #[derive(Default)]
 pub struct KeptShare {
@@ -273,7 +284,8 @@ pub struct ResolveAhead {
     /// The workers' job of this load, until `finish`.
     job: Option<Arc<Job>>,
     keep_keys: Option<Box<dyn FnOnce(Arc<KeyList>)>>,
-    previous_keys: usize,
+    /// The module keys and the package scope keys of the previous load.
+    previous_keys: (usize, usize),
 }
 
 impl ResolveAhead {
@@ -288,7 +300,10 @@ impl ResolveAhead {
             extra_extensions: resolver.extra_extensions.clone(),
             current_directory: resolver.host.get_current_directory().to_string(),
         });
-        let previous_keys = host.previous_keys.as_ref().map_or(0, |keys| keys.len());
+        let previous_keys = host
+            .previous_keys
+            .as_ref()
+            .map_or((0, 0), |keys| (keys.len() - keys.scopes(), keys.scopes()));
         let keys = host
             .previous_keys
             .as_deref()
@@ -320,15 +335,13 @@ impl ResolveAhead {
             None => host.accept,
             Some(scratch) => {
                 let accept = host.accept;
-                Rc::new(
-                    move |key: ModuleKeyParts<'_>, value: &ResolvedModule, calls: &[AheadCall]| {
-                        let accepted = accept(key, value, calls);
-                        if accepted {
-                            debug_check_answer(&config, &scratch(), key, value, calls);
-                        }
-                        accepted
-                    },
-                ) as AheadAccept
+                Rc::new(move |answer: AheadAnswer<'_>, calls: &[AheadCall]| {
+                    let accepted = accept(answer, calls);
+                    if accepted {
+                        debug_check_answer(&config, &scratch(), answer, calls);
+                    }
+                    accepted
+                }) as AheadAccept
             }
         };
         *resolver.caches.ahead.borrow_mut() = Some(AheadLink {
@@ -338,6 +351,7 @@ impl ResolveAhead {
             queue: job.as_ref().map(|job| job.queue.clone()),
             cursor: Cell::new(0),
             stats: Cell::new(AheadStats::default()),
+            scopes: RefCell::default(),
         });
         if mode() == Mode::Force
             && let Some((job, workers)) = job.as_ref().zip(Workers::get())
@@ -370,15 +384,14 @@ impl ResolveAhead {
         // known file that changed: the workers drop both now, so the next
         // job starts with neither, even when a load on another thread has
         // the workers first.
-        if loader.rejected > 0
-            && let Some((job, workers)) = self.job.as_ref().zip(Workers::started())
-        {
+        let rejected = loader.rejected + loader.scopes_rejected > 0;
+        if rejected && let Some((job, workers)) = self.job.as_ref().zip(Workers::started()) {
             workers.forget(job.epoch);
         }
         // The workers free the answers and the queue with the job.
         self.end_job(
             Some(Box::new((link.answers.take(), link.queue.take()))),
-            loader.rejected > 0,
+            rejected,
         );
         if worker_panic {
             debug_log(format_args!(
@@ -390,8 +403,10 @@ impl ResolveAhead {
         };
         let keys = Arc::new(link.keys.into_inner());
         let stats = LoadStats {
-            keys: self.previous_keys,
-            new_keys: keys.len(),
+            keys: self.previous_keys.0,
+            new_keys: keys.len() - keys.scopes(),
+            scopes: self.previous_keys.1,
+            new_scopes: keys.scopes(),
             loader,
             known_files,
             worker_panic,
@@ -576,8 +591,8 @@ impl EndedJob {
         // then kept as it is.
         if keep_known_files {
             let mut more: Option<FxHashSet<Path>> = None;
-            job.answers.for_each_module(|answer| {
-                AheadCall::each(answer.ahead.as_deref().unwrap_or_default(), &mut |call| {
+            job.answers.for_each_ahead_calls(|calls| {
+                AheadCall::each(calls, &mut |call| {
                     if let AheadCall::FileExists {
                         path, exists: true, ..
                     } = call
@@ -877,11 +892,16 @@ fn run_job(job: &Arc<Job>) {
                 break;
             };
             current.set(Some(index));
-            let _ = resolver.resolve_module_name_from_directory(
-                module_name,
-                containing_directory,
-                mode,
-            );
+            if module_name.is_empty() {
+                // A package scope key (`KeyList`).
+                resolver.publish_package_scope(containing_directory);
+            } else {
+                let _ = resolver.resolve_module_name_from_directory(
+                    module_name,
+                    containing_directory,
+                    mode,
+                );
+            }
             job.queue.done(index);
             current.set(None);
         }
@@ -1288,28 +1308,42 @@ impl Fs for AheadFs {
     }
 }
 
-/// Debug builds: checks a taken answer for `key` against a resolution of
-/// the key by a new resolver on a new tracking view of the host's file
-/// system. The answer must be the same, and the calls must list exactly the
-/// files that the view saw and the directories that it found missing. A
-/// new resolver reads every package.json itself, so this also checks that
-/// each answer lists the calls of the package.json cache entries it read.
+/// Debug builds: checks a taken answer against a resolution of its key (a
+/// module key or the package scope of a directory) by a new resolver on a
+/// new tracking view of the host's file system. The answer must be the
+/// same, and the calls must list exactly the files that the view saw and
+/// the directories that it found missing. A new resolver reads every
+/// package.json itself, so this also checks that each answer lists the
+/// calls of the package.json cache entries it read.
 fn debug_check_answer(
     config: &ResolverConfig,
     scratch: &ScratchFs,
-    key: ModuleKeyParts<'_>,
-    value: &ResolvedModule,
+    answer: AheadAnswer<'_>,
     calls: &[AheadCall],
 ) {
-    let (containing_directory, module_name, mode, _) = key;
     let resolver = config.new_resolver(scratch.fs.clone(), None);
-    let (own, _, _) =
-        resolver.resolve_module_name_from_directory(module_name, containing_directory, mode);
-    assert_eq!(
-        describe(&own),
-        describe(value),
-        "resolve ahead: the answer for {key:?} differs"
-    );
+    match answer {
+        AheadAnswer::Module((containing_directory, module_name, mode, _), value) => {
+            let (own, _, _) = resolver.resolve_module_name_from_directory(
+                module_name,
+                containing_directory,
+                mode,
+            );
+            assert_eq!(
+                describe(&own),
+                describe(value),
+                "resolve ahead: the answer for {answer:?} differs"
+            );
+        }
+        AheadAnswer::Scope(directory, scope) => {
+            let own = PackageScope::of(resolver.get_package_scope_for_path(directory).as_deref());
+            assert_eq!(
+                own.as_ref(),
+                scope,
+                "resolve ahead: the answer for {answer:?} differs"
+            );
+        }
+    }
     let mut seen = FxHashSet::default();
     let mut missing = FxHashSet::default();
     AheadCall::each(calls, &mut |call| match call {
@@ -1334,7 +1368,7 @@ fn debug_check_answer(
     let (own_seen, own_missing) = (scratch.tracked)();
     assert!(
         own_seen == seen && own_missing == missing,
-        "resolve ahead: the calls for {key:?} differ: seen {:?}, logged {:?}; missing {:?}, logged {:?}",
+        "resolve ahead: the calls for {answer:?} differ: seen {:?}, logged {:?}; missing {:?}, logged {:?}",
         sorted(&own_seen),
         sorted(&seen),
         sorted(&own_missing),

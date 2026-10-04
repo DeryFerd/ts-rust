@@ -73,6 +73,10 @@ pub struct FileLoader {
     /// The resolution cache that `resolver` shares with the parse workers
     /// (`SharedResolutionCache`), when the program shares one.
     pub shared_resolution: Option<Arc<SharedResolutionCache>>,
+    /// A language server load that resolves ahead: the module names of each
+    /// parse are kept for the next loads (`import_names`).
+    // PORT: not in Go (perf).
+    pub keeps_import_names: bool,
 
     // contentMapperMu guards the content-mapper bookkeeping below, which is written concurrently as
     // content-mapped files are parsed across worker goroutines.
@@ -249,6 +253,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         path_for_lib_file_cache: RefCell::new(FxHashMap::default()),
         path_for_lib_file_resolutions: RefCell::new(FxHashMap::default()),
         shared_resolution: None,
+        keeps_import_names: false,
         content_mapper_failures: RefCell::new(FxHashMap::default()),
         content_mapper_init_failed: RefCell::new(FxHashSet::default()),
         content_mapper_diagnostics: RefCell::new(Vec::new()),
@@ -328,6 +333,8 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
             // answer before the loader takes it. No project references, so
             // no key has a redirect and the resolver host fakes no file.
             resolve_ahead = Some(super::resolve_ahead::ResolveAhead::start(host, &resolver));
+            loader.keeps_import_names = true;
+            drop_dead_import_names();
         }
         loader.resolver = Some(Rc::new(resolver));
     }
@@ -1597,18 +1604,31 @@ impl FileLoader {
                 ModeAwareCache::default();
             resolutions_in_file.reserve(module_names.len());
             let mut resolutions_trace: Vec<DiagAndArgs> = Vec::new();
+            // PERF: the names, usages and JSDoc flags of the imports and
+            // module augmentations of a parse that the loads keep
+            // (`import_names`), and the file's emit format, once per file.
+            let kept = self
+                .keeps_import_names
+                .then(|| import_names(&file))
+                .filter(|kept| kept.len() == module_names.len() - imports_start as usize);
+            let mut file_emit_mode = None;
 
             for (index, entry) in module_names.iter().copied().enumerate() {
-                let module_name = entry.text();
+                let (module_name, usage, adds) =
+                    match (&kept, index.checked_sub(imports_start as usize)) {
+                        (Some(kept), Some(kept_index)) => kept.get(kept_index),
+                        _ => (entry.text(), import_usage(entry), None),
+                    };
                 if module_name.is_empty() {
                     continue;
                 }
 
-                let mode = get_mode_for_usage_location(
+                let mode = mode_for_import_usage(
+                    usage,
                     file.file_name(),
                     &meta,
-                    entry,
                     Some(&options_for_file),
+                    &mut file_emit_mode,
                 );
                 let (resolved_module, trace, err) = self.resolver().resolve_module_name(
                     module_name,
@@ -1669,10 +1689,10 @@ impl FileLoader {
                     && !options_for_file.no_resolve.is_true()
                     && !(is_js_file && !options_for_file.get_allow_js())
                     && (import_index < 0
-                        || ((import_index as usize) < file.imports.len() && {
-                            let import = file.imports[import_index as usize];
-                            is_in_js_file(import) || !import.flags().intersects(NodeFlags::JS_DOC)
-                        }));
+                        || ((import_index as usize) < file.imports.len()
+                            && adds.unwrap_or_else(|| {
+                                import_adds_file(file.imports[import_index as usize])
+                            })));
 
                 if should_add_file {
                     t.add_sub_task(
@@ -1821,24 +1841,28 @@ impl FileLoader {
 /// resolver and options as parameters, so a parse worker can run it with
 /// its own resolver (`files_parser.rs`).
 // Go: fileloader.go:341 (*fileLoader).loadSourceFileMetaData
+// PORT: the scope is the parts of it that this function reads
+// (`PackageScope`). In a resolve-ahead load, the loader takes the scope that
+// the workers found, or the scope that it found for the directory before
+// (`Caches::package_scope_ahead`).
 pub(crate) fn source_file_meta_data(
     resolver: &dyn Resolver,
     options: &CompilerOptions,
     file_name: &str,
 ) -> SourceFileMetaData {
-    let package_json_scope = resolver.get_package_scope_for_path(&get_directory_path(file_name));
+    let directory = get_directory_path(file_name);
+    let find = || PackageScope::of(resolver.get_package_scope_for_path(&directory).as_deref());
+    let package_json_scope = resolver
+        .as_default_resolver()
+        .and_then(|default| default.caches.package_scope_ahead(&directory, find))
+        .unwrap_or_else(find);
     let module_resolution_kind = options.get_module_resolution_kind();
 
     let mut package_json_type = String::new();
     let mut package_json_directory = String::new();
-    if let Some(scope) = package_json_scope.as_ref().filter(|scope| scope.exists()) {
-        package_json_directory = scope.package_directory.clone();
-        let contents = scope
-            .contents
-            .as_ref()
-            .expect("an existing package.json scope has contents");
-        let (value, ok) = contents.fields.header_fields.type_.get_value();
-        if ok
+    if let Some(scope) = package_json_scope {
+        package_json_directory = scope.package_directory;
+        if let Some(value) = scope.type_
             && (!file_extension_is_one_of(
                 file_name,
                 &[EXTENSION_MTS, EXTENSION_CTS, EXTENSION_MJS, EXTENSION_CJS],
@@ -1941,13 +1965,39 @@ pub(crate) fn get_default_resolution_mode_for_file(
 
 // Go: fileloader.go:726 getModeForUsageLocation
 // PORT: private, because program.rs has a public `get_mode_for_usage_location`
-// (Go program.go) with another shape. Go `options` can be nil (`None`).
+// (Go program.go) with another shape. Go `options` can be nil (`None`). The
+// node reads are `import_usage`, and the rest is `mode_for_import_usage`,
+// so the loader can keep the node reads of a parse (`import_names`).
 pub(crate) fn get_mode_for_usage_location(
     file_name: &str,
     meta: &SourceFileMetaData,
     usage: Node,
     options: Option<&CompilerOptions>,
 ) -> ResolutionMode {
+    mode_for_import_usage(import_usage(usage), file_name, meta, options, &mut None)
+}
+
+/// What Go `getModeForUsageLocation` reads of a module name node: a
+/// resolution-mode override, or the kind of usage that
+/// `getEmitSyntaxForUsageLocationWorker` tells apart (`import_usage`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImportUsage {
+    /// The `resolution-mode` of a type-only import or export, or of an
+    /// import type.
+    Override(ResolutionMode),
+    /// `require(...)`, or `import x = require(...)`.
+    Require,
+    /// `import(...)`.
+    ImportCall,
+    /// Any other module name.
+    Other,
+}
+
+/// The node reads of Go `getModeForUsageLocation` for the module name
+/// `usage`, in their order, and those of
+/// `getEmitSyntaxForUsageLocationWorker` (`emit_usage`).
+// Go: fileloader.go:726 getModeForUsageLocation
+fn import_usage(usage: Node) -> ImportUsage {
     let parent = usage.parent();
     if is_import_declaration(parent)
         || parent.kind() == SyntaxKind::JsImportDeclaration
@@ -1969,7 +2019,7 @@ pub(crate) fn get_mode_for_usage_location(
                 _ => (RESOLUTION_MODE_NONE, false),
             };
             if ok {
-                return override_;
+                return ImportUsage::Override(override_);
             }
         }
     }
@@ -1979,17 +2029,144 @@ pub(crate) fn get_mode_for_usage_location(
             .attributes()
             .get_resolution_mode_override(None);
         if ok {
-            return override_;
+            return ImportUsage::Override(override_);
         }
     }
+    emit_usage(parent)
+}
 
+/// The node reads of Go `getEmitSyntaxForUsageLocationWorker` for a module
+/// name whose parent is `parent`.
+// Go: fileloader.go:764 getEmitSyntaxForUsageLocationWorker
+fn emit_usage(parent: Node) -> ImportUsage {
+    if is_require_call(parent, false /*requireStringLiteralLikeArgument*/)
+        || is_external_module_reference(parent) && is_import_equals_declaration(parent.parent())
+    {
+        return ImportUsage::Require;
+    }
+    if is_import_call(walk_up_parenthesized_expressions(parent)) {
+        return ImportUsage::ImportCall;
+    }
+    ImportUsage::Other
+}
+
+/// Go `getModeForUsageLocation` for a module name of `usage` in
+/// `file_name`. `file_emit_mode` keeps the file's emit format for the other
+/// names of the file (`emit_syntax_for_usage`).
+// Go: fileloader.go:726 getModeForUsageLocation
+fn mode_for_import_usage(
+    usage: ImportUsage,
+    file_name: &str,
+    meta: &SourceFileMetaData,
+    options: Option<&CompilerOptions>,
+    file_emit_mode: &mut Option<ModuleKind>,
+) -> ResolutionMode {
+    if let ImportUsage::Override(mode) = usage {
+        return mode;
+    }
     if let Some(options) = options {
         if import_syntax_affects_module_resolution(options) {
-            return get_emit_syntax_for_usage_location_worker(file_name, meta, usage, options);
+            return emit_syntax_for_usage(usage, file_name, meta, options, file_emit_mode);
         }
     }
 
     RESOLUTION_MODE_NONE
+}
+/// Whether an import adds its file to the program, as far as the node
+/// tells (Go `resolveImportsAndModuleAugmentations`: a JSDoc import of a TS
+/// file adds no file).
+// Go: fileloader.go (*fileLoader).resolveImportsAndModuleAugmentations, the
+// importIndex condition (pin 673a5f17d713: fileloader.go:926)
+fn import_adds_file(import: Node) -> bool {
+    is_in_js_file(import) || !import.flags().intersects(NodeFlags::JS_DOC)
+}
+
+/// The module names of the imports and string module augmentations of a
+/// parse, in the order of `resolveImportsAndModuleAugmentations` after its
+/// synthetic imports, with each name's `ImportUsage` and, for an import,
+/// `import_adds_file`.
+// PORT: not in Go (perf, `import_names`).
+struct ImportNames {
+    /// The names, one after another.
+    text: String,
+    /// Per name: its end in `text`, its usage, and whether it adds its file
+    /// (false for a module augmentation, which adds none).
+    names: Vec<(usize, ImportUsage, bool)>,
+}
+
+impl ImportNames {
+    fn of(file: &ParsedSourceFile) -> ImportNames {
+        let augmentations = file
+            .module_augmentations
+            .iter()
+            .filter(|augmentation| augmentation.kind() == SyntaxKind::StringLiteral);
+        let count = file.imports.len() + augmentations.clone().count();
+        let mut names = ImportNames {
+            text: String::new(),
+            names: Vec::with_capacity(count),
+        };
+        for &import in &file.imports {
+            names.push(import, import_adds_file(import));
+        }
+        for &augmentation in augmentations {
+            names.push(augmentation, false);
+        }
+        names
+    }
+
+    fn push(&mut self, name: Node, adds: bool) {
+        self.text.push_str(name.text());
+        self.names.push((self.text.len(), import_usage(name), adds));
+    }
+
+    fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// The name, usage and `import_adds_file` of name `index`.
+    fn get(&self, index: usize) -> (&str, ImportUsage, Option<bool>) {
+        let (end, usage, adds) = self.names[index];
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |before| self.names[before].0);
+        (&self.text[start..end], usage, Some(adds))
+    }
+}
+
+thread_local! {
+    /// The `ImportNames` of the parses that the language server loads on
+    /// this thread read, by the address of the parse. The weak link keeps
+    /// the address from a new parse while the entry is here.
+    static IMPORT_NAMES: RefCell<FxHashMap<usize, (std::rc::Weak<ParsedSourceFile>, Rc<ImportNames>)>> =
+        RefCell::default();
+}
+
+/// The `ImportNames` of `file`, kept with the parse for the next loads. A
+/// language server load reads the parses of the unchanged files of the
+/// last load again, and `Node::text` of their module names is slow there
+/// (lspedit1: 0.72 ms per effect load).
+// PORT: not in Go (perf). Go reads `entry.Text()` and the usage nodes in
+// each load.
+fn import_names(file: &Rc<ParsedSourceFile>) -> Rc<ImportNames> {
+    let key = Rc::as_ptr(file) as usize;
+    IMPORT_NAMES.with(|kept| {
+        if let Some((_, names)) = kept.borrow().get(&key) {
+            return names.clone();
+        }
+        let names = Rc::new(ImportNames::of(file));
+        kept.borrow_mut()
+            .insert(key, (Rc::downgrade(file), names.clone()));
+        names
+    })
+}
+
+/// Drops the `ImportNames` of the parses that no one holds now (at the
+/// start of each language server load).
+fn drop_dead_import_names() {
+    IMPORT_NAMES.with(|kept| {
+        kept.borrow_mut()
+            .retain(|_, (file, _)| file.strong_count() > 0);
+    });
 }
 
 // Go: fileloader.go:758 importSyntaxAffectsModuleResolution
@@ -2008,14 +2185,33 @@ pub(crate) fn get_emit_syntax_for_usage_location_worker(
     usage: Node,
     options: &CompilerOptions,
 ) -> ResolutionMode {
-    let parent = usage.parent();
-    if is_require_call(parent, false /*requireStringLiteralLikeArgument*/)
-        || is_external_module_reference(parent) && is_import_equals_declaration(parent.parent())
-    {
+    emit_syntax_for_usage(
+        emit_usage(usage.parent()),
+        file_name,
+        meta,
+        options,
+        &mut None,
+    )
+}
+
+/// Go `getEmitSyntaxForUsageLocationWorker` for a module name of `usage`
+/// (`emit_usage`). `file_emit_mode` keeps Go `GetEmitModuleFormatOfFileWorker`
+/// of the file, which reads only the file name, the options and the
+/// metadata, for the other names of the file.
+// Go: fileloader.go:764 getEmitSyntaxForUsageLocationWorker
+fn emit_syntax_for_usage(
+    usage: ImportUsage,
+    file_name: &str,
+    meta: &SourceFileMetaData,
+    options: &CompilerOptions,
+    file_emit_mode: &mut Option<ModuleKind>,
+) -> ResolutionMode {
+    if usage == ImportUsage::Require {
         return ModuleKind::COMMON_JS;
     }
-    let file_emit_mode = get_emit_module_format_of_file_worker(file_name, options, meta);
-    if is_import_call(walk_up_parenthesized_expressions(parent)) {
+    let file_emit_mode = *file_emit_mode
+        .get_or_insert_with(|| get_emit_module_format_of_file_worker(file_name, options, meta));
+    if usage == ImportUsage::ImportCall {
         return if should_transform_import_call(file_name, options, file_emit_mode) {
             ModuleKind::COMMON_JS
         } else {

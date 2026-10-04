@@ -441,6 +441,13 @@ pub fn update_program(
     (result, new_file, reused)
 }
 
+/// Not in Go: the number of programs that `new_program` or
+/// `update_program` made on this thread and `release_program` has not
+/// released. Tests check that no program is left behind with it.
+pub fn registered_programs() -> usize {
+    PROGRAM_CHECKERS.with(|programs| programs.borrow().len())
+}
+
 /// Go drops a program when no snapshot uses it (`programCounter.Deref`
 /// returns true) and no request holds it. This is the snapshot part: the
 /// checker pools of `p` and its program version are freed now, or when the
