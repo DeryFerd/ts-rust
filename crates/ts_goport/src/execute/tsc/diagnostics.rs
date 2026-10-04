@@ -1000,7 +1000,7 @@ fn get_category_format(category: Category) -> &'static str {
         Category::Warning => FOREGROUND_COLOR_ESCAPE_YELLOW,
         Category::Suggestion => FOREGROUND_COLOR_ESCAPE_GREY,
         Category::Message => FOREGROUND_COLOR_ESCAPE_BLUE,
-        Category::Unhandled => crate::core::go_panic("Unhandled diagnostic category".to_string()),
+        _ => crate::core::go_panic("Unhandled diagnostic category".to_string()),
     }
 }
 

@@ -4815,7 +4815,7 @@ impl MarshalerTo for DiagnosticResponse {
         marshal_field_omitempty(enc, &mut first, "sourceLines", &self.source_lines)?;
         marshal_field(enc, &mut first, "code", &self.code)?;
         // PORT: `diagnostics.Category` is a Go int32 type; it writes as a number.
-        marshal_field(enc, &mut first, "category", &(self.category as i32))?;
+        marshal_field(enc, &mut first, "category", &self.category.0)?;
         marshal_field_omitempty(enc, &mut first, "source", &self.source)?;
         marshal_field(enc, &mut first, "text", &self.text)?;
         marshal_field_omitzero(

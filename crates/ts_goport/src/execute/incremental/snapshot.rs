@@ -23,24 +23,10 @@ use std::cell::OnceCell;
 /// returns it (`Arc`, because a `Diagnostic` crosses the checker threads).
 pub type RepopulateInfoRef = std::sync::Arc<RepopulateDiagnosticInfo>;
 
-/// Go `diagnostics.Category(raw)`. The build info keeps the raw Go value.
-/// Go keeps any value; one that it does not handle panics when the
-/// diagnostic is printed (`Category::Unhandled`).
-#[must_use]
-pub fn category_from_raw(raw: i32) -> crate::diagnostics::Category {
-    match raw {
-        0 => crate::diagnostics::Category::Warning,
-        1 => crate::diagnostics::Category::Error,
-        2 => crate::diagnostics::Category::Suggestion,
-        3 => crate::diagnostics::Category::Message,
-        _ => crate::diagnostics::Category::Unhandled,
-    }
-}
-
 // Go: incremental/snapshot.go:133 buildInfoDiagnosticWithFileName
 // PORT: Go `diagnostics.Category` is kept as the raw Go value, like
-// `BuildInfoDiagnostic.category`; use `category_from_raw`. Go nil slices are
-// empty vectors.
+// `BuildInfoDiagnostic.category` (`diagnostics::Category(raw)` gives the Go
+// value). Go nil slices are empty vectors.
 #[derive(Clone, Debug, Default)]
 pub struct BuildInfoDiagnosticWithFileName {
     // filename if it is for a File thats other than its stored for
@@ -151,7 +137,7 @@ impl BuildInfoDiagnosticWithFileName {
             file_for_diagnostic,
             port_text_range(file_for_diagnostic, self.pos, self.end),
             self.code,
-            category_from_raw(self.category),
+            crate::diagnostics::Category(self.category),
             &self.message_key,
             self.message_args.clone(),
             message_chain,
@@ -183,7 +169,7 @@ impl BuildInfoDiagnosticWithFileName {
             file,
             port_text_range(file, self.pos, self.end),
             self.code,
-            category_from_raw(self.category),
+            crate::diagnostics::Category(self.category),
             &self.message_key,
             self.message_args.clone(),
             message_chain,

@@ -1047,7 +1047,7 @@ pub fn compare_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
         return c;
     }
     // tsgo#4712
-    c = d1.category() as i32 - d2.category() as i32;
+    c = d1.category().0 - d2.category().0;
     if c != 0 {
         return c;
     }

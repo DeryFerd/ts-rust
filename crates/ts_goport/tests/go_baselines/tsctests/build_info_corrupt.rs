@@ -84,6 +84,19 @@ fn tsgo(dir: &Path, args: &[&str]) -> Run {
 /// and checks `tsgo -p .` and `tsgo -b`: exit 2, Go's panic line, and
 /// `p_stdout` (the text Go prints before the panic) in `-p`.
 fn check(name: &str, from: &str, to: &str, p_stdout: &str, panic: &str) {
+    check_runs(name, from, to, p_stdout, panic, false);
+}
+
+/// As `check`, but the project also has `src/x.ts` (no imports, no errors),
+/// and each run edits it first. Go then writes the build info again before
+/// the panic, from the diagnostics that it read. The new build info must
+/// keep `to`.
+fn check_written_again(name: &str, from: &str, to: &str, p_stdout: &str, panic: &str) {
+    check_runs(name, from, to, p_stdout, panic, true);
+}
+
+/// The runs of `check` and `check_written_again`.
+fn check_runs(name: &str, from: &str, to: &str, p_stdout: &str, panic: &str, edit_x: bool) {
     let dir = TmpDir::new(&format!("build-info-{name}"));
     dir.write(
         "tsconfig.json",
@@ -94,10 +107,13 @@ fn check(name: &str, from: &str, to: &str, p_stdout: &str, panic: &str) {
         "src/b.ts",
         "import { a } from \"./a\"; export const b: string = a;\n",
     );
+    if edit_x {
+        dir.write("src/x.ts", "export const x = 1;\n");
+    }
     let first = tsgo(&dir.0, &["-p", "."]);
     assert_eq!(first.code, Some(2), "first build: {first:?}");
-    let build_info =
-        std::fs::read_to_string(dir.0.join("tsconfig.tsbuildinfo")).expect("build info");
+    let build_info_path = dir.0.join("tsconfig.tsbuildinfo");
+    let build_info = std::fs::read_to_string(&build_info_path).expect("build info");
     assert_eq!(
         build_info.matches(from).count(),
         1,
@@ -109,13 +125,36 @@ fn check(name: &str, from: &str, to: &str, p_stdout: &str, panic: &str) {
         (&["-b"][..], "", format!("{panic} [recovered, repanicked]")),
     ] {
         dir.write("tsconfig.tsbuildinfo", &bad);
+        if edit_x {
+            dir.write("src/x.ts", "export const x = 2;\n");
+        }
         let want = Run {
             code: Some(2),
             stdout: stdout.to_string(),
             panic: format!("panic: {panic}"),
         };
         assert_eq!(tsgo(&dir.0, args), want, "{name} {args:?}");
+        if edit_x {
+            let written = std::fs::read_to_string(&build_info_path).expect("build info");
+            assert_ne!(
+                written, bad,
+                "{name} {args:?}: build info not written again"
+            );
+            assert!(
+                written.contains(to),
+                "{name} {args:?}: {to:?} not in {written}"
+            );
+        }
     }
+}
+
+/// The one diagnostic of `src/b.ts` in the build info.
+const B_DIAGNOSTIC: &str = r#"{"pos":38,"end":39,"code":2322,"category":1,"messageKey":"Type_0_is_not_assignable_to_type_1_2322","messageArgs":["number","string"]}"#;
+
+/// `B_DIAGNOSTIC`, then a copy of it with category `category`.
+fn with_copy_of_category(category: i32) -> String {
+    let copy = B_DIAGNOSTIC.replace(r#""category":1,"#, &format!(r#""category":{category},"#));
+    format!("{B_DIAGNOSTIC},{copy}")
 }
 
 // Go: scanner/scanner.go:2687 `lineMap[line]` with line -1.
@@ -215,5 +254,32 @@ fn too_few_message_args_panic_when_printed() {
         r#""messageArgs":["number"]"#,
         "src/b.ts(1,39): error TS2322: ",
         "Invalid formatting placeholder",
+    );
+}
+
+// Go: ast/diagnostic.go:502 `CompareDiagnostics` compares the categories
+// as ints, so a negative category sorts before the error at the same place
+// and is printed (and panics) first.
+#[test]
+fn negative_category_sorts_first() {
+    check(
+        "neg-cat-sort",
+        B_DIAGNOSTIC,
+        &with_copy_of_category(-1),
+        "src/b.ts(1,39): ",
+        "Unhandled diagnostic category",
+    );
+}
+
+// Go: execute/incremental/snapshottobuildinfo.go:166 writes the category
+// that the read diagnostic keeps, not a fixed value.
+#[test]
+fn unhandled_category_is_written_again() {
+    check_written_again(
+        "bad-cat-written",
+        r#""category":1,"#,
+        r#""category":999,"#,
+        "src/b.ts(1,39): ",
+        "Unhandled diagnostic category",
     );
 }
