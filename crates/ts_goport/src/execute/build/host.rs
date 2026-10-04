@@ -209,6 +209,12 @@ pub struct BuildHost {
     // PORT: Go `*collections.SyncMap`. The task `writeFile` stores into it
     // from the checker threads.
     pub m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
+    // PORT: not in Go (perf). The paths that the tasks of this build wrote
+    // (the task `writeFile`) or touched (`set_m_time`). A check reads such
+    // a file again, as Go does, in place of what the build info prefetch
+    // read before the write (orchestrator.rs `BuildInfoPrefetch`). The
+    // orchestrator clears it at the start and the end of each build.
+    pub written: Arc<Mutex<FxHashSet<Path>>>,
 }
 
 impl BuildHost {
@@ -246,6 +252,7 @@ impl BuildHost {
             resolved_references: ParseCache::default(),
             config_prefetch: RefCell::new(None),
             m_times: Arc::default(),
+            written: Arc::default(),
         }
     }
 
@@ -284,17 +291,34 @@ impl BuildHost {
     /// `path`. `prefetched` is the mtime that a prefetch thread read for it
     /// (orchestrator.rs `BuildInfoPrefetch`), taken where this would read
     /// the file system.
+    /// A task of this build wrote `file` after the prefetch read: then this
+    /// reads the file system, as Go does (`written`).
     pub fn get_m_time_of_path(
         &self,
         file: &str,
         path: &Path,
         prefetched: Option<Option<SystemTime>>,
     ) -> Option<SystemTime> {
+        let prefetched = prefetched.filter(|_| !self.was_written(path));
         self.load_or_store_m_time_of_path(file, path.clone(), None, true, prefetched)
     }
 
+    /// PORT: not in Go (perf). True when a task of this build wrote or
+    /// touched `path` (`written`).
+    pub fn was_written(&self, path: &Path) -> bool {
+        self.written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(path)
+    }
+
     // Go: build/host.go:98 (*host).SetMTime
+    // PORT: it also notes the file in `written`.
     pub fn set_m_time(&self, file: &str, m_time: Option<SystemTime>) -> Result<(), FsError> {
+        self.written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(self.to_path(file));
         CompilerHost::fs(self).chtimes(file, None, m_time)
     }
 

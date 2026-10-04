@@ -884,6 +884,11 @@ impl Orchestrator {
         let testing = self.opts.testing.is_some();
         let paths: Vec<Path> = order.iter().map(|c| self.to_path(c)).collect();
         let pool = self.prefetch_pool.borrow_mut().take();
+        self.host
+            .written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         if !clean {
             *self.build_info_prefetch.borrow_mut() = self.start_build_info_prefetch(&paths, pool);
         }
@@ -1034,6 +1039,11 @@ impl Orchestrator {
         for path in &paths {
             self.get_task(path).borrow_mut().drop_status_prefetch();
         }
+        self.host
+            .written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     // Go: build/orchestrator.go:959 (*Orchestrator).buildOrCleanProject,
@@ -1093,8 +1103,10 @@ impl Orchestrator {
     /// info), a file system other than the OS one (tests), or no `pool` and
     /// fewer than two files. A solution (Go `upToDateStatusTypeSolution`) and a task
     /// that keeps the build info of an earlier cycle (watch) read nothing.
-    /// A build info file that two tasks name is left out, so no task of the
-    /// build writes a prefetched file before its task reads it. Names are
+    /// A build info file that two tasks name is left out, so no other task
+    /// writes it as its build info. Another task can write it as an
+    /// ordinary output: then the check reads it again
+    /// (`read_build_info_file`). Names are
     /// compared by key (`PathKeys::build_info_key`, as `outputs_overlap`
     /// does), so two names of one file through a symbolic link, even one
     /// that does not resolve before the build writes the file, are one file.
@@ -1317,13 +1329,17 @@ impl BuildTaskOrchestrator for Orchestrator {
         self.host.store_m_time(file, Some(m_time));
     }
 
+    // PORT: when a task of this build wrote the build info file after the
+    // prefetch (another project's output with this name), the check reads
+    // it again, as Go reads it in the check (`BuildHost::written`).
     fn read_build_info_file(&self, config: &ParsedCommandLine) -> Option<Rc<BuildInfo>> {
         let name = config.get_build_info_file_name();
         let prefetched = self
             .build_info_prefetch
             .borrow_mut()
             .as_mut()
-            .and_then(|prefetch| prefetch.take(&name));
+            .and_then(|prefetch| prefetch.take(&name))
+            .filter(|_| !self.host.was_written(&self.to_path(&name)));
         if let Some((build_info, status_prefetch)) = prefetched {
             *self.status_prefetch.borrow_mut() = status_prefetch.map(|status| (name, status));
             return build_info.map(Rc::new);
@@ -1367,11 +1383,13 @@ impl BuildTaskOrchestrator for Orchestrator {
 /// After the parse, the thread does the other parts of the check that need
 /// no task state (`StatusPrefetch`): the root info reader, the paths of the
 /// file names, and the mtimes of the task's TypeScript sources that are not
-/// declaration files, the root files and the files of the build info. No
-/// task of a build writes such a file, so the mtime is the one that the
-/// check would read later. A build info file
-/// is read for one task only (`start_build_info_prefetch`), so no task
-/// writes it before its task's check takes the read.
+/// declaration files, the root files and the files of the build info. A
+/// task of a build most often writes no such file, so the mtime is the one
+/// that the check would read later; `StatusPrefetch::read_m_times` names
+/// the exceptions and how the check reads those files again. A build info
+/// file is read for one task only (`start_build_info_prefetch`), so no
+/// other task writes it as its build info. When another task writes it as
+/// an ordinary output, the check reads it again (`read_build_info_file`).
 struct BuildInfoPrefetch {
     slots: FxHashMap<String, Arc<BuildInfoSlot>>,
 }
