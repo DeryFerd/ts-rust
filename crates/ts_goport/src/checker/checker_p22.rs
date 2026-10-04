@@ -58,7 +58,10 @@ impl Checker {
             if object_flags.intersects(ObjectFlags::CLASS_OR_INTERFACE | ObjectFlags::REFERENCE) {
                 // Go: checker/checker.go:19903 getTargetType
                 let (target, target_ty) = if object_flags.intersects(ObjectFlags::REFERENCE) {
-                    // A generic class or interface is its own target.
+                    // A class or interface with `Reference` is its own
+                    // target: a generic one, and also a non-generic class or
+                    // an interface that is not thisless (Go
+                    // `getDeclaredTypeOfClassOrInterface`, checker.go:17652).
                     // PERF: its target without the `Type::target` dispatch.
                     let target = match &ty.data {
                         TypeData::Interface(data) => data.reference.object.target,

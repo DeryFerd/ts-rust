@@ -2081,10 +2081,9 @@ impl LanguageService {
             // PORT: on Go bytes, as `get_ambient_module_completions`.
             if go_has_prefix(name, fragment) {
                 let mut name = tspath::remove_trailing_directory_separator(name).to_string();
-                if !fragment_directory.is_empty()
-                    && let Some(rest) = name.strip_prefix(fragment_directory.as_str())
-                {
-                    name = rest.to_string();
+                // Go: strings.TrimPrefix, on Go bytes.
+                if !fragment_directory.is_empty() && go_has_prefix(&name, &fragment_directory) {
+                    name = go_slice(&name, go_len(&fragment_directory), go_len(&name)).into_owned();
                 }
                 return vec![ModuleCompletionNameAndKind {
                     name,
@@ -2110,10 +2109,13 @@ impl LanguageService {
         let star_index = parsed_path.star_index as usize;
         let path_prefix = &parsed_path.text[..star_index];
         let path_suffix = &parsed_path.text[star_index + 1..];
-        if !fragment.starts_with(path_prefix) {
+        // PORT: the prefix checks and cuts below are on Go bytes, as
+        // `get_ambient_module_completions`: a `paths` key keeps the raw bytes
+        // of its tsconfig text, so its prefix can end inside a char that the
+        // fragment has whole.
+        if !go_has_prefix(fragment, path_prefix) {
             // Fragment doesn't match the path mapping prefix at all:
             // we cannot extend it via this path.
-            // PORT: on Go bytes, as `get_ambient_module_completions`.
             if !go_has_prefix(path_prefix, fragment) {
                 return Vec::new();
             }
@@ -2126,10 +2128,12 @@ impl LanguageService {
                 );
             }
             // If path is e.g. `foo/bar/*`, and fragment is `foo/b`, then remaining directory prefix is `bar/`,
-            // PORT: Go `pathPrefix[len(fragmentDirectory):]` cuts bytes; see the file header.
-            let remaining_directory_prefix =
-                String::from_utf8_lossy(&path_prefix.as_bytes()[fragment_directory.len()..])
-                    .into_owned();
+            let remaining_directory_prefix = go_slice(
+                path_prefix,
+                go_len(&fragment_directory),
+                go_len(path_prefix),
+            )
+            .into_owned();
             let mut completions = Vec::new();
             for pattern in patterns {
                 let mut modules = self.get_modules_for_paths_pattern(
@@ -2153,19 +2157,21 @@ impl LanguageService {
             }
             return completions;
         }
-        let remaining_fragment = &fragment[path_prefix.len()..];
+        let remaining_fragment = go_slice(fragment, go_len(path_prefix), go_len(fragment));
         let mut remaining_directory_fragment = String::new();
-        if !fragment_directory.starts_with(path_prefix) {
-            // PORT: Go `pathPrefix[len(fragmentDirectory):]` cuts bytes; see the file header.
-            remaining_directory_fragment =
-                String::from_utf8_lossy(&path_prefix.as_bytes()[fragment_directory.len()..])
-                    .into_owned();
+        if !go_has_prefix(&fragment_directory, path_prefix) {
+            remaining_directory_fragment = go_slice(
+                path_prefix,
+                go_len(&fragment_directory),
+                go_len(path_prefix),
+            )
+            .into_owned();
         }
         // Go: core.FlatMap
         let mut result = Vec::new();
         for pattern in patterns {
             let mut modules = self.get_modules_for_paths_pattern(
-                remaining_fragment,
+                &remaining_fragment,
                 package_directory,
                 pattern,
                 is_exports,
