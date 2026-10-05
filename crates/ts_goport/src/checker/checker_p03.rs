@@ -315,15 +315,19 @@ impl Checker {
             }
         }
 
+        // PERF: chkport1 item 9. Go reads `node.Kind` as a plain field; here
+        // it is an AST store read, so it is read once for the unreachable
+        // test and the switch.
+        let kind = node.kind();
         if !self.within_unreachable_code
             && self.compiler_options.allow_unreachable_code != Tristate::True
         {
-            if self.check_source_element_unreachable(node) {
+            if self.check_source_element_unreachable(node, kind) {
                 self.within_unreachable_code = true;
             }
         }
 
-        match node.kind() {
+        match kind {
             SyntaxKind::TypeParameter => self.check_type_parameter(node),
             SyntaxKind::Parameter => self.check_parameter(node),
             SyntaxKind::PropertyDeclaration => self.check_property_declaration(node),
@@ -501,12 +505,17 @@ impl Checker {
     }
 
     // Go: checker/checker.go:2433 checkSourceElementUnreachable
-    pub fn check_source_element_unreachable(&mut self, node: Node) -> bool {
-        if !is_potentially_executable_node(node) {
+    // PERF: chkport1 item 9. `kind` is `node.Kind`, read once by the caller
+    // (`is_potentially_executable_kind`). The reported set is empty in most
+    // programs, so its hash lookup is skipped while it is empty.
+    pub fn check_source_element_unreachable(&mut self, node: Node, kind: SyntaxKind) -> bool {
+        if !is_potentially_executable_kind(node, kind) {
             return false;
         }
 
-        if self.reported_unreachable_nodes.contains(&node) {
+        if !self.reported_unreachable_nodes.is_empty()
+            && self.reported_unreachable_nodes.contains(&node)
+        {
             return true;
         }
 
@@ -534,7 +543,7 @@ impl Checker {
                 let mut last = offset;
                 for i in (offset + 1)..statements.len() {
                     let next_node = statements[i];
-                    if !is_potentially_executable_node(next_node)
+                    if !is_potentially_executable_kind(next_node, next_node.kind())
                         || !self.is_source_element_unreachable(next_node)
                     {
                         break;
@@ -1448,4 +1457,31 @@ impl Checker {
         self.check_source_element(node.body());
         self.set_node_links_for_private_identifier_scope(node);
     }
+}
+
+// Go: ast/utilities.go:4271 IsPotentiallyExecutableNode
+/// `is_potentially_executable_node(node)` with `kind`, the kind of `node`
+/// that the caller read.
+// PERF: chkport1 item 9. The ast function reads the kind up to five times.
+fn is_potentially_executable_kind(node: Node, kind: SyntaxKind) -> bool {
+    if (SyntaxKind::FIRST_STATEMENT as u16) <= (kind as u16)
+        && (kind as u16) <= (SyntaxKind::LAST_STATEMENT as u16)
+    {
+        if kind == SyntaxKind::VariableStatement {
+            let declaration_list = node.declaration_list();
+            if get_combined_node_flags(declaration_list).intersects(NodeFlags::BLOCK_SCOPED) {
+                return true;
+            }
+            return declaration_list
+                .declarations()
+                .nodes()
+                .iter()
+                .any(|d| d.initializer().is_some());
+        }
+        return true;
+    }
+    matches!(
+        kind,
+        SyntaxKind::ClassDeclaration | SyntaxKind::EnumDeclaration | SyntaxKind::ModuleDeclaration
+    )
 }

@@ -75,6 +75,13 @@ impl TscExtendedConfigCache {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SourceFileCacheKey(pub SourceFileParseOptions);
 
+/// PORT: not in Go. A parse that `BuildHost::watch_source_file` keeps, and
+/// the modification time of its file at the parse.
+pub struct WatchSource {
+    file: Rc<ParsedSourceFile>,
+    mod_time: Option<std::time::SystemTime>,
+}
+
 impl Hash for SourceFileCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.file_name.hash(state);
@@ -206,6 +213,16 @@ pub struct BuildHost {
     // graph ahead of `get_resolved_project_reference` (config_prefetch.rs),
     // until the graph is made.
     pub config_prefetch: RefCell<Option<PrefetchPool>>,
+    // PORT: not in Go (`CompilerHost::prefetch_parses`). False in the watch
+    // cycles after the first (set by `Orchestrator::watch`): they take most
+    // files from `watch_sources`, and a parse worker's parse keeps its nodes
+    // in the worker's AST arena, so a worker parse of a kept file would
+    // leak them, and so would a freeable file version of a worker parse.
+    pub prefetch: std::cell::Cell<bool>,
+    // PORT: not in Go (`watch_source_file`). The parses of the source files
+    // (not `.d.ts` or `.json`) in `tsc -b --watch`, with the modification
+    // time of each file at its parse. `None` outside watch mode.
+    pub watch_sources: RefCell<Option<FxHashMap<SourceFileCacheKey, WatchSource>>>,
     // PORT: Go `*collections.SyncMap`. The task `writeFile` stores into it
     // from the checker threads.
     pub m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
@@ -287,8 +304,88 @@ impl BuildHost {
             config_times: RefCell::new(FxHashMap::default()),
             resolved_references: ParseCache::default(),
             config_prefetch: RefCell::new(None),
+            prefetch: std::cell::Cell::new(true),
+            watch_sources: RefCell::new(None),
             m_times: Arc::default(),
             written: Arc::default(),
+        }
+    }
+
+    /// PORT: not in Go (memory and time). In `tsc -b --watch` a file keeps
+    /// its parse while its modification time does not change, no watch
+    /// event names it and no build of this cycle wrote it, as Go
+    /// `tsc --watch` keeps its files (execute/watcher.go `sourceFileCache`).
+    /// Go parses every file of each project that it builds again in each
+    /// cycle (`resetCaches`, and `sourceFiles` keeps the `.d.ts` and `.json`
+    /// files of one cycle). Here each such parse is a new file version, and
+    /// with parse workers off after the first build (`prefetch`) the parses
+    /// of a cycle ran on one thread (query-persist-client-core rebuilds took
+    /// 2.7 times as long). A parse of the same text with the same options is
+    /// the same file, so the output does not change. A bundled lib never
+    /// changes. `shared` is a `.d.ts` or `.json` file (see `get_source_file`).
+    fn watch_source_file(
+        &self,
+        opts: &SourceFileParseOptions,
+        shared: bool,
+    ) -> Option<Rc<ParsedSourceFile>> {
+        let key = SourceFileCacheKey(opts.clone());
+        let fixed = crate::frontend::bundled::is_bundled(&opts.file_name);
+        // The OS file system, not the one this cycle caches: a build of this
+        // cycle can write the file after a lookup of it.
+        let mod_time = if fixed {
+            None
+        } else {
+            self.sys
+                .fs()
+                .stat(&opts.file_name)
+                .and_then(|info| info.mod_time())
+        };
+        let keep = fixed || (mod_time.is_some() && !self.written.contains(&opts.path));
+        let cached = self
+            .watch_sources
+            .borrow()
+            .as_ref()
+            .and_then(|sources| sources.get(&key))
+            .filter(|source| keep && source.mod_time == mod_time)
+            .map(|source| source.file.clone());
+        if cached.is_some() {
+            return cached;
+        }
+        let file = self.host.get_source_file(opts);
+        if shared {
+            // See the note in `get_source_file`.
+            if let Some(file) = &file {
+                crate::program::note_parsed_source_file(file);
+            }
+        }
+        if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
+            match &file {
+                Some(file) if fixed || mod_time.is_some() => {
+                    sources.insert(
+                        key,
+                        WatchSource {
+                            file: file.clone(),
+                            mod_time,
+                        },
+                    );
+                }
+                _ => {
+                    sources.remove(&key);
+                }
+            }
+        }
+        file
+    }
+
+    /// PORT: not in Go (`watch_source_file`). Drops the kept parses of the
+    /// files at `paths` (the paths of a cycle's watch events), or every
+    /// kept parse when `paths` is `None` (an overflow or a config change).
+    pub fn evict_watch_sources(&self, paths: Option<&FxHashSet<Path>>) {
+        if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
+            match paths {
+                Some(paths) => sources.retain(|key, _| !paths.contains(&key.0.path)),
+                None => sources.clear(),
+            }
         }
     }
 
@@ -461,11 +558,19 @@ impl CompilerHost for BuildHost {
         );
     }
 
+    // PORT: not in Go (see `BuildHost::prefetch`).
+    fn prefetch_parses(&self) -> bool {
+        self.prefetch.get()
+    }
+
     // Go: build/host.go:54 (*host).GetSourceFile
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
-        if is_declaration_file_name(&opts.file_name)
-            || file_extension_is(&opts.file_name, EXTENSION_JSON)
-        {
+        let shared = is_declaration_file_name(&opts.file_name)
+            || file_extension_is(&opts.file_name, EXTENSION_JSON);
+        if self.watch_sources.borrow().is_some() {
+            return self.watch_source_file(opts, shared);
+        }
+        if shared {
             // Cache dts and json files as they will be reused
             // PORT: a parse that the cache keeps can be left out of one
             // program (a deduplicated package, or a file that only such a
@@ -520,7 +625,7 @@ impl CompilerHost for BuildHost {
     fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<FileRefs>> {
         let mut refs = FxHashMap::default();
         let mut memo = self.cached_refs.borrow_mut();
-        self.source_files.for_each_stored(|key, file| {
+        let mut add = |key: &SourceFileCacheKey, file: &Rc<ParsedSourceFile>| {
             let (parse, file_refs) = memo
                 .entry(key.0.file_name.clone())
                 .or_insert_with(|| (Rc::downgrade(file), Arc::new(FileRefs::of_file(file))));
@@ -529,7 +634,20 @@ impl CompilerHost for BuildHost {
                 *file_refs = Arc::new(FileRefs::of_file(file));
             }
             refs.insert(key.0.file_name.clone(), file_refs.clone());
-        });
+        };
+        self.source_files.for_each_stored(&mut add);
+        // `tsc -b --watch` keeps its files in `watch_sources`. Only its
+        // first build parses ahead, so only its `.d.ts` and `.json` files
+        // can be in another program of that build.
+        if let Some(sources) = self.watch_sources.borrow().as_ref() {
+            for (key, source) in sources {
+                if is_declaration_file_name(&key.0.file_name)
+                    || file_extension_is(&key.0.file_name, EXTENSION_JSON)
+                {
+                    add(key, &source.file);
+                }
+            }
+        }
         refs
     }
 
@@ -660,6 +778,11 @@ impl CompilerHost for BuildCompilerHost {
     // Go: build/compilerHost.go:37 (*compilerHost).GetSourceFile
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
         self.host.get_source_file(opts)
+    }
+
+    // PORT: not in Go (see `BuildHost::prefetch`).
+    fn prefetch_parses(&self) -> bool {
+        self.host.prefetch_parses()
     }
 
     // Go: build/compilerHost.go:41 (*compilerHost).GetContentMappedSourceFiles (tsgo#4712)

@@ -1185,12 +1185,19 @@ pub fn get_sort_order_flags(t: &Type) -> i64 {
 impl Checker {
     // Go: checker/utilities.go:632 compareTypeNames
     // PERF: chkA. It takes the two types as `compare_types` read them from
-    // the arena.
+    // the arena. unionfn1: inlined into `compare_types`, its one caller.
+    #[inline(always)]
     pub fn compare_type_names_of(&self, ty1: &Type, ty2: &Type) -> i32 {
         let s1 = type_name_symbol(ty1);
         let s2 = type_name_symbol(ty2);
         if s1 == s2 {
-            return self.compare_type_lists(ty1.alias.type_arguments(), ty2.alias.type_arguments());
+            let (a1, a2) = (ty1.alias.type_arguments(), ty2.alias.type_arguments());
+            // PERF: unionfn1. Two empty lists compare as 0 (`compare_type_lists`).
+            // Unnamed types (both symbols nil) take this branch, so skip the call.
+            if a1.is_empty() && a2.is_empty() {
+                return 0;
+            }
+            return self.compare_type_lists(a1, a2);
         }
         if s1.is_nil() {
             return 1;
@@ -1299,8 +1306,12 @@ impl Checker {
         if s1.len() != s2.len() {
             return s1.len() as i32 - s2.len() as i32;
         }
-        for (i, &t1) in s1.iter().enumerate() {
-            let c = self.compare_types(t1, s2[i]);
+        for (&t1, &t2) in s1.iter().zip(s2) {
+            // PERF: unionfn1. `compare_types` of a type and itself is 0.
+            if t1 == t2 {
+                continue;
+            }
+            let c = self.compare_types(t1, t2);
             if c != 0 {
                 return c;
             }

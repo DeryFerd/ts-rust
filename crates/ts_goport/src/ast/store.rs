@@ -1590,9 +1590,9 @@ struct BlockPool {
     /// The given-back blocks with the pin epoch from which they are free,
     /// in the order they came back (the epochs only grow).
     quarantine: VecDeque<(usize, PoolBlock)>,
-    /// The kind columns of the last `RECENT_KINDS` node shells, newest
-    /// first (`shell_kinds`).
-    recent_kinds: VecDeque<&'static [SyntaxKind]>,
+    /// Each kind column that `shell_kinds` leaked, by the hash of its
+    /// kinds.
+    kind_columns: FxHashMap<u64, Vec<&'static [SyntaxKind]>>,
 }
 
 /// The number of program releases a given-back block waits
@@ -1605,29 +1605,33 @@ const QUARANTINE_RELEASES: usize = 2;
 static POOL: Mutex<BlockPool> = Mutex::new(BlockPool {
     free: Vec::new(),
     quarantine: VecDeque::new(),
-    recent_kinds: VecDeque::new(),
+    kind_columns: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
 });
 
-/// The number of kind columns `shell_kinds` compares.
-const RECENT_KINDS: usize = 4;
-
-/// The kind column of a node shell whose store has kinds `kinds`: a column
-/// of one of the last `RECENT_KINDS` shells when it is equal (a column
-/// never changes, so shells can share it), else `kinds`, leaked. An edit
-/// inside a token or a literal keeps every kind of the file, so its shell
-/// leaks no column. A column is 2 bytes per slot; a pooled block cannot
-/// hold it (`NodeRecord`).
+/// The kind column of a node shell whose store has kinds `kinds`: an equal
+/// column that an earlier shell leaked (a column never changes, so shells
+/// can share it), else `kinds`, leaked. An edit inside a token or a literal
+/// keeps every kind of the file, and a file parsed again with the same text
+/// (a `tsc --watch` build after a config change) has the same kinds, so
+/// their shells leak no column. A column is 2 bytes per slot; a pooled
+/// block cannot hold it (`NodeRecord`).
+// PERF: watchfree1. The last 4 columns were kept before, so a config
+// change in `tsc --watch` leaked a column for each file (0.54 MiB per
+// change on query-core). A column is hashed and compared once, about the
+// cost of the compare with the last column before.
 fn shell_kinds(kinds: Vec<SyntaxKind>) -> &'static [SyntaxKind] {
+    let hash = {
+        let mut hasher = rustc_hash::FxHasher::default();
+        std::hash::Hash::hash(kinds.as_slice(), &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    };
     let mut pool = lock_pool();
-    let recent = &mut pool.recent_kinds;
-    if let Some(i) = recent.iter().position(|column| **column == *kinds) {
-        let column = recent.remove(i).expect("a recent kind column");
-        recent.push_front(column);
+    let columns = pool.kind_columns.entry(hash).or_default();
+    if let Some(column) = columns.iter().find(|column| ***column == *kinds) {
         return column;
     }
     let column: &'static [SyntaxKind] = Vec::leak(kinds);
-    recent.push_front(column);
-    recent.truncate(RECENT_KINDS);
+    columns.push(column);
     column
 }
 
@@ -1692,7 +1696,7 @@ fn clear_block_pool() {
     let mut pool = lock_pool();
     pool.free.clear();
     pool.quarantine.clear();
-    pool.recent_kinds.clear();
+    pool.kind_columns.clear();
 }
 
 /// Test hook (AST node records, step 4): the address of the records of the
@@ -2121,9 +2125,10 @@ thread_local! {
 /// owned nodes on (`owned_nodes_enabled`) the stores that
 /// `new_file_store` makes until the scope ends own their astdata nodes,
 /// pending lists and parse lists (`OwnedAst`), so they are freed with the
-/// store, not leaked in the AST arena. The language server parse cache
-/// opens it for a new version of a published path (`ast::freeable_path`),
-/// the version that gets a `FileVersion`.
+/// store, not leaked in the AST arena. The language server parse cache and
+/// the compiler host (`tsc --watch`, `goport_multiprog`) open it for a new
+/// version of a published path (`ast::freeable_path`), the version that
+/// gets a `FileVersion`.
 // PORT: Go nodes are heap objects that the GC frees with their file. A
 // static parse keeps its nodes in the leaked AST arena, so its node reads
 // stay `'static`.
@@ -2138,10 +2143,11 @@ pub fn enter_freeable_parse() -> FreeableParseScope {
 /// True when a freeable parse owns its nodes (lsshells M3c). Off, it is a
 /// static parse (its nodes stay in the leaked AST arena, and its node shell
 /// has a node column), as before M3c. `GOPORT_OWNED_NODES` is read once:
-/// `0` is off, `1` is on; else it is on in a language server or API process
-/// only (`ast::set_editor_process`), where the freeable versions are. A CLI
-/// process makes freeable parses only with `GOPORT_FREE_FILE_VERSIONS=1`
-/// (`goport_multiprog`), and they stay static there by default.
+/// `0` is off, `1` is on; else it is on in a language server, API or
+/// `tsc --watch` process only (`ast::frees_file_versions_by_default`),
+/// where the freeable versions are. Another CLI process makes freeable
+/// parses only with `GOPORT_FREE_FILE_VERSIONS=1` (`goport_multiprog`), and
+/// they stay static there by default.
 // PERF: on by default since lsshells M3g (root decision
 // m3-owned-default-2026-09-29). Only with it on do 1000-edit sessions pass
 // memory (M3f, mini-abf9: effect 0.46 MiB/edit and +480 MiB, off 1.23 and
@@ -2162,7 +2168,7 @@ fn owned_nodes_enabled() -> bool {
         Ok("1") => Some(true),
         _ => None,
     });
-    flag.unwrap_or_else(crate::ast::is_editor_process)
+    flag.unwrap_or_else(crate::ast::frees_file_versions_by_default)
 }
 
 /// `enter_freeable_parse` with owned nodes on, whatever the flag, for the
@@ -7227,5 +7233,47 @@ mod tests {
         assert!([d_block, d1_block].contains(&addr(g_nodes[0])));
         assert_eq!(g_nodes[0].kind(), SyntaxKind::Identifier);
         drop((e, f, g));
+    }
+
+    // watchfree1: a node shell shares the kind column of any earlier shell
+    // with equal kinds, not only of the last few (`shell_kinds`): a
+    // `tsc --watch` build after a config change parses every file again.
+    // It publishes, so no other test may build or publish stores while it
+    // runs (the runner uses one thread).
+    #[test]
+    fn node_shells_share_any_equal_kind_column() {
+        use super::super::file_version::FileVersion;
+        // Publishes a freeable version of `count` identifiers, and gives
+        // the address of its kind column.
+        let column = |count: usize| {
+            let names: Vec<String> = (0..count).map(|i| format!("n{i}")).collect();
+            let text: &'static str = Box::leak(names.join(";").into_boxed_str());
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let name: &'static str = Box::leak(format!("/kinds/{id}.ts").into_boxed_str());
+            let file = new_file_store(name, text);
+            let factory = NodeFactory::for_file(file);
+            let node = names
+                .iter()
+                .map(|n| factory.new_identifier(n.as_str()))
+                .last()
+                .expect("one name");
+            freeze_file_store(file);
+            let version = FileVersion::new(file);
+            crate::program::publish_parsed_files("/");
+            let kinds = registry_block(node.file_index())
+                .expect("a published store node")
+                .kinds
+                .as_ptr();
+            (version, kinds)
+        };
+        let (_first, first) = column(1);
+        let others: Vec<_> = (2..9).map(column).collect();
+        assert!(
+            others.iter().all(|(_, kinds)| *kinds != first),
+            "other kinds, other columns"
+        );
+        let (_again, again) = column(1);
+        assert_eq!(again, first, "equal kinds share the first column");
     }
 }

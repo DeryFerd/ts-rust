@@ -232,7 +232,7 @@ impl ToBuildInfo<'_> {
                     pos,
                     end,
                     code: d.code(),
-                    category: d.category() as i32,
+                    category: d.category().0,
                     source: d.source().to_string(),
                     message_text: d.message_text().to_string(),
                     message_key: d.message_key().to_string(),

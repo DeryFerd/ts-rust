@@ -996,7 +996,7 @@ impl Encoder {
             self.u32(diagnostic.pos as u32);
             self.u32(diagnostic.end as u32);
             self.u32(diagnostic.code as u32);
-            self.u8(diagnostic.category as u8);
+            self.u8(diagnostic.category.0 as u8);
             let key = diagnostic.message.key();
             if crate::diagnostics::message_by_key(key) != Some(diagnostic.message) {
                 return Err(format!("message key {key} does not find its message"));

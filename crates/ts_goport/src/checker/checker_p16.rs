@@ -716,12 +716,23 @@ impl Checker {
     }
 
     // Go: checker/checker.go:14636 getLateBoundSymbol
+    // PERF: chkport1 item 7. Most calls take the early exit. It reads the
+    // symbol once and compares the name by id (`COMPUTED_NAME`), and it is
+    // inlined: the rest is out of line (`get_late_bound_symbol_slow`), so
+    // the exit saves and restores no registers.
+    #[inline]
     pub fn get_late_bound_symbol(&mut self, symbol: SymbolId) -> SymbolId {
-        if !self.sym(symbol).flags.intersects(SymbolFlags::CLASS_MEMBER)
-            || self.sym(symbol).name != INTERNAL_SYMBOL_NAME_COMPUTED
-        {
+        let s = self.sym(symbol);
+        if !s.flags.intersects(SymbolFlags::CLASS_MEMBER) || s.name != *COMPUTED_NAME {
             return symbol;
         }
+        self.get_late_bound_symbol_slow(symbol)
+    }
+
+    /// `get_late_bound_symbol` after the early exit: `symbol` is a class
+    /// member named `INTERNAL_SYMBOL_NAME_COMPUTED`.
+    #[inline(never)]
+    fn get_late_bound_symbol_slow(&mut self, symbol: SymbolId) -> SymbolId {
         if self.late_bound_links.get(symbol).late_symbol.is_nil() {
             let declarations = self.sym(symbol).declarations.clone();
             let mut has_late_bindable = false;
@@ -1694,3 +1705,8 @@ fn tspath_get_base_file_name(path: &str) -> &str {
         None => trimmed,
     }
 }
+
+/// `INTERNAL_SYMBOL_NAME_COMPUTED` as a `Name`, so `get_late_bound_symbol`
+/// compares ids and does not read the name text.
+static COMPUTED_NAME: std::sync::LazyLock<Name> =
+    std::sync::LazyLock::new(|| Name::from(INTERNAL_SYMBOL_NAME_COMPUTED));

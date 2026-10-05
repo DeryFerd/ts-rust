@@ -9,7 +9,7 @@
 use crate::project::logging::prelude::*;
 use std::cell::Cell;
 use std::io::Write;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 // Go: project/logging/logger.go:10 Logger
 pub trait Logger {
@@ -139,30 +139,32 @@ pub fn format_time(t: SystemTime) -> String {
     format!("[{}]", format_clock_millis(t))
 }
 
-// PORT: Go `t.Format("15:04:05.000")`: two-digit hour, minute and second,
-// then milliseconds, truncated (not rounded). Go prints the local time zone.
-// The crate has no time zone database (no dependency may be added), so the
-// port prints UTC; log text is not compared by the oracle.
+/// Go `t.Format("15:04:05.000")` of a Go `time.Now()`, which is in
+/// `time.Local` (the local time zone, from `TZ` or `/etc/localtime`).
 pub fn format_clock_millis(t: SystemTime) -> String {
-    let (secs, nanos): (i64, u32) = match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
-        Err(e) => {
-            let d = e.duration();
-            let mut secs = -(d.as_secs() as i64);
-            let mut nanos = d.subsec_nanos();
-            if nanos > 0 {
-                secs -= 1;
-                nanos = 1_000_000_000 - nanos;
-            }
-            (secs, nanos)
-        }
+    format_clock_millis_in(t, crate::execute::tsc::diagnostics::local_location())
+}
+
+/// Go `t.In(zone).Format("15:04:05.000")`: two-digit hour, minute and
+/// second, then milliseconds, truncated (not rounded).
+// Go (go1.27.1, the pin N oracle toolchain): time/format.go:667
+// (Time).appendFormat, the stdHour (:747), stdZeroMinute (:765),
+// stdZeroSecond (:769) and stdFracSecond0 (:831) cases.
+// PORT: jiff converts the time to the zone's civil time (Go
+// `Time.locabs`). A time outside the jiff range (years -9999 to 9999) is
+// not ported.
+fn format_clock_millis_in(t: SystemTime, zone: &jiff::tz::TimeZone) -> String {
+    let Ok(timestamp) = jiff::Timestamp::try_from(t) else {
+        unported!("Time.Format of a time outside years -9999 to 9999");
     };
-    let day_secs = secs.rem_euclid(86_400);
-    let hour = day_secs / 3_600;
-    let minute = (day_secs % 3_600) / 60;
-    let second = day_secs % 60;
-    let millis = nanos / 1_000_000;
-    format!("{:02}:{:02}:{:02}.{:03}", hour, minute, second, millis)
+    let datetime = zone.to_datetime(timestamp);
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        datetime.hour(),
+        datetime.minute(),
+        datetime.second(),
+        datetime.subsec_nanosecond() / 1_000_000
+    )
 }
 
 // PORT: Go nil-receiver methods of `logger` (the `NewNopLogger` value).
@@ -223,5 +225,52 @@ impl Logger for Option<Rc<dyn Logger>> {
         if let Some(l) = self {
             l.set_verbose(verbose);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::logging::logcollector::{LogCollector, new_test_logger};
+
+    /// Set in the child process of `log_time_is_local_time`.
+    const CHILD_ENV: &str = "GOPORT_LOGGER_TZ_CHILD";
+    const CHILD_TEST: &str = "project::logging::logger::tests::log_time_is_local_time";
+
+    // Go: project/logging/logger.go:133 formatTime prints Go `time.Local`.
+    // Go's `NewTestLogger` (logcollector.go:23) prints its fixed time
+    // (2012-10-01 10:01:12 UTC) in `time.Local`, so with
+    // `TZ=Etc/GMT+7` (UTC-7) the line starts with `[03:01:12.000]`.
+    // `time.Local` is read once per process, so the test runs itself again
+    // with that `TZ`.
+    #[test]
+    fn log_time_is_local_time() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let logger = new_test_logger();
+            logger.log("x");
+            assert_eq!(logger.string(), "[03:01:12.000] x\n");
+            return;
+        }
+        // `/proc/self/exe` still names this binary when a build replaces it.
+        let proc_exe = std::path::Path::new("/proc/self/exe");
+        let exe = if proc_exe.exists() {
+            proc_exe.to_path_buf()
+        } else {
+            std::env::current_exe().expect("test binary")
+        };
+        let output = std::process::Command::new(exe)
+            .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads", "1"])
+            .env(CHILD_ENV, "1")
+            .env("TZ", "Etc/GMT+7")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run the child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child ({}):\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

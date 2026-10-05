@@ -2222,10 +2222,11 @@ thread_local! {
     /// M3c); their small slices stay leaked.
     static DECORATORS: RefCell<PerFileMap<NodeSlice>> = const { RefCell::new(PerFileMap::new()) };
     /// Go `CompositeBase.facts` of parsed nodes: per file (keyed by
-    /// `facts_file_key`), the cached `SubtreeFacts` of each node by its
-    /// index, with `COMPUTED` set once cached. It forgets the files of dead
-    /// file versions (`PerFileMap`, lsshells M3a). A factory node keeps its
-    /// facts in its arena slot (`synthetic_subtree_facts`).
+    /// `facts_file_key`), the cached `SubtreeFacts` of each node of a
+    /// `CompositeBase` kind (`is_composite_data`) by its index, with
+    /// `COMPUTED` set once cached. It forgets the files of dead file
+    /// versions (`PerFileMap`, lsshells M3a). A factory node keeps its facts
+    /// in its arena slot (`synthetic_subtree_facts`).
     // PERF: emitast1 F1. A column per file, not a map entry per node: no
     // hash per read and no growth rehash of a map with one entry per node.
     static SUBTREE_FACTS: RefCell<PerFileMap<Vec<SubtreeFacts>>> = const { RefCell::new(PerFileMap::new()) };
@@ -2242,10 +2243,7 @@ thread_local! {
 /// so a column never holds more than 16 MiB.
 const FACTS_COLUMN_LIMIT: usize = 1 << 22;
 
-/// The index of non-nil node `n` in its file (`SUBTREE_FACTS`). Nil wraps
-/// to the largest index, past `FACTS_COLUMN_LIMIT`: its facts are never
-/// cached, so `Node::subtree_facts` reads its data and panics with Go's nil
-/// dereference (`static_tier_ast_node`), in debug builds as in release.
+/// The index of non-nil node `n` in its file (`SUBTREE_FACTS`).
 #[inline]
 fn facts_index(n: Node) -> usize {
     (n.0 & 0xffff_ffff).wrapping_sub(1) as usize
@@ -2258,8 +2256,9 @@ fn facts_file_key(n: Node) -> Node {
     Node((n.0 & !0xffff_ffff) | 1)
 }
 
-/// The cached `Node::subtree_facts` of `n`, if any. A factory node keeps
-/// them in its arena slot (emitast1 F1), any other node in `SUBTREE_FACTS`.
+/// The cached `Node::subtree_facts` of `n`, a node of a `CompositeBase`
+/// kind, if any. A factory node keeps them in its arena slot (emitast1 F1),
+/// any other node in `SUBTREE_FACTS`.
 #[inline]
 fn cached_subtree_facts(n: Node) -> Option<SubtreeFacts> {
     if is_synthetic_node(n) {
@@ -2516,15 +2515,11 @@ impl Node {
     }
 
     // Go: ast.go:209 SubtreeFacts
-    /// Go `node.SubtreeFacts()`, cached per node like Go `CompositeBase`.
+    /// Go `node.SubtreeFacts()`: cached for a `CompositeBase` kind, computed
+    /// on each call for any other kind (`subtree_facts_with_data`).
     #[must_use]
     pub fn subtree_facts(self) -> SubtreeFacts {
-        if let Some(facts) = cached_subtree_facts(self) {
-            return facts;
-        }
-        let facts = compute_subtree_facts(self).without(SubtreeFacts::COMPUTED);
-        cache_subtree_facts(self, facts);
-        facts
+        with_data!(self, |d| subtree_facts_with_data(self, d))
     }
 
     // Go: ast.go:229 Decorators
@@ -4508,6 +4503,90 @@ fn propagate_node_list(
     facts
 }
 
+/// True for Go node types that embed `CompositeBase` (directly, or through
+/// `ClassLikeBase` or `AccessorDeclarationBase`), on the data `d` of node
+/// `n`. Go caches `SubtreeFacts()` only for these types (`ast.go:1602`).
+#[inline]
+fn is_composite_data(n: Node, d: &NodeData) -> bool {
+    match d {
+        // PORT: a PropertyDeclaration that Go parses as a PropertySignature
+        // (`is_type_syntax_data`).
+        NodeData::PropertyDeclaration(_) => n.kind() != SyntaxKind::PropertySignature,
+        NodeData::ClassDeclaration(_)
+        | NodeData::ClassExpression(_)
+        | NodeData::GetAccessorDeclaration(_)
+        | NodeData::SetAccessorDeclaration(_)
+        | NodeData::QualifiedName(_)
+        | NodeData::ComputedPropertyName(_)
+        | NodeData::Decorator(_)
+        | NodeData::IfStatement(_)
+        | NodeData::DoStatement(_)
+        | NodeData::WhileStatement(_)
+        | NodeData::ForStatement(_)
+        | NodeData::ForInOrOfStatement(_)
+        | NodeData::ReturnStatement(_)
+        | NodeData::WithStatement(_)
+        | NodeData::SwitchStatement(_)
+        | NodeData::CaseBlock(_)
+        | NodeData::CaseOrDefaultClause(_)
+        | NodeData::ThrowStatement(_)
+        | NodeData::TryStatement(_)
+        | NodeData::CatchClause(_)
+        | NodeData::Block(_)
+        | NodeData::VariableStatement(_)
+        | NodeData::VariableDeclaration(_)
+        | NodeData::VariableDeclarationList(_)
+        | NodeData::BindingPattern(_)
+        | NodeData::ParameterDeclaration(_)
+        | NodeData::BindingElement(_)
+        | NodeData::FunctionDeclaration(_)
+        | NodeData::HeritageClause(_)
+        | NodeData::EnumMember(_)
+        | NodeData::EnumDeclaration(_)
+        | NodeData::ModuleBlock(_)
+        | NodeData::ImportDeclaration(_)
+        | NodeData::NamedImports(_)
+        | NodeData::ExportAssignment(_)
+        | NodeData::NamedExports(_)
+        | NodeData::ExportSpecifier(_)
+        | NodeData::ConstructorDeclaration(_)
+        | NodeData::MethodDeclaration(_)
+        | NodeData::ClassStaticBlockDeclaration(_)
+        | NodeData::BinaryExpression(_)
+        | NodeData::ArrowFunction(_)
+        | NodeData::FunctionExpression(_)
+        | NodeData::ConditionalExpression(_)
+        | NodeData::PropertyAccessExpression(_)
+        | NodeData::ElementAccessExpression(_)
+        | NodeData::CallExpression(_)
+        | NodeData::NewExpression(_)
+        | NodeData::MetaProperty(_)
+        | NodeData::TemplateExpression(_)
+        | NodeData::TaggedTemplateExpression(_)
+        | NodeData::ArrayLiteralExpression(_)
+        | NodeData::ObjectLiteralExpression(_)
+        | NodeData::PropertyAssignment(_)
+        | NodeData::ShorthandPropertyAssignment(_)
+        | NodeData::ExpressionWithTypeArguments(_)
+        | NodeData::ImportAttribute(_)
+        | NodeData::ImportAttributes(_)
+        | NodeData::JsxElement(_)
+        | NodeData::JsxAttributes(_)
+        | NodeData::JsxNamespacedName(_)
+        | NodeData::JsxOpeningElement(_)
+        | NodeData::JsxSelfClosingElement(_)
+        | NodeData::JsxFragment(_)
+        | NodeData::JsxAttribute(_)
+        | NodeData::ModuleDeclaration(_)
+        | NodeData::ImportEqualsDeclaration(_)
+        | NodeData::ExportDeclaration(_)
+        | NodeData::ImportClause(_)
+        | NodeData::ImportSpecifier(_)
+        | NodeData::SourceFile(_) => true,
+        _ => false,
+    }
+}
+
 /// True for Go node types that embed `TypeSyntaxBase`, on the data `d` of
 /// node `n`.
 // PERF: emitast1 F2. The callers load the data once and pass it in; this
@@ -4612,9 +4691,18 @@ fn propagate_node_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
     }
 }
 
-/// Go `n.SubtreeFacts()` for node `n` whose data `d` the caller loaded:
-/// the cached facts, or the facts computed from `d` (and cached).
+// Go: ast.go:1602 (*CompositeBase).subtreeFactsWorker and ast.go:1234
+// (*NodeDefault).subtreeFactsWorker
+/// Go `n.SubtreeFacts()` for node `n` whose data `d` the caller loaded. A
+/// node of a `CompositeBase` kind gets the cached facts, or the facts
+/// computed from `d` (and cached). Any other node (a token, an identifier,
+/// a literal, type syntax) gets the facts computed from `d`, not cached.
+// PERF: factscol1a. Caching every node cost 2 thread-local map accesses per
+// node (4.9x Go's instructions in the facts walk of a 5 MB JS file).
 fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
+    if !is_composite_data(n, d) {
+        return subtree_facts_of_data(n, d);
+    }
     if let Some(facts) = cached_subtree_facts(n) {
         return facts;
     }
@@ -4627,11 +4715,7 @@ fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
 // ast_generated.go computeSubtreeFacts methods.
 // PORT: the Go per-type methods are merged into one match. Types without an
 // override use Go `(*NodeDefault).computeSubtreeFacts`, which is None.
-fn compute_subtree_facts(n: Node) -> SubtreeFacts {
-    with_data!(n, |d| subtree_facts_of_data(n, d))
-}
-
-/// `compute_subtree_facts` over the data `d` of `n`, read in place.
+/// Go `computeSubtreeFacts` over the data `d` of `n`, read in place.
 fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
     if is_type_syntax_data(n, d) {
         // Go: ast.go:1619 (*TypeSyntaxBase).computeSubtreeFacts
@@ -6460,12 +6544,53 @@ pub fn get_declaration_name(declaration: Node) -> String {
 mod tests {
     use super::*;
 
-    /// Go `(*Node)(nil).SubtreeFacts()` dereferences nil. The facts index of
-    /// nil wraps (`facts_index`), so a debug build gives the panic of a
-    /// release build, not an overflow.
+    /// Go `(*Node)(nil).SubtreeFacts()` dereferences nil. The data read of
+    /// nil panics (`static_tier_ast_node`) before any facts cache read, in a
+    /// debug build as in a release build.
     #[test]
     #[should_panic(expected = "nil node dereference")]
     fn subtree_facts_of_nil_is_a_nil_dereference() {
         let _ = Node::NIL.subtree_facts();
+    }
+
+    /// Go caches `SubtreeFacts()` only in nodes of a `CompositeBase` type
+    /// (`ast.go:1602`). Tokens, identifiers, literals and type syntax compute
+    /// their facts on each call (`ast.go:1234`), with the same values.
+    #[test]
+    fn subtree_facts_are_cached_only_for_composite_kinds() {
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+        fn collect(n: Node, out: &mut Vec<Node>) {
+            out.push(n);
+            n.for_each_child(|c| {
+                collect(c, out);
+                false
+            });
+        }
+        let text = "@dec class C { m(@p a: number = 1) { return a ?? this.b?.c; } }\n\
+            let x: string[] = [1, 2].map(y => `${y}`), z = !(-x.length);\n";
+        let opts = SourceFileParseOptions {
+            file_name: "/facts.ts".to_string(),
+            ..Default::default()
+        };
+        let root = parse_source_file(&opts, text, ScriptKind::TS).root;
+        assert!(
+            root.subtree_facts()
+                .intersects(SubtreeFacts::SUBTREE_CONTAINS_DECORATORS)
+        );
+        let mut nodes = Vec::new();
+        collect(root, &mut nodes);
+        let (mut cached, mut computed) = (0, 0);
+        for &n in &nodes {
+            let facts = n.subtree_facts();
+            assert_eq!(n.subtree_facts(), facts, "{:?}", n.kind());
+            if with_data!(n, |d| is_composite_data(n, d)) {
+                assert_eq!(cached_subtree_facts(n), Some(facts), "{:?}", n.kind());
+                cached += 1;
+            } else {
+                assert_eq!(cached_subtree_facts(n), None, "{:?}", n.kind());
+                computed += 1;
+            }
+        }
+        assert!(cached > 10 && computed > 10, "{cached} {computed}");
     }
 }

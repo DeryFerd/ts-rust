@@ -570,21 +570,20 @@ pub(crate) fn install_program(host: Rc<dyn CompilerHost>, config: Rc<ParsedComma
 }
 
 /// Go `compiler.NewProgram(compiler.ProgramOptions{Config, Host})` in a
-/// process that makes a new program for each build (watch mode). The
-/// program is a program version (`program::new_program_version`); it is
-/// not current, and the caller releases it (`program::release_program`).
-pub(crate) fn new_program_version(
+/// process that makes a new program for each build (watch mode, `tsc -b`):
+/// the frontend program. The caller marks its new parses freeable
+/// (`program::mark_freeable_parses`) and makes its program version
+/// (`program::new_program_version`), which is not current, and which the
+/// caller releases (`program::release_program`).
+pub(crate) fn new_frontend_program(
     host: Rc<dyn CompilerHost>,
     config: Rc<ParsedCommandLine>,
-) -> &'static crate::core::GoProgram {
-    let np = {
-        // The frontend parses with no current program, like the first load.
-        let _scope = crate::core::enter_program(None);
-        Rc::new(crate::frontend::compiler::new_program(program_options(
-            host, config,
-        )))
-    };
-    crate::program::new_program_version(&np, None)
+) -> Rc<NewProgram> {
+    // The frontend parses with no current program, like the first load.
+    let _scope = crate::core::enter_program(None);
+    Rc::new(crate::frontend::compiler::new_program(program_options(
+        host, config,
+    )))
 }
 
 /// The Go `compiler.ProgramOptions` of a tsc program.

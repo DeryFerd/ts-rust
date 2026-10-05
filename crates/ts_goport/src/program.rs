@@ -296,6 +296,26 @@ impl Deref for LateSourceFileInfo {
     }
 }
 
+/// The threads that join the workers of the checker pools that
+/// `shut_down_in_background` stopped, except those that had ended at the
+/// last stop (`wait_for_background_releases`).
+static BACKGROUND_STOPS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Waits until the checker workers of each program released in the
+/// background (`release_program_in_background`) have ended, so the tables
+/// and file versions that only they held are freed. A test reads the file
+/// version counts after it (`goport_watch`).
+pub fn wait_for_background_releases() {
+    let reapers = std::mem::take(
+        &mut *BACKGROUND_STOPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
+    for reaper in reapers {
+        let _ = reaper.join();
+    }
+}
+
 /// Go `checkerPool` (compiler pool). Checkers are created on first use.
 /// Each checker lives on its own worker thread; the pool holds the job
 /// queue of each worker. Only the loading thread has pools, one for each
@@ -328,10 +348,29 @@ impl CheckerPool {
     }
 
     /// `shut_down` without the wait: the workers drop their checkers, free
-    /// their synthetic nodes and end while the caller goes on. Nothing waits
-    /// for them; at process exit a worker that is still freeing just stops.
+    /// their synthetic nodes and end while the caller goes on. Only
+    /// `wait_for_background_releases` waits for them; at process exit a
+    /// worker that is still freeing just stops.
     fn shut_down_in_background(self) {
-        drop(self.stop());
+        let threads = self.stop();
+        if threads.is_empty() {
+            return;
+        }
+        // A thread joins the workers, so each worker stack is freed when the
+        // worker ends (as with a detached thread), and
+        // `wait_for_background_releases` can wait for the joins.
+        let reaper = std::thread::spawn(move || {
+            for thread in threads {
+                // A job panic stays in its job result, so a worker ends
+                // normally.
+                let _ = thread.join();
+            }
+        });
+        let mut reapers = BACKGROUND_STOPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        reapers.retain(|reaper| !reaper.is_finished());
+        reapers.push(reaper);
     }
 
     /// Sends each worker the job that drops its checker and frees its
@@ -2425,7 +2464,7 @@ pub fn try_load_version(
 /// parsed again. `old` stays usable. Loading thread only. With
 /// `GOPORT_FREE_FILE_VERSIONS=1`, each new parse of a path that was
 /// published before is a freeable file version (lsshells M3b), as in the
-/// language server.
+/// language server and `tsc --watch`.
 pub fn update_program_version(
     old: &'static GoProgram,
     changed_file: &str,
@@ -2447,6 +2486,16 @@ pub fn new_program_version(
     previous: Option<&'static GoProgram>,
 ) -> &'static GoProgram {
     go_frontend::new_program_version(np, previous)
+}
+
+/// Gives each new parse of `np` of a path that this thread published
+/// before a `FileVersion` (`ast::freeable_path`), so the publish of its
+/// program version makes it a freeable file version, freed with its last
+/// holder (`ast/file_version.rs`). Call it on the loading thread before
+/// `new_program_version(np, ..)`. Does nothing while
+/// `ast::free_file_versions` is off. `tsc --watch` calls it for each build.
+pub(crate) fn mark_freeable_parses(np: &crate::frontend::compiler::NewProgram) {
+    go_frontend::mark_freeable_parses(np);
 }
 
 /// Records a source file that this thread parsed outside a program load

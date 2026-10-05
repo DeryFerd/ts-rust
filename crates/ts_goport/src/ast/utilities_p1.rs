@@ -506,6 +506,85 @@ pub fn is_compound_assignment(token: SyntaxKind) -> bool {
         && (token as u16) <= (SyntaxKind::LAST_COMPOUND_ASSIGNMENT as u16)
 }
 
+/// The fields of a BinaryExpression, read once: Go `node.AsBinaryExpression()`
+/// and its fields, plus `OperatorToken.Kind`. The binder reads them through
+/// this view (`Binder::binary_view`) in `bind` and passes it on.
+// PERF: binderview1 (cliperf1 rank 4a). Each accessor read (`left`,
+// `operator_token`, `right`, `type_`) looks the node up again: about 45
+// instructions and 2 file block lookups, and the binder made about 7
+// `operator_token` reads per BinaryExpression. A view loads the node data
+// once and resolves the child ids with no lookup (`FrozenIds`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BinaryView {
+    pub left: Node,
+    pub operator_token: Node,
+    /// Go `OperatorToken.Kind`.
+    pub operator: SyntaxKind,
+    pub right: Node,
+    pub type_: Node,
+}
+
+impl BinaryView {
+    /// The view of BinaryExpression `node`. `ids` is `frozen_store_ids` of
+    /// the file of `node` (a caller that reads many nodes of one file reads
+    /// it once). A node with no published data (synthetic, unpublished or
+    /// of a freeable file version), or no `ids`, reads each field with its
+    /// accessor. Panics as the accessors do when `node` is no
+    /// BinaryExpression.
+    #[inline]
+    #[must_use]
+    pub fn with_ids(node: Node, ids: Option<FrozenIds>) -> Self {
+        let view = match (frozen_store_ast_node(node), ids) {
+            (Some(crate::astdata::NodeData::BinaryExpression(d)), Some(ids)) => {
+                let operator_token = ids.node(d.operator_token);
+                BinaryView {
+                    left: ids.node(d.left),
+                    operator_token,
+                    operator: operator_token.kind(),
+                    right: ids.node(d.right),
+                    type_: d.type_.map_or(Node::NIL, |id| ids.node(id)),
+                }
+            }
+            _ => Self::read(node),
+        };
+        debug_assert_eq!(view, Self::read(node), "binary view of {node:?}");
+        view
+    }
+
+    /// `with_ids` with the ids of the file of `node`.
+    #[inline]
+    #[must_use]
+    pub fn new(node: Node) -> Self {
+        Self::with_ids(node, frozen_store_ids(node.file_index()))
+    }
+
+    /// The view from the field accessors.
+    #[cold]
+    #[inline(never)]
+    fn read(node: Node) -> Self {
+        let operator_token = node.operator_token();
+        BinaryView {
+            left: node.left(),
+            operator_token,
+            operator: operator_token.kind(),
+            right: node.right(),
+            type_: node.type_(),
+        }
+    }
+
+    /// `is_destructuring_assignment` of the node of this view. An object or
+    /// array literal is a left-hand side expression kind, so the kind test
+    /// of `left` also gives Go `IsLeftHandSideExpression(Left)`.
+    #[must_use]
+    pub fn is_destructuring_assignment(&self) -> bool {
+        self.operator == SyntaxKind::EqualsToken
+            && matches!(
+                self.left.kind(),
+                SyntaxKind::ObjectLiteralExpression | SyntaxKind::ArrayLiteralExpression
+            )
+    }
+}
+
 // Go: ast/utilities.go:116 IsAssignmentExpression
 pub fn is_assignment_expression(node: Node, exclude_compound_assignment: bool) -> bool {
     if node.kind() == SyntaxKind::BinaryExpression {
@@ -781,8 +860,14 @@ pub fn is_string_literal_like(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:331 IsStringOrNumericLiteralLike
+// PERF: binderview1. The kind is read once (see `is_access_expression`).
 pub fn is_string_or_numeric_literal_like(node: Node) -> bool {
-    is_string_literal_like(node) || is_numeric_literal(node)
+    matches!(
+        node.kind(),
+        SyntaxKind::StringLiteral
+            | SyntaxKind::NoSubstitutionTemplateLiteral
+            | SyntaxKind::NumericLiteral
+    )
 }
 
 // Go: ast/utilities.go:335 IsSignedNumericLiteral
@@ -899,7 +984,14 @@ fn is_left_hand_side_expression_kind(kind: SyntaxKind) -> bool {
 
 // Determines whether a node is a LeftHandSideExpression based only on its kind.
 // Go: ast/utilities.go:411 IsLeftHandSideExpression
+// PERF: binderview1. The kind is read once. Only a PartiallyEmittedExpression
+// is an outer expression of `OEK_PARTIALLY_EMITTED_EXPRESSIONS`, so any other
+// node is its own `SkipPartiallyEmittedExpressions`.
 pub fn is_left_hand_side_expression(node: Node) -> bool {
+    let kind = node.kind();
+    if kind != SyntaxKind::PartiallyEmittedExpression {
+        return is_left_hand_side_expression_kind(kind);
+    }
     is_left_hand_side_expression_kind(skip_partially_emitted_expressions(node).kind())
 }
 
@@ -974,9 +1066,13 @@ pub fn is_iteration_statement(node: Node, look_in_labeled_statements: bool) -> b
 
 // Determines if a node is a property or element access expression
 // Go: ast/utilities.go:479 IsAccessExpression
+// PERF: binderview1. The kind is read once: a kind read is a store lookup
+// that the compiler does not merge with a second one.
 pub fn is_access_expression(node: Node) -> bool {
-    node.kind() == SyntaxKind::PropertyAccessExpression
-        || node.kind() == SyntaxKind::ElementAccessExpression
+    matches!(
+        node.kind(),
+        SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression
+    )
 }
 
 /// A fixed set of `SyntaxKind`s, one bit per kind, built at compile time.
@@ -1437,15 +1533,24 @@ pub fn is_outer_expression(node: Node, kinds: OuterExpressionKinds) -> bool {
         SyntaxKind::PartiallyEmittedExpression => {
             return kinds.intersects(OuterExpressionKinds::OEK_PARTIALLY_EMITTED_EXPRESSIONS);
         }
-        SyntaxKind::BinaryExpression => match node.operator_token().kind() {
-            SyntaxKind::EqualsToken => {
-                return kinds.intersects(OuterExpressionKinds::OEK_ASSIGNMENTS);
+        // PERF: binderview1. With neither the assignment nor the comma bit in
+        // `kinds` the answer is false for every operator, so the operator
+        // token is not read (`skip_partially_emitted_expressions`).
+        SyntaxKind::BinaryExpression
+            if kinds.intersects(
+                OuterExpressionKinds::OEK_ASSIGNMENTS | OuterExpressionKinds::OEK_COMMA,
+            ) =>
+        {
+            match node.operator_token().kind() {
+                SyntaxKind::EqualsToken => {
+                    return kinds.intersects(OuterExpressionKinds::OEK_ASSIGNMENTS);
+                }
+                SyntaxKind::CommaToken => {
+                    return kinds.intersects(OuterExpressionKinds::OEK_COMMA);
+                }
+                _ => {}
             }
-            SyntaxKind::CommaToken => {
-                return kinds.intersects(OuterExpressionKinds::OEK_COMMA);
-            }
-            _ => {}
-        },
+        }
         _ => {}
     }
     false
@@ -1674,5 +1779,68 @@ mod symbol_id_tests {
         assert!(ids.chunks[START >> LINEAGE_ID_SHIFT].is_none());
         assert_eq!(ids.id(START - 1), kept);
         ids.id(START + LINEAGE_ID_CHUNK + 1);
+    }
+}
+
+#[cfg(test)]
+mod binary_view_tests {
+    use super::*;
+
+    /// binderview1: a `BinaryView` holds what the field accessors read:
+    /// before the publish (the accessor path), after it in an alias-free
+    /// store (`FrozenIds::Direct`) and in a store with an alias slot (a
+    /// synthetic right operand, `FrozenIds::Records`), and with no ids. It
+    /// publishes, so no other test may build or publish stores while it runs
+    /// (the runner uses one thread).
+    #[test]
+    fn binary_view_reads_what_the_accessors_read() {
+        let plain = new_file_store("/binaryview/a.ts", "x = y;");
+        let aliased = new_file_store("/binaryview/b.ts", "x + s;");
+        let make = |file: usize, operator: SyntaxKind, right: Node| {
+            let f = NodeFactory::for_file(file);
+            let left = f.new_identifier("x");
+            let operator_token = f.new_token(operator);
+            f.new_binary_expression(ModifierList::NIL, left, Node::NIL, operator_token, right)
+        };
+        let a = make(
+            plain,
+            SyntaxKind::EqualsToken,
+            NodeFactory::for_file(plain).new_identifier("y"),
+        );
+        let b = make(
+            aliased,
+            SyntaxKind::PlusToken,
+            NodeFactory::new().new_identifier("s"),
+        );
+        let check = |when: &str| {
+            for n in [a, b] {
+                let operator_token = n.operator_token();
+                let read = BinaryView {
+                    left: n.left(),
+                    operator_token,
+                    operator: operator_token.kind(),
+                    right: n.right(),
+                    type_: n.type_(),
+                };
+                assert_eq!(BinaryView::new(n), read, "{when}");
+                assert_eq!(BinaryView::with_ids(n, None), read, "{when}");
+            }
+        };
+        check("built");
+        freeze_file_store(plain);
+        freeze_file_store(aliased);
+        crate::program::publish_parsed_files("/");
+        assert!(frozen_store_ast_node(a).is_some(), "a is published");
+        assert!(matches!(
+            frozen_store_ids(plain),
+            Some(FrozenIds::Direct { .. })
+        ));
+        assert!(matches!(
+            frozen_store_ids(aliased),
+            Some(FrozenIds::Records { .. })
+        ));
+        check("published");
+        assert_eq!(BinaryView::new(a).operator, SyntaxKind::EqualsToken);
+        assert_eq!(BinaryView::new(b).operator, SyntaxKind::PlusToken);
     }
 }

@@ -609,7 +609,9 @@ fn as_new_line_kind(value: &CompilerOptionsValue) -> Option<NewLineKind> {
 // Go: tsoptions/parsinghelpers.go:570 floatOrInt32ToFlag
 // PORT: the Go type parameter `T ~int32` is the pair (`typed`, `from_i32`):
 // `typed` is Go `value.(T)` and `from_i32` is the Go conversion `T(...)`.
-// Go `value.(float64)` panics on another type; so does this port.
+// Go `value.(float64)` panics on another type; so does this port. A JSON
+// value of another type comes from a bad `.tsbuildinfo` (`"module": "x"`),
+// and the panic has Go's runtime text.
 fn float_or_int32_to_flag<T>(
     value: &CompilerOptionsValue,
     typed: fn(&CompilerOptionsValue) -> Option<T>,
@@ -618,10 +620,18 @@ fn float_or_int32_to_flag<T>(
     if let Some(v) = typed(value) {
         return v;
     }
-    match value {
-        CompilerOptionsValue::Number(f) => from_i32(*f as i32),
+    let go_type = match value {
+        CompilerOptionsValue::Number(f) => return from_i32(*f as i32),
+        CompilerOptionsValue::Nil => "nil",
+        CompilerOptionsValue::Bool(_) => "bool",
+        CompilerOptionsValue::String(_) => "string",
+        CompilerOptionsValue::List(_) | CompilerOptionsValue::NilList => "[]interface {}",
+        CompilerOptionsValue::Map(_) => "map[string]interface {}",
         _ => panic!("interface conversion: option value is not float64"),
-    }
+    };
+    go_panic(format!(
+        "interface conversion: interface {{}} is {go_type}, not float64"
+    ))
 }
 
 // Go: tsoptions/parsinghelpers.go:577 ParseWatchOptions

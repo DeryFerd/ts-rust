@@ -318,7 +318,7 @@ pub fn format_status_time(now: SystemTime) -> String {
 static LOCAL_LOC: OnceLock<jiff::tz::TimeZone> = OnceLock::new();
 
 /// Go `time.Local`.
-fn local_location() -> &'static jiff::tz::TimeZone {
+pub(crate) fn local_location() -> &'static jiff::tz::TimeZone {
     LOCAL_LOC.get_or_init(init_local)
 }
 
@@ -705,11 +705,26 @@ fn get_ecma_line_of_file_position(file: &FileLike, pos: i32) -> i32 {
 // PORT: Go takes an `ast.SourceFileLike`. This is the code of the Rust
 // scanner function (which takes a file node) on a `FileLike`. See that
 // function for a `pos` inside a char.
+// A `pos` before the text (line -1) or past its end comes only from a bad
+// diagnostic in a `.tsbuildinfo`. Go `lineMap[line]` and
+// `text[lineMap[line]:pos]` panic there; the panic text has the Go offset
+// and length (see `port_byte_offset`: past the end both forms differ by
+// the same count).
 pub fn get_ecma_line_and_utf16_character_of_file_position(file: &FileLike, pos: i32) -> (i32, i32) {
     let line_map = file.ecma_line_map();
     let line = compute_line_of_position(&line_map, pos);
     let text = file.text();
+    if line < 0 {
+        crate::core::go_panic(format!("runtime error: index out of range [{line}]"));
+    }
     let end = pos as usize;
+    if end > text.len() {
+        let go_len = crate::scanner_util::go_len(&text);
+        let go_pos = end - text.len() + go_len;
+        crate::core::go_panic(format!(
+            "runtime error: slice bounds out of range [:{go_pos}] with length {go_len}"
+        ));
+    }
     let mut boundary = end;
     while !text.is_char_boundary(boundary) {
         boundary -= 1;
@@ -979,13 +994,13 @@ fn diagnostic_prefix(diagnostic: AstDiagnostic<'_>) -> &str {
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:387 getCategoryFormat
-// PORT: Go panics on an unhandled category. The Rust match is exhaustive.
 fn get_category_format(category: Category) -> &'static str {
     match category {
         Category::Error => FOREGROUND_COLOR_ESCAPE_RED,
         Category::Warning => FOREGROUND_COLOR_ESCAPE_YELLOW,
         Category::Suggestion => FOREGROUND_COLOR_ESCAPE_GREY,
         Category::Message => FOREGROUND_COLOR_ESCAPE_BLUE,
+        _ => crate::core::go_panic("Unhandled diagnostic category".to_string()),
     }
 }
 

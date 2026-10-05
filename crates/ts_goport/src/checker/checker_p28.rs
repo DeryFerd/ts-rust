@@ -4,6 +4,9 @@
 
 use crate::jsnum::{Number, PseudoBigInt};
 use crate::prelude::*;
+use rustc_hash::FxBuildHasher;
+use std::borrow::Cow;
+use std::hash::BuildHasher;
 
 impl Checker {
     // Go: checker/checker.go:25520 newUniqueESSymbolType
@@ -586,19 +589,38 @@ impl Checker {
 
     // Go: checker/checker.go:25770 getStringLiteralType
     pub fn get_string_literal_type(&mut self, value: &str) -> TypeId {
-        let mut t = self
-            .string_literal_types
-            .get(value)
-            .copied()
-            .unwrap_or_default();
-        if t.is_nil() {
-            t = self.new_literal_type(
-                TypeFlags::STRING_LITERAL,
-                Some(LiteralValue::String(value.to_string())),
-                TypeId::NIL,
-            );
-            self.string_literal_types.insert(value.to_string(), t);
+        self.get_string_literal_type_cow(Cow::Borrowed(value))
+    }
+
+    /// `get_string_literal_type` for an owned value: a new type keeps
+    /// `value` without a copy. `get_template_literal_type` moves its joined
+    /// text in, as Go `sb.String()` gives the text without a copy.
+    pub fn get_string_literal_type_owned(&mut self, value: String) -> TypeId {
+        self.get_string_literal_type_cow(Cow::Owned(value))
+    }
+
+    // Go: checker/checker.go:25770 getStringLiteralType
+    // PORT: perf (tcsplit1). In Go the map key and the type share one
+    // string. Here `string_literal_types` keys on the FxHash of the value and
+    // a lookup compares the value of each type in the bucket, so the value
+    // is stored once, in the type. Types are made at the same calls as Go.
+    fn get_string_literal_type_cow(&mut self, value: Cow<'_, str>) -> TypeId {
+        let hash = FxBuildHasher.hash_one(&*value);
+        if let Some(bucket) = self.string_literal_types.get(&hash) {
+            for &t in bucket {
+                if self.get_string_literal_value_ref(t) == value {
+                    return t;
+                }
+            }
         }
+        let mut value = value.into_owned();
+        value.shrink_to_fit();
+        let t = self.new_literal_type(
+            TypeFlags::STRING_LITERAL,
+            Some(LiteralValue::String(value)),
+            TypeId::NIL,
+        );
+        self.string_literal_types.entry(hash).or_default().push(t);
         t
     }
 
@@ -1484,6 +1506,13 @@ impl Checker {
             .flags
             .intersects(TypeFlags::TEMPLATE_LITERAL)
         {
+            // PERF (chkmid1): most pairs fail the start and end text test,
+            // so it runs before the template and the comparer are cloned.
+            if self.ty(t).flags.intersects(TypeFlags::STRING_LITERAL)
+                && self.string_literal_misses_template_literal_ends(t, template)
+            {
+                return false;
+            }
             let template_literal = self.ty(template).as_template_literal_type().clone();
             let comparer = self.compare_types_assignable.clone();
             return self.is_type_matched_by_template_literal_type(

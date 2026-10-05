@@ -23,22 +23,10 @@ use std::cell::OnceCell;
 /// returns it (`Arc`, because a `Diagnostic` crosses the checker threads).
 pub type RepopulateInfoRef = std::sync::Arc<RepopulateDiagnosticInfo>;
 
-/// Go `diagnostics.Category(raw)`. The build info keeps the raw Go value.
-#[must_use]
-pub fn category_from_raw(raw: i32) -> crate::diagnostics::Category {
-    match raw {
-        0 => crate::diagnostics::Category::Warning,
-        1 => crate::diagnostics::Category::Error,
-        2 => crate::diagnostics::Category::Suggestion,
-        3 => crate::diagnostics::Category::Message,
-        _ => panic!("invalid diagnostic category {raw}"),
-    }
-}
-
 // Go: incremental/snapshot.go:133 buildInfoDiagnosticWithFileName
 // PORT: Go `diagnostics.Category` is kept as the raw Go value, like
-// `BuildInfoDiagnostic.category`; use `category_from_raw`. Go nil slices are
-// empty vectors.
+// `BuildInfoDiagnostic.category` (`diagnostics::Category(raw)` gives the Go
+// value). Go nil slices are empty vectors.
 #[derive(Clone, Debug, Default)]
 pub struct BuildInfoDiagnosticWithFileName {
     // filename if it is for a File thats other than its stored for
@@ -149,7 +137,7 @@ impl BuildInfoDiagnosticWithFileName {
             file_for_diagnostic,
             port_text_range(file_for_diagnostic, self.pos, self.end),
             self.code,
-            category_from_raw(self.category),
+            crate::diagnostics::Category(self.category),
             &self.message_key,
             self.message_args.clone(),
             message_chain,
@@ -181,7 +169,7 @@ impl BuildInfoDiagnosticWithFileName {
             file,
             port_text_range(file, self.pos, self.end),
             self.code,
-            category_from_raw(self.category),
+            crate::diagnostics::Category(self.category),
             &self.message_key,
             self.message_args.clone(),
             message_chain,
@@ -364,6 +352,17 @@ pub struct Snapshot {
 
     // Used with testing to add text of hash for better comparison
     pub hash_with_text: bool,
+
+    /// PORT: not in Go. The freeable file versions (`ast::FileVersion`)
+    /// that the diagnostics copied from the old snapshot point at
+    /// (`programToSnapshot`, Go `repopulateDiagnosticsOfFile`): their
+    /// files, related information and message chains. Go's GC keeps an old
+    /// `*ast.SourceFile` alive through a copied `*ast.Diagnostic`. Here a
+    /// watch rebuild can free a file version that the new program does not
+    /// have, so the snapshot holds it while the report and the build info
+    /// can read it. Empty unless a freeable version is published
+    /// (`ast::any_freeable_published`).
+    pub held_file_versions: Vec<std::sync::Arc<crate::ast::FileVersion>>,
 }
 
 impl Snapshot {
@@ -394,6 +393,7 @@ impl Snapshot {
             has_changed_dts_file: false,
             has_emit_diagnostics: false,
             hash_with_text: false,
+            held_file_versions: Vec::new(),
         }
     }
 

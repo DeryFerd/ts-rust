@@ -554,9 +554,8 @@ impl Binder {
         // A top level or comma expression call expression with a dotted function name and at least one argument
         // is potentially an assertion and is therefore included in the control flow.
         if is_call_expression(node) {
-            if node.expression().kind() != SyntaxKind::SuperKeyword
-                && is_dotted_name(node.expression())
-            {
+            let expression = node.expression();
+            if expression.kind() != SyntaxKind::SuperKeyword && is_dotted_name(expression) {
                 self.current_flow = self.create_flow_call(self.current_flow, node);
             }
         }
@@ -613,28 +612,31 @@ impl Binder {
     }
 
     // Go: binder/binder.go:2221 bindDestructuringAssignmentFlow
-    pub fn bind_destructuring_assignment_flow(&mut self, node: Node) {
+    // PERF: binderview1. `expr` holds the fields of the node (Go
+    // `node.AsBinaryExpression()`), read once.
+    pub fn bind_destructuring_assignment_flow(&mut self, expr: &BinaryView) {
         if self.in_assignment_pattern {
             self.in_assignment_pattern = false;
-            self.bind(node.operator_token());
-            self.bind(node.right());
+            self.bind(expr.operator_token);
+            self.bind(expr.right);
             self.in_assignment_pattern = true;
-            self.bind(node.left());
-            self.bind(node.type_());
+            self.bind(expr.left);
+            self.bind(expr.type_);
         } else {
             self.in_assignment_pattern = true;
-            self.bind(node.left());
-            self.bind(node.type_());
+            self.bind(expr.left);
+            self.bind(expr.type_);
             self.in_assignment_pattern = false;
-            self.bind(node.operator_token());
-            self.bind(node.right());
+            self.bind(expr.operator_token);
+            self.bind(expr.right);
         }
-        self.bind_assignment_target_flow(node.left());
+        self.bind_assignment_target_flow(expr.left);
     }
 
     // Go: binder/binder.go:2241 bindBinaryExpressionFlow
-    pub fn bind_binary_expression_flow(&mut self, node: Node) {
-        let operator = node.operator_token().kind();
+    // PERF: binderview1. `expr` holds the fields of `node`, read once.
+    pub fn bind_binary_expression_flow(&mut self, node: Node, expr: &BinaryView) {
+        let operator = expr.operator;
         if is_logical_or_coalescing_binary_operator(operator)
             || is_logical_or_coalescing_assignment_operator(operator)
         {
@@ -645,6 +647,7 @@ impl Binder {
                 self.has_flow_effects = false;
                 self.bind_logical_like_expression(
                     node,
+                    expr,
                     post_expression_label,
                     post_expression_label,
                 );
@@ -657,19 +660,20 @@ impl Binder {
             } else {
                 self.bind_logical_like_expression(
                     node,
+                    expr,
                     self.current_true_target,
                     self.current_false_target,
                 );
             }
         } else {
-            let left = node.left();
-            let right = node.right();
+            let left = expr.left;
+            let right = expr.right;
             self.bind(left);
-            self.bind(node.type_());
+            self.bind(expr.type_);
             if operator == SyntaxKind::CommaToken {
                 self.maybe_bind_expression_flow_if_call(left);
             }
-            self.bind(node.operator_token());
+            self.bind(expr.operator_token);
             self.bind(right);
             if operator == SyntaxKind::CommaToken {
                 self.maybe_bind_expression_flow_if_call(right);
@@ -692,31 +696,32 @@ impl Binder {
     }
 
     // Go: binder/binder.go:2283 bindLogicalLikeExpression
+    // PERF: binderview1. `expr` holds the fields of `node`, read once.
     pub fn bind_logical_like_expression(
         &mut self,
         node: Node,
+        expr: &BinaryView,
         true_target: FlowNodeId,
         false_target: FlowNodeId,
     ) {
-        let operator_token = node.operator_token();
         let pre_right_label = self.create_branch_label();
-        if operator_token.kind() == SyntaxKind::AmpersandAmpersandToken
-            || operator_token.kind() == SyntaxKind::AmpersandAmpersandEqualsToken
+        if expr.operator == SyntaxKind::AmpersandAmpersandToken
+            || expr.operator == SyntaxKind::AmpersandAmpersandEqualsToken
         {
-            self.bind_condition(node.left(), pre_right_label, false_target);
+            self.bind_condition(expr.left, pre_right_label, false_target);
         } else {
-            self.bind_condition(node.left(), true_target, pre_right_label);
+            self.bind_condition(expr.left, true_target, pre_right_label);
         }
         self.current_flow = self.finish_flow_label(pre_right_label);
-        self.bind(operator_token);
-        if is_logical_or_coalescing_assignment_operator(operator_token.kind()) {
+        self.bind(expr.operator_token);
+        if is_logical_or_coalescing_assignment_operator(expr.operator) {
             self.do_with_conditional_branches(
                 &mut Binder::bind,
-                node.right(),
+                expr.right,
                 true_target,
                 false_target,
             );
-            self.bind_assignment_target_flow(node.left());
+            self.bind_assignment_target_flow(expr.left);
             let true_flow =
                 self.create_flow_condition(FlowFlags::TRUE_CONDITION, self.current_flow, node);
             self.add_antecedent(true_target, true_flow);
@@ -724,7 +729,7 @@ impl Binder {
                 self.create_flow_condition(FlowFlags::FALSE_CONDITION, self.current_flow, node);
             self.add_antecedent(false_target, false_flow);
         } else {
-            self.bind_condition(node.right(), true_target, false_target);
+            self.bind_condition(expr.right, true_target, false_target);
         }
     }
 
@@ -1203,7 +1208,7 @@ pub fn is_narrowing_expression(expr: Node) -> bool {
         SyntaxKind::ParenthesizedExpression
         | SyntaxKind::NonNullExpression
         | SyntaxKind::TypeOfExpression => is_narrowing_expression(expr.expression()),
-        SyntaxKind::BinaryExpression => is_narrowing_binary_expression(expr),
+        SyntaxKind::BinaryExpression => is_narrowing_binary_expression(&BinaryView::new(expr)),
         SyntaxKind::PrefixUnaryExpression => {
             expr.operator() == SyntaxKind::ExclamationToken
                 && is_narrowing_expression(expr.operand())
@@ -1241,16 +1246,28 @@ pub fn is_narrowable_reference(node: Node) -> bool {
         SyntaxKind::PropertyAccessExpression
         | SyntaxKind::ParenthesizedExpression
         | SyntaxKind::NonNullExpression => is_narrowable_reference(node.expression()),
+        // PERF: binderview1. Go `IsStringOrNumericLiteralLike(arg) ||
+        // IsEntityNameExpression(arg) && isNarrowableReference(Expression)`
+        // with the kind of `arg` read once: a literal is no entity name, and
+        // an entity name is an identifier or a property access.
         SyntaxKind::ElementAccessExpression => {
             let argument_expression = node.argument_expression();
-            is_string_or_numeric_literal_like(argument_expression)
-                || is_entity_name_expression(argument_expression)
-                    && is_narrowable_reference(node.expression())
+            match argument_expression.kind() {
+                SyntaxKind::StringLiteral
+                | SyntaxKind::NoSubstitutionTemplateLiteral
+                | SyntaxKind::NumericLiteral => true,
+                SyntaxKind::Identifier => is_narrowable_reference(node.expression()),
+                SyntaxKind::PropertyAccessExpression => {
+                    is_entity_name_expression(argument_expression)
+                        && is_narrowable_reference(node.expression())
+                }
+                _ => false,
+            }
         }
         SyntaxKind::BinaryExpression => {
-            let operator = node.operator_token().kind();
-            operator == SyntaxKind::CommaToken && is_narrowable_reference(node.right())
-                || is_assignment_operator(operator) && is_left_hand_side_expression(node.left())
+            let expr = BinaryView::new(node);
+            expr.operator == SyntaxKind::CommaToken && is_narrowable_reference(expr.right)
+                || is_assignment_operator(expr.operator) && is_left_hand_side_expression(expr.left)
         }
         _ => false,
     }
@@ -1273,19 +1290,20 @@ pub fn has_narrowable_argument(expr: Node) -> bool {
 }
 
 // Go: binder/binder.go:2688 isNarrowingBinaryExpression
-// PORT: Go takes `*ast.BinaryExpression`; this takes the BinaryExpression node.
-pub fn is_narrowing_binary_expression(expr: Node) -> bool {
-    match expr.operator_token().kind() {
+// PORT: Go takes `*ast.BinaryExpression`; this takes its fields, read once
+// (`BinaryView`).
+pub fn is_narrowing_binary_expression(expr: &BinaryView) -> bool {
+    match expr.operator {
         SyntaxKind::EqualsToken
         | SyntaxKind::BarBarEqualsToken
         | SyntaxKind::AmpersandAmpersandEqualsToken
-        | SyntaxKind::QuestionQuestionEqualsToken => contains_narrowable_reference(expr.left()),
+        | SyntaxKind::QuestionQuestionEqualsToken => contains_narrowable_reference(expr.left),
         SyntaxKind::EqualsEqualsToken
         | SyntaxKind::ExclamationEqualsToken
         | SyntaxKind::EqualsEqualsEqualsToken
         | SyntaxKind::ExclamationEqualsEqualsToken => {
-            let left = skip_parentheses(expr.left());
-            let right = skip_parentheses(expr.right());
+            let left = skip_parentheses(expr.left);
+            let right = skip_parentheses(expr.right);
             is_narrowable_operand(left)
                 || is_narrowable_operand(right)
                 || is_narrowing_type_of_operands(right, left)
@@ -1293,9 +1311,9 @@ pub fn is_narrowing_binary_expression(expr: Node) -> bool {
                 || (is_boolean_literal(right) && is_narrowing_expression(left)
                     || is_boolean_literal(left) && is_narrowing_expression(right))
         }
-        SyntaxKind::InstanceOfKeyword => is_narrowable_operand(expr.left()),
-        SyntaxKind::InKeyword => is_narrowing_expression(expr.right()),
-        SyntaxKind::CommaToken => is_narrowing_expression(expr.right()),
+        SyntaxKind::InstanceOfKeyword => is_narrowable_operand(expr.left),
+        SyntaxKind::InKeyword => is_narrowing_expression(expr.right),
+        SyntaxKind::CommaToken => is_narrowing_expression(expr.right),
         _ => false,
     }
 }
@@ -1306,15 +1324,18 @@ pub fn is_narrowable_operand(expr: Node) -> bool {
         SyntaxKind::ParenthesizedExpression => {
             return is_narrowable_operand(expr.expression());
         }
-        SyntaxKind::BinaryExpression => match expr.operator_token().kind() {
-            SyntaxKind::EqualsToken => {
-                return is_narrowable_operand(expr.left());
+        SyntaxKind::BinaryExpression => {
+            let binary = BinaryView::new(expr);
+            match binary.operator {
+                SyntaxKind::EqualsToken => {
+                    return is_narrowable_operand(binary.left);
+                }
+                SyntaxKind::CommaToken => {
+                    return is_narrowable_operand(binary.right);
+                }
+                _ => {}
             }
-            SyntaxKind::CommaToken => {
-                return is_narrowable_operand(expr.right());
-            }
-            _ => {}
-        },
+        }
         _ => {}
     }
     contains_narrowable_reference(expr)
