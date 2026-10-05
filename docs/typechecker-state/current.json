@@ -877,12 +877,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "a0cae05f9b86ceaff",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "ab754bc36d336a64e",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R172 pipeline (candidate.sh side)."
