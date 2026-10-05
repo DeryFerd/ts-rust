@@ -13,7 +13,8 @@
 //!
 //! A method that can be private stays with the properties, in first-seen
 //! order, so a conflicting private method declared first is found before the
-//! properties are checked.
+//! properties are checked. That holds for a private static method that
+//! shares its name with a public instance method too.
 
 use crate::support::child::run_command_in_child;
 use crate::support::runner::TscInput;
@@ -96,6 +97,11 @@ fn private_symbols(method_first: bool) -> u64 {
         class("A", "string"),
         class("B", "number")
     );
+    symbols_of(text)
+}
+
+/// The `Symbols` count of `counts_of(text)`.
+fn symbols_of(text: String) -> u64 {
     let (symbols, _) = counts_of(text);
     symbols["Symbols:".len()..]
         .trim()
@@ -107,4 +113,34 @@ fn private_symbols(method_first: bool) -> u64 {
 fn never_intersection_checks_private_methods_with_properties() {
     // Each property checked before `m` makes one synthetic property.
     assert_eq!(private_symbols(false) - private_symbols(true), 30);
+}
+
+/// The `Symbols` count on `A & typeof A` of a class with a public `m()`, a
+/// `private static m()` and 30 names that are an instance and a static
+/// property of different types, with the methods declared before or after
+/// the properties.
+fn private_static_symbols(methods_first: bool) -> u64 {
+    let methods = "    m(): void {}\n    private static m(): void {}\n";
+    let fields: String = (0..30)
+        .map(|i| format!("    f{i}!: string;\n    static f{i}: number = 0;\n"))
+        .collect();
+    let body = if methods_first {
+        format!("{methods}{fields}")
+    } else {
+        format!("{fields}{methods}")
+    };
+    symbols_of(format!(
+        "class A {{\n{body}}}\ndeclare const a: A & typeof A;\nexport const n: number = a;\n"
+    ))
+}
+
+#[test]
+fn never_intersection_checks_a_private_static_method_with_properties() {
+    // The instance `m` and the static `m` have one parent, the class. The
+    // static `m` is private, so `m` stays with the properties, and each
+    // property checked before it makes one synthetic property.
+    assert_eq!(
+        private_static_symbols(false) - private_static_symbols(true),
+        30
+    );
 }

@@ -14,9 +14,9 @@ use std::sync::mpsc;
 
 use ts_goport::ast::{
     dead_file_versions, file_version_probe, file_versions_made, free_file_versions,
-    node_block_addr, node_block_is_owned, owned_node_count, source_file_ecma_line_map,
-    source_file_get_declaration_map, source_file_get_name_table, source_file_imports,
-    source_file_info, source_file_text, version_child_links,
+    frozen_store_children, node_block_addr, node_block_is_owned, owned_node_count,
+    source_file_ecma_line_map, source_file_get_declaration_map, source_file_get_name_table,
+    source_file_imports, source_file_info, source_file_text, version_child_links,
 };
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::core::Node;
@@ -750,4 +750,325 @@ fn owned_nodes_off_keeps_node_data_leaked() {
         assert_eq!(owned_node_count(), 0, "every parse is static");
         assert_eq!(second.statements().len(), statements);
     });
+}
+
+/// bindkinds (followups22, R169 reviewer on bindfast1): the project of
+/// `edited_versions_of_every_node_kind_bind_through_their_child_links`. The
+/// files have each node kind that a bind walks, with JSDoc that the JS file
+/// reparses into its tree (types, typedefs, callbacks, imports, templates).
+const KINDS_DIR: &str = "/home/projects/TS/kinds";
+const KINDS_CONFIG: &str = r#"{"compilerOptions":{"allowJs":true,"checkJs":true,"jsx":"preserve","target":"esnext","module":"esnext","moduleResolution":"bundler","noLib":true,"types":[]}}"#;
+
+/// TS syntax: declarations, types, statements and expressions.
+const KINDS_TS: &str = r#"import def, { a as alias, type T0 } from "./kinds-lib";
+import * as ns from "./kinds-lib";
+import json from "./data.json" with { type: "json" };
+import eq = ns.inner;
+import req = require("./kinds-lib");
+export * as reexported from "./kinds-lib";
+export { alias as renamed };
+/** A documented enum. @deprecated */
+export enum E { A = 1, B = A << 1, C = "c".length }
+declare module "ambient" { export const v: number; }
+namespace N.M { export type Q = string; }
+type Primitive = string | number & {} | boolean;
+type Tuple = [first: string, second?: number, ...rest: boolean[]];
+type Tuple2 = [string, number?, ...boolean[]];
+type Cond<T> = T extends (infer U extends string)[] ? U : never;
+type Mapped<T> = { readonly [K in keyof T as `get${string & K}`]-?: T[K] };
+type Fn = (this: void, a?: number, ...b: string[]) => asserts a is number;
+type Ctor = abstract new <T>(x: T) => T;
+type Lit = "x" | 1 | -1 | true | null | undefined | 10n;
+type Q1 = N.M.Q;
+type Imp = typeof import("./kinds-lib", { with: { "resolution-mode": "import" } });
+type Paren = (string)[];
+type Thisy = { self(): this; [key: string]: unknown; new (): Thisy; (): void; method?<T>(): T; readonly prop: unique symbol };
+type Query = typeof ns.a;
+type Tmpl = `a${number}b${string}`;
+interface I<T = unknown> extends Omit0<T> { x: T; }
+interface Omit0<T> { y?: T }
+function isString(x: unknown): x is string { return typeof x === "string"; }
+function* gen(): Generator<number> { yield 1; yield* [2]; }
+async function asy() { for await (const x of [Promise.resolve(1)]) { await x; } }
+function dec(_t: unknown, _c: unknown) {}
+@dec
+abstract class Base<T> implements I<T> {
+  static #count = 0;
+  declare x: T;
+  protected abstract m(): void;
+  static { Base.#count++; }
+  constructor(public readonly p: number, private q?: string) { super0(); }
+  get v() { return this.p; }
+  set v(value) { void value; }
+  [Symbol.iterator]?(): void;
+  ;
+  override toString() { return ""; }
+}
+class Derived extends Base<string> { m() {} }
+declare function super0(): void;
+label: for (let i = 0, j = 1; i < j; i++, --j) {
+  if (i) continue label; else if (j) break label; else { debugger; }
+}
+for (const k in { a: 1 }) { k; }
+for (const [x, , ...ys] of [[1, 2, 3]]) { x; ys; }
+do { } while (false);
+while (true) { break; }
+switch (Math.random()) { case 1: break; default: }
+try { throw new Error("e"); } catch ({ message }) { message; } finally { }
+const { p1, p2: { p3 = 1 } = {}, ...others } = { p1: 1, p2: { p3: 2 }, p4: 3 };
+const arr = [1, ...[2], , 3];
+const obj = { arr, ["computed"]: 1, method() {}, get g() { return 1; }, set s(v: number) {}, ...{ z: 1 } };
+const cls = class Named { };
+const arrow = async <T,>(x: T): Promise<T> => x;
+const fe = function named(this: unknown) { return new.target; };
+const ops = !true ? -1 : +2, post = obj.arr.length++, del = delete (obj as any).z;
+const assert0 = <string>(<unknown>"s");
+const sat = { a: 1 } satisfies Record<string, number>;
+const nn = obj!.arr![0];
+const tagged = String.raw`a${1}b${2}c`;
+const tpl = `x${ops}y`;
+const inst = Array<string>;
+const meta = import.meta;
+const opt = obj?.arr?.[0] ?? obj.method?.();
+const vt = void 0, to = typeof ops, bin = (1 + 2) * 3 ** 2 >>> 1 in obj;
+let assign: number; assign = 1; assign += 2; assign ||= 3;
+;
+export default Derived;
+export type { Primitive, Tuple, Tuple2, Cond, Mapped, Fn, Ctor, Lit, Q1, Imp, Paren, Thisy, Query, Tmpl };
+export { def, alias, json, eq, req, isString, gen, asy, Base, arr, cls, arrow, fe, assert0, sat, nn, tagged, tpl, inst, meta, opt, vt, to, bin, post, del, others, p1, p3 };
+export type { T0 };
+"#;
+
+/// The module that `KINDS_TS` and `KINDS_JS` import.
+const KINDS_LIB: &str = r#"export const a = 1;
+export type T0 = number;
+export namespace inner { export const z = 1; }
+export default a;
+"#;
+
+/// A declaration file: `export as namespace` and an `export =`.
+const KINDS_DTS: &str = r#"export as namespace KindsGlobal;
+declare const value: { x: number };
+export = value;
+"#;
+
+/// JSX.
+const KINDS_TSX: &str = r#"declare namespace JSX { interface IntrinsicElements { [name: string]: any } }
+const props = { a: 1 };
+export const el = <div id="x" {...props} a:b="ns" flag>
+  text {props.a} <span /> {/* comment */}
+  <>fragment</>
+</div>;
+"#;
+
+/// JSDoc that the JS file reparses into its tree.
+const KINDS_JS: &str = r#"// @ts-check
+/** @import { T0 } from "./kinds-lib" */
+/** @import * as lib from "./kinds-lib" */
+/**
+ * @typedef {Object} Shape
+ * @property {string} name
+ * @property {number} [size]
+ * @property {{ deep: boolean }} nested
+ */
+/** @typedef {{ x: number, y?: string }} Point */
+/** @typedef {string | number} Id */
+/**
+ * @callback Handler
+ * @param {Event} e
+ * @param {...number} rest
+ * @returns {void}
+ */
+/**
+ * @template T, U
+ * @template {string} [K="k"]
+ * @param {T} a
+ * @param {?U} b
+ * @param {!Array<*>} c
+ * @param {number=} d
+ * @param {...string} e
+ * @returns {T | U}
+ */
+export function pick(a, b, c, d, e) { return a ?? b; }
+/** @type {Handler} */
+export const handler = (e, ...rest) => {};
+/** @type {(a: T0) => lib.T0} */
+export const conv = (a) => a;
+/** @enum {number} */
+export const Colors = { Red: 1, Green: 2 };
+/**
+ * @class
+ * @implements {Iface}
+ */
+export class Klass {
+  /** @param {number} n */
+  constructor(n) {
+    /** @type {number} @readonly */
+    this.n = n;
+    /** @private */
+    this.secret = 1;
+  }
+  /**
+   * @overload
+   * @param {string} x
+   * @returns {string}
+   */
+  /**
+   * @overload
+   * @param {number} x
+   * @returns {number}
+   */
+  /**
+   * @param {string | number} x
+   * @this {Klass}
+   * @throws {Error}
+   * @see {@link Klass} and {@linkcode pick} and {@linkplain conv}
+   */
+  run(x) { return x; }
+}
+/** @extends {Klass} */
+export class Sub extends Klass {}
+/** @typedef {{ m(): void }} Iface */
+/** @satisfies {Point} */
+export const pt = { x: 1 };
+/** @type {Shape} */
+export const shape = /** @type {Shape} */ ({ name: "s", nested: { deep: true } });
+/** @param {Id} id @returns {Point} */
+export function at(id) { return { x: Number(id) }; }
+/** @param {Point} p @param {(x: number) => string} f */
+export function visit({ x }, f) { return f(x); }
+export function scoped(o) { with (o) { visit; } }
+"#;
+
+child_test! {
+    // followups22 (R169 reviewer on bindfast1): the child link walk of a
+    // bind (`Binder::bind_each_child`) must give the children of
+    // `for_each_child` (Go `ForEachChild`, binder/binder.go:1745
+    // `bindEachChild`) for each node of a file. The debug builds compare
+    // each walk, but the protected tests run release builds; this compares
+    // every node of these files there: the first (static) version of each
+    // file (its block's column) and an edited (freeable) version (its
+    // version's column, bindfast1). The files have each node kind of the
+    // syntax kind table from QualifiedName to SourceFile (less the kinds in
+    // `NOT_MADE`), and the JSDoc nodes and JS nodes that the JS file's
+    // reparse puts in the tree.
+    fn edited_versions_of_every_node_kind_bind_through_their_child_links() {
+        // Kinds that no parse of these files makes: a checker kind, and
+        // the parse error recovery of modifiers with no declaration.
+        const NOT_MADE: &[SyntaxKind] = &[
+            SyntaxKind::SyntheticExpression,
+            SyntaxKind::MissingDeclaration,
+        ];
+        let name = |file: &str| format!("{KINDS_DIR}/{file}");
+        let file_uri = |file: &str| format!("file://{KINDS_DIR}/{file}");
+        let sources = [
+            ("kinds.ts", KINDS_TS),
+            ("kinds-decl.d.ts", KINDS_DTS),
+            ("kinds-jsx.tsx", KINDS_TSX),
+            ("kinds-doc.js", KINDS_JS),
+        ];
+        let mut entries: Vec<(String, String)> = sources
+            .iter()
+            .map(|(file, text)| (name(file), text.to_string()))
+            .collect();
+        entries.push((name("tsconfig.json"), KINDS_CONFIG.to_string()));
+        entries.push((name("kinds-lib.ts"), KINDS_LIB.to_string()));
+        entries.push((name("data.json"), "{\"a\": 1}".to_string()));
+        let entry_refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(file, text)| (file.as_str(), text.as_str()))
+            .collect();
+        let session = bare_session(files(&entry_refs));
+        for (file, text) in sources {
+            let kind = if file.ends_with(".js") {
+                lsproto::LanguageKind::JAVA_SCRIPT
+            } else if file.ends_with(".tsx") {
+                lsproto::LanguageKind::TYPE_SCRIPT_REACT
+            } else {
+                lsproto::LanguageKind::TYPE_SCRIPT
+            };
+            open_kind(&session, &file_uri(file), text, kind);
+        }
+        let first = program(&session, &file_uri("kinds.ts"));
+        let mut seen = std::collections::BTreeSet::new();
+        let mut compared = 0usize;
+        // The nodes whose chain is not known, by file and kind: the walk
+        // reads their data (`for_each_child`). Static and edited.
+        let mut unknown = [(); 2].map(|()| std::collections::BTreeMap::<String, usize>::new());
+        // The static versions: the link column of each file's block.
+        for (file, _) in sources {
+            let root = root(&first, &name(file));
+            assert!(file_version_probe(root).is_none(), "{file}: the first version is static");
+            for n in tree(root) {
+                seen.insert(n.kind() as u16);
+                match frozen_store_children(n) {
+                    Some(children) => {
+                        compared += 1;
+                        assert_eq!(
+                            children.collect::<Vec<_>>(),
+                            n.iter_children().collect::<Vec<_>>(),
+                            "{file} static: the children of {:?}",
+                            n.kind()
+                        );
+                    }
+                    None => *unknown[0].entry(format!("{file} {:?}", n.kind())).or_default() += 1,
+                }
+            }
+        }
+        drop(first);
+        // An edit of each file: each new version is freeable.
+        for (file, _) in sources {
+            edit(&session, &file_uri(file), 2, (0, 0), (0, 0), "\n");
+        }
+        let edited = program(&session, &file_uri("kinds.ts"));
+        session.wait_for_background_tasks();
+        for (file, _) in sources {
+            let root = root(&edited, &name(file));
+            assert!(file_version_probe(root).is_some(), "{file}: the edited version is freeable");
+            let links = version_child_links(root.file_index())
+                .unwrap_or_else(|| panic!("{file}: the edited version keeps its child links"));
+            for n in tree(root) {
+                match links.children(n) {
+                    Some(children) => {
+                        compared += 1;
+                        assert_eq!(
+                            children.collect::<Vec<_>>(),
+                            n.iter_children().collect::<Vec<_>>(),
+                            "{file} edited: the children of {:?}",
+                            n.kind()
+                        );
+                    }
+                    None => *unknown[1].entry(format!("{file} {:?}", n.kind())).or_default() += 1,
+                }
+            }
+        }
+        let missing: Vec<SyntaxKind> = (SyntaxKind::FIRST_NODE as u16..=SyntaxKind::SourceFile as u16)
+            .filter_map(|kind| SyntaxKind::try_from(kind).ok())
+            .filter(|kind| !seen.contains(&(*kind as u16)) && !NOT_MADE.contains(kind))
+            .collect();
+        assert_eq!(missing, [], "node kinds that the files do not have");
+        let reparsed = [
+            SyntaxKind::JsDocAllType,
+            SyntaxKind::JsDocNullableType,
+            SyntaxKind::JsDocNonNullableType,
+            SyntaxKind::JsDocOptionalType,
+            SyntaxKind::JsDocVariadicType,
+            SyntaxKind::JsTypeAliasDeclaration,
+            SyntaxKind::JsImportDeclaration,
+        ];
+        let missing_reparsed: Vec<_> = reparsed.iter().filter(|kind| !seen.contains(&(**kind as u16))).collect();
+        assert_eq!(missing_reparsed, [&SyntaxKind::Unknown; 0], "reparsed kinds that the JS file does not have");
+        assert!(compared > 2000, "{compared} chains compared");
+        // The column of an edited version knows the chains that the block
+        // of a static one knows. Few chains are unknown (mostly the JSDoc
+        // that the JS file reparses: a reparsed node shares its JSDoc
+        // nodes), and their walk reads the node data.
+        let [static_unknown, edited_unknown] = unknown;
+        assert_eq!(edited_unknown, static_unknown);
+        let unknown_count: usize = static_unknown.values().sum();
+        assert!(
+            unknown_count * 10 < compared,
+            "{unknown_count} unknown chains: {static_unknown:?}"
+        );
+    }
 }

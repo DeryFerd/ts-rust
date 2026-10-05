@@ -1,9 +1,15 @@
-//! The tsgo panic hook (bin/tsgo.rs `install_panic_hook`) and the work
-//! thread failure write with stderr a pipe that has no reader, so each write
-//! gets EPIPE. With `eprintln!` the hook panicked again, and a panic inside
-//! the hook aborts the process (SIGABRT), also for a panic that a caller
-//! catches (a resolve-ahead worker panic in `run_task`). The hook must drop
-//! its write errors, and the run then ends as it does with a reader.
+//! The tsgo panic hook (bin/tsgo.rs `install_panic_hook`) and the getwd
+//! error of `new_os_system` write with stderr a pipe that has no reader, so
+//! each write gets EPIPE. With `eprintln!` the hook panicked again, and a
+//! panic inside the hook aborts the process (SIGABRT), also for a panic that
+//! a caller catches (a resolve-ahead worker panic in `run_task`). The hook
+//! must drop its write errors, and the run then ends as it does with a
+//! reader. The getwd error is a Go write to `os.Stderr`, which ends the
+//! process by SIGPIPE as in Go.
+//!
+//! The work thread failure write (bin/tsgo.rs `main`, "tsgo: work thread
+//! failed") also drops its error. No test reaches it now: its test used the
+//! getwd error, which was a panic outside the `catch_unwind` of `run_main`.
 //!
 //! The panic of the hook test: tsgo reads the current directory again when it installs the
 //! program (`execute_tsc::install_program`), and a removed directory panics
@@ -55,19 +61,16 @@ fn a_printed_panic_with_no_stderr_reader_does_not_abort() {
     );
 }
 
-/// The work thread's failure (bin/tsgo.rs `main`: "tsgo: work thread
-/// failed") with stderr a pipe that has no reader. With `eprintln!` that
-/// write panicked on the main thread, and the run ended with exit code 101.
-///
-/// The panic that ends the work thread: tsgo runs in a removed directory, so
-/// `new_os_system` cannot get the current directory, and it writes that
-/// error with `eprintln!`, outside the `catch_unwind` of `run_main`. With no
-/// reader, that write panics. With a reader, the port writes the error and
-/// exits 3, as Go N does (cmd/tsc/sys.go:127 `newSystem`); the control run
-/// checks that. When a change removes this panic, the closed run fails: then
-/// use another panic outside `catch_unwind`.
+/// The getwd error of `new_os_system` (Go cmd/tsc/sys.go:127 `newSystem`)
+/// with stderr a pipe that has no reader. Go N writes the error to
+/// `os.Stderr`, gets EPIPE and ends by SIGPIPE (`os/file_unix.go`
+/// `epipecheck`), also when SIGPIPE was ignored at start. The port wrote it
+/// with `eprintln!`, which panicked outside the `catch_unwind` of
+/// `run_main`: the work thread failed (bin/tsgo.rs `main`) and the run
+/// exited 70. With a reader, both write the error and exit 3; the control
+/// run checks that.
 #[test]
-fn a_failed_work_thread_with_no_stderr_reader_ends_unported() {
+fn a_getwd_error_with_no_stderr_reader_ends_by_sigpipe() {
     // Control: with a reader, the getwd error and exit code 3.
     let (status, stderr) = run_in_removed_cwd("wtcontrol", Stdio::piped());
     let stderr = String::from_utf8_lossy(&stderr);
@@ -76,14 +79,13 @@ fn a_failed_work_thread_with_no_stderr_reader_ends_unported() {
         stderr.starts_with("Error getting current directory: getwd: "),
         "control: {stderr}"
     );
-    // No reader: the unported exit code, not 101 or a signal.
+    // No reader: SIGPIPE, as Go N (not exit code 70 or 101).
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
     let (status, _) = run_in_removed_cwd("wtclosed", Stdio::from(writer));
-    assert_eq!(status.signal(), None, "closed stderr: {status}");
     assert_eq!(
-        status.code(),
-        Some(EXIT_UNPORTED),
+        status.signal(),
+        Some(rustix::process::Signal::PIPE.as_raw()),
         "closed stderr: {status}"
     );
 }

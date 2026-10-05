@@ -774,16 +774,24 @@ fn run_worker(workers: &'static Workers) {
 /// the workers to leave its job (`Mode::Force`) would then wait forever,
 /// and the pool would have one worker less with no word. The worker
 /// catches it and stays in the pool. A job that panicked fails: its loader
-/// resolves the rest of its keys itself (`AheadQueue::fail`). The panic
-/// hook of the bin prints the panic as for any other, and the debug log
-/// (`GOPORT_RESOLVE_AHEAD_STATS`) has a line for it.
+/// resolves the rest of its keys itself, and the other workers take no more
+/// keys (`AheadQueue::fail`). The panic hook of the bin prints the panic as
+/// for any other, and the debug log (`GOPORT_RESOLVE_AHEAD_STATS`) has a
+/// line for it.
+///
+/// The panic does not close the job (`Job::closed`): only `Workers::end`
+/// does, after the load. The loader can still take an answer that a worker
+/// published before it saw the failure, and the check of that answer
+/// passes a lookup that the snapshot has no answer for, since the snapshot
+/// takes the job's stored lookup (`ResolveAheadHost::attach`). A closed
+/// job stores no lookup, so a close here let the loader take an answer
+/// whose lookups were not stored, and then ask the OS again for them.
 // PORT: not in Go (perf).
 fn run_task(workers: &Workers, task: Task) {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     match task {
         Task::Run(job) => {
             if let Err(payload) = catch_unwind(AssertUnwindSafe(|| run_job(&job))) {
-                job.closed.store(true, Ordering::Relaxed);
                 job.queue.fail();
                 // The thread's resolve-ahead state holds the job.
                 drop(end_ahead_thread());
@@ -840,6 +848,8 @@ struct Job {
     /// The files that earlier jobs of the epoch found
     /// (`WorkerState::known_files`).
     known_files: Arc<FxHashSet<Path>>,
+    /// The load ended (`Workers::end`, the only writer): the workers take no
+    /// more keys and store no more lookups (`cached`).
     closed: AtomicBool,
     /// The workers that left this job.
     left: AtomicUsize,
@@ -854,8 +864,8 @@ struct Job {
     inject_panic: bool,
 }
 
-/// A worker's part of `job`: resolves the next key until none is left or
-/// the job ends. A resolution that panics (a Go panic) panics on the loader
+/// A worker's part of `job`: resolves the next key until none is left, the
+/// job ends or a worker failed it (`run_task`). A resolution that panics (a Go panic) panics on the loader
 /// too when it resolves the same key; the worker ends that key with no
 /// answer and leaves the job. A panic outside the resolutions fails the
 /// job (`run_task`). The worker's resolver and its caches are freed here,
@@ -886,7 +896,7 @@ fn run_job(job: &Arc<Job>) {
     });
     let current = Cell::new(None);
     let _ = crate::core::go_recover(|| {
-        while !job.closed.load(Ordering::Relaxed) {
+        while !job.closed.load(Ordering::Relaxed) && !job.queue.failed() {
             let Some((index, (containing_directory, module_name, mode))) = job.queue.take_next()
             else {
                 break;
@@ -1229,6 +1239,15 @@ impl Fs for AheadFs {
     }
 
     // Go: project/overlayfs.go:280 overlayFS.ReadFile
+    // PORT: a failed read of a file that the workers do not know from an
+    // earlier job (no read permission, or a file that went away after its
+    // `file_exists`) makes the answer unshareable: the loader resolves the
+    // key itself and gets Go's answer. Nothing that the workers keep made
+    // the answer, so they keep it (a rejection drops it, `Workers::forget`),
+    // and a package.json that no read can open does not drop it at each
+    // load. A failed read of a known file is logged, and the check rejects
+    // it (`AheadCall::Read`): the file may be gone, and the workers then
+    // drop the known files.
     fn read_file(&self, path: &str) -> (String, bool) {
         let canonical = self.path(path);
         let view = &self.job.view;
@@ -1242,6 +1261,10 @@ impl Fs for AheadFs {
         } else {
             self.os.read_file(path)
         };
+        if !ok && !self.job.known_files.contains(&canonical) {
+            note_ahead_unshareable(Some(path));
+            return (text, ok);
+        }
         note_ahead_read(path, ok.then(|| xxh3_128(text.as_bytes())));
         (text, ok)
     }
@@ -1400,8 +1423,87 @@ fn describe(module: &ResolvedModule) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AheadLookups, WorkerStats, write_debug_line};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::{
+        AheadLookups, AheadQueue, Job, KeyList, ResolverConfig, Task, WorkerStats, WorkerView,
+        Workers, run_task, write_debug_line,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A pool with no threads, for `run_task` on the test thread.
+    fn test_workers() -> Workers {
+        Workers {
+            state: std::sync::Mutex::default(),
+            wake: std::sync::Condvar::new(),
+            left: std::sync::Condvar::new(),
+            count: AtomicUsize::new(1),
+        }
+    }
+
+    /// A job of `keys` in a missing directory.
+    fn test_job(keys: KeyList, inject_panic: bool) -> Arc<Job> {
+        let root = "/goport-resolve-ahead-test-missing";
+        Arc::new(Job {
+            queue: Arc::new(AheadQueue::new(Arc::new(keys))),
+            epoch: 0,
+            known_files: Arc::default(),
+            closed: AtomicBool::new(false),
+            left: AtomicUsize::new(0),
+            answers: Arc::default(),
+            view: WorkerView {
+                current_directory: root.to_string(),
+                use_case_sensitive_file_names: true,
+                open_files: Default::default(),
+                open_directories: Default::default(),
+            },
+            stats: Arc::default(),
+            config: Arc::new(ResolverConfig {
+                options: crate::options::CompilerOptions::default(),
+                typings_location: String::new(),
+                project_name: String::new(),
+                extra_extensions: Vec::new(),
+                current_directory: root.to_string(),
+            }),
+            inject_panic,
+        })
+    }
+
+    // PORT: not in Go (resolve ahead). R169 reviewer (followups19): a worker
+    // panic fails the job but does not close it. The loader can still take
+    // an answer that another worker published before it saw the failure,
+    // and the check passes the lookups that the snapshot takes from the job
+    // (`ResolveAheadHost::attach`), so those lookups must be stored. When
+    // the panic closed the job, they were not, and the snapshot asked the
+    // OS for them again later in the load.
+    #[test]
+    fn a_worker_panic_fails_the_job_but_keeps_its_lookups() {
+        let workers = test_workers();
+        let job = test_job(KeyList::default(), true);
+        run_task(&workers, Task::Run(job.clone()));
+        assert!(job.queue.failed());
+        assert_eq!(job.left.load(Ordering::Relaxed), 1);
+        assert!(!job.closed.load(Ordering::Relaxed));
+        // Another worker's lookup during the load.
+        assert!(job.stats.file_exists(&job.closed, "/p/a.ts", || true));
+        assert_eq!(
+            AheadLookups::file_exists(&*job.stats, "/p/a.ts"),
+            Some(true)
+        );
+    }
+
+    // PORT: not in Go (resolve ahead). The workers stop at a failed job
+    // (`AheadQueue::fail`) without a close: the loader resolves its keys.
+    #[test]
+    fn a_worker_takes_no_key_of_a_failed_job() {
+        let workers = test_workers();
+        let mut keys = KeyList::default();
+        keys.push("/p", "./a", crate::options::RESOLUTION_MODE_NONE);
+        let job = test_job(keys, false);
+        job.queue.fail();
+        run_task(&workers, Task::Run(job.clone()));
+        assert_eq!(job.left.load(Ordering::Relaxed), 1);
+        assert_eq!(job.queue.next.load(Ordering::Relaxed), 0);
+    }
 
     // PORT: not in Go (resolve ahead). R167 reviewer (followups15a): a
     // worker of an ended job must not store a lookup, since the snapshot

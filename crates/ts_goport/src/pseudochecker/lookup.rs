@@ -8,7 +8,8 @@ use super::types::*;
 // PORT: every method that can reach a `node.Symbol.Declarations` read takes
 // `symbols: &SymbolArena` (the checker's arena) as its first parameter. See
 // the note on `PseudoChecker` in mod.rs.
-// PORT: Go `debug.FailBadSyntaxKind` panics; so does the port. Go returns
+// PORT: Go `debug.FailBadSyntaxKind` panics; so does the port
+// (`gostd::debug::fail_bad_syntax_kind`). Go returns
 // `nil` after it, which is unreachable, so the Rust return type is
 // `Rc<PseudoType>` without `Option`, and Go `expr != nil` checks are always
 // true.
@@ -36,7 +37,10 @@ impl PseudoChecker {
             | SyntaxKind::JsDocSignature => {
                 self.create_return_from_signature(symbols, signature_node)
             }
-            k => panic!("Unexpected node kind {k:?}: Node needs to be an inferrable node"),
+            _ => crate::gostd::debug::fail_bad_syntax_kind(
+                signature_node.kind(),
+                Some("Node needs to be an inferrable node"),
+            ),
         }
     }
 
@@ -76,7 +80,10 @@ impl PseudoChecker {
                 }
                 new_pseudo_type_no_result(node)
             }
-            k => panic!("Unexpected node kind {k:?}: node needs to be an inferrable node"),
+            _ => crate::gostd::debug::fail_bad_syntax_kind(
+                node.kind(),
+                Some("node needs to be an inferrable node"),
+            ),
         }
     }
 
@@ -637,7 +644,7 @@ impl PseudoChecker {
                 pseudo_type_number(),
             );
         }
-        panic!("Unexpected node kind {:?}", inner.kind())
+        crate::gostd::debug::fail_bad_syntax_kind(inner.kind(), None)
     }
 
     // Go: pseudochecker/lookup.go:510 typeFromTypeAssertion
@@ -953,4 +960,60 @@ fn is_contextually_typed(node: Node) -> bool {
         is_jsx_element(n) || is_jsx_expression(n)
     })
     .is_some()
+}
+
+#[cfg(test)]
+mod debug_site_tests {
+    use super::*;
+    use crate::core::go_panic_text;
+    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+    use crate::frontend::tspath::Path;
+    use crate::ls::findallreferences_p2::for_each_descendant_of_kind;
+    use crate::pseudochecker::new_pseudo_checker;
+
+    /// The last node of `kind` in a parse of `text`.
+    fn node_of_kind(text: &'static str, kind: SyntaxKind) -> Node {
+        let file = parse_source_file(
+            &SourceFileParseOptions {
+                file_name: "/a.ts".to_string(),
+                path: Path("/a.ts".to_string()),
+                ..Default::default()
+            },
+            text,
+            ScriptKind::TS,
+        )
+        .root;
+        let mut found = Node::NIL;
+        for_each_descendant_of_kind(file, kind, &mut |n| found = n);
+        assert!(!found.is_nil(), "no {kind:?} in {text:?}");
+        found
+    }
+
+    // Go pseudochecker/lookup.go:21, :64 and :506 call
+    // `debug.FailBadSyntaxKind` for a node the pseudochecker cannot type.
+    #[test]
+    fn bad_node_kinds_are_go_debug_failures() {
+        let pc = new_pseudo_checker(true, false);
+        let symbols = SymbolArena::new();
+        let ident = node_of_kind("x;", SyntaxKind::Identifier);
+        assert_eq!(
+            go_panic_text(|| {
+                pc.get_return_type_of_signature(&symbols, ident);
+            }),
+            "Debug failure. Node needs to be an inferrable node\nNode KindIdentifier was unexpected."
+        );
+        assert_eq!(
+            go_panic_text(|| {
+                pc.get_type_of_declaration(&symbols, ident);
+            }),
+            "Debug failure. node needs to be an inferrable node\nNode KindIdentifier was unexpected."
+        );
+        let prefix = node_of_kind("-x;", SyntaxKind::PrefixUnaryExpression);
+        assert_eq!(
+            go_panic_text(|| {
+                pc.type_from_primitive_literal_prefix(prefix);
+            }),
+            "Debug failure. Unexpected node.\nNode KindIdentifier was unexpected."
+        );
+    }
 }

@@ -866,7 +866,6 @@ impl DeclarationTransformer {
     }
 
     // Go: transformers/declarations/transform.go:2727 DeclarationTransformer.transformExpandoAssignment
-    #[allow(unreachable_code)] // Code after the unported `GetReferencedValueDeclaration`.
     pub(crate) fn transform_expando_assignment(&mut self, node: Node) {
         let left = node.left();
 
