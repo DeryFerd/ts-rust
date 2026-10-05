@@ -709,6 +709,56 @@ child_test! {
             1,
             "only the build project's program should stay registered"
         );
+        // The clone froze the spec project's host too, so the host holds
+        // neither the project nor the builder.
+        assert_eq!(
+            ts_goport::project::unfrozen_compiler_hosts(),
+            0,
+            "every host that the clone made should be frozen"
+        );
+    }
+}
+
+child_test! {
+    // PORT: not in Go. One clone updates the inferred project twice: the
+    // edit of a.ts makes the request for a.ts update its program
+    // (projectcollectionbuilder.go:658), and the request for the closed b.ts,
+    // which no config holds, adds it as a root and updates it again
+    // (:626 ensureInferredProjectIncludesClosedFile). Go's GC frees the
+    // first program and its host; the port releases the first program at
+    // the end of the clone (`Snapshot::clone`,
+    // `ProjectCollectionBuilder::made_programs`), and the second program,
+    // which the project keeps, still answers.
+    fn project_updated_twice_in_a_clone_releases_its_first_program() {
+        const A: &str = "/home/projects/loose/a.ts";
+        const A_URI: &str = "file:///home/projects/loose/a.ts";
+        const B: &str = "/home/projects/loose/b.ts";
+        const B_URI: &str = "file:///home/projects/loose/b.ts";
+        let a = "export const a = 1;";
+        let (session, _) =
+            projecttestutil::setup(files(&[(A, a), (B, "export const b: number = 2;")]));
+        open(&session, A_URI, a);
+        assert_eq!(default_project_kind(&session, A_URI), Kind::INFERRED);
+        assert_eq!(ts_goport::program::ls_program::registered_programs(), 1);
+
+        edit(&session, A_URI, 2, (0, 0), (0, 0), "// edited\n");
+        session.get_language_services_for_documents_loading_project_tree(
+            &bg(),
+            &[uri(A_URI), uri(B_URI)],
+        );
+        let program = program(&session, A_URI);
+        assert!(has_file(&program, B), "b.ts should be a root of the inferred project");
+        assert_eq!(sem_diag_count(&program, B), 0);
+        assert_eq!(
+            ts_goport::program::ls_program::registered_programs(),
+            1,
+            "only the inferred project's last program should stay registered"
+        );
+        assert_eq!(
+            ts_goport::project::unfrozen_compiler_hosts(),
+            0,
+            "no host of the clone should keep its project and the builder"
+        );
     }
 }
 
@@ -744,6 +794,58 @@ child_test! {
         assert!(
             same_program(&before, &after),
             "a Created event for an uninstalled dependency should not rebuild the program"
+        );
+    }
+}
+
+child_test! {
+    env &[("GOPORT_BIND_THREADS", "2")];
+    // PORT: when one clone makes the program and builds its auto-import
+    // bucket, Go's registry makes the first use of the symlink cache
+    // (ls/autoimport/registry.go:1256) before the host is frozen
+    // (project/snapshot.go:662, then :711). That build tracks the missing
+    // node_modules/<dependency> directory, so a Created event for it marks
+    // the project dirty (projectcollectionbuilder.go:1574). The parallel
+    // bind (2 threads) first builds the checkers' copy with the tracking
+    // paused (H3); the registry's build of the program's own value then
+    // reads the directory again (module/resolver.go:1061, no cache in
+    // `resolvePackageDirectoryOnly`), with the tracking on.
+    fn created_dependency_directory_rebuilds_after_auto_imports_before_freeze() {
+        let index = "export const x = 1;";
+        let (session, _) = projecttestutil::setup(files(&[
+            ("/home/projects/myproject/tsconfig.json", "{}"),
+            (
+                "/home/projects/myproject/package.json",
+                r#"{ "name": "myproject", "dependencies": { "zlibx": "^1.0.0" } }"#,
+            ),
+            (
+                "/home/projects/myproject/node_modules/other/package.json",
+                r#"{ "name": "other" }"#,
+            ),
+            ("/home/projects/myproject/src/index.ts", index),
+            ("/home/projects/myproject/src/other.ts", "export const y = 2;"),
+        ]));
+        let index_uri = "file:///home/projects/myproject/src/index.ts";
+        open(&session, index_uri, index);
+        let opened = program(&session, index_uri);
+
+        // A new import: the next clone makes a new program, and the
+        // auto-import request builds the project's bucket in that clone.
+        edit(&session, index_uri, 2, (0, 0), (0, 0), "import { y } from \"./other\";\n");
+        session
+            .get_current_language_service_with_auto_imports(&bg(), &uri(index_uri))
+            .unwrap_or_else(|err| panic!("{}", err.error()));
+        let before = program(&session, index_uri);
+        assert!(!same_program(&opened, &before));
+
+        watch(
+            &session,
+            &[(CREATED, "file:///home/projects/myproject/node_modules/zlibx")],
+        );
+        let after = program(&session, index_uri);
+        assert!(
+            !same_program(&before, &after),
+            "the registry's symlink cache build tracked node_modules/zlibx, so its Created event rebuilds"
         );
     }
 }

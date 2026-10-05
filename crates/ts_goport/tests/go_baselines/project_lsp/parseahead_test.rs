@@ -10,9 +10,10 @@
 //! temp directory and runs with no OS override (not `child_test!`).
 
 use ts_goport::frontend::compiler::{PrefetchCounts, prefetch_counts};
+use ts_goport::lsp::lsproto;
 
 use super::resolveahead_test::{file_uri, os_session, write};
-use super::util::{edit, open};
+use super::util::{edit, open, open_kind};
 
 /// A test in a child process with no OS override and two parse workers.
 macro_rules! os_child_test {
@@ -133,5 +134,162 @@ os_child_test! {
         );
         drop(session);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// Writes `files` to a new temp directory named for `name`, opens each of
+/// `opens` (file, text, language) in turn, and returns the change of the
+/// counts at each open and over all of them.
+fn counts_of_opens(
+    name: &str,
+    files: &[(&str, &str)],
+    opens: &[(&str, &str, lsproto::LanguageKind)],
+) -> (Vec<PrefetchCounts>, PrefetchCounts) {
+    let dir = std::env::temp_dir().join(format!(
+        "ts_goport_parse_ahead_{}_{name}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (file, text) in files {
+        write(&dir.to_string_lossy(), file, text);
+    }
+    let root = std::fs::canonicalize(&dir)
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let session = os_session(&root);
+    let start = prefetch_counts();
+    let each = opens
+        .iter()
+        .map(|(file, text, kind)| {
+            let before = prefetch_counts();
+            open_kind(&session, &file_uri(&root, file), text, kind.clone());
+            since(before)
+        })
+        .collect();
+    let all = since(start);
+    drop(session);
+    std::fs::remove_dir_all(&dir).unwrap();
+    (each, all)
+}
+
+const TS: lsproto::LanguageKind = lsproto::LanguageKind::TYPE_SCRIPT;
+
+os_child_test! {
+    // The build and spec projects differ only in `moduleDetection`, so the
+    // cache keys of the build project's files have another `force` (Go
+    // project/parsecache.go:22). The spec load cannot take them, so its
+    // workers parse ahead, and the loader takes their parses.
+    fn a_cached_file_with_another_force_is_parsed_ahead() {
+        let files = [
+            FILES[0],
+            (
+                "tsconfig.build.json",
+                r#"{ "compilerOptions": { "noLib": true, "types": [], "moduleDetection": "force" }, "include": ["src/**/*.ts"] }"#,
+            ),
+            (
+                "tsconfig.spec.json",
+                r#"{ "compilerOptions": { "noLib": true, "types": [], "moduleDetection": "legacy" }, "include": ["src/**/*.ts"] }"#,
+            ),
+            ("src/main.ts", MAIN),
+            ("src/helper.ts", HELPER),
+        ];
+        let (each, all) = counts_of_opens("force", &files, &[("src/main.ts", MAIN, TS)]);
+        assert_eq!(
+            (each[0].pool_loads, each[0].cached_loads),
+            (2, 0),
+            "build and spec parse ahead: {each:?}"
+        );
+        assert_eq!(all.untaken, 0, "every worker parse was taken: {all:?}");
+    }
+}
+
+os_child_test! {
+    // In a `"type": "module"` scope with `module` nodenext and
+    // `moduleDetection` auto, every key has `force` set (Go
+    // ast/parseoptions.go:46 isFileForcedToBeModuleByFormat), which the host
+    // cannot know before the load finds the scope. The spec project made
+    // again still takes every file from the cache.
+    fn a_made_again_project_in_an_esm_scope_parses_nothing_ahead() {
+        let files = [
+            ("package.json", r#"{ "name": "esm", "type": "module" }"#),
+            FILES[0],
+            (
+                "tsconfig.build.json",
+                r#"{ "compilerOptions": { "noLib": true, "types": [], "module": "nodenext", "moduleDetection": "auto" }, "include": ["src/**/*.ts"] }"#,
+            ),
+            (
+                "tsconfig.spec.json",
+                r#"{ "compilerOptions": { "noLib": true, "types": [], "module": "nodenext", "moduleDetection": "auto", "jsx": "react-jsx" }, "include": ["src/**/*.ts"] }"#,
+            ),
+            ("src/main.ts", MAIN),
+            ("src/helper.ts", HELPER),
+        ];
+        let (each, all) = counts_of_opens(
+            "esm",
+            &files,
+            &[("src/main.ts", MAIN, TS), ("src/helper.ts", HELPER, TS)],
+        );
+        assert_eq!(
+            (each[1].pool_loads, each[1].cached_loads, each[1].reads),
+            (0, 1, 0),
+            "the spec project made again parses nothing ahead: {each:?}"
+        );
+        assert_eq!(all.untaken, 0, "every worker parse was taken: {all:?}");
+    }
+}
+
+os_child_test! {
+    // An open file's key has the kind of its language id (Go
+    // project/overlayfs.go:178 `Overlay.Kind`), here TSX for a `.ts` name.
+    // The spec project made again takes it from the cache.
+    fn a_made_again_project_takes_an_open_file_of_another_kind_from_the_cache() {
+        let (each, all) = counts_of_opens(
+            "kind",
+            FILES,
+            &[
+                ("src/helper.ts", HELPER, lsproto::LanguageKind::TYPE_SCRIPT_REACT),
+                ("src/main.ts", MAIN, TS),
+            ],
+        );
+        assert_eq!(
+            (each[1].pool_loads, each[1].cached_loads, each[1].reads),
+            (0, 1, 0),
+            "the spec project made again parses nothing ahead: {each:?}"
+        );
+        assert_eq!(all.untaken, 0, "every worker parse was taken: {all:?}");
+    }
+}
+
+os_child_test! {
+    // The app project uses the sources of its lib reference, which it parses
+    // with lib's options (Go compiler/fileloader.go:418,
+    // projectreferencefilemapper.go:80 getCompilerOptionsForFile), not its
+    // own jsx. The lib project loads first, so the app load takes every
+    // file from the cache.
+    fn a_project_with_references_takes_their_sources_from_the_cache() {
+        let files = [
+            (
+                "tsconfig.json",
+                r#"{ "files": [], "references": [{ "path": "./tsconfig.lib.json" }, { "path": "./tsconfig.app.json" }] }"#,
+            ),
+            (
+                "tsconfig.lib.json",
+                r#"{ "compilerOptions": { "composite": true, "noLib": true, "types": [] }, "include": ["src/**/*.ts"] }"#,
+            ),
+            (
+                "tsconfig.app.json",
+                r#"{ "compilerOptions": { "noLib": true, "types": [], "jsx": "react-jsx" }, "include": ["src/**/*.ts"], "references": [{ "path": "./tsconfig.lib.json" }] }"#,
+            ),
+            ("src/main.ts", MAIN),
+            ("src/helper.ts", HELPER),
+        ];
+        let (each, all) = counts_of_opens("refs", &files, &[("src/main.ts", MAIN, TS)]);
+        assert_eq!(
+            (each[0].pool_loads, each[0].cached_loads),
+            (1, 1),
+            "lib parses ahead, app takes the cache: {each:?}"
+        );
+        assert_eq!(all.untaken, 0, "every worker parse was taken: {all:?}");
     }
 }
