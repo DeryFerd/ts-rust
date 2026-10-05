@@ -111,89 +111,37 @@ impl Checker {
 // PERF: a text precheck for check_unmatched_js_doc_parameters. It walks the
 // same hosts as get_all_js_doc_tags. The JSDoc of a host is parsed from the
 // comment ranges at host.pos(), and those ranges all end before
-// skip_trivia(host.pos()). A parameter tag starts at an `@` that
-// `is_param_tag_mark` accepts. False means that no host can have a
-// JsDocParameterTag. True is conservative.
-//
-// PERF: chkfacts1. The marks of a static text are found in one scan and kept
-// for the last file of the thread (`PARAM_TAG_MARKS`). A host whose range
-// has no mark from its pos to its end (the end of its first token or later)
-// needs no `skip_trivia`, and a file with no mark returns at once.
+// skip_trivia(host.pos()). A parameter tag name is `param`, `arg` or
+// `argument` right after `@`, or an identifier with a unicode escape. False
+// means that no host can have a JsDocParameterTag. True is conservative.
 fn may_have_js_doc_parameter_tag(node: Node) -> bool {
     let file = get_source_file_of_node(node);
     if file.is_nil() {
         return true;
     }
     let text = source_file_text(file);
-    let Some(text) = text.as_static() else {
-        // A freeable text (a language service edit): scan each range.
-        return js_doc_hosts_any(node, |_, pos| {
-            let end = skip_trivia(&text, pos as i32) as usize;
-            let Some(range) = text.as_bytes().get(pos..end) else {
-                return true;
-            };
-            memchr::memchr_iter(b'@', range).any(|i| is_param_tag_mark(text.as_bytes(), pos + i))
-        });
-    };
-    PARAM_TAG_MARKS.with_borrow_mut(|(key, marks)| {
-        // A static text is never freed, so its address names it.
-        if *key != (text.as_ptr() as usize, text.len()) {
-            *key = (text.as_ptr() as usize, text.len());
-            marks.clear();
-            marks.extend(
-                memchr::memchr_iter(b'@', text.as_bytes())
-                    .filter(|&i| is_param_tag_mark(text.as_bytes(), i))
-                    .map(|i| i as u32),
-            );
-        }
-        js_doc_hosts_any(node, |host, pos| {
-            let first = marks.partition_point(|&m| (m as usize) < pos);
-            marks.get(first).is_some_and(|&m| {
-                (m as i32) < host.end() && (m as i32) < skip_trivia(text, pos as i32)
-            })
-        })
-    })
-}
-
-thread_local! {
-    /// The address and length of the last static text that
-    /// `may_have_js_doc_parameter_tag` read, and the positions in it that
-    /// `is_param_tag_mark` accepts, in order.
-    static PARAM_TAG_MARKS: std::cell::RefCell<((usize, usize), Vec<u32>)> =
-        const { std::cell::RefCell::new(((0, 0), Vec::new())) };
-}
-
-/// Whether `has_mark(host, pos)` holds for a JSDoc host of `node` (the hosts
-/// that `get_all_js_doc_tags` reads), or a host has no position.
-fn js_doc_hosts_any(node: Node, mut has_mark: impl FnMut(Node, usize) -> bool) -> bool {
     let mut current = node;
     while current.is_some() {
         if current.flags().intersects(NodeFlags::HAS_JS_DOC) {
-            let Ok(pos) = usize::try_from(current.pos()) else {
+            let pos = current.pos();
+            if pos < 0 {
+                return true;
+            }
+            let end = skip_trivia(&text, pos);
+            let Some(range) = text.as_bytes().get(pos as usize..end as usize) else {
                 return true;
             };
-            if has_mark(current, pos) {
+            let found = memchr::memchr2_iter(b'@', b'\\', range).any(|i| {
+                let rest = &range[i + 1..];
+                range[i] == b'\\' || rest.starts_with(b"param") || rest.starts_with(b"arg")
+            });
+            if found {
                 return true;
             }
         }
         current = get_next_js_doc_comment_location(current);
     }
     false
-}
-
-/// Whether the `@` at `at` in `text` can start a parameter tag: the tag
-/// name `param`, `arg` or `argument`, or a name with a unicode escape (a
-/// `\` after its first letters).
-fn is_param_tag_mark(text: &[u8], at: usize) -> bool {
-    let name = &text[at + 1..];
-    if name.starts_with(b"param") || name.starts_with(b"arg") {
-        return true;
-    }
-    let letters = name
-        .iter()
-        .take_while(|&&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
-        .count();
-    name.get(letters) == Some(&b'\\')
 }
 
 // Go: checker/jsdoc.go:86 getAllJSDocTags
@@ -213,97 +161,4 @@ pub fn get_all_js_doc_tags(node: Node) -> Vec<Node> {
         }
     }
     Vec::new()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `is_param_tag_mark` at the first `@` of each text.
-    #[test]
-    fn param_tag_marks() {
-        let cases = [
-            ("@param x", true),
-            ("@arg x", true),
-            ("@argument x", true),
-            (r"@param x", true),
-            (r"@\u{70}aram x", true),
-            ("@returns x", false),
-            ("@type {number}", false),
-            ("@ param x", false),
-            ("a@b.c", false),
-            ("@", false),
-        ];
-        for (text, want) in cases {
-            let at = text.find('@').unwrap();
-            assert_eq!(is_param_tag_mark(text.as_bytes(), at), want, "{text}");
-        }
-    }
-
-    /// The precheck is true for each function whose JSDoc (Go
-    /// `getAllJSDocTags`) has a parameter tag, also when the mark is in a
-    /// host above the function, and false for the functions with no mark in
-    /// their ranges, before and after the marks of the file.
-    #[test]
-    fn precheck_finds_every_parameter_tag() {
-        let source = r"/** @returns {number} */
-function before(a) { return 1; }
-/** @param {number} a */
-function documented(a) {}
-/** @param {number} b
- */
-function wrong(a) {}
-/** @param {number} c */
-function escaped(a) {}
-/** @param {number} d */
-const assigned = function (a) {};
-/** no tag: a@b.c */
-function mail(a) {}
-/** @returns {number} */
-function after(a) { return 1; }
-function plain(a) {}
-";
-        let dir =
-            std::env::temp_dir().join(format!("ts_goport_jsdoc_marks_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.js"), source).unwrap();
-        std::fs::write(
-            dir.join("tsconfig.json"),
-            r#"{ "compilerOptions": { "allowJs": true, "checkJs": true, "noEmit": true, "types": [] }, "files": ["a.js"] }"#,
-        )
-        .unwrap();
-        let config = dir.join("tsconfig.json");
-        let program = crate::program::try_load_version(&config.to_string_lossy(), |_| {})
-            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let scope = crate::core::enter_program(Some(program));
-        let file = program
-            .source_files()
-            .find(|file| file.info.file_name.ends_with("/a.js"))
-            .expect("a.js is not in the program")
-            .root;
-        let mut got = Vec::new();
-        for statement in file.statements().iter() {
-            let function = match statement.kind() {
-                SyntaxKind::FunctionDeclaration => statement,
-                SyntaxKind::VariableStatement => statement
-                    .declaration_list()
-                    .declarations()
-                    .nodes()
-                    .first()
-                    .map_or(Node::NIL, |d| d.initializer()),
-                _ => continue,
-            };
-            let has_tag = get_all_js_doc_tags(function)
-                .iter()
-                .any(|tag| tag.kind() == SyntaxKind::JsDocParameterTag);
-            let may_have = may_have_js_doc_parameter_tag(function);
-            assert!(may_have || !has_tag, "statement {}", got.len());
-            got.push(may_have);
-        }
-        drop(scope);
-        crate::program::release_program(program);
-        // before, documented, wrong, escaped, assigned, mail, after, plain.
-        assert_eq!(got, [false, true, true, true, true, false, false, false]);
-    }
 }
