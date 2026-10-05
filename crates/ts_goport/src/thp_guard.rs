@@ -63,15 +63,20 @@ const DEFAULT_MIN_FREE_MIB: u64 = 64;
 /// compaction stall.
 const POLL_MIN: Duration = Duration::from_millis(5);
 
-/// The longest wait between two reads. One read costs about 66 us of CPU
-/// on cup2 (cliperf1: 146 ms per eslint-plugin-svelte check of 11 s with
-/// reads every 5 ms), so 50 ms keeps the guard under 0.2% of one core.
+/// The longest wait between two reads. One wake and read costs 55 to 190 us
+/// of CPU (thpguard1, schedstat of the thread: cup2 about 65, alvin 130 to
+/// 190; a longer sleep costs more per wake), so 50 ms keeps the guard under
+/// 0.4% of one core. With reads every 5 ms it took 1.2% to 2.7% of the CPU
+/// of a single-threaded check (cliperf1 on cup2, thpguard1 on alvin).
 const POLL_MAX: Duration = Duration::from_millis(50);
 
 /// The fastest fall of the free memory that `next_poll` plans for, in
-/// bytes per ms: 2x the fastest seen. perf13b saw up to 36 MiB in 5 ms.
-/// thpguard1 on zbook (no guard, other agents building) saw up to 92 MiB in
-/// 5 ms, 168 MiB in 10 ms and 268 MiB in 50 ms.
+/// bytes per ms. thpguard1 traced the fall with no guard (1 ms reads, zbook
+/// with other agents building, and cup2): at most 122 MiB in 5 ms, 168 MiB
+/// in 10 ms and 268 MiB in 50 ms (perf13b: 36 MiB in 5 ms). So a wait of
+/// 10 ms covers 2x the largest 10 ms fall, and a wait of 50 ms 6x the
+/// largest 50 ms fall. Less than 192 MiB above the limit the wait is 5 ms,
+/// as it was before `next_poll`.
 const MAX_FALL_PER_MS: u64 = 32 << 20;
 
 /// The watcher stops after this time, so a long run does not read the
@@ -347,9 +352,9 @@ fn watch_step(elapsed: Duration, free: Option<u64>, min_free: u64) -> Watch {
 /// `MAX_FALL_PER_MS`, from `POLL_MIN` to `POLL_MAX`. So the watcher reads
 /// before the memory can reach the limit, and near the limit it reads as
 /// often as it did with a fixed 5 ms (cliperf1 rank 9: the fixed 5 ms read
-/// cost 1.2% to 1.5% of the CPU of a single-threaded run on cup2). Up to
-/// 224 MiB free (zbook in cliperf1 gapA: 166 MiB): 5 ms. 1,664 MiB or more
-/// free: 50 ms.
+/// cost 1.2% to 1.5% of the CPU of a single-threaded run on cup2). Less
+/// than 256 MiB free (zbook in cliperf1 gapA: 166 MiB): 5 ms. 1,664 MiB or
+/// more free: 50 ms.
 fn next_poll(free: u64, min_free: u64) -> Duration {
     let ms = free.saturating_sub(min_free) / MAX_FALL_PER_MS;
     Duration::from_millis(ms).clamp(POLL_MIN, POLL_MAX)
@@ -503,6 +508,7 @@ Node 0, zone   Normal 616681 607866 455781 337376 229283 129647  50350  16747   
         assert_eq!(next_poll(0, limit), POLL_MIN);
         assert_eq!(next_poll(limit, limit), POLL_MIN);
         assert_eq!(next_poll(limit + 191 * MIB, limit), POLL_MIN);
+        assert_eq!(next_poll(limit + 192 * MIB, limit), ms(6));
         // zbook (cliperf1 gapA): 166 MiB free.
         assert_eq!(next_poll(166 * MIB, limit), POLL_MIN);
         assert_eq!(next_poll(limit + 320 * MIB, limit), ms(10));
@@ -512,9 +518,9 @@ Node 0, zone   Normal 616681 607866 455781 337376 229283 129647  50350  16747   
         assert_eq!(next_poll(limit + 1600 * MIB, limit), POLL_MAX);
         assert_eq!(next_poll(u64::MAX, limit), POLL_MAX);
         // With as much free above the limit as the largest fall that
-        // thpguard1 saw in 5, 10 and 50 ms on zbook, the next read comes
-        // within that time.
-        for (window, fall) in [(5, 92), (10, 168), (50, 268)] {
+        // thpguard1 saw in 5, 10 and 50 ms, the next read comes within that
+        // time.
+        for (window, fall) in [(5, 122), (10, 168), (50, 268)] {
             assert!(next_poll(limit + fall * MIB, limit) <= ms(window));
         }
         // A wait never lets the planned fall pass the limit.
