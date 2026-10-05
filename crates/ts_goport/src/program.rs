@@ -851,6 +851,8 @@ pub(crate) struct VersionTables {
     /// chunks of a dead file version until the release frees it (lsshells
     /// M2c, M3d).
     bound_symbols: OnceLock<SymbolArena>,
+    /// Go `Program.packagesMap`, made on first use (`get_packages_map`).
+    packages_map: OnceLock<Arc<FxHashMap<String, bool>>>,
 }
 
 impl VersionTables {
@@ -895,6 +897,7 @@ impl VersionTables {
             go: None,
             file_versions: Vec::new(),
             bound_symbols: OnceLock::new(),
+            packages_map: OnceLock::new(),
         }
     }
 
@@ -2698,21 +2701,56 @@ pub fn single_threaded() -> bool {
     prog().options.single_threaded.is_true()
 }
 
+/// A module resolution of the current program (`get_resolved_module`).
+// PERF (chkport1): the leaked tables of a one-program process live to the
+// end, so their resolution is borrowed with no reference count change. A
+// program version or an alias resolver gives a copy of the `Arc`.
+pub enum ResolvedModuleRef {
+    Static(&'static ResolvedModule),
+    Shared(Arc<ResolvedModule>),
+}
+
+impl Deref for ResolvedModuleRef {
+    type Target = ResolvedModule;
+
+    #[inline]
+    fn deref(&self) -> &ResolvedModule {
+        match self {
+            ResolvedModuleRef::Static(module) => module,
+            ResolvedModuleRef::Shared(module) => module,
+        }
+    }
+}
+
 // Go: compiler/program.go:623 GetResolvedModule
 // PERF: the stored resolution is shared, not copied.
 pub fn get_resolved_module(
     file: Node,
     module_reference: &str,
     mode: ResolutionMode,
-) -> Option<Arc<ResolvedModule>> {
+) -> Option<ResolvedModuleRef> {
     // Go: ls/autoimport/aliasresolver.go:116 GetResolvedModule (never nil)
     if let Some(resolver) = alias_resolver() {
-        return Some(resolver.resolved_module(file, module_reference, mode));
+        return Some(ResolvedModuleRef::Shared(resolver.resolved_module(
+            file,
+            module_reference,
+            mode,
+        )));
+    }
+    if let TablesSlot::Leaked(tables) = &state().tables {
+        let go = tables
+            .go
+            .as_ref()
+            .expect("Go frontend data of an alias resolver program");
+        return go
+            .get_resolved_module(file, module_reference, mode)
+            .map(|module| ResolvedModuleRef::Static(module));
     }
     with_go(|go| {
         go.get_resolved_module(file, module_reference, mode)
             .cloned()
     })
+    .map(ResolvedModuleRef::Shared)
 }
 
 // Go: compiler/program.go:632 GetResolvedModuleFromModuleSpecifier
@@ -2726,7 +2764,7 @@ pub fn get_resolved_module_from_module_specifier(
         panic!("moduleSpecifier must be a StringLiteralLike");
     }
     let mode = get_mode_for_usage_location(file, module_specifier);
-    get_resolved_module(file, module_specifier.text(), mode).map(Arc::unwrap_or_clone)
+    get_resolved_module(file, module_specifier.text(), mode).map(|module| (*module).clone())
 }
 
 // Go: compiler/program.go:640 GetResolvedModules
@@ -3106,14 +3144,26 @@ pub fn get_import_helpers_import_specifier(path: &str) -> Node {
 }
 
 // Go: compiler/program.go:650 GetPackagesMap
+// PORT: made once per program version, as Go `packagesMapOnce`, and kept
+// in its tables. The checker copies it (`Checker::get_packages_map`).
+pub fn get_packages_map() -> Arc<FxHashMap<String, bool>> {
+    with_tables(|tables| {
+        Arc::clone(
+            tables
+                .packages_map
+                .get_or_init(|| Arc::new(packages_map(tables))),
+        )
+    })
+}
+
+// Go: compiler/program.go:652 (the packagesMapOnce func)
 // Go: checker/utilities.go:1722 getPackagesMap (the same body)
-// PORT: Go caches the map on the program (and on the checker); this builds
-// it on each call. Go ranges over `GetResolvedModules()`, the program's own
-// map. With the Go frontend that is the version's map in `GoSharedState`,
-// borrowed, so no owned copy of every resolution stays with the version.
-// An alias resolver program (no resolutions) uses `get_resolved_modules`.
-// The result does not depend on the order: each value is an OR.
-pub fn get_packages_map() -> FxHashMap<String, bool> {
+// PORT: Go ranges over `GetResolvedModules()`, the program's own map. With
+// the Go frontend that is the version's map in `GoSharedState`, borrowed,
+// so no owned copy of every resolution stays with the version. An alias
+// resolver program (no resolutions) uses `get_resolved_modules`. The result
+// does not depend on the order: each value is an OR.
+fn packages_map(tables: &VersionTables) -> FxHashMap<String, bool> {
     let mut packages_map: FxHashMap<String, bool> = FxHashMap::default();
     let mut add = |module: &ResolvedModule| {
         if !module.package_id.name.is_empty() {
@@ -3127,14 +3177,12 @@ pub fn get_packages_map() -> FxHashMap<String, bool> {
             );
         }
     };
-    let is_go = with_tables(|tables| {
-        let go = tables.go.as_ref()?;
-        go.resolved_modules().for_each(&mut add);
-        Some(())
-    });
-    if is_go.is_none() {
-        for resolved_modules_in_file in get_resolved_modules().values() {
-            resolved_modules_in_file.values().for_each(&mut add);
+    match tables.go.as_ref() {
+        Some(go) => go.resolved_modules().for_each(&mut add),
+        None => {
+            for resolved_modules_in_file in get_resolved_modules().values() {
+                resolved_modules_in_file.values().for_each(&mut add);
+            }
         }
     }
     packages_map

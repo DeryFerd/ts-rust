@@ -1286,9 +1286,11 @@ impl Checker {
     // PORT: the Go field is a nil-able map. The Rust field is a plain
     // `FxHashMap`, so an empty map means "not computed yet". An empty computed
     // map is recomputed to the same empty result, so behavior is the same.
+    // Go builds the map from the program's resolutions with the same body as
+    // `Program.GetPackagesMap`; here it is a copy of the program's map.
     pub fn get_packages_map(&mut self) -> &FxHashMap<String, bool> {
         if self.packages_map.is_empty() {
-            self.packages_map = crate::program::get_packages_map();
+            self.packages_map = FxHashMap::clone(&crate::program::get_packages_map());
         }
         &self.packages_map
     }
@@ -1458,10 +1460,9 @@ pub fn create_module_not_found_chain(
 
 /// `create_module_not_found_chain` that reads the packages map from
 /// `packages_map`, called only when the map is needed.
-// PERF: chkport1 item 3. `program::get_packages_map` builds the map from
-// every resolution of the program on each call (Go builds it once per
-// program, `packagesMapOnce`). The checker passes its own memo
-// (`Checker::get_packages_map`, Go `c.packagesMap`).
+// PERF: chkport1 item 3. The checker passes its own memo
+// (`Checker::get_packages_map`, Go `c.packagesMap`). Others pass the
+// program's map (`program::get_packages_map`, made once per program).
 pub fn create_module_not_found_chain_with<M: std::borrow::Borrow<FxHashMap<String, bool>>>(
     _program: &GoProgram,
     file: Node,

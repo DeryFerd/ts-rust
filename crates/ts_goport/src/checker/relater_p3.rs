@@ -869,6 +869,35 @@ impl Checker {
         )
     }
 
+    // PORT: perf (perffu1), no Go function. True when Go
+    // `inferTypesFromTemplateLiteralType(source, target)` returns nil before
+    // it makes a type: `source` is not a string or template literal type, or
+    // it fails the start and end text test of
+    // `inferFromLiteralPartsToTemplateLiteral`. Then
+    // `is_type_matched_by_template_literal_type` is false, so a caller tests
+    // this before it clones the template literal type `target`.
+    pub fn template_literal_match_fails_early(&self, source: TypeId, target: TypeId) -> bool {
+        let flags = self.ty(source).flags;
+        if flags.intersects(TypeFlags::STRING_LITERAL) {
+            return self.string_literal_misses_template_literal_ends(source, target);
+        }
+        if !flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
+            return true;
+        }
+        let source = self.ty(source).as_template_literal_type();
+        let target = self.ty(target).as_template_literal_type();
+        if source.texts == target.texts {
+            return false;
+        }
+        !literal_part_ends_match(
+            &go_bytes_of(&source.texts[0], source.go_plain),
+            &go_bytes_of(&source.texts[source.texts.len() - 1], source.go_plain),
+            source.texts.len() == 1,
+            &go_bytes_of(&target.texts[0], target.go_plain),
+            &go_bytes_of(&target.texts[target.texts.len() - 1], target.go_plain),
+        )
+    }
+
     // Go: checker/relater.go:2365 isTypeMatchedByTemplateLiteralType
     pub fn is_type_matched_by_template_literal_type(
         &mut self,
