@@ -472,7 +472,9 @@ impl CheckerPool {
         let missing = self.persistent_checker.borrow().is_none();
         if missing {
             (self.log)("checkerpool: Creating persistent checker");
-            let c = Rc::new(RefCell::new(ls_program::new_checker(&self.program)));
+            // PORT: the API hands it symbols of other projects
+            // (`ls_program::new_api_checker`).
+            let c = Rc::new(RefCell::new(ls_program::new_api_checker(&self.program)));
             *self.persistent_checker.borrow_mut() = Some(c);
         }
 

@@ -561,12 +561,34 @@ pub fn new_checker(p: &NewProgram) -> Checker {
 /// (`program::new_alias_resolver_program`) has no `NewProgram`.
 pub fn new_checker_for_version(version: &'static GoProgram) -> Checker {
     let _program = enter_version(version);
-    let id = NEXT_CHECKER_ID.with(|next| {
+    Checker::new(next_checker_index())
+}
+
+/// `new_checker` for the API's persistent checker
+/// (`project::checkerpool` `get_persistent_checker`). Its symbol arena
+/// copies the binder lineage as it is when the checker is made
+/// (`program::lineage_for_checker`), not the program's older copy
+/// (`program::bound_symbols`).
+// PORT: Go's API hands a symbol of any project to this checker
+// (api/session.go:2439 handleGetTypeOfSymbol), and a Go checker reads
+// `node.Symbol()` of every bound file. A port checker reads only the
+// lineage ids of its copy, so this checker can read the file versions that
+// other programs bound after its program did. Lineage ids are global, so
+// its reads of its own files do not change. It keeps the lineage chunks of
+// its copy until it drops.
+pub fn new_api_checker(p: &NewProgram) -> Checker {
+    let _program = enter_version(program_version(p));
+    crate::program::bind_all();
+    Checker::with_symbols(next_checker_index(), crate::program::lineage_for_checker())
+}
+
+/// The next checker index (`Checker::new`): Go `nextCheckerID.Add(1) - 1`.
+fn next_checker_index() -> usize {
+    NEXT_CHECKER_ID.with(|next| {
         let id = next.get() + 1;
         next.set(id);
-        id
-    });
-    Checker::new((id - 1) as usize)
+        (id - 1) as usize
+    })
 }
 
 // ---------------------------------------------------------------------------

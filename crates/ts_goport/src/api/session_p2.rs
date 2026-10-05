@@ -6,8 +6,8 @@ use crate::api::prelude::*;
 // `computeSnapshotChanges`, `Close`, and the references, signature usage and
 // completion handlers. The file header of `session_p1.rs` holds the PORT
 // notes for both files (registry entries keep the owning checker; handles
-// cross to the setup checker only through `checker_symbol`, `checker_type`
-// and `checker_signature`).
+// cross to the setup checker only through `checker_symbol`,
+// `checker_symbol_for_names`, `checker_type` and `checker_signature`).
 
 use crate::api::encoder;
 use crate::api::requestfilesystem;
@@ -159,9 +159,12 @@ impl Session {
         // More than one symbol, need a checker to sort
         let setup = self.setup_checker(ctx, params.snapshot, &params.project)?;
 
-        let mut symbols: Vec<SymbolId> = Vec::with_capacity(table_len);
+        // PORT: the setup checker only sorts (`checker_symbol_for_names`).
+        // Each entry keeps the symbol of `checker` for its answer, which Go
+        // reads with no checker, as the one-entry answer above does.
+        let mut symbols: Vec<(SymbolId, SymbolId)> = Vec::with_capacity(table_len);
         for sub in subs {
-            symbols.push(checker_symbol(&setup.checker, &checker, sub));
+            symbols.push((checker_symbol_for_names(&setup.checker, &checker, sub), sub));
         }
         // Go: api/session.go:2196 slices.SortFunc(symbols, setup.checker.CompareSymbols)
         // PORT: `CompareSymbols` is not a total order (see
@@ -169,14 +172,14 @@ impl Session {
         // which can panic.
         {
             let mut c = setup.checker.borrow_mut();
-            crate::gostd::slices::sort_func(&mut symbols, |&a, &b| {
+            crate::gostd::slices::sort_func(&mut symbols, |&(a, _), &(b, _)| {
                 c.compare_symbols_exported(a, b)
             });
         }
 
         let mut results = Vec::with_capacity(symbols.len());
-        for sub in symbols {
-            results.push(setup.new_symbol_response(sub));
+        for (_, sub) in symbols {
+            results.push(sd.new_symbol_response(&checker, sub, &setup.project_id));
         }
         Ok(results)
     }
@@ -1688,7 +1691,15 @@ impl Session {
         if symbol.is_nil() {
             return Ok(String::new());
         }
-        let symbol = checker_symbol(&setup.checker, &owner, symbol);
+        // PORT: the name reads names, declarations and parents
+        // (`checker_symbol_for_names`), but the name of an ambient module
+        // (getSpecifierForModuleSymbol) also reads the file symbol of its
+        // declaration and the type of its import attributes.
+        let symbol = if prints_ambient_module(&owner.borrow().symbols, symbol) {
+            checker_symbol(&setup.checker, &owner, symbol)
+        } else {
+            checker_symbol_for_names(&setup.checker, &owner, symbol)
+        };
 
         let result = setup
             .checker
@@ -1898,6 +1909,25 @@ impl Session {
 
         Ok(setup.new_symbol_response(member))
     }
+}
+
+/// True when `symbol` or one of its parents is a module that
+/// `getFullyQualifiedName` prints with getSpecifierForModuleSymbol and no
+/// source file declaration: an ambient module or a module augmentation
+/// (`declare module "m"`).
+fn prints_ambient_module(symbols: &SymbolArena, mut symbol: SymbolId) -> bool {
+    while symbol.is_some() {
+        let s = symbols.sym(symbol);
+        if s.declarations
+            .iter()
+            .any(|&declaration| is_module_with_string_literal_name(declaration))
+            && get_declaration_of_kind(symbols, symbol, SyntaxKind::SourceFile).is_nil()
+        {
+            return true;
+        }
+        symbol = s.parent;
+    }
+    false
 }
 
 impl Session {

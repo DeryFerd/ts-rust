@@ -62,6 +62,7 @@ mod api_session_batch_test;
 mod api_session_completion_test;
 mod api_session_createprogram_test;
 mod api_session_createsourcefile_test;
+mod api_session_crossproject_test;
 mod api_session_misuse_test;
 mod api_session_module_resolution_test;
 mod api_session_requestfilesystem_test;
