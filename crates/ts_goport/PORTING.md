@@ -31,8 +31,11 @@ the most literal port and add a `// PORT:` comment that explains the choice.
   `debug::*`): the check stays on in release builds and fails with Go's
   "panic: Debug failure. ..." text and exit 2. A check that only the port
   has stays `debug_assert!`. Older ports keep `debug_assert!` at some Go
-  `debug.Assert` sites (47 checker, 15 ls and 3 compiler sites, state notes
-  `sweepN3-go-assert-2026-10-01` and `portgaps1-decisions-2026-10-04`).
+  `debug.Assert` sites (47 checker, 15 ls, 3 compiler, 5 parser
+  (`parser_p3.rs`, `parser_p4.rs`) and 2 class fields transform
+  (`class_fields.rs`, `class_fields_p2.rs`, Go `debug.AssertNever`) sites,
+  state notes `sweepN3-go-assert-2026-10-01` and
+  `portgaps1-decisions-2026-10-04`).
 
 ## Names
 

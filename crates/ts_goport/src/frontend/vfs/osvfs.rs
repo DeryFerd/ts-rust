@@ -46,7 +46,7 @@ pub fn go_string_from_os(s: impl Into<OsString>) -> String {
 }
 
 // PORT divergence: off unix an OS path is text (UTF-16 on Windows), and the
-// port converts it lossily. Go on Windows uses WTF-8 (go1.26
+// port converts it lossily. Go on Windows uses WTF-8 (go1.27.1
 // syscall/wtf8_windows.go): `UTF16ToString` keeps an unpaired surrogate as
 // its 3-byte WTF-8 form, and `UTF16FromString` turns those 3 bytes back into
 // the surrogate, so a name read from the OS goes back to the OS unchanged.
@@ -78,7 +78,7 @@ pub fn os_args() -> Vec<String> {
 /// The current directory in the port form (Go `os.Getwd`, see `os_path`).
 /// With an OS override installed, the override's directory.
 /// `getwd_error_text` gives the Go text of an error.
-// Go: os/getwd.go:26 Getwd (go1.26.4)
+// Go: os/getwd.go:26 Getwd (go1.27.1)
 // PORT: on unix, `$PWD` when it is absolute and names the same file as "."
 // (Go `SameFile`: the same device and inode), so a directory reached
 // through a symlink keeps the link path. Else `syscall.Getwd` is
@@ -717,7 +717,7 @@ fn os_remove_all(path: &str) -> Result<(), FsError> {
     }
 }
 
-// Go: os/path.go:19 MkdirAll (go1.26.4)
+// Go: os/path.go:19 MkdirAll (go1.27.1)
 // MkdirAll creates a directory named path,
 // along with any necessary parents, and returns nil,
 // or else returns an error.
@@ -776,7 +776,7 @@ pub fn os_mkdir_all(path: &str, perm: u32) -> Result<(), FsError> {
     Ok(())
 }
 
-// Go: syscall.ENOTDIR (go1.26.4 syscall/zerrors_linux_amd64.go; darwin and
+// Go: syscall.ENOTDIR (go1.27.1 syscall/zerrors_linux_amd64.go; darwin and
 // the BSDs have the same value). On Windows it is ERROR_PATH_NOT_FOUND
 // (syscall/zerrors_windows.go).
 #[cfg(not(windows))]

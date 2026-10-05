@@ -52,7 +52,8 @@ pub fn get_all_rules() -> Vec<RuleSpec> {
     // because EndOfFile is skipped), so both results above share one backing
     // array and the second call overwrites the last element of the first. In
     // Go, anyTokenIncludingMultilineComments ends with KindEndOfFile, not
-    // KindMultiLineCommentTrivia (checked with go1.26). Reproduce that.
+    // KindMultiLineCommentTrivia (checked with go1.26 and go1.27.1,
+    // followups24 appendcap-go.txt). Reproduce that.
     let last = any_token_including_multiline_comments.tokens.len() - 1;
     any_token_including_multiline_comments.tokens[last] = any_token_including_eof.tokens[last];
     let keywords = token_range_from_range(SyntaxKind::FIRST_KEYWORD, SyntaxKind::LAST_KEYWORD);
