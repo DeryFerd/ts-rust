@@ -3334,4 +3334,3 @@ fn rune_to_char(r: i32) -> char {
 fn unicode_is_space(r: i32) -> bool {
     char::from_u32(r as u32).is_some_and(char::is_whitespace)
 }
-

@@ -121,7 +121,10 @@ fn a_bad_server_flag_with_no_stderr_reader_ends_by_sigpipe() {
             }
             assert_eq!(stderr, want, "{mode} control: {status}");
         } else {
-            assert!(stderr.starts_with(&want), "{mode} control: {status} {stderr:?}");
+            assert!(
+                stderr.starts_with(&want),
+                "{mode} control: {status} {stderr:?}"
+            );
         }
         assert_eq!(status.code(), Some(2), "{mode} control: {status}");
         // No reader: SIGPIPE, as Go N (not exit code 70).
