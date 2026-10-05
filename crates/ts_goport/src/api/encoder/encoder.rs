@@ -14,7 +14,8 @@
 //!   `parsed_source_file_of`.
 //! - The other Go `SourceFile` fields that the parser sets (`Path()`,
 //!   `Imports()`, `ModuleAugmentations`, ...) are read through
-//!   `source_file_fields`, which also works for a file that is parsed
+//!   `source_file_fields`: from the record that the caller gives, else from
+//!   the published file, else from the parse of a file that is parsed
 //!   outside a program.
 
 use crate::api::encoder::prelude::*;
@@ -437,7 +438,11 @@ fn source_file_node_count(source_file: Node) -> usize {
 // PORT: Go reads them from the `*ast.SourceFile`. A published file has them
 // in its `GoFile` (`source_file_info`). A file that is parsed outside a
 // program (Go `parser.ParseSourceFile`, as the encoder tests do) is not
-// published and has no `GoFile`; its `ParsedSourceFile` has them.
+// published and has no `GoFile`; its `ParsedSourceFile` has them. The
+// leased file of an api `createSourceFile` is published, but its encode
+// reads the `ParsedSourceFile` that the lease holds, as Go reads the leased
+// object. The `GoFile` has copies of the same lists
+// (`program_file_info`), so the output is the same.
 enum SourceFileFields {
     Published(FileRef<SourceFileInfo>),
     Parsed(Rc<ParsedSourceFile>),
@@ -498,8 +503,15 @@ impl SourceFileFields {
     }
 }
 
-/// `SourceFileFields` of `sf`.
-fn source_file_fields(sf: Node) -> SourceFileFields {
+/// `SourceFileFields` of `sf`. `given` is the parsed-file record of `sf`
+/// when the caller of `encode_tree` holds it (`encode_parsed_source_file`).
+// PORT: Go reads the fields from the `*ast.SourceFile`. The leased file of
+// an api `createSourceFile` has them in its record, as Go has them on the
+// leased object, so its encode reads them there.
+fn source_file_fields(sf: Node, given: Option<&Rc<ParsedSourceFile>>) -> SourceFileFields {
+    if let Some(file) = given {
+        return SourceFileFields::Parsed(Rc::clone(file));
+    }
     if !is_synthetic_node(sf)
         && is_file_store_before_program(sf.file_index())
         && let Some(parsed) = parsed_source_file_of(sf)
@@ -764,16 +776,16 @@ impl EncodeTreeState {
 }
 
 // Go: api/encoder/encoder.go:446 encodeTree
-// PORT: `parsed` is the parsed-file record of `source_file` when the caller
-// holds it (`encode_parsed_source_file`). It gives the Go `SourceFile` fields
-// `Hash`, `ParseOptions()`, `NodeCount` and `TextCount`.
+// PORT: `given` is the parsed-file record of `source_file` when the caller
+// holds it (`encode_parsed_source_file`, where `root_node` is `source_file`).
+// It gives the Go `SourceFile` fields `Hash`, `ParseOptions()`, `NodeCount`,
+// `TextCount` and the parser fields (`source_file_fields`).
 fn encode_tree(
     root_node: Node,
     source_file: Node,
-    parsed: Option<&Rc<ParsedSourceFile>>,
+    given: Option<&Rc<ParsedSourceFile>>,
 ) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
-    let given = parsed.is_some();
-    let parsed = parsed
+    let parsed = given
         .cloned()
         .or_else(|| parsed_source_file_of(source_file));
     let (parent_index, node_count, prev_index): (u32, u32, u32) = (0, 0, 0);
@@ -819,7 +831,7 @@ fn encode_tree(
     let sf_extended_data_offset: usize; // byte offset in extendedData where SourceFile fields start
     if root_node.kind() == SyntaxKind::SourceFile {
         let sf = root_node;
-        let fields = source_file_fields(sf);
+        let fields = source_file_fields(sf, given);
         let mut total = fields.imports().len() + fields.module_augmentations().len();
         if fields.external_module_indicator().is_some()
             && fields.external_module_indicator() != root_node
@@ -942,6 +954,7 @@ fn encode_tree(
                 &st.position_map,
                 &mut st.extended_data,
                 &mut st.structured_data,
+                None,
             );
             let flags = node.flags().0;
             append_uint32s(
@@ -1008,6 +1021,7 @@ fn encode_tree(
             &st.position_map,
             &mut st.extended_data,
             &mut st.structured_data,
+            given,
         );
         let flags = root_node.flags().0;
         append_uint32s(&mut st.nodes, &[kind, pos, end, 0, 0, data, flags]);
@@ -1035,7 +1049,7 @@ fn encode_tree(
     let mut parse_opts: u32 = 0;
     if root_node.kind() == SyntaxKind::SourceFile {
         let parsed = parsed.unwrap_or_else(|| unported!("SourceFile.ParseOptions"));
-        hash = if given {
+        hash = if given.is_some() {
             parse_cache_hash(&parsed)
         } else {
             source_file_content_hash(source_file)
@@ -1045,7 +1059,7 @@ fn encode_tree(
         // Encode imports, moduleAugmentations, and ambientModuleNames into structured data,
         // and patch the placeholder offsets in the SourceFile extended data.
         let sf = root_node;
-        let fields = source_file_fields(sf);
+        let fields = source_file_fields(sf, given);
         let imports_offset = encode_node_index_array(
             fields.imports(),
             node_index_map.as_ref(),
@@ -1153,12 +1167,15 @@ fn put_uint32(buf: &mut [u8], offset: usize, value: u32) {
 }
 
 // Go: api/encoder/encoder.go:662 getNodeData
+// PORT: `given` is the record that `encode_tree` was given for a SourceFile
+// `node` (see `source_file_fields`), else None.
 pub fn get_node_data(
     node: Node,
     strs: &mut StringTable,
     position_map: &PositionMap,
     extended_data: &mut Vec<u8>,
     structured_data: &mut Vec<u8>,
+    given: Option<&Rc<ParsedSourceFile>>,
 ) -> u32 {
     let t = get_node_data_type(node);
     match t {
@@ -1168,7 +1185,14 @@ pub fn get_node_data(
         NODE_DATA_TYPE_STRING => t | get_node_common_data(node) | record_node_strings(node, strs),
         NODE_DATA_TYPE_EXTENDED_DATA => {
             t | get_node_common_data(node)
-                | record_extended_data(node, strs, position_map, extended_data, structured_data)
+                | record_extended_data(
+                    node,
+                    strs,
+                    position_map,
+                    extended_data,
+                    structured_data,
+                    given,
+                )
         }
         _ => panic!("unreachable"),
     }
@@ -1178,15 +1202,17 @@ pub fn get_node_data(
 const NO_STRUCTURED_DATA: u32 = 0xFFFFFFFF;
 
 // Go: api/encoder/encoder.go:678 recordExtendedData_SourceFile
+// PORT: `given` as in `get_node_data`.
 pub fn record_extended_data_source_file(
     node: Node,
     strs: &mut StringTable,
     position_map: &PositionMap,
     extended_data: &mut Vec<u8>,
     structured_data: &mut Vec<u8>,
+    given: Option<&Rc<ParsedSourceFile>>,
 ) {
     let sf = node;
-    let fields = source_file_fields(sf);
+    let fields = source_file_fields(sf, given);
     let text_index = strs.add(&source_file_text(sf), sf.kind(), sf.pos(), sf.end());
     let original_text = source_file_original_text(sf);
     let mut original_text_index = text_index;

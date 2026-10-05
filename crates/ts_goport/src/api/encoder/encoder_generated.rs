@@ -7,6 +7,7 @@
 //! the `NodeList` accessor (`statement_list`, `parameter_list`, ...).
 
 use crate::api::encoder::prelude::*;
+use crate::frontend::parser::ParsedSourceFile;
 
 // Go: api/encoder/encoder_generated.go:11 getNodeDataType
 pub fn get_node_data_type(node: Node) -> u32 {
@@ -1109,12 +1110,14 @@ pub fn record_node_strings(node: Node, strs: &mut StringTable) -> u32 {
 }
 
 // Go: api/encoder/encoder_generated.go:682 recordExtendedData
+// PORT: `given` goes to the SourceFile arm (see `get_node_data`).
 pub fn record_extended_data(
     node: Node,
     strs: &mut StringTable,
     position_map: &PositionMap,
     extended_data: &mut Vec<u8>,
     structured_data: &mut Vec<u8>,
+    given: Option<&Rc<ParsedSourceFile>>,
 ) -> u32 {
     let offset = extended_data.len() as u32;
     match node.kind() {
@@ -1182,6 +1185,7 @@ pub fn record_extended_data(
             position_map,
             extended_data,
             structured_data,
+            given,
         ),
         _ => panic!(
             "unknown extended data node kind {}",
