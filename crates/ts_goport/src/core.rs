@@ -1901,11 +1901,12 @@ impl Table {
 
     /// An empty index for `len` entries, or no index when a table of that
     /// size is searched linearly.
+    // PERF: `zeroed_vec`, as `index_insert` reads a slot before it writes one.
     fn empty_index(len: usize) -> Box<[u16]> {
         if len <= TABLE_LINEAR_MAX {
             return Box::default();
         }
-        vec![0u16; (len * 2).next_power_of_two()].into_boxed_slice()
+        zeroed_vec((len * 2).next_power_of_two()).into_boxed_slice()
     }
 
     /// True when `additional` more entries fit without growing the entries
