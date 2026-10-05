@@ -449,6 +449,16 @@ pub struct FlagSet {
     pub error_handling: ErrorHandling,
 }
 
+// Go: flag.go:431 FlagSet.Output (go1.27.1)
+/// Writes one message of the flag set to Go `os.Stderr` (the flag sets
+/// here set no output): one write of the Go bytes (an argument can hold raw
+/// bytes), as Go `fmt.Fprint` does. Go ignores the write error, and a
+/// stderr pipe with no reader ends the process by SIGPIPE (`stdio`), not by
+/// a panic of `eprint!`.
+fn output(text: &str) {
+    let _ = tsc::write_go_output(&mut tsc::stdio::Stderr, text.as_bytes());
+}
+
 // Go: flag.go:1223 NewFlagSet
 // NewFlagSet returns a new, empty flag set with the specified name and
 // error handling property. If the name is not empty, it will be printed
@@ -532,7 +542,7 @@ impl FlagSet {
     // Go: flag.go:1050 FlagSet.sprintf
     // sprintf formats the message, prints it to output, and returns it.
     fn sprintf(&self, msg: String) -> String {
-        eprintln!("{msg}");
+        output(&format!("{msg}\n"));
         msg
     }
 
@@ -556,9 +566,9 @@ impl FlagSet {
     // defaultUsage is the default function to print a usage message.
     fn default_usage(&self) {
         if self.name.is_empty() {
-            eprint!("Usage:\n");
+            output("Usage:\n");
         } else {
-            eprint!("Usage of {}:\n", self.name);
+            output(&format!("Usage of {}:\n", self.name));
         }
         self.print_defaults();
     }
@@ -605,7 +615,7 @@ impl FlagSet {
                     b.push_str(&format!(" (default {})", flag.def_value));
                 }
             }
-            eprint!("{b}\n");
+            output(&format!("{b}\n"));
         }
     }
 
