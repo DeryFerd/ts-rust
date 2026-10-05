@@ -934,16 +934,18 @@ impl Checker {
     pub fn some_property_reduces_to_never(&mut self, t: TypeId) -> bool {
         // Collect declaration counts for each property across all constituent types of the intersection.
         // PORT: with each count, whether every declaration of the name is a
-        // public method (`is_public_method`), and the parent of the first
-        // declaration.
-        // PERF: a name seen again with the parent of its first declaration is
-        // not tested again. It is almost always the same member (an instance
-        // and a static member of one class can share a name), and the order
-        // changes no answer. The tuples of an intersection share the parent
-        // of their array methods, so this saves a test for each method of
-        // each tuple (mongodb test check: 6.5% more instructions than without
-        // the test, 1.6% with this).
-        let mut counts: FxIndexMap<u32, (i32, bool, SymbolId)> = FxIndexMap::default();
+        // public method (`is_public_method`), and the value declaration of
+        // the first property of the name.
+        // PERF: a name seen again with that value declaration is the same
+        // member (an instantiation of it), so it is not tested again. The
+        // tuples of an intersection share the lib declarations of their
+        // array methods, so this saves a test for each method of each tuple
+        // (mongodb test check: the test cost 6.5% more instructions, 1.6%
+        // with the parent of the first declaration as the key). The key is
+        // not the parent: an instance and a static member of one class have
+        // the same parent, so in `A & typeof A` a `private static m()` after a
+        // public `m()` went last, after every property of the class.
+        let mut counts: FxIndexMap<u32, (i32, bool, Node)> = FxIndexMap::default();
         for i in 0..self.ty(t).types().len() {
             let u = self.type_at(t, i);
             let props = self.get_properties_of_type(u);
@@ -953,12 +955,12 @@ impl Checker {
                     indexmap::map::Entry::Occupied(entry) => {
                         let entry = entry.into_mut();
                         entry.0 += 1;
-                        if entry.1 && symbol.parent != entry.2 {
+                        if entry.1 && symbol.value_declaration != entry.2 {
                             entry.1 = self.is_public_method(prop);
                         }
                     }
                     indexmap::map::Entry::Vacant(entry) => {
-                        entry.insert((1, self.is_public_method(prop), symbol.parent));
+                        entry.insert((1, self.is_public_method(prop), symbol.value_declaration));
                     }
                 }
             }

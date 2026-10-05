@@ -22,9 +22,9 @@
 //!
 //! PORT: `Ending`, `ResolvedEntrypoint`, `GetEntrypointsFromPackageJsonInfo`,
 //! `createResolvedEntrypointHandlingSymlink`, `loadEntrypointsFromExportMap`
-//! and `getMatchedStarForPatternEntrypoint` (Go lines 2122 to 2361) are only
-//! used by `ls/autoimport` and `modulespecifiers.ProcessEntrypointEnding`
-//! (language service). They are not ported.
+//! and `getMatchedStarForPatternEntrypoint` (Go lines 2127 to 2366) are in
+//! `entrypoints.rs`. Only `ls/autoimport` and
+//! `modulespecifiers.ProcessEntrypointEnding` (language service) use them.
 
 use crate::frontend::prelude::*;
 use std::borrow::Cow;

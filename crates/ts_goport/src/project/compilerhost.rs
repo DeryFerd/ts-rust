@@ -717,7 +717,11 @@ fn check_ahead_call(
         // (a package.json that `file_exists` found was gone), or the file
         // cannot be read. The snapshot does not cache a failed read, so a
         // later read in the load can find the file, and then the worker's
-        // resolution without its text is not the loader's.
+        // resolution without its text is not the loader's. A worker logs a
+        // failed read only for a file that it knows from an earlier job, so
+        // the rejection drops the known files; any other failed read makes
+        // the answer unshareable (compiler/resolve_ahead.rs
+        // `AheadFs::read_file`).
         AheadCall::Read { hash: None, .. } => false,
         AheadCall::Read {
             file_name,

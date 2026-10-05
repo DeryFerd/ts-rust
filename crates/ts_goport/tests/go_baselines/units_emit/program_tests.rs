@@ -444,6 +444,72 @@ fn test_lazy_js_doc_link_marks_its_target_used() {
     );
 }
 
+// PORT: no Go test (followups22, R169 reviewer on basetype1). The test
+// above runs in a multi-program process (the test harness registers its
+// programs as versions), where a list of more than 3 base types is an owned
+// list that `SharedList::detach` does not read in place. This one installs
+// its program as `tsc` does (`program::load`, one program in the process),
+// so such a list is in the checker arena, and the `has_base_type` walk reads
+// it in place. The answers must be Go `hasBaseType`'s (checker.go:19888).
+#[test]
+fn test_has_base_type_reads_arena_base_types_in_place() {
+    in_child(
+        module_path!(),
+        "test_has_base_type_reads_arena_base_types_in_place",
+        || {
+            let map_fs = MapFs::from_map(
+                [
+                    (
+                        "/a.ts",
+                        "class A {}\ninterface I {}\nclass B extends A implements I {}\nclass C extends B {}\ninterface J {}\ninterface K extends A, B, C, I {}\ninterface L extends K, A, B, C {}\n",
+                    ),
+                    (
+                        "/tsconfig.json",
+                        r#"{"compilerOptions":{"strict":true,"noEmit":true},"files":["a.ts"]}"#,
+                    ),
+                ],
+                false, /*useCaseSensitiveFileNames*/
+            );
+            install_map_fs(&map_fs, "/");
+            ts_goport::program::load("/tsconfig.json");
+            assert!(!ts_goport::core::is_multi_program());
+            ts_goport::program::bind_all();
+            let file = ts_goport::program::get_source_file("/a.ts");
+            ts_goport::program::with_type_checker_for_file(file, |c| {
+                let statements = ts_goport::program::get_source_file("/a.ts").statements();
+                let mut declared = |i: usize| {
+                    let symbol = c.get_symbol_at_location_exported(statements.get(i).name());
+                    c.get_declared_type_of_symbol(symbol)
+                };
+                let [a, i, b, cc, j, k, l] = [0, 1, 2, 3, 4, 5, 6].map(&mut declared);
+                // Resolve the base types first, so each step of the walk
+                // reads them in place.
+                for t in [a, i, b, cc, j, k, l] {
+                    c.get_base_types_shared(t);
+                }
+                for (t, bases) in [(k, vec![a, b, cc, i]), (l, vec![k, a, b, cc])] {
+                    let mut buf = Default::default();
+                    let list = c.ty(t).resolved_base_types().expect("resolved");
+                    assert_eq!(
+                        list.detach(&mut buf),
+                        Some(&bases[..]),
+                        "base types of {t:?} in the checker arena"
+                    );
+                }
+                // L -> K -> I and L -> K -> C -> B -> A, through two arena
+                // lists. J is no base of either.
+                assert!(c.has_base_type(l, i));
+                assert!(c.has_base_type(l, a));
+                assert!(c.has_base_type(l, k));
+                assert!(c.has_base_type(k, cc));
+                assert!(!c.has_base_type(l, j));
+                assert!(!c.has_base_type(k, l));
+                assert!(!c.has_base_type(a, k));
+            });
+        },
+    );
+}
+
 // PORT: no Go test (basetype1). `has_base_type` (Go `hasBaseType`,
 // checker.go:19888) reads resolved base types in place with
 // `Type::resolved_base_types` and calls `get_base_types_shared` (Go

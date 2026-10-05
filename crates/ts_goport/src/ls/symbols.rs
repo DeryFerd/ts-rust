@@ -1067,3 +1067,20 @@ pub fn get_symbol_kind_from_node(node: Node) -> lsproto::SymbolKind {
     }
     lsproto::SymbolKind::VARIABLE
 }
+
+#[cfg(test)]
+mod match_score_tests {
+    use super::get_match_score;
+
+    // Go `getMatchScore` (ls/symbols.go:628) lowers both runes with
+    // `unicode.ToLower`. At pin N that is go1.27.1 (Unicode 17.0.0), where
+    // U+A7CB lowers to U+0264, so the lower case pattern matches the capital
+    // in a string-named declaration. An upper case pattern rune must match
+    // exactly.
+    #[test]
+    fn match_score_uses_unicode_17_case() {
+        assert_eq!(get_match_score("\u{A7CB}ab", "\u{264}ab"), 0);
+        assert_eq!(get_match_score("x\u{10D50}", "\u{10D70}"), 1);
+        assert_eq!(get_match_score("\u{264}ab", "\u{A7CB}"), -1);
+    }
+}

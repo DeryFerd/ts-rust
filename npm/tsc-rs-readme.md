@@ -16,6 +16,18 @@ npx tsc-rs -p tsconfig.json
 
 `tsc-rs` takes the same options as `tsc`.
 
+## VS Code
+
+The TypeScript 7 extension looks for the `typescript` package, so it does not find `tsc-rs` by
+itself. Point it at the dir of the `tsc` in the platform package, in `.vscode/settings.json`, and
+allow it when VS Code asks:
+
+```json
+{ "js/ts.tsdk.path": "node_modules/@tsc-rs/linux-x64/lib" }
+```
+
+On macOS, use `@tsc-rs/darwin-arm64`.
+
 ## Platforms
 
 - Linux x64 (static, any distribution)

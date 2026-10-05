@@ -7,9 +7,9 @@
 //!
 //! Resolve ahead runs only on the OS file system, so each test writes a
 //! project to a temp directory and runs with no OS override (not
-//! `child_test!`, which installs one). It is off on a case-insensitive file
-//! system (the default macOS volumes), where the tests are skipped
-//! (`resolve_ahead_off`).
+//! `child_test!`, which installs one). It is off when the OS file system is
+//! case-insensitive (the default macOS volumes), where the tests are
+//! skipped (`resolve_ahead_off`).
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -47,36 +47,18 @@ macro_rules! os_child_test {
     };
 }
 
-/// Why resolve ahead cannot run in these tests, if it cannot. It is off on a
-/// case-insensitive file system (project/compilerhost.rs
-/// `CompilerHost::resolve_ahead`), which the OS file system decides from the
-/// executable's path (`use_case_sensitive_file_names`), and the tests write
-/// their projects to the temp dir, so both must be case-sensitive. The
-/// default macOS volumes are not; Linux file systems are, so the tests run
-/// there.
+/// Why resolve ahead cannot run in these tests, if it cannot: it is off on
+/// a case-insensitive file system (project/compilerhost.rs
+/// `CompilerHost::resolve_ahead`), which the OS file system decides from
+/// the executable's path (`use_case_sensitive_file_names`). The default
+/// macOS volumes are case-insensitive; Linux file systems are not, so the
+/// tests run there. A temp dir on a case-insensitive volume does not turn
+/// resolve ahead off, so it does not skip the tests either
+/// (`a_case_insensitive_temp_dir_does_not_skip_the_tests`).
 // PORT: not in Go (resolve ahead is a port feature).
 fn resolve_ahead_off() -> Option<String> {
-    if !ts_goport::frontend::vfs::Fs::use_case_sensitive_file_names(&*osvfs_fs()) {
-        return Some(
-            "the OS file system is case-insensitive here, and resolve ahead is off".to_string(),
-        );
-    }
-    let probe = std::env::temp_dir().join(format!(
-        "ts_goport_resolve_ahead_Case_{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&probe).ok()?;
-    let other = std::env::temp_dir().join(format!(
-        "ts_goport_resolve_ahead_cASE_{}",
-        std::process::id()
-    ));
-    let insensitive = other.exists();
-    let _ = std::fs::remove_dir(&probe);
-    insensitive.then(|| {
-        format!(
-            "the temp dir {} is case-insensitive, and the tests write their projects there",
-            std::env::temp_dir().display()
-        )
+    (!ts_goport::frontend::vfs::Fs::use_case_sensitive_file_names(&*osvfs_fs())).then(|| {
+        "the OS file system is case-insensitive here, and resolve ahead is off".to_string()
     })
 }
 
@@ -561,9 +543,11 @@ os_child_test! {
     /// followups19 (R167 reviewer): a package.json that `file_exists` finds
     /// but that no read can open, here a Unix socket (as when a package is
     /// removed between the two calls). The worker resolves `sock` with a
-    /// failed read, and the check must not take that answer: the snapshot
+    /// failed read, and the load must not take that answer: the snapshot
     /// does not cache a failed read, so a later read in the load could find
-    /// the file. The loader resolves the key itself.
+    /// the file. The loader resolves the key itself. The workers do not
+    /// know the file from an earlier job, so the answer is not shared
+    /// (followups22, `AheadFs::read_file`), and no check rejects it.
     #[cfg(unix)]
     fn a_failed_package_json_read_is_not_taken() {
         let stats = same_with_and_without("fr", &|session, root| {
@@ -588,8 +572,59 @@ os_child_test! {
                 "{observed:?}"
             );
         });
-        assert_eq!(stats.loader.rejected, 1, "{stats:?}");
+        assert_eq!(stats.loader.rejected, 0, "{stats:?}");
+        assert_eq!(stats.loader.scopes_rejected, 0, "{stats:?}");
         assert_eq!(stats.loader.taken + 1, stats.keys, "{stats:?}");
+    }
+}
+
+os_child_test! {
+    /// followups22 (R169 reviewer): a package.json that is there but that
+    /// no read can open (no read permission). The worker read fails at each
+    /// load. The loader resolves the key itself, with Go's answer, as in a
+    /// serial load. No rejection drops what the workers keep: the next load
+    /// starts with the known files of the one before. When the check
+    /// rejected the answer, every load dropped them (`Workers::forget`).
+    #[cfg(unix)]
+    fn a_never_readable_package_json_does_not_drop_the_kept_state() {
+        let stats = same_with_and_without("locked", &|session, root| {
+            use std::os::unix::fs::PermissionsExt;
+            write(
+                root,
+                "node_modules/locked/index.d.ts",
+                "export declare const k: number;",
+            );
+            let package_json = format!("{root}/node_modules/locked/package.json");
+            write(root, "node_modules/locked/package.json", r#"{ "name": "locked" }"#);
+            std::fs::set_permissions(&package_json, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            let locked = std::fs::File::open(&package_json).is_err();
+            let uri = file_uri(root, "src/index.ts");
+            open(session, &uri, &format!("{INDEX}import {{ k }} from \"locked\";\n"));
+            program(session, &uri);
+            add_import(session, root);
+            if let Some(stats) = resolve_ahead::last_stats().filter(|_| locked) {
+                assert_eq!(stats.loader.rejected, 0, "{stats:?}");
+                assert_eq!(stats.loader.scopes_rejected, 0, "{stats:?}");
+                assert_eq!(stats.loader.taken + 1, stats.keys, "{stats:?}");
+            }
+            resolve_ahead::wait_for_frees();
+            edit_index(session, root, 3, "import { b as b2 } from \"./sub/b\";\n");
+            let observed = observe(session, root);
+            assert!(
+                observed
+                    .resolutions
+                    .iter()
+                    .any(|resolution| resolution.contains("\"locked\"")
+                        && resolution.contains("-> <root>/node_modules/locked/index.d.ts")),
+                "{observed:?}"
+            );
+            if !locked {
+                eprintln!("skipped: a file without read permission opens here");
+            }
+        });
+        assert_eq!(stats.loader.rejected, 0, "{stats:?}");
+        assert!(stats.known_files > 0, "{stats:?}");
     }
 }
 
@@ -1214,4 +1249,54 @@ os_child_test! {
 #[test]
 fn resolve_ahead_runs_on_linux() {
     assert_eq!(resolve_ahead_off(), None);
+}
+
+/// followups22 (R169 reviewer): the skip (`resolve_ahead_off`) is only the
+/// production condition. With the executable on a case-sensitive file
+/// system and the temp dir on a case-insensitive one, resolve ahead runs,
+/// so the tests must run too. The child runs one of them with `TMPDIR` on
+/// a casefold tmpfs (Linux 6.13 and later) in a new user and mount
+/// namespace. The skip that also probed the temp dir skipped it there.
+/// Where the namespace or the casefold directory cannot be made, this test
+/// is skipped.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_case_insensitive_temp_dir_does_not_skip_the_tests() {
+    const READY: &str = "casefold temp dir ready";
+    const TEST: &str = "project_lsp::resolveahead_test::takes_every_answer_of_an_unchanged_project";
+    let mount = std::env::temp_dir().join(format!(
+        "ts_goport_resolve_ahead_casefold_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir(&mount);
+    std::fs::create_dir(&mount).unwrap();
+    // $1 the mount point, $2 this test binary, $3 the test, $4 READY.
+    let script = r#"mount -t tmpfs -o casefold tmpfs "$1" 2>/dev/null || exit 0
+mkdir "$1/t" && chattr +F "$1/t" 2>/dev/null && : > "$1/t/Probe" && test -e "$1/t/pROBE" || exit 0
+echo "$4"
+TMPDIR="$1/t" exec "$2" --exact "$3" --nocapture --test-threads=1"#;
+    let output = std::process::Command::new("unshare")
+        .args(["-rm", "sh", "-c", script, "sh"])
+        .arg(&mount)
+        .arg(std::env::current_exe().unwrap())
+        .args([TEST, READY])
+        .stdin(std::process::Stdio::null())
+        .output();
+    let _ = std::fs::remove_dir(&mount);
+    let output = match output {
+        Ok(output) => output,
+        Err(err) => {
+            eprintln!("skipped: unshare: {err}");
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = format!("{stdout}{}", String::from_utf8_lossy(&output.stderr));
+    if !stdout.starts_with(READY) {
+        eprintln!("skipped: no casefold temp dir in a new namespace here:\n{text}");
+        return;
+    }
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("test result: ok. 1 passed"), "{text}");
+    assert!(!text.contains("skipped"), "{text}");
 }
