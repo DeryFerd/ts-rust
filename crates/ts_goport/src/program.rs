@@ -4860,20 +4860,14 @@ fn resolve_diagnostic_location(d: &Diagnostic) -> ResolvedLocation {
 /// Go `scanner.GetECMALineAndUTF16CharacterOfPosition` on the Go
 /// `originalTextFile` of a content-mapped file (#4712), whose line map is
 /// `core.ComputeECMALineStarts` of its original text.
-// PORT: `get_ecma_line_and_utf16_character_of_position` reads the text of a
-// file node; the original text has no node, so this is the same code on
-// the text.
+// PORT: the original text has no file node, so this is the scanner code on
+// the text (with Go's panics for a `pos` out of the text).
 fn ecma_line_and_utf16_character_of_text_position(text: &str, pos: i32) -> (i32, i32) {
-    let line_map = compute_ecma_line_starts(text);
-    let line = compute_line_of_position(&line_map, pos);
-    let end = pos as usize;
-    let mut boundary = end;
-    while !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    let character =
-        utf16_len(&text[line_map[line as usize] as usize..boundary]) + (end - boundary) as i32;
-    (line, character)
+    crate::scanner_util::ecma_line_and_utf16_character_of_text_position(
+        &compute_ecma_line_starts(text),
+        text,
+        pos,
+    )
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:380 diagnosticPrefix (#4712)
