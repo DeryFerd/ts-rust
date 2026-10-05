@@ -1127,6 +1127,253 @@ impl Checker {
     }
 }
 
+// PERF: unionsort1. The union sort and the union searches decide most
+// comparisons at the first steps of `compare_types`: the sort-order flags,
+// the name, or the first value that the type's arm compares.
+// `union_sort_key` packs those steps into one `u128` per type, read once per
+// sort or per searched list, so most comparisons are one integer compare.
+//
+// The rule: when `union_sort_key(a) < union_sort_key(b)`, Go's
+// `CompareTypes(a, b)` is negative, and Go returns at one of those first
+// steps. Those steps have no effect: they come before every lazy symbol id
+// (`compareSymbolsWorker` returns at `compareNodes` there) and before every
+// case in which Go's order is not transitive (two files with the same index
+// in `compareNodes`, an instantiation expression type against another
+// object type). Equal keys say nothing, and `compare_types` decides. So a
+// keyed comparison has the sign and the effects of Go's comparison, and a
+// sort or search that uses it makes Go's comparisons in Go's order, with
+// Go's result. The fields that the key reads are set when the type is made
+// (Go reads the same fields when it compares).
+//
+// The key: `sort flags << 96 | unnamed << 95 | value` (value < 2^95).
+// - sort flags: `getSortOrderFlags`, a `u32`.
+// - unnamed: 1 when `getTypeNameSymbol` is nil (Go puts nil names last).
+// - value, for a named type: the first 11 Go bytes of the name
+//   (`go_bytes_prefix`). For an unnamed type, by the arm that it takes in
+//   `compare_types`:
+//   - any, unknown, string and the other types that only the id tells
+//     apart: the type id (Go's last step);
+//   - object, enum-like and unique symbol types: `symbol_sort_rank` of the
+//     type's symbol (`compareSymbolsWorker` and the instantiation expression
+//     branch both start with the first declarations);
+//   - intersection: the member count (Go `compareTypeLists` compares the
+//     lengths first), then the first 87 bits of the first member's key (the
+//     first members are compared next; truncation keeps the order);
+//   - string literal: the first 11 Go bytes of the value;
+//   - number literal: `number_sort_value`;
+//   - boolean literal: 0 for false, 1 for true;
+//   - template literal: the first 11 Go bytes of the first text (Go
+//     compares the text lists first, element by element);
+//   - the other arms (union, bigint literal, index and so on): 0, so the
+//     keys tie and `compare_types` decides.
+// Equal sort flags give the same arm: types with equal flags take the same
+// branch, and every enum-like unit type takes the enum branch.
+
+/// The first 11 Go bytes of `s` as an 88-bit big-endian number, in an
+/// order that never contradicts Go `strings.Compare`. ASCII bytes are their
+/// own Go bytes, and every non-ASCII unit has Go bytes of 0x80 or more (see
+/// `compare_go_strings`). So the prefix keeps the leading ASCII bytes,
+/// writes 0x80 at the first non-ASCII byte and zeros after it, and pads a
+/// short string with zeros. Equal prefixes say nothing.
+#[inline]
+fn go_bytes_prefix(s: &str) -> u128 {
+    let b = s.as_bytes();
+    let n = b.len().min(11);
+    let mut buf = [0u8; 16];
+    buf[..n].copy_from_slice(&b[..n]);
+    let x = u128::from_be_bytes(buf);
+    let high = x & 0x8080_8080_8080_8080_8080_8080_8080_8080;
+    let x = if high == 0 {
+        x
+    } else {
+        // Byte `i` (from the left) is the first byte of 0x80 or more.
+        let i = high.leading_zeros() / 8;
+        (x & !(u128::MAX >> (8 * i))) | (0x80u128 << (120 - 8 * i))
+    };
+    x >> 40
+}
+
+/// Go `cmp.Compare` order of a number literal value: NaN first, -0 equal
+/// to +0.
+#[inline]
+fn number_sort_value(n: crate::jsnum::Number) -> u64 {
+    let x = n.0;
+    if x.is_nan() {
+        return 0;
+    }
+    // -0 + 0 is +0.
+    let bits = (x + 0.0).to_bits();
+    if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | 1 << 63
+    }
+}
+
+/// Lists shorter than this are sorted without keys: a key costs about as
+/// much as a comparison, and a short list makes few comparisons.
+const KEYED_SORT_MIN: usize = 8;
+
+/// Longer lists are sorted without keys. A key pair is 8 times the size of
+/// a `TypeId`, and the sort moves its elements: on lists of 10^4 to 10^6
+/// types (eslint-plugin-svelte) the keyed sort ran more instructions.
+const KEYED_SORT_MAX: usize = 4096;
+
+impl Checker {
+    /// The union sort key of `t` (see the PERF note above).
+    #[inline]
+    pub(crate) fn union_sort_key(&self, t: TypeId) -> u128 {
+        let ty = self.ty(t);
+        let flags = u128::from(get_sort_order_flags(ty) as u32) << 96;
+        let s = type_name_symbol(ty);
+        if s.is_some() {
+            return flags | go_bytes_prefix(&self.sym(s).name) << 7;
+        }
+        let f = ty.flags;
+        // The branches of `compare_types`, in its order.
+        let value = if f.intersects(
+            TypeFlags::ANY
+                | TypeFlags::UNKNOWN
+                | TypeFlags::STRING
+                | TypeFlags::NUMBER
+                | TypeFlags::BOOLEAN
+                | TypeFlags::BIG_INT
+                | TypeFlags::ES_SYMBOL
+                | TypeFlags::VOID
+                | TypeFlags::UNDEFINED
+                | TypeFlags::NULL
+                | TypeFlags::NEVER
+                | TypeFlags::NON_PRIMITIVE,
+        ) {
+            u128::from(ty.id.0)
+        } else if f.intersects(TypeFlags::OBJECT) {
+            u128::from(self.symbol_sort_rank(ty.symbol))
+        } else if f.intersects(TypeFlags::UNION) {
+            0
+        } else if f.intersects(TypeFlags::INTERSECTION) {
+            let members = ty.types();
+            // More than 254 members all get 255 and tie.
+            match members.first() {
+                Some(&first) if members.len() < 255 => {
+                    (members.len() as u128) << 87 | self.union_sort_key(first) >> 41
+                }
+                _ => 255 << 87,
+            }
+        } else if f
+            .intersects(TypeFlags::ENUM | TypeFlags::ENUM_LITERAL | TypeFlags::UNIQUE_ES_SYMBOL)
+        {
+            u128::from(self.symbol_sort_rank(ty.symbol))
+        } else if f.intersects(TypeFlags::STRING_LITERAL) {
+            go_bytes_prefix(literal_string_value(ty)) << 7
+        } else if f.intersects(TypeFlags::NUMBER_LITERAL) {
+            u128::from(number_sort_value(literal_number_value(ty)))
+        } else if f.intersects(TypeFlags::BOOLEAN_LITERAL) {
+            u128::from(literal_bool_value(ty))
+        } else if f.intersects(TypeFlags::TEMPLATE_LITERAL) {
+            match ty.as_template_literal_type().texts.first() {
+                Some(text) => go_bytes_prefix(text) << 7,
+                None => 0,
+            }
+        } else {
+            0
+        };
+        flags | 1 << 95 | value
+    }
+
+    /// The order of `compareSymbolsWorker` at its declaration step, as a
+    /// number. A symbol whose first declaration is in the file at index
+    /// k >= 1 gets `k << 32 | pos` (pos with its sign bit flipped, so `u32`
+    /// order is `i32` order). A declaration in the file at index 0, in a file
+    /// that is not in `file_index_map` (Go reads 0) or in no file gets 0:
+    /// Go puts those before index k >= 1 and can tie them with each other,
+    /// so their ranks tie. No symbol or no declaration gets `u64::MAX`: both
+    /// sort after a symbol with declarations (`compareNodes` also puts a nil
+    /// node last).
+    #[inline]
+    fn symbol_sort_rank(&self, s: SymbolId) -> u64 {
+        if s.is_nil() {
+            return u64::MAX;
+        }
+        let Some(&declaration) = self.sym(s).declarations.first() else {
+            return u64::MAX;
+        };
+        let file = get_source_file_of_node(declaration);
+        match self.file_index_map.get(&file) {
+            Some(&k) if k >= 1 => {
+                (u64::from(k as u32) << 32) | u64::from(declaration.pos() as u32 ^ 0x8000_0000)
+            }
+            _ => 0,
+        }
+    }
+
+    /// `compare_types(t1, t2)` with the keys of `t1` and `t2` first (see the
+    /// PERF note above). Callers use only the sign.
+    #[inline]
+    fn compare_keyed_types(&self, k1: u128, t1: TypeId, k2: u128, t2: TypeId) -> i32 {
+        if k1 != k2 {
+            return if k1 < k2 { -1 } else { 1 };
+        }
+        if t1 == t2 {
+            return 0;
+        }
+        self.compare_types(t1, t2)
+    }
+
+    /// Go `slices.SortStableFunc(types, CompareTypes)`. Lists of
+    /// `KEYED_SORT_MIN` to `KEYED_SORT_MAX` types are sorted as key pairs
+    /// with keyed comparisons: Go's algorithm (`gostd`) makes the same
+    /// comparisons in the same order, and the keys only answer some of them
+    /// early, so the result and the lazy symbol ids are Go's.
+    // Go: checker/checker.go:26275 slices.SortStableFunc(types, CompareTypes)
+    pub(crate) fn sort_union_types(&self, types: &mut [TypeId]) {
+        if !(KEYED_SORT_MIN..=KEYED_SORT_MAX).contains(&types.len()) {
+            crate::gostd::slices::sort_stable_func(types, |&a, &b| self.compare_types(a, b));
+            return;
+        }
+        let mut keyed = self.union_sort_keys(types);
+        crate::gostd::slices::sort_stable_func(&mut keyed, |&(k1, t1), &(k2, t2)| {
+            self.compare_keyed_types(k1, t1, k2, t2)
+        });
+        for (slot, &(_, t)) in types.iter_mut().zip(&keyed) {
+            *slot = t;
+        }
+    }
+
+    /// `(union_sort_key(t), t)` for each of `types`, in order.
+    pub(crate) fn union_sort_keys(&self, types: &[TypeId]) -> Vec<(u128, TypeId)> {
+        types.iter().map(|&t| (self.union_sort_key(t), t)).collect()
+    }
+
+    /// Go `slices.BinarySearchFunc(types, t, CompareTypes)` on the key pairs
+    /// of sorted types (`union_sort_keys`); `key` is the key of `t`. The
+    /// keyed comparisons have Go's signs and effects, so the search makes
+    /// Go's comparisons and gives Go's result: the index where `t` is or
+    /// would be, and whether it is there.
+    // Go: slices/sort.go:152 BinarySearchFunc
+    pub(crate) fn search_keyed_types(
+        &self,
+        keyed: &[(u128, TypeId)],
+        key: u128,
+        t: TypeId,
+    ) -> (usize, bool) {
+        crate::gostd::slices::binary_search_func(keyed, (key, t), |&(k1, t1), &(k2, t2)| {
+            self.compare_keyed_types(k1, t1, k2, t2)
+        })
+    }
+
+    /// Go `slices.BinarySearchFunc(types, t, CompareTypes)`: the index where
+    /// `t` is or would be, and whether it is there. This is Go's search, not
+    /// Rust's `binary_search_by`, which looks at other elements: it made 4%
+    /// more comparisons on realworld repos (unionsort1), and a comparison can
+    /// assign lazy symbol ids. No keys: one search reads too few elements.
+    // Go: slices/sort.go:152 BinarySearchFunc
+    pub(crate) fn search_union_types(&self, types: &[TypeId], t: TypeId) -> (usize, bool) {
+        crate::gostd::slices::binary_search_func(types, t, |&probe, &t| {
+            self.compare_types(probe, t)
+        })
+    }
+}
+
 // PORT: Go `t.AsLiteralType().value.(string)`; panics like the Go type assertion.
 fn literal_string_value(t: &Type) -> &str {
     match t.as_literal_type().value.as_ref() {
@@ -1686,4 +1933,311 @@ pub fn is_numeric_literal_name(name: &str) -> bool {
 pub fn is_this_property(node: Node) -> bool {
     (is_property_access_expression(node) || is_element_access_expression(node))
         && node.expression().kind() == SyntaxKind::ThisKeyword
+}
+
+#[cfg(test)]
+mod union_sort_tests {
+    use super::*;
+    use crate::gostd::slices::{binary_search_func, sort_stable_func};
+    use crate::scanner_util::go_string_from_bytes;
+    use std::cmp::Ordering;
+
+    /// Strings in the port form of Go strings: ASCII, long shared prefixes,
+    /// NUL, non-ASCII, lone surrogate and invalid byte units, the internal
+    /// symbol name prefix.
+    fn strings() -> Vec<String> {
+        let mut v: Vec<String> = [
+            "",
+            "a",
+            "ab",
+            "abc",
+            "abcdefghijk",
+            "abcdefghijkl",
+            "abcdefghijkm",
+            "abcdefghij",
+            "abcdefghijk\u{0}",
+            "\u{0}",
+            "Z",
+            "zz",
+            "é",
+            "aé",
+            "a\u{7f}",
+            "abcdefghijé",
+            "abcdefghijkéz",
+            "\u{FDD0}",
+            crate::ast::INTERNAL_SYMBOL_NAME_PREFIX,
+            "日本",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        for bytes in [
+            &[0x61, 0xfe][..],
+            &[0x61, 0x80, 0x62],
+            &[0xed, 0xa0, 0x80],
+            &[0x61, 0xed, 0xbf, 0xbf],
+            &[0xff],
+        ] {
+            v.push(go_string_from_bytes(bytes.to_vec()));
+        }
+        v
+    }
+
+    /// The prefix order never contradicts Go `strings.Compare`.
+    #[test]
+    fn go_bytes_prefix_keeps_go_string_order() {
+        let v = strings();
+        let mut decided = 0;
+        for a in &v {
+            for b in &v {
+                if go_bytes_prefix(a) < go_bytes_prefix(b) {
+                    decided += 1;
+                    assert_eq!(compare_go_strings(a, b), Ordering::Less, "{a:?} {b:?}");
+                }
+            }
+        }
+        assert!(decided > 200, "{decided}");
+    }
+
+    /// `number_sort_value` order is Go `cmp.Compare` order.
+    #[test]
+    fn number_sort_value_is_cmp_compare_order() {
+        let v = [
+            f64::NAN,
+            f64::NEG_INFINITY,
+            -1e300,
+            -1.5,
+            -f64::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            5e-324,
+            1.0,
+            1.5,
+            1e300,
+            f64::INFINITY,
+        ];
+        for &a in &v {
+            for &b in &v {
+                let (a, b) = (crate::jsnum::Number(a), crate::jsnum::Number(b));
+                let c = compare_numbers(a, b);
+                assert_eq!(
+                    number_sort_value(a).cmp(&number_sort_value(b)),
+                    c.cmp(&0),
+                    "{a:?} {b:?}"
+                );
+            }
+        }
+    }
+
+    /// The types of the type aliases in `source` (one file `a.ts`), then
+    /// the members of those that are unions or intersections, on the
+    /// checker of that file.
+    fn with_alias_types<R: Send + 'static>(
+        source: &str,
+        f: impl FnOnce(&mut Checker, &[TypeId]) -> R + Send + 'static,
+    ) -> R {
+        let dir = std::env::temp_dir().join(format!("ts_goport_unionsort_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), source).unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "strict": true, "target": "es2020", "types": [] }, "files": ["a.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = crate::program::try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scope = crate::core::enter_program(Some(program));
+        let file = program
+            .source_files()
+            .find(|file| file.info.file_name.ends_with("/a.ts"))
+            .expect("a.ts is not in the program")
+            .root;
+        let result = crate::program::with_type_checker_for_file(file, move |checker| {
+            let mut types: Vec<TypeId> = file
+                .statements()
+                .iter()
+                .filter(|s| s.kind() == SyntaxKind::TypeAliasDeclaration)
+                .map(|alias| checker.get_type_from_type_node(alias.type_()))
+                .collect();
+            // Then the members of the unions and intersections, which have
+            // no alias.
+            for i in 0..types.len() {
+                if checker
+                    .ty(types[i])
+                    .flags
+                    .intersects(TypeFlags::UNION_OR_INTERSECTION)
+                {
+                    for &m in checker.ty(types[i]).types().to_vec().iter() {
+                        if !types.contains(&m) {
+                            types.push(m);
+                        }
+                    }
+                }
+            }
+            f(checker, &types)
+        });
+        drop(scope);
+        crate::program::release_program(program);
+        result
+    }
+
+    /// Each arm of `compare_types`, and the ties: two interfaces with one
+    /// name, references to one generic type, intersections with the same
+    /// first member, string literals with a long shared prefix, objects
+    /// with no symbol (tuples), instantiations of one anonymous type.
+    const SOURCE: &str = r#"
+interface A { a: 1 }
+interface B { b: 1 }
+interface Abcdefghijklmn1 { c: 1 }
+interface Abcdefghijklmn2 { d: 1 }
+namespace N1 { export interface Same { x: 1 } }
+namespace N2 { export interface Same { y: 1 } }
+enum E { X, Y, Z = "z" }
+declare const s1: unique symbol;
+declare const s2: unique symbol;
+declare function f<T>(x: T): { v: T };
+type T0 = string;
+type T1 = number;
+type T2 = boolean;
+type T3 = any;
+type T4 = unknown;
+type T5 = never;
+type T6 = undefined;
+type T7 = null;
+type T8 = void;
+type T9 = object;
+type T10 = bigint;
+type T11 = symbol;
+type T12 = "abcdefghijklmnop1";
+type T13 = "abcdefghijklmnop2";
+type T14 = "abc";
+type T15 = "";
+type T16 = "é";
+type T17 = "aé";
+type T18 = 1;
+type T19 = -1;
+type T20 = 0;
+type T21 = 1.5;
+type T22 = 1e300;
+type T23 = true;
+type T24 = false;
+type T25 = 10n;
+type T26 = -5n;
+type T27 = A;
+type T28 = B;
+type T29 = N1.Same;
+type T30 = N2.Same;
+type T31 = A[];
+type T32 = B[];
+type T33 = Array<string>;
+type T34 = Promise<A>;
+type T35 = Promise<B>;
+type T36 = [string];
+type T37 = [number, string];
+type T38 = readonly [string];
+type T39 = { x: 1 };
+type T40 = { y: 2 };
+type T41 = () => void;
+type T42 = A & B;
+type T43 = A & { z: 1 };
+type T44 = A & B & { z: 1 };
+type T45 = string & { __brand: 1 };
+type T46 = number & { __brand: 1 };
+type T47 = E;
+type T48 = E.X;
+type T49 = E.Y;
+type T50 = E.Z;
+type T51 = typeof s1;
+type T52 = typeof s2;
+type T53 = `a${string}`;
+type T54 = `b${number}`;
+type T55 = `abcdefghijklmn${string}x`;
+type T56 = `abcdefghijklmn${number}y`;
+type T57 = keyof A;
+type T58 = A["a"];
+type T59 = Uppercase<string>;
+type T60 = A | B;
+type T61 = "a" | "b";
+type T62 = string | number;
+type T63 = Abcdefghijklmn1;
+type T64 = Abcdefghijklmn2;
+type T65 = ReturnType<typeof f<string>>;
+type T66 = ReturnType<typeof f<number>>;
+type T67 = Abcdefghijklmn1 & B;
+type T68 = Abcdefghijklmn2 & B;
+type T69 = Promise<A> | Promise<B> | Array<A> | Array<B> | [A] | [B, A];
+type T70 = (A & B) | (A & { z: 1 }) | (Abcdefghijklmn1 & B) | (B & Abcdefghijklmn2);
+type T71 = "abcdefghijklmnop1" | "abcdefghijklmnop2" | `x${string}` | `x${number}`;
+type T72 = { x: 1 } | { y: 2 } | ReturnType<typeof f<string>> | ReturnType<typeof f<number>>;
+"#;
+
+    /// Keys never contradict `compare_types`, keys decide many pairs, and
+    /// the ties named in `SOURCE` tie.
+    #[test]
+    fn union_sort_key_agrees_with_compare_types() {
+        with_alias_types(SOURCE, |c, types| {
+            let mut decided = 0;
+            let mut ties = 0;
+            for &a in types {
+                for &b in types {
+                    if a == b {
+                        continue;
+                    }
+                    let (ka, kb) = (c.union_sort_key(a), c.union_sort_key(b));
+                    let s = c.compare_types(a, b).signum();
+                    match ka.cmp(&kb) {
+                        Ordering::Less => assert_eq!(s, -1, "{a:?} {b:?} {ka:#x} {kb:#x}"),
+                        Ordering::Greater => assert_eq!(s, 1, "{a:?} {b:?} {ka:#x} {kb:#x}"),
+                        Ordering::Equal => ties += 1,
+                    }
+                    decided += usize::from(ka != kb);
+                }
+            }
+            // The same name in two namespaces: equal keys.
+            let key = |i: usize| c.union_sort_key(types[i]);
+            assert_eq!(key(29), key(30));
+            // Names and values that share their first 11 bytes tie.
+            assert_eq!(key(63), key(64));
+            assert_eq!(key(12), key(13));
+            assert_ne!(key(14), key(15));
+            assert!(decided > 3000 && ties > 0, "{decided} {ties}");
+        });
+    }
+
+    /// The keyed sort and the keyed search give Go's results (`gostd` sort
+    /// and search with `compare_types`) on many orders of the types, with
+    /// duplicates.
+    #[test]
+    fn keyed_sort_and_search_match_go() {
+        with_alias_types(SOURCE, |c, types| {
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            for round in 0..64 {
+                // A deterministic shuffle with duplicates, of 8 to 80 types.
+                let n = 8 + round % 73;
+                let list: Vec<TypeId> = (0..n)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        types[(state % types.len() as u64) as usize]
+                    })
+                    .collect();
+                let mut keyed = list.clone();
+                c.sort_union_types(&mut keyed);
+                let mut go = list.clone();
+                sort_stable_func(&mut go, |&a, &b| c.compare_types(a, b));
+                assert_eq!(keyed, go, "round {round}");
+                go.dedup();
+                let pairs = c.union_sort_keys(&go);
+                for &t in types {
+                    let want = binary_search_func(&go[..], t, |&a, &b| c.compare_types(a, b));
+                    let key = c.union_sort_key(t);
+                    assert_eq!(c.search_keyed_types(&pairs, key, t), want, "round {round}");
+                    assert_eq!(c.search_union_types(&go, t), want, "round {round}");
+                }
+            }
+        });
+    }
 }

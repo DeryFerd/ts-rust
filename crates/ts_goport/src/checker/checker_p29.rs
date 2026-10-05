@@ -924,9 +924,7 @@ impl Checker {
             return self.filter_type(t, &mut |_c: &mut Checker, t: TypeId| t != target_type);
         }
         let types = self.ty(t).types();
-        if let Ok(i) =
-            types.binary_search_by(|&probe| self.compare_types(probe, target_type).cmp(&0))
-        {
+        if let (i, true) = self.search_union_types(types, target_type) {
             if types.len() == 2 {
                 return types[1 - i];
             }
@@ -948,23 +946,19 @@ impl Checker {
 
     // Go: checker/checker.go:27081 containsType
     pub fn contains_type(&self, types: &[TypeId], t: TypeId) -> bool {
-        types
-            .binary_search_by(|&probe| self.compare_types(probe, t).cmp(&0))
-            .is_ok()
+        self.search_union_types(types, t).1
     }
 
     // Go: checker/checker.go:27086 insertType
     // PORT: Go returns the (possibly grown) slice; Rust returns a new Vec.
-    // Rust `binary_search_by` gives the same insertion index as Go
-    // `slices.BinarySearchFunc` when the value is absent.
     pub fn insert_type(&self, types: &[TypeId], t: TypeId) -> (Vec<TypeId>, bool) {
-        match types.binary_search_by(|&probe| self.compare_types(probe, t).cmp(&0)) {
-            Err(i) => {
+        match self.search_union_types(types, t) {
+            (i, false) => {
                 let mut result = types.to_vec();
                 result.insert(i, t);
                 (result, true)
             }
-            Ok(_) => (types.to_vec(), false),
+            (_, true) => (types.to_vec(), false),
         }
     }
 
