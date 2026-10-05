@@ -191,14 +191,13 @@ impl ToBuildInfo<'_> {
                     message_text: d.message_text.clone(),
                     message_key: d.message_key.clone(),
                     message_args: d.message_args.clone(),
-                    message_chain: non_empty(
-                        self.to_build_info_diagnostics_from_file_name_diagnostics(&d.message_chain),
-                    ),
-                    related_information: non_empty(
-                        self.to_build_info_diagnostics_from_file_name_diagnostics(
-                            &d.related_information,
-                        ),
-                    ),
+                    // Go `core.Map` keeps nil and empty apart.
+                    message_chain: d.message_chain.as_deref().map(|chain| {
+                        self.to_build_info_diagnostics_from_file_name_diagnostics(chain)
+                    }),
+                    related_information: d.related_information.as_deref().map(|info| {
+                        self.to_build_info_diagnostics_from_file_name_diagnostics(info)
+                    }),
                     reports_unnecessary: d.reports_unnecessary,
                     reports_deprecated: d.reports_deprecated,
                     skipped_on_no_emit: d.skipped_on_no_emit,

@@ -906,7 +906,9 @@ pub fn repopulate_diagnostic_message_chain(
             };
             // Recursively handle nested chains
             for nested in c.message_chain() {
-                b.message_chain.push(ast_diag_to_build_info_diag(nested));
+                b.message_chain
+                    .get_or_insert_with(Vec::new)
+                    .push(ast_diag_to_build_info_diag(nested));
             }
             result.push(repopulate_diagnostic_chain(&b, file));
             changed = true;
@@ -946,7 +948,9 @@ pub fn ast_diag_to_build_info_diag(d: &Diagnostic) -> BuildInfoDiagnosticWithFil
         ..Default::default()
     };
     for nested in d.message_chain() {
-        b.message_chain.push(ast_diag_to_build_info_diag(nested));
+        b.message_chain
+            .get_or_insert_with(Vec::new)
+            .push(ast_diag_to_build_info_diag(nested));
     }
     b
 }

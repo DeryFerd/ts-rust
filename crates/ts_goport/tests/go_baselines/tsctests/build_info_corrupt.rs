@@ -298,20 +298,13 @@ fn far_apart_categories_sort_as_go_ints() {
     );
 }
 
-// Go: execute/incremental/buildInfo.go:209 writes `messageArgs` with
-// `omitzero`. A read `"messageArgs":[]` is an empty slice, not nil, and the
-// snapshot keeps it (buildinfotosnapshot.go:85, snapshottobuildinfo.go:140),
-// so the build info written again has `[]` too. Here `src/x.ts` gets a
-// syntax error, so no semantic diagnostic is asked for and those of
-// `src/b.ts` are written from the read form. Texts and bytes from the pin N
-// oracle.
-// PORT: when the read diagnostics are reported first (no syntax error),
-// Go writes them from its `ast.Diagnostic` copies, which also keep `[]`.
-// The port's `Diagnostic.message_args` (core.rs) has no nil, so that path
-// still drops it (followups25).
-#[test]
-fn empty_message_args_are_written_again() {
-    let dir = TmpDir::new("build-info-empty-args");
+/// Builds the project with `src/x.ts`, replaces `from` (once) with `to` in
+/// its build info, and gives `src/x.ts` a syntax error, so no semantic
+/// diagnostic is asked for and those of `src/b.ts` are written from the
+/// read form. `tsgo -p .` and `tsgo -b` report the syntax error (Go N's
+/// text) and write a build info that has `written`.
+fn check_read_form_written_again(name: &str, from: &str, to: &str, written: &str) {
+    let dir = TmpDir::new(&format!("build-info-{name}"));
     dir.write(
         "tsconfig.json",
         r#"{ "compilerOptions": { "outDir": "dist", "rootDir": "src", "incremental": true, "strict": true, "lib": ["es5"] }, "include": ["src"] }"#,
@@ -326,11 +319,12 @@ fn empty_message_args_are_written_again() {
     assert_eq!(first.code, Some(2), "first build: {first:?}");
     let build_info_path = dir.0.join("tsconfig.tsbuildinfo");
     let build_info = std::fs::read_to_string(&build_info_path).expect("build info");
-    let bad = build_info.replace(
-        r#""messageArgs":["number","string"]"#,
-        r#""messageArgs":[]"#,
+    assert_eq!(
+        build_info.matches(from).count(),
+        1,
+        "{from:?} once in {build_info}"
     );
-    assert_ne!(bad, build_info, "messageArgs in {build_info}");
+    let bad = build_info.replace(from, to);
     for args in [&["-p", "."][..], &["-b"][..]] {
         dir.write("tsconfig.tsbuildinfo", &bad);
         dir.write("src/x.ts", "export const x = ;\n");
@@ -339,16 +333,50 @@ fn empty_message_args_are_written_again() {
             stdout: "src/x.ts(1,18): error TS1109: Expression expected.\n".to_string(),
             panic: String::new(),
         };
-        assert_eq!(tsgo(&dir.0, args), want, "{args:?}");
-        let written = std::fs::read_to_string(&build_info_path).expect("build info");
-        assert_ne!(written, bad, "{args:?}: build info not written again");
+        assert_eq!(tsgo(&dir.0, args), want, "{name} {args:?}");
+        let new = std::fs::read_to_string(&build_info_path).expect("build info");
+        assert_ne!(new, bad, "{name} {args:?}: build info not written again");
         assert!(
-            written.contains(
-                r#""messageKey":"Type_0_is_not_assignable_to_type_1_2322","messageArgs":[]}"#
-            ),
-            "{args:?}: no empty messageArgs in {written}"
+            new.contains(written),
+            "{name} {args:?}: {written:?} not in {new}"
         );
     }
+}
+
+// Go: execute/incremental/buildInfo.go:209 writes `messageArgs` with
+// `omitzero`. A read `"messageArgs":[]` is an empty slice, not nil, and the
+// snapshot keeps it (buildinfotosnapshot.go:85, snapshottobuildinfo.go:140),
+// so the build info written again has `[]` too. Texts and bytes from the pin
+// N oracle.
+// PORT: when the read diagnostics are reported first (no syntax error),
+// Go writes them from its `ast.Diagnostic` copies, which also keep `[]`.
+// The port's `Diagnostic.message_args` (core.rs) has no nil, so that path
+// still drops it (followups25).
+#[test]
+fn empty_message_args_are_written_again() {
+    check_read_form_written_again(
+        "empty-args",
+        r#""messageArgs":["number","string"]"#,
+        r#""messageArgs":[]"#,
+        r#""messageKey":"Type_0_is_not_assignable_to_type_1_2322","messageArgs":[]}"#,
+    );
+}
+
+// Go: execute/incremental/buildInfo.go:210 and :211 write `messageChain`
+// and `relatedInformation` with `omitzero`, as `messageArgs`. Go `core.Map`
+// keeps a read empty list empty (buildinfotosnapshot.go:86 and :87,
+// snapshottobuildinfo.go:141 and :142), so the build info written again has
+// both `[]`. Bytes from the pin N oracle.
+// PORT: the ast path drops them, as for `messageArgs`.
+#[test]
+fn empty_message_chain_and_related_information_are_written_again() {
+    let lists = r#""messageArgs":["number","string"],"messageChain":[],"relatedInformation":[]}"#;
+    check_read_form_written_again(
+        "empty-lists",
+        r#""messageArgs":["number","string"]}"#,
+        lists,
+        lists,
+    );
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:266 `start+length` is a Go int,
@@ -386,3 +414,4 @@ fn far_diagnostic_end_panics_slice_bounds_with_pretty() {
         assert_eq!(tsgo(&dir.0, &["-p", ".", "--pretty"]), want, "end {end}");
     }
 }
+
