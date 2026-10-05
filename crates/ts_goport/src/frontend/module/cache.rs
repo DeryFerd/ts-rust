@@ -641,7 +641,8 @@ pub struct SharedResolutionCache {
         >,
     >,
     /// The package scopes that resolve-ahead workers found, by directory
-    /// (`DefaultResolver::publish_package_scope`).
+    /// (`DefaultResolver::publish_package_scope`), or that parse workers
+    /// found for the metadata of the files they parse (`store_scope`).
     scopes: std::sync::Mutex<FxHashMap<String, SharedResolution<Option<PackageScope>>>>,
 }
 
@@ -1047,6 +1048,23 @@ impl SharedResolutionCache {
     // PORT: not in Go (resolve ahead).
     pub fn set_scope(&self, directory: String, value: SharedResolution<Option<PackageScope>>) {
         lock_shared(&self.scopes).entry(directory).or_insert(value);
+    }
+
+    /// Publishes the package scope of `directory` (the first value wins),
+    /// and returns the value that the cache keeps. A parse worker finds
+    /// the metadata of a file with it, so every file of a directory gets
+    /// one value and one lookup log (the loader notes each log once).
+    // PORT: not in Go (loadpar1). Go's parse tasks share one package.json
+    // cache, so the scope walk of a directory reads it from there.
+    pub fn store_scope(
+        &self,
+        directory: &str,
+        value: SharedResolution<Option<PackageScope>>,
+    ) -> SharedResolution<Option<PackageScope>> {
+        lock_shared(&self.scopes)
+            .entry(directory.to_string())
+            .or_insert(value)
+            .clone()
     }
 
     /// Go `moduleResolutionCache.Set` (`LoadOrStore`: the first value wins).
