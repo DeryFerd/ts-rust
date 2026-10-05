@@ -6,7 +6,9 @@
 //! (`ls_program::new_api_checker`), so it gets Go's answer for a file version
 //! bound before that. When B's API checker is older than the version, the
 //! port answers an `unported` panic (`api::checker_symbol`), not a wrong type,
-//! and B's next answers do not change.
+//! and B's next answers do not change. Handlers that read only names,
+//! declarations and parents, and sort, still give Go's answer
+//! (`api::checker_symbol_for_names`).
 //!
 //! PORT: the tests call the session handlers directly and catch the panic
 //! that the server turns into the `panic: <text>` answer, as
@@ -17,8 +19,9 @@ use std::rc::Rc;
 
 use ts_goport::api::requestfilesystem::{Kind, RequestFileSystem};
 use ts_goport::api::{
-    self, CreateSnapshotParams, EnsurePrograms, GetSymbolAtPositionParams, GetTypeOfSymbolParams,
-    SnapshotID, SnapshotRequestChangesParams, SymbolID, TypeToTypeNodeParams, UpdateSnapshotParams,
+    self, CheckerSymbolParams, CreateSnapshotParams, EnsurePrograms, GetSymbolAtPositionParams,
+    GetSymbolOfSourceFileParams, GetSymbolPropertyParams, GetTypeOfSymbolParams, SnapshotID,
+    SnapshotRequestChangesParams, SymbolID, TypeToTypeNodeParams, UpdateSnapshotParams,
 };
 use ts_goport::gostd::Context;
 use ts_goport::project;
@@ -32,16 +35,21 @@ const A_CONFIG: &str = "/home/projects/p/tsconfig.a.json";
 const B_CONFIG: &str = "/home/projects/p/tsconfig.b.json";
 const X_TS: &str = "/home/projects/p/x.ts";
 const B_TS: &str = "/home/projects/p/b.ts";
+const M_TS: &str = "/home/projects/p/m.d.ts";
 const X_TEXT: &str = "export const f = <T,>(x: T, y: string) => x;\n";
 /// The edit that `layer` gives x.ts. `f` keeps its type.
-const X_EDITED: &str = "// edited\nexport const f = <T,>(x: T, y: string) => x;\n";
+const X_EDITED: &str =
+    "// edited\nexport const f = <T,>(x: T, y: string) => x;\nexport class K { #p = 1; q = 2; }\n";
+const M_TEXT: &str = "declare module \"m\" { export const v: number; }\n";
+/// The edit that `layer` gives m.d.ts.
+const M_EDITED: &str = "// edited\ndeclare module \"m\" { export const v: number; }\n";
 const B_TEXT: &str = "export const g = (n: number) => n;\n";
 const F_TYPE: &str = "<T>(x: T, y: string) => T";
 const G_TYPE: &str = "(n: number) => number";
 
-/// An API session with A (x.ts) and B (b.ts) open: two projects that share
-/// no file. B never reads x.ts, so an edit of x.ts keeps B's program and its
-/// API checker.
+/// An API session with A (x.ts, m.d.ts) and B (b.ts) open: two projects
+/// that share no file. B never reads x.ts or m.d.ts, so an edit of them
+/// keeps B's program and its API checker.
 struct Api {
     project_session: Rc<project::Session>,
     session: Rc<api::Session>,
@@ -55,9 +63,10 @@ impl Api {
     fn new() -> Self {
         let options = r#"{ "compilerOptions": { "noLib": true }, "files": "#;
         let (project_session, _) = projecttestutil::setup(files(&[
-            (A_CONFIG, &format!(r#"{options}["x.ts"] }}"#)),
+            (A_CONFIG, &format!(r#"{options}["x.ts", "m.d.ts"] }}"#)),
             (B_CONFIG, &format!(r#"{options}["b.ts"] }}"#)),
             (X_TS, X_TEXT),
+            (M_TS, M_TEXT),
             (B_TS, B_TEXT),
         ]));
         let session = api::new_lsp_session(project_session.clone(), None);
@@ -93,8 +102,8 @@ impl Api {
     }
 
     /// Go `updateSnapshot` with a layer that gives x.ts the text `X_EDITED`
-    /// and `ensurePrograms.all`. A gets a new program with a new x.ts
-    /// version; B keeps its program.
+    /// and m.d.ts `M_EDITED`, and `ensurePrograms.all`. A gets a new program
+    /// with new versions of both; B keeps its program.
     fn edit_x(&mut self) {
         let b_before = project_program(&snapshot_of(&self.session, self.snapshot), &self.b.0);
         self.snapshot = nil_error(self.session.handle_update_snapshot(
@@ -111,7 +120,7 @@ impl Api {
                     },
                     file_system: Some(RequestFileSystem {
                         kind: Kind::LAYER,
-                        files: request_files(&[(X_TS, X_EDITED)]),
+                        files: request_files(&[(X_TS, X_EDITED), (M_TS, M_EDITED)]),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -167,6 +176,61 @@ impl Api {
         text.downcast_ref::<String>().expect("a string").clone()
     }
 
+    /// Go `getFullyQualifiedName(symbol)` on `project`.
+    fn qualified_name(&self, project: &project::ID, symbol: SymbolID) -> String {
+        nil_error(self.session.handle_get_fully_qualified_name(
+            &self.ctx,
+            &CheckerSymbolParams {
+                snapshot: self.snapshot,
+                project: project.clone(),
+                symbol,
+            },
+        ))
+    }
+
+    /// The symbol of source file `file`, on `project`.
+    fn file_symbol(&self, project: &project::ID, file: &str) -> SymbolID {
+        nil_error(self.session.handle_get_symbol_of_source_file(
+            &self.ctx,
+            &GetSymbolOfSourceFileParams {
+                snapshot: self.snapshot,
+                project: project.clone(),
+                file: doc(file),
+            },
+        ))
+        .expect("a symbol")
+        .id
+    }
+
+    /// The (id, name, project) of each answer of Go `getExportsOfSymbol`
+    /// (`exports`) or `getMembersOfSymbol` of `symbol` on `project`.
+    fn table(
+        &self,
+        project: &project::ID,
+        symbol: SymbolID,
+        exports: bool,
+    ) -> Vec<(SymbolID, String, String)> {
+        let params = GetSymbolPropertyParams {
+            snapshot: self.snapshot,
+            project: project.clone(),
+            symbol,
+        };
+        let answers = if exports {
+            self.session
+                .handle_get_exports_of_symbol(&self.ctx, &params)
+        } else {
+            self.session
+                .handle_get_members_of_symbol(&self.ctx, &params)
+        };
+        nil_error(answers)
+            .into_iter()
+            .map(|answer| {
+                let answer = answer.expect("a symbol");
+                (answer.id, answer.name, answer.project.0)
+            })
+            .collect()
+    }
+
     fn close(self) {
         self.session.close();
         self.project_session.close();
@@ -217,6 +281,47 @@ child_test! {
         let g = api.symbol(&api.b, B_TS, B_TEXT, "g =");
         assert_eq!(api.type_text(&api.b, g), G_TYPE);
         assert_eq!(api.type_text(&api.a, f), F_TYPE);
+        api.close();
+    }
+}
+
+child_test! {
+    // sk-h-late, sk-fx-lib-late (apisym1 round b): with B's API checker older
+    // than the versions, getFullyQualifiedName, getExportsOfSymbol and
+    // getMembersOfSymbol on B read only names, declarations and parents,
+    // and sort, so they give Go's answer. The type requests after them stay
+    // `unported`. The name of an ambient module reads its file symbol, so
+    // it stays `unported` too.
+    fn names_of_later_file_version_on_older_api_checker() {
+        let unported = "unported Go code: api: symbol of a file bound after the checker was made";
+        let mut api = Api::new();
+        let g = api.symbol(&api.b, B_TS, B_TEXT, "g =");
+        assert_eq!(api.type_text(&api.b, g), G_TYPE);
+        api.edit_x();
+        let f = api.symbol(&api.a, X_TS, X_EDITED, "f =");
+        assert_eq!(api.qualified_name(&api.b, f), r#""/home/projects/p/x".f"#);
+        let x = api.file_symbol(&api.a, X_TS);
+        let exports = api.table(&api.b, x, true);
+        let names: Vec<_> = exports.iter().map(|(_, name, _)| name.as_str()).collect();
+        assert_eq!(names, ["f", "K"]);
+        // The project where each symbol was first seen, as Go.
+        assert_eq!(exports[0].2, api.a.0);
+        assert_eq!(exports[1].2, api.b.0);
+        let k = exports[1].0;
+        let members = api.table(&api.b, k, false);
+        assert_eq!(members[1].1, "q");
+        // The name of `#p` holds the id of its class `K`, as on A.
+        assert!(members[0].1.ends_with(&format!("#{}@#p", k.0)), "{}", members[0].1);
+        assert_eq!(api.table(&api.a, k, false), members);
+        assert_eq!(go_panic_text(|| api.type_text(&api.b, f)), unported);
+        assert_eq!(go_panic_text(|| api.type_text(&api.b, members[1].0)), unported);
+        let v = api.symbol(&api.a, M_TS, M_EDITED, "v:");
+        assert_eq!(go_panic_text(|| api.qualified_name(&api.b, v)), unported);
+        assert_eq!(api.qualified_name(&api.a, v), r#""m".v"#);
+        assert_eq!(api.type_text(&api.a, f), F_TYPE);
+        assert_eq!(api.type_text(&api.a, members[1].0), "number");
+        let g = api.symbol(&api.b, B_TS, B_TEXT, "g =");
+        assert_eq!(api.type_text(&api.b, g), G_TYPE);
         api.close();
     }
 }

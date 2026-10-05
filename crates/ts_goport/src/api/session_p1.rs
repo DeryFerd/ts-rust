@@ -23,7 +23,9 @@ use crate::api::prelude::*;
 //   setup checker's arena with the same id and no links (`import_symbol`).
 //   A symbol that reaches a file version bound after the setup checker's
 //   copy of the binder lineage, and a type or signature of another
-//   checker, call `unported!`.
+//   checker, call `unported!`. A handler that reads only names,
+//   declarations and parents, and sorts, takes the symbol through
+//   `checker_symbol_for_names`, which imports such a symbol too.
 // - Go `defer setup.done()`: `CheckerSetup::done` is a `Release` guard. It
 //   releases the checker when `setup` drops at the end of the handler.
 // - Current program: node handles (`node_handle_from`, `resolve_node_handle`)
@@ -581,16 +583,49 @@ impl SnapshotData {
 
 /// PORT: Go hands a `*ast.Symbol` of any checker to `setup.checker`. A Rust
 /// symbol handle indexes the arena of `owner`. This returns the symbol of
-/// `checker`'s arena that is the same Go symbol (`import_symbol`).
+/// `checker`'s arena that is the same Go symbol (`import_symbol`), for a
+/// handler that reads types, signatures, aliases or modules of it.
 /// `checker` can read only the binder lineage symbols of its copy
-/// (`SymbolArena::for_checker`). When the import reaches a file
-/// version bound after that copy, this calls `unported!` before it writes
-/// anything (`importable`): Go's checker reads `node.Symbol()` of any bound
-/// file, but `checker` would read those lineage ids past its copy (a panic,
-/// or one of its own symbols). The API's persistent checker copies the
-/// lineage when it is made (`ls_program::new_api_checker`), so this stops
-/// only when that checker is older than the version.
+/// (`SymbolArena::for_checker`). When the symbol reaches a file version
+/// bound after that copy, this calls `unported!` before it writes anything
+/// (`readable`): Go's checker reads `node.Symbol()` of any bound file, but
+/// `checker` would read those lineage ids past its copy (a panic, or one of
+/// its own symbols). That holds also for a shadow that
+/// `checker_symbol_for_names` made, whoever owns the handle. The API's
+/// persistent checker copies the lineage when it is made
+/// (`ls_program::new_api_checker`), so this stops only when that checker is
+/// older than the version.
 pub fn checker_symbol(
+    checker: &Rc<RefCell<Checker>>,
+    owner: &Rc<RefCell<Checker>>,
+    symbol: SymbolId,
+) -> SymbolId {
+    if symbol.is_nil() {
+        return symbol;
+    }
+    let imported = if Rc::ptr_eq(checker, owner) {
+        let checker = checker.borrow();
+        readable(&checker.symbols, &checker.symbols, symbol).then_some(symbol)
+    } else {
+        let owner = owner.borrow();
+        let mut checker = checker.borrow_mut();
+        readable(&owner.symbols, &checker.symbols, symbol)
+            .then(|| import_symbol(&owner.symbols, &mut checker.symbols, symbol))
+    };
+    imported.unwrap_or_else(|| unported!("api: symbol of a file bound after the checker was made"))
+}
+
+/// `checker_symbol` for a handler that reads only the names, flags,
+/// declaration nodes and parents of the symbols, and sorts them
+/// (`compareSymbols`): it reads no `node.symbol()` or `node.locals()` of a
+/// declaration and makes no type. A shadow holds those fields of the Go
+/// symbol, so this imports also a symbol of a file version bound after
+/// `checker`'s copy of the binder lineage, and gives Go's answer.
+/// `checker_symbol` refuses such a shadow later. An answer of the handler
+/// must not register such a shadow: it names a private identifier with
+/// the class index of the lineage (`go_symbol_name`), which `checker` reads
+/// as one of its own symbols.
+pub fn checker_symbol_for_names(
     checker: &Rc<RefCell<Checker>>,
     owner: &Rc<RefCell<Checker>>,
     symbol: SymbolId,
@@ -598,34 +633,66 @@ pub fn checker_symbol(
     if Rc::ptr_eq(checker, owner) || symbol.is_nil() {
         return symbol;
     }
-    let imported = {
-        let owner = owner.borrow();
-        let mut checker = checker.borrow_mut();
-        importable(&owner.symbols, &checker.symbols, symbol)
-            .then(|| import_symbol(&owner.symbols, &mut checker.symbols, symbol))
-    };
-    imported.unwrap_or_else(|| unported!("api: symbol of a file bound after the checker was made"))
+    let owner = owner.borrow();
+    let mut checker = checker.borrow_mut();
+    import_symbol(&owner.symbols, &mut checker.symbols, symbol)
 }
 
-/// True when arena `to` can read everything that `import_symbol` copies
-/// from `from` for `symbol`. It walks the symbols that the import would
-/// shadow (the same walk, with no writes). `to` has a binder lineage
-/// symbol (id slot key 0) only when its copy of the lineage
-/// (`SymbolArena::for_checker`) holds it, so a lineage symbol that `to`
-/// lacks is past that copy. A shadow keeps its declarations, whose
-/// `node.symbol()` and `node.locals()` are lineage ids that `to` reads at
-/// those indexes, so each declaration symbol must be that symbol in `to`.
-fn importable(from: &SymbolArena, to: &SymbolArena, symbol: SymbolId) -> bool {
-    let in_lineage_copy = |n: SymbolId| to.symbol_at_slot(IdSlot { key: 0, place: n.0 }) == Some(n);
+/// What a checker arena reads as its own: the binder lineage symbols of its
+/// copy (`SymbolArena::for_checker`) and the symbols that its checker made.
+/// Every other symbol in it is a shadow (`SymbolArena::push_shadow`).
+#[derive(Clone, Copy)]
+struct ArenaCopy {
+    /// The copy holds the lineage ids below this.
+    lineage_len: u32,
+    /// The key of the arena's own id slots (`IdSlot`).
+    key: u32,
+}
+
+impl ArenaCopy {
+    // PORT: core.rs has no accessor for these. Index `symbol_count()` is
+    // past every symbol, so it is no shadow, and its id slot is an own slot
+    // whose place counts from the end of the copy (`SymbolArena::id_slot`).
+    fn of(arena: &SymbolArena) -> ArenaCopy {
+        let end = u32::try_from(arena.symbol_count()).expect("symbol overflow");
+        let slot = arena.id_slot(SymbolId(end));
+        debug_assert!(slot.key != 0, "a checker arena");
+        ArenaCopy {
+            lineage_len: end - slot.place,
+            key: slot.key,
+        }
+    }
+
+    /// True when the symbol of id slot `slot` is one of the arena's own.
+    fn holds(self, slot: IdSlot) -> bool {
+        if slot.key == 0 {
+            slot.place < self.lineage_len
+        } else {
+            slot.key == self.key
+        }
+    }
+}
+
+/// True when the checker of arena `to` can read everything that a handler
+/// can reach from `symbol` of arena `from` (`from` can be `to`): the symbols
+/// that `import_symbol` copies (parent, export symbol, members and exports,
+/// the same walk with no writes), and the lineage ids that their
+/// declarations hold (`node.symbol()`, and `node.locals()` of the same
+/// bind). It walks every symbol that `to` does not hold as its own
+/// (`ArenaCopy`), also the shadows that `to` has. A binder lineage symbol
+/// (id slot key 0) that `to` does not hold is past its copy.
+fn readable(from: &SymbolArena, to: &SymbolArena, symbol: SymbolId) -> bool {
+    let copy = ArenaCopy::of(to);
+    let in_copy = |n: SymbolId| copy.holds(IdSlot { key: 0, place: n.0 });
     let shared_tables = from.shared_table_count().min(to.shared_table_count());
     let mut seen = FxHashSet::default();
     let mut work = vec![symbol];
     while let Some(symbol) = work.pop() {
-        if symbol.is_nil() || !seen.insert(symbol) {
+        if symbol.is_nil() {
             continue;
         }
         let origin = from.id_slot(symbol);
-        if to.symbol_at_slot(origin).is_some() {
+        if copy.holds(origin) || !seen.insert(origin) {
             continue;
         }
         if origin.key == 0 {
@@ -635,7 +702,7 @@ fn importable(from: &SymbolArena, to: &SymbolArena, symbol: SymbolId) -> bool {
         if !s
             .declarations
             .iter()
-            .all(|declaration| in_lineage_copy(declaration.symbol()))
+            .all(|declaration| in_copy(declaration.symbol()))
         {
             return false;
         }
