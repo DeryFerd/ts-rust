@@ -70,14 +70,14 @@ impl WatchCompilerHost {
     /// config change (`doBuild` empties `sourceFileCache`, watcher.go:409),
     /// and so did the port, on one thread in watchfree1: a query-core build
     /// after a tsconfig edit took 1.8 times as long as Go, and an effect
-    /// build after a `moduleDetection` edit 2.7 times. The parse workers
-    /// parse the other files (`prefetch_parses`). The
-    /// parse and the bind of a file read only its text and its parse
-    /// options, so the output does not change. The Go language server parse
-    /// cache keys a parse by the same fields (project/parsecache.go:16
-    /// `ParseCacheKey`). The text is read as Go reads it for its parse. A
-    /// file with diagnostics in the old snapshot is not in `config_parses`
-    /// (see `Watcher::do_build`).
+    /// build after a `moduleDetection` edit 2.7 times. The parse and the
+    /// bind of a file read only its text and its parse options, so the
+    /// output does not change. The Go language server parse cache keys a
+    /// parse by the same fields (project/parsecache.go:16 `ParseCacheKey`).
+    /// The text is read as Go reads it for its parse. A file with
+    /// diagnostics in the old snapshot is not in `config_parses` (see
+    /// `Watcher::do_build`). The parse workers parse the files that this
+    /// does not give (`prefetch_parses`).
     fn reuse_parse(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
         let old = self.config_parses.borrow_mut().remove(&opts.path)?;
         let file = crate::frontend::parser::parse_with_options(&old.file, opts)?;

@@ -243,10 +243,11 @@ pub fn parse_with_options(
 /// a file that is not JSON or a declaration file and has no import, export
 /// or `import.meta`.
 #[must_use]
+// PERF: the statement walk goes last, so a lib file needs none.
 pub fn reads_module_indicator_options(file: &ParsedSourceFile) -> bool {
     file.script_kind != ScriptKind::JSON
-        && is_file_probably_external_module(file.root).is_nil()
         && !file.is_declaration_file
+        && is_file_probably_external_module(file.root).is_nil()
 }
 
 // Go: ast/parseoptions.go:86 isFileProbablyExternalModule

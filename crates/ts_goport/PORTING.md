@@ -467,18 +467,25 @@ The batch that adds it is not accepted until Theo approves.
   `FileVersion`. In a `tsc --watch` process (`Watcher::start`,
   `ast::set_watch_process`; watchfree1) each build does the same for its
   new parses (`program::mark_freeable_parses`), and parses ahead
-  (prefetch) only in its first build. Go parses every file again after a
-  config change. Here the build after it keeps the parse of a file whose
+  (prefetch) only in a build with an empty source file cache: the first
+  build, and a build after an overflow or a config change. A parse
+  worker's parse of a published path is then a freeable parse too
+  (`CompilerHost::freeable_worker_parses`, watchcfg1 round c): its detached
+  store owns its nodes and its text is shared, so the file version frees
+  it, and a worker parse that the loader does not take is freed with the
+  pool after the load. Go parses every file again after a config change. Here the build after it keeps the parse of a file whose
   text is the same and that has no diagnostics in the last snapshot
   (`WatchCompilerHost::reuse_parse`, watchcfg1; Go's error summary groups
   errors by file object, and a copied diagnostic keeps the old one), when
   its parse options are the same or differ only in module indicator
   options that its parse did not read (a file with an import or export):
   then it keeps a copy with the new options (`parser::parse_with_options`,
-  the parse worker rule of `read_module_indicator_options`). It parses the
-  other files into owned stores on the loading
-  thread: the watch file system is not the plain OS file system, so a
-  changed lib is a live parse, not a `lib_parse.bin` load. A diagnostic that a watch build copies from the
+  the parse worker rule of `read_module_indicator_options`). The parse
+  workers skip these parses (`cached_source_file_refs`, each for the module
+  indicator options that it read, `FileRefs::of_kept_parse`) and parse the
+  other files, as Go does on goroutines. The watch file system is not the
+  plain OS file system, so a changed lib is a live parse, not a
+  `lib_parse.bin` load. A diagnostic that a watch build copies from the
   last build (Go `repopulateDiagnosticsOfFile`) points at the file
   versions of the build that made it, and Go prints it from them: the new
   snapshot holds them (`Snapshot::held_file_versions`). `tsc -b --watch`
@@ -487,13 +494,14 @@ The batch that adds it is not accepted until Theo approves.
   (`resetCaches`); here a file keeps its parse while its modification time
   does not change, no watch event names it and no build of the cycle
   wrote it (`BuildHost::watch_source_file`, as Go `tsc --watch` keeps its
-  files), so a cycle parses only the changed files, on the loading thread:
-  parse workers parse ahead only in the first build (`BuildHost::prefetch`).
+  files), so a cycle parses only the changed files, on the loading thread.
   A config change keeps the parses too: their key holds the parse options,
   and a parse with other module indicator options that it did not read is
   kept as a copy, as in `tsc --watch`
   (`BuildHost::keep_watch_sources_for_config_change`); only an overflow
-  drops them. A task keeps the versions that its errors point at until its
+  drops them. Parse workers parse ahead in the first build and in the
+  cycles with a config change or an overflow (`BuildHost::prefetch`); they
+  skip the kept parses, as in `tsc --watch`. A task keeps the versions that its errors point at until its
   next build (`BuildTask::held_file_versions`). A file version's parse
   holds it (`ParsedSourceFile::version`), and so
   do the `VersionTables` of each program version that has the file, so a
