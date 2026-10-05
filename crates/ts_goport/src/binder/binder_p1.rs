@@ -405,7 +405,10 @@ impl BoundFile {
     /// `file.BindOnce`). AST node records, step 2: first writes the symbol,
     /// the flow node and the added flags of each node into its record
     /// (`ast::bind_store_records`); the other fields go into the
-    /// `FileNodeBind` of the file.
+    /// `FileNodeBind` of the file. The ids must be program ids already
+    /// (`remap`). A parallel bind installs each file on its bind thread, as
+    /// Go's `BindSourceFile` stores the output in the file on the goroutine
+    /// that binds it (`program::bind_files_parallel`).
     pub fn install(self) {
         let file = self.file.file_index();
         let go_file = crate::ast::go_file(file);
