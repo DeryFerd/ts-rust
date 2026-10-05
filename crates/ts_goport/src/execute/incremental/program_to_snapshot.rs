@@ -900,7 +900,7 @@ pub fn repopulate_diagnostic_message_chain(
                 source: c.source().to_string(),
                 message_text: c.message_text().to_string(),
                 message_key: c.message_key().to_string(),
-                message_args: c.message_args().to_vec(),
+                message_args: Some(c.message_args().to_vec()),
                 repopulate_info: Some(repopulate_info),
                 ..Default::default()
             };
@@ -941,7 +941,7 @@ pub fn ast_diag_to_build_info_diag(d: &Diagnostic) -> BuildInfoDiagnosticWithFil
         source: d.source().to_string(),
         message_text: d.message_text().to_string(),
         message_key: d.message_key().to_string(),
-        message_args: d.message_args().to_vec(),
+        message_args: Some(d.message_args().to_vec()),
         repopulate_info: d.repopulate_info(),
         ..Default::default()
     };

@@ -39,7 +39,10 @@ pub struct BuildInfoDiagnosticWithFileName {
     pub source: String,
     pub message_text: String,
     pub message_key: String,
-    pub message_args: Vec<String>,
+    /// Go `[]string`, where nil (`None`) and empty differ: the build info
+    /// leaves out a nil list (`omitzero`, buildInfo.go:209), so a read
+    /// `"messageArgs":[]` is written again as `[]`.
+    pub message_args: Option<Vec<String>>,
     pub message_chain: Vec<BuildInfoDiagnosticWithFileName>,
     pub related_information: Vec<BuildInfoDiagnosticWithFileName>,
     pub reports_unnecessary: bool,
@@ -139,7 +142,7 @@ impl BuildInfoDiagnosticWithFileName {
             self.code,
             crate::diagnostics::Category(self.category),
             &self.message_key,
-            self.message_args.clone(),
+            self.message_args.clone().unwrap_or_default(),
             message_chain,
             related_information,
             self.reports_unnecessary,
@@ -171,7 +174,7 @@ impl BuildInfoDiagnosticWithFileName {
             self.code,
             crate::diagnostics::Category(self.category),
             &self.message_key,
-            self.message_args.clone(),
+            self.message_args.clone().unwrap_or_default(),
             message_chain,
             related_information,
             self.reports_unnecessary,

@@ -138,7 +138,7 @@ impl ToSnapshot<'_> {
                     source: d.source.clone(),
                     message_text: d.message_text.clone(),
                     message_key: d.message_key.clone(),
-                    message_args: d.message_args.clone().unwrap_or_default(),
+                    message_args: d.message_args.clone(),
                     message_chain: self
                         .to_build_info_diagnostics_with_file_name(d.message_chain.as_ref()),
                     related_information: self

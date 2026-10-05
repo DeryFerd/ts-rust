@@ -297,3 +297,56 @@ fn far_apart_categories_sort_as_go_ints() {
         "Unhandled diagnostic category",
     );
 }
+
+// Go: execute/incremental/buildInfo.go:209 writes `messageArgs` with
+// `omitzero`. A read `"messageArgs":[]` is an empty slice, not nil, and the
+// snapshot keeps it (buildinfotosnapshot.go:85, snapshottobuildinfo.go:140),
+// so the build info written again has `[]` too. Here `src/x.ts` gets a
+// syntax error, so no semantic diagnostic is asked for and those of
+// `src/b.ts` are written from the read form. Texts and bytes from the pin N
+// oracle.
+// PORT: when the read diagnostics are reported first (no syntax error),
+// Go writes them from its `ast.Diagnostic` copies, which also keep `[]`.
+// The port's `Diagnostic.message_args` (core.rs) has no nil, so that path
+// still drops it (followups25).
+#[test]
+fn empty_message_args_are_written_again() {
+    let dir = TmpDir::new("build-info-empty-args");
+    dir.write(
+        "tsconfig.json",
+        r#"{ "compilerOptions": { "outDir": "dist", "rootDir": "src", "incremental": true, "strict": true, "lib": ["es5"] }, "include": ["src"] }"#,
+    );
+    dir.write("src/a.ts", "export const a: number = 1;\n");
+    dir.write(
+        "src/b.ts",
+        "import { a } from \"./a\"; export const b: string = a;\n",
+    );
+    dir.write("src/x.ts", "export const x = 1;\n");
+    let first = tsgo(&dir.0, &["-p", "."]);
+    assert_eq!(first.code, Some(2), "first build: {first:?}");
+    let build_info_path = dir.0.join("tsconfig.tsbuildinfo");
+    let build_info = std::fs::read_to_string(&build_info_path).expect("build info");
+    let bad = build_info.replace(
+        r#""messageArgs":["number","string"]"#,
+        r#""messageArgs":[]"#,
+    );
+    assert_ne!(bad, build_info, "messageArgs in {build_info}");
+    for args in [&["-p", "."][..], &["-b"][..]] {
+        dir.write("tsconfig.tsbuildinfo", &bad);
+        dir.write("src/x.ts", "export const x = ;\n");
+        let want = Run {
+            code: Some(2),
+            stdout: "src/x.ts(1,18): error TS1109: Expression expected.\n".to_string(),
+            panic: String::new(),
+        };
+        assert_eq!(tsgo(&dir.0, args), want, "{args:?}");
+        let written = std::fs::read_to_string(&build_info_path).expect("build info");
+        assert_ne!(written, bad, "{args:?}: build info not written again");
+        assert!(
+            written.contains(
+                r#""messageKey":"Type_0_is_not_assignable_to_type_1_2322","messageArgs":[]}"#
+            ),
+            "{args:?}: no empty messageArgs in {written}"
+        );
+    }
+}

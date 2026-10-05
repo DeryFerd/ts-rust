@@ -190,7 +190,7 @@ impl ToBuildInfo<'_> {
                     source: d.source.clone(),
                     message_text: d.message_text.clone(),
                     message_key: d.message_key.clone(),
-                    message_args: non_empty(d.message_args.clone()),
+                    message_args: d.message_args.clone(),
                     message_chain: non_empty(
                         self.to_build_info_diagnostics_from_file_name_diagnostics(&d.message_chain),
                     ),
