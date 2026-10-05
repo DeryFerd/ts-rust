@@ -352,6 +352,17 @@ pub struct Snapshot {
 
     // Used with testing to add text of hash for better comparison
     pub hash_with_text: bool,
+
+    /// PORT: not in Go. The freeable file versions (`ast::FileVersion`)
+    /// that the diagnostics copied from the old snapshot point at
+    /// (`programToSnapshot`, Go `repopulateDiagnosticsOfFile`): their
+    /// files, related information and message chains. Go's GC keeps an old
+    /// `*ast.SourceFile` alive through a copied `*ast.Diagnostic`. Here a
+    /// watch rebuild can free a file version that the new program does not
+    /// have, so the snapshot holds it while the report and the build info
+    /// can read it. Empty unless a freeable version is published
+    /// (`ast::any_freeable_published`).
+    pub held_file_versions: Vec<std::sync::Arc<crate::ast::FileVersion>>,
 }
 
 impl Snapshot {
@@ -382,6 +393,7 @@ impl Snapshot {
             has_changed_dts_file: false,
             has_emit_diagnostics: false,
             hash_with_text: false,
+            held_file_versions: Vec::new(),
         }
     }
 

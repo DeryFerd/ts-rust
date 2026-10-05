@@ -2,17 +2,21 @@
 //! that each build makes a new program version.
 //!
 //! ```text
-//! goport_watch <out-file> <changed-file> <edit-file>... -- <tsc args>...
+//! goport_watch <out-file> <changed-file> <edit>... -- <tsc args>...
 //! ```
 //!
 //! It runs `execute_tsc::command_line` (Go `execute.CommandLine`) with the
 //! tsc arguments in the current directory. The watch backend records the
 //! watches (`watcher::set_test_watch_backend`) instead of watching the OS
-//! file system. After the first build, for each edit file: it copies the
-//! file over `changed-file`, sends an update event for `changed-file` to
-//! the watches that cover it, and waits for the build that the event
-//! starts. Then it stops the watch and writes the tsc output to
-//! `out-file`. `changed-file` gets its original text back.
+//! file system. After the first build, for each edit: it copies the edit
+//! file over its target, sends an update event for the target to the
+//! watches that cover it, and waits for the build that the event starts.
+//! An edit is `<edit-file>`, whose target is `changed-file`, or
+//! `<target>=<edit-file>`. Then it stops the watch, writes the tsc output to
+//! `out-file`, and gives each target its original text back. Last, after
+//! the released programs are freed, it prints
+//! `file_versions made=<n> dead=<m>` (`ast::file_versions_made`,
+//! `ast::dead_file_versions`).
 //!
 //! Exit 0 when every build ran, 1 when a build did not end in time, and 70
 //! (`EXIT_UNPORTED`) when unported code ran or the run panicked.
@@ -52,23 +56,49 @@ fn main() {
     }
     let out_file = ours[0].clone();
     let changed = absolute(&ours[1]);
-    let edits: Vec<Vec<u8>> = ours[2..].iter().map(|path| read(path)).collect();
+    let edits: Vec<Edit> = ours[2..]
+        .iter()
+        .map(|edit| match edit.split_once('=') {
+            Some((target, file)) => Edit {
+                target: absolute(target),
+                text: read(file),
+            },
+            None => Edit {
+                target: changed.clone(),
+                text: read(edit),
+            },
+        })
+        .collect();
 
-    let original = read(&changed);
+    let mut originals: Vec<(String, Vec<u8>)> = Vec::new();
+    for target in std::iter::once(&changed).chain(edits.iter().map(|edit| &edit.target)) {
+        if !originals.iter().any(|(path, _)| path == target) {
+            originals.push((target.clone(), read(target)));
+        }
+    }
     let output = Arc::new(Mutex::new(Vec::new()));
     let watches = Arc::new(Watches::default());
     let work = {
         let (output, watches) = (output.clone(), watches.clone());
-        let changed = changed.clone();
         std::thread::Builder::new()
             .stack_size(ts_goport::gostd::stack::max_stack_size())
-            .spawn(move || run(&tsc_args, output, watches, &changed, edits))
+            .spawn(move || run(&tsc_args, output, watches, edits))
             .expect("start the work thread")
     };
     let result = work.join();
-    std::fs::write(&changed, &original).unwrap_or_else(|e| panic!("restore {changed}: {e}"));
+    for (path, original) in &originals {
+        std::fs::write(path, original).unwrap_or_else(|e| panic!("restore {path}: {e}"));
+    }
     std::fs::write(&out_file, &*output.lock().expect("output"))
         .unwrap_or_else(|e| panic!("write {out_file}: {e}"));
+    // The checkers of the released programs end in the background; the
+    // tables and file versions that only they hold go with them.
+    ts_goport::program::wait_for_background_releases();
+    println!(
+        "file_versions made={} dead={}",
+        ts_goport::ast::file_versions_made(),
+        ts_goport::ast::dead_file_versions()
+    );
     let code = match result {
         Ok(true) if unported_report().is_empty() => 0,
         Ok(false) if unported_report().is_empty() => 1,
@@ -83,8 +113,16 @@ fn main() {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: goport_watch <out-file> <changed-file> <edit-file>... -- <tsc args>...");
+    eprintln!(
+        "usage: goport_watch <out-file> <changed-file> <[target=]edit-file>... -- <tsc args>..."
+    );
     std::process::exit(2);
+}
+
+/// One edit: the new text of `target` (an absolute path).
+struct Edit {
+    target: String,
+    text: Vec<u8>,
 }
 
 /// Runs tsc on this thread and the edits on another. Returns false when a
@@ -93,8 +131,7 @@ fn run(
     tsc_args: &[String],
     output: Arc<Mutex<Vec<u8>>>,
     watches: Arc<Watches>,
-    changed: &str,
-    edits: Vec<Vec<u8>>,
+    edits: Vec<Edit>,
 ) -> bool {
     set_test_watch_backend(Rc::new(TestBackend {
         watches: watches.clone(),
@@ -104,31 +141,28 @@ fn run(
         .unwrap_or_else(|status| panic!("no system: {status:?}"))
         .with_writer(writer);
     let (ctx, cancel) = context::with_cancel(&context::background());
-    let driver = {
-        let changed = changed.to_string();
-        std::thread::spawn(move || {
-            let ok = drive(&output, &watches, &changed, &edits);
-            cancel();
-            ok
-        })
-    };
+    let driver = std::thread::spawn(move || {
+        let ok = drive(&output, &watches, &edits);
+        cancel();
+        ok
+    });
     let sys: Rc<dyn System> = Rc::new(sys);
     let _ = command_line(&ctx, sys, tsc_args, &GoTsc);
     driver.join().expect("the edit thread")
 }
 
 /// Waits for the first build, then makes each edit and waits for its build.
-fn drive(output: &Mutex<Vec<u8>>, watches: &Watches, changed: &str, edits: &[Vec<u8>]) -> bool {
+fn drive(output: &Mutex<Vec<u8>>, watches: &Watches, edits: &[Edit]) -> bool {
     if !wait_for_builds(output, 1) {
         return false;
     }
-    for (i, edit) in edits.iter().enumerate() {
+    for (i, Edit { target, text }) in edits.iter().enumerate() {
         // The file system clock is coarse: an edit right after a build can
         // get the mtime of that build's outputs, and the `-b` up-to-date
         // check then sees no change.
         std::thread::sleep(EDIT_DELAY);
-        std::fs::write(changed, edit).unwrap_or_else(|e| panic!("write {changed}: {e}"));
-        watches.send_update(changed);
+        std::fs::write(target, text).unwrap_or_else(|e| panic!("write {target}: {e}"));
+        watches.send_update(target);
         if !wait_for_builds(output, i + 2) {
             return false;
         }
