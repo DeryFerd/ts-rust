@@ -3204,9 +3204,14 @@ pub fn new_detached_file_store(
         DETACHED.get().is_none(),
         "this thread already has a detached store"
     );
+    // PERF: watchcfg1 round c. The first cell of a thread is leaked with its
+    // own malloc, not in the AST arena: the first value in a thread's arena
+    // leaks a 128 KiB chunk, and a watch build after a config change starts
+    // new parse workers, whose owned parses put nothing else there. With
+    // the arena an x1 session grew 0.24 MiB per op over 500 config edits.
     let store = SPARE_CELL
         .take()
-        .unwrap_or_else(|| leak_in_ast_arena(RefCell::default()));
+        .unwrap_or_else(|| Box::leak(Box::default()));
     let mut new = FileStore::new(file_name, text.into());
     if FREEABLE_PARSE.get() {
         new.owned = Some(Box::new(OwnedAst::new(new.records.capacity())));
