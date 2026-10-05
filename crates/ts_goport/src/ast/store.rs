@@ -1334,6 +1334,15 @@ struct BlockFile {
     /// one load after the entry (`static_go_file`). `None` in a node shell:
     /// the freeable file version owns it.
     go_file: Option<GoFile>,
+    /// Go `CompositeBase.facts` of the nodes of a static publish: one word
+    /// per slot (`static_facts_word`), made at the first facts read of the
+    /// file. Never made in a node shell: the nodes of a freeable file
+    /// version keep their facts in the thread-local map of
+    /// `Node::subtree_facts`, which forgets them with the version.
+    // PERF: factscol1b. Go keeps the facts in an atomic field of the node
+    // (`ast.go:1602`), shared by all threads. The thread-local map cost a
+    // `LocalKey::with`, a `RefCell` borrow and a hash lookup per read.
+    subtree_facts: OnceLock<Box<[AtomicU32]>>,
 }
 
 impl FileBlock {
@@ -3942,6 +3951,7 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
                 links: &s.links,
                 store: Some(s),
                 go_file: Some(go_file),
+                subtree_facts: OnceLock::new(),
             })
             .collect::<Box<[_]>>(),
     );
@@ -4047,6 +4057,7 @@ fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
             links: &[],
             store: None,
             go_file: None,
+            subtree_facts: OnceLock::new(),
         })),
     };
     (shell, block)
@@ -4239,6 +4250,39 @@ pub fn frozen_store_kind(n: Node) -> Option<SyntaxKind> {
         return None;
     }
     file_block(n.file_index()).map(|b| b.kinds[slot_index(n)])
+}
+
+/// Go `node.facts` (`CompositeBase`) of published store node `n` of a
+/// static publish: its word in the facts column of its file
+/// (`BlockFile::subtree_facts`), which the first call for that file makes.
+/// `None` for any other node: nil, synthetic, unpublished, or a node of a
+/// freeable file version (its node shell has no column).
+#[inline]
+pub(crate) fn static_facts_word(n: Node) -> Option<&'static AtomicU32> {
+    if n.is_nil() {
+        return None;
+    }
+    let b = file_block(n.file_index())?;
+    let column = match b.file.subtree_facts.get() {
+        Some(column) => column,
+        None => new_static_facts_column(b)?,
+    };
+    column.get(slot_index(n))
+}
+
+/// The facts column of block `b`, made now with all words 0 (no facts
+/// computed), or `None` when `b` is a node shell (no static store).
+#[cold]
+#[inline(never)]
+fn new_static_facts_column(b: &'static FileBlock) -> Option<&'static [AtomicU32]> {
+    if b.file.store.is_none() {
+        return None;
+    }
+    let column = b
+        .file
+        .subtree_facts
+        .get_or_init(|| (0..b.kinds.len()).map(|_| AtomicU32::new(0)).collect());
+    Some(column)
 }
 
 /// The record of a published store node, by reference, so a read of one
@@ -5905,6 +5949,9 @@ impl FileStore {
     /// The record of a new node slot (`alloc_store_slot_node`).
     #[inline]
     fn push_node_header(&mut self, kind: SyntaxKind, text_is_keyword: bool) {
+        if self.records.len() == self.records.capacity() {
+            self.reserve_slots_for_text();
+        }
         self.records.push(NodeRecord::node(text_is_keyword));
         self.kinds.push(kind);
     }
@@ -5925,6 +5972,48 @@ impl FileStore {
         ));
         self.build_links.push(SlotLinks::NONE);
         self.debug_assert_build_columns();
+    }
+
+    /// The slot columns are full (`push_node_header`): reserves room in
+    /// each for the slots of the whole text, at the node density of the
+    /// text parsed so far (the largest end of the last slots), and at least
+    /// double, as a `Vec` grows.
+    // PERF: factscol1b (cliperf1 rank 6). `FileStore::new` reserves for one
+    // slot per 12 text bytes. A dense file (a 5 MB JS file of 1.09 bytes
+    // per slot) doubled its columns 4 times, and each `realloc` moved them
+    // (801 MB of new buffers). Normal TypeScript (6 to 8 bytes per slot)
+    // grows once, by doubling, as before.
+    #[cold]
+    #[inline(never)]
+    fn reserve_slots_for_text(&mut self) {
+        /// The slots back from the last one that give the parsed length.
+        const LOOK_BACK: usize = 64;
+        let slots = self.records.len();
+        let parsed = self.records[slots.saturating_sub(LOOK_BACK)..]
+            .iter()
+            .filter(|r| r.is_node())
+            .map(|r| r.loc().end())
+            .max()
+            .unwrap_or(0);
+        let parsed = usize::try_from(parsed).unwrap_or(0);
+        let text = self.text.len();
+        // 1/8 more than the estimate, so a file a bit denser at its end
+        // does not double again near the end.
+        let wanted = if parsed > 0 && parsed < text {
+            let estimate = (slots as u128 * text as u128 / parsed as u128) as usize;
+            estimate + estimate / 8
+        } else {
+            slots + 1
+        };
+        let additional = wanted.saturating_sub(slots).max(1);
+        self.records.reserve(additional);
+        self.kinds.reserve(additional);
+        self.kids.reserve(additional);
+        self.nodes.reserve(additional);
+        self.build_links.reserve(additional);
+        if let Some(owned) = self.owned.as_deref_mut() {
+            owned.cell_of.reserve(additional);
+        }
     }
 }
 
@@ -6981,6 +7070,82 @@ mod tests {
         assert_eq!(message, "too many file ids");
     }
 
+    // factscol1b: a static publish gets a facts column at its first facts
+    // read, one word per slot, shared by all threads. A node shell (a
+    // freeable file version) gets none, so its facts stay in the
+    // thread-local map that forgets them with the version. The test sets
+    // the blocks of two file ids that no publish reaches.
+    #[test]
+    fn static_files_keep_subtree_facts_in_a_column() {
+        fn block(file: usize, store: Option<&'static FileStore>) -> FileBlock {
+            let mut records = vec![NodeRecord::target(Node::NIL), NodeRecord::node(false)];
+            *records[0].bind.get_mut() = NodeRecord::owner_word(file);
+            FileBlock {
+                kinds: Vec::leak(vec![SyntaxKind::Unknown, SyntaxKind::Block]),
+                records: Vec::leak(records),
+                kids: Vec::leak(vec![NodeKids::unknown(), NodeKids::unknown()]),
+                file: Box::leak(Box::new(BlockFile {
+                    nodes: &[],
+                    facts: StoreFacts::ONLY_NIL_SLOT,
+                    root: Node::NIL,
+                    foreign: &[],
+                    links: &[],
+                    store,
+                    go_file: None,
+                    subtree_facts: OnceLock::new(),
+                })),
+            }
+        }
+        let (static_file, shell_file) = (FILE_ID_LIMIT - 5, FILE_ID_LIMIT - 6);
+        let store: &'static FileStore = Box::leak(Box::default());
+        set_file_block(static_file, block(static_file, Some(store)));
+        set_file_block(shell_file, block(shell_file, None));
+        let n = handle(static_file, 1);
+        let word = static_facts_word(n).expect("a static file has a column");
+        assert_eq!(word.load(Ordering::Relaxed), 0, "no facts computed yet");
+        word.store(7, Ordering::Relaxed);
+        let column = file_block(static_file).unwrap().file.subtree_facts.get();
+        assert_eq!(column.map(|c| c.len()), Some(2), "one word per slot");
+        let other_thread =
+            std::thread::spawn(move || static_facts_word(n).map(|w| w.load(Ordering::Relaxed)));
+        assert_eq!(other_thread.join().unwrap(), Some(7));
+        assert!(static_facts_word(handle(shell_file, 1)).is_none());
+        assert!(static_facts_word(Node::NIL).is_none());
+    }
+
+    // factscol1b (cliperf1 rank 6): `FileStore::new` reserves for one slot
+    // per 12 text bytes. When the columns of a dense file fill, they get
+    // room for the slots of the whole text at the density so far, not one
+    // doubling (a 5 MB JS file of about 1 byte per slot doubled 4 times).
+    #[test]
+    fn full_slot_columns_reserve_for_the_whole_text() {
+        let text: &'static str = "a".repeat(1200).leak();
+        let mut s = FileStore::new("/dense.js", text.into());
+        // One slot per text byte: slot `i` ends at byte `i`.
+        while s.records.len() < s.records.capacity() {
+            let i = s.records.len() as i32;
+            let mut record = NodeRecord::node(false);
+            record.set_loc(TextRange::new(i - 1, i));
+            s.records.push(record);
+            s.kinds.push(SyntaxKind::Identifier);
+            s.kids.push(NodeKids::unknown());
+            s.nodes.push(None);
+            s.build_links.push(SlotLinks::NONE);
+        }
+        let slots = s.records.len();
+        assert!(slots < 200, "{slots} slots reserved for 1,200 bytes");
+        s.reserve_slots_for_text();
+        for cap in [
+            s.records.capacity(),
+            s.kinds.capacity(),
+            s.kids.capacity(),
+            s.nodes.capacity(),
+            s.build_links.capacity(),
+        ] {
+            assert!(cap >= 1200, "{cap} slots after the first growth");
+        }
+    }
+
     /// Sets the block of unpublished file id `file` (from `LOW_BLOCKS` on)
     /// and reads its node through the node reads.
     fn set_and_read_high_file_block(file: usize) {
@@ -7001,6 +7166,7 @@ mod tests {
                 links: &[],
                 store: None,
                 go_file: None,
+                subtree_facts: OnceLock::new(),
             })),
         };
         assert!(file_block(file).is_none());
