@@ -233,16 +233,16 @@ pub fn to_lower(r: char) -> char {
 mod tests {
     use super::*;
 
-    // PORT: the test names are from the Unicode 15.0.0 tables (go1.26.8).
-    // They stay for the protected test set; the values are go1.27.1
-    // (Unicode 17.0.0), the toolchain of the pin N oracle.
+    // The values are go1.27.1 (Unicode 17.0.0), the toolchain of the pin N
+    // oracle. followups24 renamed the 3 tests from `*_uses_unicode_15`
+    // (their go1.26.8 names; followups24 name-map.tsv).
 
     // U+A7C0, U+A7C9 and U+A7D0 are Lu. U+A7CB and the Garay capitals
     // (U+10D50) are Lu from Unicode 16.0, so go1.27.1 says true for them
     // (go1.26.8 said false). Roman numerals (U+2160) and circled letters
     // (U+24B6) are `Other_Uppercase`, not Lu.
     #[test]
-    fn is_upper_uses_unicode_15() {
+    fn is_upper_uses_unicode_17() {
         assert_eq!(crate::gostd::unicode_tables::VERSION, "17.0.0");
         for c in "AZ\u{C0}\u{DE}\u{100}\u{A7C0}\u{A7C9}\u{A7D0}\u{A7CB}\u{10D50}".chars() {
             assert!(is_upper(c), "{c:?}");
@@ -261,7 +261,7 @@ mod tests {
     // says false for it. U+A7CD and the Garay small letters (U+10D70) are Ll
     // from Unicode 16.0. U+00AA and U+2170 are `Other_Lowercase`, not Ll.
     #[test]
-    fn is_lower_uses_unicode_15() {
+    fn is_lower_uses_unicode_17() {
         for c in "az\u{B5}\u{DF}\u{F8}\u{FF}\u{101}\u{A7CD}\u{10D70}".chars() {
             assert!(is_lower(c), "{c:?}");
         }
@@ -297,7 +297,7 @@ mod tests {
     // and 17.0 pairs (U+A7CB and U+0264, U+A7DC and U+019B, U+1C89 and
     // U+1C8A, U+10D50 and U+10D70, U+16EA0 and U+16EBB) map to each other.
     #[test]
-    fn case_mapping_uses_unicode_15() {
+    fn case_mapping_uses_unicode_17() {
         let lower = [
             ('A', 'a'),
             ('\u{C0}', '\u{E0}'),
