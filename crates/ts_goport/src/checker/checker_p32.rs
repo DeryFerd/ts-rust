@@ -255,7 +255,19 @@ impl Checker {
         // new type. The texts, the key and the created type are the same.
         let mut new_types: SmallVec<[TypeId; 4]> = SmallVec::new();
         let mut ends: SmallVec<[usize; 5]> = SmallVec::new();
-        let mut buf = String::new();
+        // PERF (tcsplit1): reserve the texts and the direct string literal
+        // spans once, so a long joined text is not copied as it grows. The
+        // reserve stops at the length limit: past it the type is an error.
+        let mut capacity: usize = texts.iter().map(String::len).sum();
+        for &t in types {
+            let ty = self.ty(t);
+            if ty.flags.intersects(TypeFlags::STRING_LITERAL)
+                && let Some(LiteralValue::String(s)) = &ty.as_literal_type().value
+            {
+                capacity += s.len();
+            }
+        }
+        let mut buf = String::with_capacity(capacity.min(MAX_TEMPLATE_LITERAL_TYPE_LENGTH + 1));
         buf.push_str(&texts[0]);
         let mut text_length = 0usize; // combined length of the segments already moved into newTexts
         let mut too_large = false;
@@ -346,6 +358,12 @@ impl Checker {
         // PORT: Go joins the texts by bytes. `go_value` gives the port form
         // of the joined Go bytes (see `scanner_util::GO_STRING_MARKER`).
         if new_types.is_empty() {
+            // PERF (tcsplit1): without a marker, `go_value` and
+            // `combine_surrogate_pairs_cow` return `buf` as is, so one scan
+            // is enough and `buf` moves into the type.
+            if !crate::scanner_util::contains_go_string_marker(&buf) {
+                return self.get_string_literal_type_owned(buf);
+            }
             let value = go_value(&buf);
             let s = combine_surrogate_pairs_cow(&value);
             return self.get_string_literal_type(&s);

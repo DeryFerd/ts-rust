@@ -155,9 +155,15 @@ fn go_string_marker_at(bytes: &[u8], i: usize) -> bool {
 /// lead byte 0xEF is rare in source text, so a check for it (core's inlined
 /// `contains`), then `memchr` for it and a compare of the other two bytes,
 /// is cheaper.
+///
+/// PERF (tcsplit1): text of `LONG_TEXT_SCAN` bytes or more skips the
+/// `contains` check. The `memchr` crate (AVX2) is several times faster than
+/// core's `contains` (2 words a step) on long text, and one scan is enough.
+/// Go does one `strings.IndexByte` scan. Short text keeps the check.
 #[inline]
 fn find_go_string_marker(bytes: &[u8], from: usize) -> Option<usize> {
-    if !bytes[from..].contains(&GO_STRING_MARKER_BYTES[0]) {
+    const LONG_TEXT_SCAN: usize = 256;
+    if bytes.len() - from < LONG_TEXT_SCAN && !bytes[from..].contains(&GO_STRING_MARKER_BYTES[0]) {
         return None;
     }
     let mut i = from;

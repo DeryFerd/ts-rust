@@ -838,7 +838,10 @@ pub struct Checker {
     pub array_variances: SharedList<VarianceFlags>,
     pub globals: SymbolTable,
     pub evaluate: Evaluator,
-    pub string_literal_types: FxHashMap<String, TypeId>,
+    // PORT: perf (tcsplit1). Go keys on the value. Here the key is the
+    // FxHash of the value, and the types of a bucket hold the values (see
+    // `get_string_literal_type_cow`).
+    pub string_literal_types: FxHashMap<u64, smallvec::SmallVec<[TypeId; 1]>>,
     pub number_literal_types: FxHashMap<NumberKey, TypeId>,
     pub nan_type: TypeId,
     pub bigint_literal_types: FxHashMap<PseudoBigIntKey, TypeId>,
