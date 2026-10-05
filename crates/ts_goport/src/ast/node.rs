@@ -4733,11 +4733,19 @@ fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
 // they write the same word. The type syntax test is made once per node,
 // not once more here: in a deep chain of nodes that Go does not cache
 // (`await await ... x`), each step was 2 tests.
+#[inline]
 fn non_type_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
     debug_assert!(!is_type_syntax_data(n, d), "{:?} is type syntax", n.kind());
     if !is_composite_data(n, d) {
         return subtree_facts_of_data(n, d);
     }
+    composite_subtree_facts(n, d)
+}
+
+/// `non_type_subtree_facts` for a node of a `CompositeBase` kind: the
+/// cached facts, or the facts computed from `d`, cached.
+#[inline(never)]
+fn composite_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
     if let Some(word) = super::store::static_facts_word(n) {
         if let Some(facts) = computed_facts(SubtreeFacts(word.load(Ordering::Relaxed))) {
             return facts;
