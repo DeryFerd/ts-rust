@@ -11,7 +11,9 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
-use crate::frontend::core_ext::get_script_kind_from_file_name;
+use crate::frontend::core_ext::{
+    ensure_script_kind_from_file_name, get_script_kind_from_file_name,
+};
 use crate::frontend::module::{AheadAnswer, AheadCall, KeyList};
 use crate::frontend::parser;
 use std::cell::Cell;
@@ -430,16 +432,38 @@ impl compiler::CompilerHost for CompilerHost {
     }
 
     // PORT: not in Go (see `compiler::CompilerHost::cached_source_file_refs`).
-    // The parse cache files that `get_source_file` would give for a worker's
-    // guess of the parse: the script kind of the file name, the jsx option
-    // that this project's options give the name, and, when the text is
-    // known with no read, its hash. The loader then hits the cache and never
-    // takes a worker parse of these files, so the workers do not parse them.
-    // A project that one clone made and deleted keeps its files in the cache
-    // (as in Go), so when a later open makes it again (hono's
-    // tsconfig.spec.json), its load starts no worker parse. A guess that
-    // misses (another `force` option, a file whose language id gives another
-    // kind) only makes the loader parse the file itself.
+    // The parse cache files whose key `get_source_file` can make in this
+    // project's load. The loader then takes them from the cache, so the
+    // workers do not parse them. A project that one clone made and deleted
+    // keeps its files in the cache (as in Go), so when a later open makes it
+    // again (hono's tsconfig.spec.json), its load starts no worker parse.
+    //
+    // Go's key (project/parsecache.go:22 NewParseCacheKey) is the parse
+    // options (file name, path, jsx, force), the script kind and the text
+    // hash. Before the load the host knows only some of them:
+    // - hash and script kind (Go `FileHandle.Kind`, compilerhost.go:106):
+    //   when the snapshot knows the file with no read (`known_file`: an
+    //   open file or a cached one), they must match. Else the file is read
+    //   from disk, whose kind comes from the name (Go overlayfs.go:108
+    //   `cachedFile.Kind`), and any hash passes. `NewParseCacheKey` makes an
+    //   unknown kind TS.
+    // - jsx and force: what this project's options give the name. force also
+    //   depends on the file's package.json scope, which the load finds later
+    //   (ast/parseoptions.go:46 isFileForcedToBeModuleByFormat), so either
+    //   value that a scope can give passes. A project with references parses
+    //   their source files with the reference's own options (Go
+    //   projectreferencefilemapper.go:80 getCompilerOptionsForFile, from
+    //   fileloader.go:418), which the host does not have yet, so then any
+    //   jsx and force pass.
+    //
+    // A wrong guess costs only time or memory: the output always comes from
+    // `get_source_file` with the full key (Go compilerhost.go:106).
+    // - A file in the map whose key misses the cache: no worker parses it,
+    //   so the loader parses it itself (time).
+    // - A file not in the map whose key hits the cache: a worker parses it,
+    //   the loader takes the cached file, and the worker's parse stays in
+    //   its AST arena (memory). The matches above never leave out a key
+    //   that the load can make.
     fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<compiler::FileRefs>> {
         let mut refs = FxHashMap::default();
         let (Some(builder), Some(project)) =
@@ -451,20 +475,37 @@ impl compiler::CompilerHost for CompilerHost {
             return refs;
         };
         let options = command_line.compiler_options();
-        let metadata = SourceFileMetaData::default();
+        let has_references = !command_line.project_references().is_empty();
+        let no_scope = SourceFileMetaData::default();
+        let esm_scope = SourceFileMetaData {
+            package_json_type: "module".to_string(),
+            implied_node_format: ModuleKind::ES_NEXT,
+            ..SourceFileMetaData::default()
+        };
+        let options_pass = |key: &ParseCacheKey| {
+            if has_references {
+                return true;
+            }
+            let guess = |metadata| {
+                parser::get_external_module_indicator_options(&key.file_name, &options, metadata)
+            };
+            let plain = guess(&no_scope);
+            key.jsx == plain.jsx
+                && (key.force == plain.force || key.force == guess(&esm_scope).force)
+        };
         for (key, entry) in builder.parse_cache.entries.borrow().iter() {
-            if key.script_kind != get_script_kind_from_file_name(&key.file_name)
-                || key.jsx
-                    != parser::get_external_module_indicator_options(
-                        &key.file_name,
-                        &options,
-                        &metadata,
-                    )
-                    .jsx
-                || builder
-                    .fs
-                    .known_file_hash(&key.path)
-                    .is_some_and(|hash| hash != key.hash)
+            let (hash, kind) = match builder.fs.known_file(&key.path) {
+                Some((hash, kind)) => (Some(hash), kind),
+                None => (None, get_script_kind_from_file_name(&key.file_name)),
+            };
+            let kind = if kind == ScriptKind::UNKNOWN {
+                ensure_script_kind_from_file_name(&key.file_name)
+            } else {
+                kind
+            };
+            if key.script_kind != kind
+                || hash.is_some_and(|hash| hash != key.hash)
+                || !options_pass(key)
             {
                 continue;
             }

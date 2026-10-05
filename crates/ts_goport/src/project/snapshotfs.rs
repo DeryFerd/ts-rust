@@ -1248,22 +1248,25 @@ impl SnapshotFSBuilder {
         }
     }
 
-    /// The hash of the text that `get_file_by_path` gives for `path` now,
-    /// when it is known with no read and no side effect: a cached file that
-    /// needs no reload, else an open file. `None` when it is not known.
+    /// The hash and the script kind (Go `FileHandle.Kind`) of the file that
+    /// `get_file_by_path` gives for `path` now, when they are known with no
+    /// read and no side effect: a cached file that needs no reload, else an
+    /// open file. `None` when they are not known.
     // PORT: not in Go (parse workers, project/compilerhost.rs
     // `cached_source_file_refs`).
-    pub fn known_file_hash(&self, path: &tspath::Path) -> Option<u128> {
+    pub fn known_file(&self, path: &tspath::Path) -> Option<(u128, ScriptKind)> {
         match self.cache_file_value(path) {
             Some(Some(file)) => {
                 let file = file.borrow();
-                file.matches_disk_text().then(|| file.file_base.hash())
+                file.matches_disk_text()
+                    .then(|| (file.file_base.hash(), file.kind()))
             }
             Some(None) => None,
             None => {
                 let layered: &dyn vfs::Fs = &*self.cached_layered()?.layered;
                 let overlays = as_overlay_fs(layered)?.overlays.borrow();
-                Some(overlays.get(path)?.hash())
+                let overlay = overlays.get(path)?;
+                Some((overlay.hash(), overlay.kind))
             }
         }
     }
