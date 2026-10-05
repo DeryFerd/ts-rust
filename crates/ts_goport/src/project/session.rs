@@ -2234,22 +2234,28 @@ impl Session {
         let s = self.clone();
         let task_old_snapshot = old_snapshot.clone();
         let task_new_snapshot = new_snapshot.clone();
-        // PORT: the task reads the programs of the new snapshot
-        // (`publish_program_diagnostics`). Go's pointers keep them readable
-        // when the next snapshot change disposes it before the task runs; here
-        // a hold keeps each one registered until the task ends.
-        let program_holds: Vec<crate::program::ls_program::ProgramHold> = new_snapshot
-            .project_collection
-            .projects()
-            .iter()
-            .filter_map(|project| {
-                project
-                    .borrow()
-                    .program
-                    .as_deref()
-                    .and_then(crate::program::ls_program::hold_program)
-            })
-            .collect();
+        // PORT: with push diagnostics, the task reads the programs of the new
+        // snapshot (`publish_program_diagnostics`). Go's pointers keep them
+        // readable when the next snapshot change disposes it before the task
+        // runs; here a hold keeps each one registered until the task ends.
+        // No other part of the task reads a program through the registry.
+        let program_holds: Vec<crate::program::ls_program::ProgramHold> =
+            if self.options.push_diagnostics_enabled {
+                new_snapshot
+                    .project_collection
+                    .projects()
+                    .iter()
+                    .filter_map(|project| {
+                        project
+                            .borrow()
+                            .program
+                            .as_deref()
+                            .and_then(crate::program::ls_program::hold_program)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         self.background_queue
             .enqueue(&self.background_context(), move |ctx| {
                 let _program_holds = program_holds;
