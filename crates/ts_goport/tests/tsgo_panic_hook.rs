@@ -8,8 +8,10 @@
 //! Go writes to `os.Stderr`, which end the process by SIGPIPE as in Go.
 //!
 //! The work thread failure write (bin/tsgo.rs `main`, "tsgo: work thread
-//! failed") also drops its error. No test reaches it now: its test used the
-//! getwd error, which was a panic outside the `catch_unwind` of `run_main`.
+//! failed") also drops its error. Its test needs a panic outside the
+//! `catch_unwind` of `run_main`: at a low fd limit, `notify_context` cannot
+//! make the signal-hook pipe and panics (a port gap: Go N needs no fd for
+//! `signal.Notify` and runs).
 //!
 //! The panic of the hook test: tsgo reads the current directory again when it installs the
 //! program (`execute_tsc::install_program`), and a removed directory panics
@@ -149,6 +151,84 @@ fn run_with_flag(mode: &str, stderr: Stdio) -> (ExitStatus, Vec<u8>) {
         .spawn()
         .unwrap();
     let status = wait(&mut child, mode);
+    let mut out = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        std::io::Read::read_to_end(&mut pipe, &mut out).unwrap();
+    }
+    (status, out)
+}
+
+/// A panic outside the `catch_unwind` of `run_main` ends the work thread,
+/// and bin/tsgo.rs `main` writes "tsgo: work thread failed" and exits 70.
+/// With stderr a pipe that has no reader, that write and the hook's drop
+/// their errors: the same exit, not 101 (a panic of the main thread) or
+/// SIGABRT. Go has no such path: a Go panic exits 2.
+///
+/// The panic: `notify_context` (`Signals::new`) cannot make its pipe at a
+/// low fd limit. Go N (tsgo-oracle-673a5f17d713) needs no fd there and
+/// prints its version at a limit of 4 (followups24 lowfd-go.txt), so this
+/// is a port gap that the test only uses. The control finds the lowest
+/// limit at which tsgo starts (the dynamic loader opens its libraries) and
+/// the panic ends the work thread; an inherited fd only moves that limit.
+/// When a change removes the panic, the control fails: then use another
+/// panic outside the `catch_unwind`.
+#[test]
+fn a_panic_outside_catch_unwind_with_no_stderr_reader_exits_unported() {
+    let limit = (3..=32)
+        .find(|&limit| {
+            let (status, stderr) = run_with_fd_limit(limit, Stdio::piped());
+            let stderr = String::from_utf8_lossy(&stderr);
+            if !stderr.contains("tsgo: work thread failed") {
+                assert!(
+                    !status.success(),
+                    "control at fd limit {limit}: tsgo ran: {stderr}"
+                );
+                return false;
+            }
+            assert_eq!(
+                status.code(),
+                Some(EXIT_UNPORTED),
+                "control at fd limit {limit}: {status} {stderr}"
+            );
+            assert!(
+                stderr.starts_with("tsgo: panic at ")
+                    && stderr.contains("signal.Notify: cannot register SIGINT and SIGTERM"),
+                "control at fd limit {limit}: {stderr}"
+            );
+            true
+        })
+        .expect("control: no fd limit ends the work thread");
+    // No reader: the same exit.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let (status, _) = run_with_fd_limit(limit, Stdio::from(writer));
+    assert_eq!(status.signal(), None, "closed stderr: {status}");
+    assert_eq!(
+        status.code(),
+        Some(EXIT_UNPORTED),
+        "closed stderr: {status}"
+    );
+}
+
+/// Runs `tsgo --version` with the fd limit `limit` (soft and hard, `sh`
+/// `ulimit -n`) and no launcher, and returns the exit status and the
+/// stderr (empty when `stderr` is not a pipe to this process).
+fn run_with_fd_limit(limit: u32, stderr: Stdio) -> (ExitStatus, Vec<u8>) {
+    let case = format!("fd limit {limit}");
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(r#"ulimit -n "$1" && exec "$2" --version"#)
+        .arg("sh")
+        .arg(limit.to_string())
+        .arg(env!("CARGO_BIN_EXE_tsgo"))
+        .env_remove("GOPORT_TRACE")
+        .env("GOPORT_LAUNCH", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let status = wait(&mut child, &case);
     let mut out = Vec::new();
     if let Some(mut pipe) = child.stderr.take() {
         std::io::Read::read_to_end(&mut pipe, &mut out).unwrap();
