@@ -113,6 +113,7 @@ mod resolveahead_test;
 mod selectionranges_test;
 mod session_test;
 mod sharedtext_test;
+mod snapshot_task_program_test;
 mod snapshot_test;
 mod snapshotfs_test;
 mod stringliteralranges_test;

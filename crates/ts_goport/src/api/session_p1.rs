@@ -930,6 +930,12 @@ pub fn new_standalone_session(
     init: &project::SessionInit,
     options: Option<&SessionOptions>,
 ) -> Rc<Session> {
+    // Not in Go: the API process frees the file versions that it publishes
+    // again and owns the nodes of their parses, as `project::new_session`
+    // sets for the language server (`ast::free_file_versions`), so a
+    // released source file lease or program frees its parse, as Go's GC
+    // does.
+    crate::ast::set_editor_process();
     let snapshot_host = project::new_snapshot_host(init);
     let mut s = new_session(snapshot_host, None, options);
     s.owns_snapshot_host = true;
@@ -3109,6 +3115,7 @@ impl Session {
             Ok((data, _)) => data,
             Err(err) => {
                 lease.release();
+                project::drop_released_lease(lease);
                 return Err(errors::errorf(
                     format!("failed to encode source file: {err}"),
                     vec![err],
@@ -3150,6 +3157,7 @@ impl Session {
             ));
         };
         lease.release();
+        project::drop_released_lease(lease);
         Ok(to_any(true))
     }
 
@@ -3163,6 +3171,7 @@ impl Session {
             .collect();
         for lease in leases {
             lease.release();
+            project::drop_released_lease(lease);
         }
     }
 
