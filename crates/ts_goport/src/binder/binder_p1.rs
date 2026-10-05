@@ -185,10 +185,12 @@ impl NodeBindBuilder {
     pub fn new(file_index: usize, node_count: usize, entries: usize) -> Self {
         let mut data = Vec::with_capacity(entries.max(1));
         data.push(NodeBindData::default());
+        // PERF: `zeroed_vec`, as `get_mut` and `set_flow_node` read a slot
+        // before they write it.
         NodeBindBuilder {
-            slots: vec![0; node_count],
+            slots: zeroed_vec(node_count),
             entries: data,
-            flows: vec![0; node_count],
+            flows: zeroed_vec(node_count),
             flow_file: (file_index as u64) << 32,
             flow_count: 0,
         }
