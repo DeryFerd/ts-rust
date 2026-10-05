@@ -115,6 +115,26 @@ before calling another `&mut self` method. Clone `Vec`s you iterate while
 calling `&mut self` methods. After a call, re-fetch links
 (`self.value_symbol_links.get(s)`) instead of holding a reference across it.
 
+### Go `int` past the int32 range
+
+Go `int` is 64 bits, and the port holds it as `i32` (the table above). This
+is safe for real sizes and positions. Values from a `.tsbuildinfo` are not
+safe: a diagnostic `pos`, `end` or `start+length` can be near ±2^31 (the i32
+wrap class). Where Go adds or compares such values as `int`, do it in `i64`
+and give Go's panic text (`write_code_snippet`,
+`scanner_util::panic_past_text`).
+
+PORT limit: in a text with bytes that are not valid UTF-8, the port form is
+longer than Go's bytes (marker units, `gostring::go_byte_offset`). Past the
+units, a port offset is `extra` more than its Go offset. A Go offset within
+`extra` of `i32::MAX` has no `i32` port offset, so it wraps to a negative
+one. Go panics `slice bounds out of range [:N]`. The port panics `index out
+of range [-1]`, or with `--pretty` gives the text of the negative Go `end`
+that has the same port offset, or writes the negative value to a
+`.tsbuildinfo`. Do not keep such an offset in `i32`: that only moves the
+error to the `extra` Go offsets below it (followups25 round b, 158 runs lost
+against R172). The full fix needs i64 diagnostic offsets in core.rs.
+
 ## Checker data (owned by checker_p01 and types)
 
 `checker/types.rs` defines (Go names, snake fields):
