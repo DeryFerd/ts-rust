@@ -67,7 +67,8 @@ pub struct CompilerHost {
 /// The keys are hints only: the loader checks each answer
 /// (`accept_ahead_answer`), and resolves itself a key that it does not
 /// find. One per session (`SnapshotHost`), with at most `CAPACITY`
-/// projects; a new one drops the oldest.
+/// projects; a new one drops the least recently deleted (a project
+/// deleted again moves to the end, and `take` removes its entry).
 ///
 /// Rule: only `Snapshot::clone` puts, for a program that it made for a
 /// project that its new collection does not have. A host that `release`
@@ -110,11 +111,11 @@ impl ResolveAheadStash {
             keys,
             share,
         });
-        let oldest = (projects.len() > Self::CAPACITY).then(|| projects.remove(0));
+        let least_recent = (projects.len() > Self::CAPACITY).then(|| projects.remove(0));
         drop(projects);
         // A dropped share can make the workers forget what they keep.
         drop(older);
-        drop(oldest);
+        drop(least_recent);
     }
 
     /// Takes the keys and the share of the deleted project of
