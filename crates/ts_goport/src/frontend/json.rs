@@ -808,7 +808,7 @@ fn invalid_text_error(label: &str, what: &[u8], at: &str) -> String {
     let quoted = if runes == 1 {
         go_quote_rune_bytes(what)
     } else if need_escape {
-        go_quote_bytes(what)
+        crate::gostd::strconv::quote_bytes(what)
     } else {
         format!("`{}`", String::from_utf8_lossy(what))
     };
@@ -858,30 +858,6 @@ fn go_quote_rune_bytes(b: &[u8]) -> String {
         None if b.is_empty() => crate::gostd::strconv::quote_rune('\u{FFFD}'),
         None => format!("'\\x{:x}'", b[0]),
     }
-}
-
-// Go `strconv.Quote` of a byte string: a byte that is not valid UTF-8 is
-// `\x` and two hex digits.
-fn go_quote_bytes(b: &[u8]) -> String {
-    let mut out = String::from("\"");
-    let mut i = 0;
-    while i < b.len() {
-        let start = i;
-        while let Some((_, n)) = decode_utf8(&b[i..]) {
-            i += n;
-        }
-        if i > start {
-            let run = std::str::from_utf8(&b[start..i]).expect("valid UTF-8 run");
-            let quoted = crate::gostd::strconv::quote(run);
-            out.push_str(&quoted[1..quoted.len() - 1]);
-        }
-        if i < b.len() {
-            out.push_str(&format!("\\x{:02x}", b[i]));
-            i += 1;
-        }
-    }
-    out.push('"');
-    out
 }
 
 // Go: jsonwire/decode.go:299 hasEscapedUTF16Prefix
