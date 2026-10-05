@@ -945,14 +945,18 @@ impl Checker {
             return resolved_symbol;
         }
         if !self.pattern_ambient_modules.is_empty() {
-            let pattern_ambient_modules = self.pattern_ambient_modules.clone();
+            // PERF: chkport1 item 3. Go filters a slice of pointers. A clone
+            // of the whole list copied two strings per pattern on each call,
+            // so the list is read by index and only candidates are cloned.
+            // `initialize_checker` sets the list before any check.
             let mut candidates: Vec<PatternAmbientModule> = Vec::new();
-            for v in pattern_ambient_modules {
-                let module_attributes_type = self.get_type_of_module_import_attributes(v.symbol);
-                if core_p17::pattern_matches(&v, module_reference)
+            for i in 0..self.pattern_ambient_modules.len() {
+                let symbol = self.pattern_ambient_modules[i].symbol;
+                let module_attributes_type = self.get_type_of_module_import_attributes(symbol);
+                if core_p17::pattern_matches(&self.pattern_ambient_modules[i], module_reference)
                     && self.is_type_assignable_to(import_attributes_type, module_attributes_type)
                 {
-                    candidates.push(v);
+                    candidates.push(self.pattern_ambient_modules[i].clone());
                 }
             }
 
@@ -1144,12 +1148,17 @@ impl Checker {
             stored_package_name = "";
         }
 
-        let details = create_module_not_found_chain(
-            self.program,
+        // PERF: chkport1 item 3. Go `program.GetPackagesMap()` builds the
+        // map once per program; the port's builds it on each call, so the
+        // checker's memo (Go `c.packagesMap`) is passed in.
+        let program = self.program;
+        let details = create_module_not_found_chain_with(
+            program,
             get_source_file_of_node(error_node),
             module_reference,
             mode,
             package_name,
+            || self.get_packages_map(),
         );
         let mut result = new_diagnostic_for_node(error_node, details.message, details.args);
         result.set_repopulate_info(Some(std::sync::Arc::new(RepopulateDiagnosticInfo {
@@ -1185,11 +1194,13 @@ impl Checker {
         if tspath_p17::is_external_module_name_relative(module_name) {
             return SymbolId::NIL;
         }
-        let symbol = self.get_symbol(
-            self.globals,
-            &format!("\"{module_name}\""),
-            SymbolFlags::VALUE_MODULE,
-        );
+        // PERF: chkport1 item 3. Go concatenates the three strings; `format!`
+        // runs the formatting machinery for each lookup.
+        let mut quoted = String::with_capacity(module_name.len() + 2);
+        quoted.push('"');
+        quoted.push_str(module_name);
+        quoted.push('"');
+        let symbol = self.get_symbol(self.globals, &quoted, SymbolFlags::VALUE_MODULE);
         // merged symbol is module declaration symbol combined with all augmentations
         if with_augmentations {
             return self.get_merged_symbol(symbol);
