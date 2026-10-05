@@ -48,13 +48,14 @@ macro_rules! os_child_test {
 }
 
 /// `env` after `GOPORT_RESOLVE_AHEAD_THREADS=1` when this process can use
-/// only one core. Resolve ahead has one worker per parse thread less the
-/// loading thread (`resolve_ahead::worker_count`), so on one core it starts
-/// none, and the tests check worker answers. A value in `env` wins (the
-/// child's environment takes the last one).
+/// only one core (`program::available_cores`, Go `runtime.GOMAXPROCS`, which
+/// `GOMAXPROCS=1` sets). Resolve ahead has one worker per parse thread less
+/// the loading thread (`resolve_ahead::worker_count`), so on one core it
+/// starts none, and the tests check worker answers. A value in `env` wins
+/// (the child's environment takes the last one).
 // PORT: not in Go (resolve ahead is a port feature).
 fn with_a_worker<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
-    let one_core = std::thread::available_parallelism().map_or(true, |n| n.get() == 1);
+    let one_core = ts_goport::program::available_cores() == 1;
     let mut all = Vec::new();
     if one_core {
         all.push(("GOPORT_RESOLVE_AHEAD_THREADS", "1"));
