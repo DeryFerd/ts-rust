@@ -1,5 +1,6 @@
-//! Go `net/url` subset (go1.26.8 `src/net/url/url.go`,
-//! `src/net/url/encoding_table.go`; identical in go1.26.4): `Parse` for
+//! Go `net/url` subset (go1.27.1 `src/net/url/url.go`,
+//! `src/net/url/encoding_table.go`; go1.27.1 changed only `URL.String` and
+//! added the `Clone` methods, which are not ported): `Parse` for
 //! `lsproto.DocumentUri.FileName`, `PathEscape`, `QueryEscape`,
 //! `PathUnescape` and what they call. Other `net/url` functions are not
 //! ported.
@@ -19,7 +20,7 @@ use crate::gostd::strconv;
 use std::fmt;
 
 // Go: net/url/url.go:30 urlstrictcolons
-// PORT: GODEBUG is not read. The go1.26 default (strict colons for http and
+// PORT: GODEBUG is not read. The go1.27.1 default (strict colons for http and
 // https, Old "0" not set) applies.
 fn urlstrictcolons_value() -> &'static str {
     ""
@@ -817,7 +818,7 @@ fn valid_optional_port(port: &str) -> bool {
     true
 }
 
-// Go: net/url/url.go:1263 validUserinfo
+// Go: net/url/url.go:1283 validUserinfo
 /// validUserinfo reports whether s is a valid userinfo string per RFC 3986
 /// Section 3.2.1.
 /// It doesn't validate pct-encoded. The caller does that via func unescape.
@@ -853,7 +854,7 @@ fn valid_userinfo(s: &str) -> bool {
     true
 }
 
-// Go: net/url/url.go:1297 stringContainsCTLByte
+// Go: net/url/url.go:1317 stringContainsCTLByte
 /// stringContainsCTLByte reports whether s contains any ASCII control character.
 fn string_contains_ctl_byte(s: &str) -> bool {
     for &b in s.as_bytes() {

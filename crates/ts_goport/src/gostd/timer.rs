@@ -1,5 +1,6 @@
 //! Go `time.Timer`, `time.Ticker`, `time.AfterFunc` and `time.After`
-//! (go1.26.8 `src/time/sleep.go`, `src/time/tick.go`) for `Send` data, with
+//! (go1.27.1 `src/time/sleep.go`, `src/time/tick.go`; go1.27.1 removed the
+//! `asynctimerchan` GODEBUG, which the port never read) for `Send` data, with
 //! the runtime timer rules of `src/runtime/time.go` (Go 1.23+ synchronous
 //! timer channels: after `Stop` or `Reset` returns, no stale value is
 //! received).
@@ -51,7 +52,7 @@ impl TimerShared {
     }
 }
 
-// Go: time/sleep.go:52 when
+// Go: time/sleep.go:24 when
 /// when is a helper function for setting the 'when' field of a runtimeTimer.
 /// It returns what the time will be, in nanoseconds, Duration d in the future.
 /// If d is negative, it is ignored. If the returned value would be less than
@@ -79,7 +80,7 @@ fn max_when(now: Instant) -> Instant {
     }
 }
 
-// Go: time/sleep.go:72 newTimer
+// Go: time/sleep.go:44 newTimer
 fn new_timer(when: Instant, period: Duration, f: TimerFunc) -> Arc<TimerShared> {
     let t = Arc::new(TimerShared {
         state: Mutex::new(TimerState {
@@ -145,7 +146,7 @@ fn run_timer(t: Arc<TimerShared>) {
             state.when = None;
         }
         match &t.f {
-            // Go: time/sleep.go:180 sendTime
+            // Go: time/sleep.go:147 sendTime
             // sendTime does a non-blocking send of the current time on c.
             // PORT: Go sends `Now().Add(-delta)`, the time the timer was due.
             TimerFunc::SendTime(c) => {
@@ -155,7 +156,7 @@ fn run_timer(t: Arc<TimerShared>) {
                     state.when = None;
                 }
             }
-            // Go: time/sleep.go:214 goFunc
+            // Go: time/sleep.go:181 goFunc
             TimerFunc::GoFunc(f) => {
                 let f = f.clone();
                 crate::core::GoThread::new()
@@ -172,7 +173,7 @@ fn run_timer(t: Arc<TimerShared>) {
     }
 }
 
-// Go: time/sleep.go:75 stopTimer
+// Go: time/sleep.go:47 stopTimer
 // Go: runtime/time.go stop
 fn stop_timer(t: &Arc<TimerShared>, c: Option<&Receiver<Instant>>) -> bool {
     let mut pending;
@@ -193,7 +194,7 @@ fn stop_timer(t: &Arc<TimerShared>, c: Option<&Receiver<Instant>>) -> bool {
     pending
 }
 
-// Go: time/sleep.go:78 resetTimer
+// Go: time/sleep.go:50 resetTimer
 // Go: runtime/time.go modify
 fn reset_timer(
     t: &Arc<TimerShared>,
@@ -219,7 +220,7 @@ fn reset_timer(
     pending
 }
 
-// Go: time/sleep.go:89 Timer
+// Go: time/sleep.go:61 Timer
 /// The Timer type represents a single event. When the Timer expires, the
 /// current time will be sent on C, unless the Timer was created by
 /// [AfterFunc].
@@ -235,7 +236,7 @@ pub struct Timer {
 }
 
 impl Timer {
-    // Go: time/sleep.go:143 NewTimer
+    // Go: time/sleep.go:110 NewTimer
     /// NewTimer creates a new Timer that will send
     /// the current time on its channel after at least duration d.
     pub fn new(d: Duration) -> Timer {
@@ -244,7 +245,7 @@ impl Timer {
         Timer { c, r, nil_c: None }
     }
 
-    // Go: time/sleep.go:113 Stop
+    // Go: time/sleep.go:85 Stop
     /// Stop prevents the [Timer] from firing.
     /// It returns true if the call stops the timer, false if the timer has already
     /// expired or been stopped.
@@ -261,7 +262,7 @@ impl Timer {
         stop_timer(&self.r, Some(&self.c))
     }
 
-    // Go: time/sleep.go:171 Reset
+    // Go: time/sleep.go:138 Reset
     /// Reset changes the timer to expire after duration d.
     /// It returns true if the timer had been active, false if the timer had
     /// expired or been stopped.
@@ -281,7 +282,7 @@ impl std::fmt::Debug for Timer {
     }
 }
 
-// Go: time/sleep.go:202 After
+// Go: time/sleep.go:169 After
 /// After waits for the duration to elapse and then sends the current time
 /// on the returned channel.
 /// It is equivalent to [NewTimer](d).C.
@@ -289,7 +290,7 @@ pub fn after(d: Duration) -> Receiver<Instant> {
     Timer::new(d).c
 }
 
-// Go: time/sleep.go:210 AfterFunc
+// Go: time/sleep.go:177 AfterFunc
 /// AfterFunc waits for the duration to elapse and then calls f
 /// in its own goroutine. It returns a [Timer] that can
 /// be used to cancel the call using its Stop method.
@@ -340,7 +341,7 @@ impl Ticker {
         Ticker { c, r }
     }
 
-    // Go: time/tick.go:52 Stop
+    // Go: time/tick.go:53 Stop
     /// Stop turns off a ticker. After Stop, no more ticks will be sent.
     /// Stop does not close the channel, to prevent a concurrent goroutine
     /// reading from the channel from seeing an erroneous "tick".
@@ -348,7 +349,7 @@ impl Ticker {
         stop_timer(&self.r, Some(&self.c));
     }
 
-    // Go: time/tick.go:65 Reset
+    // Go: time/tick.go:66 Reset
     /// Reset stops a ticker and resets its period to the specified duration.
     /// The next tick will arrive after the new period elapses. The duration d
     /// must be greater than zero; if not, Reset will panic.
@@ -371,7 +372,7 @@ impl std::fmt::Debug for Ticker {
     }
 }
 
-// Go: time/tick.go:86 Tick
+// Go: time/tick.go:87 Tick
 /// Tick is a convenience wrapper for [NewTicker] providing access to the
 /// ticking channel only. Unlike NewTicker, Tick will return nil if d <= 0.
 ///

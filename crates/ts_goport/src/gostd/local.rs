@@ -654,7 +654,7 @@ fn run_local_timers(shared: Arc<LocalShared>) {
     }
 }
 
-// Go: time/sleep.go:52 when
+// Go: time/sleep.go:24 when
 fn when(d: Duration) -> Instant {
     let now = Instant::now();
     match now.checked_add(d) {

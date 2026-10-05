@@ -15,6 +15,11 @@ Node (`node node_modules/typescript/bin/tsc`) runs it as Go's JS launcher. The e
 path of the binary in the platform package, where it reads the lib files. When the rewrite cannot
 happen, `bin/tsc` stays Go's JS launcher, which still works.
 
+The relative path is fixed at install. pnpm keeps a postinstall's result in its store (the
+side-effects cache) and gives it to a later install of the same package in another layout
+(hoisted, isolated or the global virtual store), where the path can name no file. Then `bin/tsc`
+runs Go's JS launcher with Node, as Go's package does, about 20 ms slower per run.
+
 Files:
 
 - `pack.mjs` writes the package dirs. It follows the Go checkout's `Herebyfile.mjs`

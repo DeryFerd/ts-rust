@@ -2982,7 +2982,7 @@ impl Session {
         &self,
         lease: Rc<project::SourceFileLease>,
     ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
-        let mut data = match encoder::encode_source_file(lease.source_file()) {
+        let mut data = match encoder::encode_parsed_source_file(lease.parsed_source_file()) {
             Ok((data, _)) => data,
             Err(err) => {
                 lease.release();

@@ -1,4 +1,4 @@
-//! Go `errors` (go1.26.8 `src/errors/errors.go`, `wrap.go`, `join.go`), the
+//! Go `errors` (go1.27.1 `src/errors/errors.go`, `wrap.go`, `join.go`), the
 //! error values that `fmt.Errorf` makes (`src/fmt/errors.go`) and `io.EOF`.
 //!
 //! PORT: Go `error` is an interface. `GoError` is one shared error value.

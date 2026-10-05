@@ -14,13 +14,15 @@
 //! The guard has two parts:
 //! - The start check turns THP off at once when less than the limit is free
 //!   in 2 MiB blocks.
-//! - Else a watcher thread reads the free memory every `POLL` and turns THP
-//!   off the first time it drops below the limit. The huge pages that the
-//!   run faulted before stay. The flag changes only the later faults. A
-//!   process that lives on after its first build (`long_running`: watch
-//!   mode, `--lsp`, `--api`) starts no watcher. Its polls cost CPU on every
-//!   edit for up to `WATCH_FOR` (dropin1 diag: 9 to 22 ms per edit window),
-//!   and an LSP server builds nothing until a request comes.
+//! - Else a watcher thread reads the free memory again and again and turns
+//!   THP off the first time it drops below the limit. The huge pages that
+//!   the run faulted before stay. The flag changes only the later faults.
+//!   The wait between two reads (`next_poll`) is 5 ms near the limit and
+//!   up to 50 ms far above it. A process that lives on after its first
+//!   build (`long_running`: watch mode, `--lsp`, `--api`) starts no
+//!   watcher. Its polls cost CPU on every edit for up to `WATCH_FOR`
+//!   (dropin1 diag: 9 to 22 ms per edit window), and an LSP server builds
+//!   nothing until a request comes.
 //!
 //! The limit is low (`DEFAULT_MIN_FREE_MIB`) because a run that finds
 //! enough free 2 MiB blocks is faster with THP. perf13 on dbook, with only
@@ -34,7 +36,7 @@
 //! perf13b, a watcher at 128 MiB on fragmented memory: hono emit faulted
 //! about 66 huge pages before it fired, where THP kept got all 144 with a
 //! few compaction stalls, so hono was 2.2% slower than with THP kept. The
-//! watcher fires later than the limit (see `POLL`); 64 MiB keeps enough
+//! watcher fires later than the limit (see `POLL_MIN`); 64 MiB keeps enough
 //! margin for that. In two more grids (more fragmented: most runs started
 //! below 64 MiB) 64 MiB was within noise of 128 MiB or faster in every
 //! cell, and tsgo -b query chain got about 90 to 130 huge pages, not 56 to
@@ -54,11 +56,28 @@ use std::time::Duration;
 /// perf13b data.
 const DEFAULT_MIN_FREE_MIB: u64 = 64;
 
-/// How often the watcher reads `/proc/buddyinfo`. A run faults huge pages
-/// fastest at its start: in perf13b the free memory fell up to 36 MiB
-/// between two reads (effect emit and query check), so the watcher must
-/// fire that far above zero to beat the first compaction stall.
-const POLL: Duration = Duration::from_millis(5);
+/// The shortest wait between two reads of `/proc/buddyinfo`. A run faults
+/// huge pages fastest at its start: in perf13b, with reads every 5 ms, the
+/// free memory fell up to 36 MiB between two reads (effect emit and query
+/// check), so the watcher must fire that far above zero to beat the first
+/// compaction stall.
+const POLL_MIN: Duration = Duration::from_millis(5);
+
+/// The longest wait between two reads. One wake and read costs 55 to 190 us
+/// of CPU (thpguard1, schedstat of the thread: cup2 about 65, alvin 130 to
+/// 190; a longer sleep costs more per wake), so 50 ms keeps the guard under
+/// 0.4% of one core. With reads every 5 ms it took 1.2% to 2.7% of the CPU
+/// of a single-threaded check (cliperf1 on cup2, thpguard1 on alvin).
+const POLL_MAX: Duration = Duration::from_millis(50);
+
+/// The fastest fall of the free memory that `next_poll` plans for, in
+/// bytes per ms. thpguard1 traced the fall with no guard (1 ms reads, zbook
+/// with other agents building, and cup2): at most 122 MiB in 5 ms, 168 MiB
+/// in 10 ms and 268 MiB in 50 ms (perf13b: 36 MiB in 5 ms). So a wait of
+/// 10 ms covers 2x the largest 10 ms fall, and a wait of 50 ms 6x the
+/// largest 50 ms fall. Less than 192 MiB above the limit the wait is 5 ms,
+/// as it was before `next_poll`.
+const MAX_FALL_PER_MS: u64 = 32 << 20;
 
 /// The watcher stops after this time, so a long run does not read the
 /// memory for its whole life. The longest run of the perf13 grid took 1.2 s.
@@ -155,7 +174,7 @@ pub fn thp_guard() -> bool {
         let failed = step == Start::Off && set_thp_disable(true).is_err();
         let no_watcher = step == Start::Watch && watcher && long_running();
         let watching =
-            step == Start::Watch && watcher && !no_watcher && start_watcher(min_free, debug);
+            step == Start::Watch && watcher && !no_watcher && start_watcher(min_free, free, debug);
         say(
             debug,
             format_args!(
@@ -212,37 +231,40 @@ fn say(debug: bool, args: std::fmt::Arguments<'_>) {
     }
 }
 
-/// Starts the `watch` thread. False when the thread cannot start. The
-/// buddyinfo buffer is made here, on the heap: glibc puts the static TLS
-/// (79 to 99 KiB in perf13b) at the top of each thread stack, so a small
-/// stack (a 128 KiB one, or `RUST_MIN_STACK`) had too little room for it.
+/// Starts the `watch` thread. `free` is the start check's read. False when
+/// the thread cannot start. The buddyinfo buffer is made here, on the heap:
+/// glibc puts the static TLS (79 to 99 KiB in perf13b) at the top of each
+/// thread stack, so a small stack (a 128 KiB one, or `RUST_MIN_STACK`) had
+/// too little room for it.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn start_watcher(min_free: u64, debug: bool) -> bool {
+fn start_watcher(min_free: u64, free: u64, debug: bool) -> bool {
     let buddyinfo = vec![0; BUDDYINFO_BYTES];
     std::thread::Builder::new()
         .name("thp-guard".into())
-        .spawn(move || watch(min_free, debug, buddyinfo))
+        .spawn(move || watch(min_free, next_poll(free, min_free), debug, buddyinfo))
         .is_ok()
 }
 
-/// The watcher thread: reads `/proc/buddyinfo` into `buddyinfo` every
-/// `POLL` and follows `watch_step`. It turns THP off at most once, then
-/// ends. It allocates nothing.
+/// The watcher thread: waits `wait`, reads `/proc/buddyinfo` into
+/// `buddyinfo` and follows `watch_step`, again and again. It turns THP off
+/// at most once, then ends. It allocates nothing.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn watch(min_free: u64, debug: bool, mut buddyinfo: Vec<u8>) {
+fn watch(min_free: u64, mut wait: Duration, debug: bool, mut buddyinfo: Vec<u8>) {
     let start = std::time::Instant::now();
+    let mut reads = 0u32;
     loop {
-        std::thread::sleep(POLL);
+        std::thread::sleep(wait);
         let free = read_small("/proc/buddyinfo", &mut buddyinfo).and_then(free_huge_bytes);
         let elapsed = start.elapsed();
+        reads += 1;
         match (watch_step(elapsed, free, min_free), free) {
-            (Watch::Wait, _) => {}
+            (Watch::Wait(next), _) => wait = next,
             (Watch::Off, free) => {
                 let ok = nix::sys::prctl::set_thp_disable(true).is_ok();
                 return say(
                     debug,
                     format_args!(
-                        "THP off by the watcher after {} ms ({} MiB free in 2 MiB blocks, prctl ok {ok})",
+                        "THP off by the watcher after {} ms and {reads} reads ({} MiB free in 2 MiB blocks, prctl ok {ok})",
                         elapsed.as_millis(),
                         free.unwrap_or(0) >> 20,
                     ),
@@ -260,7 +282,7 @@ fn watch(min_free: u64, debug: bool, mut buddyinfo: Vec<u8>) {
                 return say(
                     debug,
                     format_args!(
-                        "watcher stopped after {} s, THP kept ({} MiB free in 2 MiB blocks)",
+                        "watcher stopped after {} s and {reads} reads, THP kept ({} MiB free in 2 MiB blocks)",
                         elapsed.as_secs(),
                         free >> 20,
                     ),
@@ -305,8 +327,8 @@ fn start_step(enabled: &str, defrag: &str, free: u64, min_free: u64) -> Start {
 /// What the watcher does after one read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Watch {
-    /// Read again after `POLL`.
-    Wait,
+    /// Read again after this wait (`next_poll`).
+    Wait(Duration),
     /// Turn THP off and stop.
     Off,
     /// Stop and keep THP.
@@ -321,8 +343,21 @@ fn watch_step(elapsed: Duration, free: Option<u64>, min_free: u64) -> Watch {
         None => Watch::Stop,
         Some(free) if free < min_free => Watch::Off,
         Some(_) if elapsed >= WATCH_FOR => Watch::Stop,
-        Some(_) => Watch::Wait,
+        Some(free) => Watch::Wait(next_poll(free, min_free)),
     }
+}
+
+/// The wait before the next read when `free` bytes are free in 2 MiB
+/// blocks: the time the free memory takes to fall to `min_free` at
+/// `MAX_FALL_PER_MS`, from `POLL_MIN` to `POLL_MAX`. So the watcher reads
+/// before the memory can reach the limit, and near the limit it reads as
+/// often as it did with a fixed 5 ms (cliperf1 rank 9: the fixed 5 ms read
+/// cost 1.2% to 1.5% of the CPU of a single-threaded run on cup2). Less
+/// than 256 MiB free (zbook in cliperf1 gapA: 166 MiB): 5 ms. 1,664 MiB or
+/// more free: 50 ms.
+fn next_poll(free: u64, min_free: u64) -> Duration {
+    let ms = free.saturating_sub(min_free) / MAX_FALL_PER_MS;
+    Duration::from_millis(ms).clamp(POLL_MIN, POLL_MAX)
 }
 
 /// The text of the file at `path`, read into `buf` without a heap
@@ -446,9 +481,12 @@ Node 0, zone   Normal 616681 607866 455781 337376 229283 129647  50350  16747   
     #[test]
     fn watch_step_turns_thp_off_below_the_limit_until_the_time_limit() {
         let limit = DEFAULT_MIN_FREE_MIB * MIB;
-        let early = POLL;
-        assert_eq!(watch_step(early, Some(limit), limit), Watch::Wait);
-        assert_eq!(watch_step(early, Some(10_000 * MIB), limit), Watch::Wait);
+        let early = POLL_MIN;
+        assert_eq!(watch_step(early, Some(limit), limit), Watch::Wait(POLL_MIN));
+        assert_eq!(
+            watch_step(early, Some(10_000 * MIB), limit),
+            Watch::Wait(POLL_MAX)
+        );
         assert_eq!(watch_step(early, Some(limit - 1), limit), Watch::Off);
         // A file that cannot be read stops the watcher.
         assert_eq!(watch_step(early, None, limit), Watch::Stop);
@@ -457,7 +495,39 @@ Node 0, zone   Normal 616681 607866 455781 337376 229283 129647  50350  16747   
         assert_eq!(watch_step(WATCH_FOR, Some(0), limit), Watch::Off);
         assert_eq!(
             watch_step(WATCH_FOR - Duration::from_millis(1), Some(limit), limit),
-            Watch::Wait
+            Watch::Wait(POLL_MIN)
         );
+    }
+
+    #[test]
+    fn next_poll_waits_until_the_memory_can_reach_the_limit() {
+        let limit = DEFAULT_MIN_FREE_MIB * MIB;
+        let ms = Duration::from_millis;
+        // At or below the limit (the start check and `watch_step` turn THP
+        // off there first), and up to 5 ms of fall above it: 5 ms.
+        assert_eq!(next_poll(0, limit), POLL_MIN);
+        assert_eq!(next_poll(limit, limit), POLL_MIN);
+        assert_eq!(next_poll(limit + 191 * MIB, limit), POLL_MIN);
+        assert_eq!(next_poll(limit + 192 * MIB, limit), ms(6));
+        // zbook (cliperf1 gapA): 166 MiB free.
+        assert_eq!(next_poll(166 * MIB, limit), POLL_MIN);
+        assert_eq!(next_poll(limit + 320 * MIB, limit), ms(10));
+        assert_eq!(next_poll(limit + 960 * MIB, limit), ms(30));
+        // 1,600 MiB above the limit and more: 50 ms.
+        assert_eq!(next_poll(limit + 1599 * MIB, limit), ms(49));
+        assert_eq!(next_poll(limit + 1600 * MIB, limit), POLL_MAX);
+        assert_eq!(next_poll(u64::MAX, limit), POLL_MAX);
+        // With as much free above the limit as the largest fall that
+        // thpguard1 saw in 5, 10 and 50 ms, the next read comes within that
+        // time.
+        for (window, fall) in [(5, 122), (10, 168), (50, 268)] {
+            assert!(next_poll(limit + fall * MIB, limit) <= ms(window));
+        }
+        // A wait never lets the planned fall pass the limit.
+        for free in (limit..limit + 4096 * MIB).step_by(7 * MIB as usize) {
+            let wait = next_poll(free, limit);
+            let fall = MAX_FALL_PER_MS * wait.as_millis() as u64;
+            assert!(wait == POLL_MIN || free - fall >= limit, "{free}");
+        }
     }
 }

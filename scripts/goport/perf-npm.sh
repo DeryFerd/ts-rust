@@ -14,6 +14,7 @@
 #               --incremental false (the inputs are read-only, and hono is composite)
 #   hono-noop   as hono, but composite with a .tsbuildinfo per side (in the output dir) that the
 #               warmup runs write: the no-change run that repeats in a watch-free dev loop
+# Each run must exit with its cell's code (0, or 2 for the hono cells), else the script fails.
 # Timing on a loaded host is noise: the script refuses to start when the 1-minute load is over
 # PERF_MAX_LOAD (default 1.5). Run it on a quiet host (mini-743d) through remote.sh, with
 # both projects pushed there. PERF_RUNS sets the runs per cell (default 30).
@@ -22,7 +23,7 @@
 # Output: target/continuation-r97-goport/perf-npm/<label>/ (hyperfine JSON and text, table.txt).
 set -euo pipefail
 cd /home/theo/Code/sandbox/ts-rust
-[[ $# == 3 ]] || { sed -n '21p' "$0" >&2; exit 2; }
+[[ $# == 3 ]] || { sed -n '22p' "$0" >&2; exit 2; }
 label=$1 rs=$(realpath "$2") go=$(realpath "$3")
 out=target/continuation-r97-goport/perf-npm/$label
 mkdir -p "$out"
@@ -47,11 +48,24 @@ rm -f "$out"/*.tsbuildinfo
 runs=${PERF_RUNS:-30}
 echo "host $(hostname) load $load node $(node --version) runs $runs" > "$out/host.txt"
 cells=(version query hono hono-noop)
+# The exit code of each cell: tsc exits 2 on hono at pin 673a5f17d713, as Go's tsc does (2 TS7031).
+declare -A want=([version]=0 [query]=0 [hono]=2 [hono-noop]=2)
 for cell in "${cells[@]}"; do
   hf=()
   for i in "${!names[@]}"; do hf+=(-n "${names[i]}" "${cmds[i]} ${args[$cell]//SIDE/${names[i]%%-*}}"); done
-  # -i: tsc exits 2 on hono with --composite false at pin 673a5f17d713, as Go's tsc does (2 TS7031).
-  hyperfine -N -i --warmup 3 --runs "$runs" --export-json "$out/$cell.json" "${hf[@]}" > "$out/$cell.txt" 2>&1
+  # hyperfine -i ignores every non-zero exit code (mini-743d has hyperfine 1.19, which takes no list
+  # of codes), so only a cell that must exit non-zero uses it, and every run's code is checked below.
+  ignore=()
+  [[ ${want[$cell]} == 0 ]] || ignore=(-i)
+  hyperfine -N "${ignore[@]}" --warmup 3 --runs "$runs" --export-json "$out/$cell.json" "${hf[@]}" > "$out/$cell.txt" 2>&1 ||
+    { echo "$cell: hyperfine failed (a run did not exit ${want[$cell]}?):" >&2; tail -5 "$out/$cell.txt" >&2; exit 1; }
+  node -e '
+    const [file, want] = process.argv.slice(1);
+    const bad = JSON.parse(require("fs").readFileSync(file, "utf8")).results
+      .filter(r => !r.exit_codes.every(c => c === Number(want)))
+      .map(r => `${r.command}: ${[...new Set(r.exit_codes)].join(",")}`);
+    if (bad.length) { console.error(`exit codes other than ${want}: ${bad.join("; ")}`); process.exit(1); }
+  ' "$out/$cell.json" "${want[$cell]}" || { echo "$cell: wrong exit code" >&2; exit 1; }
 done
 echo "load at end $(cut -d' ' -f1 /proc/loadavg)" >> "$out/host.txt"
 

@@ -1756,6 +1756,34 @@ mod hole_tests {
     }
 }
 
+/// `vec![T::default(); len]` for a large table that a probe reads before it
+/// writes. Not a Go port.
+///
+/// PERF: prefault1. `vec![0; len]` is calloc, and jemalloc does not write a
+/// fresh extent. A read first maps the huge zero page over its 2 MiB block.
+/// On Linux up to 6.12 (6.13: "Do not shatter hugezeropage on wp-fault")
+/// the first write splits it, and each 4 KiB page then takes a
+/// copy-on-write fault with a TLB shootdown to the other checker threads
+/// (zod MT: about 3,200 such faults per run). One store per 4 KiB page,
+/// and one on the last element, makes the first touch a write. Linux only:
+/// it was measured only there, and wasm has no page faults.
+// PERF: `inline(never)`, so a call site stays as small as the `vec!` call it
+// replaces. Inlined, the check and the loop made `Table::push` (through
+// `reindex` and `empty_index`) too large to inline into its callers, and zod
+// ST ran 0.55% more instructions.
+#[inline(never)]
+pub fn zeroed_vec<T: Copy + Default>(len: usize) -> Vec<T> {
+    let mut vec = vec![T::default(); len];
+    if cfg!(target_os = "linux") && size_of_val(vec.as_slice()) >= 16 << 10 {
+        let step = (4096 / size_of::<T>().max(1)).max(1);
+        for i in (0..len).step_by(step).chain([len - 1]) {
+            // black_box: LLVM removes a plain store of 0 into calloc memory.
+            vec[i] = std::hint::black_box(T::default());
+        }
+    }
+    vec
+}
+
 /// One symbol table entry. `hash` is the low half of `intern::hash_str` of
 /// the name, so a lookup by text skips most entries without reading them.
 #[derive(Clone, Copy, Debug)]
@@ -1878,11 +1906,12 @@ impl Table {
 
     /// An empty index for `len` entries, or no index when a table of that
     /// size is searched linearly.
+    // PERF: `zeroed_vec`, as `index_insert` reads a slot before it writes one.
     fn empty_index(len: usize) -> Box<[u16]> {
         if len <= TABLE_LINEAR_MAX {
             return Box::default();
         }
-        vec![0u16; (len * 2).next_power_of_two()].into_boxed_slice()
+        zeroed_vec((len * 2).next_power_of_two()).into_boxed_slice()
     }
 
     /// True when `additional` more entries fit without growing the entries
