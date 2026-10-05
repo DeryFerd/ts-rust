@@ -281,7 +281,7 @@ pub fn create_watch_status_reporter(
 }
 
 /// Go `sys.Now().Format("03:04:05 PM")`. Go `time.Now()` is in `time.Local`.
-// Go (go1.26, the oracle toolchain): time/format.go:667
+// Go (go1.27.1, the oracle toolchain): time/format.go:667
 // (Time).appendFormat, the stdZeroHour12 (:756), stdZeroMinute (:765),
 // stdZeroSecond (:769) and stdPM (:771) cases.
 // PORT: jiff converts the time to the zone's civil time (Go
@@ -307,7 +307,7 @@ pub fn format_status_time(now: SystemTime) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Go time.Local (go1.26 time/zoneinfo_unix.go), for the status clock
+// Go time.Local (go1.27.1 time/zoneinfo_unix.go), for the status clock
 // ---------------------------------------------------------------------------
 // PORT: Go `time.Location` is a `jiff::tz::TimeZone`. Go parses zone files
 // with `LoadLocationFromTZData`; jiff parses the same TZif data (the

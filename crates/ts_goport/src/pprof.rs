@@ -1,6 +1,7 @@
 //! Go: pprof/pprof.go (package `pprof`), and the parts of the Go standard
-//! library package `runtime/pprof` (go1.26.4, the oracle's toolchain) that
-//! it calls.
+//! library package `runtime/pprof` (go1.27.1, the oracle's toolchain) that
+//! it calls. go1.27.1 changed only the parts that the port does not run (the
+//! record loop of `writeHeapProto` and the text form of `writeHeap`).
 //!
 //! `BeginProfiling` and `ProfileSession.Stop` serve `tscCompilation` and
 //! `tscBuildCompilation` (execute/execute_tsc.rs). `CPUProfiler`,
@@ -292,7 +293,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 // ---------------------------------------------------------------------
-// Go standard library: os (go1.26.8)
+// Go standard library: os (go1.27.1)
 // ---------------------------------------------------------------------
 
 // Go: os/path.go:19 MkdirAll, as a Go error (osvfs `os_mkdir_all`).
@@ -317,17 +318,17 @@ pub(crate) fn path_error(op: &str, path: &str, err: &io::Error) -> GoError {
 }
 
 // ---------------------------------------------------------------------
-// Go standard library: runtime/pprof (go1.26.4)
+// Go standard library: runtime/pprof (go1.27.1)
 // ---------------------------------------------------------------------
 
-// Go: runtime/pprof/pprof.go:871 cpu (the `profiling` field)
+// Go: runtime/pprof/pprof.go:868 cpu (the `profiling` field)
 // PORT: Go guards it with a mutex. The atomic swap does the same job.
 static CPU_PROFILING: AtomicBool = AtomicBool::new(false);
 
 // Go: runtime/mprof.go:880 MemProfileRate. tsgo does not change it.
 const MEM_PROFILE_RATE: i64 = 512 * 1024;
 
-// Go: runtime/pprof/pprof.go:888 StartCPUProfile
+// Go: runtime/pprof/pprof.go:885 StartCPUProfile
 // PORT: Go starts the runtime sampler with `runtime.SetCPUProfileRate(hz)`
 // and runs `profileWriter(w)` in a goroutine, which owns the profile
 // builder and writes it to `w` when profiling stops. The port returns
@@ -349,7 +350,7 @@ fn start_cpu_profile() -> Result<ProfileBuilder, &'static str> {
         return Err("cpu profiling already in use");
     }
 
-    // Go: pprof.go:922 profileWriter: b := newProfileBuilder(w)
+    // Go: pprof.go:919 profileWriter: b := newProfileBuilder(w)
     let mut b = ProfileBuilder::new();
     // Go: proto.go:278 addCPUData, for the header record that
     // `runtime.SetCPUProfileRate(hz)` writes first. The port has no other
@@ -361,7 +362,7 @@ fn start_cpu_profile() -> Result<ProfileBuilder, &'static str> {
     Ok(b)
 }
 
-// Go: runtime/pprof/pprof.go:950 StopCPUProfile
+// Go: runtime/pprof/pprof.go:947 StopCPUProfile
 // StopCPUProfile stops the current CPU profile, if any.
 // PORT: Go `<-cpu.done` waits for `profileWriter`, which reads the end
 // of the profile, calls `b.build()` and ignores its error.
@@ -372,7 +373,7 @@ fn stop_cpu_profile(b: ProfileBuilder, w: &File) {
     let _ = b.build(w);
 }
 
-// Go: runtime/pprof/pprof.go:621 writeHeap
+// Go: runtime/pprof/pprof.go:618 writeHeap
 // PORT: Go `pprof.Lookup("heap").WriteTo(w, 0)` calls it with debug 0, so
 // `writeHeapInternal` calls `writeHeapProto` with no default sample type
 // (see `write_alloc`).
@@ -380,9 +381,9 @@ fn write_heap(w: &File) -> io::Result<()> {
     write_heap_proto(w, MEM_PROFILE_RATE, "")
 }
 
-// Go: runtime/pprof/pprof.go:627 writeAlloc
+// Go: runtime/pprof/pprof.go:624 writeAlloc
 // PORT: Go `pprof.Lookup("allocs").WriteTo(w, 0)` calls it with debug 0,
-// so `writeHeapInternal` (pprof.go:631) calls `writeHeapProto` with the
+// so `writeHeapInternal` (pprof.go:628) calls `writeHeapProto` with the
 // runtime memory profile records and `runtime.MemProfileRate`. The port
 // has no records (see the module comment).
 fn write_alloc(w: &File) -> io::Result<()> {

@@ -14,7 +14,8 @@
 //! A method that can be private stays with the properties, in first-seen
 //! order, so a conflicting private method declared first is found before the
 //! properties are checked. That holds for a private static method that
-//! shares its name with a public instance method too.
+//! shares its name with a public instance method too; that test also checks
+//! Go's error text, which names the private `m`.
 
 use crate::support::child::run_command_in_child;
 use crate::support::runner::TscInput;
@@ -46,6 +47,20 @@ fn counts(kind_first: bool) -> (String, String) {
 /// The `Symbols` and `Types` lines of `tsc --extendedDiagnostics` on the
 /// project with the one file `a.ts`.
 fn counts_of(text: String) -> (String, String) {
+    let output = output_of(text);
+    let line = |name: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} line in:\n{output}"))
+            .to_string()
+    };
+    (line("Symbols:"), line("Types:"))
+}
+
+/// The output of `tsc --extendedDiagnostics --pretty false` on the project
+/// with the one file `a.ts`.
+fn output_of(text: String) -> String {
     let input = TscInput {
         files: [
             (format!("{PROJECT}/a.ts"), text.into()),
@@ -59,18 +74,17 @@ fn counts_of(text: String) -> (String, String) {
         ..Default::default()
     };
     let sys = new_test_sys(&input, false);
-    let args = ["-p", "tsconfig.json", "--extendedDiagnostics"].map(String::from);
+    let args = [
+        "-p",
+        "tsconfig.json",
+        "--extendedDiagnostics",
+        "--pretty",
+        "false",
+    ]
+    .map(String::from);
     let result = run_command_in_child(&sys, &args).unwrap_or_else(|err| panic!("tsgo: {err}"));
     assert!(result.unported.is_none(), "unported {:?}", result.unported);
-    let output = sys.output_text();
-    let line = |name: &str| {
-        output
-            .lines()
-            .find(|line| line.starts_with(name))
-            .unwrap_or_else(|| panic!("no {name} line in:\n{output}"))
-            .to_string()
-    };
-    (line("Symbols:"), line("Types:"))
+    sys.output_text()
 }
 
 #[test]
@@ -100,10 +114,18 @@ fn private_symbols(method_first: bool) -> u64 {
     symbols_of(text)
 }
 
-/// The `Symbols` count of `counts_of(text)`.
+/// The `Symbols` count of `tsc --extendedDiagnostics` on `text`.
 fn symbols_of(text: String) -> u64 {
-    let (symbols, _) = counts_of(text);
-    symbols["Symbols:".len()..]
+    symbols_of_output(&output_of(text))
+}
+
+/// The `Symbols` count in a `tsc --extendedDiagnostics` output.
+fn symbols_of_output(output: &str) -> u64 {
+    let symbols = output
+        .lines()
+        .find_map(|line| line.strip_prefix("Symbols:"))
+        .unwrap_or_else(|| panic!("no Symbols line in:\n{output}"));
+    symbols
         .trim()
         .parse()
         .unwrap_or_else(|err| panic!("{symbols:?}: {err}"))
@@ -115,10 +137,12 @@ fn never_intersection_checks_private_methods_with_properties() {
     assert_eq!(private_symbols(false) - private_symbols(true), 30);
 }
 
-/// The `Symbols` count on `A & typeof A` of a class with a public `m()`, a
-/// `private static m()` and 30 names that are an instance and a static
-/// property of different types, with the methods declared before or after
-/// the properties.
+/// The `Symbols` count of `tsc --extendedDiagnostics` on `(A & typeof A).m`
+/// of a class with a public `m()`, a `private static m()` and 30 names that
+/// are an instance and a static property of different types, with the
+/// methods declared before or after the properties. The output must have
+/// Go N's error (tsgo-oracle-673a5f17d713, the same for both orders): the
+/// intersection is never because of `m`.
 fn private_static_symbols(methods_first: bool) -> u64 {
     let methods = "    m(): void {}\n    private static m(): void {}\n";
     let fields: String = (0..30)
@@ -129,9 +153,17 @@ fn private_static_symbols(methods_first: bool) -> u64 {
     } else {
         format!("{fields}{methods}")
     };
-    symbols_of(format!(
-        "class A {{\n{body}}}\ndeclare const a: A & typeof A;\nexport const n: number = a;\n"
-    ))
+    let output = output_of(format!(
+        "class A {{\n{body}}}\ndeclare const a: A & typeof A;\nexport const n: number = a.m;\n"
+    ));
+    let error = "a.ts(66,28): error TS2339: Property 'm' does not exist on type 'never'.\n  \
+                 The intersection 'A & typeof A' was reduced to 'never' because property 'm' \
+                 exists in multiple constituents and is private in some.\n";
+    assert!(
+        output.contains(error),
+        "methods first {methods_first}:\n{output}"
+    );
+    symbols_of_output(&output)
 }
 
 #[test]

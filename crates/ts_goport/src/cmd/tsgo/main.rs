@@ -60,7 +60,7 @@ fn run_on_big_stack(args: Vec<String>, f: fn(Vec<String>) -> i32) -> i32 {
     }
 }
 
-// Go: os/signal/signal.go:281 NotifyContext (go1.26.8)
+// Go: os/signal/signal.go:293 NotifyContext (go1.27.1)
 // NotifyContext returns a copy of the parent context that is marked done
 // (its Done channel is closed) when one of the listed signals arrives,
 // when the returned stop function is called, or when the parent context's
@@ -96,7 +96,7 @@ pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
                 }
             });
     }
-    // Go: signal.go:310 signalCtx.stop
+    // Go: signal.go:322 signalCtx.stop
     let stop: CancelFunc = Arc::new(move || {
         cancel(None);
         // Go: Stop(c.ch)
@@ -115,7 +115,7 @@ pub fn notify_context(parent: &Context) -> (Context, CancelFunc) {
     (ctx, stop)
 }
 
-// Go: os/signal/signal.go:340 signalError
+// Go: os/signal/signal.go:352 signalError
 // PORT: Go `Is(target error) bool` (true for `context.Canceled`) has no
 // port form. No port code reads the cause.
 #[cfg(not(target_family = "wasm"))]
@@ -124,7 +124,7 @@ struct SignalError(String);
 
 #[cfg(not(target_family = "wasm"))]
 impl std::fmt::Display for SignalError {
-    // Go: signal.go:342 signalError.Error
+    // Go: signal.go:354 signalError.Error
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -152,7 +152,7 @@ pub fn must_getwd() -> String {
         .unwrap_or_else(|err| crate::core::go_panic(crate::frontend::vfs::getwd_error_text(&err)))
 }
 
-// Go: flag/flag.go (go1.26.8), the part that package main uses.
+// Go: flag/flag.go (go1.27.1), the part that package main uses.
 
 // Go: flag.go:101 ErrHelp
 // ErrHelp is the error returned if the -help or -h flag is invoked
@@ -243,12 +243,12 @@ pub enum NumError {
     Range,
 }
 
-// Go: internal/strconv/atoi.go:11 lower (go1.26.8)
+// Go: internal/strconv/atoi.go:11 lower (go1.27.1)
 fn lower(c: u8) -> u8 {
     c | (b'x' - b'X')
 }
 
-// Go: internal/strconv/atoi.go:171 ParseInt (go1.26.8), with base 0 and bitSize 64
+// Go: internal/strconv/atoi.go:172 ParseInt (go1.27.1), with base 0 and bitSize 64
 // PORT: only the cause of a Go `*NumError` is kept (see `NumError`).
 fn parse_int(s: &str) -> (i64, Option<NumError>) {
     if s.is_empty() {
@@ -285,7 +285,7 @@ fn parse_int(s: &str) -> (i64, Option<NumError>) {
     (n, None)
 }
 
-// Go: internal/strconv/atoi.go:47 ParseUint (go1.26.8), with base 0 and bitSize 64
+// Go: internal/strconv/atoi.go:47 ParseUint (go1.27.1), with base 0 and bitSize 64
 fn parse_uint(s: &str) -> (u64, Option<NumError>) {
     if s.is_empty() {
         return (0, Some(NumError::Syntax));
@@ -357,7 +357,7 @@ fn parse_uint(s: &str) -> (u64, Option<NumError>) {
     (n, None)
 }
 
-// Go: internal/strconv/atoi.go:251 underscoreOK (go1.26.8)
+// Go: internal/strconv/atoi.go:252 underscoreOK (go1.27.1)
 // underscoreOK reports whether the underscores in s are allowed.
 // Checking them in this one function lets all the parsers skip over them simply.
 // Underscore must appear only between digits or between a base prefix and a digit.
@@ -449,6 +449,16 @@ pub struct FlagSet {
     pub error_handling: ErrorHandling,
 }
 
+// Go: flag.go:431 FlagSet.Output (go1.27.1)
+/// Writes one message of the flag set to Go `os.Stderr` (the flag sets
+/// here set no output): one write of the Go bytes (an argument can hold raw
+/// bytes), as Go `fmt.Fprint` does. Go ignores the write error, and a
+/// stderr pipe with no reader ends the process by SIGPIPE (`stdio`), not by
+/// a panic of `eprint!`.
+fn output(text: &str) {
+    let _ = tsc::write_go_output(&mut tsc::stdio::Stderr, text.as_bytes());
+}
+
 // Go: flag.go:1223 NewFlagSet
 // NewFlagSet returns a new, empty flag set with the specified name and
 // error handling property. If the name is not empty, it will be printed
@@ -532,7 +542,7 @@ impl FlagSet {
     // Go: flag.go:1050 FlagSet.sprintf
     // sprintf formats the message, prints it to output, and returns it.
     fn sprintf(&self, msg: String) -> String {
-        eprintln!("{msg}");
+        output(&format!("{msg}\n"));
         msg
     }
 
@@ -556,9 +566,9 @@ impl FlagSet {
     // defaultUsage is the default function to print a usage message.
     fn default_usage(&self) {
         if self.name.is_empty() {
-            eprint!("Usage:\n");
+            output("Usage:\n");
         } else {
-            eprint!("Usage of {}:\n", self.name);
+            output(&format!("Usage of {}:\n", self.name));
         }
         self.print_defaults();
     }
@@ -605,7 +615,7 @@ impl FlagSet {
                     b.push_str(&format!(" (default {})", flag.def_value));
                 }
             }
-            eprint!("{b}\n");
+            output(&format!("{b}\n"));
         }
     }
 
