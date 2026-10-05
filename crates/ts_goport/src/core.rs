@@ -2027,6 +2027,9 @@ impl Table {
     }
 
     /// Appends an entry for name id `name`, which is not in the table.
+    // PERF: inline, as before the filter: out of line, the binder's inserts
+    // paid a call per new entry (+0.2% instructions on Hono).
+    #[inline]
     fn push(&mut self, hash: u32, name: u32, symbol: SymbolId) {
         self.entries.push(TableEntry { hash, name, symbol });
         self.filter |= filter_bit(hash);
