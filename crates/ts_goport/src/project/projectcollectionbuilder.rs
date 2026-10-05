@@ -42,6 +42,10 @@ pub struct ProjectCollectionBuilder {
     pub content_mapped_parse_cache: Rc<ContentMappedParseCache>,
     pub extended_config_cache: Rc<ExtendedConfigCache>,
     pub content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
+    /// The session's stash of deleted projects' resolve-ahead keys, which
+    /// the hosts of the projects that this clone makes again take.
+    // PORT: not in Go (see `ResolveAheadStash`).
+    pub resolve_ahead_stash: Rc<ResolveAheadStash>,
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
 
     pub ctx: Context,
@@ -70,8 +74,24 @@ pub struct ProjectCollectionBuilder {
     pub synthetic_projects: Rc<dirty::SyncMap<SyntheticProjectID, Rc<RefCell<Project>>>>,
     pub inferred_project: Rc<dirty::Box<Rc<RefCell<Project>>>>,
     pub created_programs: RefCell<Vec<Rc<RefCell<Project>>>>,
+    /// Each program that `update_program` made in this clone, with its host
+    /// and checker pool. The snapshot frees the ones that no project of the
+    /// new collection has (`Snapshot::clone`).
+    // PORT: not in Go. Go's GC frees a program that this clone made for a
+    // project that it then deleted (hono: tsconfig.spec.json at each file
+    // open) or updated again.
+    pub made_programs: RefCell<Vec<MadeProgram>>,
 
     pub api_state: RefCell<APIState>,
+}
+
+/// A program that the builder made, with the host and checker pool that it
+/// gave the project with it (`ProjectCollectionBuilder::made_programs`).
+// PORT: not in Go.
+pub struct MadeProgram {
+    pub program: Rc<compiler::NewProgram>,
+    pub host: Rc<CompilerHost>,
+    pub checker_pool: Rc<CheckerPool>,
 }
 
 // Go: project/projectcollectionbuilder.go:68 newProjectCollectionBuilder
@@ -95,6 +115,7 @@ pub fn new_project_collection_builder(
     content_mapped_parse_cache: Rc<ContentMappedParseCache>,
     extended_config_cache: Rc<ExtendedConfigCache>,
     content_mapper_host: Option<Rc<dyn contentmapper::Host>>,
+    resolve_ahead_stash: Rc<ResolveAheadStash>,
     client: Option<Rc<dyn Client>>,
 ) -> Rc<ProjectCollectionBuilder> {
     let open_files = open_file_paths(&overlays);
@@ -130,6 +151,7 @@ pub fn new_project_collection_builder(
         content_mapped_parse_cache,
         extended_config_cache,
         content_mapper_host,
+        resolve_ahead_stash,
         config_file_registry_builder,
         new_snapshot_id,
         configured_projects: dirty::new_sync_map(
@@ -138,6 +160,7 @@ pub fn new_project_collection_builder(
         synthetic_projects: dirty::new_sync_map(old_project_collection.synthetic_projects.clone()),
         inferred_project: dirty::new_box(old_project_collection.inferred_project.clone()),
         created_programs: RefCell::new(Vec::new()),
+        made_programs: RefCell::new(Vec::new()),
         api_state: RefCell::new(old_api_state.clone()),
         client,
         base: old_project_collection,
@@ -2066,9 +2089,19 @@ impl ProjectCollectionBuilder {
     // the plain `errors`, which are the same on these command lines:
     // - Go adds TS6059 to `Errors` only in `checkSourceFilesBelongToPath`
     //   (tsoptions/parsedcommandline.go:181). Only
-    //   `(*ParsedCommandLine).CommonSourceDirectory` (:157) calls it, and
-    //   only checker.go:15547 calls that, on `redirect`, the command line of
-    //   a project reference (compiler/projectreferencefilemapper.go:90).
+    //   `(*ParsedCommandLine).CommonSourceDirectory` (:157) calls it. Its
+    //   callers:
+    //   - checker.go:15547, on `redirect`, the command line of a project
+    //     reference (compiler/projectreferencefilemapper.go:90);
+    //   - outputpaths (outputpaths.go:141, :167, :191), with the command
+    //     line as its `OutputPathsHost` (parsedcommandline.go:117), from
+    //     `getOutputDeclarationAndSourceFileNames` (:197) and
+    //     `GetOutputFileNames` (:211). Only `ParseInputOutputNames` (:135)
+    //     calls the first, on a reference
+    //     (compiler/projectreferenceparser.go:28, ls/autoimport/util.go:189).
+    //     Only tsc -b calls the second, on the command line of a config
+    //     file (execute/build/buildtask.go:290, :520, :782, :797, :824,
+    //     orchestrator.go:398).
     // - An inferred or synthetic command line comes from
     //   `newInferredProjectCommandLine` (project/project.go:258), not from a
     //   config file, so it is never a reference of a program. Its `Errors`
@@ -2562,6 +2595,15 @@ impl ProjectCollectionBuilder {
                     p.content_mapper_watched_files = Some(Rc::new(content_mapper_watched_files));
                     p.program = Some(Rc::clone(&result.program));
                     p.program_file_refs = Some(Rc::clone(&result.file_refs));
+                    self.made_programs.borrow_mut().push(MadeProgram {
+                        program: Rc::clone(&result.program),
+                        host: Rc::clone(
+                            p.host
+                                .as_ref()
+                                .unwrap_or_else(|| crate::core::go_nil_dereference()),
+                        ),
+                        checker_pool: Rc::clone(&checker_pool),
+                    });
                     p.checker_pool = Some(checker_pool);
                     p.program_update_kind = result.update_kind;
                     p.program_last_update = self.new_snapshot_id;

@@ -609,6 +609,145 @@ child_test! {
     }
 }
 
+child_test! {
+    // PORT: Go's project search starts every reference of a BFS level on its
+    // own goroutine (`core/bfs.go:102`), so after the build project finds a
+    // file, Go still creates the spec project that also includes it (hono's
+    // tsconfig.build.json and tsconfig.spec.json). After an open, the cleanup
+    // deletes it again. A project tree request for a closed file
+    // (willRenameFiles, `lsp/server.go` handleWillRenameFilesWorker) has no
+    // cleanup, so the spec project stays and the answer has the test files.
+    fn solution_search_creates_every_project_of_the_level() {
+        const HELPER_URI: &str = "file:///user/username/projects/myproject/src/helper.ts";
+        let files = files(&[
+            (
+                "/user/username/projects/myproject/tsconfig.json",
+                r#"{
+			"files": [],
+			"references": [{ "path": "./tsconfig.build.json" }, { "path": "./tsconfig.spec.json" }]
+		}"#,
+            ),
+            (
+                "/user/username/projects/myproject/tsconfig.build.json",
+                r#"{ "include": ["src/**/*.ts"], "exclude": ["src/**/*.test.ts"] }"#,
+            ),
+            (
+                "/user/username/projects/myproject/tsconfig.spec.json",
+                r#"{ "include": ["src/**/*.ts"] }"#,
+            ),
+            (MAIN, "export const foo = 1;"),
+            (
+                "/user/username/projects/myproject/src/helper.ts",
+                "export const bar = 2;",
+            ),
+            (
+                "/user/username/projects/myproject/src/main.test.ts",
+                "import { foo } from './main';\nfoo;",
+            ),
+        ]);
+        let (session, _) = projecttestutil::setup(files.clone());
+        let content = file_text(&files, MAIN);
+
+        // The open creates both projects; the cleanup keeps only the default one.
+        open(&session, MAIN_URI, &content);
+        let build_project =
+            configured_project(&session, &cfg("tsconfig.build.json")).expect("build project");
+        assert!(default_project_is(&session, MAIN_URI, &build_project));
+        assert!(!has_configured_project(&session, &cfg("tsconfig.spec.json")));
+        assert_eq!(projects_len(&session), 1);
+
+        // The search for a closed file visits every project of the level.
+        let services =
+            session.get_language_services_for_documents_loading_project_tree(&bg(), &[uri(HELPER_URI)]);
+        assert_eq!(services.len(), 2);
+        assert!(
+            has_configured_project(&session, &cfg("tsconfig.spec.json")),
+            "spec project should be created by the same search level"
+        );
+        assert_eq!(projects_len(&session), 2);
+    }
+}
+
+child_test! {
+    // PORT: not in Go. The open in the layout above makes a program for the
+    // spec project, and the cleanup of the same snapshot clone deletes the
+    // project. No snapshot holds that program, so `dispose` never frees it.
+    // Go's GC frees it; the port frees it at the end of the clone
+    // (`Snapshot::clone`, `ProjectCollectionBuilder::made_programs`). Else
+    // each open in hono keeps a whole spec program.
+    fn deleted_project_of_a_clone_releases_its_program() {
+        let files = files(&[
+            (
+                "/user/username/projects/myproject/tsconfig.json",
+                r#"{
+			"files": [],
+			"references": [{ "path": "./tsconfig.build.json" }, { "path": "./tsconfig.spec.json" }]
+		}"#,
+            ),
+            (
+                "/user/username/projects/myproject/tsconfig.build.json",
+                r#"{ "include": ["src/**/*.ts"], "exclude": ["src/**/*.test.ts"] }"#,
+            ),
+            (
+                "/user/username/projects/myproject/tsconfig.spec.json",
+                r#"{ "include": ["src/**/*.ts"] }"#,
+            ),
+            (MAIN, "export const foo = 1;"),
+            (
+                "/user/username/projects/myproject/src/main.test.ts",
+                "import { foo } from './main';\nfoo;",
+            ),
+        ]);
+        let (session, _) = projecttestutil::setup(files.clone());
+        let content = file_text(&files, MAIN);
+
+        open(&session, MAIN_URI, &content);
+        assert!(!has_configured_project(&session, &cfg("tsconfig.spec.json")));
+        assert_eq!(projects_len(&session), 1);
+        assert_eq!(
+            ts_goport::program::ls_program::registered_programs(),
+            1,
+            "only the build project's program should stay registered"
+        );
+    }
+}
+
+child_test! {
+    // PORT: Go builds the symlink cache on first use (compiler/program.go:2300),
+    // after the project host is frozen (project/compilerhost.go:57), so the
+    // resolution of a package.json dependency that is not installed is not
+    // tracked. A Created event for node_modules/<dependency> then does not
+    // mark the project dirty (projectcollectionbuilder.go:1574, editfuzz3 H3).
+    fn created_dependency_directory_keeps_program() {
+        let index = "export const x = 1;";
+        let (session, _) = projecttestutil::setup(files(&[
+            ("/home/projects/myproject/tsconfig.json", "{}"),
+            (
+                "/home/projects/myproject/package.json",
+                r#"{ "name": "myproject", "dependencies": { "zlibx": "^1.0.0" } }"#,
+            ),
+            (
+                "/home/projects/myproject/node_modules/other/package.json",
+                r#"{ "name": "other" }"#,
+            ),
+            ("/home/projects/myproject/src/index.ts", index),
+        ]));
+        let index_uri = "file:///home/projects/myproject/src/index.ts";
+        open(&session, index_uri, index);
+        let before = program(&session, index_uri);
+
+        watch(
+            &session,
+            &[(CREATED, "file:///home/projects/myproject/node_modules/zlibx")],
+        );
+        let after = program(&session, index_uri);
+        assert!(
+            same_program(&before, &after),
+            "a Created event for an uninstalled dependency should not rebuild the program"
+        );
+    }
+}
+
 // Go: projectcollectionbuilder_test.go:602 filesForSolutionConfigFile
 fn files_for_solution_config_file(
     solution_refs: &[&str],

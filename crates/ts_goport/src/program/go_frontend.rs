@@ -46,9 +46,9 @@ pub(super) struct GoSharedState {
     /// The frontend `IncludeProcessor::diagnostics_read`: set where Go builds
     /// the include processor diagnostics (`get_include_processor_diagnostics`).
     include_diagnostics_read: Arc<std::sync::atomic::AtomicBool>,
-    /// Go `GetParseFileRedirect` of each resolved module file name that is
-    /// not a program file and has a redirect. Shared like `resolved_modules`.
-    parse_file_redirects: Arc<FxHashMap<String, String>>,
+    /// Go `projectReferenceFileMapper.realpathDtsToSource` after the load,
+    /// by path: the entries with a source (`get_parse_file_redirect`).
+    realpath_dts_to_source: FxHashMap<String, Arc<SourceOutputAndProjectReference>>,
     /// Go `processedFiles.redirectTargetsMap`, by path.
     redirect_targets: FxHashMap<String, Vec<String>>,
     /// Go `GetSourceFileFromReference` of each preserved `/// <reference
@@ -67,9 +67,10 @@ pub(super) struct GoSharedState {
     redirects_for_resolution: FxHashMap<usize, Arc<ResolvedProjectReference>>,
     /// Go `GetResolvedProjectReferences`.
     resolved_project_references: Vec<Option<Arc<ResolvedProjectReference>>>,
-    /// Go `Program.GetSymlinkCache`. Shared with the version this one was
-    /// updated from when the frontend shares the cache.
-    known_symlinks: Arc<crate::modulespecifiers::symlinks::KnownSymlinks>,
+    /// Go `Program.knownSymlinks`: set on first use (`known_symlinks`).
+    /// Shared with the version this one was updated from when the frontend
+    /// shares the cache (Go `tryReuse`).
+    known_symlinks: OnceLock<Arc<crate::modulespecifiers::symlinks::KnownSymlinks>>,
     /// Go `processedFiles.sourceFilesFoundSearchingNodeModules`, by path.
     /// Shared like `resolved_modules`.
     source_files_found_searching_node_modules: Arc<FxHashSet<String>>,
@@ -285,6 +286,54 @@ pub(super) fn mark_freeable_parses(np: &NewProgram) {
     }
 }
 
+// Go: compiler/program.go:2300 GetSymlinkCache (`get_go_symlink_cache`)
+// PORT: Go builds the cache on first use, on any goroutine. The port
+// builds it from the frontend program, which only the loading thread has,
+// and keeps a thread-safe copy in the program's shared state. The loading
+// thread builds it on first use, or when it seeds a thread
+// (`build_lazy_shared_state`), so a seeded thread finds it built.
+pub(super) fn known_symlinks() -> Arc<crate::modulespecifiers::symlinks::KnownSymlinks> {
+    if let Some(built) = with_go(GoSharedState::built_known_symlinks) {
+        return built;
+    }
+    let id = prog().id;
+    let frontend = FRONTENDS
+        .with(|frontends| frontends.borrow().get(&id).cloned())
+        .expect("the symlink cache is built on the loading thread (`build_lazy_shared_state`)");
+    // PORT: the parallel bind seeds threads while the project host still
+    // tracks its file system calls, before Go makes any use of the cache. A
+    // Go first use after the host is frozen (project/compilerhost.go:57)
+    // makes no tracked calls. So when the frontend has not built its value,
+    // the copy is built with the tracking paused, and the frontend's own
+    // value is left for its first use (the auto-import registry, which can
+    // come before the freeze, as in Go). Else a node_modules/<dependency>
+    // Created event marks the project dirty where Go only clones the
+    // snapshot (editfuzz3 H3).
+    let copy = match frontend.symlink_cache_if_built() {
+        Some(built) => Arc::new((*built).clone()),
+        None => {
+            let mut built = None;
+            frontend
+                .host()
+                .without_fs_tracking(&mut || built = Some(frontend.build_symlink_cache()));
+            Arc::new(built.expect("without_fs_tracking runs its callback"))
+        }
+    };
+    with_go(|go| Arc::clone(go.known_symlinks.get_or_init(|| copy)))
+}
+
+/// Builds the shared state values that the current program makes on first
+/// use (`known_symlinks`), when this thread loaded it: a thread seeded from
+/// this one (`WorkerSeed`) cannot build them. Does nothing on another
+/// thread, which was seeded after they were built, or for an alias
+/// resolver program.
+pub(super) fn build_lazy_shared_state() {
+    let id = prog().id;
+    if FRONTENDS.with(|frontends| frontends.borrow().contains_key(&id)) {
+        let _ = known_symlinks();
+    }
+}
+
 /// `new_program_version` (program.rs).
 pub(super) fn new_program_version(
     np: &Rc<NewProgram>,
@@ -404,8 +453,10 @@ pub(super) fn file_exists(path: &str) -> bool {
     if let Some(go) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned()) {
         return go.file_exists(path);
     }
-    super::with_host_fs_cache(|cache| {
-        cache.file_exists(path, || WORKER_FS.with(|fs| fs.file_exists(path)))
+    super::with_tables(|tables| {
+        tables
+            .host_fs_cache
+            .file_exists(path, || WORKER_FS.with(|fs| fs.file_exists(path)))
     })
 }
 
@@ -599,7 +650,9 @@ enum Entry {
 /// updated from, if it is still loaded; the new state shares its copies of
 /// unchanged frontend data (`GoSharedState::new`). When `np` replaced files
 /// of `previous` in place (Go `ReuseProgram`), the new tables start from
-/// its tables (`reused_tables`).
+/// its tables (`reused_tables`). When `np` keeps the frontend resolver of
+/// `previous`, the new tables share its package.json cache
+/// (`VersionTables::package_json_cache`).
 fn build_program(
     np: &Rc<NewProgram>,
     entry: Entry,
@@ -688,7 +741,7 @@ fn build_program(
     let previous_shared = previous
         .as_ref()
         .and_then(|old| Some((&*old.np, old.tables.go.as_ref()?)));
-    let (tables, common_source_directory) = match (&previous, &replaced) {
+    let (mut tables, common_source_directory) = match (&previous, &replaced) {
         (Some(old), Some(replaced)) => {
             let tables = reused_tables(np, old, replaced);
             // Go computes it from the file names and the options, which a
@@ -711,6 +764,15 @@ fn build_program(
             (tables, common_source_directory)
         }
     };
+    // Go: compiler/program.go:408 ReuseProgram keeps `processedFiles`, so
+    // the new program keeps the resolver and the package.json lookups of
+    // module specifier generation in its cache (program.go:147-169).
+    if let Some(old) = &previous
+        && let (Some(resolver), Some(old_resolver)) = (&np.resolver, &old.np.resolver)
+        && Rc::ptr_eq(resolver, old_resolver)
+    {
+        tables.package_json_cache = Arc::clone(&old.tables.package_json_cache);
+    }
     if check_version_tables() {
         tables
             .go
@@ -1250,24 +1312,6 @@ impl GoSharedState {
             .map(|(path, &specifier)| (path.0.clone(), specifier))
             .collect();
         let include_diagnostics = include_diagnostics_of(p, file_by_path);
-        // Go reads these lazily from the program. The only file names the
-        // checker asks about are resolved module names.
-        let parse_file_redirects = match same_resolutions {
-            Some((_, old)) => Arc::clone(&old.parse_file_redirects),
-            None => Arc::new(
-                files
-                    .resolved_modules
-                    .values()
-                    .flat_map(|cache| cache.values())
-                    .map(|resolved| &resolved.resolved_file_name)
-                    .filter(|name| !name.is_empty() && p.get_source_file(name).is_none())
-                    .filter_map(|name| {
-                        let redirect = p.get_parse_file_redirect(name);
-                        (!redirect.is_empty()).then(|| (name.clone(), redirect))
-                    })
-                    .collect(),
-            ),
-        };
         let redirect_targets = files
             .redirect_targets_map
             .iter()
@@ -1316,13 +1360,30 @@ impl GoSharedState {
         };
         let source_to_project_reference = copy_map(&mapper.source_to_project_reference);
         let output_dts_to_project_reference = copy_map(&mapper.output_dts_to_project_reference);
+        // The load released the mapper's loader (Go fileloader.go:223), so
+        // no entry is added after it (`getSourceToDtsIfSymlink`, :163), and
+        // an entry with no source finds nothing.
+        let realpath_dts_to_source: FxHashMap<_, _> = mapper
+            .realpath_dts_to_source
+            .borrow()
+            .iter()
+            .filter_map(|(path, entry)| {
+                Some((path.0.clone(), project_references.entry(entry.as_ref()?)))
+            })
+            .collect();
         let can_use_project_reference_source = mapper.opts.can_use_project_reference_source();
         drop(mapper);
         // Go asks for the redirect of checker files only, which are program
         // files. A redirect comes from the path and the project references,
         // so with the same references a file that `p` shares keeps its
-        // redirect. The map is built again unless no file has one.
+        // redirect. The map is built again unless no file has one. With no
+        // project reference entries, Go finds no redirect for any file
+        // (projectreferencefilemapper.go:90 getRedirectForResolution).
+        let no_redirects = source_to_project_reference.is_empty()
+            && output_dts_to_project_reference.is_empty()
+            && realpath_dts_to_source.is_empty();
         let redirects_for_resolution = match (reused, same_resolutions) {
+            _ if no_redirects => FxHashMap::default(),
             (Some((_, old)), Some(_))
                 if old.redirects_for_resolution.is_empty()
                     && replaced
@@ -1344,15 +1405,24 @@ impl GoSharedState {
             .iter()
             .map(|r| r.as_ref().map(|r| project_references.resolved(r)))
             .collect();
-        // PORT: Go builds the symlink cache on first use. It reads only the
-        // loaded program, so building it here gives the same value.
-        let symlinks = p.get_symlink_cache();
-        let known_symlinks = match previous {
-            Some((old_p, old)) if Rc::ptr_eq(&symlinks, &old_p.get_symlink_cache()) => {
-                Arc::clone(&old.known_symlinks)
-            }
-            _ => Arc::new((*symlinks).clone()),
-        };
+        // Go builds the symlink cache on first use (`known_symlinks`), and
+        // `ReuseProgram` takes the old program's cache when it is built
+        // (`tryReuse`, program.go:415). The copy stands for that cache: it
+        // is shared when `p` replaced files of `previous` in place, or when
+        // the frontend shares its built cache.
+        // PORT: the copy can be built while the frontend's own value is not
+        // (`known_symlinks` builds it with the fs tracking paused, H3).
+        let known_symlinks = OnceLock::new();
+        if let Some((old_p, old)) = previous
+            && (reused.is_some()
+                || matches!(
+                    (p.known_symlinks.get(), old_p.known_symlinks.get()),
+                    (Some(symlinks), Some(old_symlinks)) if Rc::ptr_eq(symlinks, old_symlinks)
+                ))
+            && let Some(copy) = old.known_symlinks.get()
+        {
+            let _ = known_symlinks.set(Arc::clone(copy));
+        }
         let source_files_found_searching_node_modules = match previous {
             Some((old_p, old))
                 if Rc::ptr_eq(
@@ -1389,7 +1459,7 @@ impl GoSharedState {
             import_helpers_import_specifiers,
             include_diagnostics,
             include_diagnostics_read: Arc::clone(&p.include_processor.diagnostics_read),
-            parse_file_redirects,
+            realpath_dts_to_source,
             redirect_targets,
             references,
             output_file_to_project_reference_source,
@@ -1461,15 +1531,52 @@ impl GoSharedState {
         self.resolved_project_references.clone()
     }
 
-    // Go: compiler/program.go:2300 GetSymlinkCache
-    pub(crate) fn known_symlinks(&self) -> Arc<crate::modulespecifiers::symlinks::KnownSymlinks> {
-        Arc::clone(&self.known_symlinks)
+    /// The copy of Go `Program.GetSymlinkCache` when it is built
+    /// (`known_symlinks`).
+    fn built_known_symlinks(
+        &self,
+    ) -> Option<Arc<crate::modulespecifiers::symlinks::KnownSymlinks>> {
+        self.known_symlinks.get().cloned()
     }
 
-    // Go: compiler/program.go:211 GetParseFileRedirect (for resolved module
-    // file names)
+    // Go: compiler/program.go:211 GetParseFileRedirect
+    // Go: compiler/projectreferencefilemapper.go:35 getParseFileRedirect
+    // PORT: after the load, so `getSourceToDtsIfSymlink` only reads
+    // `realpathDtsToSource`. None is the Go "".
+    // PERF: with no project reference entries there is no redirect, and
+    // the path is not made.
     pub(super) fn get_parse_file_redirect(&self, file_name: &str) -> Option<&str> {
-        self.parse_file_redirects.get(file_name).map(String::as_str)
+        let to_path = || {
+            crate::frontend::tspath::to_path(
+                file_name,
+                &self.current_directory,
+                self.use_case_sensitive_file_names,
+            )
+        };
+        let redirect = if self.can_use_project_reference_source {
+            // Map to source file from project reference
+            if self.output_dts_to_project_reference.is_empty()
+                && self.realpath_dts_to_source.is_empty()
+            {
+                return None;
+            }
+            let path = to_path();
+            let source = self
+                .output_dts_to_project_reference
+                .get(&path.0)
+                .or_else(|| self.realpath_dts_to_source.get(&path.0))?;
+            source.source.as_str()
+        } else {
+            // Map to dts file from project reference
+            if self.source_to_project_reference.is_empty() {
+                return None;
+            }
+            self.source_to_project_reference
+                .get(&to_path().0)?
+                .output_dts
+                .as_str()
+        };
+        (!redirect.is_empty()).then_some(redirect)
     }
 
     // Go: compiler/program.go:173 GetRedirectTargets
@@ -1773,6 +1880,190 @@ mod tests {
         // A replaced file of the group takes the full build.
         let edited = replaced_in_place(&np, pkg);
         assert!(replaced_files(&edited, &np, &old).is_none());
+    }
+
+    /// A project in a new dir under the system temp dir: `index.ts`
+    /// imports `pkg`, and `node_modules/pkg` is a symlink to `real/pkg`, so
+    /// the resolution goes through the symlink. Returns the dir with `/`
+    /// separators. `name` names the dir.
+    #[cfg(unix)]
+    fn symlinked_package_project(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = [
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"types":[]},"files":["index.ts"]}"#,
+            ),
+            (
+                "index.ts",
+                "import { p } from \"pkg\";\nexport const x = p;\n",
+            ),
+            (
+                "real/pkg/package.json",
+                r#"{"name":"pkg","types":"index.d.ts"}"#,
+            ),
+            ("real/pkg/index.d.ts", "export declare const p: number;\n"),
+        ];
+        for (path, text) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink("../real/pkg", dir.join("node_modules/pkg")).unwrap();
+        dir.to_string_lossy().replace('\\', "/")
+    }
+
+    /// The frontend program of `version` on this thread.
+    fn frontend_of(version: &GoProgram) -> Rc<NewProgram> {
+        FRONTENDS
+            .with(|frontends| frontends.borrow().get(&version.id).cloned())
+            .expect("a version loaded on this thread")
+    }
+
+    // progtables1: Go builds the symlink cache on first use
+    // (program.go:2300 GetSymlinkCache, a `lazyValue`). A load does not
+    // build it. A seeded thread cannot build it, so the loading thread
+    // builds it when it seeds one, and both read the same copy.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cache_is_built_on_first_use() {
+        let dir = symlinked_package_project("goport-lazy-symlinks");
+        let program = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        let frontend = frontend_of(program);
+        assert!(
+            frontend.known_symlinks.get().is_none(),
+            "the load built the symlink cache"
+        );
+        let (seeded, built) = {
+            let _scope = crate::core::enter_program(Some(program));
+            let seeded = crate::program::spawn_seeded_thread(|| {
+                crate::program::get_go_symlink_cache().expect("a Go frontend program")
+            })
+            .join()
+            .expect("the seeded thread reads the cache");
+            let built = crate::program::get_go_symlink_cache().expect("a Go frontend program");
+            (seeded, built)
+        };
+        assert!(Arc::ptr_eq(&seeded, &built), "two copies of the cache");
+        let directories = |symlinks: &crate::modulespecifiers::symlinks::KnownSymlinks| {
+            symlinks.directories().keys().cloned().collect::<Vec<_>>()
+        };
+        assert_eq!(
+            directories(&built),
+            directories(&frontend.get_symlink_cache())
+        );
+        assert!(
+            directories(&built)
+                .iter()
+                .any(|path| path.0.ends_with("/node_modules/pkg/")),
+            "node_modules/pkg is not a known symlink"
+        );
+        drop(frontend);
+        crate::program::release_program(program);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // progtables1: Go `ReuseProgram` takes the old program's symlink cache
+    // when it is built (`tryReuse`, program.go:415), and keeps it unbuilt
+    // when it is not.
+    #[cfg(unix)]
+    #[test]
+    fn reused_program_shares_a_built_symlink_cache() {
+        let dir = symlinked_package_project("goport-reused-symlinks");
+        let index = format!("{dir}/index.ts");
+        let v1 = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        let body_edit = |old, digit: &str| {
+            std::fs::write(
+                &index,
+                format!("import {{ p }} from \"pkg\";\nexport const x = p + {digit};\n"),
+            )
+            .unwrap();
+            let (version, reused) = crate::program::update_program_version(old, &index);
+            assert!(reused, "a body edit replaces the file in place");
+            version
+        };
+        let v2 = body_edit(v1, "1");
+        assert!(frontend_of(v2).known_symlinks.get().is_none());
+        let built = {
+            let _scope = crate::core::enter_program(Some(v2));
+            crate::program::get_go_symlink_cache().expect("a Go frontend program")
+        };
+        let v3 = body_edit(v2, "2");
+        let shared = {
+            let _scope = crate::core::enter_program(Some(v3));
+            crate::program::get_go_symlink_cache().expect("a Go frontend program")
+        };
+        assert!(
+            Arc::ptr_eq(&built, &shared),
+            "the reused program built its own copy"
+        );
+        for version in [v1, v2, v3] {
+            crate::program::release_program(version);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // progtables1: Go reads a parse file redirect per call (program.go:211
+    // GetParseFileRedirect). The copy answers per call from the project
+    // reference maps, as the frontend program does. Here b references a,
+    // so a's source file redirects to its output d.ts (tsc does not use
+    // the source of a project reference).
+    #[test]
+    fn parse_file_redirects_match_the_frontend() {
+        let dir =
+            std::env::temp_dir().join(format!("goport-parse-redirects-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let files = [
+            (
+                "a/tsconfig.json",
+                r#"{"compilerOptions":{"composite":true,"outDir":"out","types":[]}}"#,
+            ),
+            ("a/index.ts", "export const a = 1;\n"),
+            ("a/out/index.d.ts", "export declare const a = 1;\n"),
+            (
+                "b/tsconfig.json",
+                r#"{"compilerOptions":{"types":[]},"references":[{"path":"../a"}],"files":["index.ts"]}"#,
+            ),
+            (
+                "b/index.ts",
+                "import { a } from \"../a/index\";\nexport const b = a;\n",
+            ),
+        ];
+        for (path, text) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let dir = dir.to_string_lossy().replace('\\', "/");
+        let program = crate::program::try_load_version(&format!("{dir}/b/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        let frontend = frontend_of(program);
+        let mut names: Vec<String> = frontend
+            .resolved_modules
+            .values()
+            .flat_map(|cache| cache.values())
+            .map(|resolved| resolved.resolved_file_name.clone())
+            .filter(|name| !name.is_empty())
+            .collect();
+        names.extend([format!("{dir}/a/index.ts"), format!("{dir}/b/index.ts")]);
+        let mut redirected = 0;
+        {
+            let _scope = crate::core::enter_program(Some(program));
+            for name in &names {
+                let want = frontend.get_parse_file_redirect(name);
+                let got = with_go(|go| go.get_parse_file_redirect(name).map(str::to_string));
+                assert_eq!(got.unwrap_or_default(), want, "redirect of {name}");
+                redirected += usize::from(!want.is_empty());
+            }
+        }
+        assert!(redirected > 0, "no name has a redirect");
+        drop(frontend);
+        crate::program::release_program(program);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Why the `redirect_files_by_path` half of the bailout in

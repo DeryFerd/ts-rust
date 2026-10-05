@@ -254,6 +254,10 @@ impl StatusPrefetch {
     ///   (`os_mod_times_of_non_links`), so the check reads it.
     /// - a link in a directory part of the name, to the output directory of
     ///   another task: not found, and the prefetched mtime stays.
+    /// - a name that is a hard link to an output of another task (one file
+    ///   with two names). The task writes the file in place under its own
+    ///   name, and only that name is noted as written, so the prefetched
+    ///   mtime of this name stays.
     /// The build drops what its checks did not take
     /// (`BuildTask::drop_status_prefetch`), so a later build reads the file
     /// system. Each path is read once: the build info lists the root files
