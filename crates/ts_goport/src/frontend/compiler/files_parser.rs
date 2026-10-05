@@ -1919,6 +1919,16 @@ impl PrefetchShared {
     /// normalized absolute name with a known extension).
     fn queue_names(&self, names: Vec<String>) {
         let config = &self.config;
+        // PERF (perffu1): with the program options the guess is the one of
+        // `FilesParser::prefetch_request`. With the default options, a
+        // file with no import or export that the loader parses with other
+        // options (a `.cjs`, `.mjs`, `.cts` or `.mts` file, or any file with
+        // `moduleDetection: force` or a `react-jsx` emit) was parsed again.
+        // Without a worker resolver the options are not known here.
+        let options = match self.resolve.get() {
+            Some(Some(resolve)) => Some(&resolve.options),
+            _ => None,
+        };
         for file_name in names {
             let script_kind = get_script_kind_from_file_name(&file_name);
             if script_kind == ScriptKind::UNKNOWN
@@ -1933,12 +1943,20 @@ impl PrefetchShared {
                 &config.current_directory,
                 config.use_case_sensitive_file_names,
             );
-            // PORT: the options are a guess (see `FilesParser::prefetch`).
+            // PORT: the options are a guess (see `FilesParser::prefetch_request`).
+            let external_module_indicator_options =
+                options.map_or_else(Default::default, |options| {
+                    get_external_module_indicator_options(
+                        &file_name,
+                        options,
+                        &SourceFileMetaData::default(),
+                    )
+                });
             self.queue(
                 SourceFileParseOptions {
                     file_name,
                     path,
-                    external_module_indicator_options: ExternalModuleIndicatorOptions::default(),
+                    external_module_indicator_options,
                 },
                 script_kind,
             );
