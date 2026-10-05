@@ -1804,6 +1804,18 @@ const TABLE_LINEAR_MAX: usize = 8;
 struct Table {
     entries: Vec<TableEntry>,
     index: Box<[u16]>,
+    /// The `filter_bit` of the hash of each entry. A name whose bit is clear
+    /// is not in the table, so most lookups of an absent name end here and
+    /// read no entry and no index slot, as most Go map lookups of an absent
+    /// key end at the control bytes of one group.
+    filter: u64,
+}
+
+/// The bit of a table hash in `Table::filter`: its top 6 bits, which the
+/// index slot (the low bits) does not use.
+#[inline]
+fn filter_bit(hash: u32) -> u64 {
+    1 << (hash >> 26)
 }
 
 const INDEX_MOD: usize = u16::MAX as usize;
@@ -1901,6 +1913,7 @@ impl Table {
             // PERF: a table sized past `TABLE_LINEAR_MAX` gets its index now,
             // so filling it never reindexes. The index is lookup only.
             index: Self::empty_index(capacity),
+            filter: 0,
         }
     }
 
@@ -1951,6 +1964,9 @@ impl Table {
     /// The position of the entry with hash `hash` that `is_name` accepts.
     #[inline]
     fn find_by(&self, hash: u32, is_name: impl Fn(&TableEntry) -> bool) -> Option<usize> {
+        if self.filter & filter_bit(hash) == 0 {
+            return None;
+        }
         if self.index.is_empty() {
             return self
                 .entries
@@ -1986,8 +2002,12 @@ impl Table {
         index[slot] = u16::try_from(position % INDEX_MOD + 1).expect("index slot");
     }
 
-    /// Rebuilds the index for the current entries.
+    /// Rebuilds the index and the filter for the current entries.
     fn reindex(&mut self) {
+        self.filter = self
+            .entries
+            .iter()
+            .fold(0, |filter, entry| filter | filter_bit(entry.hash));
         let mut index = Self::empty_index(self.entries.len());
         if !index.is_empty() {
             for (position, entry) in self.entries.iter().enumerate() {
@@ -2009,6 +2029,7 @@ impl Table {
     /// Appends an entry for name id `name`, which is not in the table.
     fn push(&mut self, hash: u32, name: u32, symbol: SymbolId) {
         self.entries.push(TableEntry { hash, name, symbol });
+        self.filter |= filter_bit(hash);
         let len = self.entries.len();
         // A table can have an index before it passes `TABLE_LINEAR_MAX`
         // (`with_capacity`, `reserve`). Every entry of an indexed table is in
@@ -2295,6 +2316,7 @@ impl SymbolArena {
         let mut table = Table {
             entries: Vec::with_capacity(entries.len()),
             index: Box::default(),
+            filter: 0,
         };
         table
             .entries
@@ -3520,6 +3542,57 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
         match key.link_slot() {
             LinkSlot::Map => self.map.get(&key),
             slot => self.cell(slot)?.as_ref(),
+        }
+    }
+}
+
+// PORT: no Go counterpart. The filter of a symbol table (`Table::filter`)
+// never hides an entry: every way to add, remove or rename entries keeps it.
+#[cfg(test)]
+mod table_filter_tests {
+    use super::*;
+
+    #[test]
+    fn table_filter_keeps_every_entry_findable() {
+        let mut arena = SymbolArena::new();
+        let name = |n: usize| Name::from(format!("corefix1_name_{n}").as_str());
+        for size in [0, 1, 7, 8, 9, 40, 300] {
+            let set = arena.new_table();
+            let built =
+                arena.push_table_from_entries((0..size).map(|n| (name(n), SymbolId(n as u32 + 1))));
+            for n in 0..size {
+                arena.set(set, name(n), SymbolId(n as u32 + 1));
+            }
+            for n in (0..size).step_by(3) {
+                arena.delete(set, name(n).as_str());
+            }
+            for n in 0..size + 50 {
+                let expected = if n < size {
+                    SymbolId(n as u32 + 1)
+                } else {
+                    SymbolId::NIL
+                };
+                assert_eq!(
+                    arena.get_name(built, &name(n)),
+                    expected,
+                    "built {size} {n}"
+                );
+                assert_eq!(
+                    arena.get(built, name(n).as_str()),
+                    expected,
+                    "built {size} {n}"
+                );
+                let expected = if n % 3 == 0 { SymbolId::NIL } else { expected };
+                assert_eq!(arena.get_name(set, &name(n)), expected, "set {size} {n}");
+                assert_eq!(arena.get(set, name(n).as_str()), expected, "set {size} {n}");
+            }
+            let copy = arena.clone_table(set);
+            for n in 0..size {
+                assert_eq!(
+                    arena.get_name(copy, &name(n)),
+                    arena.get_name(set, &name(n))
+                );
+            }
         }
     }
 }
