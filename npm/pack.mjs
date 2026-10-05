@@ -5,7 +5,8 @@
 // It follows Herebyfile.mjs `buildNativePreviewPackages` of the Go checkout with the
 // release profile "typescript" (publishAsTypescript) for the current platform only, as
 // Go's local build does. With --native-bin it adds one thing to the main package: the
-// postinstall npm/install.js (as lib/install.js), which swaps bin/tsc for the native tsc.
+// postinstall npm/install.js (as lib/install.js), which rewrites bin/tsc on POSIX as a sh and JS
+// polyglot: sh runs the native tsc without Node, and Node runs Go's launcher (see there).
 //
 // PORT: not in Go. `--name tsc-rs` writes the port's own package set from the same input:
 // `tsc-rs` (bin `tsc-rs`, npm/getExePath.js as lib/getExePath.js, npm/tsc-rs-readme.md) and one

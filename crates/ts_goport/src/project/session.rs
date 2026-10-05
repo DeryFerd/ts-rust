@@ -1041,8 +1041,9 @@ enum MetricsValue {
     Float64Histogram,
 }
 
-// Go: runtime/metrics/sample.go:45 Read (go1.26.8), which runs
-// runtime/metrics.go:1028 readMetricsLocked.
+// Go: runtime/metrics/sample.go:45 Read (go1.27.1), which runs
+// runtime/metrics.go:1029 readMetricsLocked. go1.27.1 returns early for no
+// samples; the loop below does nothing then too.
 // PORT: Go computes each metric from Go runtime statistics (heap, GC,
 // scheduler, goroutines). The port has no Go runtime, so it has only
 // `/sched/gomaxprocs:threads` (`gostd::runtime::gomaxprocs`, as Go

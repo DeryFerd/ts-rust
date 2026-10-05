@@ -655,7 +655,7 @@ pub fn spawn_process(
     Err(crate::gostd::errors::new("pipe: Not implemented on wasip1"))
 }
 
-/// Go `exec.LookPath(file)` (os/exec/lp_unix.go, go1.26) for a name without
+/// Go `exec.LookPath(file)` (os/exec/lp_unix.go, go1.27.1) for a name without
 /// a slash, with the Go `exec.Error` texts.
 // PORT: Go `execerrdot` is its default: a match in a relative PATH entry is
 // the `ErrDot` error.
@@ -959,7 +959,7 @@ impl crate::ipc::ReadWriteCloser for ChildProcess {
     }
 }
 
-/// Go os/exec/lp_windows.go (go1.26) and the Windows `path/filepath` and
+/// Go os/exec/lp_windows.go (go1.27.1) and the Windows `path/filepath` and
 /// syscall helpers that it and `StartProcess` use. Each function returns
 /// the Go error text of its Go counterpart.
 // PORT: Go `execerrdot` is its default: a match in the current directory

@@ -7,16 +7,16 @@
 //! `io_error_text` (osvfs, getwd, pprof, tracing, ipc, the tsgo spawn).
 //!
 //! PORT: on Linux (and Windows, see below) the values and the texts are
-//! Linux's (go1.26 syscall/zerrors_linux_amd64.go; Linux arm64 has the same
+//! Linux's (go1.27.1 syscall/zerrors_linux_amd64.go; Linux arm64 has the same
 //! values). On darwin and the BSDs, where kqueue.go and walkdir_unix.go
-//! build, they are darwin's (go1.26 syscall/zerrors_darwin_amd64.go; darwin
+//! build, they are darwin's (go1.27.1 syscall/zerrors_darwin_amd64.go; darwin
 //! arm64 and FreeBSD have the same values and texts for these errnos, except
 //! that FreeBSD's EOPNOTSUPP is ENOTSUP).
 //!
 //! PORT divergence: on Windows, Go `syscall.ENOTDIR` is
 //! `ERROR_PATH_NOT_FOUND` (3), whose text is the system message ("The system
 //! cannot find the path specified.") and which `errors.Is` matches to
-//! `fs.ErrNotExist` (go1.26 syscall/zerrors_windows.go). The port uses 0x14
+//! `fs.ErrNotExist` (go1.27.1 syscall/zerrors_windows.go). The port uses 0x14
 //! and "not a directory" there. Only walkdir.rs and watcher.rs use it on
 //! Windows (the Windows backend does not).
 
@@ -85,8 +85,8 @@ mod darwin_values {
 }
 
 impl Errno {
-    // Go: syscall/syscall_unix.go Errno.Error (go1.26), with the texts of
-    // go1.26.4 syscall/zerrors_linux_amd64.go `errors` (all of them; Linux
+    // Go: syscall/syscall_unix.go Errno.Error (go1.27.1), with the texts of
+    // go1.27.1 syscall/zerrors_linux_amd64.go `errors` (all of them; Linux
     // arm64 has the same table). Errnos 41, 58 and 133 have no text there.
     #[cfg(not(any(
         target_vendor = "apple",
@@ -235,9 +235,9 @@ impl Errno {
         format!("errno {}", self.0)
     }
 
-    // Go: syscall/syscall_unix.go Errno.Error (go1.26), darwin table
+    // Go: syscall/syscall_unix.go Errno.Error (go1.27.1), darwin table
     // PORT: the errnos that kqueue.go, walkdir_unix.go and their syscalls
-    // can return (go1.26 syscall/zerrors_darwin_amd64.go `errors`).
+    // can return (go1.27.1 syscall/zerrors_darwin_amd64.go `errors`).
     #[cfg(any(
         target_vendor = "apple",
         target_os = "freebsd",

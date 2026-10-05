@@ -101,7 +101,7 @@ pub fn go_repanic(mut payload: Box<dyn std::any::Any + Send>) -> ! {
     std::panic::resume_unwind(payload)
 }
 
-/// Runs `f` as the goroutine of Go `sync.WaitGroup.Go(f)`. At Go 1.26 that
+/// Runs `f` as the goroutine of Go `sync.WaitGroup.Go(f)`. At go1.27.1 that
 /// goroutine has a deferred recover that panics again with the value of a
 /// panic in `f` (`go_repanic`), so the runtime line ends with
 /// ` [recovered, repanicked]`. The port runs the task on the calling thread.

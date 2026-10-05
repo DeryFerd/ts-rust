@@ -2,8 +2,11 @@
 //! `golang.org/x/text/internal/colltab` that `Collator.CompareString` uses.
 //! Its `tables.go` and `internal/colltab` are the same as in v0.38.0, and
 //! `collate.go` differs only in a comment.
-//! The only caller is `ls/lsutil/organizeimports.rs`
-//! (`getOrganizeImportsUnicodeStringComparer`).
+//! No port code calls it now. Go `ls/lsutil/organizeimports.go` used it at
+//! the old default pin (dc37b5249ab6); from bump A (pin 52168999f3dc) Go
+//! has its own unicode comparer, and Go N imports no `x/text/collate`. So
+//! `unicode_is_ideographic` keeps its Unicode 15.0.0 copy (go1.27.1 has
+//! Unicode 17.0.0): no output depends on it.
 //!
 //! PORT: Go's `tables.go` (CLDR 23, 95 locales) is dumped as little-endian
 //! binary files in `data/` (`collate_main_*.bin`, 1.25 MB) by
@@ -411,7 +414,8 @@ fn implicit_primary(r: u32) -> i32 {
     r as i32 + OTHER_OFFSET
 }
 
-/// Go `unicode.Is(unicode.Ideographic, r)` (Go 1.26, Unicode 15.0.0).
+/// Go `unicode.Is(unicode.Ideographic, r)` (Go 1.26, Unicode 15.0.0; no
+/// caller now, see the module note).
 fn unicode_is_ideographic(r: u32) -> bool {
     const IDEOGRAPHIC: [(u32, u32); 20] = [
         (0x3006, 0x3007),
@@ -1936,7 +1940,7 @@ fn utf8_decode_rune(s: &[u8]) -> (u32, usize) {
     }
 }
 
-/// Go `unicode.In(r, unicode.Nd)` (go1.26.8, Unicode 15.0.0).
+/// Go `unicode.In(r, unicode.Nd)` (go1.27.1, Unicode 17.0.0).
 fn unicode_is_nd(r: u32) -> bool {
     unicode_is(&unicode_tables::ND, r)
 }

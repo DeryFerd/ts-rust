@@ -451,7 +451,9 @@ child_test! {
 }
 
 /// The text edits of a rename of `old` to `new` (Go `GetEditsForFileRename`),
-/// one line per edit: the file, the new text and the range.
+/// one line per edit: the file, the new text and the range, sorted. Go
+/// ranges over a map of the edits by file (ls/file_rename.go:70), so the
+/// order of the files is random; the tests compare the edits as a set.
 fn file_rename_edits(entries: &[(&str, &str)], open: &str, old: &str, new: &str) -> Vec<String> {
     let (session, language_service, _) = session_for(entries, open, open);
     let ctx = projecttestutil::with_request_id(&bg());
@@ -469,6 +471,7 @@ fn file_rename_edits(entries: &[(&str, &str)], open: &str, old: &str, new: &str)
         }
     }
     session.close();
+    lines.sort();
     lines
 }
 
@@ -500,8 +503,8 @@ child_test! {
         assert_eq!(
             edits,
             [
-                "file:///home/projects/p/tsconfig.json \"b.ts\"@0:60-0:66",
                 "file:///home/projects/p/m.ts \"./b\"@0:8-0:9",
+                "file:///home/projects/p/tsconfig.json \"b.ts\"@0:60-0:66",
             ]
         );
     }

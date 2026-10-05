@@ -45,7 +45,7 @@ pub fn new_pipe_listener(path: &str) -> Result<Box<dyn NetListener>, GoError> {
 }
 
 /// Go `net.Listen("unix", path)`. On Linux a name that starts with '@' is
-/// an abstract name, with no file (go1.26.4 syscall/syscall_linux.go
+/// an abstract name, with no file (go1.27.1 syscall/syscall_linux.go
 /// `SockaddrUnix.sockaddr`: the '@' becomes a NUL, and the address has no
 /// trailing NUL). `from_abstract_name` makes the same address, and fails
 /// with no errno where Go's name is longer than 108 bytes (EINVAL).

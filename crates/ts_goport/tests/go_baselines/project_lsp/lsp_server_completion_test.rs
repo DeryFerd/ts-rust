@@ -341,3 +341,68 @@ child_test! {
         assert!(msg.error.is_none(), "{:?}", msg.error);
     }
 }
+
+child_test! {
+    // PORT: no Go counterpart (followups24, R171 reviewer). A member
+    // completion of a name that is not an identifier inserts `[name]`, and
+    // Go quotes the name unless it starts with a decimal digit
+    // (ls/completions.go:3711 quotePropertyName, `unicode.IsDigit` at
+    // go1.27.1, Unicode 17.0.0). U+10D40 and U+1CCF0 are Nd from Unicode
+    // 16.0; the port's old Unicode 15.0.0 table quoted them. U+0660 is Nd in
+    // both. Each item is Go N's (tsgo-oracle-673a5f17d713, followups24
+    // lspcases.py nd-member).
+    fn member_completion_of_a_name_that_starts_with_a_unicode_17_digit_is_not_quoted() {
+        let client = init_completion_client(
+            "/home/projects",
+            &[
+                ("/home/projects/tsconfig.json", TSCONFIG),
+                ("/home/projects/a.ts", "export {};\n"),
+            ],
+        );
+        let a_uri = lsconv::file_name_to_document_uri("/home/projects/a.ts");
+        open(
+            &client,
+            &a_uri,
+            "const o = { \"\u{10D40}x\": 1, \"\u{1CCF0}y\": 2, \"\u{660}z\": 3, \"w v\": 4 };\no.",
+        );
+        let (msg, resp) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_COMPLETION_INFO,
+            completion_params(&a_uri, 1, 2),
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+        // Plain text, not `{:?}`: Rust escapes the chars that its own
+        // Unicode tables do not know.
+        let mut items: Vec<String> = completion_items(resp)
+            .into_iter()
+            .map(|item| {
+                let edit = item
+                    .text_edit
+                    .and_then(|edit| edit.text_edit)
+                    .map(|edit| {
+                        let (start, end) = (edit.range.start, edit.range.end);
+                        format!(
+                            "{}@{}:{}-{}:{}",
+                            edit.new_text, start.line, start.character, end.line, end.character
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "{} | {} | {} | {edit}",
+                    item.label,
+                    item.insert_text.unwrap_or_default(),
+                    item.filter_text.unwrap_or_default(),
+                )
+            })
+            .collect();
+        items.sort();
+        assert_eq!(
+            items,
+            [
+                "w v | [\"w v\"] | .w v | [\"w v\"]@1:1-1:2",
+                "\u{660}z | [\u{660}z] | .\u{660}z | [\u{660}z]@1:1-1:2",
+                "\u{10D40}x | [\u{10D40}x] | .\u{10D40}x | [\u{10D40}x]@1:1-1:2",
+                "\u{1CCF0}y | [\u{1CCF0}y] | .\u{1CCF0}y | [\u{1CCF0}y]@1:1-1:2",
+            ]
+        );
+    }
+}

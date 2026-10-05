@@ -1,4 +1,4 @@
-//! Go `internal/module/resolver.go` lines 2122 to 2361: `Ending`,
+//! Go `internal/module/resolver.go` lines 2127 to 2366 (pin N): `Ending`,
 //! `ResolvedEntrypoint`, `GetEntrypointsFromPackageJsonInfo`,
 //! `createResolvedEntrypointHandlingSymlink`, `loadEntrypointsFromExportMap`
 //! and `getMatchedStarForPatternEntrypoint`. Only `ls/autoimport` and
@@ -19,7 +19,7 @@ fn is_resolved(resolved: &Option<Resolved>) -> bool {
     resolved.as_ref().is_some_and(|r| !r.path.is_empty())
 }
 
-// Go: module/resolver.go:2122 Ending
+// Go: module/resolver.go:2127 Ending
 go_enum!(Ending, i32 {
     // EndingFixed indicates that the module specifier cannot be changed without changing its resolution.
     FIXED = 0; // EndingFixed
@@ -32,7 +32,7 @@ go_enum!(Ending, i32 {
     CHANGEABLE = 2; // EndingChangeable
 });
 
-// Go: module/resolver.go:2136 ResolvedEntrypoint
+// Go: module/resolver.go:2141 ResolvedEntrypoint
 #[derive(Clone, Debug, Default)]
 pub struct ResolvedEntrypoint {
     // OriginalFileName is the symlink path if the entrypoint was discovered at a symlink. Empty otherwise.
@@ -49,7 +49,7 @@ pub struct ResolvedEntrypoint {
 }
 
 impl ResolvedEntrypoint {
-    // Go: module/resolver.go:2150 SymlinkOrRealpath
+    // Go: module/resolver.go:2155 SymlinkOrRealpath
     #[must_use]
     pub fn symlink_or_realpath(&self) -> String {
         if !self.original_file_name.is_empty() {
@@ -60,7 +60,7 @@ impl ResolvedEntrypoint {
 }
 
 impl DefaultResolver {
-    // Go: module/resolver.go:2157 GetEntrypointsFromPackageJsonInfo
+    // Go: module/resolver.go:2162 GetEntrypointsFromPackageJsonInfo
     // PORT: Go returns a nil slice for no entrypoints; that is an empty `Vec`.
     // Go `&resolutionState{resolver: r, extensions: ..., features: ...,
     // compilerOptions: r.compilerOptions}` spells out the zero fields here
@@ -165,7 +165,7 @@ impl DefaultResolver {
         Vec::new()
     }
 
-    // Go: module/resolver.go:2216 createResolvedEntrypointHandlingSymlink
+    // Go: module/resolver.go:2221 createResolvedEntrypointHandlingSymlink
     pub fn create_resolved_entrypoint_handling_symlink(
         &self,
         file_name: &str,
@@ -193,7 +193,7 @@ impl DefaultResolver {
 }
 
 impl ResolutionState<'_> {
-    // Go: module/resolver.go:2233 loadEntrypointsFromExportMap
+    // Go: module/resolver.go:2238 loadEntrypointsFromExportMap
     pub fn load_entrypoints_from_export_map(
         &mut self,
         package_json: &Option<Rc<InfoCacheEntry>>,
@@ -260,7 +260,7 @@ impl ResolutionState<'_> {
         entrypoints
     }
 
-    // Go: module/resolver.go:2241 loadEntrypointsFromTargetExports (closure in loadEntrypointsFromExportMap)
+    // Go: module/resolver.go:2246 loadEntrypointsFromTargetExports (closure in loadEntrypointsFromExportMap)
     // PORT: the Go closure is a method; its captures (`packageJson`,
     // `packageName`, `entrypoints`) are parameters. Go passes
     // `*collections.Set` pointers and clones a set before every change, so
@@ -427,7 +427,7 @@ impl ResolutionState<'_> {
         }
     }
 
-    // Go: module/resolver.go:2348 getMatchedStarForPatternEntrypoint
+    // Go: module/resolver.go:2353 getMatchedStarForPatternEntrypoint
     // PORT: Go slices bytes; a case-insensitive match can end inside a
     // character, so the bytes are copied (`from_utf8_lossy`) instead of
     // slicing the `&str`.

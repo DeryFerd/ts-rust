@@ -1,4 +1,5 @@
-//! Go `context` (go1.26.8 `src/context/context.go`).
+//! Go `context` (go1.27.1 `src/context/context.go`; it differs from go1.26.8
+//! only in the package comment).
 //!
 //! PORT: Go `Context` is an interface. The port has only the standard
 //! implementations (background, TODO, cancel, timer, value, withoutCancel),
@@ -63,15 +64,15 @@ impl Context {
     /// context should be canceled. `None` when no deadline is set.
     pub fn deadline(&self) -> Option<Instant> {
         match &self.0 {
-            // Go: context/context.go:183 emptyCtx.Deadline
+            // Go: context/context.go:184 emptyCtx.Deadline
             Ctx::Background | Ctx::Todo => None,
             // Go: the embedded parent Context.
             Ctx::Cancel(c) => c.context.deadline(),
-            // Go: context/context.go:669 timerCtx.Deadline
+            // Go: context/context.go:670 timerCtx.Deadline
             Ctx::Timer(c) => Some(c.deadline),
             // Go: the embedded parent Context.
             Ctx::Value(c) => c.context.deadline(),
-            // Go: context/context.go:596 withoutCancelCtx.Deadline
+            // Go: context/context.go:597 withoutCancelCtx.Deadline
             Ctx::WithoutCancel(_) => None,
         }
     }
@@ -82,13 +83,13 @@ impl Context {
     /// channel.
     pub fn done(&self) -> Option<Done> {
         match &self.0 {
-            // Go: context/context.go:187 emptyCtx.Done
+            // Go: context/context.go:188 emptyCtx.Done
             Ctx::Background | Ctx::Todo => None,
             Ctx::Cancel(c) => Some(c.done()),
             Ctx::Timer(c) => Some(c.cancel_ctx.done()),
             // Go: the embedded parent Context.
             Ctx::Value(c) => c.context.done(),
-            // Go: context/context.go:600 withoutCancelCtx.Done
+            // Go: context/context.go:601 withoutCancelCtx.Done
             Ctx::WithoutCancel(_) => None,
         }
     }
@@ -99,13 +100,13 @@ impl Context {
     /// context was canceled for some other reason.
     pub fn err(&self) -> Option<GoError> {
         match &self.0 {
-            // Go: context/context.go:191 emptyCtx.Err
+            // Go: context/context.go:192 emptyCtx.Err
             Ctx::Background | Ctx::Todo => None,
             Ctx::Cancel(c) => c.err(),
             Ctx::Timer(c) => c.cancel_ctx.err(),
             // Go: the embedded parent Context.
             Ctx::Value(c) => c.context.err(),
-            // Go: context/context.go:604 withoutCancelCtx.Err
+            // Go: context/context.go:605 withoutCancelCtx.Err
             Ctx::WithoutCancel(_) => None,
         }
     }
@@ -129,9 +130,9 @@ impl Context {
     /// Go `String()` of the standard contexts (for debugging).
     pub fn string(&self) -> String {
         match &self.0 {
-            // Go: context/context.go:201 backgroundCtx.String
+            // Go: context/context.go:202 backgroundCtx.String
             Ctx::Background => "context.Background".to_string(),
-            // Go: context/context.go:207 todoCtx.String
+            // Go: context/context.go:208 todoCtx.String
             Ctx::Todo => "context.TODO".to_string(),
             Ctx::Cancel(c) => c.string(),
             Ctx::Timer(c) => c.string(),
@@ -389,41 +390,41 @@ fn run_deferred_wakers() {
     }
 }
 
-// Go: context/context.go:167 Canceled
+// Go: context/context.go:168 Canceled
 /// Canceled is the error returned by [Context.Err] when the context is canceled
 /// for some reason other than its deadline passing.
 pub static CANCELED: LazyLock<GoError> = LazyLock::new(|| errors::new("context canceled"));
 
-// Go: context/context.go:171 DeadlineExceeded
+// Go: context/context.go:172 DeadlineExceeded
 /// DeadlineExceeded is the error returned by [Context.Err] when the context is canceled
 /// due to its deadline passing.
 pub static DEADLINE_EXCEEDED: LazyLock<GoError> =
     LazyLock::new(|| errors::from_value(DeadlineExceededError));
 
-// Go: context/context.go:173 deadlineExceededError
+// Go: context/context.go:174 deadlineExceededError
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeadlineExceededError;
 
 impl fmt::Display for DeadlineExceededError {
-    // Go: context/context.go:175 Error
+    // Go: context/context.go:176 Error
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("context deadline exceeded")
     }
 }
 
 impl DeadlineExceededError {
-    // Go: context/context.go:176 Timeout
+    // Go: context/context.go:177 Timeout
     pub fn timeout(&self) -> bool {
         true
     }
 
-    // Go: context/context.go:177 Temporary
+    // Go: context/context.go:178 Temporary
     pub fn temporary(&self) -> bool {
         true
     }
 }
 
-// Go: context/context.go:215 Background
+// Go: context/context.go:216 Background
 /// Background returns a non-nil, empty [Context]. It is never canceled, has no
 /// values, and has no deadline. It is typically used by the main function,
 /// initialization, and tests, and as the top-level Context for incoming
@@ -432,21 +433,21 @@ pub fn background() -> Context {
     Context(Ctx::Background)
 }
 
-// Go: context/context.go:223 TODO
+// Go: context/context.go:224 TODO
 /// TODO returns a non-nil, empty [Context]. Code should use context.TODO when
 /// it's unclear which Context to use or it is not yet available.
 pub fn todo() -> Context {
     Context(Ctx::Todo)
 }
 
-// Go: context/context.go:231 CancelFunc
+// Go: context/context.go:232 CancelFunc
 /// A CancelFunc tells an operation to abandon its work.
 /// A CancelFunc does not wait for the work to stop.
 /// A CancelFunc may be called by multiple goroutines simultaneously.
 /// After the first call, subsequent calls to a CancelFunc do nothing.
 pub type CancelFunc = Arc<dyn Fn() + Send + Sync>;
 
-// Go: context/context.go:240 WithCancel
+// Go: context/context.go:241 WithCancel
 /// WithCancel returns a derived context that points to the parent context
 /// but has a new Done channel. The returned context's Done channel is closed
 /// when the returned cancel function is called or when the parent context's
@@ -460,12 +461,12 @@ pub fn with_cancel(parent: &Context) -> (Context, CancelFunc) {
     )
 }
 
-// Go: context/context.go:255 CancelCauseFunc
+// Go: context/context.go:256 CancelCauseFunc
 /// A CancelCauseFunc behaves like a [CancelFunc] but additionally sets the
 /// cancellation cause. `None` is a nil cause.
 pub type CancelCauseFunc = Arc<dyn Fn(Option<GoError>) + Send + Sync>;
 
-// Go: context/context.go:268 WithCancelCause
+// Go: context/context.go:269 WithCancelCause
 /// WithCancelCause behaves like [WithCancel] but returns a [CancelCauseFunc]
 /// instead of a [CancelFunc]. Calling cancel with a non-nil error (the
 /// "cause") records that error in ctx; it can then be retrieved using
@@ -479,7 +480,7 @@ pub fn with_cancel_cause(parent: &Context) -> (Context, CancelCauseFunc) {
     )
 }
 
-// Go: context/context.go:273 withCancel
+// Go: context/context.go:274 withCancel
 // PORT: named `with_cancel_unexported` because Go `WithCancel` is
 // `with_cancel`. Go panics on a nil parent, which cannot occur here.
 fn with_cancel_unexported(parent: &Context) -> Arc<CancelCtx> {
@@ -488,7 +489,7 @@ fn with_cancel_unexported(parent: &Context) -> Arc<CancelCtx> {
     c
 }
 
-// Go: context/context.go:288 Cause
+// Go: context/context.go:289 Cause
 /// Cause returns a non-nil error explaining why c was canceled.
 /// The first cancellation of c or one of its parents sets the cause.
 /// If that cancellation happened via a call to CancelCauseFunc(err),
@@ -517,7 +518,7 @@ pub fn cause(c: &Context) -> Option<GoError> {
 /// The `stop` function returned by `after_func`.
 pub type AfterFuncStop = Arc<dyn Fn() -> bool + Send + Sync>;
 
-// Go: context/context.go:325 AfterFunc
+// Go: context/context.go:326 AfterFunc
 /// AfterFunc arranges to call f in its own goroutine after ctx is canceled.
 /// If ctx is already canceled, AfterFunc calls f immediately in its own goroutine.
 ///
@@ -557,11 +558,11 @@ pub fn after_func<F: FnOnce() + Send + 'static>(ctx: &Context, f: F) -> AfterFun
 /// process. Tests read it to check that a code path starts no thread.
 pub static AFTER_FUNC_GOROUTINES: AtomicUsize = AtomicUsize::new(0);
 
-// Go: context/context.go:342 afterFuncer
+// Go: context/context.go:343 afterFuncer
 // PORT: only custom Context implementations have an AfterFunc method; the
 // port has none, so the interface is not needed.
 
-// Go: context/context.go:346 afterFuncCtx
+// Go: context/context.go:347 afterFuncCtx
 struct AfterFuncCtx {
     cancel_ctx: CancelCtx,
     once: Once, // either starts running f or stops f from running
@@ -569,7 +570,7 @@ struct AfterFuncCtx {
 }
 
 impl Canceler for AfterFuncCtx {
-    // Go: context/context.go:352 cancel
+    // Go: context/context.go:353 cancel
     fn cancel(&self, remove_from_parent: bool, err: GoError, cause: Option<GoError>) {
         self.cancel_ctx.cancel(false, err, cause);
         if remove_from_parent {
@@ -588,15 +589,15 @@ impl Canceler for AfterFuncCtx {
     }
 }
 
-// Go: context/context.go:365 stopCtx
+// Go: context/context.go:366 stopCtx
 // PORT: a stopCtx replaces the parent of a cancelCtx whose parent has an
 // AfterFunc method (a custom Context). The port has none.
 
-// Go: context/context.go:371 goroutines
+// Go: context/context.go:372 goroutines
 // PORT: a test counter for the watcher goroutine of propagateCancel, which
 // the port never starts.
 
-// Go: context/context.go:382 parentCancelCtx
+// Go: context/context.go:383 parentCancelCtx
 /// parentCancelCtx returns the underlying *cancelCtx for parent.
 /// It does this by looking up parent.Value(&cancelCtxKey) to find
 /// the innermost enclosing *cancelCtx and then checking whether
@@ -619,7 +620,7 @@ fn parent_cancel_ctx(parent: &Context) -> Option<CancelCtxRef> {
     Some(p)
 }
 
-// Go: context/context.go:399 removeChild
+// Go: context/context.go:400 removeChild
 /// removeChild removes a context from its parent.
 /// PORT: Go first checks for a `stopCtx` parent (see `stopCtx`); the port
 /// has none. `child` is the canceler's identity (`canceler_key`).
@@ -633,7 +634,7 @@ fn remove_child(parent: &Context, child: usize) {
     }
 }
 
-// Go: context/context.go:417 canceler
+// Go: context/context.go:418 canceler
 /// A canceler is a context type that can be canceled directly. The
 /// implementations are *cancelCtx and *timerCtx.
 trait Canceler: Send + Sync {
@@ -646,16 +647,16 @@ fn canceler_key<T: ?Sized>(c: &T) -> usize {
     c as *const T as *const () as usize
 }
 
-// Go: context/context.go:423 closedchan
+// Go: context/context.go:424 closedchan
 /// closedchan is a reusable closed channel.
 static CLOSEDCHAN: LazyLock<Done> = LazyLock::new(|| {
-    // Go: context/context.go:425 init
+    // Go: context/context.go:426 init
     let d = Done::new();
     d.close();
     d
 });
 
-// Go: context/context.go:431 cancelCtx
+// Go: context/context.go:432 cancelCtx
 /// A cancelCtx can be canceled. When canceled, it also cancels any children
 /// that implement canceler.
 struct CancelCtx {
@@ -697,7 +698,7 @@ impl CancelCtx {
         }
     }
 
-    // Go: context/context.go:448 Done
+    // Go: context/context.go:449 Done
     fn done(&self) -> Done {
         if let Some(d) = self.done.get() {
             return d.clone();
@@ -706,7 +707,7 @@ impl CancelCtx {
         self.done.get_or_init(Done::new).clone()
     }
 
-    // Go: context/context.go:463 Err
+    // Go: context/context.go:464 Err
     fn err(&self) -> Option<GoError> {
         // An atomic load is ~5x faster than a mutex, which can matter in tight loops.
         if let Some(err) = self.err.get() {
@@ -717,7 +718,7 @@ impl CancelCtx {
         None
     }
 
-    // Go: context/context.go:475 propagateCancel
+    // Go: context/context.go:476 propagateCancel
     /// propagateCancel arranges for child to be canceled when parent is.
     /// It sets the parent context of cancelCtx.
     fn propagate_cancel(&self, parent: &Context, child: Arc<dyn Canceler>) {
@@ -762,14 +763,14 @@ impl CancelCtx {
         unreachable!("context: parent is not a standard Context");
     }
 
-    // Go: context/context.go:542 String
+    // Go: context/context.go:543 String
     fn string(&self) -> String {
         context_name(&self.context) + ".WithCancel"
     }
 }
 
 impl Canceler for CancelCtx {
-    // Go: context/context.go:549 cancel
+    // Go: context/context.go:550 cancel
     /// cancel closes c.done, cancels each of c's children, and, if
     /// removeFromParent is true, removes c from its parent's children.
     /// cancel sets c.cause to cause if this is the first time c is canceled.
@@ -819,12 +820,12 @@ impl Canceler for CancelCtx {
     }
 }
 
-// Go: context/context.go:535 contextName
+// Go: context/context.go:536 contextName
 fn context_name(c: &Context) -> String {
     c.string()
 }
 
-// Go: context/context.go:585 WithoutCancel
+// Go: context/context.go:586 WithoutCancel
 /// WithoutCancel returns a derived context that points to the parent context
 /// and is not canceled when parent is canceled.
 /// The returned context returns no Deadline or Err, and its Done channel is nil.
@@ -835,19 +836,19 @@ pub fn without_cancel(parent: &Context) -> Context {
     })))
 }
 
-// Go: context/context.go:592 withoutCancelCtx
+// Go: context/context.go:593 withoutCancelCtx
 struct WithoutCancelCtx {
     c: Context,
 }
 
 impl WithoutCancelCtx {
-    // Go: context/context.go:612 String
+    // Go: context/context.go:613 String
     fn string(&self) -> String {
         context_name(&self.c) + ".WithoutCancel"
     }
 }
 
-// Go: context/context.go:625 WithDeadline
+// Go: context/context.go:626 WithDeadline
 /// WithDeadline returns a derived context that points to the parent context
 /// but has the deadline adjusted to be no later than d. If the parent's
 /// deadline is already earlier than d, WithDeadline(parent, d) is semantically
@@ -858,7 +859,7 @@ pub fn with_deadline(parent: &Context, d: Instant) -> (Context, CancelFunc) {
     with_deadline_cause(parent, d, None)
 }
 
-// Go: context/context.go:632 WithDeadlineCause
+// Go: context/context.go:633 WithDeadlineCause
 /// WithDeadlineCause behaves like [WithDeadline] but also sets the cause of the
 /// returned Context when the deadline is exceeded. The returned [CancelFunc] does
 /// not set the cause.
@@ -903,7 +904,7 @@ pub fn with_deadline_cause(
     )
 }
 
-// Go: context/context.go:662 timerCtx
+// Go: context/context.go:663 timerCtx
 /// A timerCtx carries a timer and a deadline. It embeds a cancelCtx to
 /// implement Done and Err. It implements cancel by stopping its timer then
 /// delegating to cancelCtx.cancel.
@@ -914,7 +915,7 @@ struct TimerCtx {
 }
 
 impl TimerCtx {
-    // Go: context/context.go:673 String
+    // Go: context/context.go:674 String
     // PORT: Go prints `deadline.String()` (wall clock) and the Go duration
     // text; an Instant has no wall clock, so this uses Rust debug text.
     fn string(&self) -> String {
@@ -928,7 +929,7 @@ impl TimerCtx {
 }
 
 impl Canceler for TimerCtx {
-    // Go: context/context.go:679 cancel
+    // Go: context/context.go:680 cancel
     fn cancel(&self, remove_from_parent: bool, err: GoError, cause: Option<GoError>) {
         self.cancel_ctx.cancel(false, err, cause);
         if remove_from_parent {
@@ -946,7 +947,7 @@ impl Canceler for TimerCtx {
     }
 }
 
-// Go: context/context.go:703 WithTimeout
+// Go: context/context.go:704 WithTimeout
 /// WithTimeout returns WithDeadline(parent, time.Now().Add(timeout)).
 ///
 /// Canceling this context releases resources associated with it, so code should
@@ -955,7 +956,7 @@ pub fn with_timeout(parent: &Context, timeout: Duration) -> (Context, CancelFunc
     with_deadline(parent, Instant::now() + timeout)
 }
 
-// Go: context/context.go:710 WithTimeoutCause
+// Go: context/context.go:711 WithTimeoutCause
 /// WithTimeoutCause behaves like [WithTimeout] but also sets the cause of the
 /// returned Context when the timeout expires. The returned [CancelFunc] does
 /// not set the cause.
@@ -967,7 +968,7 @@ pub fn with_timeout_cause(
     with_deadline_cause(parent, Instant::now() + timeout, cause)
 }
 
-// Go: context/context.go:727 WithValue
+// Go: context/context.go:728 WithValue
 /// WithValue returns a derived context that points to the parent Context.
 /// In the derived context, the value associated with key is val.
 ///
@@ -990,7 +991,7 @@ pub fn with_value<T: Send + Sync + 'static>(
     })))
 }
 
-// Go: context/context.go:742 valueCtx
+// Go: context/context.go:743 valueCtx
 /// A valueCtx carries a key-value pair. It implements Value for that key and
 /// delegates all other calls to the embedded Context.
 struct ValueCtx {
@@ -1002,7 +1003,7 @@ struct ValueCtx {
 }
 
 impl ValueCtx {
-    // Go: context/context.go:762 String
+    // Go: context/context.go:763 String
     fn string(&self) -> String {
         context_name(&self.context)
             + ".WithValue("
@@ -1012,7 +1013,7 @@ impl ValueCtx {
             + ")"
     }
 
-    // Go: context/context.go:750 stringify
+    // Go: context/context.go:751 stringify
     // PORT: Go prints a key with its type name (for example `core.key`); the
     // port prints the key's Go name. A value that is not a string prints its
     // Rust type name where Go prints its Go type name.
@@ -1027,7 +1028,7 @@ impl ValueCtx {
     }
 }
 
-// Go: context/context.go:775 value
+// Go: context/context.go:776 value
 // PORT: Go's `default` case (`c.Value(key)` of a custom Context) cannot
 // occur.
 fn value(c: &Context, key: &KeyRef) -> Option<ValueRef> {
