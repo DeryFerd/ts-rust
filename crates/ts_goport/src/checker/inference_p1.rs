@@ -1357,6 +1357,8 @@ impl Checker {
                                     } else if left_flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
                                         left
                                     } else if right_flags.intersects(TypeFlags::TEMPLATE_LITERAL)
+                                        // PERF (perffu1): Go's first test, before the clone.
+                                        && !c.string_literal_misses_template_literal_ends(source, right)
                                         && {
                                             let right_template =
                                                 c.ty(right).as_template_literal_type().clone();
