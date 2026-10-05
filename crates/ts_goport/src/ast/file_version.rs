@@ -53,9 +53,10 @@
 //! Freeable rule (`free_file_versions`, `freeable_path`): only a parse of
 //! a path that a publish on this thread published before, in a language
 //! server or API process (the parse cache, project/parsecache.rs) or a
-//! `tsc --watch` process (each build, `program::mark_freeable_parses`;
-//! watchfree1). So the first publish, the first version of each file and
-//! every other CLI publish never get a `FileVersion`.
+//! `tsc --watch` or `tsc -b --watch` process (each build,
+//! `program::mark_freeable_parses`; watchfree1). So the first publish, the
+//! first version of each file and every other CLI publish never get a
+//! `FileVersion`.
 //! `GOPORT_FREE_FILE_VERSIONS=0` turns it off (the behavior before M3a);
 //! `=1` turns it on in any process, and then
 //! `program::update_program_version` (`goport_multiprog`) applies the same
@@ -196,8 +197,8 @@ static MADE: AtomicUsize = AtomicUsize::new(0);
 /// the API.
 static EDITOR_PROCESS: AtomicBool = AtomicBool::new(false);
 
-/// Set by `Watcher::start`: this process runs `tsc --watch` (without
-/// `--build`).
+/// Set by `Watcher::start` and `Orchestrator::start`: this process runs
+/// `tsc --watch`, with or without `--build`.
 static WATCH_PROCESS: AtomicBool = AtomicBool::new(false);
 
 /// Set when the first freeable version is published. Until then a registry
@@ -219,9 +220,10 @@ pub fn set_editor_process() {
     EDITOR_PROCESS.store(true, Ordering::Relaxed);
 }
 
-/// Marks this process as a `tsc --watch` process, where
-/// `free_file_versions` and owned nodes are on by default, as in a
-/// language server. `Watcher::start` calls it before the first build.
+/// Marks this process as a `tsc --watch` process (with or without
+/// `--build`), where `free_file_versions` and owned nodes are on by
+/// default, as in a language server. `Watcher::start` and
+/// `Orchestrator::start` call it before the first build.
 // PORT: not in Go. Go frees an old `*ast.SourceFile` of a watch rebuild
 // with its GC (execute/watcher.go:482, :567). Every tsc command of the
 // go_baselines tests runs in a child process of its own, so the flag never
@@ -294,6 +296,36 @@ pub(crate) fn live_file_versions(files: impl Iterator<Item = usize>) -> Vec<Arc<
     };
     // Upgraded after the lock ends: the last drop of a version locks it.
     weak.iter().filter_map(Weak::upgrade).collect()
+}
+
+/// The live file versions that `diagnostics` point at: the file of each
+/// diagnostic, of its related information and of its message chain. Empty
+/// until a freeable version is published (`any_freeable_published`).
+/// `tsc --watch` keeps them with a diagnostic that it reads after the
+/// program that made it is released (a copied diagnostic, a `tsc -b` task
+/// error), as Go's GC keeps an `*ast.SourceFile` that an `*ast.Diagnostic`
+/// points at.
+pub(crate) fn diagnostic_file_versions<'a>(
+    diagnostics: impl IntoIterator<Item = &'a crate::core::Diagnostic>,
+) -> Vec<Arc<FileVersion>> {
+    fn note(d: &crate::core::Diagnostic, files: &mut Vec<usize>) {
+        if !d.file.is_nil() {
+            files.push(d.file.file_index());
+        }
+        for d in d.message_chain.iter().chain(&d.related_information) {
+            note(d, files);
+        }
+    }
+    if !any_freeable_published() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    for d in diagnostics {
+        note(d, &mut files);
+    }
+    files.sort_unstable();
+    files.dedup();
+    live_file_versions(files.into_iter())
 }
 
 /// True once a freeable version is published in this process. A CLI

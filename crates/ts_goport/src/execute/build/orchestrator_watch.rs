@@ -50,6 +50,9 @@ impl Orchestrator {
             self.wm.borrow().force_overflow();
         }
         self.reset_caches();
+        // PORT: not in Go (see `BuildHost::prefetch`). The first build
+        // parsed ahead; its parses are static.
+        self.host.prefetch.set(!crate::ast::free_file_versions());
 
         self.wm.borrow().unlock();
 
@@ -82,7 +85,14 @@ impl Orchestrator {
         // `cached_fs` (host.rs).
         self.host.cached_fs.clear_cache();
         self.host.extended_config_cache.reset();
-        self.host.source_files.reset();
+        // PORT: not in Go. A bundled lib keeps its parse: its text never
+        // changes, and the key holds its parse options, so a parse again
+        // gives the same file. A parse of a bundled lib loads its nodes from
+        // `lib_parse.bin` into the leaked AST arena, so each watch cycle
+        // that parsed it again leaked them (watchfree1).
+        self.host
+            .source_files
+            .reset_except(|key| crate::frontend::bundled::is_bundled(&key.0.file_name));
         *self.host.config_times.borrow_mut() = FxHashMap::default();
     }
 

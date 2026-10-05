@@ -12,7 +12,7 @@
 //! takes shared borrows of the manager.
 //!
 //! PORT: Go makes a new program on every build. Each build here makes a
-//! program version (`execute_tsc::new_program_version`) and runs with it
+//! program version (`execute_tsc::new_frontend_program`) and runs with it
 //! current (`core::enter_program`). Files that the source file cache keeps
 //! are shared with the last version. The last version is released when the
 //! next build has read it (Go drops the old program there). The rest of the

@@ -578,6 +578,10 @@ impl Orchestrator {
         });
         let result = 'start: {
             if self.opts.command.compiler_options.watch.is_true() {
+                // PORT: not in Go. From the second build of a file on, its
+                // new parse is a freeable file version (watchfree1, see
+                // `Watcher::start`).
+                crate::ast::set_watch_process();
                 (self
                     .watch_status_reporter
                     .as_ref()

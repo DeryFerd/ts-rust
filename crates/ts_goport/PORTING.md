@@ -466,7 +466,14 @@ The batch that adds it is not accepted until Theo approves.
   `lib_parse.bin` load. A diagnostic that a watch build copies from the
   last build (Go `repopulateDiagnosticsOfFile`) points at the file
   versions of the build that made it, and Go prints it from them: the new
-  snapshot holds them (`Snapshot::held_file_versions`). Its parse holds it (`ParsedSourceFile::version`), and so
+  snapshot holds them (`Snapshot::held_file_versions`). `tsc -b --watch`
+  (`Orchestrator::start`) does the same for the program of each task:
+  each cycle parses the files of each project that it builds again (Go
+  `resetCaches`), parse workers parse ahead only in the first build
+  (`BuildHost::prefetch`), a task keeps the versions that its errors
+  point at until its next build (`BuildTask::held_file_versions`), and a
+  bundled lib keeps its parse across cycles (not in Go; its
+  `lib_parse.bin` load leaks its nodes, so each cycle leaked them). Its parse holds it (`ParsedSourceFile::version`), and so
   do the `VersionTables` of each program version that has the file, so a
   seeded thread keeps it too. A thread that reads it pins it until the
   next program release (`release_file_version_pins`, run when a
@@ -510,7 +517,7 @@ The batch that adds it is not accepted until Theo approves.
   back to the pool (see "Pooled node blocks" above); its small `BlockFile`,
   its foreign parents and its text stay leaked for now. The first publish, the
   first version of each file and every CLI publish except `tsc --watch`
-  never get one.
+  and `tsc -b --watch` never get one.
   `GOPORT_FREE_FILE_VERSIONS=0` turns this off, `=1` turns it on in any
   process; there `update_program_version` (`goport_multiprog`) also gives
   each new parse of a published path a version, so a leak record can

@@ -206,6 +206,12 @@ pub struct BuildHost {
     // graph ahead of `get_resolved_project_reference` (config_prefetch.rs),
     // until the graph is made.
     pub config_prefetch: RefCell<Option<PrefetchPool>>,
+    // PORT: not in Go (`CompilerHost::prefetch_parses`). False in the watch
+    // cycles after the first while file versions are freed
+    // (`ast::free_file_versions`): a parse worker's parse keeps its nodes
+    // in the worker's AST arena, so a freeable file version of it would
+    // leak them. Set by `Orchestrator::watch`.
+    pub prefetch: std::cell::Cell<bool>,
     // PORT: Go `*collections.SyncMap`. The task `writeFile` stores into it
     // from the checker threads.
     pub m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
@@ -287,6 +293,7 @@ impl BuildHost {
             config_times: RefCell::new(FxHashMap::default()),
             resolved_references: ParseCache::default(),
             config_prefetch: RefCell::new(None),
+            prefetch: std::cell::Cell::new(true),
             m_times: Arc::default(),
             written: Arc::default(),
         }
@@ -459,6 +466,11 @@ impl CompilerHost for BuildHost {
         panic!(
             "build.Orchestrator.host does not support tracing; use a different host for tracing"
         );
+    }
+
+    // PORT: not in Go (see `BuildHost::prefetch`).
+    fn prefetch_parses(&self) -> bool {
+        self.prefetch.get()
     }
 
     // Go: build/host.go:54 (*host).GetSourceFile
@@ -660,6 +672,11 @@ impl CompilerHost for BuildCompilerHost {
     // Go: build/compilerHost.go:37 (*compilerHost).GetSourceFile
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
         self.host.get_source_file(opts)
+    }
+
+    // PORT: not in Go (see `BuildHost::prefetch`).
+    fn prefetch_parses(&self) -> bool {
+        self.host.prefetch_parses()
     }
 
     // Go: build/compilerHost.go:41 (*compilerHost).GetContentMappedSourceFiles (tsgo#4712)

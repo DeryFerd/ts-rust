@@ -47,6 +47,11 @@ const WATCH_HELD_FIXTURE: &str = concat!(
     "/tests/fixtures/multiprog/watch-held"
 );
 
+const WATCH_BUILD_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/multiprog/watch-build"
+);
+
 const BUILD_DEDUP_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/multiprog/build-dedup"
@@ -703,6 +708,69 @@ fn watch_copied_errors_read_their_file_versions() {
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
 }
 
+/// watchfree1: `tsc -b --watch` parses every file of a project that it
+/// builds again in each cycle (Go `resetCaches`), and from the second cycle
+/// on each parse is a freeable file version. Four edits of `core/src/a.ts`
+/// build `core` (`a.ts` and `c.ts`) again each time. The output (times
+/// removed) equals `expected.txt`, the output of
+/// `tsgo-oracle-673a5f17d713 -b -w tsconfig.json --pretty false` for the
+/// same edits, and the outputs of `core` equal its outputs
+/// (`expected-out`). Each version dies but the last two, which the error
+/// of the last build of `core` holds (`BuildTask::held_file_versions`).
+// PORT: no Go counterpart for the file versions; the output is Go's.
+#[test]
+fn watch_build_frees_file_versions() {
+    let root = scratch_dir("watch-build");
+    let project = root.join("project");
+    copy_dir(Path::new(WATCH_BUILD_FIXTURE), &project);
+    let out = root.join("watch.txt");
+    let run = Command::new(env!("CARGO_BIN_EXE_goport_watch"))
+        .arg(&out)
+        .arg("core/src/a.ts")
+        .args([
+            "edits/a-y.ts",
+            "edits/a-2.ts",
+            "edits/a-3.ts",
+            "edits/a-4.ts",
+        ])
+        .args(["--", "-b", "--watch", "tsconfig.json", "--pretty", "false"])
+        .env_remove("GOPORT_FREE_FILE_VERSIONS")
+        .current_dir(&project)
+        .output()
+        .expect("run goport_watch");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    assert!(
+        run.status.success(),
+        "goport_watch failed ({}) in {}:\n{stdout}\n{}",
+        run.status,
+        root.display(),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        normalize_watch_output(&read(&out)),
+        read(&project.join("expected.txt")),
+        "watch output against tsgo ({})",
+        root.display()
+    );
+    assert_eq!(
+        read_tree(&project.join("core/out")),
+        read_tree(&project.join("expected-out")),
+        "core outputs against tsgo ({})",
+        root.display()
+    );
+    let (made, dead) = file_version_counts(&stdout);
+    assert_eq!(
+        made, 8,
+        "each build after the first parses a.ts and c.ts again"
+    );
+    assert_eq!(
+        dead,
+        made - 2,
+        "only the c.ts error of the last build holds versions"
+    );
+    fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+}
+
 /// The counts of the last stdout line of `goport_watch`,
 /// `file_versions made=<n> dead=<m>`.
 fn file_version_counts(stdout: &str) -> (usize, usize) {
@@ -715,23 +783,33 @@ fn file_version_counts(stdout: &str) -> (usize, usize) {
         .unwrap_or_else(|| panic!("no file_versions line in the goport_watch output:\n{stdout}"))
 }
 
-/// A `--pretty` watch output without the clear-screen codes, and with each
-/// status time (`[<esc>[90m3:41:35 PM<esc>[0m] `) as `[<time>] `.
+/// A watch output without the clear-screen codes, and with each status
+/// time as `<time>`: `[<esc>[90m3:41:35 PM<esc>[0m] ` (`--pretty`) as
+/// `[<time>] `, and `03:41:35 PM - ` as `<time> - `.
 fn normalize_watch_output(output: &str) -> String {
     const TIME_START: &str = "[\x1b[90m";
     const TIME_END: &str = "\x1b[0m] ";
+    let is_time = |text: &str| {
+        text.strip_suffix(" AM")
+            .or_else(|| text.strip_suffix(" PM"))
+            .is_some_and(|time| {
+                !time.is_empty() && time.bytes().all(|b| b.is_ascii_digit() || b == b':')
+            })
+    };
     let output = output.replace("\x1b[2J\x1b[3J\x1b[H", "");
     let mut normalized = String::with_capacity(output.len());
     for line in output.split_inclusive('\n') {
-        match line
+        if let Some((_, rest)) = line
             .strip_prefix(TIME_START)
             .and_then(|rest| rest.split_once(TIME_END))
         {
-            Some((_, rest)) => {
-                normalized.push_str("[<time>] ");
-                normalized.push_str(rest);
-            }
-            None => normalized.push_str(line),
+            normalized.push_str("[<time>] ");
+            normalized.push_str(rest);
+        } else if let Some((_, rest)) = line.split_once(" - ").filter(|(time, _)| is_time(time)) {
+            normalized.push_str("<time> - ");
+            normalized.push_str(rest);
+        } else {
+            normalized.push_str(line);
         }
     }
     normalized

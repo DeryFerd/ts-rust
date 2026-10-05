@@ -129,12 +129,6 @@ impl ToProgramSnapshot<'_> {
                 .any(|path| get_source_file_by_path(path).is_nil())
         });
 
-        // PORT: not in Go. The file ids that the copied diagnostics point at
-        // (`Snapshot::held_file_versions`), collected only once a freeable
-        // file version is published.
-        let mut held_files: Option<Vec<usize>> =
-            crate::ast::any_freeable_published().then(Vec::new);
-
         let files = source_files();
         // PORT: perf. Go hashes each file text in the file's WorkGroup job.
         // Here another thread hashes the texts while the files bind and the
@@ -212,11 +206,10 @@ impl ToProgramSnapshot<'_> {
                     if let Some(emit_diagnostics) =
                         old_snapshot.emit_diagnostics_per_file.get(&file_path)
                     {
-                        let copied = repopulate_diagnostics_of_file(emit_diagnostics, file);
-                        note_diagnostic_files(&copied, held_files.as_mut());
-                        self.snapshot
-                            .emit_diagnostics_per_file
-                            .insert(file_path.clone(), copied);
+                        self.snapshot.emit_diagnostics_per_file.insert(
+                            file_path.clone(),
+                            repopulate_diagnostics_of_file(emit_diagnostics, file),
+                        );
                     }
                     if can_copy_semantic_diagnostics
                         && (!source_file_info(file).is_declaration_file
@@ -228,11 +221,10 @@ impl ToProgramSnapshot<'_> {
                         if let Some(diagnostics) =
                             old_snapshot.semantic_diagnostics_per_file.get(&file_path)
                         {
-                            let copied = repopulate_diagnostics_of_file(diagnostics, file);
-                            note_diagnostic_files(&copied, held_files.as_mut());
-                            self.snapshot
-                                .semantic_diagnostics_per_file
-                                .insert(file_path.clone(), copied);
+                            self.snapshot.semantic_diagnostics_per_file.insert(
+                                file_path.clone(),
+                                repopulate_diagnostics_of_file(diagnostics, file),
+                            );
                         }
                     }
                 }
@@ -263,15 +255,20 @@ impl ToProgramSnapshot<'_> {
                 },
             );
         }
-        if let Some(mut held_files) = held_files {
-            held_files.sort_unstable();
-            held_files.dedup();
-            // The old snapshot and the old program hold these versions
-            // until after this call (the watcher releases the old program
-            // after `new_program`), so each is still alive here.
-            self.snapshot.held_file_versions =
-                crate::ast::live_file_versions(held_files.into_iter());
-        }
+        // PORT: not in Go (`Snapshot::held_file_versions`). Each entry of the
+        // two maps is a copy so far. The old snapshot and the old program
+        // hold these versions until after this call (the watcher releases
+        // the old program after `new_program`), so each is alive here.
+        let snapshot = &self.snapshot;
+        let held = crate::ast::diagnostic_file_versions(
+            snapshot
+                .semantic_diagnostics_per_file
+                .values()
+                .chain(snapshot.emit_diagnostics_per_file.values())
+                .filter_map(|entry| entry.diagnostics.as_deref())
+                .flatten(),
+        );
+        self.snapshot.held_file_versions = held;
     }
 
     // Go: incremental/programtosnapshot.go:162 handleFileDelete
@@ -826,29 +823,6 @@ fn referenced_file_name_paths(file: Node) -> Vec<Path> {
         }
     }
     referenced_files
-}
-
-/// PORT: not in Go. Adds to `held` the file id of each diagnostic of
-/// `diags`, of its related information and of its message chain (see
-/// `Snapshot::held_file_versions`). Does nothing when `held` is `None`.
-fn note_diagnostic_files(
-    diags: &DiagnosticsOrBuildInfoDiagnosticsWithFileName,
-    held: Option<&mut Vec<usize>>,
-) {
-    fn note(d: &Diagnostic, held: &mut Vec<usize>) {
-        if !d.file.is_nil() {
-            held.push(d.file.file_index());
-        }
-        for d in d.message_chain().iter().chain(d.related_information()) {
-            note(d, held);
-        }
-    }
-    let (Some(held), Some(diagnostics)) = (held, &diags.diagnostics) else {
-        return;
-    };
-    for d in diagnostics {
-        note(d, held);
-    }
 }
 
 // Go: incremental/programtosnapshot.go:337 repopulateDiagnosticsOfFile

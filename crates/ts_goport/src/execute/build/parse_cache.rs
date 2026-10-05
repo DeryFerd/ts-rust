@@ -76,4 +76,10 @@ impl<K: Clone + Eq + Hash, V: Clone> ParseCache<K, V> {
     pub fn reset(&self) {
         self.entries.borrow_mut().clear();
     }
+
+    /// `reset` that keeps the entries for which `keep` is true.
+    // PORT: not in Go (see `Orchestrator::reset_caches`).
+    pub fn reset_except(&self, mut keep: impl FnMut(&K) -> bool) {
+        self.entries.borrow_mut().retain(|key, _| keep(key));
+    }
 }
