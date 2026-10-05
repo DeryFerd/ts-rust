@@ -460,10 +460,14 @@ The batch that adds it is not accepted until Theo approves.
   `FileVersion`. In a `tsc --watch` process (`Watcher::start`,
   `ast::set_watch_process`; watchfree1) each build does the same for its
   new parses (`program::mark_freeable_parses`), and parses ahead
-  (prefetch) only in its first build, so a config change parses every file
-  into owned stores on the loading thread, libs too: the watch file system
-  is not the plain OS file system, so a lib is a live parse, not a
-  `lib_parse.bin` load. A diagnostic that a watch build copies from the
+  (prefetch) only in its first build. Go parses every file again after a
+  config change. Here the build after it keeps the parse of a file whose
+  parse options and text are the same and that has no diagnostics in the
+  last snapshot (`WatchCompilerHost::reuse_parse`, watchcfg1; Go's error
+  summary groups errors by file object, and a copied diagnostic keeps the
+  old one). It parses the other files into owned stores on the loading
+  thread: the watch file system is not the plain OS file system, so a
+  changed lib is a live parse, not a `lib_parse.bin` load. A diagnostic that a watch build copies from the
   last build (Go `repopulateDiagnosticsOfFile`) points at the file
   versions of the build that made it, and Go prints it from them: the new
   snapshot holds them (`Snapshot::held_file_versions`). `tsc -b --watch`
@@ -474,8 +478,11 @@ The batch that adds it is not accepted until Theo approves.
   wrote it (`BuildHost::watch_source_file`, as Go `tsc --watch` keeps its
   files), so a cycle parses only the changed files, on the loading thread:
   parse workers parse ahead only in the first build (`BuildHost::prefetch`).
-  A task keeps the versions that its errors point at until its next build
-  (`BuildTask::held_file_versions`). Its parse holds it (`ParsedSourceFile::version`), and so
+  A config change keeps the parses too: their key holds the parse options
+  (`BuildHost::keep_watch_sources_for_config_change`); only an overflow
+  drops them. A task keeps the versions that its errors point at until its
+  next build (`BuildTask::held_file_versions`). A file version's parse
+  holds it (`ParsedSourceFile::version`), and so
   do the `VersionTables` of each program version that has the file, so a
   seeded thread keeps it too. A thread that reads it pins it until the
   next program release (`release_file_version_pins`, run when a

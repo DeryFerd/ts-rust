@@ -14,4 +14,5 @@ mod tsc_a;
 mod tsc_b;
 mod tsc_contentmapper;
 mod tscwatch;
+mod watch_specifier_package_json;
 mod watcher_race;

@@ -57,6 +57,38 @@ pub struct WatchCompilerHost {
     /// PORT: not in Go. False when parse workers must not parse ahead (see
     /// `prefetch_parses`).
     pub prefetch: bool,
+    /// PORT: not in Go (`reuse_parse`). In the build after a config change,
+    /// the source file cache from before the change. `do_build` empties it
+    /// when the program is loaded.
+    pub config_parses: RefCell<FxHashMap<Path, Rc<CachedSourceFile>>>,
+}
+
+impl WatchCompilerHost {
+    /// PORT: not in Go. The parse that the source file cache had before a
+    /// config change, when a parse now gives the same file: the same parse
+    /// options and the same text (a bundled lib never changes). Go parses
+    /// every file again after a config change (`doBuild` empties
+    /// `sourceFileCache`, watcher.go:409), and so did the port, on one
+    /// thread (see `prefetch_parses`): a query-core build after a tsconfig
+    /// edit took 1.8 times as long as Go. The parse and the bind of a file
+    /// read only its text and its parse options, so the output does not
+    /// change. The Go language server parse cache keys a parse by the same
+    /// fields (project/parsecache.go:16 `ParseCacheKey`). The text is read
+    /// as Go reads it for its parse. A file with diagnostics in the old
+    /// snapshot is not in `config_parses` (see `Watcher::do_build`).
+    fn reuse_parse(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
+        let old = self.config_parses.borrow_mut().remove(&opts.path)?;
+        if old.file.parse_options() != opts {
+            return None;
+        }
+        if !crate::frontend::bundled::is_bundled(&opts.file_name) {
+            let (text, ok) = self.compiler_host.fs().read_file(&opts.file_name);
+            if !ok || text != old.file.text() {
+                return None;
+            }
+        }
+        Some(old.file.clone())
+    }
 }
 
 impl CompilerHost for WatchCompilerHost {
@@ -89,7 +121,9 @@ impl CompilerHost for WatchCompilerHost {
             }
         }
 
-        let file = self.compiler_host.get_source_file(opts);
+        let file = self
+            .reuse_parse(opts)
+            .or_else(|| self.compiler_host.get_source_file(opts));
         if let Some(file) = &file {
             if let Some(info) = &info {
                 self.cache.borrow_mut().insert(
@@ -137,9 +171,14 @@ impl CompilerHost for WatchCompilerHost {
     // change (both empty the cache) parses ahead only while
     // `ast::free_file_versions` is off (`prefetch`): a worker parse keeps
     // its nodes in the worker's AST arena, so a freeable file version of it
-    // would leak them.
+    // would leak them. And not while it can take parses from before a
+    // config change (`config_parses`): the workers would parse those files
+    // for nothing.
     fn prefetch_parses(&self) -> bool {
-        self.prefetch && self.cache.borrow().is_empty() && self.compiler_host.prefetch_parses()
+        self.prefetch
+            && self.cache.borrow().is_empty()
+            && self.config_parses.borrow().is_empty()
+            && self.compiler_host.prefetch_parses()
     }
 }
 
@@ -650,8 +689,38 @@ impl Watcher {
 
     // Go: execute/watcher.go:408 (*Watcher).doBuild
     pub fn do_build(&mut self) -> Result<(), GoError> {
+        // PORT: the full build below can still use the parses of the old
+        // cache (`WatchCompilerHost::reuse_parse`); Go drops them here.
+        let mut config_parses = FxHashMap::default();
         if self.config_modified {
-            self.source_file_cache = Rc::new(RefCell::new(FxHashMap::default()));
+            let old = std::mem::replace(
+                &mut self.source_file_cache,
+                Rc::new(RefCell::new(FxHashMap::default())),
+            );
+            config_parses = old.take();
+            // A file that has diagnostics in the old snapshot is parsed
+            // again, as in Go: the new snapshot can copy them, and Go's
+            // error summary groups errors by file object
+            // (diagnosticwriter.go:479 getErrorSummary). A copy keeps the
+            // old object, so Go shows a file whose copied and new errors
+            // meet in one build twice.
+            if let Some(program) = &self.program {
+                let snapshot = program.snapshot.borrow();
+                let has_diagnostics = |path: &Path| {
+                    [
+                        &snapshot.semantic_diagnostics_per_file,
+                        &snapshot.emit_diagnostics_per_file,
+                    ]
+                    .iter()
+                    .any(|map| {
+                        map.get(path).is_some_and(|entry| {
+                            entry.diagnostics.as_ref().is_some_and(|d| !d.is_empty())
+                                || !entry.build_info_diagnostics.is_empty()
+                        })
+                    })
+                };
+                config_parses.retain(|path, _| !has_diagnostics(path));
+            }
             self.watch_set_dirty = true;
         }
 
@@ -699,6 +768,7 @@ impl Watcher {
                 compiler_host: inner_host,
                 cache: self.source_file_cache.clone(),
                 prefetch: self.prefetch_parses(),
+                config_parses: RefCell::default(),
             });
 
             if self.try_update_program(&host) {
@@ -761,11 +831,13 @@ impl Watcher {
             )),
             self.content_mapper_project.clone(),
         );
-        let host: Rc<dyn CompilerHost> = Rc::new(WatchCompilerHost {
+        let watch_host = Rc::new(WatchCompilerHost {
             compiler_host: inner_host,
             cache: self.source_file_cache.clone(),
             prefetch: self.prefetch_parses(),
+            config_parses: RefCell::new(config_parses),
         });
+        let host: Rc<dyn CompilerHost> = watch_host.clone();
 
         if self.config.config_file.is_some() {
             for dir in self.config.wildcard_directories().keys() {
@@ -793,6 +865,9 @@ impl Watcher {
         // Its new parses of files that an earlier build published are
         // freeable file versions (see `start`).
         let np = new_frontend_program(host.clone(), self.config.clone());
+        // The old parses that the program did not take go now, as Go's GC
+        // frees them after the new program is made.
+        drop(watch_host.config_parses.take());
         crate::program::mark_freeable_parses(&np);
         let version = crate::program::new_program_version(&np, None);
         drop(np);
@@ -827,6 +902,26 @@ impl Watcher {
 
         let result = self.compile_and_emit();
         cached.disable_and_clear_cache();
+
+        // PORT: Go's module specifier lookups read package.json files through
+        // the program's resolver, whose file system is `tfs`
+        // (module/resolver.go:1755 getPackageJsonInfo), so the lookups of
+        // this build are seen files. The port's lookups run on the checker
+        // threads on the OS file system, and the program's `HostFsCache`
+        // keeps their entries (modulespecifiers/host.rs). It is new in each
+        // full build, as Go's resolver is. Each entry adds what Go's lookup
+        // adds: the package directory (`DirectoryExists`) and, when it
+        // exists, its package.json (`FileExists`, `ReadFile`).
+        crate::program::with_host_fs_cache(|cache| {
+            let mut seen = tfs.seen_files.borrow_mut();
+            cache.package_json_entries(|_, package_directory, directory_exists, _| {
+                seen.insert(package_directory.to_string());
+                if directory_exists {
+                    seen.insert(combine_paths(package_directory, &["package.json"]));
+                }
+                true
+            });
+        });
 
         let case_sensitive = self.sys.fs().use_case_sensitive_file_names();
         let cwd = self.sys.get_current_directory();

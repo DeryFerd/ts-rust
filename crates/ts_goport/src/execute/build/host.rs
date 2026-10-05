@@ -223,6 +223,10 @@ pub struct BuildHost {
     // (not `.d.ts` or `.json`) in `tsc -b --watch`, with the modification
     // time of each file at its parse. `None` outside watch mode.
     pub watch_sources: RefCell<Option<FxHashMap<SourceFileCacheKey, WatchSource>>>,
+    // PORT: not in Go (`keep_watch_sources_for_config_change`). In a cycle
+    // after a config change, the parses that `watch_sources` had before it
+    // and that no build of the cycle took yet.
+    watch_sources_before_config_change: RefCell<FxHashMap<SourceFileCacheKey, WatchSource>>,
     // PORT: Go `*collections.SyncMap`. The task `writeFile` stores into it
     // from the checker threads.
     pub m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
@@ -306,6 +310,7 @@ impl BuildHost {
             config_prefetch: RefCell::new(None),
             prefetch: std::cell::Cell::new(true),
             watch_sources: RefCell::new(None),
+            watch_sources_before_config_change: RefCell::default(),
             m_times: Arc::default(),
             written: Arc::default(),
         }
@@ -351,6 +356,19 @@ impl BuildHost {
         if cached.is_some() {
             return cached;
         }
+        // A kept parse from before a config change of this cycle.
+        let before = self
+            .watch_sources_before_config_change
+            .borrow_mut()
+            .remove(&key)
+            .filter(|source| keep && source.mod_time == mod_time);
+        if let Some(source) = before {
+            let file = source.file.clone();
+            if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
+                sources.insert(key, source);
+            }
+            return Some(file);
+        }
         let file = self.host.get_source_file(opts);
         if shared {
             // See the note in `get_source_file`.
@@ -379,13 +397,51 @@ impl BuildHost {
 
     /// PORT: not in Go (`watch_source_file`). Drops the kept parses of the
     /// files at `paths` (the paths of a cycle's watch events), or every
-    /// kept parse when `paths` is `None` (an overflow or a config change).
+    /// kept parse when `paths` is `None` (an overflow).
     pub fn evict_watch_sources(&self, paths: Option<&FxHashSet<Path>>) {
         if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
             match paths {
                 Some(paths) => sources.retain(|key, _| !paths.contains(&key.0.path)),
                 None => sources.clear(),
             }
+        }
+    }
+
+    /// PORT: not in Go (`watch_source_file`). A cycle with a config change
+    /// keeps the parses too: the key of a parse holds its parse options, so
+    /// a project whose options changed parses again only the files whose
+    /// parse options changed. Go parses every file again in each cycle, and
+    /// the port did in a config change cycle, on one thread (a
+    /// query-persist-client-core build after a tsconfig edit took 2 times
+    /// as long as Go). The kept parses wait in
+    /// `watch_sources_before_config_change`, and a build of the cycle takes
+    /// back each one that it uses (`watch_source_file`). Then
+    /// `end_config_change_cycle` drops the ones that it replaced.
+    pub fn keep_watch_sources_for_config_change(&self) {
+        if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
+            self.watch_sources_before_config_change
+                .borrow_mut()
+                .extend(sources.drain());
+        }
+    }
+
+    /// PORT: not in Go (`keep_watch_sources_for_config_change`). At the end
+    /// of a cycle, a kept parse from before a config change that no build
+    /// of the cycle took goes back to `watch_sources`, for a later build of
+    /// its project, unless the cycle has a parse of the same path (with
+    /// other parse options): that one replaced it, so it goes.
+    pub fn end_config_change_cycle(&self) {
+        let before = std::mem::take(&mut *self.watch_sources_before_config_change.borrow_mut());
+        if before.is_empty() {
+            return;
+        }
+        if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
+            let parsed: FxHashSet<Path> = sources.keys().map(|key| key.0.path.clone()).collect();
+            sources.extend(
+                before
+                    .into_iter()
+                    .filter(|(key, _)| !parsed.contains(&key.0.path)),
+            );
         }
     }
 
