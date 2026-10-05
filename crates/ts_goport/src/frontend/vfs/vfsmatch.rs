@@ -1,4 +1,5 @@
 use crate::frontend::prelude::*;
+use std::borrow::Cow;
 
 // This file ports vfs/vfsmatch/vfsmatch.go and stringer_generated.go.
 // It implements the glob matching algorithm specified in MATCHING_ALGORITHM.md.
@@ -144,6 +145,9 @@ struct GlobPattern {
     case_sensitive: bool,
     /// for "files" patterns, exclude .min.js by default
     exclude_min_js: bool,
+    /// PERF (cfgwalk1): bit `i` is set when component `i` is `**` (see
+    /// `prefix_states`).
+    double_asterisks: u64,
 }
 
 // Go: vfs/vfsmatch/vfsmatch.go:107 component
@@ -154,6 +158,9 @@ struct Component {
     kind: ComponentKind,
     /// for Literal: the exact string to match
     literal: String,
+    /// PERF (cfgwalk1): the Go bytes of `literal` (see
+    /// `scanner_util::GO_STRING_MARKER`), made once at compile time.
+    literal_bytes: Vec<u8>,
     /// for Wildcard: parsed wildcard pattern
     segments: Vec<Segment>,
     /// Include patterns with wildcards skip common package folders (node_modules, etc.)
@@ -179,6 +186,8 @@ struct Segment {
     kind: SegmentKind,
     /// only for Literal
     literal: String,
+    /// PERF (cfgwalk1): the Go bytes of `literal`, made once.
+    literal_bytes: Vec<u8>,
 }
 
 // Go: vfs/vfsmatch/vfsmatch.go:130 segmentKind
@@ -223,11 +232,17 @@ fn compile_glob_pattern(
         exclude_min_js: usage == Usage::Files,
         // Avoid slice growth during compilation.
         components: Vec::with_capacity(parts.len()),
+        double_asterisks: 0,
     };
 
     for part in &parts {
         p.components
             .push(parse_component(part, usage != Usage::Exclude));
+    }
+    for (i, comp) in p.components.iter().enumerate().take(64) {
+        if comp.kind == ComponentKind::DoubleAsterisk {
+            p.double_asterisks |= 1 << i;
+        }
     }
     Some(p)
 }
@@ -239,6 +254,7 @@ fn parse_component(s: &str, is_include: bool) -> Component {
         return Component {
             kind: ComponentKind::DoubleAsterisk,
             literal: String::new(),
+            literal_bytes: Vec::new(),
             segments: Vec::new(),
             skip_package_folders: false,
         };
@@ -247,6 +263,7 @@ fn parse_component(s: &str, is_include: bool) -> Component {
         return Component {
             kind: ComponentKind::Literal,
             literal: s.to_string(),
+            literal_bytes: go_string_bytes(s).into_owned(),
             segments: Vec::new(),
             skip_package_folders: false,
         };
@@ -254,6 +271,7 @@ fn parse_component(s: &str, is_include: bool) -> Component {
     Component {
         kind: ComponentKind::Wildcard,
         literal: String::new(),
+        literal_bytes: Vec::new(),
         segments: parse_segments(s),
         skip_package_folders: is_include,
     }
@@ -274,17 +292,20 @@ fn parse_segments(s: &str) -> Vec<Segment> {
                 result.push(Segment {
                     kind: SegmentKind::Literal,
                     literal: s[start..i].to_string(),
+                    literal_bytes: go_string_bytes(&s[start..i]).into_owned(),
                 });
             }
             if b[i] == b'*' {
                 result.push(Segment {
                     kind: SegmentKind::Star,
                     literal: String::new(),
+                    literal_bytes: Vec::new(),
                 });
             } else {
                 result.push(Segment {
                     kind: SegmentKind::Question,
                     literal: String::new(),
+                    literal_bytes: Vec::new(),
                 });
             }
             start = i + 1;
@@ -294,6 +315,7 @@ fn parse_segments(s: &str) -> Vec<Segment> {
         result.push(Segment {
             kind: SegmentKind::Literal,
             literal: s[start..].to_string(),
+            literal_bytes: go_string_bytes(&s[start..]).into_owned(),
         });
     }
     result
@@ -365,9 +387,7 @@ impl GlobPattern {
                     // PORT: Go compares bytes. The names are port forms, so
                     // this compares their Go bytes (see
                     // `scanner_util::GO_STRING_MARKER`).
-                    if !self
-                        .strings_equal(&go_string_bytes(&comp.literal), &go_string_bytes(path_part))
-                    {
+                    if !self.strings_equal(&comp.literal_bytes, &go_string_bytes(path_part)) {
                         return false;
                     }
                 }
@@ -395,6 +415,152 @@ impl GlobPattern {
             .iter()
             .all(|c| c.kind == ComponentKind::DoubleAsterisk)
     }
+
+    // PERF (cfgwalk1): `match_path_parts` as a set of states, so that the
+    // parts of a directory are matched once for all its entries (see
+    // `GlobVisitor::visit`). Go matches every part of the absolute path again
+    // for each entry. A state is a component index, bit `i` of a `u64`; bit
+    // `len` is the state after the last component. `match_path_parts` is an
+    // OR over its branches with no side effects, so the states give the same
+    // result:
+    // - `**` at `i` tries `i + 1` on the same part (the closure), and keeps
+    //   `i` on the next part unless an include meets a hidden or package
+    //   folder part;
+    // - a literal or wildcard at `i` goes to `i + 1` when it matches the part;
+    // - a part left at state `len` ends that branch with
+    //   `is_exclude && !prefix_only` (`overrun`);
+    // - at the end of the path a state `i` gives `prefix_only ||
+    //   pattern_satisfied(i)`.
+    // Patterns of 64 or more components use `match_path_parts`.
+
+    /// The start state, or `None` when the pattern is too long for the states.
+    fn start_states(&self) -> Option<u64> {
+        (self.components.len() < 64).then_some(1)
+    }
+
+    /// The states and the `**` states that they reach on the same part.
+    fn state_closure(&self, mut live: u64) -> u64 {
+        loop {
+            let reached = ((live & self.double_asterisks) << 1) & !live;
+            if reached == 0 {
+                return live;
+            }
+            live |= reached;
+        }
+    }
+
+    /// Steps the states `live` over one path part (`part_bytes` is its Go
+    /// bytes). Returns the next states and whether a branch had the part left
+    /// after the last component (`overrun`).
+    fn step_states(&self, live: u64, part: &str, part_bytes: &[u8]) -> (u64, bool) {
+        if live == 0 {
+            return (0, false);
+        }
+        let live = self.state_closure(live);
+        let end = 1u64 << self.components.len();
+        let mut rest = live & !end;
+        let mut next = 0u64;
+        while rest != 0 {
+            let i = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            let comp = &self.components[i];
+            match comp.kind {
+                ComponentKind::DoubleAsterisk => {
+                    if self.is_exclude || !(is_hidden_path(part) || is_package_folder(part)) {
+                        next |= 1 << i;
+                    }
+                }
+                ComponentKind::Literal => {
+                    if self.strings_equal(&comp.literal_bytes, part_bytes) {
+                        next |= 1 << (i + 1);
+                    }
+                }
+                ComponentKind::Wildcard => {
+                    if !(comp.skip_package_folders && is_package_folder(part))
+                        && self.match_wildcard(&comp.segments, part_bytes)
+                    {
+                        next |= 1 << (i + 1);
+                    }
+                }
+            }
+        }
+        (next, live & end != 0)
+    }
+
+    /// The states after `parts`, the parts of a path that ends in '/' and
+    /// their Go bytes (`prefix_parts`).
+    fn prefix_states(&self, parts: &[(&str, Cow<'_, [u8]>)]) -> Option<PrefixStates> {
+        let mut live = self.start_states()?;
+        let mut overrun = false;
+        for (part, part_bytes) in parts {
+            if live == 0 {
+                break;
+            }
+            let (next, over) = self.step_states(live, part, part_bytes);
+            live = next;
+            overrun |= over;
+        }
+        Some(PrefixStates { live, overrun })
+    }
+
+    /// `match_path_parts(prefix, suffix, 0, 0, prefix_only)` from the states
+    /// of `prefix` (`prefix_states`). `suffix_bytes` is the Go bytes of
+    /// `suffix`.
+    fn match_suffix(
+        &self,
+        states: PrefixStates,
+        suffix: &str,
+        suffix_bytes: &[u8],
+        prefix_only: bool,
+    ) -> bool {
+        let overrun_matches = self.is_exclude && !prefix_only;
+        if states.overrun && overrun_matches {
+            return true;
+        }
+        // `next_path_part_parts` gives the whole suffix as one part.
+        let mut live = states.live;
+        if !suffix.is_empty() {
+            let (next, over) = self.step_states(live, suffix, suffix_bytes);
+            if over && overrun_matches {
+                return true;
+            }
+            live = next;
+        }
+        if prefix_only {
+            return live != 0;
+        }
+        let mut rest = live;
+        while rest != 0 {
+            let i = rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            if self.pattern_satisfied(i) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+// PERF (cfgwalk1): the parts of `prefix`, a path that ends in '/', as
+// `next_path_part_parts(prefix, suffix, ..)` gives them before the suffix,
+// with their Go bytes.
+fn prefix_parts(prefix: &str) -> Vec<(&str, Cow<'_, [u8]>)> {
+    let mut parts = Vec::new();
+    let mut offset = 0;
+    while let Some((part, next_offset)) = next_path_part_single(prefix, offset) {
+        parts.push((part, go_string_bytes(part)));
+        offset = next_offset;
+    }
+    parts
+}
+
+// PERF (cfgwalk1): the states of one pattern after the parts of a directory
+// path (see `GlobPattern::prefix_states`).
+#[derive(Clone, Copy, Debug)]
+struct PrefixStates {
+    live: u64,
+    /// A branch had a part left after the last component.
+    overrun: bool,
 }
 
 // Go: vfs/vfsmatch/vfsmatch.go:294 nextPathPartSingle
@@ -494,9 +660,8 @@ impl GlobPattern {
             && segs[0].kind == SegmentKind::Star
             && segs[1].kind == SegmentKind::Literal
         {
-            let suffix = go_string_bytes(&segs[1].literal);
-            if s.len() < suffix.len() || !self.strings_equal(&suffix, &s[s.len() - suffix.len()..])
-            {
+            let suffix = &segs[1].literal_bytes;
+            if s.len() < suffix.len() || !self.strings_equal(suffix, &s[s.len() - suffix.len()..]) {
                 return false;
             }
             return self.should_include_min_js(s, segs);
@@ -519,9 +684,9 @@ impl GlobPattern {
                 let seg = &segs[seg_idx];
                 match seg.kind {
                     SegmentKind::Literal => {
-                        let lit = go_string_bytes(&seg.literal);
+                        let lit = &seg.literal_bytes;
                         let end = s_idx + lit.len();
-                        if end <= s.len() && self.strings_equal(&lit, &s[s_idx..end]) {
+                        if end <= s.len() && self.strings_equal(lit, &s[s_idx..end]) {
                             s_idx = end;
                             seg_idx += 1;
                             continue;
@@ -628,7 +793,9 @@ impl GlobPattern {
     /// Compares strings with appropriate case sensitivity.
     fn strings_equal(&self, a: &[u8], b: &[u8]) -> bool {
         if self.case_sensitive {
-            return a == b;
+            // PERF (cfgwalk1): path parts are short. A byte loop in place is
+            // faster than the `memcmp` call of `a == b`.
+            return a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y);
         }
         equal_fold(a, b)
     }
@@ -670,6 +837,12 @@ fn ensure_trailing_slash(s: &str) -> String {
 // PORT: Go `utf8.DecodeRuneInString`. An invalid or truncated sequence
 // gives U+FFFD with width 1. The input is never empty at the call sites.
 fn decode_rune(s: &[u8]) -> (char, usize) {
+    // PERF (cfgwalk1): an ASCII byte is its own rune, as in Go's fast path.
+    if let Some(&b) = s.first()
+        && b < 0x80
+    {
+        return (b as char, 1);
+    }
     let head = &s[..s.len().min(4)];
     let valid = match std::str::from_utf8(head) {
         Ok(v) => v,
@@ -799,6 +972,86 @@ impl GlobMatcher {
         None
     }
 
+    /// PERF (cfgwalk1): the states of each pattern after the parts of
+    /// `prefix`, a directory path that ends in '/' (see
+    /// `GlobPattern::prefix_states`). `None` for a pattern that
+    /// `match_path_parts` matches.
+    fn prefix_states(&self, prefix: &str) -> MatcherPrefixStates {
+        let parts = prefix_parts(prefix);
+        let states = |patterns: &[GlobPattern]| -> Vec<Option<PrefixStates>> {
+            patterns.iter().map(|p| p.prefix_states(&parts)).collect()
+        };
+        MatcherPrefixStates {
+            excludes: states(&self.excludes),
+            includes: states(&self.includes),
+        }
+    }
+
+    /// `matches_file_parts(prefix, suffix)` from `states`, the states of
+    /// `prefix` (`prefix_states`).
+    fn matches_file_in(
+        &self,
+        states: &MatcherPrefixStates,
+        prefix: &str,
+        suffix: &str,
+    ) -> Option<usize> {
+        let suffix_bytes = go_string_bytes(suffix);
+        let matches = |p: &GlobPattern, st: Option<PrefixStates>| match st {
+            Some(st) => p.match_suffix(st, suffix, &suffix_bytes, false),
+            None => p.matches_parts(prefix, suffix),
+        };
+        for (exclude, st) in self.excludes.iter().zip(&states.excludes) {
+            if matches(exclude, *st) {
+                return None;
+            }
+        }
+        if self.includes.is_empty() {
+            if self.had_includes {
+                return None;
+            }
+            return Some(0);
+        }
+        for (i, (include, st)) in self.includes.iter().zip(&states.includes).enumerate() {
+            if matches(include, *st) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// `matches_directory_parts(prefix, suffix)` from `states`, the states of
+    /// `prefix` (`prefix_states`).
+    fn matches_directory_in(
+        &self,
+        states: &MatcherPrefixStates,
+        prefix: &str,
+        suffix: &str,
+    ) -> bool {
+        let suffix_bytes = go_string_bytes(suffix);
+        for (exclude, st) in self.excludes.iter().zip(&states.excludes) {
+            let excluded = match st {
+                Some(st) => exclude.match_suffix(*st, suffix, &suffix_bytes, false),
+                None => exclude.matches_parts(prefix, suffix),
+            };
+            if excluded {
+                return false;
+            }
+        }
+        if self.includes.is_empty() {
+            return !self.had_includes;
+        }
+        for (include, st) in self.includes.iter().zip(&states.includes) {
+            let included = match st {
+                Some(st) => include.match_suffix(*st, suffix, &suffix_bytes, true),
+                None => include.matches_prefix_parts(prefix, suffix),
+            };
+            if included {
+                return true;
+            }
+        }
+        false
+    }
+
     // Go: vfs/vfsmatch/vfsmatch.go:562 (*globMatcher).matchesDirectoryParts
     /// Checks if files under the directory prefix+suffix could match any pattern.
     fn matches_directory_parts(&self, prefix: &str, suffix: &str) -> bool {
@@ -817,6 +1070,12 @@ impl GlobMatcher {
         }
         false
     }
+}
+
+// PERF (cfgwalk1): the prefix states of the patterns of a `GlobMatcher`.
+struct MatcherPrefixStates {
+    excludes: Vec<Option<PrefixStates>>,
+    includes: Vec<Option<PrefixStates>>,
 }
 
 // Go: vfs/vfsmatch/vfsmatch.go:579 globVisitor
@@ -863,11 +1122,22 @@ impl GlobVisitor<'_> {
         let path_prefix = ensure_trailing_slash(path);
         let abs_prefix = ensure_trailing_slash(absolute_path);
 
+        // PERF (cfgwalk1): match the parts of `abs_prefix` once for all
+        // entries (see `GlobPattern::prefix_states`). `abs_prefix` ends in
+        // '/' unless it is empty, and the states need the '/'.
+        let use_states = abs_prefix.ends_with('/');
+
+        let file_states = (use_states && !entries.files.is_empty())
+            .then(|| self.file_matcher.prefix_states(&abs_prefix));
         for file in &entries.files {
             if !self.extensions.is_empty() && !file_extension_is_one_of(file, &self.extensions) {
                 continue;
             }
-            if let Some(idx) = self.file_matcher.matches_file_parts(&abs_prefix, file) {
+            let matched = match &file_states {
+                Some(states) => self.file_matcher.matches_file_in(states, &abs_prefix, file),
+                None => self.file_matcher.matches_file_parts(&abs_prefix, file),
+            };
+            if let Some(idx) = matched {
                 // PERF: `format!` without the formatter.
                 let mut name = String::with_capacity(path_prefix.len() + file.len());
                 name.push_str(&path_prefix);
@@ -883,11 +1153,19 @@ impl GlobVisitor<'_> {
             }
         }
 
+        let directory_states = (use_states && !entries.directories.is_empty())
+            .then(|| self.directory_matcher.prefix_states(&abs_prefix));
         for dir in &entries.directories {
-            if !self
-                .directory_matcher
-                .matches_directory_parts(&abs_prefix, dir)
-            {
+            let matched = match &directory_states {
+                Some(states) => {
+                    self.directory_matcher
+                        .matches_directory_in(states, &abs_prefix, dir)
+                }
+                None => self
+                    .directory_matcher
+                    .matches_directory_parts(&abs_prefix, dir),
+            };
+            if !matched {
                 continue;
             }
             let abs_dir = format!("{abs_prefix}{dir}");
@@ -1015,4 +1293,120 @@ pub fn new_spec_matcher(
         return None;
     }
     Some(SpecMatcher { patterns })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // cfgwalk1: the prefix states (`GlobMatcher::matches_file_in` and
+    // `matches_directory_in`) give the results of `match_path_parts` for
+    // random patterns and paths.
+    #[test]
+    fn prefix_states_match_path_parts() {
+        const SPECS: &[&str] = &[
+            "**/*",
+            "src",
+            "src/**/*.ts",
+            "**/node_modules",
+            "*.ts",
+            "a/*/b",
+            "**/.git",
+            "a?c/**",
+            "node_modules",
+            "**",
+            "src/**",
+            "**/*.min.js",
+            "./x/../y/*",
+            "/abs/path/*",
+            "A/B",
+            ".hidden/*",
+            "**/a*b*c",
+            "x/**/y/**/z",
+            "\u{65e5}\u{672c}/*",
+            "a/**/**/b/*",
+            "*/*",
+            "**/*.MIN.*",
+            "../up/**/*",
+            "/r",
+            "/",
+        ];
+        const NAMES: &[&str] = &[
+            "src",
+            "a",
+            "b",
+            "node_modules",
+            ".git",
+            "A",
+            "x",
+            "y",
+            "z",
+            "abc",
+            "aXbYc",
+            "\u{65e5}\u{672c}",
+            "bower_components",
+            "lib.min.js",
+            "foo.ts",
+            "FOO.TS",
+            ".hidden",
+            "up",
+            "path",
+            "abs",
+            "r",
+        ];
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = |n: usize| -> usize {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut checked = 0;
+        for round in 0..400 {
+            let case_sensitive = round % 2 == 0;
+            let pick = |k: usize, next: &mut dyn FnMut(usize) -> usize| -> Vec<String> {
+                (0..k)
+                    .map(|_| SPECS[next(SPECS.len())].to_string())
+                    .collect()
+            };
+            let ni = next(3);
+            let includes = pick(ni, &mut next);
+            let ne = next(4);
+            let excludes = pick(ne, &mut next);
+            let base = if round % 5 == 0 { "/" } else { "/r" };
+            let files = new_glob_matcher(&includes, &excludes, base, case_sensitive, Usage::Files);
+            let dirs = new_glob_matcher(
+                &includes,
+                &excludes,
+                base,
+                case_sensitive,
+                Usage::Directories,
+            );
+            for _ in 0..60 {
+                let mut prefix = String::from(if next(6) == 0 { "/" } else { "/r/" });
+                for _ in 0..next(6) {
+                    prefix.push_str(NAMES[next(NAMES.len())]);
+                    prefix.push('/');
+                }
+                let file_states = files.prefix_states(&prefix);
+                let dir_states = dirs.prefix_states(&prefix);
+                for name in NAMES.iter().copied().chain(["", "q.ts", "Q.d.ts"]) {
+                    assert_eq!(
+                        files.matches_file_in(&file_states, &prefix, name),
+                        files.matches_file_parts(&prefix, name),
+                        "file {prefix}{name} includes {includes:?} excludes {excludes:?} \
+                         case {case_sensitive}"
+                    );
+                    assert_eq!(
+                        dirs.matches_directory_in(&dir_states, &prefix, name),
+                        dirs.matches_directory_parts(&prefix, name),
+                        "dir {prefix}{name} includes {includes:?} excludes {excludes:?} \
+                         case {case_sensitive}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 400 * 60 * (NAMES.len() + 3));
+    }
 }
