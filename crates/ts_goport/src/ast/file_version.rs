@@ -257,8 +257,10 @@ pub fn free_file_versions() -> bool {
 
 thread_local! {
     /// The paths that a publish on this thread published, while
-    /// `free_file_versions` is on (`note_published_path`).
-    static PUBLISHED_PATHS: RefCell<FxHashSet<String>> = RefCell::new(FxHashSet::default());
+    /// `free_file_versions` is on (`note_published_path`). Shared with the
+    /// parse workers of a load (`published_paths`); a new path copies the
+    /// set while a load holds it.
+    static PUBLISHED_PATHS: RefCell<Arc<FxHashSet<String>>> = RefCell::default();
 }
 
 /// Records that a publish on this thread published a file at `path`. Does
@@ -270,9 +272,19 @@ pub(crate) fn note_published_path(path: &str) {
     PUBLISHED_PATHS.with(|paths| {
         let mut paths = paths.borrow_mut();
         if !paths.contains(path) {
-            paths.insert(path.to_string());
+            Arc::make_mut(&mut paths).insert(path.to_string());
         }
     });
+}
+
+/// The paths whose new parse on this thread is a freeable file version
+/// (`freeable_path`), for the parse workers of a program load, which
+/// cannot read this thread's state. Empty while `free_file_versions` is off.
+pub fn published_paths() -> Arc<FxHashSet<String>> {
+    if !free_file_versions() {
+        return Arc::default();
+    }
+    PUBLISHED_PATHS.with(|paths| paths.borrow().clone())
 }
 
 /// The freeable rule: true when a new parse of `path` gets a

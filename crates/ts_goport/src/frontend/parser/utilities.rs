@@ -225,12 +225,9 @@ pub fn parse_with_options(
     if own == opts {
         return Some(file.clone());
     }
-    let reads_options = file.script_kind != ScriptKind::JSON
-        && is_file_probably_external_module(file.root).is_nil()
-        && !file.is_declaration_file;
     if own.file_name != opts.file_name
         || own.path != opts.path
-        || reads_options
+        || reads_module_indicator_options(file)
         || !file.content_mapper().is_empty()
     {
         return None;
@@ -239,6 +236,17 @@ pub fn parse_with_options(
         parse_options: opts.clone(),
         ..(**file).clone()
     }))
+}
+
+/// PORT: not in Go (see `parse_with_options`). True when the parse of
+/// `file` read its module indicator options (`get_external_module_indicator`):
+/// a file that is not JSON or a declaration file and has no import, export
+/// or `import.meta`.
+#[must_use]
+pub fn reads_module_indicator_options(file: &ParsedSourceFile) -> bool {
+    file.script_kind != ScriptKind::JSON
+        && is_file_probably_external_module(file.root).is_nil()
+        && !file.is_declaration_file
 }
 
 // Go: ast/parseoptions.go:86 isFileProbablyExternalModule

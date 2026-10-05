@@ -37,6 +37,7 @@ use crate::frontend::prelude::*;
 use crate::frontend::vfs::trackingvfs;
 use crate::fswatch;
 use crate::gostd::{Context, GoError};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 // Go: execute/watcher.go:26 cachedSourceFile
@@ -54,9 +55,6 @@ pub struct CachedSourceFile {
 pub struct WatchCompilerHost {
     pub compiler_host: Rc<dyn CompilerHost>,
     pub cache: Rc<RefCell<FxHashMap<Path, Rc<CachedSourceFile>>>>,
-    /// PORT: not in Go. False when parse workers must not parse ahead (see
-    /// `prefetch_parses`).
-    pub prefetch: bool,
     /// PORT: not in Go (`reuse_parse`). In the build after a config change,
     /// the source file cache from before the change. `do_build` empties it
     /// when the program is loaded.
@@ -70,9 +68,10 @@ impl WatchCompilerHost {
     /// that the parse did not read (`parse_with_options`, which then gives
     /// a copy with the new options). Go parses every file again after a
     /// config change (`doBuild` empties `sourceFileCache`, watcher.go:409),
-    /// and so did the port, on one thread (see `prefetch_parses`): a
-    /// query-core build after a tsconfig edit took 1.8 times as long as Go,
-    /// and an effect build after a `moduleDetection` edit 2.7 times. The
+    /// and so did the port, on one thread in watchfree1: a query-core build
+    /// after a tsconfig edit took 1.8 times as long as Go, and an effect
+    /// build after a `moduleDetection` edit 2.7 times. The parse workers
+    /// parse the other files (`prefetch_parses`). The
     /// parse and the bind of a file read only its text and its parse
     /// options, so the output does not change. The Go language server parse
     /// cache keys a parse by the same fields (project/parsecache.go:16
@@ -166,20 +165,36 @@ impl CompilerHost for WatchCompilerHost {
 
     // PORT: not in Go (see `CompilerHost::prefetch_parses`). A rebuild
     // gets the files that did not change from `cache`, so parse workers
-    // would parse them again for nothing, and those parses stay in the
-    // workers' AST arenas (about 38 MiB for each query-core rebuild). The
-    // first build parses ahead. A build after an overflow or a config
-    // change (both empty the cache) parses ahead only while
-    // `ast::free_file_versions` is off (`prefetch`): a worker parse keeps
-    // its nodes in the worker's AST arena, so a freeable file version of it
-    // would leak them. And not while it can take parses from before a
-    // config change (`config_parses`): the workers would parse those files
-    // for nothing.
+    // would parse them again for nothing (about 38 MiB for each query-core
+    // rebuild). A build with an empty cache parses ahead: the first build,
+    // and a build after an overflow or a config change. Go parses every
+    // file of those builds on goroutines. After a config change the workers
+    // skip the parses that `reuse_parse` probably gives
+    // (`cached_source_file_refs`), so they parse the files with old
+    // diagnostics and the files whose parse read changed options. A worker
+    // parse of a published path is a freeable file version
+    // (`freeable_worker_parses`).
     fn prefetch_parses(&self) -> bool {
-        self.prefetch
-            && self.cache.borrow().is_empty()
-            && self.config_parses.borrow().is_empty()
-            && self.compiler_host.prefetch_parses()
+        self.cache.borrow().is_empty() && self.compiler_host.prefetch_parses()
+    }
+
+    // PORT: not in Go (see `CompilerHost::cached_source_file_refs`). The
+    // parses from before a config change, each for the module indicator
+    // options that its parse read, if any (`FileRefs::of_kept_parse`).
+    fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<FileRefs>> {
+        self.config_parses
+            .borrow()
+            .values()
+            .map(|cached| {
+                let refs = FileRefs::of_kept_parse(&cached.file);
+                (cached.file.file_name().to_string(), Arc::new(refs))
+            })
+            .collect()
+    }
+
+    // PORT: not in Go (see `CompilerHost::freeable_worker_parses`).
+    fn freeable_worker_parses(&self) -> bool {
+        true
     }
 }
 
@@ -768,7 +783,6 @@ impl Watcher {
             let host: Rc<dyn CompilerHost> = Rc::new(WatchCompilerHost {
                 compiler_host: inner_host,
                 cache: self.source_file_cache.clone(),
-                prefetch: self.prefetch_parses(),
                 config_parses: RefCell::default(),
             });
 
@@ -835,7 +849,6 @@ impl Watcher {
         let watch_host = Rc::new(WatchCompilerHost {
             compiler_host: inner_host,
             cache: self.source_file_cache.clone(),
-            prefetch: self.prefetch_parses(),
             config_parses: RefCell::new(config_parses),
         });
         let host: Rc<dyn CompilerHost> = watch_host.clone();
@@ -997,14 +1010,6 @@ impl Watcher {
             }
             self.retired_program = Some(old);
         }
-    }
-
-    /// PORT: not in Go. True when the parse workers of the next build may
-    /// parse ahead (`WatchCompilerHost::prefetch_parses`): in the first
-    /// build, whose parses are static, or while `ast::free_file_versions`
-    /// is off.
-    fn prefetch_parses(&self) -> bool {
-        !self.program_ready || !crate::ast::free_file_versions()
     }
 
     /// Frees the snapshot of the program that the last build replaced,

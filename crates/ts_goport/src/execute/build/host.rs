@@ -213,11 +213,14 @@ pub struct BuildHost {
     // graph ahead of `get_resolved_project_reference` (config_prefetch.rs),
     // until the graph is made.
     pub config_prefetch: RefCell<Option<PrefetchPool>>,
-    // PORT: not in Go (`CompilerHost::prefetch_parses`). False in the watch
-    // cycles after the first (set by `Orchestrator::watch`): they take most
-    // files from `watch_sources`, and a parse worker's parse keeps its nodes
-    // in the worker's AST arena, so a worker parse of a kept file would
-    // leak them, and so would a freeable file version of a worker parse.
+    // PORT: not in Go (`CompilerHost::prefetch_parses`). In watch mode,
+    // true only in the first build and in the cycles with a config change
+    // or an overflow (set by `Orchestrator::watch` and `do_cycle`). Another
+    // cycle takes almost every file from `watch_sources`: a parse of a
+    // changed file on a worker saves less than the pool costs. The workers
+    // skip the parses that `watch_source_file` keeps
+    // (`cached_source_file_refs`), and a worker parse of a published path
+    // is a freeable file version (`freeable_worker_parses`).
     pub prefetch: std::cell::Cell<bool>,
     // PORT: not in Go (`watch_source_file`). The parses of the source files
     // (not `.d.ts` or `.json`) in `tsc -b --watch`, with the modification
@@ -711,35 +714,40 @@ impl CompilerHost for BuildHost {
     }
 
     // PORT: not in Go (see `CompilerHost::cached_source_file_refs`). The
-    // `.d.ts` and `.json` files that `get_source_file` keeps. The
-    // references of each parse are made once (`cached_refs`).
+    // `.d.ts` and `.json` files that `get_source_file` keeps, and in
+    // `tsc -b --watch` the parses that `watch_source_file` keeps, also from
+    // before a config change. A kept parse is given only for the module
+    // indicator options that its parse read, if any
+    // (`FileRefs::of_kept_parse`; a `.d.ts` or `.json` parse reads none).
+    // The references of each parse are made once (`cached_refs`).
     fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<FileRefs>> {
         let mut refs = FxHashMap::default();
         let mut memo = self.cached_refs.borrow_mut();
         let mut add = |key: &SourceFileCacheKey, file: &Rc<ParsedSourceFile>| {
             let (parse, file_refs) = memo
                 .entry(key.0.file_name.clone())
-                .or_insert_with(|| (Rc::downgrade(file), Arc::new(FileRefs::of_file(file))));
+                .or_insert_with(|| (Rc::downgrade(file), Arc::new(FileRefs::of_kept_parse(file))));
             if !parse.ptr_eq(&Rc::downgrade(file)) {
                 *parse = Rc::downgrade(file);
-                *file_refs = Arc::new(FileRefs::of_file(file));
+                *file_refs = Arc::new(FileRefs::of_kept_parse(file));
             }
             refs.insert(key.0.file_name.clone(), file_refs.clone());
         };
         self.source_files.for_each_stored(&mut add);
-        // `tsc -b --watch` keeps its files in `watch_sources`. Only its
-        // first build parses ahead, so only its `.d.ts` and `.json` files
-        // can be in another program of that build.
         if let Some(sources) = self.watch_sources.borrow().as_ref() {
             for (key, source) in sources {
-                if is_declaration_file_name(&key.0.file_name)
-                    || file_extension_is(&key.0.file_name, EXTENSION_JSON)
-                {
-                    add(key, &source.file);
-                }
+                add(key, &source.file);
             }
         }
+        for (key, source) in self.watch_sources_before_config_change.borrow().iter() {
+            add(key, &source.file);
+        }
         refs
+    }
+
+    // PORT: not in Go (see `CompilerHost::freeable_worker_parses`).
+    fn freeable_worker_parses(&self) -> bool {
+        self.watch_sources.borrow().is_some()
     }
 
     // Go: build/host.go:70 (*host).GetResolvedProjectReference
@@ -926,5 +934,10 @@ impl CompilerHost for BuildCompilerHost {
     // PORT: not in Go (see `CompilerHost::cached_source_file_refs`).
     fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<FileRefs>> {
         self.host.cached_source_file_refs()
+    }
+
+    // PORT: not in Go (see `CompilerHost::freeable_worker_parses`).
+    fn freeable_worker_parses(&self) -> bool {
+        self.host.freeable_worker_parses()
     }
 }

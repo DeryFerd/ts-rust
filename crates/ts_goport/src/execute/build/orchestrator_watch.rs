@@ -531,7 +531,12 @@ impl Orchestrator {
             self.generate_graph_reusing_old_tasks();
         }
 
+        // PORT: not in Go (see `BuildHost::prefetch`). Go parses the files
+        // of each build on goroutines. A cycle with a config change or an
+        // overflow can parse many files again, so its builds parse ahead.
+        self.host.prefetch.set(needs_config_update);
         self.build_or_clean();
+        self.host.prefetch.set(false);
         self.update_watch();
         let desired_dirs = self.compute_desired_watches();
         let reconciled = self.wm.borrow().reconcile_watches(&desired_dirs);
