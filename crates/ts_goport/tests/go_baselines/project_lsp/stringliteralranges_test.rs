@@ -451,28 +451,63 @@ child_test! {
 }
 
 /// The text edits of a rename of `old` to `new` (Go `GetEditsForFileRename`),
-/// one line per edit: the file, the new text and the range, sorted. Go
-/// ranges over a map of the edits by file (ls/file_rename.go:70), so the
-/// order of the files is random; the tests compare the edits as a set.
+/// one line per edit: the file, the new text and the range. Go ranges over a
+/// map of the edits by file (ls/file_rename.go:70), so the order of the
+/// files is random: the files are sorted. Inside a file the edits keep
+/// Go's order, by range (ls/change/trackerimpl.go:66).
 fn file_rename_edits(entries: &[(&str, &str)], open: &str, old: &str, new: &str) -> Vec<String> {
     let (session, language_service, _) = session_for(entries, open, open);
     let ctx = projecttestutil::with_request_id(&bg());
     let changes = language_service.get_edits_for_file_rename(&ctx, &uri(old), &uri(new));
-    let mut lines = Vec::new();
+    let mut files: Vec<(String, Vec<String>)> = Vec::new();
     for change in changes {
         let edit = change.text_document_edit.expect("a text document edit");
-        for text_edit in edit.edits {
-            let text_edit = text_edit.text_edit.expect("a text edit");
-            let ((a, b), (c, d)) = span(&text_edit.range);
-            lines.push(format!(
-                "{} {:?}@{a}:{b}-{c}:{d}",
-                edit.text_document.uri.0, text_edit.new_text
-            ));
-        }
+        let file = edit.text_document.uri.0;
+        let lines = edit
+            .edits
+            .into_iter()
+            .map(|text_edit| {
+                let text_edit = text_edit.text_edit.expect("a text edit");
+                let ((a, b), (c, d)) = span(&text_edit.range);
+                format!("{file} {:?}@{a}:{b}-{c}:{d}", text_edit.new_text)
+            })
+            .collect();
+        files.push((file, lines));
     }
     session.close();
-    lines.sort();
-    lines
+    files.sort_by(|(a, _), (b, _)| a.cmp(b));
+    files.into_iter().flat_map(|(_, lines)| lines).collect()
+}
+
+child_test! {
+    // followups26 (R173 reviewer item 11): only the files are sorted. Go N
+    // (followups26 tools/renameorder.py two-files) gives the m.ts edits by
+    // range, line 2 then line 10; a sort of the lines put line 10 first.
+    fn file_rename_keeps_the_go_order_of_the_edits_in_a_file() {
+        let m = format!("\n\nimport \"./a\";\n{}import \"./a\";\n", "\n".repeat(7));
+        let edits = file_rename_edits(
+            &[
+                (
+                    "/home/projects/p/tsconfig.json",
+                    r#"{"compilerOptions":{"noLib":true,"types":[]}}"#,
+                ),
+                ("/home/projects/p/a.ts", "export const a = 1;\n"),
+                ("/home/projects/p/m.ts", &m),
+                ("/home/projects/p/k.ts", "import \"./a\";\n"),
+            ],
+            "/home/projects/p/m.ts",
+            "file:///home/projects/p/a.ts",
+            "file:///home/projects/p/b.ts",
+        );
+        assert_eq!(
+            edits,
+            [
+                "file:///home/projects/p/k.ts \"./b\"@0:8-0:11",
+                "file:///home/projects/p/m.ts \"./b\"@2:8-2:11",
+                "file:///home/projects/p/m.ts \"./b\"@10:8-10:11",
+            ]
+        );
+    }
 }
 
 child_test! {
