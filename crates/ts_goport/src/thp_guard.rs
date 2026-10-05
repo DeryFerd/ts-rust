@@ -69,8 +69,10 @@ const POLL_MIN: Duration = Duration::from_millis(5);
 const POLL_MAX: Duration = Duration::from_millis(50);
 
 /// The fastest fall of the free memory that `next_poll` plans for, in
-/// bytes per ms: about 2x the fastest that perf13b saw (36 MiB in 5 ms).
-const MAX_FALL_PER_MS: u64 = 16 << 20;
+/// bytes per ms: 2x the fastest seen. perf13b saw up to 36 MiB in 5 ms.
+/// thpguard1 on zbook (no guard, other agents building) saw up to 92 MiB in
+/// 5 ms, 168 MiB in 10 ms and 268 MiB in 50 ms.
+const MAX_FALL_PER_MS: u64 = 32 << 20;
 
 /// The watcher stops after this time, so a long run does not read the
 /// memory for its whole life. The longest run of the perf13 grid took 1.2 s.
@@ -345,8 +347,9 @@ fn watch_step(elapsed: Duration, free: Option<u64>, min_free: u64) -> Watch {
 /// `MAX_FALL_PER_MS`, from `POLL_MIN` to `POLL_MAX`. So the watcher reads
 /// before the memory can reach the limit, and near the limit it reads as
 /// often as it did with a fixed 5 ms (cliperf1 rank 9: the fixed 5 ms read
-/// cost 1.2% to 1.5% of the CPU of a single-threaded run on cup2). zbook
-/// with 166 MiB free: 6 ms. A host with 800 MiB or more free: 50 ms.
+/// cost 1.2% to 1.5% of the CPU of a single-threaded run on cup2). Up to
+/// 224 MiB free (zbook in cliperf1 gapA: 166 MiB): 5 ms. 1,664 MiB or more
+/// free: 50 ms.
 fn next_poll(free: u64, min_free: u64) -> Duration {
     let ms = free.saturating_sub(min_free) / MAX_FALL_PER_MS;
     Duration::from_millis(ms).clamp(POLL_MIN, POLL_MAX)
@@ -499,15 +502,23 @@ Node 0, zone   Normal 616681 607866 455781 337376 229283 129647  50350  16747   
         // off there first), and up to 5 ms of fall above it: 5 ms.
         assert_eq!(next_poll(0, limit), POLL_MIN);
         assert_eq!(next_poll(limit, limit), POLL_MIN);
-        assert_eq!(next_poll(limit + 80 * MIB, limit), POLL_MIN);
+        assert_eq!(next_poll(limit + 191 * MIB, limit), POLL_MIN);
         // zbook (cliperf1 gapA): 166 MiB free.
-        assert_eq!(next_poll(166 * MIB, limit), ms(6));
-        assert_eq!(next_poll(limit + 480 * MIB, limit), ms(30));
-        // 800 MiB above the limit and more: 50 ms.
-        assert_eq!(next_poll(limit + 800 * MIB, limit), POLL_MAX);
+        assert_eq!(next_poll(166 * MIB, limit), POLL_MIN);
+        assert_eq!(next_poll(limit + 320 * MIB, limit), ms(10));
+        assert_eq!(next_poll(limit + 960 * MIB, limit), ms(30));
+        // 1,600 MiB above the limit and more: 50 ms.
+        assert_eq!(next_poll(limit + 1599 * MIB, limit), ms(49));
+        assert_eq!(next_poll(limit + 1600 * MIB, limit), POLL_MAX);
         assert_eq!(next_poll(u64::MAX, limit), POLL_MAX);
+        // With as much free above the limit as the largest fall that
+        // thpguard1 saw in 5, 10 and 50 ms on zbook, the next read comes
+        // within that time.
+        for (window, fall) in [(5, 92), (10, 168), (50, 268)] {
+            assert!(next_poll(limit + fall * MIB, limit) <= ms(window));
+        }
         // A wait never lets the planned fall pass the limit.
-        for free in (limit..limit + 2048 * MIB).step_by(7 * MIB as usize) {
+        for free in (limit..limit + 4096 * MIB).step_by(7 * MIB as usize) {
             let wait = next_poll(free, limit);
             let fall = MAX_FALL_PER_MS * wait.as_millis() as u64;
             assert!(wait == POLL_MIN || free - fall >= limit, "{free}");
