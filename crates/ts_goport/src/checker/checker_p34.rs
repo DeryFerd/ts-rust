@@ -1403,6 +1403,40 @@ mod tests {
         result
     }
 
+    /// Go `getStringLiteralType` (checker.go:25770) keys its map on the
+    /// value. The port keys `string_literal_types` on the value's FxHash and
+    /// compares each type's value in the bucket (`checker_p28.rs`
+    /// `get_string_literal_type_cow`, tmpl1). The test puts the type of "b"
+    /// in the buckets of "a" and "c", as a hash collision would: "a" still
+    /// gives its own type, and "c" makes a new type once.
+    #[test]
+    fn string_literal_types_compare_values_in_a_hash_bucket() {
+        use std::hash::BuildHasher;
+        let aliases = [r#""a""#, r#""b""#];
+        let got = with_alias_types("strlit_bucket", &aliases, true, |checker, types| {
+            let (a, b) = (types[0], types[1]);
+            assert_eq!(checker.get_string_literal_type("a"), a);
+            assert_eq!(checker.get_string_literal_type("b"), b);
+            for value in ["a", "c"] {
+                let hash = rustc_hash::FxBuildHasher.hash_one(value);
+                checker
+                    .string_literal_types
+                    .entry(hash)
+                    .or_default()
+                    .insert(0, b);
+            }
+            let c = checker.get_string_literal_type("c");
+            (
+                checker.get_string_literal_type("a") == a,
+                c != b && c != a,
+                checker.get_string_literal_value_ref(c) == "c",
+                checker.get_string_literal_type("c") == c,
+                checker.get_string_literal_type("b") == b,
+            )
+        });
+        assert_eq!(got, (true, true, true, true, true));
+    }
+
     /// Go `maybeTypeOfKind` recurses into a union or intersection
     /// constituent (checker.go:28071). unionfn1 tests the flags of other
     /// constituents in its loop.
