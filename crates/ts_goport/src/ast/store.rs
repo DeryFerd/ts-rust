@@ -1147,7 +1147,7 @@ impl BuildStores {
             );
         }
         let id = self.base + self.stores.len();
-        assert!(id < FILE_ID_LIMIT, "too many file ids");
+        assert!(id < file_id_cap(), "too many file ids");
         id
     }
 }
@@ -1228,13 +1228,46 @@ pub const DETACHED_STORE_BASE: usize = 0x8000_0000;
 /// Number of provisional ids.
 pub const DETACHED_STORE_LIMIT: usize = 0x4000_0000;
 
-/// Every real file id is below this (`file_block`).
-const FILE_ID_LIMIT: usize = 1 << 22;
+/// Every real file id is below this (`file_block`). Ids are never used
+/// again: each new file version takes one, and so does each file of a
+/// whole parse again (a parse option change, a reopen, a `tsc -w` tsconfig
+/// edit).
+// fileid1: 2^22 ids took 116 hours at 10 language server edits per second
+// (one id per edit). At 2^28 that is 7,456 hours, and the 64-byte entry of
+// each id from `LOW_BLOCKS` on (16 GiB at the cap) plus the other memory
+// of each edit runs out first.
+const FILE_ID_LIMIT: usize = 1 << 28;
 /// AST node records, step 3: a file id below this has its entry in
 /// `FILE_BLOCKS`; a higher one in a chunk of `HIGH_BLOCKS`.
 const LOW_BLOCKS: usize = 1 << 16;
-/// Entries per `HIGH_BLOCKS` chunk.
-const HIGH_CHUNK: usize = 1 << 10;
+/// Entries per `HIGH_BLOCKS` chunk: 1 MiB of entries per chunk, and 16,380
+/// chunk cells (256 KiB of `.data`) up to `FILE_ID_LIMIT`.
+const HIGH_CHUNK: usize = 1 << 14;
+
+// A real file id is never `LOCAL_STORE`, and the chunks end at the limit.
+const _: () = assert!(FILE_ID_LIMIT <= LOCAL_STORE);
+const _: () = assert!((FILE_ID_LIMIT - LOW_BLOCKS) % HIGH_CHUNK == 0);
+
+/// The end of the new file ids (`BuildStores::next_id`,
+/// `publish_file_stores`).
+#[cfg(not(test))]
+#[inline]
+fn file_id_cap() -> usize {
+    FILE_ID_LIMIT
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The `file_id_cap` of this test thread, so a test can reach it.
+    static TEST_FILE_ID_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(FILE_ID_LIMIT) };
+}
+
+/// `file_id_cap` in a test: the lower cap of the thread
+/// (`TEST_FILE_ID_CAP`).
+#[cfg(test)]
+fn file_id_cap() -> usize {
+    TEST_FILE_ID_CAP.get().min(FILE_ID_LIMIT)
+}
 
 #[inline]
 fn is_detached_id(file: usize) -> bool {
@@ -1430,15 +1463,26 @@ fn set_file_block(file: usize, block: FileBlock) {
         None => {
             assert!(file < FILE_ID_LIMIT, "too many file ids");
             let i = file - LOW_BLOCKS;
-            &HIGH_BLOCKS[i / HIGH_CHUNK]
-                .get_or_init(|| Box::new([const { BlockEntry(OnceLock::new()) }; HIGH_CHUNK]))
-                [i % HIGH_CHUNK]
+            &HIGH_BLOCKS[i / HIGH_CHUNK].get_or_init(new_high_chunk)[i % HIGH_CHUNK]
         }
     };
     assert!(
         entry.0.set(block).is_ok(),
         "file {file} is already published"
     );
+}
+
+/// A new `HIGH_BLOCKS` chunk, made on the heap: `Box::new` of the array
+/// can make it on the stack first (1 MiB), which a test thread or wasm
+/// does not have.
+fn new_high_chunk() -> Box<[BlockEntry; HIGH_CHUNK]> {
+    let chunk: Box<[BlockEntry]> = (0..HIGH_CHUNK)
+        .map(|_| BlockEntry(OnceLock::new()))
+        .collect();
+    let Ok(chunk) = chunk.try_into() else {
+        unreachable!("a chunk has HIGH_CHUNK entries")
+    };
+    chunk
 }
 
 /// `try_resolve_store_id(file, index)` for published store `file`, whose
@@ -3811,7 +3855,7 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
     if count == 0 {
         return;
     }
-    assert!(base + count <= FILE_ID_LIMIT, "too many file ids");
+    assert!(base + count <= file_id_cap(), "too many file ids");
     if let Err(published) =
         PUBLISHED.compare_exchange(base, base + count, Ordering::AcqRel, Ordering::Acquire)
     {
@@ -6890,7 +6934,50 @@ mod tests {
     // its node through the node reads.
     #[test]
     fn high_file_ids_read_their_block_from_a_chunk() {
-        let file = FILE_ID_LIMIT - 1;
+        set_and_read_high_file_block(FILE_ID_LIMIT - 1);
+    }
+
+    // fileid1: ids are never used again, so a long session (one id per
+    // edit) or a long watch could reach the old limit of 2^22 ids and
+    // panic ("too many file ids"). The id at the old limit has a block now.
+    #[test]
+    fn file_ids_past_the_old_limit_read_their_block() {
+        set_and_read_high_file_block(1 << 22);
+    }
+
+    // fileid1: with a test cap, the last id below the cap is given and
+    // published, and the next new store stops at the cap. It publishes, so
+    // no other test may build or publish stores while it runs (the runner
+    // uses one thread).
+    #[test]
+    fn new_file_ids_stop_at_the_cap() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let message = std::thread::spawn(|| {
+            let cap = PUBLISHED.load(Ordering::Acquire) + 1;
+            TEST_FILE_ID_CAP.set(cap);
+            let last = new_file_store("/fileidcap/a.ts", "a;");
+            assert_eq!(last, cap - 1);
+            NodeFactory::for_file(last).new_identifier("a");
+            freeze_file_store(last);
+            crate::program::publish_parsed_files("/");
+            assert_eq!(PUBLISHED.load(Ordering::Acquire), cap);
+            assert!(file_block(last).is_some(), "the last id is published");
+            let next = catch_unwind(AssertUnwindSafe(|| new_file_store("/fileidcap/b.ts", "b;")));
+            let payload = next.expect_err("a new store at the cap must panic");
+            payload
+                .downcast_ref::<&str>()
+                .map(|m| (*m).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(message, "too many file ids");
+    }
+
+    /// Sets the block of unpublished file id `file` (from `LOW_BLOCKS` on)
+    /// and reads its node through the node reads.
+    fn set_and_read_high_file_block(file: usize) {
         let mut records = vec![NodeRecord::target(Node::NIL), NodeRecord::node(false)];
         records[1].set_flags(NodeFlags::AMBIENT);
         records[1].set_loc(TextRange::new(3, 7));
@@ -6921,7 +7008,7 @@ mod tests {
             resolve_store_id(file, crate::astdata::NodeId::new(0)),
             Node::NIL
         );
-        assert!(file_block(file - 1).is_none(), "the same chunk");
+        assert!(file_block(file - 1).is_none(), "the id before");
         assert!(file_block(file - HIGH_CHUNK).is_none(), "another chunk");
         assert!(file_block(LOW_BLOCKS).is_none(), "the first chunk");
         assert!(file_block(FILE_ID_LIMIT).is_none(), "no file id");

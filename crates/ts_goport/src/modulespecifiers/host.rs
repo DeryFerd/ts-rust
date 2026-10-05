@@ -172,12 +172,13 @@ fn typings_location() -> Rc<str> {
 }
 
 // Go: module/resolver.go:1755 getPackageJsonInfo
-// PORT: Go returns `existing.WithPackageDirectory(packageDirectory)`. The
-// cache key is `<packageDirectory>/package.json`, so the directory already
-// matches and the cached entry is returned as is. Tracing is not ported.
-// The entries are in the program's `HostFsCache`, not in the frontend
-// resolver's cache; the build info reads both
-// (`incremental::checker_access::package_json_cache_entries`).
+// PORT: tracing is not ported. The entries are in the program's
+// `HostFsCache`, not in the frontend resolver's cache; the build info reads
+// both (`incremental::checker_access::package_json_cache_entries`). The key
+// is the `Path` of `<packageDirectory>/package.json`, so another spelling of
+// a directory (another case on a case-insensitive file system, or a trailing
+// separator) finds the entry of the first spelling, and
+// `with_package_directory` gives it this spelling, as in Go.
 fn get_package_json_info_for_directory(package_directory: &str) -> Option<Arc<InfoCacheEntry>> {
     let package_json_path = tspath::combine_paths(package_directory, &["package.json"]);
     let key = tspath::to_path(
@@ -190,7 +191,7 @@ fn get_package_json_info_for_directory(package_directory: &str) -> Option<Arc<In
         crate::program::with_host_fs_cache(|cache| cache.get_package_json_info(&key))
     {
         if existing.contents.is_some() {
-            return Some(existing);
+            return Some(existing.with_package_directory(package_directory));
         }
         return None;
     }
@@ -207,11 +208,14 @@ fn get_package_json_info_for_directory(package_directory: &str) -> Option<Arc<In
         let result = InfoCacheEntry {
             package_directory: package_directory.to_string(),
             directory_exists: true,
-            contents: Some(PackageJson::new(parsed.unwrap_or_default(), parseable)),
+            contents: Some(Arc::new(PackageJson::new(
+                parsed.unwrap_or_default(),
+                parseable,
+            ))),
         };
         let result =
             crate::program::with_host_fs_cache(|cache| cache.set_package_json_info(key, result));
-        return Some(result);
+        return Some(result.with_package_directory(package_directory));
     }
     crate::program::with_host_fs_cache(|cache| {
         cache.set_package_json_info(
@@ -352,5 +356,64 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
 
     fn as_output_paths_host(&self) -> &dyn OutputPathsHost {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // specstat1 skeptic: Go getPackageJsonInfo gives the cached entry the
+    // caller's directory (packagejson/cache.go:158 WithPackageDirectory).
+    // Two spellings of one directory have one cache key: here a trailing
+    // separator, on a case-insensitive file system also another case. The
+    // port gave the first spelling's entry as is, so GetPackageJsonInfo
+    // (which wants the entry's directory to equal its own) found no
+    // package.json, and GetNearestAncestorDirectoryWithPackageJson gave the
+    // first spelling.
+    #[test]
+    fn a_package_json_lookup_keeps_the_spelling_of_its_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "goport-package-directory-spelling-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in [
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"types":[]},"files":["index.ts"]}"#,
+            ),
+            ("index.ts", "export const x = 1;\n"),
+            ("node_modules/pkg/package.json", r#"{"name":"pkg"}"#),
+        ] {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let dir = dir.to_string_lossy().replace('\\', "/");
+        let program = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        let _scope = crate::core::enter_program(Some(program));
+        let pkg = format!("{dir}/node_modules/pkg");
+        let thread_pkg = pkg.clone();
+        let (with_separator, info, without_separator) = std::thread::spawn(move || {
+            crate::core::set_thread_program(Some(program));
+            let pkg = thread_pkg;
+            (
+                ProgramHost.get_nearest_ancestor_directory_with_package_json(&format!("{pkg}/")),
+                ProgramHost
+                    .get_package_json_info(&format!("{pkg}/package.json"))
+                    .map(|entry| entry.package_directory.clone()),
+                ProgramHost.get_nearest_ancestor_directory_with_package_json(&pkg),
+            )
+        })
+        .join()
+        .unwrap();
+        drop(_scope);
+        crate::program::release_program(program);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(with_separator, format!("{pkg}/"));
+        assert_eq!(info, Some(pkg.clone()));
+        assert_eq!(without_separator, pkg);
     }
 }

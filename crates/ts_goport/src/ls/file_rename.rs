@@ -314,9 +314,12 @@ pub fn try_update_config_string(
         return false;
     }
 
+    // PORT: Go `End()-1` steps back one Go byte (`go_offset_before`). An
+    // unterminated literal at the end of the file can end in a marker unit
+    // (see `GO_STRING_MARKER`), which has more port bytes than Go bytes.
     let text_range = TextRange::new(
         get_token_pos_of_node(element, config_file, false) + 1,
-        element.end() - 1,
+        go_offset_before(&source_file_text(config_file), element.end()),
     );
     let (lsp_range, fidelity) = converters.to_lsp_range(&config_file, text_range);
     crate::go_assert!(fidelity.is_exact(), "config files are not content-mapped");
@@ -620,10 +623,12 @@ pub fn get_updated_import_specifier_from_moved_source_files(
 }
 
 // Go: ls/file_rename.go:362 createStringTextRange
+// PORT: Go `End()-1` steps back one Go byte (`go_offset_before`), as in
+// `try_update_config_string`.
 pub fn create_string_text_range(source_file: Node, node: Node) -> TextRange {
     TextRange::new(
         get_token_pos_of_node(node, source_file, false) + 1,
-        node.end() - 1,
+        go_offset_before(&source_file_text(source_file), node.end()),
     )
 }
 

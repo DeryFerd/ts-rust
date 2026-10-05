@@ -1178,7 +1178,7 @@ impl<'a> Parser<'a> {
     pub fn is_in_some_parsing_context(&mut self) -> bool {
         // We should be in at least one parsing context, be it SourceElements while parsing
         // a SourceFile, or JSDocComment when lazily parsing JSDoc.
-        assert!(self.parsing_contexts != 0, "Missing parsing context");
+        go_assert!(self.parsing_contexts != 0, "Missing parsing context");
         for kind in ParsingContext::ALL {
             if self.parsing_contexts & (1 << (kind as i32)) != 0
                 && (self.is_list_element(kind, true /*inErrorRecovery*/)
@@ -2217,4 +2217,23 @@ pub struct ParserState<'a> {
 #[must_use]
 pub fn is_declare_modifier(modifier: Node) -> bool {
     modifier.kind() == SyntaxKind::DeclareKeyword
+}
+
+#[cfg(test)]
+mod debug_site_tests {
+    use super::new_parser;
+    use crate::core::go_panic_text;
+
+    // Go `isInSomeParsingContext` (parser.go:744) runs
+    // `debug.Assert(p.parsingContexts != 0, "Missing parsing context")`.
+    #[test]
+    fn missing_parsing_context_is_a_go_debug_failure() {
+        let text = go_panic_text(|| {
+            new_parser().is_in_some_parsing_context();
+        });
+        assert_eq!(
+            text,
+            "Debug failure. False expression: Missing parsing context"
+        );
+    }
 }
