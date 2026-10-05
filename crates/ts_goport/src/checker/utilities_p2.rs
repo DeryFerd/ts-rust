@@ -1440,11 +1440,35 @@ pub struct DiagnosticDetails {
 // methods are the program.rs free functions, so the parameter is unused.
 // `program.GetPackagesMap()` is `program::get_packages_map()`.
 pub fn create_module_not_found_chain(
+    program: &GoProgram,
+    file: Node,
+    module_reference: &str,
+    mode: ResolutionMode,
+    package_name: &str,
+) -> DiagnosticDetails {
+    create_module_not_found_chain_with(
+        program,
+        file,
+        module_reference,
+        mode,
+        package_name,
+        crate::program::get_packages_map,
+    )
+}
+
+/// `create_module_not_found_chain` that reads the packages map from
+/// `packages_map`, called only when the map is needed.
+// PERF: chkport1 item 3. `program::get_packages_map` builds the map from
+// every resolution of the program on each call (Go builds it once per
+// program, `packagesMapOnce`). The checker passes its own memo
+// (`Checker::get_packages_map`, Go `c.packagesMap`).
+pub fn create_module_not_found_chain_with<M: std::borrow::Borrow<FxHashMap<String, bool>>>(
     _program: &GoProgram,
     file: Node,
     module_reference: &str,
     mode: ResolutionMode,
     package_name: &str,
+    packages_map: impl FnOnce() -> M,
 ) -> DiagnosticDetails {
     let mut package_name = package_name.to_string();
     let resolved_module = get_resolved_module(file, module_reference, mode);
@@ -1468,7 +1492,8 @@ pub fn create_module_not_found_chain(
         };
     }
 
-    let packages_map = crate::program::get_packages_map();
+    let packages_map = packages_map();
+    let packages_map = packages_map.borrow();
     if packages_map.contains_key(&tspath_up2::get_types_package_name(&package_name)) {
         let mangled = tspath_up2::mangle_scoped_package_name(&package_name);
         return DiagnosticDetails {
