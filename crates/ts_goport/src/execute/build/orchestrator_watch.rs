@@ -50,6 +50,9 @@ impl Orchestrator {
             self.wm.borrow().force_overflow();
         }
         self.reset_caches();
+        // PORT: not in Go (see `BuildHost::prefetch`). The first build
+        // parsed ahead; its parses are static.
+        self.host.prefetch.set(false);
 
         self.wm.borrow().unlock();
 
@@ -82,6 +85,8 @@ impl Orchestrator {
         // `cached_fs` (host.rs).
         self.host.cached_fs.clear_cache();
         self.host.extended_config_cache.reset();
+        // PORT: watch mode keeps its parses in `watch_sources` (see
+        // `BuildHost::watch_source_file`), so this one is empty.
         self.host.source_files.reset();
         *self.host.config_times.borrow_mut() = FxHashMap::default();
     }
@@ -486,6 +491,19 @@ impl Orchestrator {
                 &mut needs_config_update,
                 &mut needs_update,
             );
+        }
+
+        // PORT: not in Go (`BuildHost::watch_source_file`). A changed file
+        // is parsed again; an overflow or a config change parses every file
+        // again, as Go does in each cycle.
+        if overflow || needs_config_update {
+            self.host.evict_watch_sources(None);
+        } else {
+            let paths: FxHashSet<Path> = changed_paths
+                .keys()
+                .map(|path| self.to_path(path))
+                .collect();
+            self.host.evict_watch_sources(Some(&paths));
         }
 
         if !needs_update {

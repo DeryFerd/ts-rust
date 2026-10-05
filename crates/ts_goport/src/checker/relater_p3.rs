@@ -844,6 +844,31 @@ impl Checker {
             || source_end[source_end.len() - end_len..] != target_end[target_end.len() - end_len..]
     }
 
+    // PORT: perf (chkmid1), no Go function. True when the string literal
+    // `source` fails the start and end text test of Go
+    // `inferFromLiteralPartsToTemplateLiteral` against the template literal
+    // type `target`, so `is_type_matched_by_template_literal_type` is false.
+    // Most pairs fail there and Go makes no type before the test, so a
+    // caller tests it first and clones the template only when it passes.
+    pub fn string_literal_misses_template_literal_ends(
+        &self,
+        source: TypeId,
+        target: TypeId,
+    ) -> bool {
+        let target = self.ty(target).as_template_literal_type();
+        let value = go_bytes_of(
+            self.get_string_literal_value_ref(source),
+            self.string_literal_go_plain(source),
+        );
+        !literal_part_ends_match(
+            &value,
+            &value,
+            true,
+            &go_bytes_of(&target.texts[0], target.go_plain),
+            &go_bytes_of(&target.texts[target.texts.len() - 1], target.go_plain),
+        )
+    }
+
     // Go: checker/relater.go:2365 isTypeMatchedByTemplateLiteralType
     pub fn is_type_matched_by_template_literal_type(
         &mut self,
@@ -1085,14 +1110,16 @@ impl Checker {
                     && value == self.ty(target).as_intrinsic_type().intrinsic_name
                 || target_flags.intersects(TypeFlags::STRING_MAPPING)
                     && self.is_member_of_string_mapping(source, target)
-                || target_flags.intersects(TypeFlags::TEMPLATE_LITERAL) && {
-                    let template = self.ty(target).as_template_literal_type().clone();
-                    self.is_type_matched_by_template_literal_type(
-                        source,
-                        &template,
-                        &mut *compare_types,
-                    )
-                };
+                || target_flags.intersects(TypeFlags::TEMPLATE_LITERAL)
+                    && !self.string_literal_misses_template_literal_ends(source, target)
+                    && {
+                        let template = self.ty(target).as_template_literal_type().clone();
+                        self.is_type_matched_by_template_literal_type(
+                            source,
+                            &template,
+                            &mut *compare_types,
+                        )
+                    };
         }
         if source_flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
             let (texts_match, first_type) = {
@@ -1926,6 +1953,22 @@ fn go_bytes_of(text: &str, plain: bool) -> Cow<'_, [u8]> {
     }
 }
 
+/// The first test of Go `inferFromLiteralPartsToTemplateLiteral`: the source
+/// starts with the target start text and ends with the target end text, and
+/// a single source text is long enough for both. False is Go's early `nil`.
+fn literal_part_ends_match(
+    source_start_text: &[u8],
+    source_end_text: &[u8],
+    single_source_text: bool,
+    target_start_text: &[u8],
+    target_end_text: &[u8],
+) -> bool {
+    !(single_source_text
+        && source_start_text.len() < target_start_text.len() + target_end_text.len())
+        && source_start_text.starts_with(target_start_text)
+        && source_end_text.ends_with(target_end_text)
+}
+
 // PORT: perf. The text matching of Go `inferFromLiteralPartsToTemplateLiteral`
 // without the type creation. It records each `addMatch` call in `matches`, so
 // the caller can keep the source text borrowed from the checker while it
@@ -1944,11 +1987,13 @@ fn match_literal_parts_to_template_literal<S: AsRef<[u8]>, T: AsRef<[u8]>>(
     let last_target_index = target_texts.len() - 1;
     let target_start_text = target_texts[0].as_ref();
     let target_end_text = target_texts[last_target_index].as_ref();
-    if last_source_index == 0
-        && source_start_text.len() < target_start_text.len() + target_end_text.len()
-        || !source_start_text.starts_with(target_start_text)
-        || !source_end_text.ends_with(target_end_text)
-    {
+    if !literal_part_ends_match(
+        source_start_text,
+        source_end_text,
+        last_source_index == 0,
+        target_start_text,
+        target_end_text,
+    ) {
         return false;
     }
     let remaining_end_text = &source_end_text[..source_end_text.len() - target_end_text.len()];

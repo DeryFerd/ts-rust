@@ -20,14 +20,14 @@ use std::sync::Arc;
 // before it is disabled for the rest of the program.
 const MAX_CONTENT_MAPPER_FAILURES: i32 = 5;
 
-// Go: fileloader.go:21 libResolution
+// Go: fileloader.go:26 libResolution
 pub struct LibResolution {
     pub library_name: String,
     pub resolution: Arc<ResolvedModule>,
     pub trace: Vec<DiagAndArgs>,
 }
 
-// Go: fileloader.go:27 LibFile
+// Go: fileloader.go:36 LibFile
 #[derive(Clone, Debug, Default)]
 pub struct LibFile {
     pub name: String,
@@ -35,13 +35,13 @@ pub struct LibFile {
     pub replaced: bool,
 }
 
-// Go: fileloader.go:33 sourceFileFromReferenceDiagnostic
+// Go: fileloader.go:42 sourceFileFromReferenceDiagnostic
 pub struct SourceFileFromReferenceDiagnostic {
     pub message: &'static Message,
     pub args: Vec<String>,
 }
 
-// Go: fileloader.go:38 fileLoader
+// Go: fileloader.go:47 fileLoader
 // PORT: the Go loader is shared by the parse work group. The port is single
 // threaded (contract 10), so the atomics and sync maps are `Cell` and
 // `RefCell`, and `factoryMu` is not needed. `resolver` is `None` only until
@@ -91,7 +91,7 @@ pub struct FileLoader {
     pub module_resolution_error: RefCell<Option<GoError>>,
 }
 
-// Go: fileloader.go:62 redirectsFile
+// Go: fileloader.go:81 redirectsFile
 #[derive(Clone, Debug, Default)]
 pub struct RedirectsFile {
     // Index of file at which this redirect file needs to be iterated
@@ -101,7 +101,7 @@ pub struct RedirectsFile {
     pub target: Path,
 }
 
-// Go: fileloader.go:70 DuplicateSourceFile
+// Go: fileloader.go:89 DuplicateSourceFile
 // PORT: Go keeps `Hash xxh3.Uint128` for the language server parse cache.
 // Here `hash` is the hash that a parse cache set on the file
 // (`ParsedSourceFile::hash`), and `text` is kept so the language server can
@@ -136,18 +136,18 @@ impl DuplicateSourceFile {
 }
 
 impl RedirectsFile {
-    // Go: fileloader.go:78 (*redirectsFile).FileName
+    // Go: fileloader.go:105 (*redirectsFile).FileName
     pub fn file_name(&self) -> String {
         self.file_name.clone()
     }
 
-    // Go: fileloader.go:82 (*redirectsFile).Path
+    // Go: fileloader.go:109 (*redirectsFile).Path
     pub fn path(&self) -> Path {
         self.path.clone()
     }
 }
 
-// Go: fileloader.go:86 processedFiles
+// Go: fileloader.go:113 processedFiles
 // PORT: Go nil maps that stay nil until first use are `Option`. Go
 // `*includeProcessor` is owned by value. Go `UpdateProgram` copies this
 // struct and so shares its maps with the old program. The maps that stay
@@ -193,14 +193,14 @@ pub struct ProcessedFiles {
     pub finished_processing: bool,
 }
 
-// Go: fileloader.go:117 jsxRuntimeImportSpecifier
+// Go: fileloader.go:147 jsxRuntimeImportSpecifier
 #[derive(Clone, Debug)]
 pub struct JsxRuntimeImportSpecifier {
     pub module_reference: String,
     pub specifier: Node,
 }
 
-// Go: fileloader.go:122 processAllProgramFiles
+// Go: fileloader.go:152 processAllProgramFiles
 pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) -> ProcessedFiles {
     let compiler_options = opts.config.compiler_options().clone();
     let root_files: Vec<String> = opts.config.file_names().to_vec();
@@ -773,7 +773,7 @@ pub fn content_mapper_project_diagnostic(err: &GoError) -> Diagnostic {
 }
 
 impl FileLoader {
-    // Go: fileloader.go:187 (*fileLoader).toPath
+    // Go: fileloader.go:229 (*fileLoader).toPath
     pub fn to_path(&self, file: &str) -> Path {
         to_path(
             file,
@@ -782,7 +782,7 @@ impl FileLoader {
         )
     }
 
-    // Go: fileloader.go:191 (*fileLoader).addRootTask
+    // Go: fileloader.go:233 (*fileLoader).addRootTask
     pub fn add_root_task(
         &mut self,
         file_name: &str,
@@ -808,7 +808,7 @@ impl FileLoader {
         }
     }
 
-    // Go: fileloader.go:202 (*fileLoader).addRootFileTask
+    // Go: fileloader.go:244 (*fileLoader).addRootFileTask
     pub fn add_root_file_task(
         &mut self,
         file_name: &str,
@@ -845,7 +845,7 @@ impl FileLoader {
         self.root_tasks.push(Rc::new(RefCell::new(root_task)));
     }
 
-    // Go: fileloader.go:229 (*fileLoader).addAutomaticTypeDirectiveTasks
+    // Go: fileloader.go:272 (*fileLoader).addAutomaticTypeDirectiveTasks
     pub fn add_automatic_type_directive_tasks(&mut self) {
         let containing_directory;
         let compiler_options = self.opts.config.compiler_options();
@@ -863,7 +863,7 @@ impl FileLoader {
         })));
     }
 
-    // Go: fileloader.go:244 (*fileLoader).resolveAutomaticTypeDirectives
+    // Go: fileloader.go:287 (*fileLoader).resolveAutomaticTypeDirectives
     #[allow(clippy::type_complexity)]
     pub fn resolve_automatic_type_directives(
         &self,
@@ -961,7 +961,7 @@ impl FileLoader {
         )
     }
 
-    // Go: fileloader.go:297 (*fileLoader).addProjectReferenceTasks
+    // Go: fileloader.go:340 (*fileLoader).addProjectReferenceTasks
     // PORT: Go makes the project reference file mapper here. The port makes
     // it in `process_all_program_files`, because the loader struct needs a
     // value for the field. It is made from the same `opts` and host, so the
@@ -977,7 +977,7 @@ impl FileLoader {
         parser.parse(root_tasks);
     }
 
-    // Go: fileloader.go:315 (*fileLoader).sortLibs
+    // Go: fileloader.go:358 (*fileLoader).sortLibs
     // PORT: Go `slices.SortFunc` is pdqsort. It is not stable for more than
     // 12 items, so libs with the same priority can change places there.
     // `gostd::slices::sort_func` is the same pdqsort, so they move as in Go.
@@ -989,7 +989,7 @@ impl FileLoader {
         });
     }
 
-    // Go: fileloader.go:321 (*fileLoader).getDefaultLibFilePriority
+    // Go: fileloader.go:364 (*fileLoader).getDefaultLibFilePriority
     pub fn get_default_lib_file_priority(&self, a: &ParsedSourceFile) -> usize {
         // defaultLibraryPath and a.FileName() are absolute and normalized; a prefix check should suffice.
         let default_library_path = remove_trailing_directory_separator(&self.default_library_path);
@@ -1017,7 +1017,7 @@ impl FileLoader {
         LIBS.len() + 2
     }
 
-    // Go: fileloader.go:341 (*fileLoader).loadSourceFileMetaData
+    // Go: fileloader.go:384 (*fileLoader).loadSourceFileMetaData
     pub fn load_source_file_meta_data(&self, file_name: &str) -> SourceFileMetaData {
         if self.opts.skip_module_resolution {
             return SourceFileMetaData {
@@ -1033,7 +1033,7 @@ impl FileLoader {
         )
     }
 
-    // Go: fileloader.go:364 (*fileLoader).parseSourceFile
+    // Go: fileloader.go:413 (*fileLoader).parseSourceFile
     pub fn parse_source_file(&self, t: &ParseTask) -> Option<Rc<ParsedSourceFile>> {
         let _trace = crate::tracing::get().map(|tr| {
             tr.push(
@@ -1252,7 +1252,7 @@ impl FileLoader {
         true
     }
 
-    // Go: fileloader.go:378 (*fileLoader).isSupportedExtension
+    // Go: fileloader.go:680 (*fileLoader).isSupportedExtension
     pub fn is_supported_extension(&self, canonical_file_name: &str) -> bool {
         for group in &self.supported_extensions_with_json_if_resolve_json_module {
             let group: Vec<&str> = group.iter().map(String::as_str).collect();
@@ -1263,7 +1263,7 @@ impl FileLoader {
         false
     }
 
-    // Go: fileloader.go:387 (*fileLoader).getSourceFileFromReference
+    // Go: fileloader.go:689 (*fileLoader).getSourceFileFromReference
     pub fn get_source_file_from_reference(
         &self,
         file_name: &str,
@@ -1362,7 +1362,7 @@ impl FileLoader {
         )
     }
 
-    // Go: fileloader.go:434 (*fileLoader).resolveTripleslashPathReference
+    // Go: fileloader.go:736 (*fileLoader).resolveTripleslashPathReference
     pub fn resolve_tripleslash_path_reference(
         &self,
         module_name: &str,
@@ -1412,7 +1412,7 @@ impl FileLoader {
         )
     }
 
-    // Go: fileloader.go:473 (*fileLoader).resolveTypeReferenceDirectives
+    // Go: fileloader.go:775 (*fileLoader).resolveTypeReferenceDirectives
     pub fn resolve_type_reference_directives(&self, t: &mut ParseTask) {
         let file = t
             .file
@@ -1513,11 +1513,11 @@ impl FileLoader {
         t.type_resolutions_trace = type_resolutions_trace;
     }
 
-    // Go: fileloader.go:526 externalHelpersModuleNameText
+    // Go: fileloader.go:828 externalHelpersModuleNameText
     // PORT: the Go constant is `EXTERNAL_HELPERS_MODULE_NAME_TEXT` in
     // checker/types.rs. It is reused here.
 
-    // Go: fileloader.go:528 (*fileLoader).resolveImportsAndModuleAugmentations
+    // Go: fileloader.go:830 (*fileLoader).resolveImportsAndModuleAugmentations
     pub fn resolve_imports_and_module_augmentations(&self, t: &mut ParseTask) {
         let _trace = crate::tracing::get().map(|tr| {
             let containing_file_name = t
@@ -1720,7 +1720,7 @@ impl FileLoader {
         }
     }
 
-    // Go: fileloader.go:634 (*fileLoader).createSyntheticImport
+    // Go: fileloader.go:951 (*fileLoader).createSyntheticImport
     pub fn create_synthetic_import(&self, text: &str, file: &ParsedSourceFile) -> Node {
         let external_helpers_module_reference =
             self.factory.new_string_literal(text, TokenFlags::NONE);
@@ -1735,7 +1735,7 @@ impl FileLoader {
         external_helpers_module_reference
     }
 
-    // Go: fileloader.go:644 (*fileLoader).pathForLibFile
+    // Go: fileloader.go:961 (*fileLoader).pathForLibFile
     pub fn path_for_lib_file(&self, name: &str) -> Rc<LibFile> {
         if let Some(cached) = self.path_for_lib_file_cache.borrow().get(name) {
             return cached.clone();
@@ -1788,7 +1788,7 @@ impl FileLoader {
             .clone()
     }
 
-    // Go: fileloader.go:670 (*fileLoader).resolveLibrary
+    // Go: fileloader.go:987 (*fileLoader).resolveLibrary
     pub fn resolve_library(
         &self,
         library_name: &str,
@@ -1840,7 +1840,7 @@ impl FileLoader {
 /// The body of Go `(*fileLoader).loadSourceFileMetaData` with the loader's
 /// resolver and options as parameters, so a parse worker can run it with
 /// its own resolver (`files_parser.rs`).
-// Go: fileloader.go:341 (*fileLoader).loadSourceFileMetaData
+// Go: fileloader.go:384 (*fileLoader).loadSourceFileMetaData
 // PORT: the scope is the parts of it that this function reads
 // (`PackageScope`). In a resolve-ahead load, the loader takes the scope that
 // the workers found, or the scope that it found for the directory before
@@ -1894,7 +1894,7 @@ pub(crate) fn workers_resolve_imports(options: &CompilerOptions) -> bool {
             || kind == ModuleResolutionKind::BUNDLER)
 }
 
-// Go: fileloader.go:677 getLibraryNameFromLibFileName
+// Go: fileloader.go:1000 getLibraryNameFromLibFileName
 pub fn get_library_name_from_lib_file_name(lib_file_name: &str) -> String {
     // Support resolving to lib.dom.d.ts -> @typescript/lib-dom, and
     //                      lib.dom.iterable.d.ts -> @typescript/lib-dom/iterable
@@ -1917,7 +1917,7 @@ pub fn get_library_name_from_lib_file_name(lib_file_name: &str) -> String {
     path
 }
 
-// Go: fileloader.go:700 getInferredLibraryNameResolveFrom
+// Go: fileloader.go:1023 getInferredLibraryNameResolveFrom
 pub fn get_inferred_library_name_resolve_from(
     options: &CompilerOptions,
     current_directory: &str,
@@ -1934,7 +1934,7 @@ pub fn get_inferred_library_name_resolve_from(
     )
 }
 
-// Go: fileloader.go:710 getModeForTypeReferenceDirectiveInFile
+// Go: fileloader.go:1033 getModeForTypeReferenceDirectiveInFile
 pub fn get_mode_for_type_reference_directive_in_file(
     ref_: &FileReference,
     file: &ParsedSourceFile,
@@ -1948,7 +1948,7 @@ pub fn get_mode_for_type_reference_directive_in_file(
     }
 }
 
-// Go: fileloader.go:718 getDefaultResolutionModeForFile
+// Go: fileloader.go:1041 getDefaultResolutionModeForFile
 // PORT: private, because program.rs has a public
 // `get_default_resolution_mode_for_file` (Go program.go) with another shape.
 pub(crate) fn get_default_resolution_mode_for_file(
@@ -1963,7 +1963,7 @@ pub(crate) fn get_default_resolution_mode_for_file(
     }
 }
 
-// Go: fileloader.go:726 getModeForUsageLocation
+// Go: fileloader.go:1049 getModeForUsageLocation
 // PORT: private, because program.rs has a public `get_mode_for_usage_location`
 // (Go program.go) with another shape. Go `options` can be nil (`None`). The
 // node reads are `import_usage`, and the rest is `mode_for_import_usage`,
@@ -1996,7 +1996,7 @@ enum ImportUsage {
 /// The node reads of Go `getModeForUsageLocation` for the module name
 /// `usage`, in their order, and those of
 /// `getEmitSyntaxForUsageLocationWorker` (`emit_usage`).
-// Go: fileloader.go:726 getModeForUsageLocation
+// Go: fileloader.go:1049 getModeForUsageLocation
 fn import_usage(usage: Node) -> ImportUsage {
     let parent = usage.parent();
     if is_import_declaration(parent)
@@ -2037,7 +2037,7 @@ fn import_usage(usage: Node) -> ImportUsage {
 
 /// The node reads of Go `getEmitSyntaxForUsageLocationWorker` for a module
 /// name whose parent is `parent`.
-// Go: fileloader.go:764 getEmitSyntaxForUsageLocationWorker
+// Go: fileloader.go:1087 getEmitSyntaxForUsageLocationWorker
 fn emit_usage(parent: Node) -> ImportUsage {
     if is_require_call(parent, false /*requireStringLiteralLikeArgument*/)
         || is_external_module_reference(parent) && is_import_equals_declaration(parent.parent())
@@ -2053,7 +2053,7 @@ fn emit_usage(parent: Node) -> ImportUsage {
 /// Go `getModeForUsageLocation` for a module name of `usage` in
 /// `file_name`. `file_emit_mode` keeps the file's emit format for the other
 /// names of the file (`emit_syntax_for_usage`).
-// Go: fileloader.go:726 getModeForUsageLocation
+// Go: fileloader.go:1049 getModeForUsageLocation
 fn mode_for_import_usage(
     usage: ImportUsage,
     file_name: &str,
@@ -2169,7 +2169,7 @@ fn drop_dead_import_names() {
     });
 }
 
-// Go: fileloader.go:758 importSyntaxAffectsModuleResolution
+// Go: fileloader.go:1081 importSyntaxAffectsModuleResolution
 fn import_syntax_affects_module_resolution(options: &CompilerOptions) -> bool {
     let module_resolution = options.get_module_resolution_kind();
     ModuleResolutionKind::NODE16 <= module_resolution
@@ -2178,7 +2178,7 @@ fn import_syntax_affects_module_resolution(options: &CompilerOptions) -> bool {
         || options.get_resolve_package_json_imports()
 }
 
-// Go: fileloader.go:764 getEmitSyntaxForUsageLocationWorker
+// Go: fileloader.go:1087 getEmitSyntaxForUsageLocationWorker
 pub(crate) fn get_emit_syntax_for_usage_location_worker(
     file_name: &str,
     meta: &SourceFileMetaData,
@@ -2198,7 +2198,7 @@ pub(crate) fn get_emit_syntax_for_usage_location_worker(
 /// (`emit_usage`). `file_emit_mode` keeps Go `GetEmitModuleFormatOfFileWorker`
 /// of the file, which reads only the file name, the options and the
 /// metadata, for the other names of the file.
-// Go: fileloader.go:764 getEmitSyntaxForUsageLocationWorker
+// Go: fileloader.go:1087 getEmitSyntaxForUsageLocationWorker
 fn emit_syntax_for_usage(
     usage: ImportUsage,
     file_name: &str,
@@ -2246,7 +2246,7 @@ pub(crate) fn guess_import_mode(
     if !import_syntax_affects_module_resolution(options) {
         return RESOLUTION_MODE_NONE;
     }
-    // Go: fileloader.go:764 getEmitSyntaxForUsageLocationWorker, for a
+    // Go: fileloader.go:1087 getEmitSyntaxForUsageLocationWorker, for a
     // usage that is not a require or an import call.
     let file_emit_mode = get_emit_module_format_of_file_worker(file_name, options, meta);
     if file_emit_mode == ModuleKind::COMMON_JS {

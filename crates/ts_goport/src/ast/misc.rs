@@ -336,8 +336,8 @@ impl Diagnostic {
     // Go: ast/diagnostic.go:117 Localize
     // PORT: the port resolves the message when it makes the diagnostic (see
     // NewDiagnosticFromSerialized below), so the Go `d.messageKey` is read
-    // only for the Go nil message (`NIL_MESSAGE`, key ""), and Go panics
-    // there as it does here.
+    // only for the Go nil message (`NIL_MESSAGE` with the key "", or an
+    // unknown key), and Go panics there as it does here.
     // PORT: Go returns the message text when `d.message == nil`. Go sets the
     // text only on a diagnostic with a nil message: `NewExternalDiagnostic`
     // and `SetExternalData` on a serialized diagnostic. A serialized port
@@ -432,10 +432,29 @@ pub static NIL_MESSAGE: &crate::diagnostics::Message = &crate::diagnostics::Mess
     false,
 );
 
-/// True for the Go nil message (`NIL_MESSAGE`).
+/// True for the Go nil message: `NIL_MESSAGE`, or the message of an
+/// unknown key (`unknown_key_message`).
 #[must_use]
 pub fn is_nil_message(message: &'static crate::diagnostics::Message) -> bool {
-    std::ptr::eq(message, NIL_MESSAGE)
+    std::ptr::eq(message, NIL_MESSAGE) || (message.code() == 0 && !message.key().is_empty())
+}
+
+/// The Go nil message of a serialized diagnostic whose key is not in the
+/// catalog: code 0 and the key, which no other message has (catalog
+/// messages have a code, and the nil and ad hoc messages the key "").
+// PORT: the message is leaked, as the ad hoc messages are. Only a bad
+// `.tsbuildinfo` has such a key.
+fn unknown_key_message(key: &str) -> &'static crate::diagnostics::Message {
+    let key: &'static str = Box::leak(key.to_string().into_boxed_str());
+    Box::leak(Box::new(crate::diagnostics::Message::new(
+        0,
+        crate::diagnostics::Category::Error,
+        key,
+        "",
+        false,
+        false,
+        false,
+    )))
 }
 
 // Go: diagnostics/diagnostics.go:129 Format
@@ -459,16 +478,19 @@ pub fn format_message(message: &'static crate::diagnostics::Message, args: &[Str
     };
     match message.format(args) {
         Ok(text) => text,
-        Err(_) => panic!("Invalid formatting placeholder"),
+        Err(_) => crate::core::go_panic("Invalid formatting placeholder".to_string()),
     }
 }
 
 // Go: ast/diagnostic.go:166 NewDiagnosticFromSerialized
 // PORT: Go keeps `message` nil and resolves the key lazily in `Localize`
-// (panicking on an unknown key). `core::Diagnostic` needs the message, so it
-// is resolved here with the same panic. The key "" of a serialized external
+// (panicking on an unknown key). `core::Diagnostic` needs the message, so a
+// known key is resolved here. The key "" of a serialized external
 // diagnostic (tsgo#4712: Go `SetExternalData` gives it its text next) is the
 // Go nil message, and `localize` panics on it without a text, as Go does.
+// An unknown key (a bad `.tsbuildinfo`) is a nil message that keeps the key
+// (`unknown_key_message`), so `localize` panics when Go does, with Go's
+// text, and the build info keeps the key.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn new_diagnostic_from_serialized(
@@ -489,7 +511,7 @@ pub fn new_diagnostic_from_serialized(
     let message = match crate::diag::key_to_message(message_key) {
         Some(message) => message,
         None if message_key.is_empty() => NIL_MESSAGE,
-        None => panic!("Unknown diagnostic message: {message_key}"),
+        None => unknown_key_message(message_key),
     };
     Diagnostic {
         file,
@@ -1012,20 +1034,24 @@ pub fn compare_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
     if c != 0 {
         return c;
     }
-    c = d1.pos() - d2.pos();
+    // PORT: Go subtracts these int32 values as Go ints (64 bits), so the
+    // sign is their true order. An `i32` difference can wrap on the values
+    // of a bad `.tsbuildinfo` (category -2147483648 and 1), so the port
+    // compares them.
+    c = ordering_to_int(d1.pos().cmp(&d2.pos()));
     if c != 0 {
         return c;
     }
-    c = d1.end() - d2.end();
+    c = ordering_to_int(d1.end().cmp(&d2.end()));
     if c != 0 {
         return c;
     }
-    c = d1.code() - d2.code();
+    c = ordering_to_int(d1.code().cmp(&d2.code()));
     if c != 0 {
         return c;
     }
     // tsgo#4712
-    c = d1.category() as i32 - d2.category() as i32;
+    c = ordering_to_int(d1.category().cmp(&d2.category()));
     if c != 0 {
         return c;
     }

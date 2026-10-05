@@ -230,8 +230,8 @@ impl<'a, C> NodeVisitor<'a, C> {
         // changes (Go `VisitSlice` returns the input slice otherwise).
         if let Some(result) = self.visit_slice_changed(nodes.nodes().iter()) {
             // PORT: Go `list := v.Factory.NewNodeList(result); list.Loc = nodes.Loc`.
-            // A synthetic list fixes its `Loc` at creation (see synthetic.rs).
-            return new_synthetic_node_list(&result, nodes.loc());
+            // A factory list fixes its `Loc` at creation, so it is passed in.
+            return self.factory().new_node_list_with_loc(&result, nodes.loc());
         }
 
         nodes
@@ -254,8 +254,10 @@ impl<'a, C> NodeVisitor<'a, C> {
         // PERF: read the list in place, as in `visit_nodes`.
         if let Some(result) = self.visit_slice_changed(nodes.nodes().iter()) {
             // PORT: Go `list := v.Factory.NewModifierList(result); list.Loc = nodes.Loc`.
-            // A synthetic list fixes its `Loc` at creation (see synthetic.rs).
-            return new_synthetic_modifier_list(&result, nodes.node_list().loc());
+            // A factory list fixes its `Loc` at creation, so it is passed in.
+            return self
+                .factory()
+                .new_modifier_list_with_loc(&result, nodes.node_list().loc());
         }
 
         nodes

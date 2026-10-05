@@ -203,6 +203,58 @@ fn gone_files_mostly_global_change_all_files() {
     );
 }
 
+// Two files leave the program and one of them, `g.d.ts`, affects global
+// scope: a tie. Go meets the global file first in about half of the runs
+// (pin 673a5f17d713: 89 of 200), and the port takes the global branch on a
+// tie, so the unchanged `a.ts` is emitted again. With a strict majority
+// rule (`>` in place of `>=`), it would not be.
+#[test]
+fn gone_files_half_global_change_all_files() {
+    let source = |name: &str| format!("{PROJECT}/src/{name}");
+    let input = TscInput {
+        files: [
+            (
+                format!("{PROJECT}/tsconfig.json"),
+                r#"{"compilerOptions":{"incremental":true,"rootDir":"src","outDir":"out"},"include":["src"]}"#
+                    .into(),
+            ),
+            (source("a.ts"), "export const a = 1;\n".into()),
+            (source("g.d.ts"), "declare const g: number;\n".into()),
+            (source("m.d.ts"), "export declare const m: number;\n".into()),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let sys = new_test_sys(&input, false);
+    let fs = sys.fs_from_file_map();
+
+    let status = build_with(&sys, &["--listEmittedFiles"]);
+    let output = sys.output_text();
+    assert_eq!(status, ExitStatus::Success, "{output}");
+    assert!(
+        output.contains(&format!("TSFILE: {PROJECT}/out/a.js")),
+        "{output}"
+    );
+
+    for name in ["g.d.ts", "m.d.ts"] {
+        fs.remove(&source(name))
+            .unwrap_or_else(|err| panic!("remove {name}: {err:?}"));
+    }
+    sys.clear_output();
+    let status = build_with(&sys, &["--listEmittedFiles"]);
+    let output = sys.output_text();
+    assert_eq!(status, ExitStatus::Success, "{output}");
+    assert!(
+        output.contains(&format!("TSFILE: {PROJECT}/out/a.js")),
+        "{output}"
+    );
+    assert!(
+        output.contains(&format!("TSFILE: {PROJECT}/tsconfig.tsbuildinfo")),
+        "{output}"
+    );
+}
+
 // `lib` goes from es2022, dom, dom.iterable and dom.asynciterable to es2022,
 // and `a.ts` uses `document` (the incrjs1 skeptic's `libdom.sh`). Three libs
 // leave the program. Only `lib.dom.d.ts` affects global scope: at pin

@@ -104,12 +104,15 @@ impl ToSnapshot<'_> {
 
     // Go: incremental/buildinfotosnapshot.go:61 toFilePath
     fn to_file_path(&self, file_id: BuildInfoFileId) -> Path {
-        self.file_paths[(file_id.0 - 1) as usize].clone()
+        go_index(&self.file_paths, i64::from(file_id.0) - 1).clone()
     }
 
     // Go: incremental/buildinfotosnapshot.go:65 toFilePathSet
     fn to_file_path_set(&self, file_id_list_id: BuildInfoFileIdListId) -> Arc<FxIndexSet<Path>> {
-        Arc::clone(&self.file_path_set[(file_id_list_id.0 - 1) as usize])
+        Arc::clone(go_index(
+            &self.file_path_set,
+            i64::from(file_id_list_id.0) - 1,
+        ))
     }
 
     // Go: incremental/buildinfotosnapshot.go:69 toBuildInfoDiagnosticsWithFileName
@@ -245,10 +248,12 @@ impl ToSnapshot<'_> {
                     .semantic_diagnostics_per_file
                     .shift_remove(&file_path); // does not have cached diagnostics
             } else {
-                let diagnostics = diagnostic
-                    .diagnostics
-                    .as_ref()
-                    .expect("BuildInfoSemanticDiagnostic without fileId has diagnostics");
+                // Go: buildinfotosnapshot.go:166 reads
+                // `diagnostic.Diagnostics.FileId`. A plain file id 0 has no
+                // diagnostics, and Go dereferences nil.
+                let Some(diagnostics) = diagnostic.diagnostics.as_ref() else {
+                    go_nil_dereference();
+                };
                 let file_path = self.to_file_path(diagnostics.file_id);
                 let value =
                     self.to_diagnostics_or_build_info_diagnostics_with_file_name(diagnostics);
@@ -312,6 +317,20 @@ impl ToSnapshot<'_> {
                 .map(|package_json| self.to_absolute_path(package_json))
                 .collect(),
         );
+    }
+}
+
+/// Go `s[i]`. An id of a bad `.tsbuildinfo` can be out of range, and Go
+/// panics with the runtime text.
+#[track_caller]
+fn go_index<T>(s: &[T], i: i64) -> &T {
+    match usize::try_from(i).ok().and_then(|at| s.get(at)) {
+        Some(item) => item,
+        None if i < 0 => go_panic(format!("runtime error: index out of range [{i}]")),
+        None => go_panic(format!(
+            "runtime error: index out of range [{i}] with length {}",
+            s.len()
+        )),
     }
 }
 

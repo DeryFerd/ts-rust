@@ -266,11 +266,13 @@ pub(super) fn update_program_version(
 
 /// Gives each new parse of `np` (its store is not published) of a path
 /// that this thread published before a `FileVersion`, as the language
-/// server parse cache does (`ast::freeable_path`). Only
-/// `update_program_version` (`goport_multiprog`) calls it, and the rule is
-/// off there unless `GOPORT_FREE_FILE_VERSIONS=1`, so a measurement can
-/// turn it on (lsshells M3b).
-fn mark_freeable_parses(np: &NewProgram) {
+/// server parse cache does (`ast::freeable_path`). `tsc --watch` calls it
+/// for each build (`program::mark_freeable_parses`), and
+/// `update_program_version` (`goport_multiprog`) too, where the rule is off
+/// unless `GOPORT_FREE_FILE_VERSIONS=1`, so a measurement can turn it on
+/// (lsshells M3b). A parse that is not a program file gets none: it is
+/// published static.
+pub(super) fn mark_freeable_parses(np: &NewProgram) {
     if !crate::ast::free_file_versions() {
         return;
     }

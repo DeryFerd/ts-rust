@@ -23,7 +23,7 @@ use ts_goport::lsp::lsproto;
 use ts_goport::project::{self, Session, SessionInit, SessionOptions};
 
 use super::projecttestutil;
-use super::util::{CHANGED, bg, close, edit, generate_file_events, open, program, uri};
+use super::util::{CHANGED, DELETED, bg, close, edit, generate_file_events, open, program, uri};
 
 /// A test in a child process with no OS override, with the environment
 /// variables `$env` set. It is skipped, with a message, where resolve ahead
@@ -177,9 +177,14 @@ struct Observed {
 }
 
 fn observe(session: &Rc<Session>, root: &str) -> Observed {
+    observe_project(session, root, "tsconfig.json")
+}
+
+/// `observe` for the project of the config file `config` in `root`.
+fn observe_project(session: &Rc<Session>, root: &str, config: &str) -> Observed {
     let relative = |name: &str| name.replace(root, "<root>");
     let snapshot = session.snapshot();
-    let config = tspath::to_path(&format!("{root}/tsconfig.json"), root, true);
+    let config = tspath::to_path(&format!("{root}/{config}"), root, true);
     let project = snapshot
         .project_collection
         .configured_project(&config)
@@ -1026,6 +1031,89 @@ os_child_test! {
         resolve_ahead::set_mode(None);
         drop(session);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+/// `SPEC_TEST` with an import of `tpkg`, a package that only the spec
+/// project reads.
+const SPEC_TEST_TPKG: &str = "import { foo } from \"./main\";\nimport { bar } from \"./helper\";\nimport { t } from \"tpkg\";\nfoo + bar + t;\n";
+
+os_child_test! {
+    /// The disk changes between the delete and the remake of a project
+    /// whose keys and kept share are in the stash
+    /// (`project::ResolveAheadStash`): `tpkg/index.d.ts`, which the job of
+    /// the deleted project found, is deleted. The remade project's workers
+    /// start with it as a known file and answer with it; the loader's
+    /// check rejects that answer, so the load is the load of a loader that
+    /// resolves every key itself.
+    fn a_change_between_delete_and_remake_gives_the_fresh_answer() {
+        let run = |mode: Mode| {
+            let dir = std::env::temp_dir().join(format!(
+                "ts_goport_resolve_ahead_{}_remake_{mode:?}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let files = SPEC_FILES.iter().copied().chain([
+                ("src/main.test.ts", SPEC_TEST_TPKG),
+                (
+                    "node_modules/tpkg/package.json",
+                    r#"{ "name": "tpkg", "version": "1.0.0", "types": "index.d.ts" }"#,
+                ),
+                ("node_modules/tpkg/index.d.ts", "export declare const t: number;"),
+            ]);
+            for (name, text) in files {
+                write(&dir.to_string_lossy(), name, text);
+            }
+            let root = std::fs::canonicalize(&dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            resolve_ahead::set_mode(Some(mode));
+            let session = os_session(&root);
+
+            // The search makes the spec project, loads it and deletes it,
+            // twice. The second load resolves ahead, and its job finds the
+            // files of tpkg, which the stash keeps for the next job.
+            open(&session, &file_uri(&root, "src/main.ts"), SPEC_MAIN);
+            resolve_ahead::wait_for_frees();
+            open(&session, &file_uri(&root, "src/helper.ts"), SPEC_HELPER);
+            resolve_ahead::wait_for_frees();
+
+            std::fs::remove_file(format!("{root}/node_modules/tpkg/index.d.ts")).unwrap();
+            session.did_change_watched_files(
+                &bg(),
+                &[Some(lsproto::FileEvent {
+                    uri: uri(&file_uri(&root, "node_modules/tpkg/index.d.ts")),
+                    type_: DELETED,
+                })],
+            );
+
+            // A file of the spec project only: the spec project made again
+            // keeps it.
+            open(&session, &file_uri(&root, "src/main.test.ts"), SPEC_TEST_TPKG);
+            let observed = observe_project(&session, &root, "tsconfig.spec.json");
+            let stats = resolve_ahead::last_stats();
+            resolve_ahead::set_mode(None);
+            drop(session);
+            std::fs::remove_dir_all(&dir).unwrap();
+            (observed, stats)
+        };
+        let (serial, serial_stats) = run(Mode::Off);
+        let (ahead, stats) = run(Mode::Force);
+        assert_eq!(serial_stats, None, "resolve ahead ran in mode 0");
+        assert_eq!(ahead, serial);
+        let tpkg: Vec<_> = ahead
+            .resolutions
+            .iter()
+            .filter(|line| line.contains("\"tpkg\""))
+            .collect();
+        assert!(
+            !tpkg.is_empty() && tpkg.iter().all(|line| !line.contains("tpkg/index.d.ts")),
+            "{tpkg:?}"
+        );
+        let stats = stats.expect("no resolve-ahead load");
+        assert!(stats.known_files > 0, "{stats:?}");
+        assert!(stats.loader.rejected > 0, "{stats:?}");
     }
 }
 

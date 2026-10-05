@@ -11,14 +11,16 @@
 use crate::project::prelude::*;
 
 use crate::contentmapper;
-use crate::frontend::core_ext::get_script_kind_from_file_name;
+use crate::frontend::core_ext::{
+    ensure_script_kind_from_file_name, get_script_kind_from_file_name,
+};
 use crate::frontend::module::{AheadAnswer, AheadCall, KeyList};
 use crate::frontend::parser;
 use std::cell::Cell;
 use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
 
-// Go: project/compilerhost.go:16 compilerHost
+// Go: project/compilerhost.go:21 compilerHost
 pub struct CompilerHost {
     pub config_file_path: tspath::Path,
     pub current_directory: String,
@@ -65,7 +67,8 @@ pub struct CompilerHost {
 /// The keys are hints only: the loader checks each answer
 /// (`accept_ahead_answer`), and resolves itself a key that it does not
 /// find. One per session (`SnapshotHost`), with at most `CAPACITY`
-/// projects; a new one drops the oldest.
+/// projects; a new one drops the least recently deleted (a project
+/// deleted again moves to the end, and `take` removes its entry).
 ///
 /// Rule: only `Snapshot::clone` puts, for a program that it made for a
 /// project that its new collection does not have. A host that `release`
@@ -108,11 +111,11 @@ impl ResolveAheadStash {
             keys,
             share,
         });
-        let oldest = (projects.len() > Self::CAPACITY).then(|| projects.remove(0));
+        let least_recent = (projects.len() > Self::CAPACITY).then(|| projects.remove(0));
         drop(projects);
         // A dropped share can make the workers forget what they keep.
         drop(older);
-        drop(oldest);
+        drop(least_recent);
     }
 
     /// Takes the keys and the share of the deleted project of
@@ -130,7 +133,7 @@ impl ResolveAheadStash {
     }
 }
 
-// Go: project/compilerhost.go:29 newCompilerHost
+// Go: project/compilerhost.go:36 newCompilerHost
 // PORT: reads `project.configFilePath`, so the caller must not hold a
 // mutable borrow of `project` during this call. The host keeps its own
 // `Rc`s of `project` and `builder` until `freeze`.
@@ -160,6 +163,7 @@ pub fn new_compiler_host(
         )
     };
     let source_fs = new_source_fs(true, builder.fs.clone(), builder.to_path.clone());
+    UNFROZEN_HOSTS.with(|unfrozen| unfrozen.set(unfrozen.get() + 1));
     Rc::new(CompilerHost {
         config_file_path,
         current_directory: current_directory.to_string(),
@@ -180,8 +184,33 @@ pub fn new_compiler_host(
     })
 }
 
+thread_local! {
+    /// The hosts of this thread that are neither frozen nor dropped
+    /// (`unfrozen_compiler_hosts`).
+    static UNFROZEN_HOSTS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Not in Go: the number of hosts that `new_compiler_host` made on this
+/// thread and that are neither frozen nor dropped. A host keeps its project
+/// and the builder until `freeze`. Go's GC frees them with the host; the
+/// port keeps the host of a released program (`release`), so every host
+/// that a snapshot clone made must be frozen when the clone ends. Tests
+/// check it.
+#[must_use]
+pub fn unfrozen_compiler_hosts() -> usize {
+    UNFROZEN_HOSTS.with(Cell::get)
+}
+
+impl Drop for CompilerHost {
+    fn drop(&mut self) {
+        if self.builder.get_mut().is_some() {
+            UNFROZEN_HOSTS.with(|unfrozen| unfrozen.set(unfrozen.get() - 1));
+        }
+    }
+}
+
 impl CompilerHost {
-    // Go: project/compilerhost.go:50 compilerHost.freeze
+    // Go: project/compilerhost.go:57 compilerHost.freeze
     // freeze clears references to mutable state to make the compilerHost safe for use
     // after the snapshot has been finalized. See the usage in snapshot.go for more details.
     pub fn freeze(
@@ -192,6 +221,7 @@ impl CompilerHost {
         if self.builder.borrow().is_none() {
             crate::core::go_panic("freeze can only be called once".to_string());
         }
+        UNFROZEN_HOSTS.with(|unfrozen| unfrozen.set(unfrozen.get() - 1));
         *self.source_fs.source.borrow_mut() = snapshot_fs;
         self.source_fs.disable_tracking();
         *self.config_file_registry.borrow_mut() = Some(config_file_registry);
@@ -205,7 +235,7 @@ impl CompilerHost {
         drop(logger);
     }
 
-    // Go: project/compilerhost.go:62 compilerHost.ensureAlive
+    // Go: project/compilerhost.go:69 compilerHost.ensureAlive
     pub fn ensure_alive(&self) {
         if self.builder.borrow().is_none() || self.project.borrow().is_none() {
             crate::core::go_panic(
@@ -217,32 +247,31 @@ impl CompilerHost {
 
 // Go: project/compilerhost.go:14 `var _ compiler.CompilerHost = (*compilerHost)(nil)`
 impl compiler::CompilerHost for CompilerHost {
-    // Go: project/compilerhost.go:69 compilerHost.DefaultLibraryPath
+    // Go: project/compilerhost.go:76 compilerHost.DefaultLibraryPath
     // DefaultLibraryPath implements compiler.CompilerHost.
     fn default_library_path(&self) -> String {
         self.session_options.default_library_path.clone()
     }
 
-    // Go: project/compilerhost.go:74 compilerHost.FS
+    // Go: project/compilerhost.go:81 compilerHost.FS
     // FS implements compiler.CompilerHost.
     fn fs(&self) -> Rc<dyn vfs::Fs> {
         self.source_fs.clone()
     }
 
     // PORT: not in Go (see `compiler::CompilerHost::without_fs_tracking`).
+    // The tracking comes back also when `f` panics (`SourceFS::without_tracking`).
     fn without_fs_tracking(&self, f: &mut dyn FnMut()) {
-        let tracking = self.source_fs.tracking.replace(false);
-        f();
-        self.source_fs.tracking.set(tracking);
+        self.source_fs.without_tracking(f);
     }
 
-    // Go: project/compilerhost.go:79 compilerHost.GetCurrentDirectory
+    // Go: project/compilerhost.go:86 compilerHost.GetCurrentDirectory
     // GetCurrentDirectory implements compiler.CompilerHost.
     fn get_current_directory(&self) -> String {
         self.current_directory.clone()
     }
 
-    // Go: project/compilerhost.go:84 compilerHost.GetResolvedProjectReference
+    // Go: project/compilerhost.go:91 compilerHost.GetResolvedProjectReference
     // GetResolvedProjectReference implements compiler.CompilerHost.
     fn get_resolved_project_reference(
         &self,
@@ -273,7 +302,7 @@ impl compiler::CompilerHost for CompilerHost {
         }
     }
 
-    // Go: project/compilerhost.go:96 compilerHost.GetSourceFile
+    // Go: project/compilerhost.go:103 compilerHost.GetSourceFile
     // GetSourceFile implements compiler.CompilerHost. Files are cached in parseCache
     // and acquired immediately for the in-progress program.
     // PORT: the parse cache holds `HashedSourceFile` (the file and Go's
@@ -295,7 +324,7 @@ impl compiler::CompilerHost for CompilerHost {
         None
     }
 
-    // Go: project/compilerhost.go:112 compilerHost.GetContentMappedSourceFiles (tsgo#4712)
+    // Go: project/compilerhost.go:113 compilerHost.GetContentMappedSourceFiles (tsgo#4712)
     // GetContentMappedSourceFile implements compiler.CompilerHost.
     // PORT: a file that cannot be read is `Ok` with no canonical file (Go
     // returns the zero value and a nil error). Go `file.Hash = key.Hash` is
@@ -408,7 +437,7 @@ impl compiler::CompilerHost for CompilerHost {
         self.content_mapper_project.borrow().clone()
     }
 
-    // Go: project/compilerhost.go:106 compilerHost.Trace
+    // Go: project/compilerhost.go:172 compilerHost.Trace
     // Trace implements compiler.CompilerHost.
     fn trace(&self, msg: &'static crate::diagnostics::Message, args: Vec<String>) {
         let logger = self.logger.borrow().clone();
@@ -431,16 +460,38 @@ impl compiler::CompilerHost for CompilerHost {
     }
 
     // PORT: not in Go (see `compiler::CompilerHost::cached_source_file_refs`).
-    // The parse cache files that `get_source_file` would give for a worker's
-    // guess of the parse: the script kind of the file name, the jsx option
-    // that this project's options give the name, and, when the text is
-    // known with no read, its hash. The loader then hits the cache and never
-    // takes a worker parse of these files, so the workers do not parse them.
-    // A project that one clone made and deleted keeps its files in the cache
-    // (as in Go), so when a later open makes it again (hono's
-    // tsconfig.spec.json), its load starts no worker parse. A guess that
-    // misses (another `force` option, a file whose language id gives another
-    // kind) only makes the loader parse the file itself.
+    // The parse cache files whose key `get_source_file` can make in this
+    // project's load. The loader then takes them from the cache, so the
+    // workers do not parse them. A project that one clone made and deleted
+    // keeps its files in the cache (as in Go), so when a later open makes it
+    // again (hono's tsconfig.spec.json), its load starts no worker parse.
+    //
+    // Go's key (project/parsecache.go:22 NewParseCacheKey) is the parse
+    // options (file name, path, jsx, force), the script kind and the text
+    // hash. Before the load the host knows only some of them:
+    // - hash and script kind (Go `FileHandle.Kind`, compilerhost.go:106):
+    //   when the snapshot knows the file with no read (`known_file`: an
+    //   open file or a cached one), they must match. Else the file is read
+    //   from disk, whose kind comes from the name (Go overlayfs.go:108
+    //   `cachedFile.Kind`), and any hash passes. `NewParseCacheKey` makes an
+    //   unknown kind TS.
+    // - jsx and force: what this project's options give the name. force also
+    //   depends on the file's package.json scope, which the load finds later
+    //   (ast/parseoptions.go:46 isFileForcedToBeModuleByFormat), so either
+    //   value that a scope can give passes. A project with references parses
+    //   their source files with the reference's own options (Go
+    //   projectreferencefilemapper.go:80 getCompilerOptionsForFile, from
+    //   fileloader.go:418), which the host does not have yet, so then any
+    //   jsx and force pass.
+    //
+    // A wrong guess costs only time or memory: the output always comes from
+    // `get_source_file` with the full key (Go compilerhost.go:106).
+    // - A file in the map whose key misses the cache: no worker parses it,
+    //   so the loader parses it itself (time).
+    // - A file not in the map whose key hits the cache: a worker parses it,
+    //   the loader takes the cached file, and the worker's parse stays in
+    //   its AST arena (memory). The matches above never leave out a key
+    //   that the load can make.
     fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<compiler::FileRefs>> {
         let mut refs = FxHashMap::default();
         let (Some(builder), Some(project)) =
@@ -452,20 +503,37 @@ impl compiler::CompilerHost for CompilerHost {
             return refs;
         };
         let options = command_line.compiler_options();
-        let metadata = SourceFileMetaData::default();
+        let has_references = !command_line.project_references().is_empty();
+        let no_scope = SourceFileMetaData::default();
+        let esm_scope = SourceFileMetaData {
+            package_json_type: "module".to_string(),
+            implied_node_format: ModuleKind::ES_NEXT,
+            ..SourceFileMetaData::default()
+        };
+        let options_pass = |key: &ParseCacheKey| {
+            if has_references {
+                return true;
+            }
+            let guess = |metadata| {
+                parser::get_external_module_indicator_options(&key.file_name, &options, metadata)
+            };
+            let plain = guess(&no_scope);
+            key.jsx == plain.jsx
+                && (key.force == plain.force || key.force == guess(&esm_scope).force)
+        };
         for (key, entry) in builder.parse_cache.entries.borrow().iter() {
-            if key.script_kind != get_script_kind_from_file_name(&key.file_name)
-                || key.jsx
-                    != parser::get_external_module_indicator_options(
-                        &key.file_name,
-                        &options,
-                        &metadata,
-                    )
-                    .jsx
-                || builder
-                    .fs
-                    .known_file_hash(&key.path)
-                    .is_some_and(|hash| hash != key.hash)
+            let (hash, kind) = match builder.fs.known_file(&key.path) {
+                Some((hash, kind)) => (Some(hash), kind),
+                None => (None, get_script_kind_from_file_name(&key.file_name)),
+            };
+            let kind = if kind == ScriptKind::UNKNOWN {
+                ensure_script_kind_from_file_name(&key.file_name)
+            } else {
+                kind
+            };
+            if key.script_kind != kind
+                || hash.is_some_and(|hash| hash != key.hash)
+                || !options_pass(key)
             {
                 continue;
             }

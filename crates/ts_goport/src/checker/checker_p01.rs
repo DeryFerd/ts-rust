@@ -838,7 +838,10 @@ pub struct Checker {
     pub array_variances: SharedList<VarianceFlags>,
     pub globals: SymbolTable,
     pub evaluate: Evaluator,
-    pub string_literal_types: FxHashMap<String, TypeId>,
+    // PORT: perf (tcsplit1). Go keys on the value. Here the key is the
+    // FxHash of the value, and the types of a bucket hold the values (see
+    // `get_string_literal_type_cow`).
+    pub string_literal_types: FxHashMap<u64, smallvec::SmallVec<[TypeId; 1]>>,
     pub number_literal_types: FxHashMap<NumberKey, TypeId>,
     pub nan_type: TypeId,
     pub bigint_literal_types: FxHashMap<PseudoBigIntKey, TypeId>,
@@ -876,6 +879,14 @@ pub struct Checker {
     pub class_expression_name_tables: FxHashMap<Node, SymbolTable>,
     pub resolve_name: ResolveNameFn,
     pub resolve_name_for_symbol_suggestion: ResolveNameFn,
+    /// PORT: port-only memo of the spelling suggestion from the globals
+    /// table, by name id and meaning (`get_suggestion_for_symbol_name_lookup`),
+    /// with the `merge_version` from before its scan. Read and filled only
+    /// when `globals_complete` is set.
+    pub global_spelling_suggestions: FxHashMap<(u32, SymbolFlags), (u64, GlobalSpellingSuggestion)>,
+    /// PORT: port-only. Set at the end of `initialize_checker`. After that,
+    /// nothing adds names to the globals table or removes them.
+    pub globals_complete: bool,
     pub tuple_types: CacheKeyMap<TypeId>,
     pub union_types: FxHashMap<CacheHashKey, TypeId>,
     pub union_of_union_types: FxHashMap<UnionOfUnionKey, TypeId>,
@@ -1135,7 +1146,8 @@ pub struct Checker {
     pub(crate) matching_reference_memo: crate::checker::flow_p2::MatchingReferenceMemo,
     /// PERF: not in Go. Counts the merges (`merge_symbol` and
     /// `record_merged_symbol`), so a memo of a merged symbol or of the flags
-    /// a merge adds knows when to read them again.
+    /// a merge adds knows when to read them again (`MatchingReferenceMemo`,
+    /// `global_spelling_suggestions`).
     pub(crate) merge_version: u64,
 
     // Arenas (PORTING.md "Checker data"). Index 0 of each is a dummy entry
@@ -1362,6 +1374,8 @@ impl Checker {
             class_expression_name_tables: FxHashMap::default(),
             resolve_name: nil_resolve_name_fn(),
             resolve_name_for_symbol_suggestion: nil_resolve_name_fn(),
+            global_spelling_suggestions: FxHashMap::default(),
+            globals_complete: false,
             tuple_types: CacheKeyMap::default(),
             union_types: FxHashMap::default(),
             union_of_union_types: FxHashMap::default(),

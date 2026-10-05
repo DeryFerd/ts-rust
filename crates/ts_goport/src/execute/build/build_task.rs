@@ -370,8 +370,10 @@ impl TaskResult {
 
 /// Go drops the task's program when the task is built (outside tests) or
 /// `t.result` after `report`.
-/// This frees the checker pool and the frontend of the program. Its files
-/// stay published, so the diagnostics in `t.errors` can still be written.
+/// This frees the checker pool and the frontend of the program. Its static
+/// files stay published, and the task holds the freeable file versions
+/// that `t.errors` point at (`BuildTask::held_file_versions`), so the
+/// diagnostics in `t.errors` can still be written.
 // PORT: Go frees the program in the background GC. The checker threads
 // free their checkers while the build goes on
 // (`program::release_program_in_background_later`). The frontend program
@@ -524,6 +526,11 @@ pub struct BuildTask {
     pub package_jsons: Vec<String>,
 
     pub errors: Vec<Diagnostic>,
+    /// PORT: not in Go. The freeable file versions that `errors` point at
+    /// (`ast::diagnostic_file_versions`). The task's program is released
+    /// when the task is built, before the task and the build summary report
+    /// `errors` (`tsc -b --watch`; watchfree1).
+    held_file_versions: Vec<std::sync::Arc<crate::ast::FileVersion>>,
     pub pending: bool,
     pub is_initial_cycle: bool,
     pub dirty: bool,
@@ -590,6 +597,7 @@ impl BuildTask {
             build_info_entry: None,
             package_jsons: Vec::new(),
             errors: Vec::new(),
+            held_file_versions: Vec::new(),
             pending: true,
             is_initial_cycle,
             dirty: false,
@@ -715,12 +723,23 @@ impl BuildTask {
             self.go_panic = Some(TaskGoPanic::Upstream);
             return false;
         }
-        let mut payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.build_project_start_task(orchestrator, path)
         })) {
             Ok(compiles) => return compiles,
             Err(payload) => payload,
         };
+        self.keep_go_panic(orchestrator, payload);
+        false
+    }
+
+    /// Keeps a `go_panic` of this task's builder goroutine for `report`
+    /// (see `TaskGoPanic`). Any other panic is a port gap and continues.
+    fn keep_go_panic(
+        &mut self,
+        orchestrator: &dyn BuildTaskOrchestrator,
+        mut payload: Box<dyn std::any::Any + Send>,
+    ) {
         let Some(panic) = payload.downcast_mut::<crate::core::GoPanic>() else {
             std::panic::resume_unwind(payload);
         };
@@ -736,7 +755,6 @@ impl BuildTask {
         };
         panic.repanicked |= num_routines != 1;
         self.go_panic = Some(TaskGoPanic::Panicked(payload));
-        false
     }
 
     fn build_project_start_task(
@@ -791,10 +809,16 @@ impl BuildTask {
 
     // Go: build/buildtask.go:145 (*BuildTask).buildProject, from the emit
     // of `compileAndEmit` on (see `build_project_start`).
+    // PORT: a `go_panic` here (a bad diagnostic of a `.tsbuildinfo` panics
+    // when it is reported) is kept for `report` too.
     pub fn build_project_finish(&mut self, orchestrator: &dyn BuildTaskOrchestrator, path: &Path) {
-        self.compile_and_emit_finish(orchestrator);
-        self.update_downstream(orchestrator, path);
-        self.unblock_downstream();
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.compile_and_emit_finish(orchestrator);
+            self.update_downstream(orchestrator, path);
+            self.unblock_downstream();
+        })) {
+            self.keep_go_panic(orchestrator, payload);
+        }
     }
 
     // Go: build/buildtask.go:176 (*BuildTask).updateDownstream
@@ -888,6 +912,7 @@ impl BuildTask {
         path: &Path,
     ) -> bool {
         self.errors = Vec::new();
+        self.held_file_versions = Vec::new();
         let command = orchestrator.command();
         if command.build_options.verbose.is_true() {
             self.report_status(new_compiler_diagnostic(
@@ -935,10 +960,16 @@ impl BuildTask {
         // a program that loads while the build host caches no parse (the
         // first one of a build cycle): later programs take the lib files
         // from that cache, and the workers would parse them for nothing.
-        let mut host_has_parses = false;
+        // Not when the load gets no parse workers (`BuildHost::prefetch`):
+        // the workers' parses would stay unused in their AST arenas.
+        let mut host_has_parses = host
+            .watch_sources
+            .borrow()
+            .as_ref()
+            .is_some_and(|sources| !sources.is_empty());
         host.source_files
             .for_each_stored(|_, _| host_has_parses = true);
-        if !host_has_parses {
+        if host.prefetch.get() && !host_has_parses {
             crate::execute::execute_tsc::start_lib_prefetch(&*sys, &resolved, testing.is_some());
         }
         let build_info_read_start = sys.now();
@@ -977,7 +1008,13 @@ impl BuildTask {
         compile_times.borrow_mut().build_info_read_time = elapsed(&*sys, build_info_read_start);
         let parse_start = sys.now();
         // Go: compiler.NewProgram(compiler.ProgramOptions{Config, Host})
-        let program = crate::execute::execute_tsc::new_program_version(compiler_host, resolved);
+        // PORT: in `tsc -b --watch` the new parses of files that an earlier
+        // build published are freeable file versions (watchfree1,
+        // `ast::set_watch_process`).
+        let np = crate::execute::execute_tsc::new_frontend_program(compiler_host, resolved);
+        crate::program::mark_freeable_parses(&np);
+        let program = crate::program::new_program_version(&np, None);
+        drop(np);
         compile_times.borrow_mut().parse_time = elapsed(&*sys, parse_start);
         let written_build_info: WrittenBuildInfo = Arc::default();
         let deferred_writes = (!sys.emit_writes_through_osvfs()).then(DeferredWrites::default);
@@ -1109,6 +1146,7 @@ impl BuildTask {
         let has_changed_dts_file = incremental_program.has_changed_dts_file();
         // Go appends to `t.errors` while `EmitAndReportStatistics` reports.
         self.errors.extend(errors.take());
+        self.held_file_versions = crate::ast::diagnostic_file_versions(&self.errors);
         {
             let task_result = self.result_mut();
             task_result

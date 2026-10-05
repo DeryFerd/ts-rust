@@ -255,6 +255,20 @@ impl ToProgramSnapshot<'_> {
                 },
             );
         }
+        // PORT: not in Go (`Snapshot::held_file_versions`). Each entry of the
+        // two maps is a copy so far. The old snapshot and the old program
+        // hold these versions until after this call (the watcher releases
+        // the old program after `new_program`), so each is alive here.
+        let snapshot = &self.snapshot;
+        let held = crate::ast::diagnostic_file_versions(
+            snapshot
+                .semantic_diagnostics_per_file
+                .values()
+                .chain(snapshot.emit_diagnostics_per_file.values())
+                .filter_map(|entry| entry.diagnostics.as_deref())
+                .flatten(),
+        );
+        self.snapshot.held_file_versions = held;
     }
 
     // Go: incremental/programtosnapshot.go:162-179 handleFileDelete
@@ -882,7 +896,7 @@ pub fn repopulate_diagnostic_message_chain(
                 pos,
                 end,
                 code: c.code(),
-                category: c.category() as i32,
+                category: c.category().0,
                 source: c.source().to_string(),
                 message_text: c.message_text().to_string(),
                 message_key: c.message_key().to_string(),
@@ -923,7 +937,7 @@ pub fn ast_diag_to_build_info_diag(d: &Diagnostic) -> BuildInfoDiagnosticWithFil
         pos,
         end,
         code: d.code(),
-        category: d.category() as i32,
+        category: d.category().0,
         source: d.source().to_string(),
         message_text: d.message_text().to_string(),
         message_key: d.message_key().to_string(),

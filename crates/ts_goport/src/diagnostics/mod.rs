@@ -8,24 +8,46 @@ use std::{error::Error, fmt};
 
 pub use catalog::CATALOG;
 
-/// TypeScript's four diagnostic severity categories.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(u8)]
-pub enum Category {
-    Warning = 0,
-    Error = 1,
-    Suggestion = 2,
-    Message = 3,
-}
+/// Go `diagnostics.Category`, an `int32`. The four named values are
+/// TypeScript's diagnostic severity categories. A bad `.tsbuildinfo` can
+/// give any other value. Go keeps it: it sorts as an int and is written to
+/// the build info again as it was read. Go panics only when the diagnostic
+/// is printed ("Unhandled diagnostic category").
+// PORT: a newtype with associated consts, so `Category::Error` reads as the
+// Go `diagnostics.CategoryError`.
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Category(pub i32);
 
+#[allow(non_upper_case_globals)]
 impl Category {
+    pub const Warning: Self = Self(0);
+    pub const Error: Self = Self(1);
+    pub const Suggestion: Self = Self(2);
+    pub const Message: Self = Self(3);
+
+    // Go: diagnostics/diagnostics.go:26 (Category).Name
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Warning => "warning",
             Self::Error => "error",
             Self::Suggestion => "suggestion",
             Self::Message => "message",
+            _ => crate::core::go_panic("Unhandled diagnostic category".to_string()),
+        }
+    }
+}
+
+/// Prints a named value as the old enum did (`Error`), and any other value
+/// as `Category(999)`.
+impl fmt::Debug for Category {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Warning => formatter.write_str("Warning"),
+            Self::Error => formatter.write_str("Error"),
+            Self::Suggestion => formatter.write_str("Suggestion"),
+            Self::Message => formatter.write_str("Message"),
+            Self(raw) => write!(formatter, "Category({raw})"),
         }
     }
 }
