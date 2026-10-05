@@ -3182,9 +3182,16 @@ macro_rules! args {
 /// Where a `LinkStore` keeps the record of a key.
 #[derive(Clone, Copy, Debug)]
 pub enum LinkSlot {
-    /// An arena handle (`TypeId`, `SymbolId`, ...): an index into one page
-    /// table for the whole arena.
+    /// An arena handle (`TypeId`, ...): an index into one page table for
+    /// the whole arena.
     Arena(usize),
+    /// A binder lineage index (`SymbolId`). The lineage never reuses an
+    /// index, so in a long watch or editor session most indexes belong to
+    /// dead file versions, which a new checker never reads. Indexes below
+    /// `LINK_FLAT_IDS` use the arena table, as `Arena` does. The others use
+    /// one page table per block of indexes that the store reads
+    /// (`LinkStore::far_cell`), so a store pays only for the blocks it uses.
+    Lineage(usize),
     /// A node or flow node handle: (file, local index + 1). Each file has
     /// its own page table.
     File(usize, usize),
@@ -3213,7 +3220,6 @@ macro_rules! arena_link_key {
 
 arena_link_key!(
     TypeId,
-    SymbolId,
     SignatureId,
     IndexInfoId,
     TypePredicateId,
@@ -3221,6 +3227,33 @@ arena_link_key!(
     InferenceContextId,
     SymbolTable
 );
+
+impl LinkKey for SymbolId {
+    #[inline]
+    fn link_slot(self) -> LinkSlot {
+        LinkSlot::Lineage(self.index())
+    }
+}
+
+/// Lineage indexes below this use the flat arena table: at most 512 KiB of
+/// page pointers per store. A CLI build stays below it, so its reads are the
+/// reads of an `Arena` key. (wgrowth1: a flat table for all indexes grew by
+/// 8 bytes per 64 indexes ever bound, in each symbol link store of each
+/// checker: about 7 MiB per config edit of a 600-file project.)
+const LINK_FLAT_IDS: usize = 1 << 22;
+
+/// Lineage indexes from `LINK_FLAT_IDS` on are in blocks of this many, with
+/// one page table per block.
+const LINK_BLOCK_SHIFT: usize = 16;
+
+/// The block (an index into `LinkStore::files`) and the index in its block
+/// of lineage index `index`. An index below `LINK_FLAT_IDS` wraps to a block
+/// past every block table, so a lookup of it finds no page.
+#[inline]
+fn far_slot(index: usize) -> (usize, usize) {
+    let far = index.wrapping_sub(LINK_FLAT_IDS);
+    (far >> LINK_BLOCK_SHIFT, far & ((1 << LINK_BLOCK_SHIFT) - 1))
+}
 
 /// Files with an index below this get paged node slots. Synthetic nodes
 /// (a file index near `u32::MAX`) use the hash map.
@@ -3284,9 +3317,11 @@ fn new_link_record<V: Default>(cell: &mut Option<V>) -> &mut V {
 /// one more load.
 #[derive(Clone, Debug)]
 pub struct LinkStore<K: LinkKey, V: Default> {
-    /// Page table of arena keys: one flat table for the whole arena.
+    /// Page table of arena keys: one flat table for the whole arena (for
+    /// lineage keys, up to `LINK_FLAT_IDS`).
     arena: PageTable<V>,
-    /// Page tables of file keys, by file.
+    /// Page tables of file keys, by file. A store of lineage keys has no
+    /// file keys: it keeps the page tables of its blocks here (`far_slot`).
     files: Vec<PageTable<V>>,
     map: FxHashMap<K, V>,
 }
@@ -3304,10 +3339,15 @@ impl<K: LinkKey, V: Default> Default for LinkStore<K, V> {
 impl<K: LinkKey, V: Default> LinkStore<K, V> {
     /// The record cell of a key with slots, or `None` when its page is
     /// absent.
+    // PERF: a lineage key inside the flat table reads like an arena key.
     #[inline(always)]
     fn cell(&self, slot: LinkSlot) -> Option<&Option<V>> {
         let (table, index) = match slot {
             LinkSlot::Arena(index) => (&self.arena, index),
+            LinkSlot::Lineage(index) if index / LINK_PAGE_SIZE < self.arena.len() => {
+                (&self.arena, index)
+            }
+            LinkSlot::Lineage(index) => return self.far_cell(index),
             LinkSlot::File(file, index) => (self.files.get(file)?, index),
             LinkSlot::Map => return None,
         };
@@ -3315,17 +3355,60 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
         Some(&page[index % LINK_PAGE_SIZE])
     }
 
+    /// `cell` of a lineage key past the flat table: its block page, or
+    /// `None` when the page is absent or the key belongs in the flat table.
+    #[inline(never)]
+    fn far_cell(&self, index: usize) -> Option<&Option<V>> {
+        self.far_lookup(index)
+    }
+
+    #[inline(always)]
+    fn far_lookup(&self, index: usize) -> Option<&Option<V>> {
+        let (block, index) = far_slot(index);
+        let page = self
+            .files
+            .get(block)?
+            .get(index / LINK_PAGE_SIZE)?
+            .as_deref()?;
+        Some(&page[index % LINK_PAGE_SIZE])
+    }
+
+    /// `cell_mut` of a lineage key past the flat table.
+    // PERF: the page lookup runs twice, as in `cell_mut`, and LLVM merges
+    // them. `#[cold]` keeps the callers laid out for flat keys, as a CLI
+    // build has only those; a long session that passes `LINK_FLAT_IDS` pays
+    // the call.
+    #[cold]
+    #[inline(never)]
+    fn far_cell_mut(&mut self, key: K, index: usize) -> &mut Option<V> {
+        if self.far_lookup(index).is_none() {
+            return self.add_page(key);
+        }
+        let (block, index) = far_slot(index);
+        let page = self.files[block][index / LINK_PAGE_SIZE]
+            .as_deref_mut()
+            .expect("link page");
+        &mut page[index % LINK_PAGE_SIZE]
+    }
+
     /// The record cell of a key with slots. Adds its page if it is absent.
     // PERF: the page lookup runs twice in the source (a shared lookup, then
     // the mutable one, which the borrow checker needs), but the second one
     // reads the same memory with no store between, so LLVM merges them.
+    // A lineage key past the flat table goes to `far_cell_mut` first, so
+    // `cell` takes only its flat arm here and the merge above still holds.
     #[inline(always)]
     fn cell_mut(&mut self, key: K, slot: LinkSlot) -> &mut Option<V> {
+        if let LinkSlot::Lineage(index) = slot
+            && index / LINK_PAGE_SIZE >= self.arena.len()
+        {
+            return self.far_cell_mut(key, index);
+        }
         if self.cell(slot).is_none() {
             return self.add_page(key);
         }
         let (table, index) = match slot {
-            LinkSlot::Arena(index) => (&mut self.arena, index),
+            LinkSlot::Arena(index) | LinkSlot::Lineage(index) => (&mut self.arena, index),
             LinkSlot::File(file, index) => (&mut self.files[file], index),
             LinkSlot::Map => unreachable!("map keys have no slot"),
         };
@@ -3336,8 +3419,8 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
     }
 
     /// `cell_mut` when the page of the key is absent: adds the page (and the
-    /// file table) first. The key, not its 24-byte `LinkSlot`, is passed, so
-    /// it goes in a register.
+    /// file or block table) first. The key, not its 24-byte `LinkSlot`, is
+    /// passed, so it goes in a register.
     #[cold]
     #[inline(never)]
     fn add_page(&mut self, key: K) -> &mut Option<V> {
@@ -3347,16 +3430,30 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
                 "a link value over 32 bytes goes in a Box"
             );
         }
-        let (table, index) = match key.link_slot() {
-            LinkSlot::Arena(index) => (&mut self.arena, index),
-            LinkSlot::File(file, index) => {
-                if file >= self.files.len() {
-                    self.files.resize_with(file + 1, Vec::new);
+        let (file, index) = match key.link_slot() {
+            LinkSlot::Arena(index) => return Self::page_cell(&mut self.arena, index),
+            LinkSlot::Lineage(index) if index < LINK_FLAT_IDS => {
+                // The flat table stops at `LINK_FLAT_IDS`; so does its capacity.
+                let pages = index / LINK_PAGE_SIZE + 1;
+                if pages > self.arena.capacity() {
+                    let capacity =
+                        (2 * self.arena.capacity()).clamp(pages, LINK_FLAT_IDS / LINK_PAGE_SIZE);
+                    self.arena.reserve_exact(capacity - self.arena.len());
                 }
-                (&mut self.files[file], index)
+                return Self::page_cell(&mut self.arena, index);
             }
+            LinkSlot::Lineage(index) => far_slot(index),
+            LinkSlot::File(file, index) => (file, index),
             LinkSlot::Map => unreachable!("map keys have no slot"),
         };
+        if file >= self.files.len() {
+            self.files.resize_with(file + 1, Vec::new);
+        }
+        Self::page_cell(&mut self.files[file], index)
+    }
+
+    /// The cell of `index` in `table`, with its page added if it is absent.
+    fn page_cell(table: &mut PageTable<V>, index: usize) -> &mut Option<V> {
         let entry = index / LINK_PAGE_SIZE;
         if entry >= table.len() {
             table.resize_with(entry + 1, || None);
@@ -3462,6 +3559,48 @@ mod link_store_tests {
         assert_eq!(symbols.try_get(SymbolId(70)).map(|v| v[1]), Some(2));
         assert_eq!(symbols.try_get(SymbolId(1)).map(|v| v[7]), Some(1));
         assert!(!symbols.has(SymbolId(71)) && !symbols.has(SymbolId(64 * 50)));
+    }
+
+    // Symbol keys from `LINK_FLAT_IDS` on keep their records in pages by
+    // block: a store with a few far keys has no page table entries for the
+    // indexes between them, and every key still finds its own record.
+    #[test]
+    fn link_store_far_symbol_keys_use_blocks() {
+        let flat = LINK_FLAT_IDS as u32;
+        let block = 1u32 << LINK_BLOCK_SHIFT;
+        let mut symbols = LinkStore::<SymbolId, u64>::default();
+        let keys = [
+            SymbolId(5),
+            SymbolId(flat - 1),
+            SymbolId(flat),
+            SymbolId(flat + 70),
+            SymbolId(flat + 900 * block + 3),
+            SymbolId(u32::MAX - 1),
+        ];
+        for (n, key) in keys.into_iter().enumerate() {
+            assert!(!symbols.has(key) && symbols.try_get(key).is_none());
+            *symbols.get(key) = n as u64 + 1;
+        }
+        *symbols.insert_new(SymbolId(flat + 900 * block + 4), 40) += 2;
+        for (n, key) in keys.into_iter().enumerate() {
+            assert_eq!(symbols.try_get(key), Some(&(n as u64 + 1)));
+            *symbols.get(key) += 10;
+            assert_eq!(symbols.try_get(key), Some(&(n as u64 + 11)));
+        }
+        assert_eq!(symbols.try_get(SymbolId(flat + 900 * block + 4)), Some(&42));
+        for absent in [
+            6,
+            flat - 2,
+            flat + 1,
+            flat + 64,
+            flat + 899 * block,
+            u32::MAX - 2,
+        ] {
+            assert!(!symbols.has(SymbolId(absent)), "{absent}");
+        }
+        assert_eq!(symbols.arena.len(), LINK_FLAT_IDS / LINK_PAGE_SIZE);
+        let far_entries: usize = symbols.files.iter().map(Vec::len).sum();
+        assert!(far_entries < 3 * (1 << LINK_BLOCK_SHIFT) / LINK_PAGE_SIZE);
     }
 }
 
