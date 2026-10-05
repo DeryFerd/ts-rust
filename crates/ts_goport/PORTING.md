@@ -467,13 +467,15 @@ The batch that adds it is not accepted until Theo approves.
   last build (Go `repopulateDiagnosticsOfFile`) points at the file
   versions of the build that made it, and Go prints it from them: the new
   snapshot holds them (`Snapshot::held_file_versions`). `tsc -b --watch`
-  (`Orchestrator::start`) does the same for the program of each task:
-  each cycle parses the files of each project that it builds again (Go
-  `resetCaches`), parse workers parse ahead only in the first build
-  (`BuildHost::prefetch`), a task keeps the versions that its errors
-  point at until its next build (`BuildTask::held_file_versions`), and a
-  bundled lib keeps its parse across cycles (not in Go; its
-  `lib_parse.bin` load leaks its nodes, so each cycle leaked them). Its parse holds it (`ParsedSourceFile::version`), and so
+  (`Orchestrator::start`) does the same for the program of each task. Go
+  parses every file of each project that it builds again in each cycle
+  (`resetCaches`); here a file keeps its parse while its modification time
+  does not change, no watch event names it and no build of the cycle
+  wrote it (`BuildHost::watch_source_file`, as Go `tsc --watch` keeps its
+  files), so a cycle parses only the changed files, on the loading thread:
+  parse workers parse ahead only in the first build (`BuildHost::prefetch`).
+  A task keeps the versions that its errors point at until its next build
+  (`BuildTask::held_file_versions`). Its parse holds it (`ParsedSourceFile::version`), and so
   do the `VersionTables` of each program version that has the file, so a
   seeded thread keeps it too. A thread that reads it pins it until the
   next program release (`release_file_version_pins`, run when a

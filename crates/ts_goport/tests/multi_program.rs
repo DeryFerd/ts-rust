@@ -708,15 +708,17 @@ fn watch_copied_errors_read_their_file_versions() {
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
 }
 
-/// watchfree1: `tsc -b --watch` parses every file of a project that it
-/// builds again in each cycle (Go `resetCaches`), and from the second cycle
-/// on each parse is a freeable file version. Four edits of `core/src/a.ts`
-/// build `core` (`a.ts` and `c.ts`) again each time. The output (times
-/// removed) equals `expected.txt`, the output of
+/// watchfree1: Go `tsc -b --watch` parses every file of a project that it
+/// builds again in each cycle (`resetCaches`). Here a file keeps its parse
+/// while it does not change (`BuildHost::watch_source_file`), and from the
+/// second cycle on a new parse is a freeable file version. Four edits of
+/// `core/src/a.ts` build `core` again each time, and parse only `a.ts`
+/// again. The output (times removed) equals `expected.txt`, the output of
 /// `tsgo-oracle-673a5f17d713 -b -w tsconfig.json --pretty false` for the
 /// same edits, and the outputs of `core` equal its outputs
-/// (`expected-out`). Each version dies but the last two, which the error
-/// of the last build of `core` holds (`BuildTask::held_file_versions`).
+/// (`expected-out`). Each version of `a.ts` dies but the last: its parse is
+/// kept, and the `c.ts` error of the last build points at it
+/// (`BuildTask::held_file_versions`).
 // PORT: no Go counterpart for the file versions; the output is Go's.
 #[test]
 fn watch_build_frees_file_versions() {
@@ -760,13 +762,9 @@ fn watch_build_frees_file_versions() {
     );
     let (made, dead) = file_version_counts(&stdout);
     assert_eq!(
-        made, 8,
-        "each build after the first parses a.ts and c.ts again"
-    );
-    assert_eq!(
-        dead,
-        made - 2,
-        "only the c.ts error of the last build holds versions"
+        (made, dead),
+        (4, 3),
+        "each build after the first parses a.ts again; the last a.ts version lives"
     );
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
 }
