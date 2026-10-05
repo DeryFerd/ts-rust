@@ -2131,7 +2131,7 @@ fn bind_files_parallel(lineage: &mut Lineage) {
     let (sender, receiver) = std::sync::mpsc::channel::<ParallelBind>();
     let complete = std::thread::scope(|scope| {
         for _ in 0..threads {
-            let seed = WorkerSeed::take();
+            let seed = WorkerSeed::take_unbuilt();
             let (files, order, queue, sender) = (&files, &order, &queue, sender.clone());
             // Go starts its threads on demand and fails the same way.
             crate::core::GoThread::new()
@@ -2205,6 +2205,13 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                 });
         }
         drop(sender);
+        // PERF (progstart1): the bind threads do not read the shared state
+        // that the program makes on first use (the symlink cache), so this
+        // thread builds it while they bind, not before they start. A later
+        // seed (the checker pool) finds it built. It took 3.6 to 5.7 ms of
+        // this thread before the first bind thread started (colyseus,
+        // outline, umami). Go builds it on first use (program.go:2300).
+        go_frontend::build_lazy_shared_state();
         // Join the files in order as they arrive.
         let mut pending = FxHashMap::default();
         let mut joined = 0;
@@ -3216,6 +3223,14 @@ impl WorkerSeed {
     pub(crate) fn take() -> Self {
         // The new thread cannot build them: it has no frontend program.
         go_frontend::build_lazy_shared_state();
+        Self::take_unbuilt()
+    }
+
+    /// `take` without building the shared state values that the program
+    /// makes on first use (`go_frontend::build_lazy_shared_state`), for a
+    /// thread that does not read them (a bind thread). The caller builds them
+    /// before it seeds any other thread.
+    fn take_unbuilt() -> Self {
         Self {
             program: prog(),
             tables: current_tables(),
