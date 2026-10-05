@@ -1525,19 +1525,25 @@ mod tests {
         assert!(queue.wait_or_take(1, &mut stats));
         assert_eq!((stats.waited, stats.slept), (1, 0));
 
-        // Key 2 stays with a worker for 20 ms: the loader spins, then
-        // sleeps until the worker ends it.
+        // Key 2 stays with a worker until the loader sleeps: the loader
+        // spins, then sleeps until the worker ends it. The worker waits for
+        // the loader's `waiting` mark, which the loader sets only after the
+        // spin, so the order does not depend on the host's load. The 5 ms
+        // after the mark is the least time that the wait can count.
         assert_eq!(queue.take_next().map(|(index, _)| index), Some(2));
         let worker = {
             let queue = queue.clone();
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                while queue.waiting.load(std::sync::atomic::Ordering::SeqCst) != 2 {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
                 queue.done(2);
             })
         };
         assert!(queue.wait_or_take(2, &mut stats));
         worker.join().unwrap();
         assert_eq!((stats.waited, stats.slept), (2, 1));
-        assert!(stats.wait_ns >= 10_000_000, "{stats:?}");
+        assert!(stats.wait_ns >= 5_000_000, "{stats:?}");
     }
 }
