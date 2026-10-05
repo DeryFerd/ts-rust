@@ -2,7 +2,7 @@
 //! Unicode 17.0.0 tables of `unicode_tables`. The Rust `char` methods use
 //! the tables of the Rust version, which can be newer or older.
 
-use super::unicode_tables::{CASE_RANGES, CaseRange, LL, LU, Range16, Range32, RangeTable};
+use super::unicode_tables::{CASE_RANGES, CaseRange, LL, LU, ND, Range16, Range32, RangeTable};
 
 // Go: unicode/letter.go:10 MaxRune
 const MAX_RUNE: i32 = 0x10FFFF;
@@ -131,6 +131,17 @@ pub fn is_lower(r: char) -> bool {
         return matches!(r, 0x61..=0x7A | 0xB5 | 0xDF..=0xF6 | 0xF8..=0xFF);
     }
     is_excluding_latin(&LL, r)
+}
+
+// Go: unicode/digit.go:8 IsDigit
+/// IsDigit reports whether the rune is a decimal digit (Go `Digit` is
+/// `_Nd`).
+pub fn is_digit(r: char) -> bool {
+    let r = u32::from(r);
+    if r <= MAX_LATIN1 {
+        return matches!(r, 0x30..=0x39);
+    }
+    is_excluding_latin(&ND, r)
 }
 
 // Go: unicode/letter.go:211 lookupCaseRange
@@ -262,6 +273,23 @@ mod tests {
         let lower = || (0..=0x10FFFF).filter(|&r| char::from_u32(r).is_some_and(is_lower));
         assert_eq!(lower().count(), 2283);
         assert_eq!(lower().map(u64::from).sum::<u64>(), 107_102_796);
+    }
+
+    // Go IsDigit at go1.27.1 (Unicode 17.0.0): U+10D40 (Garay) and U+1CCF0
+    // (outlined digits) are Nd from Unicode 16.0. U+00B2 is No and U+2160
+    // is Nl. The count and the sum are Go's (followups24 isdigit-go.txt);
+    // the old Unicode 15.0.0 hand table in ls/completions_p2.rs had 680.
+    #[test]
+    fn is_digit_uses_unicode_17() {
+        for c in "09\u{660}\u{FF10}\u{10D40}\u{10D49}\u{1CCF0}\u{1CCF9}\u{1D7CE}".chars() {
+            assert!(is_digit(c), "{c:?}");
+        }
+        for c in "a\u{B2}\u{B9}\u{2160}\u{FFFD}\u{1D7CD}".chars() {
+            assert!(!is_digit(c), "{c:?}");
+        }
+        let digits = || (0..=0x10FFFF).filter(|&r| char::from_u32(r).is_some_and(is_digit));
+        assert_eq!(digits().count(), 770);
+        assert_eq!(digits().map(u64::from).sum::<u64>(), 40_623_335);
     }
 
     // Go uses the simple mapping of Unicode 17.0.0: U+0130 lowers to 'i',
