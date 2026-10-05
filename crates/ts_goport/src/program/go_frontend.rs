@@ -23,7 +23,7 @@ use crate::frontend::tspath;
 use crate::frontend::tspath::Path as GoPath;
 use crate::frontend::vfs::{Fs, osvfs_fs};
 use rustc_hash::FxHashSet;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 /// Thread-safe copies of the Go frontend data that checker code reads.
 /// Built once on the loading thread, before any checker exists.
@@ -360,17 +360,6 @@ thread_local! {
     // version publishes its store before the api request encodes it.
     static PUBLISHED_OUTSIDE: RefCell<FxHashMap<usize, &'static Rc<ParsedSourceFile>>> =
         RefCell::new(FxHashMap::default());
-
-    /// The freeable parses of `PARSED_UNPUBLISHED` that a publish gave no
-    /// program, by store id (`go_files_of_unpublished_stores`). The entry
-    /// is weak, so it does not keep the file version alive. Its holders do:
-    /// the parse cache entry and, for an api `createSourceFile`, the lease.
-    // PORT: editfuzz4 G2 (csfree1). Go `api/encoder/encoder.go:596` reads
-    // `ParseOptions()` from the leased `*ast.SourceFile` of
-    // `project/snapshothost.go:55 AcquireSourceFile`. In a language server
-    // that parse is a freeable version when the server loaded its path.
-    static FREEABLE_OUTSIDE: RefCell<FxHashMap<usize, Weak<ParsedSourceFile>>> =
-        RefCell::new(FxHashMap::default());
 }
 
 /// `note_parsed_source_file` (program.rs).
@@ -386,17 +375,12 @@ pub(super) fn unpublished_parsed_source_file(store: usize) -> Option<Rc<ParsedSo
     PARSED_UNPUBLISHED.with(|parsed| parsed.borrow().get(&store).cloned())
 }
 
-/// The parse of published store `store`: a file parsed on this thread
-/// outside a program load (`note_parsed_source_file`) that a publish gave
-/// no program. A static parse is kept for good. A freeable file version is
-/// found while a holder keeps it alive (`FREEABLE_OUTSIDE`). None for any
-/// other store.
+/// The parse of store `store` that a publish kept for good: a file parsed
+/// on this thread outside a program load (`note_parsed_source_file`) that
+/// a publish gave no program. None for any other store, and for a freeable
+/// file version (`go_files_of_unpublished_stores` keeps no parse of it).
 pub(super) fn published_outside_parsed_source_file(store: usize) -> Option<Rc<ParsedSourceFile>> {
-    PUBLISHED_OUTSIDE
-        .with(|kept| kept.borrow().get(&store).map(|&file| Rc::clone(file)))
-        .or_else(|| {
-            FREEABLE_OUTSIDE.with(|freeable| freeable.borrow().get(&store).and_then(Weak::upgrade))
-        })
+    PUBLISHED_OUTSIDE.with(|kept| kept.borrow().get(&store).map(|&file| Rc::clone(file)))
 }
 
 /// `publish_parsed_files` (program.rs).
@@ -489,7 +473,6 @@ fn go_files_of_unpublished_stores(
     // `files[i]` is the GoFile of store `unpublished_file_ids().start + i`.
     let stores = unpublished_file_ids();
     let mut files = Vec::with_capacity(stores.len());
-    let mut freeable_outside = Vec::new();
     for store in stores {
         // PERF: the `SourceFileInfo` of a static file borrows lists of the
         // parse. A static published file is never freed, so its parse is
@@ -502,20 +485,16 @@ fn go_files_of_unpublished_stores(
         // instead, which are freed with the version (M3b). A freeable parse
         // can also be outside a program load (`is_outside`): the parse
         // cache notes its parses in `PARSED_UNPUBLISHED`. It also gets
-        // `KeptLists::copied` and no `PUBLISHED_OUTSIDE` entry: a kept parse
-        // would leak the version. It gets a weak `FREEABLE_OUTSIDE` entry
-        // instead, so `parsed_source_file` finds it while it lives (bump B
-        // kept every outside parse). Only a static outside parse goes to
-        // `PUBLISHED_OUTSIDE`.
+        // `KeptLists::copied` and no `PUBLISHED_OUTSIDE` entry, so after
+        // its publish `parsed_source_file` returns None for it (bump B kept
+        // every outside parse). That is correct: keeping it would leak the
+        // version. Only a static outside parse goes to `PUBLISHED_OUTSIDE`.
         let is_outside = !parsed.contains_key(&store);
         let file = parsed.get(&store).copied().or_else(|| outside.get(&store));
         let info = match file {
             Some(file) => {
                 crate::ast::note_published_path(&file.path().0);
                 let lists = if file.version.get().is_some() {
-                    if is_outside {
-                        freeable_outside.push((store, Rc::downgrade(file)));
-                    }
                     KeptLists::copied(file)
                 } else {
                     let kept: &'static Rc<ParsedSourceFile> = Box::leak(Box::new(Rc::clone(file)));
@@ -539,15 +518,6 @@ fn go_files_of_unpublished_stores(
             node_bind: OnceLock::new(),
             file_bind: OnceLock::new(),
             flow_nodes: OnceLock::new(),
-        });
-    }
-    if !freeable_outside.is_empty() {
-        // The entries of dead versions go first, so the table holds about
-        // the live ones.
-        FREEABLE_OUTSIDE.with(|freeable| {
-            let mut freeable = freeable.borrow_mut();
-            freeable.retain(|_, file| file.strong_count() > 0);
-            freeable.extend(freeable_outside);
         });
     }
     files

@@ -49,10 +49,20 @@ pub struct SourceFileLease {
 
 impl SourceFileLease {
     // Go: project/snapshothost.go:41 SourceFileLease.SourceFile
-    // PORT: Go returns the `*ast.SourceFile`; the port returns its root node,
-    // which the API encoder takes.
+    // PORT: Go returns the `*ast.SourceFile`. This is its root node; the
+    // whole file is `parsed_source_file`.
     pub fn source_file(&self) -> Node {
         self.source_file.root
+    }
+
+    // PORT: the whole file of Go `SourceFile()` (project/snapshothost.go:41):
+    // the leased parse, with the Go `SourceFile` fields that are not on the
+    // root node (`Hash`, `ParseOptions()`). The API encoder reads them here
+    // (`encoder::encode_parsed_source_file`), as Go reads them from the
+    // leased file. A lookup by the root node fails once the program that
+    // loaded the file is released, while the lease still holds it.
+    pub fn parsed_source_file(&self) -> &Rc<parser::ParsedSourceFile> {
+        &self.source_file
     }
 
     // Go: project/snapshothost.go:45 SourceFileLease.Release
