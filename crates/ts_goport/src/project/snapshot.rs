@@ -87,7 +87,7 @@ impl Snapshot {
     }
 }
 
-// Go: project/snapshot.go:97 (*Snapshot).LSPLineMap, as a function of the
+// Go: project/snapshot.go:218 (*Snapshot).LSPLineMap, as a function of the
 // snapshot's file system.
 // PORT: Go gives NewConverters the method value `s.LSPLineMap`, which keeps
 // the snapshot alive. `s.fs` never changes after NewSnapshot, so the port's

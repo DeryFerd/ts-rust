@@ -250,7 +250,7 @@ impl vfs::Fs for CachedLayeredFileSystem {
     }
 }
 
-// Go: project/snapshotfs.go:34 realpathAliasSet
+// Go: project/snapshotfs.go:71 realpathAliasSet
 // realpathAliasSet is a thread-safe set of symlink paths that alias a single realpath.
 // It implements dirty.Cloneable so it can be used as a value in dirty.SyncMap.
 // PORT: `mu` is dropped. Go `*realpathAliasSet` is `Rc<RefCell<..>>`.
@@ -260,12 +260,12 @@ pub struct RealpathAliasSet {
 }
 
 impl RealpathAliasSet {
-    // Go: project/snapshotfs.go:39 realpathAliasSet.Add
+    // Go: project/snapshotfs.go:76 realpathAliasSet.Add
     pub fn add(&mut self, path: tspath::Path) {
         self.paths.insert(path);
     }
 
-    // Go: project/snapshotfs.go:45 realpathAliasSet.Clone
+    // Go: project/snapshotfs.go:82 realpathAliasSet.Clone
     // PORT: Go `Clone`; `clone_` keeps it apart from `std::clone::Clone`.
     pub fn clone_(&self) -> Rc<RefCell<RealpathAliasSet>> {
         let mut clone = RealpathAliasSet::default();
@@ -306,7 +306,7 @@ pub struct SnapshotFS {
 pub type MemoizedCachedFile = Rc<dyn Fn() -> Option<Rc<dyn FileHandle>>>;
 
 impl SnapshotFS {
-    // Go: project/snapshotfs.go:489 SnapshotFS.expandRealpathAliases
+    // Go: project/snapshotfs.go:578 SnapshotFS.expandRealpathAliases
     // expandRealpathAliases adds synthetic URIs to the Changed and Deleted sets for
     // files that were accessed through node_modules symlinks. When a watch event arrives
     // using a realpath, this expands it to include the symlink-based path so that
@@ -512,7 +512,7 @@ pub fn new_snapshot_fs_builder_from_source(
     })
 }
 
-// Go: project/snapshotfs.go:227 onDeletedFileOrDirectory (a closure in Finalize)
+// Go: project/snapshotfs.go:238 onDeletedFileOrDirectory (a closure in Finalize)
 // PORT: the recursive Go closure is a nested function over the map it reads.
 fn on_deleted_file_or_directory(
     cache_directories: &dirty::Map<tspath::Path, CachedDirectory>,
@@ -534,7 +534,7 @@ fn on_deleted_file_or_directory(
 }
 
 impl SnapshotFSBuilder {
-    // Go: project/snapshotfs.go:197 snapshotFSBuilder.Finalize
+    // Go: project/snapshotfs.go:208 snapshotFSBuilder.Finalize
     pub fn finalize(&self) -> (Rc<SnapshotFS>, bool) {
         // Synchronize directory structure based on added and deleted cache entries.
         let mut deleted: Option<FxHashMap<tspath::Path, Option<Rc<RefCell<CachedFile>>>>> = None;
@@ -645,7 +645,7 @@ impl SnapshotFSBuilder {
         )
     }
 
-    // Go: project/snapshotfs.go:306 snapshotFSBuilder.deleteCacheEntry (ts#64291)
+    // Go: project/snapshotfs.go:305 snapshotFSBuilder.deleteCacheEntry (ts#64291)
     pub fn delete_cache_entry(
         &self,
         entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>>,
@@ -660,7 +660,7 @@ impl SnapshotFSBuilder {
         entry.delete();
     }
 
-    // Go: project/snapshotfs.go:345 snapshotFSBuilder.cacheSourceFile (ts#64291)
+    // Go: project/snapshotfs.go:348 snapshotFSBuilder.cacheSourceFile (ts#64291)
     pub fn cache_source_file(
         &self,
         file_name: &str,
@@ -677,7 +677,7 @@ impl SnapshotFSBuilder {
         self.reload_entry_if_needed(&entry)
     }
 
-    // Go: project/snapshotfs.go:359 snapshotFSBuilder.getCachedFile (ts#64291: was getDiskFile)
+    // Go: project/snapshotfs.go:361 snapshotFSBuilder.getCachedFile (ts#64291: was getDiskFile)
     pub fn get_cached_file(
         &self,
         file_name: &str,
@@ -707,7 +707,7 @@ impl SnapshotFSBuilder {
         None
     }
 
-    // Go: project/snapshotfs.go:349 snapshotFSBuilder.recordRealpathAlias
+    // Go: project/snapshotfs.go:378 snapshotFSBuilder.recordRealpathAlias
     // recordRealpathAlias checks if fileName is accessed through a symlink and, if so,
     // records a mapping from the realpath-based key to the symlink-based key.
     // This is only called for files inside node_modules where symlinks are common.
@@ -735,7 +735,7 @@ impl SnapshotFSBuilder {
         }
     }
 
-    // Go: project/snapshotfs.go:363 snapshotFSBuilder.reloadEntry
+    // Go: project/snapshotfs.go:392 snapshotFSBuilder.reloadEntry
     pub fn reload_entry(
         &self,
         entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>>,
@@ -770,7 +770,7 @@ impl SnapshotFSBuilder {
         Some(value)
     }
 
-    // Go: project/snapshotfs.go:395 snapshotFSBuilder.reloadEntryIfNeeded
+    // Go: project/snapshotfs.go:424 snapshotFSBuilder.reloadEntryIfNeeded
     pub fn reload_entry_if_needed(
         &self,
         entry: &Rc<dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>>,
@@ -844,7 +844,7 @@ impl SnapshotFSBuilder {
         false
     }
 
-    // Go: project/snapshotfs.go:448 snapshotFSBuilder.invalidateCache
+    // Go: project/snapshotfs.go:483 snapshotFSBuilder.invalidateCache
     pub fn invalidate_cache(&self) {
         self.cache_files.range(&mut |entry: &Rc<
             dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>,
@@ -856,7 +856,7 @@ impl SnapshotFSBuilder {
         });
     }
 
-    // Go: project/snapshotfs.go:457 snapshotFSBuilder.invalidateNodeModulesCache
+    // Go: project/snapshotfs.go:492 snapshotFSBuilder.invalidateNodeModulesCache
     pub fn invalidate_node_modules_cache(&self) {
         self.cache_files.range(&mut |entry: &Rc<
             dirty::SyncMapEntry<tspath::Path, Rc<RefCell<CachedFile>>>,
@@ -870,7 +870,7 @@ impl SnapshotFSBuilder {
         });
     }
 
-    // Go: project/snapshotfs.go:480 snapshotFSBuilder.markDirtyFiles
+    // Go: project/snapshotfs.go:503 snapshotFSBuilder.markDirtyFiles
     // PORT: Go reloads the changed disk files in a work group; the port
     // reloads them one after another (one thread). The result is a set, so
     // the order does not matter.
@@ -904,7 +904,7 @@ impl SnapshotFSBuilder {
         change
     }
 
-    // Go: project/snapshotfs.go:517 snapshotFSBuilder.reloadEntryIfContentChanged
+    // Go: project/snapshotfs.go:540 snapshotFSBuilder.reloadEntryIfContentChanged
     // PORT: Go named result `(changed bool)`.
     pub fn reload_entry_if_content_changed(
         &self,
@@ -1088,7 +1088,7 @@ impl SnapshotFSBuilder {
         }
     }
 
-    // Go: project/snapshotfs.go:735 snapshotFSBuilder.convertOpenAndCloseToChanges
+    // Go: project/snapshotfs.go:734 snapshotFSBuilder.convertOpenAndCloseToChanges
     pub fn convert_open_and_close_to_changes(
         &self,
         mut change: FileChangeSummary,
@@ -1138,13 +1138,13 @@ impl SnapshotFSBuilder {
 
 // Go: project/snapshotfs.go:65 `_ FileSource = (*snapshotFSBuilder)(nil)`
 impl FileHandleSource for SnapshotFSBuilder {
-    // Go: project/snapshotfs.go:301 snapshotFSBuilder.GetFile
+    // Go: project/snapshotfs.go:300 snapshotFSBuilder.GetFile
     fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>> {
         let path = (self.to_path)(file_name);
         self.get_file_by_path(file_name, &path)
     }
 
-    // Go: project/snapshotfs.go:326 snapshotFSBuilder.GetFileByPath
+    // Go: project/snapshotfs.go:325 snapshotFSBuilder.GetFileByPath
     fn get_file_by_path(&self, file_name: &str, path: &tspath::Path) -> Option<Rc<dyn FileHandle>> {
         if let (Some(entry), true) = self.cache_files.load(path) {
             return self.reload_entry_if_needed(&entry);
@@ -1163,7 +1163,7 @@ impl FileSource for SnapshotFSBuilder {
         self.fs.clone()
     }
 
-    // Go: project/snapshotfs.go:313 snapshotFSBuilder.FileExists
+    // Go: project/snapshotfs.go:312 snapshotFSBuilder.FileExists
     fn file_exists(&self, file_name: &str, path: &tspath::Path) -> bool {
         if let (Some(entry), true) = self.cache_files.load(path) {
             let val = entry.value();
@@ -1177,7 +1177,7 @@ impl FileSource for SnapshotFSBuilder {
         self.fs.file_exists(file_name)
     }
 
-    // Go: project/snapshotfs.go:337 snapshotFSBuilder.GetAccessibleEntries
+    // Go: project/snapshotfs.go:336 snapshotFSBuilder.GetAccessibleEntries
     fn get_accessible_entries(&self, path: &str) -> vfs::Entries {
         let lower_entries = self.fs.get_accessible_entries(path);
         let (directory, ok) = self.cache_directories.get(&(self.to_path)(path));
@@ -1304,7 +1304,7 @@ impl SnapshotFSBuilder {
     }
 }
 
-// Go: project/snapshotfs.go:616 isRelevantExtension
+// Go: project/snapshotfs.go:639 isRelevantExtension
 // isRelevantExtension returns true if the given extension is a known TypeScript
 // or JavaScript extension that can affect the project.
 pub fn is_relevant_extension(ext: &str) -> bool {
@@ -1314,7 +1314,7 @@ pub fn is_relevant_extension(ext: &str) -> bool {
     )
 }
 
-// Go: project/snapshotfs.go:665 isNodeModulesPath
+// Go: project/snapshotfs.go:688 isNodeModulesPath
 // isNodeModulesPath reports whether path is a node_modules directory itself or
 // lives inside one. Used to preserve node_modules watch deletions, whose package
 // files are read transiently and therefore never tracked in cacheDirectories.
@@ -1342,7 +1342,7 @@ pub fn has_open_file_within(
     false
 }
 
-// Go: project/snapshotfs.go:643 sourceFS
+// Go: project/snapshotfs.go:769 sourceFS
 // sourceFS is a vfs.FS that sources files from a FileSource and tracks seen files.
 // PORT: Go `*sourceFS` is shared (`Rc<SourceFS>`, also as `Rc<dyn vfs::Fs>`).
 // Go writes `tracking`, `seenFiles` and `source` after sharing, so they are
@@ -1355,7 +1355,7 @@ pub struct SourceFS {
     pub source: RefCell<Rc<dyn FileSource>>,
 }
 
-// Go: project/snapshotfs.go:651 newSourceFS
+// Go: project/snapshotfs.go:777 newSourceFS
 pub fn new_source_fs(
     tracking: bool,
     source: Rc<dyn FileSource>,
@@ -1382,7 +1382,7 @@ impl SourceFS {
         self.source.borrow().clone()
     }
 
-    // Go: project/snapshotfs.go:666 sourceFS.DisableTracking
+    // Go: project/snapshotfs.go:792 sourceFS.DisableTracking
     pub fn disable_tracking(&self) {
         self.tracking.set(false);
     }
@@ -1403,7 +1403,7 @@ impl SourceFS {
         f()
     }
 
-    // Go: project/snapshotfs.go:670 sourceFS.Track
+    // Go: project/snapshotfs.go:796 sourceFS.Track
     pub fn track(&self, file_name: &str) {
         if !self.tracking.get() {
             return;
@@ -1417,7 +1417,7 @@ impl SourceFS {
             .insert(path);
     }
 
-    // Go: project/snapshotfs.go:677 sourceFS.SeenFile
+    // Go: project/snapshotfs.go:803 sourceFS.SeenFile
     pub fn seen_file(&self, path: &tspath::Path) -> bool {
         let seen_files = self.seen_files.borrow();
         let Some(seen_files) = seen_files.as_ref() else {
@@ -1427,7 +1427,7 @@ impl SourceFS {
         seen
     }
 
-    // Go: project/snapshotfs.go:684 sourceFS.SeenFileOrMissingParentDirectory
+    // Go: project/snapshotfs.go:810 sourceFS.SeenFileOrMissingParentDirectory
     pub fn seen_file_or_missing_parent_directory(&self, path: &tspath::Path) -> bool {
         if let Some(seen_files) = self.seen_files.borrow().as_ref() {
             if seen_files.borrow().contains(path) {
@@ -1454,13 +1454,13 @@ impl SourceFS {
         false
     }
 
-    // Go: project/snapshotfs.go:704 sourceFS.GetFile
+    // Go: project/snapshotfs.go:830 sourceFS.GetFile
     pub fn get_file(&self, file_name: &str) -> Option<Rc<dyn FileHandle>> {
         self.track(file_name);
         self.source().get_file(file_name)
     }
 
-    // Go: project/snapshotfs.go:709 sourceFS.GetFileByPath
+    // Go: project/snapshotfs.go:835 sourceFS.GetFileByPath
     pub fn get_file_by_path(
         &self,
         file_name: &str,
@@ -1576,7 +1576,7 @@ impl FileSource for ReleasedFileSource {
 
 // Go: project/snapshotfs.go:664 `var _ vfs.FS = (*sourceFS)(nil)`
 impl vfs::Fs for SourceFS {
-    // Go: project/snapshotfs.go:753 sourceFS.UseCaseSensitiveFileNames
+    // Go: project/snapshotfs.go:879 sourceFS.UseCaseSensitiveFileNames
     // UseCaseSensitiveFileNames implements vfs.FS.
     fn use_case_sensitive_file_names(&self) -> bool {
         // PORT: through the source, so a released source can answer it
@@ -1584,7 +1584,7 @@ impl vfs::Fs for SourceFS {
         self.source().use_case_sensitive_file_names()
     }
 
-    // Go: project/snapshotfs.go:724 sourceFS.FileExists
+    // Go: project/snapshotfs.go:850 sourceFS.FileExists
     // FileExists implements vfs.FS.
     fn file_exists(&self, path: &str) -> bool {
         // PORT: Go makes the path twice (`Track` and the source call); the
@@ -1594,7 +1594,7 @@ impl vfs::Fs for SourceFS {
         self.source().file_exists(path, &file_path)
     }
 
-    // Go: project/snapshotfs.go:735 sourceFS.ReadFile
+    // Go: project/snapshotfs.go:861 sourceFS.ReadFile
     // ReadFile implements vfs.FS.
     fn read_file(&self, path: &str) -> (String, bool) {
         if let Some(fh) = self.get_file(path) {
@@ -1603,25 +1603,25 @@ impl vfs::Fs for SourceFS {
         (String::new(), false)
     }
 
-    // Go: project/snapshotfs.go:763 sourceFS.WriteFile
+    // Go: project/snapshotfs.go:884 sourceFS.WriteFile
     // WriteFile implements vfs.FS.
     fn write_file(&self, _path: &str, _data: &str) -> Result<(), vfs::FsError> {
         crate::core::go_panic("unimplemented".to_string());
     }
 
-    // Go: project/snapshotfs.go:768 sourceFS.AppendFile
+    // Go: project/snapshotfs.go:889 sourceFS.AppendFile
     // AppendFile implements vfs.FS.
     fn append_file(&self, _path: &str, _data: &str) -> Result<(), vfs::FsError> {
         crate::core::go_panic("unimplemented".to_string());
     }
 
-    // Go: project/snapshotfs.go:773 sourceFS.Remove
+    // Go: project/snapshotfs.go:894 sourceFS.Remove
     // Remove implements vfs.FS.
     fn remove(&self, _path: &str) -> Result<(), vfs::FsError> {
         crate::core::go_panic("unimplemented".to_string());
     }
 
-    // Go: project/snapshotfs.go:778 sourceFS.Chtimes
+    // Go: project/snapshotfs.go:899 sourceFS.Chtimes
     // Chtimes implements vfs.FS.
     fn chtimes(
         &self,
@@ -1632,7 +1632,7 @@ impl vfs::Fs for SourceFS {
         crate::core::go_panic("unimplemented".to_string());
     }
 
-    // Go: project/snapshotfs.go:715 sourceFS.DirectoryExists
+    // Go: project/snapshotfs.go:841 sourceFS.DirectoryExists
     // DirectoryExists implements vfs.FS.
     fn directory_exists(&self, path: &str) -> bool {
         let exists = self.source().fs().directory_exists(path);
@@ -1646,19 +1646,19 @@ impl vfs::Fs for SourceFS {
         exists
     }
 
-    // Go: project/snapshotfs.go:730 sourceFS.GetAccessibleEntries
+    // Go: project/snapshotfs.go:856 sourceFS.GetAccessibleEntries
     // GetAccessibleEntries implements vfs.FS.
     fn get_accessible_entries(&self, path: &str) -> vfs::Entries {
         self.source().get_accessible_entries(path)
     }
 
-    // Go: project/snapshotfs.go:748 sourceFS.Stat
+    // Go: project/snapshotfs.go:874 sourceFS.Stat
     // Stat implements vfs.FS.
     fn stat(&self, path: &str) -> Option<vfs::FileInfo> {
         self.source().fs().stat(path)
     }
 
-    // Go: project/snapshotfs.go:743 sourceFS.Realpath
+    // Go: project/snapshotfs.go:869 sourceFS.Realpath
     // Realpath implements vfs.FS.
     fn realpath(&self, path: &str) -> String {
         self.source().fs().realpath(path)

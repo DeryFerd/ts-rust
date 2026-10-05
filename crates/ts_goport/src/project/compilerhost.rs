@@ -20,7 +20,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 use xxhash_rust::xxh3::xxh3_128;
 
-// Go: project/compilerhost.go:16 compilerHost
+// Go: project/compilerhost.go:21 compilerHost
 pub struct CompilerHost {
     pub config_file_path: tspath::Path,
     pub current_directory: String,
@@ -133,7 +133,7 @@ impl ResolveAheadStash {
     }
 }
 
-// Go: project/compilerhost.go:29 newCompilerHost
+// Go: project/compilerhost.go:36 newCompilerHost
 // PORT: reads `project.configFilePath`, so the caller must not hold a
 // mutable borrow of `project` during this call. The host keeps its own
 // `Rc`s of `project` and `builder` until `freeze`.
@@ -210,7 +210,7 @@ impl Drop for CompilerHost {
 }
 
 impl CompilerHost {
-    // Go: project/compilerhost.go:50 compilerHost.freeze
+    // Go: project/compilerhost.go:57 compilerHost.freeze
     // freeze clears references to mutable state to make the compilerHost safe for use
     // after the snapshot has been finalized. See the usage in snapshot.go for more details.
     pub fn freeze(
@@ -235,7 +235,7 @@ impl CompilerHost {
         drop(logger);
     }
 
-    // Go: project/compilerhost.go:62 compilerHost.ensureAlive
+    // Go: project/compilerhost.go:69 compilerHost.ensureAlive
     pub fn ensure_alive(&self) {
         if self.builder.borrow().is_none() || self.project.borrow().is_none() {
             crate::core::go_panic(
@@ -247,13 +247,13 @@ impl CompilerHost {
 
 // Go: project/compilerhost.go:14 `var _ compiler.CompilerHost = (*compilerHost)(nil)`
 impl compiler::CompilerHost for CompilerHost {
-    // Go: project/compilerhost.go:69 compilerHost.DefaultLibraryPath
+    // Go: project/compilerhost.go:76 compilerHost.DefaultLibraryPath
     // DefaultLibraryPath implements compiler.CompilerHost.
     fn default_library_path(&self) -> String {
         self.session_options.default_library_path.clone()
     }
 
-    // Go: project/compilerhost.go:74 compilerHost.FS
+    // Go: project/compilerhost.go:81 compilerHost.FS
     // FS implements compiler.CompilerHost.
     fn fs(&self) -> Rc<dyn vfs::Fs> {
         self.source_fs.clone()
@@ -265,13 +265,13 @@ impl compiler::CompilerHost for CompilerHost {
         self.source_fs.without_tracking(f);
     }
 
-    // Go: project/compilerhost.go:79 compilerHost.GetCurrentDirectory
+    // Go: project/compilerhost.go:86 compilerHost.GetCurrentDirectory
     // GetCurrentDirectory implements compiler.CompilerHost.
     fn get_current_directory(&self) -> String {
         self.current_directory.clone()
     }
 
-    // Go: project/compilerhost.go:84 compilerHost.GetResolvedProjectReference
+    // Go: project/compilerhost.go:91 compilerHost.GetResolvedProjectReference
     // GetResolvedProjectReference implements compiler.CompilerHost.
     fn get_resolved_project_reference(
         &self,
@@ -302,7 +302,7 @@ impl compiler::CompilerHost for CompilerHost {
         }
     }
 
-    // Go: project/compilerhost.go:96 compilerHost.GetSourceFile
+    // Go: project/compilerhost.go:103 compilerHost.GetSourceFile
     // GetSourceFile implements compiler.CompilerHost. Files are cached in parseCache
     // and acquired immediately for the in-progress program.
     // PORT: the parse cache holds `HashedSourceFile` (the file and Go's
@@ -324,7 +324,7 @@ impl compiler::CompilerHost for CompilerHost {
         None
     }
 
-    // Go: project/compilerhost.go:112 compilerHost.GetContentMappedSourceFiles (tsgo#4712)
+    // Go: project/compilerhost.go:113 compilerHost.GetContentMappedSourceFiles (tsgo#4712)
     // GetContentMappedSourceFile implements compiler.CompilerHost.
     // PORT: a file that cannot be read is `Ok` with no canonical file (Go
     // returns the zero value and a nil error). Go `file.Hash = key.Hash` is
@@ -437,7 +437,7 @@ impl compiler::CompilerHost for CompilerHost {
         self.content_mapper_project.borrow().clone()
     }
 
-    // Go: project/compilerhost.go:106 compilerHost.Trace
+    // Go: project/compilerhost.go:172 compilerHost.Trace
     // Trace implements compiler.CompilerHost.
     fn trace(&self, msg: &'static crate::diagnostics::Message, args: Vec<String>) {
         let logger = self.logger.borrow().clone();
