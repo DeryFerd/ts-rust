@@ -1767,6 +1767,11 @@ mod hole_tests {
 /// (zod MT: about 3,200 such faults per run). One store per 4 KiB page,
 /// and one on the last element, makes the first touch a write. Linux only:
 /// it was measured only there, and wasm has no page faults.
+// PERF: `inline(never)`, so a call site stays as small as the `vec!` call it
+// replaces. Inlined, the check and the loop made `Table::push` (through
+// `reindex` and `empty_index`) too large to inline into its callers, and zod
+// ST ran 0.55% more instructions.
+#[inline(never)]
 pub fn zeroed_vec<T: Copy + Default>(len: usize) -> Vec<T> {
     let mut vec = vec![T::default(); len];
     if cfg!(target_os = "linux") && size_of_val(vec.as_slice()) >= 16 << 10 {
