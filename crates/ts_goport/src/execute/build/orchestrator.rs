@@ -475,6 +475,19 @@ impl Orchestrator {
     // Go: build/orchestrator.go:252 (*Orchestrator).GenerateGraphReusingOldTasks
     pub fn generate_graph_reusing_old_tasks(&mut self) {
         let tasks = std::mem::take(&mut self.tasks);
+        // PORT: Go appends to the `downStream` of a reused task in each new
+        // graph (`setupBuildTask`), so the list keeps the downstream tasks
+        // of every older graph, and those keep their upstream tasks. Here
+        // that is an `Rc` cycle: each config change of a downstream project
+        // kept its old task (about 0.5 MiB for query-persist-client-core in
+        // `tsc -b -w`) for the rest of the session. So the lists are cleared,
+        // and `setup_build_task` fills them again from the new graph. The
+        // output does not change: a task of an older graph is not built
+        // again, and `update_downstream` gives a task that a list has twice
+        // the same status as one update.
+        for task in tasks.values() {
+            task.borrow_mut().down_stream.clear();
+        }
         self.order = Vec::new();
         self.errors = Vec::new();
         self.generate_graph(Some(&tasks));
