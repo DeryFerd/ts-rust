@@ -1,5 +1,6 @@
-//! Go `net/netip` subset (go1.26.8 `src/net/netip/netip.go`,
-//! `src/net/netip/uint128.go`; identical in go1.26.4): `ParseAddr` and
+//! Go `net/netip` subset (go1.27.1 `src/net/netip/netip.go`,
+//! `src/net/netip/uint128.go`; the ported functions are the same as in
+//! go1.26.8): `ParseAddr` and
 //! `Addr.Is4`, which `net/url` `parseHost` calls, and what they call. Other
 //! `net/netip` functions are not ported.
 //!

@@ -6,7 +6,7 @@
 // every run. On POSIX this script rewrites the bin as a sh and JS polyglot:
 //
 //   #!/bin/sh
-//   ":" //; p=$0; ...; exec "${p%/*}/../../@typescript/typescript-linux-x64/lib/tsc" "$@"
+//   ":" //; p=$0; ...; t="${p%/*}/../../@typescript/typescript-linux-x64/lib/tsc"; ...; exec "$t" "$@"
 //   import "../lib/tsc.js";
 //
 // sh (the shebang, npm's .bin symlink, pnpm's shim) runs line 2, where `":" //` is the no-op `:`.
@@ -15,6 +15,12 @@
 // process.execPath) reads line 2 as a string and a comment and runs line 3, Go's launcher, as
 // with Go. The exec path keeps the real path of the native tsc in the platform package, where it
 // reads the lib files (Go's noembed build).
+//
+// The relative path is fixed at install. pnpm keeps the result of a postinstall in its store (the
+// side-effects cache) and gives it to a later install of the same package in another layout
+// (hoisted, isolated or the global virtual store), where the path can name no file. Then sh does
+// not find an executable there and runs this file with Node (`exec node "$p"`), which runs Go's
+// launcher, as with Go.
 //
 // To find the real dir, sh first tries npm's node_modules/.bin/tsc link, with no fork: when $0 is
 // a symlink and ../typescript/bin/tsc from its dir (npm's link target) is the same file (test
@@ -69,12 +75,24 @@ function useNativeBin() {
         "else case $p in */*) ;; *) p=./$p ;; esac",
         'while [ -L "$p" ]; do t=$(readlink "$p"); case $t in /*) p=$t ;; *) p=${p%/*}/$t ;; esac; done; fi',
     ].join("; ");
-    const polyglot = `#!/bin/sh\n":" //; ${resolve}; exec "\${p%/*}/${target}" "$@"\nimport "../lib/tsc.js";\n`;
+    // When the native tsc is not at the path, the bin runs Go's launcher with Node (see above).
+    const run = `t="\${p%/*}/${target}"; [ -x "$t" ] || exec node "$p" "$@"; exec "$t" "$@"`;
+    const polyglot = `#!/bin/sh\n":" //; ${resolve}; ${run}\nimport "../lib/tsc.js";\n`;
     const tmp = `${binPath}.${process.pid}.tmp`;
     fs.rmSync(tmp, { force: true });
-    fs.writeFileSync(tmp, polyglot);
-    fs.chmodSync(tmp, 0o755);
-    fs.renameSync(tmp, binPath);
+    try {
+        fs.writeFileSync(tmp, polyglot);
+        fs.chmodSync(tmp, 0o755);
+        fs.renameSync(tmp, binPath);
+    }
+    catch (e) {
+        // A failed write, chmod or rename leaves no temp file; the bin is not changed.
+        try {
+            fs.rmSync(tmp, { force: true });
+        }
+        catch {}
+        throw e;
+    }
 }
 
 try {

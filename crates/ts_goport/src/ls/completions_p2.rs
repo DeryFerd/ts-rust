@@ -20,7 +20,7 @@ use crate::frontend::scanner::scanner_p1::{
     RUNE_ERROR, utf8_decode_last_rune_in_string, utf8_decode_rune_in_string,
 };
 use crate::frontend::stringutil_ls;
-use crate::gostd::{Context, GoError};
+use crate::gostd::{Context, GoError, unicode};
 use crate::ls::lsutil;
 use crate::lsp::lsproto;
 
@@ -2832,7 +2832,9 @@ pub fn quote_property_name(
     name: &str,
 ) -> String {
     let (r, _) = utf8_decode_rune_in_string(name, 0);
-    if unicode_is_digit(r) {
+    // Go `unicode.IsDigit` (go1.27.1, Unicode 17.0.0). The decoded rune is
+    // a char: RuneError (U+FFFD) for an empty name or a bad byte.
+    if char::from_u32(r as u32).is_some_and(unicode::is_digit) {
         return name.to_string();
     }
     quote(file, preferences, name)
@@ -3331,84 +3333,4 @@ fn rune_to_char(r: i32) -> char {
 // in neither).
 fn unicode_is_space(r: i32) -> bool {
     char::from_u32(r as u32).is_some_and(char::is_whitespace)
-}
-
-// Go: unicode/tables.go _Nd (Unicode 15.0.0, the pinned Go 1.26 toolchain).
-const UNICODE_ND_RANGES: [(u32, u32); 64] = [
-    (0x0030, 0x0039),
-    (0x0660, 0x0669),
-    (0x06f0, 0x06f9),
-    (0x07c0, 0x07c9),
-    (0x0966, 0x096f),
-    (0x09e6, 0x09ef),
-    (0x0a66, 0x0a6f),
-    (0x0ae6, 0x0aef),
-    (0x0b66, 0x0b6f),
-    (0x0be6, 0x0bef),
-    (0x0c66, 0x0c6f),
-    (0x0ce6, 0x0cef),
-    (0x0d66, 0x0d6f),
-    (0x0de6, 0x0def),
-    (0x0e50, 0x0e59),
-    (0x0ed0, 0x0ed9),
-    (0x0f20, 0x0f29),
-    (0x1040, 0x1049),
-    (0x1090, 0x1099),
-    (0x17e0, 0x17e9),
-    (0x1810, 0x1819),
-    (0x1946, 0x194f),
-    (0x19d0, 0x19d9),
-    (0x1a80, 0x1a89),
-    (0x1a90, 0x1a99),
-    (0x1b50, 0x1b59),
-    (0x1bb0, 0x1bb9),
-    (0x1c40, 0x1c49),
-    (0x1c50, 0x1c59),
-    (0xa620, 0xa629),
-    (0xa8d0, 0xa8d9),
-    (0xa900, 0xa909),
-    (0xa9d0, 0xa9d9),
-    (0xa9f0, 0xa9f9),
-    (0xaa50, 0xaa59),
-    (0xabf0, 0xabf9),
-    (0xff10, 0xff19),
-    (0x104a0, 0x104a9),
-    (0x10d30, 0x10d39),
-    (0x11066, 0x1106f),
-    (0x110f0, 0x110f9),
-    (0x11136, 0x1113f),
-    (0x111d0, 0x111d9),
-    (0x112f0, 0x112f9),
-    (0x11450, 0x11459),
-    (0x114d0, 0x114d9),
-    (0x11650, 0x11659),
-    (0x116c0, 0x116c9),
-    (0x11730, 0x11739),
-    (0x118e0, 0x118e9),
-    (0x11950, 0x11959),
-    (0x11c50, 0x11c59),
-    (0x11d50, 0x11d59),
-    (0x11da0, 0x11da9),
-    (0x11f50, 0x11f59),
-    (0x16a60, 0x16a69),
-    (0x16ac0, 0x16ac9),
-    (0x16b50, 0x16b59),
-    (0x1d7ce, 0x1d7ff),
-    (0x1e140, 0x1e149),
-    (0x1e2f0, 0x1e2f9),
-    (0x1e4f0, 0x1e4f9),
-    (0x1e950, 0x1e959),
-    (0x1fbf0, 0x1fbf9),
-];
-
-/// Go `unicode.IsDigit`: general category Nd.
-// PORT: Rust `char::is_numeric` is Nd, Nl and No; the Go Nd table above
-// gives Go's exact test.
-fn unicode_is_digit(r: i32) -> bool {
-    // Go: `if r <= MaxLatin1`
-    if r <= 0xFF {
-        return ('0' as i32) <= r && r <= ('9' as i32);
-    }
-    let r = r as u32;
-    UNICODE_ND_RANGES.iter().any(|&(lo, hi)| lo <= r && r <= hi)
 }

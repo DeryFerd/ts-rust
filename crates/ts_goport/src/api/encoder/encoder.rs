@@ -7,7 +7,10 @@
 //! - Go `n := node.AsX()` type assertions are the per-field `Node` accessors,
 //!   which panic on other kinds like the Go assertion.
 //! - Go `sourceFile.Hash`, `ParseOptions()`, `NodeCount` and `TextCount` are
-//!   not on the ts_goport SourceFile node. See `source_file_content_hash` and
+//!   not on the ts_goport SourceFile node. They are in its `ParsedSourceFile`.
+//!   A caller that holds that record gives it (`encode_parsed_source_file`,
+//!   the leased file of an api `createSourceFile`). Otherwise the encoder
+//!   finds it by the root node: see `source_file_content_hash` and
 //!   `parsed_source_file_of`.
 //! - The other Go `SourceFile` fields that the parser sets (`Path()`,
 //!   `Imports()`, `ModuleAugmentations`, ...) are read through
@@ -369,23 +372,34 @@ fn go_content_hash(parsed: &ParsedSourceFile, h: u128) -> u128 {
 // snapshot host's parse cache, so its Go `Hash` is `fh.Hash()`, and a
 // program that has the same file shares it (the client keeps one object per
 // content hash). Such a file keeps the hash that the parse cache set
-// (`ParsedSourceFile::hash`); the root config has none.
+// (`ParsedSourceFile::hash`, `parse_cache_hash`); the root config has none.
+// The encode of a lease reads it from the lease's record
+// (`encode_parsed_source_file`), with no lookup.
 fn source_file_content_hash(source_file: Node) -> Uint128 {
     if source_file.is_nil() || is_synthetic_node(source_file) {
         return Uint128::default();
     }
-    let h = match crate::program::ls_program::program_parsed_source_file(source_file) {
-        Some(parsed) => go_content_hash(&parsed, parsed.source_hash()),
-        None => {
-            let Some(parsed) = parsed_source_file_of(source_file) else {
-                return Uint128::default();
-            };
-            let Some(h) = parsed.hash.get() else {
-                return Uint128::default();
-            };
-            go_content_hash(&parsed, h)
-        }
-    };
+    match crate::program::ls_program::program_parsed_source_file(source_file) {
+        Some(parsed) => uint128_of(go_content_hash(&parsed, parsed.source_hash())),
+        None => parsed_source_file_of(source_file)
+            .map_or_else(Uint128::default, |parsed| parse_cache_hash(&parsed)),
+    }
+}
+
+/// Go `sourceFile.Hash` of the file of `parsed`: the hash that a parse cache
+/// set (Go `file.Hash = fh.Hash()`, project/parsecache.go:79), else 0.
+// PORT: for a parse cache file this equals the program branch of
+// `source_file_content_hash` (`source_hash()`), since the parse cache always
+// sets `hash` (project/parsecache.rs).
+fn parse_cache_hash(parsed: &ParsedSourceFile) -> Uint128 {
+    parsed
+        .hash
+        .get()
+        .map_or_else(Uint128::default, |h| uint128_of(go_content_hash(parsed, h)))
+}
+
+/// Go `Uint128{Hi, Lo}` of a 128-bit hash.
+fn uint128_of(h: u128) -> Uint128 {
     Uint128 {
         hi: (h >> 64) as u64,
         lo: h as u64,
@@ -398,7 +412,9 @@ fn source_file_content_hash(source_file: Node) -> Uint128 {
 // `ParsedSourceFile`, which the language server programs hold. A file that
 // is parsed outside a program (Go `parser.ParseSourceFile`) has the parse
 // that `program::note_parsed_source_file` recorded. A factory SourceFile has
-// none.
+// none. A leased file of an api `createSourceFile` does not use this lookup:
+// its lease holds the record, also after the program that loaded the file is
+// released (`encode_parsed_source_file`).
 fn parsed_source_file_of(source_file: Node) -> Option<Rc<ParsedSourceFile>> {
     if source_file.is_nil() || is_synthetic_node(source_file) {
         return None;
@@ -407,16 +423,11 @@ fn parsed_source_file_of(source_file: Node) -> Option<Rc<ParsedSourceFile>> {
 }
 
 /// Go `sourceFile.NodeCount`.
-// PORT: Go uses it only as a slice capacity. Without a parsed-file record the
-// capacity is 0; the output does not change.
+// PORT: Go uses it and `TextCount` only as slice capacities. Without a
+// parsed-file record the capacity is 0; the output does not change.
+// `encode_tree` reads both from its record.
 fn source_file_node_count(source_file: Node) -> usize {
     parsed_source_file_of(source_file).map_or(0, |file| file.node_count)
-}
-
-/// Go `sourceFile.TextCount`.
-// PORT: Go uses it only as a slice capacity (see `source_file_node_count`).
-fn source_file_text_count(source_file: Node) -> usize {
-    parsed_source_file_of(source_file).map_or(0, |file| file.text_count)
 }
 
 /// The Go `SourceFile` fields that the parser sets and the encoder reads:
@@ -678,7 +689,28 @@ pub fn get_node_index_table(source_file: Node) -> Rc<NodeIndexTable> {
 /// EncodeSourceFile encodes an entire source file AST into the binary format.
 /// Returns the encoded bytes and a NodeIndexTable mapping encoder indices to AST nodes.
 pub fn encode_source_file(source_file: Node) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
-    let (data, node_table) = encode_tree(source_file, source_file)?;
+    encode_source_file_of(source_file, None)
+}
+
+/// Go `EncodeSourceFile` of the file of `file`, a record that the caller
+/// holds: the leased file of api/session.go:1876 encodeLeasedSourceFile.
+// PORT: Go reads `Hash` and `ParseOptions()` from the leased
+// `*ast.SourceFile` (api/encoder/encoder.go:595-596). The lease holds the
+// `ParsedSourceFile`, so the encoder reads them from it. A lookup by the root
+// node finds no record once the program that loaded the file is released.
+pub fn encode_parsed_source_file(
+    file: &Rc<ParsedSourceFile>,
+) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
+    encode_source_file_of(file.root, Some(file))
+}
+
+/// `encode_source_file` with the parsed-file record of `source_file` when
+/// the caller has it.
+fn encode_source_file_of(
+    source_file: Node,
+    parsed: Option<&Rc<ParsedSourceFile>>,
+) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
+    let (data, node_table) = encode_tree(source_file, source_file, parsed)?;
     let node_table = crate::ast::source_file_ls::source_file_get_or_compute_data(
         source_file,
         &*NODE_INDEX_TABLE_KEY,
@@ -704,7 +736,7 @@ pub fn encode_node(
     node: Node,
     source_file: Node,
 ) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
-    encode_tree(node, source_file)
+    encode_tree(node, source_file, None)
 }
 
 /// PORT: the local variables that Go `encodeTree` closures capture. They
@@ -732,10 +764,18 @@ impl EncodeTreeState {
 }
 
 // Go: api/encoder/encoder.go:446 encodeTree
+// PORT: `parsed` is the parsed-file record of `source_file` when the caller
+// holds it (`encode_parsed_source_file`). It gives the Go `SourceFile` fields
+// `Hash`, `ParseOptions()`, `NodeCount` and `TextCount`.
 fn encode_tree(
     root_node: Node,
     source_file: Node,
+    parsed: Option<&Rc<ParsedSourceFile>>,
 ) -> Result<(Vec<u8>, Rc<NodeIndexTable>), GoError> {
+    let given = parsed.is_some();
+    let parsed = parsed
+        .cloned()
+        .or_else(|| parsed_source_file_of(source_file));
     let (parent_index, node_count, prev_index): (u32, u32, u32) = (0, 0, 0);
     let extended_data: Vec<u8> = Vec::new();
     let structured_data: Vec<u8> = Vec::new();
@@ -744,7 +784,7 @@ fn encode_tree(
     if root_node.kind() == SyntaxKind::SourceFile {
         strs = new_string_table(
             source_file_text(source_file),
-            source_file_text_count(source_file),
+            parsed.as_ref().map_or(0, |file| file.text_count),
         );
         position_map = Some(source_file_get_position_map(source_file));
     } else {
@@ -764,7 +804,7 @@ fn encode_tree(
     };
     let mut initial_node_count: usize = 0;
     if source_file.is_some() {
-        initial_node_count = source_file_node_count(source_file);
+        initial_node_count = parsed.as_ref().map_or(0, |file| file.node_count);
     }
     let nodes: Vec<u8> = Vec::with_capacity((initial_node_count + 1) * NODE_SIZE);
 
@@ -994,9 +1034,12 @@ fn encode_tree(
     let mut hash = Uint128::default();
     let mut parse_opts: u32 = 0;
     if root_node.kind() == SyntaxKind::SourceFile {
-        hash = source_file_content_hash(source_file);
-        let parsed = parsed_source_file_of(source_file)
-            .unwrap_or_else(|| unported!("SourceFile.ParseOptions"));
+        let parsed = parsed.unwrap_or_else(|| unported!("SourceFile.ParseOptions"));
+        hash = if given {
+            parse_cache_hash(&parsed)
+        } else {
+            source_file_content_hash(source_file)
+        };
         parse_opts = encode_parse_options(parsed.parse_options().external_module_indicator_options);
 
         // Encode imports, moduleAugmentations, and ambientModuleNames into structured data,

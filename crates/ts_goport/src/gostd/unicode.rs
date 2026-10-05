@@ -2,7 +2,7 @@
 //! Unicode 17.0.0 tables of `unicode_tables`. The Rust `char` methods use
 //! the tables of the Rust version, which can be newer or older.
 
-use super::unicode_tables::{CASE_RANGES, CaseRange, LL, LU, Range16, Range32, RangeTable};
+use super::unicode_tables::{CASE_RANGES, CaseRange, LL, LU, ND, Range16, Range32, RangeTable};
 
 // Go: unicode/letter.go:10 MaxRune
 const MAX_RUNE: i32 = 0x10FFFF;
@@ -133,6 +133,17 @@ pub fn is_lower(r: char) -> bool {
     is_excluding_latin(&LL, r)
 }
 
+// Go: unicode/digit.go:8 IsDigit
+/// IsDigit reports whether the rune is a decimal digit (Go `Digit` is
+/// `_Nd`).
+pub fn is_digit(r: char) -> bool {
+    let r = u32::from(r);
+    if r <= MAX_LATIN1 {
+        return matches!(r, 0x30..=0x39);
+    }
+    is_excluding_latin(&ND, r)
+}
+
 // Go: unicode/letter.go:211 lookupCaseRange
 /// lookupCaseRange returns the CaseRange mapping for rune r or nil if no
 /// mapping exists for r.
@@ -222,16 +233,16 @@ pub fn to_lower(r: char) -> char {
 mod tests {
     use super::*;
 
-    // PORT: the test names are from the Unicode 15.0.0 tables (go1.26.8).
-    // They stay for the protected test set; the values are go1.27.1
-    // (Unicode 17.0.0), the toolchain of the pin N oracle.
+    // The values are go1.27.1 (Unicode 17.0.0), the toolchain of the pin N
+    // oracle. followups24 renamed the 3 tests from `*_uses_unicode_15`
+    // (their go1.26.8 names; followups24 name-map.tsv).
 
     // U+A7C0, U+A7C9 and U+A7D0 are Lu. U+A7CB and the Garay capitals
     // (U+10D50) are Lu from Unicode 16.0, so go1.27.1 says true for them
     // (go1.26.8 said false). Roman numerals (U+2160) and circled letters
     // (U+24B6) are `Other_Uppercase`, not Lu.
     #[test]
-    fn is_upper_uses_unicode_15() {
+    fn is_upper_uses_unicode_17() {
         assert_eq!(crate::gostd::unicode_tables::VERSION, "17.0.0");
         for c in "AZ\u{C0}\u{DE}\u{100}\u{A7C0}\u{A7C9}\u{A7D0}\u{A7CB}\u{10D50}".chars() {
             assert!(is_upper(c), "{c:?}");
@@ -250,7 +261,7 @@ mod tests {
     // says false for it. U+A7CD and the Garay small letters (U+10D70) are Ll
     // from Unicode 16.0. U+00AA and U+2170 are `Other_Lowercase`, not Ll.
     #[test]
-    fn is_lower_uses_unicode_15() {
+    fn is_lower_uses_unicode_17() {
         for c in "az\u{B5}\u{DF}\u{F8}\u{FF}\u{101}\u{A7CD}\u{10D70}".chars() {
             assert!(is_lower(c), "{c:?}");
         }
@@ -264,12 +275,29 @@ mod tests {
         assert_eq!(lower().map(u64::from).sum::<u64>(), 107_102_796);
     }
 
+    // Go IsDigit at go1.27.1 (Unicode 17.0.0): U+10D40 (Garay) and U+1CCF0
+    // (outlined digits) are Nd from Unicode 16.0. U+00B2 is No and U+2160
+    // is Nl. The count and the sum are Go's (followups24 isdigit-go.txt);
+    // the old Unicode 15.0.0 hand table in ls/completions_p2.rs had 680.
+    #[test]
+    fn is_digit_uses_unicode_17() {
+        for c in "09\u{660}\u{FF10}\u{10D40}\u{10D49}\u{1CCF0}\u{1CCF9}\u{1D7CE}".chars() {
+            assert!(is_digit(c), "{c:?}");
+        }
+        for c in "a\u{B2}\u{B9}\u{2160}\u{FFFD}\u{1D7CD}".chars() {
+            assert!(!is_digit(c), "{c:?}");
+        }
+        let digits = || (0..=0x10FFFF).filter(|&r| char::from_u32(r).is_some_and(is_digit));
+        assert_eq!(digits().count(), 770);
+        assert_eq!(digits().map(u64::from).sum::<u64>(), 40_623_335);
+    }
+
     // Go uses the simple mapping of Unicode 17.0.0: U+0130 lowers to 'i',
     // U+00DF has no upper case, U+1FB3 uppers to U+1FBC, and the Unicode 16.0
     // and 17.0 pairs (U+A7CB and U+0264, U+A7DC and U+019B, U+1C89 and
     // U+1C8A, U+10D50 and U+10D70, U+16EA0 and U+16EBB) map to each other.
     #[test]
-    fn case_mapping_uses_unicode_15() {
+    fn case_mapping_uses_unicode_17() {
         let lower = [
             ('A', 'a'),
             ('\u{C0}', '\u{E0}'),

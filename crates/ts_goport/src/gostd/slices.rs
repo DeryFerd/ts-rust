@@ -1,4 +1,4 @@
-//! Go `slices.SortFunc`, `slices.BinarySearchFunc` (go1.26.8
+//! Go `slices.SortFunc`, `slices.BinarySearchFunc` (go1.27.1
 //! `src/slices/sort.go`, `src/slices/zsortanyfunc.go`) and `sort.Slice`
 //! (`src/sort/slice.go`, `src/sort/zsortfunc.go`, `src/sort/sort.go`).
 //!

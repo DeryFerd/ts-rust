@@ -16,6 +16,8 @@
 #     same for the direct run (platform lib/tsc), node_modules/.bin/tsc, node bin/tsc (a tool that
 #     starts the bin with Node) and the JS launcher (node node_modules/typescript/lib/tsc.js, the
 #     fallback when the postinstall did not run).
+#   - the postinstall with a failing chmod leaves no temp file and does not change bin/tsc.
+#   - a bin/tsc whose native tsc path names no file runs Go's launcher with Node.
 #   - the project moved to another dir: .bin/tsc and node bin/tsc still run, with its lib files.
 #   - pnpm (when on PATH), with the build approved: the same bin checks in a pnpm project.
 # Prints one line per check and ends with "npm-test: PASS" or "npm-test: FAIL (<n>)".
@@ -84,6 +86,25 @@ bins() {
 }
 
 bins npm "$nm"
+# A failed chmod in the postinstall leaves no bin/<bin>.<pid>.tmp and does not change the bin.
+if ((native)); then
+  b=$nm/$name/bin/$bin before=$(sha256sum < "$nm/$name/bin/$bin")
+  printf '%s\n' 'const fs = require("node:fs");' \
+    'fs.chmodSync = () => { throw Object.assign(new Error("EPERM: chmod"), { code: "EPERM" }); };' \
+    > "$work/chmod-fails.cjs"
+  warn=$(node --require "$work/chmod-fails.cjs" "$nm/$name/lib/install.js" 2>&1)
+  tmps=$(find "$nm/$name/bin" -name "$bin.*.tmp")
+  [[ -z $tmps && $(sha256sum < "$b") == "$before" && $warn == *EPERM* ]]
+  check "a failed chmod in the postinstall leaves no temp file and keeps bin/$bin" $? "${tmps:-$warn}"
+  # A native path that names no file (pnpm's side-effects cache in another layout): the bin runs
+  # Go's launcher with Node.
+  cp -p "$b" "$work/bin.keep"
+  sed -i '2s|t="${p%/\*}/[^"]*"|t="${p%/*}/../no-such-dir/tsc"|' "$b"
+  v=$("$nm/.bin/$bin" --version 2>&1)
+  [[ $v == "$want" ]] && grep -q no-such-dir "$b"
+  check "a bin whose native path names no file runs Go's launcher: $want" $? "$v"
+  cp -p "$work/bin.keep" "$b"
+fi
 [[ $(${ways[js]} --version) == "$want" ]]
 check "js --version: $want" $?
 lib_dir=$(realpath "$(dirname "$direct")")

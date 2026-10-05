@@ -936,15 +936,22 @@ impl Checker {
         // PORT: with each count, whether every declaration of the name is a
         // public method (`is_public_method`), and the value declaration of
         // the first property of the name.
-        // PERF: a name seen again with that value declaration is the same
-        // member (an instantiation of it), so it is not tested again. The
-        // tuples of an intersection share the lib declarations of their
-        // array methods, so this saves a test for each method of each tuple
-        // (mongodb test check: the test cost 6.5% more instructions, 1.6%
-        // with the parent of the first declaration as the key). The key is
-        // not the parent: an instance and a static member of one class have
-        // the same parent, so in `A & typeof A` a `private static m()` after a
-        // public `m()` went last, after every property of the class.
+        // PERF: a name seen again with that value declaration is not tested
+        // again. That is almost always the same member (an instantiation of
+        // it). It can be another symbol: a union or intersection property is
+        // a property with the value declaration of its first constituent's
+        // property (Go `createUnionOrIntersectionProperty`), so in
+        // `A & (A | B)`, where `A.m` is a public method and `B.m` a
+        // property, `(A | B).m` is skipped and `m` stays with the public
+        // methods. That changes only the order of the tests below, not the
+        // answer: both groups are tested. The tuples of an intersection
+        // share the lib declarations of their array methods, so this saves
+        // a test for each method of each tuple (mongodb test check: the test
+        // cost 6.5% more instructions, 1.6% with the parent of the first
+        // declaration as the key). The key is not the parent: an instance
+        // and a static member of one class have the same parent, so in
+        // `A & typeof A` a `private static m()` after a public `m()` went
+        // last, after every property of the class.
         let mut counts: FxIndexMap<u32, (i32, bool, Node)> = FxIndexMap::default();
         for i in 0..self.ty(t).types().len() {
             let u = self.type_at(t, i);

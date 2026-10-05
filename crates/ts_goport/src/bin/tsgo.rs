@@ -128,7 +128,8 @@ fn main() {
     // the panic hook's do: `eprintln!` panics when stderr is a pipe with no
     // reader, and this panic of the main thread ended the run with exit
     // code 101. A Go panic does not raise SIGPIPE (the runtime drops its
-    // write errors), so this keeps exit code 70 with no reader.
+    // write errors), so this keeps exit code 70 with no reader
+    // (`tests/tsgo_panic_hook.rs`).
     let _ = work.join();
     let _ = writeln!(std::io::stderr(), "tsgo: work thread failed");
     std::process::exit(EXIT_UNPORTED);
