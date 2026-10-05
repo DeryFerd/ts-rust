@@ -18,8 +18,19 @@
 //! `export = Thingg` of `"bad"` (augmentation loop) or the import attribute
 //! type of a pattern ambient module.
 //!
+//! The late-merge tests ask for one name before and after a late-bound
+//! member is merged into a global in place. `globalThis` is also a class
+//! whose static member has the computed name `"Foo"` (or another global's
+//! name). When its exports are resolved (`globalThis.Foo`, or an alias
+//! through `globalThis`), `combine_symbol_tables` merges that member into the
+//! global. Two files declare the global, so it is transient and gets the
+//! property flag, a value meaning, in place. A result kept from before the
+//! merge would hide the new suggestion. These run single-threaded, so one
+//! checker sees both lookups.
+//!
 //! Every expected output is Go N's (the same lib text, `noLib` with the lib
-//! as a file).
+//! as a file). In the mid-scan test, Go's first line depends on its random
+//! map order (see there).
 
 use ts_goport::execute::tsc::ExitStatus;
 
@@ -157,6 +168,177 @@ error TS2318: Cannot find global type 'ImportAttributes'.
 globals1.d.ts(4,35): error TS1555: An import attributes property must have a string literal type annotation.
 globals1.d.ts(4,42): error TS2304: Cannot find name 'Thingg'.
 use.ts(1,1): error TS2552: Cannot find name 'Thingg'. Did you mean 'Thing'?
+"
+    );
+}
+
+/// Runs `check` single-threaded with the options of the late-merge tests and
+/// every file as a root, in order.
+fn check_late(files: &[(&str, &str)]) -> String {
+    let names: Vec<String> = files.iter().map(|(name, _)| format!("{name:?}")).collect();
+    let tsconfig = format!(
+        r#"{{"compilerOptions":{{"noEmit":true,"strict":true,"module":"esnext","moduleResolution":"bundler","singleThreaded":true}},"files":[{}]}}"#,
+        names.join(",")
+    );
+    check(files, &tsconfig)
+}
+
+/// A module that makes `globalThis` also a class with the static member
+/// `[k]`, where `k` has the literal type `name`.
+fn global_this_class_aug(name: &str) -> String {
+    format!(
+        "declare const k: \"{name}\";\ndeclare global {{\n  class globalThis {{ static [k]: number; }}\n}}\nexport {{}};\n"
+    )
+}
+
+const FOO_A: &str = "interface Foo { a: number }\n";
+const FOO_B: &str = "interface Foo { b: number }\n";
+const USE_FOO: &str = "Fooo;\ntype T = globalThis.Foo;\nFooo;\nexport {};\n";
+
+#[test]
+fn spelling_memo_sees_late_bound_merge_into_global() {
+    let output = check_late(&[
+        ("use.ts", USE_FOO),
+        ("aug.ts", &global_this_class_aug("Foo")),
+        ("globals1.d.ts", FOO_A),
+        ("globals2.d.ts", FOO_B),
+    ]);
+    assert_eq!(
+        output,
+        "\
+use.ts(1,1): error TS2304: Cannot find name 'Fooo'.
+use.ts(3,1): error TS2552: Cannot find name 'Fooo'. Did you mean 'Foo'?
+"
+    );
+}
+
+#[test]
+fn spelling_memo_sees_late_bound_merge_from_global_class() {
+    let globals = "interface Foo { a: number }\ndeclare const k: \"Foo\";\ndeclare class globalThis { static [k]: number; }\n";
+    let output = check_late(&[
+        ("use.ts", USE_FOO),
+        ("globals1.d.ts", globals),
+        ("globals2.d.ts", FOO_B),
+    ]);
+    assert_eq!(
+        output,
+        "\
+globals1.d.ts(3,15): error TS2397: Declaration name conflicts with built-in global identifier 'globalThis'.
+use.ts(1,1): error TS2304: Cannot find name 'Fooo'.
+use.ts(3,1): error TS2552: Cannot find name 'Fooo'. Did you mean 'Foo'?
+"
+    );
+}
+
+#[test]
+fn spelling_memo_sees_late_bound_merge_into_alias_target() {
+    let globals = "interface Foo { a: number }\ndeclare namespace Foo { interface X {} }\nimport Alias1 = Foo;\n";
+    let output = check_late(&[
+        (
+            "use.ts",
+            "Aliasx;\ntype T = globalThis.Foo;\nAliasx;\nexport {};\n",
+        ),
+        ("aug.ts", &global_this_class_aug("Foo")),
+        ("globals1.d.ts", globals),
+        ("globals2.d.ts", FOO_B),
+    ]);
+    assert_eq!(
+        output,
+        "\
+use.ts(1,1): error TS2304: Cannot find name 'Aliasx'.
+use.ts(3,1): error TS2552: Cannot find name 'Aliasx'. Did you mean 'Alias1'?
+"
+    );
+}
+
+#[test]
+fn spelling_memo_sees_better_candidate_after_merge() {
+    let output = check_late(&[
+        (
+            "use.ts",
+            "Foooooo;\ntype T = globalThis.Foooooa;\nFoooooo;\nexport {};\n",
+        ),
+        ("aug.ts", &global_this_class_aug("Foooooa")),
+        (
+            "globals1.d.ts",
+            "interface Foooooa { a: number }\ndeclare var Foxxooo: number;\n",
+        ),
+        ("globals2.d.ts", "interface Foooooa { b: number }\n"),
+    ]);
+    assert_eq!(
+        output,
+        "\
+use.ts(1,1): error TS2304: Cannot find name 'Foooooo'.
+use.ts(3,1): error TS2552: Cannot find name 'Foooooo'. Did you mean 'Foooooa'?
+"
+    );
+}
+
+#[test]
+fn spelling_memo_sees_better_table_candidate_after_merge() {
+    let output = check_late(&[
+        (
+            "use.ts",
+            "Foooooo;\ntype T = globalThis.FoooooO;\nFoooooo;\nexport {};\n",
+        ),
+        ("aug.ts", &global_this_class_aug("FoooooO")),
+        (
+            "globals1.d.ts",
+            "interface FoooooO { a: number }\ndeclare var Fooooo: number;\n",
+        ),
+        ("globals2.d.ts", "interface FoooooO { b: number }\n"),
+    ]);
+    assert_eq!(
+        output,
+        "\
+use.ts(1,1): error TS2552: Cannot find name 'Foooooo'. Did you mean 'Fooooo'?
+use.ts(3,1): error TS2552: Cannot find name 'Foooooo'. Did you mean 'FoooooO'?
+"
+    );
+}
+
+#[test]
+fn spelling_memo_sees_merge_from_another_file() {
+    let output = check_late(&[
+        ("a1.ts", "Fooo;\nexport {};\n"),
+        ("a2.ts", "export type T = globalThis.Foo;\n"),
+        ("a3.ts", "Fooo;\nexport {};\n"),
+        ("aug.ts", &global_this_class_aug("Foo")),
+        ("globals1.d.ts", FOO_A),
+        ("globals2.d.ts", FOO_B),
+    ]);
+    assert_eq!(
+        output,
+        "\
+a1.ts(1,1): error TS2304: Cannot find name 'Fooo'.
+a3.ts(1,1): error TS2552: Cannot find name 'Fooo'. Did you mean 'Foo'?
+"
+    );
+}
+
+/// The first scan for `Fooo` resolves the alias candidate `Qalias`, whose
+/// target is found through `globalThis`, so the merge into `Foo` comes during
+/// that scan. Go ranges over the globals map in random order: when it reads
+/// `Foo` after `Qalias`, line 1 also suggests `Foo`. The port reads the table
+/// in insertion order (`Foo` first), and the Go runs that read `Foo` first
+/// give this output. Line 2 always suggests `Foo`.
+#[test]
+fn spelling_memo_sees_merge_during_its_scan() {
+    let output = check_late(&[
+        ("use.ts", "Fooo;\nFooo;\nexport {};\n"),
+        ("aug.ts", &global_this_class_aug("Foo")),
+        ("globals1.d.ts", FOO_A),
+        (
+            "globals2.d.ts",
+            "interface Foo { b: number }\ndeclare namespace Bar { interface Y {} }\n",
+        ),
+        ("globals3.d.ts", "import Qalias = globalThis.Bar;\n"),
+    ]);
+    assert_eq!(
+        output,
+        "\
+use.ts(1,1): error TS2304: Cannot find name 'Fooo'.
+use.ts(2,1): error TS2552: Cannot find name 'Fooo'. Did you mean 'Foo'?
 "
     );
 }

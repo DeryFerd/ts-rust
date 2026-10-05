@@ -1428,19 +1428,30 @@ impl Checker {
     // PORT: the name is a `TableKey` because this is a `NameResolver` lookup
     // callback (see `NameResolverLookupFn`).
     // PERF: the globals table gives the same suggestion for the same name and
-    // meaning every time, so the result is kept in
-    // `global_spelling_suggestions` (port-only). The table is complete after
-    // `initialize_checker`, and the flags and names of its symbols do not
-    // change after that. During `initialize_checker` they do change (a
-    // non-global module augmentation adds flags to a merged global namespace
-    // that an `export =` names), and suggestions are asked there too (a failed
-    // `export =`, the import attribute types of pattern ambient modules). So
-    // the memo is read and filled only when `globals_complete` is set. Before
-    // that, each lookup scans the table, as in Go.
-    // A candidate name can change only while an alias candidate is being
-    // resolved (`try_resolve_alias` gives nil, so the candidate is left out).
-    // Such a result is not kept. The primitive type alias symbols are made on
-    // each call, as before, so a hit makes the same symbols as a miss.
+    // meaning while its names and the flags and declarations of its symbols
+    // stay the same, so the result is kept in `global_spelling_suggestions`
+    // (port-only).
+    // - Names: the table is complete after `initialize_checker`. During it,
+    //   names are added and flags change (a non-global module augmentation
+    //   adds flags to a merged global namespace that an `export =` names), and
+    //   suggestions are asked too (a failed `export =`, the import attribute
+    //   types of pattern ambient modules). So the memo is read and filled only
+    //   when `globals_complete` is set. Before that, each lookup scans the
+    //   table, as in Go.
+    // - Flags and declarations: after `initialize_checker`, only
+    //   `merge_symbol` changes a symbol that already exists:
+    //   `combine_symbol_tables` merges a late-bound member into a transient
+    //   early member in place. When `globalThis` is also a class with a
+    //   static computed member, its early exports are the globals table, so a
+    //   global gets new flags. Each entry keeps the `merge_version` from
+    //   before its scan and is used only while `merge_version` is the same. A
+    //   merge during the scan (from an alias candidate's resolution) makes the
+    //   entry old at once.
+    // - Aliases: an alias candidate's target is set once. While it is being
+    //   resolved, `try_resolve_alias` gives nil and the candidate is left out.
+    //   Such a result is not kept.
+    // The primitive type alias symbols are made on each call, as before, so a
+    // hit makes the same symbols as a miss.
     // A project where a test runner's types are missing asks this for
     // `expect` thousands of times (nestjs-graphql: 24% of the check).
     pub fn get_suggestion_for_symbol_name_lookup(
@@ -1459,7 +1470,11 @@ impl Checker {
             }
             _ => None,
         };
-        let memo = memo_key.and_then(|key| self.global_spelling_suggestions.get(&key).copied());
+        let merge_version = self.merge_version;
+        let memo = memo_key.and_then(|key| match self.global_spelling_suggestions.get(&key) {
+            Some(&(version, memo)) if version == merge_version => Some(memo),
+            _ => None,
+        });
         // PORT: Go `core.ConcatenateSeq(maps.Values(symbols), extras)` -> one Vec.
         let mut candidates = if memo.is_some() {
             Vec::new()
@@ -1490,7 +1505,8 @@ impl Checker {
             } else {
                 GlobalSpellingSuggestion::Table(best)
             };
-            self.global_spelling_suggestions.insert(key, memo);
+            self.global_spelling_suggestions
+                .insert(key, (merge_version, memo));
         }
         best
     }
