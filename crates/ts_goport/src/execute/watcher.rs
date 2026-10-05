@@ -65,29 +65,30 @@ pub struct WatchCompilerHost {
 
 impl WatchCompilerHost {
     /// PORT: not in Go. The parse that the source file cache had before a
-    /// config change, when a parse now gives the same file: the same parse
-    /// options and the same text (a bundled lib never changes). Go parses
-    /// every file again after a config change (`doBuild` empties
-    /// `sourceFileCache`, watcher.go:409), and so did the port, on one
-    /// thread (see `prefetch_parses`): a query-core build after a tsconfig
-    /// edit took 1.8 times as long as Go. The parse and the bind of a file
-    /// read only its text and its parse options, so the output does not
-    /// change. The Go language server parse cache keys a parse by the same
-    /// fields (project/parsecache.go:16 `ParseCacheKey`). The text is read
-    /// as Go reads it for its parse. A file with diagnostics in the old
-    /// snapshot is not in `config_parses` (see `Watcher::do_build`).
+    /// config change, when a parse now gives the same file: the same text
+    /// (a bundled lib never changes), and the same parse options or options
+    /// that the parse did not read (`parse_with_options`, which then gives
+    /// a copy with the new options). Go parses every file again after a
+    /// config change (`doBuild` empties `sourceFileCache`, watcher.go:409),
+    /// and so did the port, on one thread (see `prefetch_parses`): a
+    /// query-core build after a tsconfig edit took 1.8 times as long as Go,
+    /// and an effect build after a `moduleDetection` edit 2.7 times. The
+    /// parse and the bind of a file read only its text and its parse
+    /// options, so the output does not change. The Go language server parse
+    /// cache keys a parse by the same fields (project/parsecache.go:16
+    /// `ParseCacheKey`). The text is read as Go reads it for its parse. A
+    /// file with diagnostics in the old snapshot is not in `config_parses`
+    /// (see `Watcher::do_build`).
     fn reuse_parse(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
         let old = self.config_parses.borrow_mut().remove(&opts.path)?;
-        if old.file.parse_options() != opts {
-            return None;
-        }
+        let file = crate::frontend::parser::parse_with_options(&old.file, opts)?;
         if !crate::frontend::bundled::is_bundled(&opts.file_name) {
             let (text, ok) = self.compiler_host.fs().read_file(&opts.file_name);
             if !ok || text != old.file.text() {
                 return None;
             }
         }
-        Some(old.file.clone())
+        Some(file)
     }
 }
 

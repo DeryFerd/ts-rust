@@ -469,10 +469,14 @@ The batch that adds it is not accepted until Theo approves.
   new parses (`program::mark_freeable_parses`), and parses ahead
   (prefetch) only in its first build. Go parses every file again after a
   config change. Here the build after it keeps the parse of a file whose
-  parse options and text are the same and that has no diagnostics in the
-  last snapshot (`WatchCompilerHost::reuse_parse`, watchcfg1; Go's error
-  summary groups errors by file object, and a copied diagnostic keeps the
-  old one). It parses the other files into owned stores on the loading
+  text is the same and that has no diagnostics in the last snapshot
+  (`WatchCompilerHost::reuse_parse`, watchcfg1; Go's error summary groups
+  errors by file object, and a copied diagnostic keeps the old one), when
+  its parse options are the same or differ only in module indicator
+  options that its parse did not read (a file with an import or export):
+  then it keeps a copy with the new options (`parser::parse_with_options`,
+  the parse worker rule of `read_module_indicator_options`). It parses the
+  other files into owned stores on the loading
   thread: the watch file system is not the plain OS file system, so a
   changed lib is a live parse, not a `lib_parse.bin` load. A diagnostic that a watch build copies from the
   last build (Go `repopulateDiagnosticsOfFile`) points at the file
@@ -485,7 +489,9 @@ The batch that adds it is not accepted until Theo approves.
   wrote it (`BuildHost::watch_source_file`, as Go `tsc --watch` keeps its
   files), so a cycle parses only the changed files, on the loading thread:
   parse workers parse ahead only in the first build (`BuildHost::prefetch`).
-  A config change keeps the parses too: their key holds the parse options
+  A config change keeps the parses too: their key holds the parse options,
+  and a parse with other module indicator options that it did not read is
+  kept as a copy, as in `tsc --watch`
   (`BuildHost::keep_watch_sources_for_config_change`); only an overflow
   drops them. A task keeps the versions that its errors point at until its
   next build (`BuildTask::held_file_versions`). A file version's parse

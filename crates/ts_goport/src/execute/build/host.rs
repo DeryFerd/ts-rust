@@ -356,11 +356,11 @@ impl BuildHost {
         if cached.is_some() {
             return cached;
         }
-        // A kept parse from before a config change of this cycle.
+        // A kept parse from before a config change of this cycle: one with
+        // these parse options, or with other module indicator options that
+        // its parse did not read (`parse_with_options`).
         let before = self
-            .watch_sources_before_config_change
-            .borrow_mut()
-            .remove(&key)
+            .take_watch_source_before_config_change(opts)
             .filter(|source| keep && source.mod_time == mod_time);
         if let Some(source) = before {
             let file = source.file.clone();
@@ -410,10 +410,11 @@ impl BuildHost {
     /// PORT: not in Go (`watch_source_file`). A cycle with a config change
     /// keeps the parses too: the key of a parse holds its parse options, so
     /// a project whose options changed parses again only the files whose
-    /// parse options changed. Go parses every file again in each cycle, and
-    /// the port did in a config change cycle, on one thread (a
-    /// query-persist-client-core build after a tsconfig edit took 2 times
-    /// as long as Go). The kept parses wait in
+    /// parse options changed and whose parses read the changed options
+    /// (`take_watch_source_before_config_change`). Go parses every file
+    /// again in each cycle, and the port did in a config change cycle, on
+    /// one thread (a query-persist-client-core build after a tsconfig edit
+    /// took 2 times as long as Go). The kept parses wait in
     /// `watch_sources_before_config_change`, and a build of the cycle takes
     /// back each one that it uses (`watch_source_file`). Then
     /// `end_config_change_cycle` drops the ones that it replaced.
@@ -423,6 +424,40 @@ impl BuildHost {
                 .borrow_mut()
                 .extend(sources.drain());
         }
+    }
+
+    /// PORT: not in Go (`watch_source_file`). Takes the kept parse from
+    /// before a config change that a parse with `opts` would give: the one
+    /// with `opts`, else one whose parse options differ only in module
+    /// indicator options that it did not read, as a copy with `opts`
+    /// (`parse_with_options`). The key of a kept parse holds its options, so
+    /// the other three module indicator options are looked up.
+    fn take_watch_source_before_config_change(
+        &self,
+        opts: &SourceFileParseOptions,
+    ) -> Option<WatchSource> {
+        let mut before = self.watch_sources_before_config_change.borrow_mut();
+        if before.is_empty() {
+            return None;
+        }
+        let mut key = SourceFileCacheKey(opts.clone());
+        if let Some(source) = before.remove(&key) {
+            return Some(source);
+        }
+        for (jsx, force) in [(false, false), (false, true), (true, false), (true, true)] {
+            key.0.external_module_indicator_options = ExternalModuleIndicatorOptions { jsx, force };
+            if key.0.external_module_indicator_options == opts.external_module_indicator_options {
+                continue;
+            }
+            let Some(source) = before.get(&key) else {
+                continue;
+            };
+            let file = crate::frontend::parser::parse_with_options(&source.file, opts)?;
+            let mod_time = source.mod_time;
+            before.remove(&key);
+            return Some(WatchSource { file, mod_time });
+        }
+        None
     }
 
     /// PORT: not in Go (`keep_watch_sources_for_config_change`). At the end
