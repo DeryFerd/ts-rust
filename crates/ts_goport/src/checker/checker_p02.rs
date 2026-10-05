@@ -517,6 +517,9 @@ impl Checker {
                 }
             }
         }
+        // PORT: port-only. Lets `get_suggestion_for_symbol_name_lookup` keep
+        // results from the globals table (see there).
+        self.globals_complete = true;
     }
 
     // Go: checker/checker.go:1397 mergeGlobalSymbol
@@ -1428,10 +1431,16 @@ impl Checker {
     // meaning every time, so the result is kept in
     // `global_spelling_suggestions` (port-only). The table is complete after
     // `initialize_checker`, and the flags and names of its symbols do not
-    // change. A candidate name can change only while an alias candidate is
-    // being resolved (`try_resolve_alias` gives nil, so the candidate is left
-    // out). Such a result is not kept. The primitive type alias symbols are
-    // made on each call, as before, so a hit makes the same symbols as a miss.
+    // change after that. During `initialize_checker` they do change (a
+    // non-global module augmentation adds flags to a merged global namespace
+    // that an `export =` names), and suggestions are asked there too (a failed
+    // `export =`, the import attribute types of pattern ambient modules). So
+    // the memo is read and filled only when `globals_complete` is set. Before
+    // that, each lookup scans the table, as in Go.
+    // A candidate name can change only while an alias candidate is being
+    // resolved (`try_resolve_alias` gives nil, so the candidate is left out).
+    // Such a result is not kept. The primitive type alias symbols are made on
+    // each call, as before, so a hit makes the same symbols as a miss.
     // A project where a test runner's types are missing asks this for
     // `expect` thousands of times (nestjs-graphql: 24% of the check).
     pub fn get_suggestion_for_symbol_name_lookup(
@@ -1445,7 +1454,9 @@ impl Checker {
             return symbol;
         }
         let memo_key = match name {
-            TableKey::Name(name) if symbols == self.globals => Some((name.id(), meaning)),
+            TableKey::Name(name) if symbols == self.globals && self.globals_complete => {
+                Some((name.id(), meaning))
+            }
             _ => None,
         };
         let memo = memo_key.and_then(|key| self.global_spelling_suggestions.get(&key).copied());

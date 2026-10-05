@@ -878,7 +878,11 @@ pub struct Checker {
     pub resolve_name_for_symbol_suggestion: ResolveNameFn,
     /// PORT: port-only memo of the spelling suggestion from the globals
     /// table, by name id and meaning (`get_suggestion_for_symbol_name_lookup`).
+    /// Read and filled only when `globals_complete` is set.
     pub global_spelling_suggestions: FxHashMap<(u32, SymbolFlags), GlobalSpellingSuggestion>,
+    /// PORT: port-only. Set at the end of `initialize_checker`. After that,
+    /// the globals table and the flags of its symbols do not change.
+    pub globals_complete: bool,
     pub tuple_types: CacheKeyMap<TypeId>,
     pub union_types: FxHashMap<CacheHashKey, TypeId>,
     pub union_of_union_types: FxHashMap<UnionOfUnionKey, TypeId>,
@@ -1366,6 +1370,7 @@ impl Checker {
             resolve_name: nil_resolve_name_fn(),
             resolve_name_for_symbol_suggestion: nil_resolve_name_fn(),
             global_spelling_suggestions: FxHashMap::default(),
+            globals_complete: false,
             tuple_types: CacheKeyMap::default(),
             union_types: FxHashMap::default(),
             union_of_union_types: FxHashMap::default(),

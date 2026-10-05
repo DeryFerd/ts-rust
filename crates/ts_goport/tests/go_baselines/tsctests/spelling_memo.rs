@@ -8,8 +8,18 @@
 //! symbol of the globals table (`Symbol`), and no suggestion (`expect`).
 //! `Symbl` in `f` finds `Symbl2` in a local scope before the globals.
 //! `Arrray` as a type finds `Array`; as a value it finds nothing, because the
-//! memo key holds the meaning. The expected output is Go N's (the same lib
-//! text, `noLib` with the lib as a file).
+//! memo key holds the meaning.
+//!
+//! The two init-order tests ask for `Thingg` once during `initialize_checker`
+//! and once after it. Between the two, the augmentation of `"foo"` (whose
+//! `export =` is the merged global namespace `Thing`) adds value flags to
+//! `Thing`, so only the second lookup finds `Thing`. A result kept during
+//! `initialize_checker` would hide it. The first lookup is the failed
+//! `export = Thingg` of `"bad"` (augmentation loop) or the import attribute
+//! type of a pattern ambient module.
+//!
+//! Every expected output is Go N's (the same lib text, `noLib` with the lib
+//! as a file).
 
 use ts_goport::execute::tsc::ExitStatus;
 
@@ -48,30 +58,105 @@ a.ts(13,9): error TS2552: Cannot find name 'Arrray'. Did you mean 'Array'?
 a.ts(14,10): error TS2304: Cannot find name 'Arrray'.
 ";
 
-#[test]
-fn spelling_memo_of_globals_gives_the_same_suggestions() {
+/// Runs `tsgo -p tsconfig.json` on `files` (name, text) in the project dir
+/// and gives the diagnostics text.
+fn check(files: &[(&str, &str)], tsconfig: &str) -> String {
     let input = TscInput {
-        files: [
-            (format!("{PROJECT}/a.ts"), TEXT.into()),
-            (
-                format!("{PROJECT}/tsconfig.json"),
-                r#"{"compilerOptions":{"noEmit":true},"files":["a.ts"]}"#.into(),
-            ),
-        ]
-        .into_iter()
-        .collect(),
+        files: files
+            .iter()
+            .map(|&(name, text)| (format!("{PROJECT}/{name}"), text.into()))
+            .chain([(format!("{PROJECT}/tsconfig.json"), tsconfig.into())])
+            .collect(),
         ..Default::default()
     };
     let sys = new_test_sys(&input, false);
     let args = ["-p", "tsconfig.json", "--pretty", "false"].map(String::from);
     let result = run_command_in_child(&sys, &args).unwrap_or_else(|err| panic!("tsgo: {err}"));
     assert!(result.unported.is_none(), "unported {:?}", result.unported);
-    // The test system adds the list of files after the diagnostics.
-    let output = sys.output_text();
-    let diagnostics = output.split("!!! List files start").next();
-    assert_eq!(diagnostics, Some(WANT));
     assert_eq!(
         result.status,
         ExitStatus::DiagnosticsPresentOutputsGenerated
+    );
+    // The test system adds the list of files after the diagnostics.
+    let output = sys.output_text();
+    output
+        .split("!!! List files start")
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn spelling_memo_of_globals_gives_the_same_suggestions() {
+    let output = check(
+        &[("a.ts", TEXT)],
+        r#"{"compilerOptions":{"noEmit":true},"files":["a.ts"]}"#,
+    );
+    assert_eq!(output, WANT);
+}
+
+const THING: &str = "declare namespace Thing { interface J {} }\n";
+
+const AUG_FOO: &str = r#"import "foo";
+declare module "foo" { export const x: number; }
+export {};
+"#;
+
+const USE: &str = "Thingg;\nexport {};\n";
+
+#[test]
+fn spelling_memo_waits_for_augmentations_after_failed_export_equals() {
+    let globals = r#"declare namespace Thing { interface I {} }
+declare module "bad" { export = Thingg; }
+declare module "foo" { export = Thing; }
+"#;
+    let aug_bad = r#"import "bad";
+declare module "bad" { export const y: number; }
+export {};
+"#;
+    let output = check(
+        &[
+            ("globals1.d.ts", globals),
+            ("globals2.d.ts", THING),
+            ("aug1.ts", aug_bad),
+            ("aug2.ts", AUG_FOO),
+            ("use.ts", USE),
+        ],
+        r#"{"compilerOptions":{"noEmit":true,"strict":true,"module":"esnext","moduleResolution":"bundler"},"files":["globals1.d.ts","globals2.d.ts","aug1.ts","aug2.ts","use.ts"]}"#,
+    );
+    assert_eq!(
+        output,
+        "\
+aug1.ts(2,16): error TS2671: Cannot augment module 'bad' because it resolves to a non-module entity.
+globals1.d.ts(2,33): error TS2304: Cannot find name 'Thingg'.
+use.ts(1,1): error TS2552: Cannot find name 'Thingg'. Did you mean 'Thing'?
+"
+    );
+}
+
+#[test]
+fn spelling_memo_waits_for_augmentations_after_import_attributes() {
+    let globals = r#"declare namespace Thing { interface I {} }
+declare module "foo" { export = Thing; }
+declare module "*.a" with { type: "a" } { const v: number; export default v; }
+declare module "*.a" with { type: typeof Thingg } { const w: number; export default w; }
+"#;
+    let output = check(
+        &[
+            ("globals1.d.ts", globals),
+            ("globals2.d.ts", THING),
+            ("aug2.ts", AUG_FOO),
+            ("use.ts", USE),
+        ],
+        r#"{"compilerOptions":{"noEmit":true,"strict":true,"module":"esnext","moduleResolution":"bundler"},"files":["globals1.d.ts","globals2.d.ts","aug2.ts","use.ts"]}"#,
+    );
+    assert_eq!(
+        output,
+        "\
+error TS2318: Cannot find global type 'ImportAttributes'.
+globals1.d.ts(4,35): error TS1555: An import attributes property must have a string literal type annotation.
+globals1.d.ts(4,42): error TS2304: Cannot find name 'Thingg'.
+use.ts(1,1): error TS2552: Cannot find name 'Thingg'. Did you mean 'Thing'?
+"
     );
 }
