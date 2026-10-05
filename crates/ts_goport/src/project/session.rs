@@ -2234,8 +2234,25 @@ impl Session {
         let s = self.clone();
         let task_old_snapshot = old_snapshot.clone();
         let task_new_snapshot = new_snapshot.clone();
+        // PORT: the task reads the programs of the new snapshot
+        // (`publish_program_diagnostics`). Go's pointers keep them readable
+        // when the next snapshot change disposes it before the task runs; here
+        // a hold keeps each one registered until the task ends.
+        let program_holds: Vec<crate::program::ls_program::ProgramHold> = new_snapshot
+            .project_collection
+            .projects()
+            .iter()
+            .filter_map(|project| {
+                project
+                    .borrow()
+                    .program
+                    .as_deref()
+                    .and_then(crate::program::ls_program::hold_program)
+            })
+            .collect();
         self.background_queue
             .enqueue(&self.background_context(), move |ctx| {
+                let _program_holds = program_holds;
                 let old_snapshot = &task_old_snapshot;
                 let new_snapshot = &task_new_snapshot;
                 if s.options.logging_enabled {

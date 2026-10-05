@@ -202,6 +202,13 @@ thread_local! {
     };
 }
 
+/// True while the queues of this thread are being dropped or are gone: the
+/// thread ends. A value that a queued job holds (a job that never ran)
+/// drops then, and must not queue more work here.
+pub fn is_ending() -> bool {
+    LOCAL.try_with(|_| ()).is_err()
+}
+
 fn next_id() -> u64 {
     LOCAL.with(|l| {
         let id = l.next_id.get();

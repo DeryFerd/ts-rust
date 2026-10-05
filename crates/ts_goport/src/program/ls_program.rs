@@ -23,11 +23,11 @@
 //!
 //! Release: Go frees a program when no snapshot and no request uses it.
 //! `release_program` is the snapshot part (Go `programCounter.Deref`); the
-//! release waits until no guard of the program is alive. It frees the
-//! version's program tables, and the registry drops its `Rc`, so the
-//! `NewProgram` is freed with its last holder. On the dispatch thread of
-//! the LSP server both frees wait until the answer is sent
-//! (`gostd::local::drop_later`). The `GoProgram` shell and the
+//! release waits until no guard and no hold (`hold_program`) of the program
+//! is alive. It frees the version's program tables, and the registry drops
+//! its `Rc`, so the `NewProgram` is freed with its last holder. On the
+//! dispatch thread of the LSP server both frees wait until the answer is
+//! sent (`gostd::local::drop_later`). The `GoProgram` shell and the
 //! file versions stay leaked (see `program::release_program`). A compiler
 //! host whose last live program is released drops its data
 //! (`CompilerHost::release`), even when a stale holder keeps the program.
@@ -151,11 +151,15 @@ thread_local! {
     /// is current again when the last guard drops.
     static BEFORE_GUARDS: Cell<Option<&'static GoProgram>> = const { Cell::new(None) };
 
-    /// Programs that `release_program` released while a guard of theirs was
-    /// alive: the registry key, by program version id. The last such guard
-    /// releases them.
+    /// Programs that `release_program` released while a guard or a hold of
+    /// theirs was alive: the registry key, by program version id. The last
+    /// such guard or hold releases them.
     static RELEASE_PENDING: RefCell<FxHashMap<u32, usize>> =
         RefCell::new(FxHashMap::default());
+
+    /// The number of live `ProgramHold`s of each program version, by program
+    /// version id.
+    static HOLDS: RefCell<FxHashMap<u32, usize>> = RefCell::new(FxHashMap::default());
 
     /// The number of programs in `PROGRAM_CHECKERS` that use each compiler
     /// host, by host address (`host_key`). A program uses its own host and
@@ -367,13 +371,86 @@ impl Drop for ProgramGuard {
             (current, still_entered)
         });
         crate::core::set_thread_program(current);
-        if !still_entered {
-            let pending =
-                RELEASE_PENDING.with(|pending| pending.borrow_mut().remove(&self.version.id));
-            if let Some(key) = pending {
-                release_now(key);
-            }
+        if !still_entered && !is_held(self.version) {
+            release_if_pending(self.version);
         }
+    }
+}
+
+/// Not in Go: from `hold_program`. While it lives, `release_program` of its
+/// program waits, as for a live `ProgramGuard`, but the program is not
+/// current. It is `!Send`, so it drops on the thread that made it.
+// PORT: a Go background task that has a pointer to a snapshot reads its
+// programs also after the next snapshot change disposed it (the GC keeps
+// them). The snapshot change task takes a hold of each program of its new
+// snapshot instead (`project::Session::update_snapshot`).
+#[must_use = "the program stays readable only while the hold lives"]
+pub struct ProgramHold {
+    version: &'static GoProgram,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+/// Holds `p` registered, so its reads here work after `release_program` of
+/// it, until the hold drops. None for a program that is not registered (not
+/// made here, or released).
+pub fn hold_program(p: &NewProgram) -> Option<ProgramHold> {
+    let checkers =
+        PROGRAM_CHECKERS.with(|programs| programs.borrow().get(&program_key(p)).cloned())?;
+    let version = checkers.version;
+    HOLDS.with(|holds| *holds.borrow_mut().entry(version.id).or_insert(0) += 1);
+    Some(ProgramHold {
+        version,
+        _not_send: std::marker::PhantomData,
+    })
+}
+
+impl Drop for ProgramHold {
+    fn drop(&mut self) {
+        // A hold of a queued task that never ran drops with the queues of
+        // its thread when the thread ends; the registry may be gone then, and
+        // the thread's programs go with it.
+        if crate::gostd::local::is_ending() {
+            return;
+        }
+        let last = HOLDS.with(|holds| {
+            let mut holds = holds.borrow_mut();
+            let count = holds
+                .get_mut(&self.version.id)
+                .expect("a live hold is counted");
+            *count -= 1;
+            let last = *count == 0;
+            if last {
+                holds.remove(&self.version.id);
+            }
+            last
+        });
+        if last && !is_entered(self.version) {
+            release_if_pending(self.version);
+        }
+    }
+}
+
+/// True while a hold of `version` is alive on this thread.
+fn is_held(version: &'static GoProgram) -> bool {
+    HOLDS.with(|holds| holds.borrow().contains_key(&version.id))
+}
+
+/// True while a guard of `version` is alive on this thread.
+fn is_entered(version: &'static GoProgram) -> bool {
+    GUARDS.with(|guards| {
+        guards
+            .borrow()
+            .iter()
+            .any(|&(_, entered)| std::ptr::eq(entered, version))
+    })
+}
+
+/// Releases `version` now when `release_program` released it while a
+/// guard or a hold of it was alive. The caller dropped the last of them.
+fn release_if_pending(version: &'static GoProgram) {
+    let pending = RELEASE_PENDING.with(|pending| pending.borrow_mut().remove(&version.id));
+    if let Some(key) = pending {
+        release_now(key);
     }
 }
 
@@ -451,20 +528,15 @@ pub fn registered_programs() -> usize {
 /// Go drops a program when no snapshot uses it (`programCounter.Deref`
 /// returns true) and no request holds it. This is the snapshot part: the
 /// checker pools of `p` and its program version are freed now, or when the
-/// last guard of `p` drops (a request that still runs on it).
+/// last guard or hold of `p` drops (a request that still runs on it, a
+/// queued snapshot change task).
 pub fn release_program(p: &NewProgram) {
     let Some(checkers) =
         PROGRAM_CHECKERS.with(|programs| programs.borrow().get(&program_key(p)).cloned())
     else {
         return;
     };
-    let entered = GUARDS.with(|guards| {
-        guards
-            .borrow()
-            .iter()
-            .any(|&(_, version)| std::ptr::eq(version, checkers.version))
-    });
-    if entered {
+    if is_entered(checkers.version) || is_held(checkers.version) {
         RELEASE_PENDING.with(|pending| {
             pending
                 .borrow_mut()
