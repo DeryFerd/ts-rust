@@ -872,12 +872,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "a2065efc37a10f593",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "a89d25a40615b518e",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R171 pipeline (candidate.sh side)."
