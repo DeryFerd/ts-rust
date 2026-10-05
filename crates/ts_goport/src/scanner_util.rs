@@ -1580,12 +1580,10 @@ pub fn get_ecma_line_and_utf16_character_of_position(source_file: Node, pos: i32
 }
 
 /// The Go panic of `text[i:pos]` (the slice in Go
-/// `GetECMALineAndUTF16CharacterOfPosition`) for a Go int `pos` past the end
-/// of `text`. The text has the Go offset and length: past the end, the port
-/// form and the Go bytes differ by the same count (see `port_byte_offset`).
-pub fn panic_past_text(text: &str, pos: i64) -> ! {
+/// `GetECMALineAndUTF16CharacterOfPosition`) for a Go int `go_pos` (a Go
+/// byte offset, see `go_byte_offset`) past the end of `text`.
+pub fn panic_past_text(text: &str, go_pos: i64) -> ! {
     let go_len = go_len(text);
-    let go_pos = pos - text.len() as i64 + go_len as i64;
     crate::core::go_panic(format!(
         "runtime error: slice bounds out of range [:{go_pos}] with length {go_len}"
     ))
@@ -1623,7 +1621,7 @@ fn ecma_utf16_character_of_line_position(
     }
     let end = pos as usize;
     if end > text.len() {
-        panic_past_text(text, i64::from(pos));
+        panic_past_text(text, i64::from(go_byte_offset(text, pos)));
     }
     let mut boundary = end;
     while !text.is_char_boundary(boundary) {
@@ -4604,7 +4602,8 @@ mod debug_site_tests {
 mod position_panic_tests {
     use super::{
         compute_ecma_line_starts, ecma_line_and_utf16_character_of_text_position,
-        get_ecma_line_and_utf16_character_of_position,
+        get_ecma_line_and_utf16_character_of_position, go_byte_offset, go_string_from_bytes,
+        port_byte_offset,
     };
     use crate::core::go_panic_text;
     use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
@@ -4655,5 +4654,29 @@ mod position_panic_tests {
             ecma_line_and_utf16_character_of_text_position(&line_map, text, 17),
             (1, 5)
         );
+    }
+
+    // A Go position far past the end of a text with bytes that are not valid
+    // UTF-8, whose port form is 12 bytes longer than Go's 17 bytes. The
+    // panic has Go's offset and length (the pin N oracle gives the same for
+    // a `.tsbuildinfo` pos, tsctests::build_info_corrupt). A Go offset within
+    // 12 of `i32::MAX` has no port offset `go_pos + 12`; it is kept, not
+    // wrapped to a negative one (`index out of range [-1]`).
+    #[test]
+    fn a_far_position_in_a_text_with_raw_bytes_panics_with_the_go_offset() {
+        let text: &'static str = go_string_from_bytes(b"let a = 1; // \xff\xfe\n".to_vec()).leak();
+        assert_eq!(text.len(), 17 + 12);
+        let line_map = compute_ecma_line_starts(text);
+        for go_pos in [i32::MAX, i32::MAX - 11, i32::MAX - 24, 18] {
+            let pos = port_byte_offset(text, go_pos);
+            assert_eq!(go_byte_offset(text, pos), go_pos, "go_pos {go_pos}");
+            let line_map = line_map.clone();
+            assert_eq!(
+                go_panic_text(move || {
+                    ecma_line_and_utf16_character_of_text_position(&line_map, text, pos);
+                }),
+                format!("runtime error: slice bounds out of range [:{go_pos}] with length 17")
+            );
+        }
     }
 }

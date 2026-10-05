@@ -778,7 +778,8 @@ pub fn go_unit_bytes(unit: GoUnit, buf: &mut [u8; 4]) -> &[u8] {
 /// signatures, LSP UTF-8 columns and completion data. A `pos` that is `k`
 /// bytes into a unit of `g` Go bytes gives the unit's Go offset plus
 /// `min(k, g)`; `port_byte_offset` gives back `pos` for `k < g`. A negative
-/// offset is kept, and an offset past the end counts the bytes past it.
+/// offset is kept, and an offset past the end counts the bytes past it
+/// (see `port_offset_after_units` for one within `extra` of `i32::MAX`).
 pub fn go_byte_offset(text: &str, pos: i32) -> i32 {
     if pos <= 0 {
         return pos;
@@ -803,14 +804,14 @@ pub fn go_byte_offset(text: &str, pos: i32) -> i32 {
         extra += size - unit.go_len();
         next = find(at + size);
     }
-    pos - extra as i32
+    go_offset_after_units(pos, extra)
 }
 
 /// The port offset of the Go byte offset `go_pos` in the port form `text`,
 /// the inverse of `go_byte_offset`. An offset `k` bytes into the Go bytes of
 /// a unit gives the unit's port offset plus `k`, so that `go_byte_offset`
 /// gives `go_pos` back. A negative offset is kept, and an offset past the
-/// end counts the bytes past it.
+/// end counts the bytes past it (see `port_offset_after_units`).
 // PORT: such an offset is inside the unit's first char. For a real U+FDD0
 // (M + M) the first M holds Go's 3 bytes, so a byte slice there cuts the
 // same bytes as Go.
@@ -834,7 +835,29 @@ pub fn port_byte_offset(text: &str, go_pos: i32) -> i32 {
         go += unit.go_len();
         port = at + size;
     }
-    (port + (go_pos - go)) as i32
+    port_offset_after_units(go_pos, port - go)
+}
+
+/// The port offset of the Go offset `go_pos` after the units of a text,
+/// whose port bytes are `extra` more than their Go bytes: `go_pos + extra`.
+// PORT: past the end, a Go offset within `extra` of `i32::MAX` (from a bad
+// `.tsbuildinfo` position) has no such port offset. It is kept, which is
+// past the port text too, and `go_offset_after_units` gives it back. So an
+// `i32` port offset holds every Go offset past the end except the `extra`
+// ones below those, which read back `extra` higher.
+fn port_offset_after_units(go_pos: usize, extra: usize) -> i32 {
+    i32::try_from(go_pos + extra).unwrap_or(go_pos as i32)
+}
+
+/// The Go offset of the port offset `pos` after the units of a text, the
+/// inverse of `port_offset_after_units`.
+fn go_offset_after_units(pos: i32, extra: usize) -> i32 {
+    let extra = extra as i32;
+    if pos > i32::MAX - extra {
+        pos
+    } else {
+        pos - extra
+    }
 }
 
 /// Go `pos-1` on the port offset `pos` of the port form `text`: the port
@@ -928,7 +951,7 @@ impl GoOffsets {
         } else {
             extra += u.size - u.go_len;
         }
-        pos - extra as i32
+        go_offset_after_units(pos, extra)
     }
 
     /// `port_byte_offset(text, go_pos)`.
@@ -944,7 +967,7 @@ impl GoOffsets {
         if u.go_at + u.go_len > go_pos {
             return (u.at + (go_pos - u.go_at)) as i32;
         }
-        (u.at + u.size + (go_pos - u.go_at - u.go_len)) as i32
+        port_offset_after_units(go_pos, u.at + u.size - u.go_at - u.go_len)
     }
 }
 

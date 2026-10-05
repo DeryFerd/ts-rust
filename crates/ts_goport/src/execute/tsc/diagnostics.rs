@@ -842,10 +842,26 @@ fn write_code_snippet(
     // Go `start+length` is a Go int. `length` is the wrapped int32 length
     // of a bad range from a `.tsbuildinfo` (`Len`), so the sum can pass the
     // int32 range: then Go panics in `text[lineMap[line]:pos]`.
+    // PORT: `start` and `length` are port offsets (see `go_byte_offset`).
+    // When their sum stays in the int32 range, so does Go's, and both are
+    // the end of the range. Else Go's sum is taken on the Go offsets of the
+    // ends: `start` is in the text (the first call above did not panic), so
+    // a wrapped Go sum is past it.
     let end = i64::from(start) + i64::from(length);
     let (last_line, mut last_line_char) = match i32::try_from(end) {
         Ok(end) => get_ecma_line_and_utf16_character_of_file_position(source_file, end),
-        Err(_) => crate::scanner_util::panic_past_text(&source_file.text(), end),
+        Err(_) => {
+            let text = source_file.text();
+            let end = start.wrapping_add(length);
+            let go_start = crate::scanner_util::go_byte_offset(&text, start);
+            let go_end = crate::scanner_util::go_byte_offset(&text, end);
+            let go_sum = i64::from(go_start) + i64::from(go_end.wrapping_sub(go_start));
+            if go_sum == i64::from(go_end) {
+                get_ecma_line_and_utf16_character_of_file_position(source_file, end)
+            } else {
+                crate::scanner_util::panic_past_text(&text, go_sum)
+            }
+        }
     };
     if length == 0 {
         last_line_char += 1; // When length is zero, squiggle the character right after the start position.
