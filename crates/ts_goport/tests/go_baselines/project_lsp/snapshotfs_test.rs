@@ -859,6 +859,28 @@ fn source_fs_disable_tracking_stops_tracking() {
     assert!(!source_fs.seen_file(&p("/src/bar.ts")));
 }
 
+// PORT: not in Go. `SourceFS::without_tracking` (H3) tracks no read in
+// its callback, and the tracking comes back after it, also when the
+// callback panics.
+#[test]
+fn source_fs_without_tracking_restores_tracking_after_a_panic() {
+    let snapshot = plain_snapshot(&[("/src/foo.ts", "content"), ("/src/bar.ts", "content")]);
+    let source_fs = new_source_fs(true /* tracking */, snapshot, to_path());
+
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        source_fs.without_tracking(|| {
+            source_fs.get_file("/src/foo.ts");
+            panic!("the callback panics");
+        })
+    }));
+    assert!(caught.is_err());
+    assert!(!source_fs.seen_file(&p("/src/foo.ts")));
+
+    // The tracking is on again.
+    source_fs.get_file("/src/bar.ts");
+    assert!(source_fs.seen_file(&p("/src/bar.ts")));
+}
+
 // Go: snapshotfs_test.go:781 TestSourceFS/FileExists returns true for files in source
 #[test]
 fn source_fs_file_exists_returns_true_for_files_in_source() {

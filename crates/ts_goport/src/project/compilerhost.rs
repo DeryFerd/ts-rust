@@ -230,10 +230,9 @@ impl compiler::CompilerHost for CompilerHost {
     }
 
     // PORT: not in Go (see `compiler::CompilerHost::without_fs_tracking`).
+    // The tracking comes back also when `f` panics (`SourceFS::without_tracking`).
     fn without_fs_tracking(&self, f: &mut dyn FnMut()) {
-        let tracking = self.source_fs.tracking.replace(false);
-        f();
-        self.source_fs.tracking.set(tracking);
+        self.source_fs.without_tracking(f);
     }
 
     // Go: project/compilerhost.go:79 compilerHost.GetCurrentDirectory

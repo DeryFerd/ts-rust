@@ -748,6 +748,58 @@ child_test! {
     }
 }
 
+child_test! {
+    env &[("GOPORT_BIND_THREADS", "2")];
+    // PORT: when one clone makes the program and builds its auto-import
+    // bucket, Go's registry makes the first use of the symlink cache
+    // (ls/autoimport/registry.go:1256) before the host is frozen
+    // (project/snapshot.go:662, then :711). That build tracks the missing
+    // node_modules/<dependency> directory, so a Created event for it marks
+    // the project dirty (projectcollectionbuilder.go:1574). The parallel
+    // bind (2 threads) first builds the checkers' copy with the tracking
+    // paused (H3); the registry's build of the program's own value then
+    // reads the directory again (module/resolver.go:1061, no cache in
+    // `resolvePackageDirectoryOnly`), with the tracking on.
+    fn created_dependency_directory_rebuilds_after_auto_imports_before_freeze() {
+        let index = "export const x = 1;";
+        let (session, _) = projecttestutil::setup(files(&[
+            ("/home/projects/myproject/tsconfig.json", "{}"),
+            (
+                "/home/projects/myproject/package.json",
+                r#"{ "name": "myproject", "dependencies": { "zlibx": "^1.0.0" } }"#,
+            ),
+            (
+                "/home/projects/myproject/node_modules/other/package.json",
+                r#"{ "name": "other" }"#,
+            ),
+            ("/home/projects/myproject/src/index.ts", index),
+            ("/home/projects/myproject/src/other.ts", "export const y = 2;"),
+        ]));
+        let index_uri = "file:///home/projects/myproject/src/index.ts";
+        open(&session, index_uri, index);
+        let opened = program(&session, index_uri);
+
+        // A new import: the next clone makes a new program, and the
+        // auto-import request builds the project's bucket in that clone.
+        edit(&session, index_uri, 2, (0, 0), (0, 0), "import { y } from \"./other\";\n");
+        session
+            .get_current_language_service_with_auto_imports(&bg(), &uri(index_uri))
+            .unwrap_or_else(|err| panic!("{}", err.error()));
+        let before = program(&session, index_uri);
+        assert!(!same_program(&opened, &before));
+
+        watch(
+            &session,
+            &[(CREATED, "file:///home/projects/myproject/node_modules/zlibx")],
+        );
+        let after = program(&session, index_uri);
+        assert!(
+            !same_program(&before, &after),
+            "the registry's symlink cache build tracked node_modules/zlibx, so its Created event rebuilds"
+        );
+    }
+}
+
 // Go: projectcollectionbuilder_test.go:602 filesForSolutionConfigFile
 fn files_for_solution_config_file(
     solution_refs: &[&str],

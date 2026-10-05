@@ -1384,6 +1384,22 @@ impl SourceFS {
         self.tracking.set(false);
     }
 
+    /// Runs `f` with no tracking, then sets the tracking back to what it
+    /// was, also when `f` panics (a caller that catches the panic keeps the
+    /// host's tracking). `CompilerHost::without_fs_tracking` uses it.
+    // PORT: not in Go (H3: Go makes no tracked call after `freeze`, and the
+    // port builds the checkers' symlink cache copy before it).
+    pub fn without_tracking<R>(&self, f: impl FnOnce() -> R) -> R {
+        struct Restore<'a>(&'a Cell<bool>, bool);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(&self.tracking, self.tracking.replace(false));
+        f()
+    }
+
     // Go: project/snapshotfs.go:670 sourceFS.Track
     pub fn track(&self, file_name: &str) {
         if !self.tracking.get() {
