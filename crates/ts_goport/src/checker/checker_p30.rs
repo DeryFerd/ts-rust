@@ -5,6 +5,14 @@ use crate::jsnum::Number;
 use crate::prelude::*;
 use smallvec::SmallVec;
 
+/// The flags of the types whose base constraint Go
+/// `getBaseConstraintOfType` resolves (with generic tuple types).
+const BASE_CONSTRAINT_FLAGS: TypeFlags = TypeFlags::INSTANTIABLE_NON_PRIMITIVE
+    .union(TypeFlags::UNION_OR_INTERSECTION)
+    .union(TypeFlags::TEMPLATE_LITERAL)
+    .union(TypeFlags::STRING_MAPPING)
+    .union(TypeFlags::INDEX);
+
 impl Checker {
     // Go: checker/checker.go:27466 getPropertyTypeForIndexType
     pub fn get_property_type_for_index_type(
@@ -881,15 +889,40 @@ impl Checker {
     }
 
     // Go: checker/checker.go:27901 getBaseConstraintOfType
+    // PERF: chkfacts1. Inline: a resolved constraint is read here, as Go
+    // `getResolvedBaseConstraint` returns it first, with no call (and for an
+    // intersection with no `as_constrained_type` dispatch). The rest is
+    // `get_base_constraint_of_type_slow`.
+    #[inline]
     pub fn get_base_constraint_of_type(&mut self, t: TypeId) -> TypeId {
-        if self.ty(t).flags.intersects(
-            TypeFlags::INSTANTIABLE_NON_PRIMITIVE
-                | TypeFlags::UNION_OR_INTERSECTION
-                | TypeFlags::TEMPLATE_LITERAL
-                | TypeFlags::STRING_MAPPING
-                | TypeFlags::INDEX,
-        ) || self.is_generic_tuple_type(t)
-        {
+        let ty = self.ty(t);
+        if ty.flags.intersects(BASE_CONSTRAINT_FLAGS) {
+            let resolved = match &ty.data {
+                TypeData::Intersection(d) => {
+                    d.union_or_intersection
+                        .structured
+                        .constrained
+                        .resolved_base_constraint
+                }
+                data => data
+                    .as_constrained_type()
+                    .map_or(TypeId::NIL, |c| c.resolved_base_constraint),
+            };
+            if resolved.is_some() {
+                if resolved != self.no_constraint_type && resolved != self.circular_constraint_type
+                {
+                    return resolved;
+                }
+                return TypeId::NIL;
+            }
+        }
+        self.get_base_constraint_of_type_slow(t)
+    }
+
+    /// `get_base_constraint_of_type` when no constraint is resolved yet.
+    #[inline(never)]
+    fn get_base_constraint_of_type_slow(&mut self, t: TypeId) -> TypeId {
+        if self.ty(t).flags.intersects(BASE_CONSTRAINT_FLAGS) || self.is_generic_tuple_type(t) {
             let constraint = self.get_resolved_base_constraint(t, &[]);
             if constraint != self.no_constraint_type && constraint != self.circular_constraint_type
             {
