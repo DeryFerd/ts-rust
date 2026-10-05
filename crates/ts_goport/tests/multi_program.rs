@@ -496,12 +496,15 @@ fn watch_builds_report_like_fresh_runs() {
 /// watchfree1: from its second build on, `tsc --watch` frees the old file
 /// versions (`ast::set_watch_process`). The builds: a body edit of
 /// `src/a.ts`, a touch (the same text again), an edit that changes its
-/// imports (a full build), a `tsconfig.json` edit (a full build that parses
-/// every file again, libs too) and the original text. The errors of each
-/// build equal a fresh `goport` run on the same files. At exit each file
-/// version that the last program does not have is dead: the four replaced
-/// versions of `src/a.ts`. The first version of each file is static, so no
-/// other version dies.
+/// imports (a full build), a `tsconfig.json` edit and the original text.
+/// The config edit is a full build that keeps the parse of each file with
+/// the same parse options and text and no errors in the last build
+/// (watchcfg1, `WatchCompilerHost::reuse_parse`): it parses again only
+/// `src/b.ts`, `src/c.ts` and `src/d.js`, which have errors. The errors of
+/// each build equal a fresh `goport` run on the same files. At exit each
+/// file version that the last program does not have is dead: the three
+/// replaced versions of `src/a.ts`. The first version of each file is
+/// static, so no other version dies.
 // PORT: no Go counterpart.
 #[test]
 fn watch_frees_file_versions() {
@@ -516,8 +519,8 @@ fn watch_frees_file_versions() {
     let original_config = read(&config);
     let original_file = root.join("original.ts");
     write(&original_file, &original);
-    // `newLine` changes the parsed config, so the build parses every file
-    // again, and changes no error.
+    // `newLine` changes the parsed config, so the build is a full build,
+    // and changes no error.
     let new_config = original_config.replace(
         "\"declaration\": true",
         "\"declaration\": true,\n    \"newLine\": \"lf\"",
@@ -594,12 +597,12 @@ fn watch_frees_file_versions() {
     }
     let (made, dead) = file_version_counts(&stdout);
     assert_eq!(
-        dead, 4,
+        dead, 3,
         "each replaced version of {CHANGED} dies, and no other (made {made})"
     );
-    assert!(
-        made > dead + 4,
-        "the config edit parses every file again (made {made})"
+    assert_eq!(
+        made, 7,
+        "three edits of {CHANGED}, the three files with errors that the config edit parses again, and the original text"
     );
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
 }

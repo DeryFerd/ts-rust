@@ -319,6 +319,10 @@ pub struct DetachedParse {
     /// The text of each `file.imports` node. The nodes cannot be read after
     /// the store leaves the worker thread.
     pub import_specifiers: Vec<String>,
+    /// True for a freeable parse (`crate::ast::is_freeable_parse` on the
+    /// worker): it interned the file name and its store owns its nodes when
+    /// owned nodes are on, as `parse_source_file` does in that scope.
+    pub freeable: bool,
 }
 
 /// `parse_source_file` on a parse worker thread. The nodes go into the
@@ -340,7 +344,13 @@ pub fn parse_source_file_detached(
     let mut p = new_parser();
     p.initialize_state(opts, &source_text, script_kind);
     p.jsdoc_cut_text = Some(&jsdoc_cut_text);
-    let file_name: &'static str = Box::leak(opts.file_name.clone().into_boxed_str());
+    // As in `parse_source_file`.
+    let freeable = crate::ast::is_freeable_parse();
+    let file_name: &'static str = if freeable {
+        crate::core::Name::from(opts.file_name.as_str()).as_str()
+    } else {
+        Box::leak(opts.file_name.clone().into_boxed_str())
+    };
     // Drop what a parse that panicked left on this thread.
     let _ = take_detached_file_store();
     p.store = new_detached_file_store(job, file_name, source_text.clone());
@@ -356,6 +366,7 @@ pub fn parse_source_file_detached(
             store: take_detached_file_store().expect("the detached store of the parse"),
             read_module_indicator_options: false,
             import_specifiers: loaded.import_specifiers,
+            freeable,
         };
     }
     let file = p.parse_into_store();
@@ -365,6 +376,7 @@ pub fn parse_source_file_detached(
         store: take_detached_file_store().expect("the detached store of the parse"),
         read_module_indicator_options: module_indicator_options_read(),
         import_specifiers,
+        freeable,
     }
 }
 
@@ -378,7 +390,10 @@ pub fn adopt_detached_parse(
     opts: &SourceFileParseOptions,
 ) -> ParsedSourceFile {
     let DetachedParse {
-        mut file, store, ..
+        mut file,
+        store,
+        freeable,
+        ..
     } = parse;
     let remap = adopt_detached_store(store);
     file.remap_store(remap);
@@ -386,7 +401,10 @@ pub fn adopt_detached_parse(
     if file.has_lazy_js_doc {
         set_file_store_lazy_js_doc(file.store, &file.parse_options, file.script_kind);
     }
-    set_source_file_diagnostics(file.root, file.diagnostics.clone());
+    // As in `parse_source_file`: a freeable parse leaks no table entry.
+    if !freeable {
+        set_source_file_diagnostics(file.root, file.diagnostics.clone());
+    }
     file
 }
 

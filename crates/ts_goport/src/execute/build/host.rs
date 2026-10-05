@@ -213,16 +213,23 @@ pub struct BuildHost {
     // graph ahead of `get_resolved_project_reference` (config_prefetch.rs),
     // until the graph is made.
     pub config_prefetch: RefCell<Option<PrefetchPool>>,
-    // PORT: not in Go (`CompilerHost::prefetch_parses`). False in the watch
-    // cycles after the first (set by `Orchestrator::watch`): they take most
-    // files from `watch_sources`, and a parse worker's parse keeps its nodes
-    // in the worker's AST arena, so a worker parse of a kept file would
-    // leak them, and so would a freeable file version of a worker parse.
+    // PORT: not in Go (`CompilerHost::prefetch_parses`). In watch mode,
+    // true only in the first build and in the cycles with a config change
+    // or an overflow (set by `Orchestrator::watch` and `do_cycle`). Another
+    // cycle takes almost every file from `watch_sources`: a parse of a
+    // changed file on a worker saves less than the pool costs. The workers
+    // skip the parses that `watch_source_file` keeps
+    // (`cached_source_file_refs`), and a worker parse of a published path
+    // is a freeable file version (`freeable_worker_parses`).
     pub prefetch: std::cell::Cell<bool>,
     // PORT: not in Go (`watch_source_file`). The parses of the source files
     // (not `.d.ts` or `.json`) in `tsc -b --watch`, with the modification
     // time of each file at its parse. `None` outside watch mode.
     pub watch_sources: RefCell<Option<FxHashMap<SourceFileCacheKey, WatchSource>>>,
+    // PORT: not in Go (`keep_watch_sources_for_config_change`). In a cycle
+    // after a config change, the parses that `watch_sources` had before it
+    // and that no build of the cycle took yet.
+    watch_sources_before_config_change: RefCell<FxHashMap<SourceFileCacheKey, WatchSource>>,
     // PORT: Go `*collections.SyncMap`. The task `writeFile` stores into it
     // from the checker threads.
     pub m_times: Arc<Mutex<FxHashMap<Path, Option<SystemTime>>>>,
@@ -306,6 +313,7 @@ impl BuildHost {
             config_prefetch: RefCell::new(None),
             prefetch: std::cell::Cell::new(true),
             watch_sources: RefCell::new(None),
+            watch_sources_before_config_change: RefCell::default(),
             m_times: Arc::default(),
             written: Arc::default(),
         }
@@ -351,6 +359,19 @@ impl BuildHost {
         if cached.is_some() {
             return cached;
         }
+        // A kept parse from before a config change of this cycle: one with
+        // these parse options, or with other module indicator options that
+        // its parse did not read (`parse_with_options`).
+        let before = self
+            .take_watch_source_before_config_change(opts)
+            .filter(|source| keep && source.mod_time == mod_time);
+        if let Some(source) = before {
+            let file = source.file.clone();
+            if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
+                sources.insert(key, source);
+            }
+            return Some(file);
+        }
         let file = self.host.get_source_file(opts);
         if shared {
             // See the note in `get_source_file`.
@@ -379,13 +400,86 @@ impl BuildHost {
 
     /// PORT: not in Go (`watch_source_file`). Drops the kept parses of the
     /// files at `paths` (the paths of a cycle's watch events), or every
-    /// kept parse when `paths` is `None` (an overflow or a config change).
+    /// kept parse when `paths` is `None` (an overflow).
     pub fn evict_watch_sources(&self, paths: Option<&FxHashSet<Path>>) {
         if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
             match paths {
                 Some(paths) => sources.retain(|key, _| !paths.contains(&key.0.path)),
                 None => sources.clear(),
             }
+        }
+    }
+
+    /// PORT: not in Go (`watch_source_file`). A cycle with a config change
+    /// keeps the parses too: the key of a parse holds its parse options, so
+    /// a project whose options changed parses again only the files whose
+    /// parse options changed and whose parses read the changed options
+    /// (`take_watch_source_before_config_change`). Go parses every file
+    /// again in each cycle, and the port did in a config change cycle, on
+    /// one thread (a query-persist-client-core build after a tsconfig edit
+    /// took 2 times as long as Go). The kept parses wait in
+    /// `watch_sources_before_config_change`, and a build of the cycle takes
+    /// back each one that it uses (`watch_source_file`). Then
+    /// `end_config_change_cycle` drops the ones that it replaced.
+    pub fn keep_watch_sources_for_config_change(&self) {
+        if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
+            self.watch_sources_before_config_change
+                .borrow_mut()
+                .extend(sources.drain());
+        }
+    }
+
+    /// PORT: not in Go (`watch_source_file`). Takes the kept parse from
+    /// before a config change that a parse with `opts` would give: the one
+    /// with `opts`, else one whose parse options differ only in module
+    /// indicator options that it did not read, as a copy with `opts`
+    /// (`parse_with_options`). The key of a kept parse holds its options, so
+    /// the other three module indicator options are looked up.
+    fn take_watch_source_before_config_change(
+        &self,
+        opts: &SourceFileParseOptions,
+    ) -> Option<WatchSource> {
+        let mut before = self.watch_sources_before_config_change.borrow_mut();
+        if before.is_empty() {
+            return None;
+        }
+        let mut key = SourceFileCacheKey(opts.clone());
+        if let Some(source) = before.remove(&key) {
+            return Some(source);
+        }
+        for (jsx, force) in [(false, false), (false, true), (true, false), (true, true)] {
+            key.0.external_module_indicator_options = ExternalModuleIndicatorOptions { jsx, force };
+            if key.0.external_module_indicator_options == opts.external_module_indicator_options {
+                continue;
+            }
+            let Some(source) = before.get(&key) else {
+                continue;
+            };
+            let file = crate::frontend::parser::parse_with_options(&source.file, opts)?;
+            let mod_time = source.mod_time;
+            before.remove(&key);
+            return Some(WatchSource { file, mod_time });
+        }
+        None
+    }
+
+    /// PORT: not in Go (`keep_watch_sources_for_config_change`). At the end
+    /// of a cycle, a kept parse from before a config change that no build
+    /// of the cycle took goes back to `watch_sources`, for a later build of
+    /// its project, unless the cycle has a parse of the same path (with
+    /// other parse options): that one replaced it, so it goes.
+    pub fn end_config_change_cycle(&self) {
+        let before = std::mem::take(&mut *self.watch_sources_before_config_change.borrow_mut());
+        if before.is_empty() {
+            return;
+        }
+        if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
+            let parsed: FxHashSet<Path> = sources.keys().map(|key| key.0.path.clone()).collect();
+            sources.extend(
+                before
+                    .into_iter()
+                    .filter(|(key, _)| !parsed.contains(&key.0.path)),
+            );
         }
     }
 
@@ -620,35 +714,40 @@ impl CompilerHost for BuildHost {
     }
 
     // PORT: not in Go (see `CompilerHost::cached_source_file_refs`). The
-    // `.d.ts` and `.json` files that `get_source_file` keeps. The
-    // references of each parse are made once (`cached_refs`).
+    // `.d.ts` and `.json` files that `get_source_file` keeps, and in
+    // `tsc -b --watch` the parses that `watch_source_file` keeps, also from
+    // before a config change. A kept parse is given only for the module
+    // indicator options that its parse read, if any
+    // (`FileRefs::of_kept_parse`; a `.d.ts` or `.json` parse reads none).
+    // The references of each parse are made once (`cached_refs`).
     fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<FileRefs>> {
         let mut refs = FxHashMap::default();
         let mut memo = self.cached_refs.borrow_mut();
         let mut add = |key: &SourceFileCacheKey, file: &Rc<ParsedSourceFile>| {
             let (parse, file_refs) = memo
                 .entry(key.0.file_name.clone())
-                .or_insert_with(|| (Rc::downgrade(file), Arc::new(FileRefs::of_file(file))));
+                .or_insert_with(|| (Rc::downgrade(file), Arc::new(FileRefs::of_kept_parse(file))));
             if !parse.ptr_eq(&Rc::downgrade(file)) {
                 *parse = Rc::downgrade(file);
-                *file_refs = Arc::new(FileRefs::of_file(file));
+                *file_refs = Arc::new(FileRefs::of_kept_parse(file));
             }
             refs.insert(key.0.file_name.clone(), file_refs.clone());
         };
         self.source_files.for_each_stored(&mut add);
-        // `tsc -b --watch` keeps its files in `watch_sources`. Only its
-        // first build parses ahead, so only its `.d.ts` and `.json` files
-        // can be in another program of that build.
         if let Some(sources) = self.watch_sources.borrow().as_ref() {
             for (key, source) in sources {
-                if is_declaration_file_name(&key.0.file_name)
-                    || file_extension_is(&key.0.file_name, EXTENSION_JSON)
-                {
-                    add(key, &source.file);
-                }
+                add(key, &source.file);
             }
         }
+        for (key, source) in self.watch_sources_before_config_change.borrow().iter() {
+            add(key, &source.file);
+        }
         refs
+    }
+
+    // PORT: not in Go (see `CompilerHost::freeable_worker_parses`).
+    fn freeable_worker_parses(&self) -> bool {
+        self.watch_sources.borrow().is_some()
     }
 
     // Go: build/host.go:70 (*host).GetResolvedProjectReference
@@ -835,5 +934,10 @@ impl CompilerHost for BuildCompilerHost {
     // PORT: not in Go (see `CompilerHost::cached_source_file_refs`).
     fn cached_source_file_refs(&self) -> FxHashMap<String, Arc<FileRefs>> {
         self.host.cached_source_file_refs()
+    }
+
+    // PORT: not in Go (see `CompilerHost::freeable_worker_parses`).
+    fn freeable_worker_parses(&self) -> bool {
+        self.host.freeable_worker_parses()
     }
 }
