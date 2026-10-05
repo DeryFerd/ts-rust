@@ -21,7 +21,9 @@ use crate::api::prelude::*;
 //   pointer of one checker to another checker. For a symbol, the port uses
 //   the same symbol when both arenas have it, else a shadow: a copy in the
 //   setup checker's arena with the same id and no links (`import_symbol`).
-//   A type or signature of another checker calls `unported!`.
+//   A symbol that reaches a file version bound after the setup checker's
+//   copy of the binder lineage, and a type or signature of another
+//   checker, call `unported!`.
 // - Go `defer setup.done()`: `CheckerSetup::done` is a `Release` guard. It
 //   releases the checker when `setup` drops at the end of the handler.
 // - Current program: node handles (`node_handle_from`, `resolve_node_handle`)
@@ -580,6 +582,14 @@ impl SnapshotData {
 /// PORT: Go hands a `*ast.Symbol` of any checker to `setup.checker`. A Rust
 /// symbol handle indexes the arena of `owner`. This returns the symbol of
 /// `checker`'s arena that is the same Go symbol (`import_symbol`).
+/// `checker` can read only the binder lineage symbols of its copy
+/// (`SymbolArena::shared_symbol_count`). When the import reaches a file
+/// version bound after that copy, this calls `unported!` before it writes
+/// anything (`importable`): Go's checker reads `node.Symbol()` of any bound
+/// file, but `checker` would read those lineage ids past its copy (a panic,
+/// or one of its own symbols). The API's persistent checker copies the
+/// lineage when it is made (`ls_program::new_api_checker`), so this stops
+/// only when that checker is older than the version.
 pub fn checker_symbol(
     checker: &Rc<RefCell<Checker>>,
     owner: &Rc<RefCell<Checker>>,
@@ -588,9 +598,52 @@ pub fn checker_symbol(
     if Rc::ptr_eq(checker, owner) || symbol.is_nil() {
         return symbol;
     }
-    let owner = owner.borrow();
-    let mut checker = checker.borrow_mut();
-    import_symbol(&owner.symbols, &mut checker.symbols, symbol)
+    let imported = {
+        let owner = owner.borrow();
+        let mut checker = checker.borrow_mut();
+        importable(&owner.symbols, &checker.symbols, symbol)
+            .then(|| import_symbol(&owner.symbols, &mut checker.symbols, symbol))
+    };
+    imported.unwrap_or_else(|| unported!("api: symbol of a file bound after the checker was made"))
+}
+
+/// True when arena `to` can read everything that `import_symbol` copies
+/// from `from` for `symbol`. It walks the symbols that the import would
+/// shadow (the same walk, with no writes). A binder lineage symbol (id slot
+/// key 0) that `to` lacks is past `to`'s lineage copy. A shadow keeps its
+/// declarations, whose `node.symbol()` and `node.locals()` are lineage ids,
+/// so each declaration symbol must be in that copy too.
+fn importable(from: &SymbolArena, to: &SymbolArena, symbol: SymbolId) -> bool {
+    let lineage = to.shared_symbol_count();
+    let shared_tables = from.shared_table_count().min(to.shared_table_count());
+    let mut seen = FxHashSet::default();
+    let mut work = vec![symbol];
+    while let Some(symbol) = work.pop() {
+        if symbol.is_nil() || !seen.insert(symbol.index()) {
+            continue;
+        }
+        let origin = from.id_slot(symbol);
+        if to.symbol_at_slot(origin).is_some() {
+            continue;
+        }
+        if origin.key == 0 {
+            return false;
+        }
+        let s = from.sym(symbol);
+        if s.declarations
+            .iter()
+            .any(|declaration| declaration.symbol().index() >= lineage)
+        {
+            return false;
+        }
+        work.extend([s.parent, s.export_symbol]);
+        for table in [s.members, s.exports] {
+            if !table.is_nil() && table.index() >= shared_tables {
+                work.extend(from.iter_names(table).map(|(_, member)| member));
+            }
+        }
+    }
+    true
 }
 
 /// The symbol of arena `to` that is Go symbol `symbol` of arena `from`: the

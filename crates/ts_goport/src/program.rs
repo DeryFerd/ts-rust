@@ -1542,6 +1542,16 @@ pub fn lineage_live_chunks() -> usize {
     with_lineage(|lineage| lineage.symbols.live_chunk_count())
 }
 
+/// A checker copy (`SymbolArena::for_checker`) of the binder lineage as it
+/// is now: every live file version bound so far, in any program. A
+/// program's own copy (`bound_symbols`) holds only the versions bound
+/// before the program bound its files. The API's persistent checker uses
+/// it (`ls_program::new_api_checker`).
+#[must_use]
+pub fn lineage_for_checker() -> SymbolArena {
+    with_lineage(|lineage| lineage.symbols.for_checker())
+}
+
 // Go: compiler/program.go:574 BindSourceFiles
 // PORT: Go binds files in parallel into per-file symbol tables. Here every
 // file binds into the shared `LINEAGE` arena, and the program's binder

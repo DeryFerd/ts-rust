@@ -1255,7 +1255,8 @@ impl Checker {
 // checkers. Here the checker binds the program first if nothing has
 // (`program::bind_all`), then copies the program's binder symbols
 // (`program::bound_symbols`) as its own symbol arena
-// (`SymbolArena::for_checker`).
+// (`SymbolArena::for_checker`). `with_symbols` takes another copy (the
+// API's persistent checker, `ls_program::new_api_checker`).
 // PORT: the checker reads its program through `program` and
 // `compiler_options`, but the `program.rs` functions it calls read the
 // current program (`prog()`). A thread that holds checkers of several
@@ -1265,9 +1266,15 @@ impl Checker {
 // struct literal; Go nil fields not set here keep their nil value.
 impl Checker {
     pub fn new(checker_index: usize) -> Checker {
-        let program = prog();
         bind_all();
-        let bound_symbols = crate::program::bound_symbols().for_checker();
+        Self::with_symbols(checker_index, crate::program::bound_symbols().for_checker())
+    }
+
+    /// `new` with `symbols` as the checker's symbol arena: a checker copy
+    /// (`SymbolArena::for_checker`) of a binder lineage copy that holds the
+    /// files of the current program, which is bound (`bind_all`).
+    pub fn with_symbols(checker_index: usize, symbols: SymbolArena) -> Checker {
+        let program = prog();
         let compiler_options = &program.options;
         let files: Vec<Node> = program.source_files().map(|f| f.root).collect();
         let file_index_map = create_file_index_map(&files);
@@ -1605,7 +1612,7 @@ impl Checker {
             alternative_module_import_misses: FxHashSet::default(),
             matching_reference_memo: Default::default(),
             merge_version: 0,
-            symbols: bound_symbols,
+            symbols,
             types: ChunkedArena::with_nil(Type::default()),
             object_type_instantiations: vec![InstantiationMap::default()],
             signatures: vec![Signature::default()],
