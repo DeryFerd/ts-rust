@@ -39,7 +39,7 @@ use ts_goport::program::ls_program;
 use ts_goport::project::{self, SourceFileLease};
 
 use super::api_util::nil_error;
-use super::projecttestutil::{self, files};
+use super::projecttestutil::{self, TypingsInstallerOptions, files};
 use super::util::{bg, edit, open, program, sem_diag_count};
 
 const INDEX_URI: &str = "file:///home/projects/TS/p1/index.ts";
@@ -420,5 +420,35 @@ child_test! {
         session.close();
         assert!(versions.iter().all(FileVersionProbe::is_freed), "the close frees them");
         project_session.close();
+    }
+}
+
+child_test! {
+    // apimem1 problem 2b: a lease of a path that no program has and no
+    // publish published. Its first version is freeable too, and the release
+    // frees it.
+    fn lease_of_a_new_path_is_freed() {
+        let (project_session, session) = setup();
+        encode_and_release(&session, "/home/projects/TS/p1/new.ts", "export const n = 1;\n");
+        session.close();
+        project_session.close();
+    }
+}
+
+child_test! {
+    // apimem1 problem 2 (sbm-loop): the plain API (`api --stdio`, Go
+    // `NewStandaloneSession`) frees released leases, with no snapshot and no
+    // program before them: the first lease of a path and a later one.
+    fn standalone_session_frees_released_leases() {
+        let (init, _) = projecttestutil::get_session_init_options(
+            files(&[(A_FILE, A_TEXT)]),
+            None,
+            TypingsInstallerOptions::default(),
+        );
+        let session = api::new_standalone_session(&init, None);
+        assert!(free_file_versions(), "an API process frees file versions");
+        encode_and_release(&session, A_FILE, A_TEXT);
+        encode_and_release(&session, A_FILE, "export const a = 2;\n");
+        session.close();
     }
 }
