@@ -1757,7 +1757,10 @@ mod hole_tests {
 }
 
 /// `vec![T::default(); len]` for a large table that a probe reads before it
-/// writes. Not a Go port.
+/// writes. Not a Go port. `T` is an integer: its `Default` is all zero
+/// bytes, so `vec!` is calloc, and it is at most 4096 bytes, so the stores
+/// below write each 4 KiB page. A compile-time assert checks the size, and a
+/// debug assert checks that `T::default()` is 0.
 ///
 /// PERF: prefault1. `vec![0; len]` is calloc, and jemalloc does not write a
 /// fresh extent. A read first maps the huge zero page over its 2 MiB block.
@@ -1772,10 +1775,20 @@ mod hole_tests {
 // `reindex` and `empty_index`) too large to inline into its callers, and zod
 // ST ran 0.55% more instructions.
 #[inline(never)]
-pub fn zeroed_vec<T: Copy + Default>(len: usize) -> Vec<T> {
+pub fn zeroed_vec<T: Copy + Default + PartialEq + From<u8>>(len: usize) -> Vec<T> {
+    const {
+        assert!(
+            size_of::<T>() <= 4096,
+            "zeroed_vec: T is larger than a page"
+        )
+    };
+    debug_assert!(
+        T::default() == T::from(0),
+        "zeroed_vec: T::default() is not 0"
+    );
     let mut vec = vec![T::default(); len];
     if cfg!(target_os = "linux") && size_of_val(vec.as_slice()) >= 16 << 10 {
-        let step = (4096 / size_of::<T>().max(1)).max(1);
+        let step = 4096 / size_of::<T>().max(1);
         for i in (0..len).step_by(step).chain([len - 1]) {
             // black_box: LLVM removes a plain store of 0 into calloc memory.
             vec[i] = std::hint::black_box(T::default());
