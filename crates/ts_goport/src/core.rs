@@ -2224,15 +2224,6 @@ impl SymbolArena {
         self.ids.shared_tables as usize
     }
 
-    /// The number of binder lineage symbols in this checker arena (the
-    /// length of its lineage copy, `for_checker`): a lineage id below it
-    /// is that lineage symbol here. The API reads it before it gives this
-    /// arena a symbol of another checker (`api::checker_symbol`).
-    #[must_use]
-    pub fn shared_symbol_count(&self) -> usize {
-        self.ids.shared as usize
-    }
-
     /// The number of symbols, with the nil symbol at index 0.
     #[must_use]
     pub fn symbol_count(&self) -> usize {

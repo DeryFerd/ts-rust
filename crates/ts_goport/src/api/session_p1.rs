@@ -583,7 +583,7 @@ impl SnapshotData {
 /// symbol handle indexes the arena of `owner`. This returns the symbol of
 /// `checker`'s arena that is the same Go symbol (`import_symbol`).
 /// `checker` can read only the binder lineage symbols of its copy
-/// (`SymbolArena::shared_symbol_count`). When the import reaches a file
+/// (`SymbolArena::for_checker`). When the import reaches a file
 /// version bound after that copy, this calls `unported!` before it writes
 /// anything (`importable`): Go's checker reads `node.Symbol()` of any bound
 /// file, but `checker` would read those lineage ids past its copy (a panic,
@@ -609,17 +609,19 @@ pub fn checker_symbol(
 
 /// True when arena `to` can read everything that `import_symbol` copies
 /// from `from` for `symbol`. It walks the symbols that the import would
-/// shadow (the same walk, with no writes). A binder lineage symbol (id slot
-/// key 0) that `to` lacks is past `to`'s lineage copy. A shadow keeps its
-/// declarations, whose `node.symbol()` and `node.locals()` are lineage ids,
-/// so each declaration symbol must be in that copy too.
+/// shadow (the same walk, with no writes). `to` has a binder lineage
+/// symbol (id slot key 0) only when its copy of the lineage
+/// (`SymbolArena::for_checker`) holds it, so a lineage symbol that `to`
+/// lacks is past that copy. A shadow keeps its declarations, whose
+/// `node.symbol()` and `node.locals()` are lineage ids that `to` reads at
+/// those indexes, so each declaration symbol must be that symbol in `to`.
 fn importable(from: &SymbolArena, to: &SymbolArena, symbol: SymbolId) -> bool {
-    let lineage = to.shared_symbol_count();
+    let in_lineage_copy = |n: SymbolId| to.symbol_at_slot(IdSlot { key: 0, place: n.0 }) == Some(n);
     let shared_tables = from.shared_table_count().min(to.shared_table_count());
     let mut seen = FxHashSet::default();
     let mut work = vec![symbol];
     while let Some(symbol) = work.pop() {
-        if symbol.is_nil() || !seen.insert(symbol.index()) {
+        if symbol.is_nil() || !seen.insert(symbol) {
             continue;
         }
         let origin = from.id_slot(symbol);
@@ -630,9 +632,10 @@ fn importable(from: &SymbolArena, to: &SymbolArena, symbol: SymbolId) -> bool {
             return false;
         }
         let s = from.sym(symbol);
-        if s.declarations
+        if !s
+            .declarations
             .iter()
-            .any(|declaration| declaration.symbol().index() >= lineage)
+            .all(|declaration| in_lineage_copy(declaration.symbol()))
         {
             return false;
         }
