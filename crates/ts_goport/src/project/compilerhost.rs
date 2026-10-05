@@ -163,6 +163,7 @@ pub fn new_compiler_host(
         )
     };
     let source_fs = new_source_fs(true, builder.fs.clone(), builder.to_path.clone());
+    UNFROZEN_HOSTS.with(|unfrozen| unfrozen.set(unfrozen.get() + 1));
     Rc::new(CompilerHost {
         config_file_path,
         current_directory: current_directory.to_string(),
@@ -183,6 +184,31 @@ pub fn new_compiler_host(
     })
 }
 
+thread_local! {
+    /// The hosts of this thread that are neither frozen nor dropped
+    /// (`unfrozen_compiler_hosts`).
+    static UNFROZEN_HOSTS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Not in Go: the number of hosts that `new_compiler_host` made on this
+/// thread and that are neither frozen nor dropped. A host keeps its project
+/// and the builder until `freeze`. Go's GC frees them with the host; the
+/// port keeps the host of a released program (`release`), so every host
+/// that a snapshot clone made must be frozen when the clone ends. Tests
+/// check it.
+#[must_use]
+pub fn unfrozen_compiler_hosts() -> usize {
+    UNFROZEN_HOSTS.with(Cell::get)
+}
+
+impl Drop for CompilerHost {
+    fn drop(&mut self) {
+        if self.builder.get_mut().is_some() {
+            UNFROZEN_HOSTS.with(|unfrozen| unfrozen.set(unfrozen.get() - 1));
+        }
+    }
+}
+
 impl CompilerHost {
     // Go: project/compilerhost.go:50 compilerHost.freeze
     // freeze clears references to mutable state to make the compilerHost safe for use
@@ -195,6 +221,7 @@ impl CompilerHost {
         if self.builder.borrow().is_none() {
             crate::core::go_panic("freeze can only be called once".to_string());
         }
+        UNFROZEN_HOSTS.with(|unfrozen| unfrozen.set(unfrozen.get() - 1));
         *self.source_fs.source.borrow_mut() = snapshot_fs;
         self.source_fs.disable_tracking();
         *self.config_file_registry.borrow_mut() = Some(config_file_registry);

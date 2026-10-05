@@ -709,6 +709,56 @@ child_test! {
             1,
             "only the build project's program should stay registered"
         );
+        // The clone froze the spec project's host too, so the host holds
+        // neither the project nor the builder.
+        assert_eq!(
+            ts_goport::project::unfrozen_compiler_hosts(),
+            0,
+            "every host that the clone made should be frozen"
+        );
+    }
+}
+
+child_test! {
+    // PORT: not in Go. One clone updates the inferred project twice: the
+    // edit of a.ts makes the request for a.ts update its program
+    // (projectcollectionbuilder.go:658), and the request for the closed b.ts,
+    // which no config holds, adds it as a root and updates it again
+    // (:626 ensureInferredProjectIncludesClosedFile). Go's GC frees the
+    // first program and its host; the port releases the first program at
+    // the end of the clone (`Snapshot::clone`,
+    // `ProjectCollectionBuilder::made_programs`), and the second program,
+    // which the project keeps, still answers.
+    fn project_updated_twice_in_a_clone_releases_its_first_program() {
+        const A: &str = "/home/projects/loose/a.ts";
+        const A_URI: &str = "file:///home/projects/loose/a.ts";
+        const B: &str = "/home/projects/loose/b.ts";
+        const B_URI: &str = "file:///home/projects/loose/b.ts";
+        let a = "export const a = 1;";
+        let (session, _) =
+            projecttestutil::setup(files(&[(A, a), (B, "export const b: number = 2;")]));
+        open(&session, A_URI, a);
+        assert_eq!(default_project_kind(&session, A_URI), Kind::INFERRED);
+        assert_eq!(ts_goport::program::ls_program::registered_programs(), 1);
+
+        edit(&session, A_URI, 2, (0, 0), (0, 0), "// edited\n");
+        session.get_language_services_for_documents_loading_project_tree(
+            &bg(),
+            &[uri(A_URI), uri(B_URI)],
+        );
+        let program = program(&session, A_URI);
+        assert!(has_file(&program, B), "b.ts should be a root of the inferred project");
+        assert_eq!(sem_diag_count(&program, B), 0);
+        assert_eq!(
+            ts_goport::program::ls_program::registered_programs(),
+            1,
+            "only the inferred project's last program should stay registered"
+        );
+        assert_eq!(
+            ts_goport::project::unfrozen_compiler_hosts(),
+            0,
+            "no host of the clone should keep its project and the builder"
+        );
     }
 }
 
