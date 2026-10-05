@@ -1756,6 +1756,29 @@ mod hole_tests {
     }
 }
 
+/// `vec![T::default(); len]` for a large table that a probe reads before it
+/// writes. Not a Go port.
+///
+/// PERF: prefault1. `vec![0; len]` is calloc, and jemalloc does not write a
+/// fresh extent. A read first maps the huge zero page over its 2 MiB block.
+/// On Linux up to 6.12 (6.13: "Do not shatter hugezeropage on wp-fault")
+/// the first write splits it, and each 4 KiB page then takes a
+/// copy-on-write fault with a TLB shootdown to the other checker threads
+/// (zod MT: about 3,200 such faults per run). One store per 4 KiB page,
+/// and one on the last element, makes the first touch a write. Linux only:
+/// it was measured only there, and wasm has no page faults.
+pub fn zeroed_vec<T: Copy + Default>(len: usize) -> Vec<T> {
+    let mut vec = vec![T::default(); len];
+    if cfg!(target_os = "linux") && size_of_val(vec.as_slice()) >= 16 << 10 {
+        let step = (4096 / size_of::<T>().max(1)).max(1);
+        for i in (0..len).step_by(step).chain([len - 1]) {
+            // black_box: LLVM removes a plain store of 0 into calloc memory.
+            vec[i] = std::hint::black_box(T::default());
+        }
+    }
+    vec
+}
+
 /// One symbol table entry. `hash` is the low half of `intern::hash_str` of
 /// the name, so a lookup by text skips most entries without reading them.
 #[derive(Clone, Copy, Debug)]

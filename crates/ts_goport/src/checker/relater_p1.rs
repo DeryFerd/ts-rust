@@ -286,10 +286,11 @@ impl PlainResultTable {
     }
 
     /// Doubles the slot count and puts every entry back.
+    // PERF: `zeroed_vec`, as the probe reads a slot before it writes one.
     #[cold]
     fn grow(&mut self) {
         let len = (self.slots.len() * 2).max(16);
-        let old = std::mem::replace(&mut self.slots, vec![0; len].into_boxed_slice());
+        let old = std::mem::replace(&mut self.slots, zeroed_vec(len).into_boxed_slice());
         for &entry in &*old {
             if entry != 0 {
                 self.insert_absent(entry);
