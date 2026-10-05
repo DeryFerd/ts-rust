@@ -945,33 +945,7 @@ pub fn get_assigned_name(node: Node) -> Node {
 pub fn get_assignment_declaration_kind(node: Node) -> JSDeclarationKind {
     match node.kind() {
         SyntaxKind::BinaryExpression => {
-            let left = node.left();
-            let right = node.right();
-            if node.operator_token().kind() == SyntaxKind::EqualsToken && is_access_expression(left)
-            {
-                if is_in_js_file(left) {
-                    if is_module_exports_access_expression(left) && !is_exports_identifier(right) {
-                        return JSDeclarationKind::MODULE_EXPORTS;
-                    }
-                    if (is_module_exports_access_expression(left.expression())
-                        || is_exports_identifier(left.expression()))
-                        && get_element_or_property_access_name(left).is_some()
-                    {
-                        return JSDeclarationKind::EXPORTS_PROPERTY;
-                    }
-                    if left.expression().kind() == SyntaxKind::ThisKeyword {
-                        return JSDeclarationKind::THIS_PROPERTY;
-                    }
-                }
-                if left.kind() == SyntaxKind::PropertyAccessExpression
-                    && is_entity_name_expression_ex(left.expression(), is_in_js_file(left))
-                    && is_identifier(left.name())
-                    || left.kind() == SyntaxKind::ElementAccessExpression
-                        && is_entity_name_expression_ex(left.expression(), is_in_js_file(left))
-                {
-                    return JSDeclarationKind::PROPERTY;
-                }
-            }
+            return get_binary_assignment_declaration_kind(&BinaryView::new(node));
         }
         SyntaxKind::CallExpression => {
             if is_in_js_file(node) && is_bindable_object_define_property_call(node) {
@@ -987,6 +961,77 @@ pub fn get_assignment_declaration_kind(node: Node) -> JSDeclarationKind {
         _ => {}
     }
     JSDeclarationKind::NONE
+}
+
+/// `get_assignment_declaration_kind` of a BinaryExpression, on its fields
+/// that the caller already read (`BinaryView`): Go's `KindBinaryExpression`
+/// case.
+// PERF: binderview1. Every test is pure, so the kind, the expression and
+// the JS file bit of `bin.Left` are read once each, and the expression's
+// kind once for the identifier and access tests on it.
+pub fn get_binary_assignment_declaration_kind(bin: &BinaryView) -> JSDeclarationKind {
+    if bin.operator != SyntaxKind::EqualsToken {
+        return JSDeclarationKind::NONE;
+    }
+    let left = bin.left;
+    let left_kind = left.kind();
+    // Go `IsAccessExpression(bin.Left)`.
+    if !matches!(
+        left_kind,
+        SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression
+    ) {
+        return JSDeclarationKind::NONE;
+    }
+    let in_js = is_in_js_file(left);
+    let expression = left.expression();
+    let expression_kind = expression.kind();
+    let expression_is_identifier = expression_kind == SyntaxKind::Identifier;
+    if in_js {
+        // Go `IsModuleExportsAccessExpression(bin.Left)` on an access
+        // expression: its expression is the `module` identifier and its
+        // name is `exports`.
+        if expression_is_identifier
+            && expression.text_is(&MODULE_NAME)
+            && is_exports_access_name(left)
+            && !is_exports_identifier(bin.right)
+        {
+            return JSDeclarationKind::MODULE_EXPORTS;
+        }
+        // Go `IsModuleExportsAccessExpression(e) || IsExportsIdentifier(e)`
+        // of `e = bin.Left.Expression()`.
+        let module_exports_or_exports = if expression_is_identifier {
+            expression.text_is(&EXPORTS_NAME)
+        } else {
+            matches!(
+                expression_kind,
+                SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression
+            ) && is_module_exports_access_expression(expression)
+        };
+        if module_exports_or_exports && get_element_or_property_access_name(left).is_some() {
+            return JSDeclarationKind::EXPORTS_PROPERTY;
+        }
+        if expression_kind == SyntaxKind::ThisKeyword {
+            return JSDeclarationKind::THIS_PROPERTY;
+        }
+    }
+    // Go `IsEntityNameExpressionEx(bin.Left.Expression(), IsInJSFile(bin.Left))`,
+    // whose first test is `IsIdentifier`.
+    let entity_name = expression_is_identifier || is_entity_name_expression_ex(expression, in_js);
+    if left_kind == SyntaxKind::PropertyAccessExpression
+        && entity_name
+        && is_identifier(left.name())
+        || left_kind == SyntaxKind::ElementAccessExpression && entity_name
+    {
+        return JSDeclarationKind::PROPERTY;
+    }
+    JSDeclarationKind::NONE
+}
+
+/// The tail of Go `IsModuleExportsAccessExpression(node)` for an access
+/// expression `node`: its access name is `exports`.
+fn is_exports_access_name(node: Node) -> bool {
+    let name = get_element_or_property_access_name(node);
+    name.is_some() && name.text() == "exports"
 }
 
 // Go: ast/utilities.go:1581 IsBindableObjectDefinePropertyCall

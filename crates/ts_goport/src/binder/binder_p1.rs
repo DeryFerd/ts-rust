@@ -82,6 +82,10 @@ pub struct Binder {
     /// The guard pins the version while the binder runs. `None` for a
     /// static file, whose block has the column.
     pub version_links: Option<crate::ast::VersionChildLinks>,
+    /// Rust-only: how the child ids of `file` resolve when it is a
+    /// published store (`ast::frozen_store_ids`), read once for the node
+    /// views (`binary_view`). `None` for any other file.
+    pub frozen_ids: Option<FrozenIds>,
 }
 
 // Go: binder/binder.go:84 ActiveLabel
@@ -369,6 +373,7 @@ pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile
         node_bind,
         flow_nodes,
         version_links: crate::ast::version_child_links(file_index),
+        frozen_ids: frozen_store_ids(file_index),
         ..Binder::default()
     };
     b.unreachable_flow = b.new_flow_node(FlowFlags::UNREACHABLE);
@@ -558,6 +563,14 @@ impl Binder {
         debug_assert_eq!(node.file_index(), self.file_index, "node from another file");
         let index = node.node_id().index();
         self.parser_flags[index] | self.node_bind.get(index).added_flags
+    }
+
+    /// Go `node.AsBinaryExpression()` of BinaryExpression `node` of `file`,
+    /// with its fields read once (`BinaryView`).
+    #[inline]
+    pub fn binary_view(&self, node: Node) -> BinaryView {
+        debug_assert_eq!(node.file_index(), self.file_index, "node from another file");
+        BinaryView::with_ids(node, self.frozen_ids)
     }
 
     /// Go `node.Flags |= flags`.
@@ -1501,6 +1514,9 @@ impl Binder {
         // node data once (`parsed_node_data`) and pass it on, so their field reads
         // (`postfix_token`, `modifiers`, `name`) skip the node lookup.
         let kind = node.kind();
+        // PERF: binderview1. The fields of a BinaryExpression, read once in
+        // its arm below for the arm and for `bind_children_of_kind`.
+        let mut binary = None;
         match kind {
             SyntaxKind::Identifier => {
                 let flow = self.current_flow;
@@ -1534,7 +1550,8 @@ impl Binder {
                 }
             }
             SyntaxKind::BinaryExpression => {
-                match get_assignment_declaration_kind(node) {
+                let bin = self.binary_view(node);
+                match get_binary_assignment_declaration_kind(&bin) {
                     JSDeclarationKind::MODULE_EXPORTS => self.bind_module_exports_assignment(node),
                     JSDeclarationKind::EXPORTS_PROPERTY => {
                         self.bind_exports_or_object_define_property(node)
@@ -1543,7 +1560,8 @@ impl Binder {
                     JSDeclarationKind::THIS_PROPERTY => self.bind_this_property_assignment(node),
                     _ => {}
                 }
-                self.check_strict_mode_binary_expression(node);
+                self.check_strict_mode_binary_expression(node, &bin);
+                binary = Some(bin);
             }
             SyntaxKind::CatchClause => {
                 self.check_strict_mode_catch_clause(node);
@@ -1768,7 +1786,7 @@ impl Binder {
             self.seen_parse_error = false;
             let container_flags = get_container_flags_of_kind(node, kind);
             if container_flags == ContainerFlags::NONE {
-                self.bind_children_of_kind(node, kind);
+                self.bind_children_of_kind(node, kind, binary.as_ref());
             } else {
                 self.bind_container(node, container_flags);
             }
