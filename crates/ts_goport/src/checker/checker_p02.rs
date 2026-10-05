@@ -517,6 +517,9 @@ impl Checker {
                 }
             }
         }
+        // PORT: port-only. Lets `get_suggestion_for_symbol_name_lookup` keep
+        // results from the globals table (see there).
+        self.globals_complete = true;
     }
 
     // Go: checker/checker.go:1397 mergeGlobalSymbol
@@ -1424,6 +1427,33 @@ impl Checker {
     // Go: checker/checker.go:1816 getSuggestionForSymbolNameLookup
     // PORT: the name is a `TableKey` because this is a `NameResolver` lookup
     // callback (see `NameResolverLookupFn`).
+    // PERF: the globals table gives the same suggestion for the same name and
+    // meaning while its names and the flags and declarations of its symbols
+    // stay the same, so the result is kept in `global_spelling_suggestions`
+    // (port-only).
+    // - Names: the table is complete after `initialize_checker`. During it,
+    //   names are added and flags change (a non-global module augmentation
+    //   adds flags to a merged global namespace that an `export =` names), and
+    //   suggestions are asked too (a failed `export =`, the import attribute
+    //   types of pattern ambient modules). So the memo is read and filled only
+    //   when `globals_complete` is set. Before that, each lookup scans the
+    //   table, as in Go.
+    // - Flags and declarations: after `initialize_checker`, only
+    //   `merge_symbol` changes a symbol that already exists:
+    //   `combine_symbol_tables` merges a late-bound member into a transient
+    //   early member in place. When `globalThis` is also a class with a
+    //   static computed member, its early exports are the globals table, so a
+    //   global gets new flags. Each entry keeps the `merge_version` from
+    //   before its scan and is used only while `merge_version` is the same. A
+    //   merge during the scan (from an alias candidate's resolution) makes the
+    //   entry old at once.
+    // - Aliases: an alias candidate's target is set once. While it is being
+    //   resolved, `try_resolve_alias` gives nil and the candidate is left out.
+    //   Such a result is not kept.
+    // The primitive type alias symbols are made on each call, as before, so a
+    // hit makes the same symbols as a miss.
+    // A project where a test runner's types are missing asks this for
+    // `expect` thousands of times (nestjs-graphql: 24% of the check).
     pub fn get_suggestion_for_symbol_name_lookup(
         &mut self,
         symbols: SymbolTable,
@@ -1434,13 +1464,51 @@ impl Checker {
         if symbol.is_some() {
             return symbol;
         }
+        let memo_key = match name {
+            TableKey::Name(name) if symbols == self.globals && self.globals_complete => {
+                Some((name.id(), meaning))
+            }
+            _ => None,
+        };
+        let merge_version = self.merge_version;
+        let memo = memo_key.and_then(|key| match self.global_spelling_suggestions.get(&key) {
+            Some(&(version, memo)) if version == merge_version => Some(memo),
+            _ => None,
+        });
         // PORT: Go `core.ConcatenateSeq(maps.Values(symbols), extras)` -> one Vec.
-        let mut candidates = self.symbols.values(symbols);
+        let mut candidates = if memo.is_some() {
+            Vec::new()
+        } else {
+            self.symbols.values(symbols)
+        };
+        let table_len = candidates.len();
         if meaning.intersects(SymbolFlags::GLOBAL_LOOKUP) {
             let extras = self.get_primitive_type_alias_suggestions(symbols);
             candidates.extend(extras);
         }
-        self.get_spelling_suggestion_for_name(name.text(), &candidates, meaning)
+        match memo {
+            Some(GlobalSpellingSuggestion::NotFound) => return SymbolId::NIL,
+            Some(GlobalSpellingSuggestion::Table(symbol)) => return symbol,
+            Some(GlobalSpellingSuggestion::Extra(index)) => return candidates[index],
+            None => {}
+        }
+        let mut alias_in_progress = false;
+        let named = self.get_spelling_candidate_names(&candidates, meaning, &mut alias_in_progress);
+        let best = self.pick_spelling_suggestion(name.text(), named);
+        if let Some(key) = memo_key
+            && !alias_in_progress
+        {
+            let memo = if best.is_nil() {
+                GlobalSpellingSuggestion::NotFound
+            } else if let Some(index) = candidates[table_len..].iter().position(|&s| s == best) {
+                GlobalSpellingSuggestion::Extra(index)
+            } else {
+                GlobalSpellingSuggestion::Table(best)
+            };
+            self.global_spelling_suggestions
+                .insert(key, (merge_version, memo));
+        }
+        best
     }
 
     // Go: checker/checker.go:1841 getSpellingSuggestionForName
@@ -1470,12 +1538,40 @@ impl Checker {
         symbols: &[SymbolId],
         meaning: SymbolFlags,
     ) -> SymbolId {
-        let mut named: Vec<(SymbolId, &'static str)> = Vec::with_capacity(symbols.len());
-        for &candidate in symbols {
-            let candidate_name =
-                self.get_candidate_name_for_spelling_suggestion(candidate, meaning);
-            named.push((candidate, candidate_name));
-        }
+        let named = self.get_spelling_candidate_names(symbols, meaning, &mut false);
+        self.pick_spelling_suggestion(name, named)
+    }
+
+    // PORT: the first half of Go getSpellingSuggestionForName: each
+    // candidate with its `getCandidateName` result, in order.
+    // `alias_in_progress` is set when an alias candidate was left out because
+    // it is being resolved (see `get_suggestion_for_symbol_name_lookup`).
+    fn get_spelling_candidate_names(
+        &mut self,
+        symbols: &[SymbolId],
+        meaning: SymbolFlags,
+        alias_in_progress: &mut bool,
+    ) -> Vec<(SymbolId, &'static str)> {
+        symbols
+            .iter()
+            .map(|&candidate| {
+                let candidate_name = self.get_candidate_name_for_spelling_suggestion(
+                    candidate,
+                    meaning,
+                    alias_in_progress,
+                );
+                (candidate, candidate_name)
+            })
+            .collect()
+    }
+
+    // PORT: the second half of Go getSpellingSuggestionForName:
+    // `core.GetSpellingSuggestion` with `c.compareSymbols`.
+    fn pick_spelling_suggestion(
+        &self,
+        name: &str,
+        named: Vec<(SymbolId, &'static str)>,
+    ) -> SymbolId {
         let (best, _) = get_spelling_suggestion(
             name,
             named,
@@ -1493,6 +1589,7 @@ impl Checker {
         &mut self,
         candidate: SymbolId,
         meaning: SymbolFlags,
+        alias_in_progress: &mut bool,
     ) -> &'static str {
         // PERF: the text of `symbol_name` without its `String` copy. Both
         // sources (a private identifier's text and the interned symbol name)
@@ -1523,6 +1620,8 @@ impl Checker {
             if alias.is_some() && self.sym(alias).flags.intersects(meaning) {
                 return candidate_name;
             }
+            // `try_resolve_alias` gives nil only while the alias is being resolved.
+            *alias_in_progress |= alias.is_nil();
         }
         ""
     }
@@ -2009,4 +2108,17 @@ impl Checker {
         })
         .is_some()
     }
+}
+
+/// A spelling suggestion from the globals table, kept by
+/// `get_suggestion_for_symbol_name_lookup`.
+#[derive(Clone, Copy, Debug)]
+pub enum GlobalSpellingSuggestion {
+    /// No candidate is close enough.
+    NotFound,
+    /// A symbol of the globals table.
+    Table(SymbolId),
+    /// The symbol at this index of `get_primitive_type_alias_suggestions`,
+    /// which makes new symbols on each call.
+    Extra(usize),
 }
