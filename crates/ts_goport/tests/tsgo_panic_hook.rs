@@ -4,8 +4,8 @@
 //! panic inside the hook aborts the process (SIGABRT), also for a panic that
 //! a caller catches (a resolve-ahead worker panic in `run_task`). The hook
 //! must drop its write errors, and the run then ends as it does with a
-//! reader. The getwd error is a Go write to `os.Stderr`, which ends the
-//! process by SIGPIPE as in Go.
+//! reader. The getwd error and the bad flag text of `--lsp` and `--api` are
+//! Go writes to `os.Stderr`, which end the process by SIGPIPE as in Go.
 //!
 //! The work thread failure write (bin/tsgo.rs `main`, "tsgo: work thread
 //! failed") also drops its error. No test reaches it now: its test used the
@@ -88,6 +88,72 @@ fn a_getwd_error_with_no_stderr_reader_ends_by_sigpipe() {
         Some(rustix::process::Signal::PIPE.as_raw()),
         "closed stderr: {status}"
     );
+}
+
+/// A bad flag of `tsgo --lsp` and `tsgo --api` (Go cmd/tsc/lsp.go:20
+/// runLSP and api.go runAPI, `flag.ContinueOnError`). Go flag.go:1050
+/// `FlagSet.sprintf`, `defaultUsage` and `PrintDefaults` write to
+/// `os.Stderr` (`FlagSet.Output`), one write each, with the raw bytes of
+/// the argument. With a stderr pipe that has no reader, Go N
+/// (tsgo-oracle-673a5f17d713) ends by SIGPIPE in both modes (followups24
+/// flag-go.txt). The port wrote with `eprint!`, which panicked inside the
+/// `catch_unwind` of the mode, so the run exited 70, and it wrote the port
+/// form of a raw byte. With a reader, both write Go's text and exit 2.
+#[test]
+fn a_bad_server_flag_with_no_stderr_reader_ends_by_sigpipe() {
+    for mode in ["--lsp", "--api"] {
+        // Control: with a reader, Go's text and exit code 2.
+        let (status, stderr) = run_with_flag(mode, Stdio::piped());
+        let usage = format!("Usage of {}:\n", &mode[2..]);
+        let mut want = b"flag provided but not defined: -x\xff\n".to_vec();
+        want.extend_from_slice(usage.as_bytes());
+        if mode == "--lsp" {
+            for line in [
+                "  -clientProcessId int\n    \tuse the given PID for the parent process watchdog\n",
+                "  -pipe string\n    \tuse named pipe for communication\n",
+                "  -pprofDir string\n    \tGenerate pprof CPU/memory profiles to the given directory.\n",
+                "  -socket string\n    \tuse socket for communication\n",
+                "  -stdio\n    \tuse stdio for communication\n",
+            ] {
+                want.extend_from_slice(line.as_bytes());
+            }
+            assert_eq!(stderr, want, "{mode} control: {status}");
+        } else {
+            assert!(stderr.starts_with(&want), "{mode} control: {status} {stderr:?}");
+        }
+        assert_eq!(status.code(), Some(2), "{mode} control: {status}");
+        // No reader: SIGPIPE, as Go N (not exit code 70).
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let (status, _) = run_with_flag(mode, Stdio::from(writer));
+        assert_eq!(
+            status.signal(),
+            Some(rustix::process::Signal::PIPE.as_raw()),
+            "{mode} closed stderr: {status}"
+        );
+    }
+}
+
+/// Runs `tsgo <mode> -x<FF>` (a flag that is not defined, with a raw byte)
+/// and returns the exit status and the stderr (empty when `stderr` is not a
+/// pipe to this process).
+fn run_with_flag(mode: &str, stderr: Stdio) -> (ExitStatus, Vec<u8>) {
+    use std::os::unix::ffi::OsStrExt;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tsgo"))
+        .arg(mode)
+        .arg(std::ffi::OsStr::from_bytes(b"-x\xff"))
+        .env_remove("GOPORT_TRACE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    let status = wait(&mut child, mode);
+    let mut out = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        std::io::Read::read_to_end(&mut pipe, &mut out).unwrap();
+    }
+    (status, out)
 }
 
 /// Runs `tsgo` with no arguments in a directory that `sh` removes before it
