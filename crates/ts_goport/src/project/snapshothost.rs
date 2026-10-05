@@ -73,6 +73,25 @@ impl SourceFileLease {
     }
 }
 
+/// Not in Go: drops `lease` after its `release`. When it held the last
+/// holder of a freeable parse (no cache entry, other lease or program has
+/// it), the pins of the parse's version go after the answer
+/// (`ast::release_file_version_pins_later`), so the version dies, as Go's GC
+/// frees the leased `*ast.SourceFile`. Without this, the encoder's reads keep
+/// it pinned on this thread until the next program release.
+// PORT: the count sees the holders on this thread only. A version that a
+// worker thread still holds (a program version's tables) dies later, with
+// that holder.
+pub fn drop_released_lease(lease: Rc<SourceFileLease>) {
+    let parsed = Rc::clone(&lease.source_file);
+    drop(lease);
+    let dies = parsed.version.get().is_some() && Rc::strong_count(&parsed) == 1;
+    drop(parsed);
+    if dies {
+        crate::ast::release_file_version_pins_later();
+    }
+}
+
 /// Go `logging.Logger` as the session logger argument of `Snapshot.Clone`,
 /// `cloneForProgram` and `CloneSnapshotWithAutoImports`.
 // PORT: Go passes the session's logger (a non-nil interface, also for the nop

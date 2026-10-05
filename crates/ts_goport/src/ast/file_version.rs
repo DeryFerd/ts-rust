@@ -13,7 +13,8 @@
 //!   (`program::VersionTables`), so a checker, bind, emit or search thread
 //!   that was seeded from that version holds it too (`WorkerSeed`);
 //! - a thread that reads it pins it (`with_file_version`, `PINS`) until the
-//!   next program release (`release_file_version_pins`) or its end;
+//!   next program release, or the next release of a source file lease that
+//!   held the last parse holder (`release_file_version_pins`), or its end;
 //! - a `FileRef` guard holds it while the guard lives;
 //! - the registry here keeps only a `Weak`.
 //!
@@ -197,7 +198,7 @@ static EDITOR_PROCESS: AtomicBool = AtomicBool::new(false);
 /// read (`with_version_store` in `ast/store.rs`) never looks for a version.
 static FREEABLE_PUBLISHED: AtomicBool = AtomicBool::new(false);
 
-/// Raised by each program release (`release_file_version_pins`). A thread
+/// Raised by each pin release (`release_file_version_pins`). A thread
 /// whose pins are from an older epoch drops them at its next pinned read.
 static PIN_EPOCH: AtomicUsize = AtomicUsize::new(0);
 
@@ -207,7 +208,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Marks this process as a language server or API process, where
 /// `free_file_versions` and owned nodes are on by default.
-/// `project::new_session` calls it.
+/// `project::new_session` and `api::new_standalone_session` call it.
 pub fn set_editor_process() {
     EDITOR_PROCESS.store(true, Ordering::Relaxed);
 }
@@ -288,7 +289,7 @@ fn is_dead_file(file: usize) -> bool {
     lock(&DEAD_FILES).contains(&file)
 }
 
-/// The pin epoch: the number of program releases so far
+/// The pin epoch: the number of pin releases so far
 /// (`release_file_version_pins`). A pooled node block given back at epoch
 /// `e` is free from epoch `e + 2` (`ast::store::BlockPool`).
 #[inline]
@@ -551,7 +552,9 @@ fn drop_hot() {
 /// Drops the pins of this thread and makes every other thread drop its
 /// pins at its next pinned read. A program release calls it
 /// (`program::ReleasedProgram`), so a version that only the released
-/// program read dies with its other holders. The versions that the live
+/// program read dies with its other holders, and so does the release of a
+/// source file lease that held the last holder of a freeable parse
+/// (`release_file_version_pins_later`). The versions that the live
 /// programs read are pinned again on their next read.
 pub fn release_file_version_pins() {
     PIN_EPOCH.fetch_add(1, Ordering::AcqRel);
@@ -565,6 +568,36 @@ pub fn release_file_version_pins() {
         .flatten();
     // Dropped after the borrow ends.
     drop(pins);
+}
+
+thread_local! {
+    /// True while a `PinRelease` of this thread waits for its drop
+    /// (`release_file_version_pins_later`).
+    static PIN_RELEASE_QUEUED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `release_file_version_pins` when the value drops.
+struct PinRelease;
+
+impl Drop for PinRelease {
+    fn drop(&mut self) {
+        let _ = PIN_RELEASE_QUEUED.try_with(|queued| queued.set(false));
+        release_file_version_pins();
+    }
+}
+
+/// Not in Go: `release_file_version_pins` after the answer
+/// (`gostd::local::drop_later`; at once on a thread that does not keep
+/// garbage). The release of a source file lease whose freeable parse has no
+/// other holder calls it (`project::drop_released_lease`), so the version
+/// dies with the lease, as Go's GC frees the leased `*ast.SourceFile`. One
+/// release waits at a time: the leases that one message releases (a
+/// session close) bump the pin epoch once.
+pub fn release_file_version_pins_later() {
+    if PIN_RELEASE_QUEUED.replace(true) {
+        return;
+    }
+    crate::gostd::local::drop_later(Box::new(PinRelease));
 }
 
 /// A borrow of per-file data (lsshells M3b), the return type of the file
