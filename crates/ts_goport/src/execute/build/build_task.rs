@@ -715,12 +715,23 @@ impl BuildTask {
             self.go_panic = Some(TaskGoPanic::Upstream);
             return false;
         }
-        let mut payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.build_project_start_task(orchestrator, path)
         })) {
             Ok(compiles) => return compiles,
             Err(payload) => payload,
         };
+        self.keep_go_panic(orchestrator, payload);
+        false
+    }
+
+    /// Keeps a `go_panic` of this task's builder goroutine for `report`
+    /// (see `TaskGoPanic`). Any other panic is a port gap and continues.
+    fn keep_go_panic(
+        &mut self,
+        orchestrator: &dyn BuildTaskOrchestrator,
+        mut payload: Box<dyn std::any::Any + Send>,
+    ) {
         let Some(panic) = payload.downcast_mut::<crate::core::GoPanic>() else {
             std::panic::resume_unwind(payload);
         };
@@ -736,7 +747,6 @@ impl BuildTask {
         };
         panic.repanicked |= num_routines != 1;
         self.go_panic = Some(TaskGoPanic::Panicked(payload));
-        false
     }
 
     fn build_project_start_task(
@@ -791,10 +801,16 @@ impl BuildTask {
 
     // Go: build/buildtask.go:145 (*BuildTask).buildProject, from the emit
     // of `compileAndEmit` on (see `build_project_start`).
+    // PORT: a `go_panic` here (a bad diagnostic of a `.tsbuildinfo` panics
+    // when it is reported) is kept for `report` too.
     pub fn build_project_finish(&mut self, orchestrator: &dyn BuildTaskOrchestrator, path: &Path) {
-        self.compile_and_emit_finish(orchestrator);
-        self.update_downstream(orchestrator, path);
-        self.unblock_downstream();
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.compile_and_emit_finish(orchestrator);
+            self.update_downstream(orchestrator, path);
+            self.unblock_downstream();
+        })) {
+            self.keep_go_panic(orchestrator, payload);
+        }
     }
 
     // Go: build/buildtask.go:176 (*BuildTask).updateDownstream

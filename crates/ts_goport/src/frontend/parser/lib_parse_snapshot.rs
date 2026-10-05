@@ -1589,7 +1589,7 @@ impl Encoder {
             self.zz(i64::from(diagnostic.pos));
             self.zz(i64::from(diagnostic.end));
             self.zz(i64::from(diagnostic.code));
-            self.u8(diagnostic.category as u8);
+            self.u8(diagnostic.category.0 as u8);
             let key = diagnostic.message.key();
             if crate::diagnostics::message_by_key(key) != Some(diagnostic.message) {
                 return Err(format!("message key {key} does not find its message"));
