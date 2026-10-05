@@ -5975,9 +5975,8 @@ impl FileStore {
     }
 
     /// The slot columns are full (`push_node_header`): reserves room in
-    /// each for the slots of the whole text, at the node density of the
-    /// text parsed so far (the largest end of the last slots), and at least
-    /// double, as a `Vec` grows.
+    /// each for `slots_for_text` slots, and at least double, as a `Vec`
+    /// grows.
     // PERF: factscol1b (cliperf1 rank 6). `FileStore::new` reserves for one
     // slot per 12 text bytes. A dense file (a 5 MB JS file of 1.09 bytes
     // per slot) doubled its columns 4 times, and each `realloc` moved them
@@ -5986,26 +5985,10 @@ impl FileStore {
     #[cold]
     #[inline(never)]
     fn reserve_slots_for_text(&mut self) {
-        /// The slots back from the last one that give the parsed length.
-        const LOOK_BACK: usize = 64;
         let slots = self.records.len();
-        let parsed = self.records[slots.saturating_sub(LOOK_BACK)..]
-            .iter()
-            .filter(|r| r.is_node())
-            .map(|r| r.loc().end())
-            .max()
-            .unwrap_or(0);
-        let parsed = usize::try_from(parsed).unwrap_or(0);
-        let text = self.text.len();
-        // 1/8 more than the estimate, so a file a bit denser at its end
-        // does not double again near the end.
-        let wanted = if parsed > 0 && parsed < text {
-            let estimate = (slots as u128 * text as u128 / parsed as u128) as usize;
-            estimate + estimate / 8
-        } else {
-            slots + 1
-        };
-        let additional = wanted.saturating_sub(slots).max(1);
+        let additional = slots_for_text(&self.records, self.text.len())
+            .saturating_sub(slots)
+            .max(1);
         self.records.reserve(additional);
         self.kinds.reserve(additional);
         self.kids.reserve(additional);
@@ -6015,6 +5998,43 @@ impl FileStore {
             owned.cell_of.reserve(additional);
         }
     }
+}
+
+/// The most a growth of full slot columns multiplies their slots by
+/// (`slots_for_text`).
+const SLOT_GROWTH_LIMIT: usize = 16;
+
+/// The slots that full slot columns `records` of a store of a text of
+/// `text` bytes reserve for (`FileStore::reserve_slots_for_text`): the
+/// slots so far at the node density of the text parsed so far, plus 1/8.
+/// Never more than one slot per text byte, nor `SLOT_GROWTH_LIMIT` times
+/// the slots so far. `records.len()` (a doubling) when no text is left.
+///
+/// The parsed length is the largest end of all node slots, which only
+/// grows with the parse. The ends of the last slots can be far before it:
+/// the parser makes the JSDoc nodes of a node after that node, so inside
+/// the leading JSDoc of a function that spans the file they are near the
+/// start of the text (factscol1b round b).
+// PERF: one pass over the records at each growth, which the `realloc`
+// copy of the columns costs as well. A store grows once or twice.
+fn slots_for_text(records: &[NodeRecord], text: usize) -> usize {
+    let slots = records.len();
+    let parsed = records
+        .iter()
+        .filter(|r| r.is_node())
+        .map(|r| r.loc().end())
+        .max()
+        .unwrap_or(0);
+    let parsed = usize::try_from(parsed).unwrap_or(0);
+    if parsed == 0 || parsed >= text {
+        return slots;
+    }
+    // 1/8 more than the estimate, so a file a bit denser at its end does
+    // not grow again near the end.
+    let estimate = (slots as u64).saturating_mul(text as u64) / parsed as u64;
+    let wanted = estimate.saturating_add(estimate / 8);
+    let limit = text.min(slots.saturating_mul(SLOT_GROWTH_LIMIT));
+    usize::try_from(wanted).map_or(limit, |wanted| wanted.min(limit))
 }
 
 /// The store-local id that stands for `n` inside `NodeData` of store `file`.
@@ -7144,6 +7164,84 @@ mod tests {
         ] {
             assert!(cap >= 1200, "{cap} slots after the first growth");
         }
+    }
+
+    /// factscol1b round b: parses JS file `text` and calls `check(kinds,
+    /// wanted)` with the kinds of the first `k` slots and their
+    /// `slots_for_text` estimate, at each `k` at which the slot columns of
+    /// the parse can fill: from the capacity of `FileStore::new` to the
+    /// slot count of the parse. Each estimate is at most one slot per text
+    /// byte and `SLOT_GROWTH_LIMIT` times `k`, or `k` (a doubling).
+    fn check_slot_reserves(name: &str, text: String, mut check: impl FnMut(&[SyntaxKind], usize)) {
+        let text: &'static str = text.leak();
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+        let opts = SourceFileParseOptions {
+            file_name: name.to_string(),
+            ..Default::default()
+        };
+        let parsed = parse_source_file(&opts, text, ScriptKind::JS);
+        with_store(parsed.store, |s| {
+            let first_fill = text.len() / STORE_TEXT_BYTES_PER_SLOT + 1;
+            let slots = s.records.len();
+            assert!(slots > first_fill, "{name}: {slots} slots never fill");
+            for k in first_fill..=slots {
+                let wanted = slots_for_text(&s.records[..k], text.len());
+                let bound = k.max(text.len().min(k * SLOT_GROWTH_LIMIT));
+                assert!(wanted <= bound, "{name}: {wanted} slots at {k}");
+                check(&s.kinds[..k], wanted);
+            }
+        });
+    }
+
+    // factscol1b round b: the parser makes the JSDoc nodes of a function
+    // after the function, and their ends are before it. With the largest
+    // end of the last 64 slots as the parsed length, columns that filled
+    // inside the leading JSDoc (16 or more `@param` tags) of a function
+    // that spans the file reserved for 403 GiB to 3.1 TiB (a 9.6 MB file),
+    // and the wasm build panicked (capacity overflow). The parsed length
+    // is now the largest end of all slots.
+    #[test]
+    fn slot_reserves_inside_a_leading_jsdoc_stay_near_the_slot_count() {
+        for tags in [16, 30, 100] {
+            let params: Vec<String> = (0..tags).map(|i| format!("a{i}")).collect();
+            let doc: String = params
+                .iter()
+                .map(|p| format!(" * @param {{string}} {p}\n"))
+                .collect();
+            let body = "x=x+1;".repeat(300);
+            let text = format!(
+                "/**\n{doc} */\nfunction big({}) {{\nvar x=0;{body}\n}}\n",
+                params.join(",")
+            );
+            let mut in_jsdoc = 0;
+            check_slot_reserves(&format!("/jt{tags}.js"), text, |kinds, wanted| {
+                // The function and its JSDoc nodes are made: the parsed
+                // length is the end of the function.
+                if kinds.contains(&SyntaxKind::JsDocParameterTag) {
+                    in_jsdoc += 1;
+                    let k = kinds.len();
+                    assert!(wanted <= k + k / 8 + 1, "{wanted} slots at {k}");
+                }
+            });
+            assert!(in_jsdoc > tags, "{in_jsdoc} fills checked in the JSDoc");
+        }
+    }
+
+    // factscol1b round b: a JS file of only a JSDoc comment (the end of
+    // file token holds it, and is made before it).
+    #[test]
+    fn slot_reserves_of_a_file_of_only_jsdoc_stay_near_the_slot_count() {
+        let doc: String = (0..100)
+            .map(|i| format!(" * @param {{string}} a{i}\n"))
+            .collect();
+        let text = format!("/**\n{doc} */\n");
+        let mut checked = 0;
+        check_slot_reserves("/only-jsdoc.js", text, |kinds, wanted| {
+            checked += 1;
+            let k = kinds.len();
+            assert!(wanted <= k + k / 8 + 1, "{wanted} slots at {k}");
+        });
+        assert!(checked > 100, "{checked} fills checked");
     }
 
     /// Sets the block of unpublished file id `file` (from `LOW_BLOCKS` on)
