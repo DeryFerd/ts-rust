@@ -1763,7 +1763,9 @@ fn wide_cores() -> bool {
         && physical_core_count().is_some_and(|cores| cores >= WIDE_CORES)
 }
 
-/// `physical_cores`, read once: it reads a sysfs file per core.
+/// `physical_cores`, read once: it reads a sysfs file per core. Only a
+/// large load (`ThreadBudget::widen`), a bind of `WIDE_BIND_FILES` files or
+/// the emit pool reads it, and only on `WIDE_CORES` CPUs or more.
 fn physical_core_count() -> Option<usize> {
     static PHYSICAL: OnceLock<Option<usize>> = OnceLock::new();
     *PHYSICAL.get_or_init(physical_cores)
@@ -1837,14 +1839,18 @@ fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
 pub struct ThreadBudget {
     /// The most parse threads, the loading thread included.
     pub parse: usize,
-    /// The most parse threads of a large program load.
+    /// The most parse threads of a large program load (see `widen`).
     pub parse_large: usize,
-    /// The most bind threads of a large program load.
+    /// The most bind threads of a large program load (see `widen`).
     pub bind: usize,
     /// The most bind threads of other program loads.
     pub bind_small: usize,
     /// `glibc.malloc.arena_max`.
     pub arena_max: usize,
+    /// When the process may run on `WIDE_CORES` physical cores
+    /// (`wide_cores`), a large load parses and binds on `WIDE_CORES` threads
+    /// instead of `parse_large` and `bind`.
+    pub widen: bool,
 }
 
 static THREAD_BUDGET: OnceLock<ThreadBudget> = OnceLock::new();
@@ -1862,6 +1868,7 @@ impl ThreadBudget {
         bind: 8,
         bind_small: 8,
         arena_max: 16,
+        widen: false,
     };
 
     /// The budget of a one-program process (`tsgo`, `goport`) on the cores
@@ -1912,32 +1919,54 @@ impl ThreadBudget {
     // [-2.94, -2.08], at 16 and 32 threads -2.4 to -2.7 ms, peak RSS -1.5
     // MiB. 15 workers and 16 bind threads were slower there than 7 and 8
     // (-1.6 against -2.6 ms). At 4 cores the counts do not change.
+    // PERF (progstart1): the physical cores are read at the first large
+    // load (`widen`), not here at process start: on 16 CPUs or more that is
+    // one sysfs file per core, which `tsgo --version` and small projects do
+    // not need.
     pub fn one_program(extra: usize) -> Self {
         let cores = available_cores();
         let parse = DEFAULT_CHECKERS + 1;
         let parse_large = parse + 3;
         let spare = cores.min(parse_large) - cores.min(parse);
-        let wide = wide_cores();
         let jemalloc = cfg!(feature = "jemalloc");
         ThreadBudget {
             parse: if jemalloc { parse_large } else { parse },
-            parse_large: if wide { WIDE_CORES } else { parse_large },
-            bind: if wide { WIDE_CORES } else { 8 },
+            parse_large,
+            bind: 8,
             bind_small: if spare > 0 && !jemalloc { parse - 1 } else { 8 },
             arena_max: DEFAULT_CHECKERS + 2 + extra + spare,
+            widen: true,
         }
     }
 
     /// Parse threads of a program load, the loading thread included: one
     /// per core, up to `parse_large` for a large load and `parse` for others.
     pub fn parse_threads(&self, large: bool) -> usize {
-        available_cores().min(if large { self.parse_large } else { self.parse })
+        available_cores().min(if large {
+            self.large(self.parse_large)
+        } else {
+            self.parse
+        })
     }
 
     /// Bind threads of a program: one per core, up to `bind` for a large
     /// load and `bind_small` for others.
     pub fn bind_threads(&self, large: bool) -> usize {
-        available_cores().min(if large { self.bind } else { self.bind_small })
+        available_cores().min(if large {
+            self.large(self.bind)
+        } else {
+            self.bind_small
+        })
+    }
+
+    /// The thread count of a large load: `WIDE_CORES` when `widen` and
+    /// `wide_cores`, else `count`.
+    fn large(&self, count: usize) -> usize {
+        if self.widen && wide_cores() {
+            WIDE_CORES
+        } else {
+            count
+        }
     }
 
     /// Makes this the budget of the program loads of this process. The
@@ -1976,9 +2005,10 @@ impl ThreadBudget {
     }
 }
 
-/// One file bound on a bind thread, with its ids already moved to program
-/// ids, or None when binding it made thread-local state or panicked.
-type ParallelBind = (usize, Option<(BoundFile, PreparedFileArena)>);
+/// The arena of one file bound on a bind thread, with its ids already moved
+/// to program ids and its binder output installed, or None when binding it
+/// made thread-local state or panicked.
+type ParallelBind = (usize, Option<PreparedFileArena>);
 
 /// The work queue of the bind threads (`bind_files_parallel`).
 struct BindQueue {
@@ -2080,10 +2110,16 @@ impl BindQueueState {
 /// result as a serial bind of every file.
 // PERF: a file's ids move to their program values on a bind thread, as soon
 // as every earlier file is bound, because its offsets are the sums of the
-// earlier file counts. The threads stay while files wait for offsets, so
-// when the last large file (lib.dom) is bound they move the waiting files in
-// parallel. The loading thread only appends chunks, in file order. The ids
-// are the ones that a join on the loading thread gives.
+// earlier file counts. The same thread then installs the file's binder
+// output (`BoundFile::install`: the node records and the `GoFile` cells).
+// The threads stay while files wait for offsets, so when the last large file
+// (lib.dom) is bound they move and install the waiting files in parallel.
+// The loading thread only appends chunks, in file order. The ids are the
+// ones that a join on the loading thread gives. A file is installed before
+// its chunks join the lineage, but nothing reads them in between: this
+// thread holds the lineage lock until every file is joined.
+// PERF (progstart1): the install on the loading thread was 338 ms of the
+// 598 ms of its `bind_all` CPU over the 60 rwtime2 repos (colyseus 10.9 ms).
 fn bind_files_parallel(lineage: &mut Lineage) {
     // Each file with whether it is a freeable file version.
     let files: Vec<(Node, bool)> = prog()
@@ -2108,7 +2144,7 @@ fn bind_files_parallel(lineage: &mut Lineage) {
     let (sender, receiver) = std::sync::mpsc::channel::<ParallelBind>();
     let complete = std::thread::scope(|scope| {
         for _ in 0..threads {
-            let seed = WorkerSeed::take();
+            let seed = WorkerSeed::take_unbuilt();
             let (files, order, queue, sender) = (&files, &order, &queue, sender.clone());
             // Go starts its threads on demand and fails the same way.
             crate::core::GoThread::new()
@@ -2124,8 +2160,12 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                         if let Some((i, mut bound, file_symbols, offsets)) = state.take_ready() {
                             drop(state);
                             bound.remap(offsets);
+                            // A ready file is always joined: every earlier
+                            // file has its counts, so it was bound here and
+                            // reaches the loading thread.
+                            bound.install();
                             let prepared = file_symbols.prepare_file_arena(offsets, files[i].1);
-                            let _ = sender.send((i, Some((bound, prepared))));
+                            let _ = sender.send((i, Some(prepared)));
                             state = queue.lock();
                             continue;
                         }
@@ -2178,20 +2218,27 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                 });
         }
         drop(sender);
+        // PERF (progstart1): the bind threads do not read the shared state
+        // that the program makes on first use (the symlink cache), so this
+        // thread builds it while they bind, not before they start. A later
+        // seed (the checker pool) finds it built. It took 3.6 to 5.7 ms of
+        // this thread before the first bind thread started (colyseus,
+        // outline, umami). Go builds it on first use (program.go:2300).
+        go_frontend::build_lazy_shared_state();
         // Join the files in order as they arrive.
         let mut pending = FxHashMap::default();
         let mut joined = 0;
         for (i, result) in &receiver {
             pending.insert(i, result);
             while let Some(result) = pending.remove(&joined) {
-                let Some((bound, prepared)) = result else {
+                let Some(prepared) = result else {
                     queue.stop();
                     return false;
                 };
-                lineage.add_file(bound.file.file_index(), files[joined].1, |symbols| {
+                let (file, freeable) = files[joined];
+                lineage.add_file(file.file_index(), freeable, |symbols| {
                     symbols.append_prepared_file_arena(prepared)
                 });
-                bound.install();
                 joined += 1;
             }
         }
@@ -3234,6 +3281,14 @@ impl WorkerSeed {
     pub(crate) fn take() -> Self {
         // The new thread cannot build them: it has no frontend program.
         go_frontend::build_lazy_shared_state();
+        Self::take_unbuilt()
+    }
+
+    /// `take` without building the shared state values that the program
+    /// makes on first use (`go_frontend::build_lazy_shared_state`), for a
+    /// thread that does not read them (a bind thread). The caller builds them
+    /// before it seeds any other thread.
+    fn take_unbuilt() -> Self {
         Self {
             program: prog(),
             tables: current_tables(),
