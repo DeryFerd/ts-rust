@@ -479,8 +479,11 @@ impl compiler::CompilerHost for CompilerHost {
     //   unknown kind TS.
     // - jsx and force: what this project's options give the name. force also
     //   depends on the file's package.json scope, which the load finds later
-    //   (ast/parseoptions.go:46 isFileForcedToBeModuleByFormat), so either
-    //   value that a scope can give passes. A project with references parses
+    //   (ast/parseoptions.go:46 isFileForcedToBeModuleByFormat). Only a
+    //   `"type": "module"` scope can set force, and the load reads the type
+    //   only where Go does (fileloader.go:398 to :401, node16 to nodenext
+    //   resolution or a `/node_modules/` path): there both values pass, and
+    //   elsewhere only the value with no scope. A project with references parses
     //   their source files with the reference's own options (Go
     //   projectreferencefilemapper.go:80 getCompilerOptionsForFile, from
     //   fileloader.go:418), which the host does not have yet, so then any
@@ -512,6 +515,7 @@ impl compiler::CompilerHost for CompilerHost {
             implied_node_format: ModuleKind::ES_NEXT,
             ..SourceFileMetaData::default()
         };
+        let module_resolution_kind = options.get_module_resolution_kind();
         let options_pass = |key: &ParseCacheKey| {
             if has_references {
                 return true;
@@ -521,7 +525,9 @@ impl compiler::CompilerHost for CompilerHost {
             };
             let plain = guess(&no_scope);
             key.jsx == plain.jsx
-                && (key.force == plain.force || key.force == guess(&esm_scope).force)
+                && (key.force == plain.force
+                    || compiler::package_json_type_applies(&key.file_name, module_resolution_kind)
+                        && key.force == guess(&esm_scope).force)
         };
         for (key, entry) in builder.parse_cache.entries.borrow().iter() {
             let (hash, kind) = match builder.fs.known_file(&key.path) {
