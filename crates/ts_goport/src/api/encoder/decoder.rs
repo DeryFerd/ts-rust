@@ -146,10 +146,15 @@ impl AstDecoder<'_> {
     // bytes that are not UTF-8 become U+FFFD. The encoder writes UTF-8 text
     // only, so its output decodes unchanged. A bad range panics as in Go.
     pub fn get_string(&self, idx: u32) -> String {
+        String::from_utf8_lossy(self.get_string_bytes(idx)).into_owned()
+    }
+
+    /// PORT: the bytes of Go `getString(idx)`, for a Go `%q` of them.
+    fn get_string_bytes(&self, idx: u32) -> &[u8] {
         let off_base = self.str_table as i64 + idx as i64 * 4;
         let start = read_le32(self.raw, off_base);
         let end = read_le32(self.raw, off_base + 4);
-        String::from_utf8_lossy(&self.all_string_data[start as usize..end as usize]).into_owned()
+        &self.all_string_data[start as usize..end as usize]
     }
 
     // Go: api/encoder/decoder.go:120 (*astDecoder).collectChildren
@@ -400,9 +405,11 @@ impl AstDecoder<'_> {
         if crate::frontend::tspath::get_encoded_root_length(&file_name) == 0
             || file_name != crate::frontend::tspath::normalize_path(&file_name)
         {
+            // Go `%q` of the name's bytes (`file_name` has U+FFFD for
+            // bytes that are not valid UTF-8).
             return Err(errors::new(format!(
                 "invalid source file name {}",
-                crate::gostd::strconv::quote(&file_name)
+                crate::gostd::strconv::quote_bytes(self.get_string_bytes(file_name_idx))
             )));
         }
 
@@ -617,5 +624,44 @@ impl AstDecoder<'_> {
             self.get_string(text_idx),
             TokenFlags(flags as i32),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flags::ScriptKind;
+    use crate::frontend::parser;
+    use crate::scanner_util::go_string_from_bytes;
+    use std::rc::Rc;
+
+    // Go `%q` of a bad source file name quotes its bytes (decoder.go:271,
+    // wrapped at :172). The encoder writes the Go bytes of the name
+    // (`StringTable`); the test then makes the name relative. A byte that is
+    // not valid UTF-8 is `\x..` and a real U+FDD0 stays one char.
+    #[test]
+    fn a_bad_file_name_is_quoted_from_its_go_bytes() {
+        let go_name: &[u8] = b"/x\xff\xef\xb7\x90\xef\xb7\x90.ts";
+        let name = go_string_from_bytes(go_name.to_vec());
+        let file = Rc::new(parser::parse_source_file(
+            &SourceFileParseOptions {
+                file_name: name.clone(),
+                path: Path(name),
+                ..Default::default()
+            },
+            "let x = 1;",
+            ScriptKind::TS,
+        ));
+        crate::program::note_parsed_source_file(&file);
+        let (mut buf, _) = crate::api::encoder::encode_source_file(file.root).expect("encode");
+        let at = buf
+            .windows(go_name.len())
+            .position(|bytes| bytes == go_name)
+            .expect("the name's Go bytes in the string data");
+        buf[at] = b'_';
+        assert_eq!(
+            decode_source_file(&buf).expect_err("a bad name").error(),
+            r#"at node 1 (kind KindSourceFile): invalid source file name "_x\xff\ufdd0\ufdd0.ts""#
+        );
     }
 }
