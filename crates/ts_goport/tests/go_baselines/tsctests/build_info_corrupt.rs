@@ -350,3 +350,39 @@ fn empty_message_args_are_written_again() {
         );
     }
 }
+
+// Go: diagnosticwriter/diagnosticwriter.go:266 `start+length` is a Go int,
+// and `length` is the wrapped int32 difference of the ends (core/text.go:30).
+// An `end` of ±2^31 (int32 -2^31 either way) gives `38 + 2147483610`, past
+// the text, so `--pretty` panics in `text[lineMap[line]:pos]` after it
+// writes the diagnostic's first line. The port added the two as `i32`,
+// which wrapped to line -1 (`index out of range [-1]`).
+#[test]
+fn far_diagnostic_end_panics_slice_bounds_with_pretty() {
+    for end in ["2147483648", "-2147483648"] {
+        let dir = TmpDir::new(&format!("build-info-far-end{end}"));
+        dir.write(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "outDir": "dist", "rootDir": "src", "incremental": true, "strict": true, "lib": ["es5"] }, "include": ["src"] }"#,
+        );
+        dir.write("src/a.ts", "export const a: number = 1;\n");
+        dir.write(
+            "src/b.ts",
+            "import { a } from \"./a\"; export const b: string = a;\n",
+        );
+        let first = tsgo(&dir.0, &["-p", "."]);
+        assert_eq!(first.code, Some(2), "first build: {first:?}");
+        let build_info_path = dir.0.join("tsconfig.tsbuildinfo");
+        let build_info = std::fs::read_to_string(&build_info_path).expect("build info");
+        let bad = build_info.replace(r#""end":39,"#, &format!(r#""end":{end},"#));
+        assert_ne!(bad, build_info, "end in {build_info}");
+        dir.write("tsconfig.tsbuildinfo", &bad);
+        let want = Run {
+            code: Some(2),
+            stdout: "\u{1b}[96msrc/b.ts\u{1b}[0m:\u{1b}[93m1\u{1b}[0m:\u{1b}[93m39\u{1b}[0m - \u{1b}[91merror\u{1b}[0m\u{1b}[90m TS2322: \u{1b}[0mType 'number' is not assignable to type 'string'.\n".to_string(),
+            panic: "panic: runtime error: slice bounds out of range [:2147483648] with length 53"
+                .to_string(),
+        };
+        assert_eq!(tsgo(&dir.0, &["-p", ".", "--pretty"]), want, "end {end}");
+    }
+}

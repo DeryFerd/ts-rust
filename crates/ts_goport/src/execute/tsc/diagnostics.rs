@@ -588,8 +588,11 @@ impl<'a> AstDiagnostic<'a> {
     }
 
     // Go: diagnosticwriter/diagnosticwriter.go:84 (*ASTDiagnostic).Len (tsgo#4712)
+    // PORT: Go `TextRange.Len` subtracts the int32 ends, which wraps for a
+    // bad range from a `.tsbuildinfo` (core/text.go:30).
     fn len(self) -> i32 {
-        self.resolve().loc.len()
+        let loc = self.resolve().loc;
+        loc.end().wrapping_sub(loc.pos())
     }
 
     // Go: diagnosticwriter/diagnosticwriter.go:90 (*ASTDiagnostic).resolve (tsgo#4712)
@@ -702,36 +705,16 @@ fn get_ecma_line_of_file_position(file: &FileLike, pos: i32) -> i32 {
 }
 
 // Go: scanner/scanner.go:2684 GetECMALineAndUTF16CharacterOfPosition
-// PORT: Go takes an `ast.SourceFileLike`. This is the code of the Rust
-// scanner function (which takes a file node) on a `FileLike`. See that
-// function for a `pos` inside a char.
-// A `pos` before the text (line -1) or past its end comes only from a bad
-// diagnostic in a `.tsbuildinfo`. Go `lineMap[line]` and
-// `text[lineMap[line]:pos]` panic there; the panic text has the Go offset
-// and length (see `port_byte_offset`: past the end both forms differ by
-// the same count).
+// PORT: Go takes an `ast.SourceFileLike`. The code is
+// `scanner_util::ecma_line_and_utf16_character_of_text_position` (a `pos`
+// inside a char, and the Go panics for a `pos` out of the text) on a
+// `FileLike`.
 pub fn get_ecma_line_and_utf16_character_of_file_position(file: &FileLike, pos: i32) -> (i32, i32) {
-    let line_map = file.ecma_line_map();
-    let line = compute_line_of_position(&line_map, pos);
-    let text = file.text();
-    if line < 0 {
-        crate::core::go_panic(format!("runtime error: index out of range [{line}]"));
-    }
-    let end = pos as usize;
-    if end > text.len() {
-        let go_len = crate::scanner_util::go_len(&text);
-        let go_pos = end - text.len() + go_len;
-        crate::core::go_panic(format!(
-            "runtime error: slice bounds out of range [:{go_pos}] with length {go_len}"
-        ));
-    }
-    let mut boundary = end;
-    while !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    let character =
-        utf16_len(&text[line_map[line as usize] as usize..boundary]) + (end - boundary) as i32;
-    (line, character)
+    crate::scanner_util::ecma_line_and_utf16_character_of_text_position(
+        &file.ecma_line_map(),
+        &file.text(),
+        pos,
+    )
 }
 
 // Go: diagnosticwriter/diagnosticwriter.go:203 foregroundColorEscapeGrey
@@ -856,8 +839,14 @@ fn write_code_snippet(
 ) {
     let (first_line, first_line_char) =
         get_ecma_line_and_utf16_character_of_file_position(source_file, start);
-    let (last_line, mut last_line_char) =
-        get_ecma_line_and_utf16_character_of_file_position(source_file, start + length);
+    // Go `start+length` is a Go int. `length` is the wrapped int32 length
+    // of a bad range from a `.tsbuildinfo` (`Len`), so the sum can pass the
+    // int32 range: then Go panics in `text[lineMap[line]:pos]`.
+    let end = i64::from(start) + i64::from(length);
+    let (last_line, mut last_line_char) = match i32::try_from(end) {
+        Ok(end) => get_ecma_line_and_utf16_character_of_file_position(source_file, end),
+        Err(_) => crate::scanner_util::panic_past_text(&source_file.text(), end),
+    };
     if length == 0 {
         last_line_char += 1; // When length is zero, squiggle the character right after the start position.
     }

@@ -1570,12 +1570,61 @@ pub fn get_ecma_line_of_position(source_file: Node, pos: i32) -> i32 {
 // and reports errors there. Go `range` reads each byte of the cut char as
 // one RuneError, which is one UTF-16 unit.
 pub fn get_ecma_line_and_utf16_character_of_position(source_file: Node, pos: i32) -> (i32, i32) {
+    // The panics of a bad `pos` come after the read, outside the line map
+    // pin (`with_ecma_line_starts`).
     let (line, line_start) = with_ecma_line_starts(source_file, |line_map| {
         let line = compute_line_of_position(line_map, pos);
-        (line, line_map[line as usize])
+        (line, usize::try_from(line).map_or(0, |line| line_map[line]))
     });
-    let text = source_file_text(source_file);
+    ecma_utf16_character_of_line_position(&source_file_text(source_file), line, line_start, pos)
+}
+
+/// The Go panic of `text[i:pos]` (the slice in Go
+/// `GetECMALineAndUTF16CharacterOfPosition`) for a Go int `pos` past the end
+/// of `text`. The text has the Go offset and length: past the end, the port
+/// form and the Go bytes differ by the same count (see `port_byte_offset`).
+pub fn panic_past_text(text: &str, pos: i64) -> ! {
+    let go_len = go_len(text);
+    let go_pos = pos - text.len() as i64 + go_len as i64;
+    crate::core::go_panic(format!(
+        "runtime error: slice bounds out of range [:{go_pos}] with length {go_len}"
+    ))
+}
+
+/// Go `GetECMALineAndUTF16CharacterOfPosition` (scanner.go:2684) on a text
+/// and its ECMA line map, for the port forms that have no file node.
+pub fn ecma_line_and_utf16_character_of_text_position(
+    line_map: &[i32],
+    text: &str,
+    pos: i32,
+) -> (i32, i32) {
+    let line = compute_line_of_position(line_map, pos);
+    let line_start = usize::try_from(line).map_or(0, |line| line_map[line]);
+    ecma_utf16_character_of_line_position(text, line, line_start, pos)
+}
+
+/// The end of Go `GetECMALineAndUTF16CharacterOfPosition`: `line` and
+/// `core.UTF16Len(text[lineMap[line]:pos])`, where `line_start` is
+/// `lineMap[line]` (any value for line -1). A `pos` inside a char counts
+/// each byte of the cut char as one unit (see
+/// `get_ecma_line_and_utf16_character_of_position`).
+// A `pos` before the text (line -1) or past its end comes only from a bad
+// position in the input (a diagnostic in a `.tsbuildinfo`). Go
+// `lineMap[line]` and `text[lineMap[line]:pos]` panic there
+// (`panic_past_text`).
+fn ecma_utf16_character_of_line_position(
+    text: &str,
+    line: i32,
+    line_start: i32,
+    pos: i32,
+) -> (i32, i32) {
+    if line < 0 {
+        crate::core::go_panic(format!("runtime error: index out of range [{line}]"));
+    }
     let end = pos as usize;
+    if end > text.len() {
+        panic_past_text(text, i64::from(pos));
+    }
     let mut boundary = end;
     while !text.is_char_boundary(boundary) {
         boundary -= 1;
@@ -4547,6 +4596,64 @@ mod debug_site_tests {
         assert_eq!(
             got,
             "Debug failure. Unexpected reparser-transformed node kind\nNode KindNumericLiteral was unexpected."
+        );
+    }
+}
+
+#[cfg(test)]
+mod position_panic_tests {
+    use super::{
+        compute_ecma_line_starts, ecma_line_and_utf16_character_of_text_position,
+        get_ecma_line_and_utf16_character_of_position,
+    };
+    use crate::core::go_panic_text;
+    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+    use crate::frontend::tspath::Path;
+    use crate::prelude::*;
+
+    // Go `GetECMALineAndUTF16CharacterOfPosition` (scanner.go:2684) on a
+    // `pos` out of the text: `lineMap[-1]` and `text[lineMap[line]:pos]`
+    // panic with these runtime texts (the pin N oracle gives the same for a
+    // bad diagnostic pos in a `.tsbuildinfo`, tsctests::build_info_corrupt).
+    // Both port forms (a file node, and a text with its line map) panic as
+    // Go, not with a Rust index panic.
+    #[test]
+    fn a_position_out_of_the_text_panics_as_go() {
+        let text = "let a = 1;\nlet é = 2;\n";
+        let file = parse_source_file(
+            &SourceFileParseOptions {
+                file_name: "/a.ts".to_string(),
+                path: Path("/a.ts".to_string()),
+                ..Default::default()
+            },
+            text,
+            ScriptKind::TS,
+        )
+        .root;
+        let line_map = compute_ecma_line_starts(text);
+        let both = |pos: i32| {
+            let node = go_panic_text(move || {
+                get_ecma_line_and_utf16_character_of_position(file, pos);
+            });
+            let line_map = line_map.clone();
+            let plain = go_panic_text(move || {
+                ecma_line_and_utf16_character_of_text_position(&line_map, text, pos);
+            });
+            assert_eq!(node, plain, "pos {pos}");
+            node
+        };
+        assert_eq!(both(-1), "runtime error: index out of range [-1]");
+        assert_eq!(
+            both(30),
+            "runtime error: slice bounds out of range [:30] with length 23"
+        );
+        assert_eq!(
+            get_ecma_line_and_utf16_character_of_position(file, 23),
+            (2, 0)
+        );
+        assert_eq!(
+            ecma_line_and_utf16_character_of_text_position(&line_map, text, 17),
+            (1, 5)
         );
     }
 }
