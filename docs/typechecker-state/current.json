@@ -887,12 +887,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "ad0caa66c2a1d3833",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "a9dfdec24679a131b",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R174 pipeline (candidate.sh side)."
