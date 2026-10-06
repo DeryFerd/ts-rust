@@ -1912,6 +1912,22 @@ impl FileLoader {
 // (`PackageScope`). In a resolve-ahead load, the loader takes the scope that
 // the workers found, or the scope that it found for the directory before
 // (`Caches::package_scope_ahead`).
+/// Whether Go `loadSourceFileMetaData` takes the package.json `type` of the
+/// scope of `file_name` (fileloader.go:398 to :401): for node16 to nodenext
+/// module resolution (not for `.mts`, `.cts`, `.mjs` and `.cjs` files), or
+/// for a path under `/node_modules/`.
+pub(crate) fn package_json_type_applies(
+    file_name: &str,
+    module_resolution_kind: ModuleResolutionKind,
+) -> bool {
+    !file_extension_is_one_of(
+        file_name,
+        &[EXTENSION_MTS, EXTENSION_CTS, EXTENSION_MJS, EXTENSION_CJS],
+    ) && ModuleResolutionKind::NODE16 <= module_resolution_kind
+        && module_resolution_kind <= ModuleResolutionKind::NODE_NEXT
+        || file_name.contains("/node_modules/")
+}
+
 pub(crate) fn source_file_meta_data(
     resolver: &dyn Resolver,
     options: &CompilerOptions,
@@ -1942,12 +1958,7 @@ pub(crate) fn meta_of_package_scope(
     if let Some(scope) = package_json_scope {
         package_json_directory = scope.package_directory;
         if let Some(value) = scope.type_
-            && (!file_extension_is_one_of(
-                file_name,
-                &[EXTENSION_MTS, EXTENSION_CTS, EXTENSION_MJS, EXTENSION_CJS],
-            ) && ModuleResolutionKind::NODE16 <= module_resolution_kind
-                && module_resolution_kind <= ModuleResolutionKind::NODE_NEXT
-                || file_name.contains("/node_modules/"))
+            && package_json_type_applies(file_name, module_resolution_kind)
         {
             package_json_type = value;
         }

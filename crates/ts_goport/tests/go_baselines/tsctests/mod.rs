@@ -4,6 +4,7 @@ mod checker_common_source_directory;
 mod contentmapper_watch;
 mod explain_files_cache;
 mod file_delete;
+mod flag_bytes;
 mod jsdoc_cut;
 mod never_intersection_order;
 mod removed_reference_config;

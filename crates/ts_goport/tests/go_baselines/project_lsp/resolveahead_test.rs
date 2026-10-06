@@ -26,8 +26,8 @@ use super::projecttestutil;
 use super::util::{CHANGED, DELETED, bg, close, edit, generate_file_events, open, program, uri};
 
 /// A test in a child process with no OS override, with the environment
-/// variables `$env` set. It is skipped, with a message, where resolve ahead
-/// cannot run (`resolve_ahead_off`).
+/// variables `$env` set (after `with_a_worker`). It is skipped, with a
+/// message, where resolve ahead cannot run (`resolve_ahead_off`).
 macro_rules! os_child_test {
     ($(#[$meta:meta])* fn $name:ident() $body:block) => {
         os_child_test!(env &[]; $(#[$meta])* fn $name() $body);
@@ -42,9 +42,26 @@ macro_rules! os_child_test {
                 eprintln!("{test}: skipped: {reason}");
                 return;
             }
-            crate::support::child::run_test_in_child_with_env(test, $env, || $body);
+            crate::support::child::run_test_in_child_with_env(test, &with_a_worker($env), || $body);
         }
     };
+}
+
+/// `env` after `GOPORT_RESOLVE_AHEAD_THREADS=1` when this process can use
+/// only one core (`program::available_cores`, Go `runtime.GOMAXPROCS`, which
+/// `GOMAXPROCS=1` sets). Resolve ahead has one worker per parse thread less
+/// the loading thread (`resolve_ahead::worker_count`), so on one core it
+/// starts none, and the tests check worker answers. A value in `env` wins
+/// (the child's environment takes the last one).
+// PORT: not in Go (resolve ahead is a port feature).
+fn with_a_worker<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let one_core = ts_goport::program::available_cores() == 1;
+    let mut all = Vec::new();
+    if one_core {
+        all.push(("GOPORT_RESOLVE_AHEAD_THREADS", "1"));
+    }
+    all.extend_from_slice(env);
+    all
 }
 
 /// Why resolve ahead cannot run in these tests, if it cannot: it is off on

@@ -1549,20 +1549,34 @@ mod tests {
         // spins, then sleeps until the worker ends it. The worker waits for
         // the loader's `waiting` mark, which the loader sets only after the
         // spin, so the order does not depend on the host's load. The 5 ms
-        // after the mark is the least time that the wait can count.
+        // after the mark is the least time that the wait can count. If the
+        // mark does not come in 60 s (the loader did not sleep), the worker
+        // still ends the key, so the loader cannot hang, and the test fails.
         assert_eq!(queue.take_next().map(|(index, _)| index), Some(2));
         let worker = {
             let queue = queue.clone();
             std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                let mut marked = true;
                 while queue.waiting.load(std::sync::atomic::Ordering::SeqCst) != 2 {
+                    if std::time::Instant::now() > deadline {
+                        marked = false;
+                        break;
+                    }
                     std::thread::yield_now();
                 }
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                if marked {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
                 queue.done(2);
+                marked
             })
         };
         assert!(queue.wait_or_take(2, &mut stats));
-        worker.join().unwrap();
+        assert!(
+            worker.join().unwrap(),
+            "the loader set no waiting mark in 60 s"
+        );
         assert_eq!((stats.waited, stats.slept), (2, 1));
         assert!(stats.wait_ns >= 5_000_000, "{stats:?}");
     }

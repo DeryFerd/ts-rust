@@ -205,6 +205,39 @@ os_child_test! {
 }
 
 os_child_test! {
+    // Go reads the package.json `type` only for node16 to nodenext
+    // resolution or a `/node_modules/` path (fileloader.go:398 to :401).
+    // With bundler resolution a `"type": "module"` scope sets no `force`,
+    // so the build project's keys (`moduleDetection` force) do not fit the
+    // spec project's load, and its workers parse ahead. A guess that let
+    // the scope set `force` here made it a cached load whose loader parsed
+    // every file itself (followups23 skeptic).
+    fn a_module_scope_sets_no_force_for_bundler_resolution() {
+        let files = [
+            ("package.json", r#"{ "name": "esm", "type": "module" }"#),
+            FILES[0],
+            (
+                "tsconfig.build.json",
+                r#"{ "compilerOptions": { "noLib": true, "types": [], "module": "esnext", "moduleResolution": "bundler", "moduleDetection": "force" }, "include": ["src/**/*.ts"] }"#,
+            ),
+            (
+                "tsconfig.spec.json",
+                r#"{ "compilerOptions": { "noLib": true, "types": [], "module": "esnext", "moduleResolution": "bundler", "moduleDetection": "auto" }, "include": ["src/**/*.ts"] }"#,
+            ),
+            ("src/main.ts", MAIN),
+            ("src/helper.ts", HELPER),
+        ];
+        let (each, all) = counts_of_opens("bundler", &files, &[("src/main.ts", MAIN, TS)]);
+        assert_eq!(
+            (each[0].pool_loads, each[0].cached_loads),
+            (2, 0),
+            "build and spec parse ahead: {each:?}"
+        );
+        assert_eq!(all.untaken, 0, "every worker parse was taken: {all:?}");
+    }
+}
+
+os_child_test! {
     // In a `"type": "module"` scope with `module` nodenext and
     // `moduleDetection` auto, every key has `force` set (Go
     // ast/parseoptions.go:46 isFileForcedToBeModuleByFormat), which the host

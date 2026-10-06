@@ -26,7 +26,11 @@ pub type RepopulateInfoRef = std::sync::Arc<RepopulateDiagnosticInfo>;
 // Go: incremental/snapshot.go:133 buildInfoDiagnosticWithFileName
 // PORT: Go `diagnostics.Category` is kept as the raw Go value, like
 // `BuildInfoDiagnostic.category` (`diagnostics::Category(raw)` gives the Go
-// value). Go nil slices are empty vectors.
+// value). The Go slices are `Option`s, because the build info leaves out a
+// nil slice but writes an empty one (`omitzero`, buildInfo.go:209 to :211).
+// A read empty list stays empty (`core.Map`, buildinfotosnapshot.go:85 to
+// :87), so it is written again as `[]` (snapshottobuildinfo.go:140 to
+// :142).
 #[derive(Clone, Debug, Default)]
 pub struct BuildInfoDiagnosticWithFileName {
     // filename if it is for a File thats other than its stored for
@@ -39,9 +43,9 @@ pub struct BuildInfoDiagnosticWithFileName {
     pub source: String,
     pub message_text: String,
     pub message_key: String,
-    pub message_args: Vec<String>,
-    pub message_chain: Vec<BuildInfoDiagnosticWithFileName>,
-    pub related_information: Vec<BuildInfoDiagnosticWithFileName>,
+    pub message_args: Option<Vec<String>>,
+    pub message_chain: Option<Vec<BuildInfoDiagnosticWithFileName>>,
+    pub related_information: Option<Vec<BuildInfoDiagnosticWithFileName>>,
     pub reports_unnecessary: bool,
     pub reports_deprecated: bool,
     pub skipped_on_no_emit: bool,
@@ -126,11 +130,13 @@ impl BuildInfoDiagnosticWithFileName {
         let message_chain = self
             .message_chain
             .iter()
+            .flatten()
             .map(|msg| msg.to_diagnostic(file_for_diagnostic))
             .collect();
         let related_information = self
             .related_information
             .iter()
+            .flatten()
             .map(|info| info.to_diagnostic(file_for_diagnostic))
             .collect();
         let mut diagnostic = new_diagnostic_from_serialized(
@@ -139,7 +145,7 @@ impl BuildInfoDiagnosticWithFileName {
             self.code,
             crate::diagnostics::Category(self.category),
             &self.message_key,
-            self.message_args.clone(),
+            self.message_args.clone().unwrap_or_default(),
             message_chain,
             related_information,
             self.reports_unnecessary,
@@ -158,11 +164,13 @@ impl BuildInfoDiagnosticWithFileName {
         let message_chain = self
             .message_chain
             .iter()
+            .flatten()
             .map(|msg| msg.to_diagnostic(file))
             .collect();
         let related_information = self
             .related_information
             .iter()
+            .flatten()
             .map(|info| info.to_diagnostic(file))
             .collect();
         new_diagnostic_from_serialized(
@@ -171,7 +179,7 @@ impl BuildInfoDiagnosticWithFileName {
             self.code,
             crate::diagnostics::Category(self.category),
             &self.message_key,
-            self.message_args.clone(),
+            self.message_args.clone().unwrap_or_default(),
             message_chain,
             related_information,
             self.reports_unnecessary,
@@ -215,6 +223,7 @@ pub fn repopulate_mode_mismatch_chain(
     let next_chain = b
         .message_chain
         .iter()
+        .flatten()
         .map(|msg| msg.to_diagnostic(file))
         .collect();
 
@@ -260,6 +269,7 @@ pub fn repopulate_module_not_found_chain(
     let next_chain = b
         .message_chain
         .iter()
+        .flatten()
         .map(|msg| msg.to_diagnostic(file))
         .collect();
 
