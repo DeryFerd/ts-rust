@@ -10,6 +10,18 @@
 //! the result and the next level are Go's deterministic ones. The side
 //! effects of `visit` (the project search creates and loads each project of
 //! the level) are those of Go's common schedule.
+//!
+//! Go's other schedule has no condition that the port can read: a later
+//! job skips its visit only when its goroutine runs the start check after
+//! an earlier job's `visit` has stored `lowestGoal`. That can happen only
+//! when the earlier visit is fast (a project that is already loaded and up
+//! to date, as at a hono reopen), and then it depends on the scheduler and
+//! the CPU: Go N skipped hono's spec project in 5 of 7 reopens on
+//! mini-743d, took the common schedule in both runs on alvin
+//! (projsearch1b), and skipped it in about 4 of 15 reopens for the R170
+//! reviewer. Both answers are Go's. The port keeps the
+//! common one, so its answers (willRenameFiles: 11 files, 2 tests) do not
+//! change from run to run or host to host.
 
 use crate::frontend::prelude::*;
 use std::hash::Hash;

@@ -61,12 +61,12 @@ impl Reader {
             }
 
             let Some(colon) = line.iter().position(|&c| c == b':') else {
-                // PORT: `%q` of invalid UTF-8 bytes prints U+FFFD, not `\x..`.
+                // Go `%q` of the line's bytes.
                 return Err(errors::errorf(
                     format!(
                         "{}: {}",
                         ERR_INVALID_HEADER.error(),
-                        strconv::quote(&String::from_utf8_lossy(&line))
+                        strconv::quote_bytes(&line)
                     ),
                     vec![ERR_INVALID_HEADER.clone()],
                 ));
@@ -74,10 +74,13 @@ impl Reader {
             let (key, value) = (&line[..colon], &line[colon + 1..]);
 
             if key == b"Content-Length" {
-                // Go bytes.TrimSpace (Unicode White_Space at both ends).
-                // PORT: invalid UTF-8 is trimmed as U+FFFD (not a space),
-                // which is where Go's TrimFunc stops too.
-                let value = String::from_utf8_lossy(value);
+                // Go bytes.TrimSpace (Unicode White_Space at both ends) and
+                // `string(...)`.
+                // PORT: the port form holds the bytes (`go_string_from_bytes`),
+                // so the ParseInt error quotes Go's bytes. A byte that is not
+                // valid UTF-8 is a marker unit, which is not a space: Go's
+                // TrimFunc stops at its RuneError too.
+                let value = crate::scanner_util::go_string_from_bytes(value.to_vec());
                 match parse_int_10_64(value.trim()) {
                     Ok(v) => content_length = v,
                     Err(err) => {
@@ -240,5 +243,45 @@ impl Writer {
             return Err(errors::new(err.to_string()));
         }
         self.w.flush().map_err(|err| errors::new(err.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_error(input: &[u8]) -> String {
+        new_reader(Box::new(std::io::Cursor::new(input.to_vec())))
+            .read()
+            .expect_err("want a header error")
+            .error()
+    }
+
+    // Go `%q` of a header line, and of the Content-Length value in the
+    // ParseInt error, quotes the Go bytes (baseproto.go:52 and :56): a byte
+    // that is not valid UTF-8 is `\x..`, and a real U+FDD0 stays one char.
+    // Texts from Go N (`tsgo --lsp --stdio`, followups25 skeptic lsphdr.py).
+    #[test]
+    fn header_errors_quote_the_go_bytes() {
+        assert_eq!(
+            read_error(b"\xff\xfe\r\n"),
+            r#"jsonrpc: invalid header: "\xff\xfe\r\n""#
+        );
+        assert_eq!(
+            read_error(b"\xef\xb7\x90\xef\xb7\x90\r\n"),
+            r#"jsonrpc: invalid header: "\ufdd0\ufdd0\r\n""#
+        );
+        assert_eq!(
+            read_error(b"\xef\xb7\x90\xf4\x8f\x9f\xbf\r\n"),
+            r#"jsonrpc: invalid header: "\ufdd0\U0010f7ff\r\n""#
+        );
+        assert_eq!(
+            read_error(b"Content-Length: \xef\xb7\x90\xef\xb7\x90\r\n\r\n"),
+            r#"jsonrpc: invalid content length: parse error: strconv.ParseInt: parsing "\ufdd0\ufdd0": invalid syntax"#
+        );
+        assert_eq!(
+            read_error(b"Content-Length: 1\xff\r\n\r\n"),
+            r#"jsonrpc: invalid content length: parse error: strconv.ParseInt: parsing "1\xff": invalid syntax"#
+        );
     }
 }

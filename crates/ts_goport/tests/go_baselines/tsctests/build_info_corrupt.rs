@@ -297,3 +297,168 @@ fn far_apart_categories_sort_as_go_ints() {
         "Unhandled diagnostic category",
     );
 }
+
+/// Builds the project with `src/x.ts`, replaces `from` (once) with `to` in
+/// its build info, and gives `src/x.ts` a syntax error, so no semantic
+/// diagnostic is asked for and those of `src/b.ts` are written from the
+/// read form. `tsgo -p .` and `tsgo -b` report the syntax error (Go N's
+/// text) and write a build info that has `written`.
+fn check_read_form_written_again(name: &str, from: &str, to: &str, written: &str) {
+    let dir = TmpDir::new(&format!("build-info-{name}"));
+    dir.write(
+        "tsconfig.json",
+        r#"{ "compilerOptions": { "outDir": "dist", "rootDir": "src", "incremental": true, "strict": true, "lib": ["es5"] }, "include": ["src"] }"#,
+    );
+    dir.write("src/a.ts", "export const a: number = 1;\n");
+    dir.write(
+        "src/b.ts",
+        "import { a } from \"./a\"; export const b: string = a;\n",
+    );
+    dir.write("src/x.ts", "export const x = 1;\n");
+    let first = tsgo(&dir.0, &["-p", "."]);
+    assert_eq!(first.code, Some(2), "first build: {first:?}");
+    let build_info_path = dir.0.join("tsconfig.tsbuildinfo");
+    let build_info = std::fs::read_to_string(&build_info_path).expect("build info");
+    assert_eq!(
+        build_info.matches(from).count(),
+        1,
+        "{from:?} once in {build_info}"
+    );
+    let bad = build_info.replace(from, to);
+    for args in [&["-p", "."][..], &["-b"][..]] {
+        dir.write("tsconfig.tsbuildinfo", &bad);
+        dir.write("src/x.ts", "export const x = ;\n");
+        let want = Run {
+            code: Some(2),
+            stdout: "src/x.ts(1,18): error TS1109: Expression expected.\n".to_string(),
+            panic: String::new(),
+        };
+        assert_eq!(tsgo(&dir.0, args), want, "{name} {args:?}");
+        let new = std::fs::read_to_string(&build_info_path).expect("build info");
+        assert_ne!(new, bad, "{name} {args:?}: build info not written again");
+        assert!(
+            new.contains(written),
+            "{name} {args:?}: {written:?} not in {new}"
+        );
+    }
+}
+
+// Go: execute/incremental/buildInfo.go:209 writes `messageArgs` with
+// `omitzero`. A read `"messageArgs":[]` is an empty slice, not nil, and the
+// snapshot keeps it (buildinfotosnapshot.go:85, snapshottobuildinfo.go:140),
+// so the build info written again has `[]` too. Texts and bytes from the pin
+// N oracle.
+// PORT: when the read diagnostics are reported first (no syntax error),
+// Go writes them from its `ast.Diagnostic` copies, which also keep `[]`.
+// The port's `Diagnostic.message_args` (core.rs) has no nil, so that path
+// still drops it (followups25).
+#[test]
+fn empty_message_args_are_written_again() {
+    check_read_form_written_again(
+        "empty-args",
+        r#""messageArgs":["number","string"]"#,
+        r#""messageArgs":[]"#,
+        r#""messageKey":"Type_0_is_not_assignable_to_type_1_2322","messageArgs":[]}"#,
+    );
+}
+
+// Go: execute/incremental/buildInfo.go:210 and :211 write `messageChain`
+// and `relatedInformation` with `omitzero`, as `messageArgs`. Go `core.Map`
+// keeps a read empty list empty (buildinfotosnapshot.go:86 and :87,
+// snapshottobuildinfo.go:141 and :142), so the build info written again has
+// both `[]`. Bytes from the pin N oracle.
+// PORT: the ast path drops them, as for `messageArgs`.
+#[test]
+fn empty_message_chain_and_related_information_are_written_again() {
+    let lists = r#""messageArgs":["number","string"],"messageChain":[],"relatedInformation":[]}"#;
+    check_read_form_written_again(
+        "empty-lists",
+        r#""messageArgs":["number","string"]}"#,
+        lists,
+        lists,
+    );
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:266 `start+length` is a Go int,
+// and `length` is the wrapped int32 difference of the ends (core/text.go:30).
+// An `end` of ±2^31 (int32 -2^31 either way) gives `38 + 2147483610`, past
+// the text, so `--pretty` panics in `text[lineMap[line]:pos]` after it
+// writes the diagnostic's first line. The port added the two as `i32`,
+// which wrapped to line -1 (`index out of range [-1]`).
+#[test]
+fn far_diagnostic_end_panics_slice_bounds_with_pretty() {
+    for end in ["2147483648", "-2147483648"] {
+        let dir = TmpDir::new(&format!("build-info-far-end{end}"));
+        dir.write(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "outDir": "dist", "rootDir": "src", "incremental": true, "strict": true, "lib": ["es5"] }, "include": ["src"] }"#,
+        );
+        dir.write("src/a.ts", "export const a: number = 1;\n");
+        dir.write(
+            "src/b.ts",
+            "import { a } from \"./a\"; export const b: string = a;\n",
+        );
+        let first = tsgo(&dir.0, &["-p", "."]);
+        assert_eq!(first.code, Some(2), "first build: {first:?}");
+        let build_info_path = dir.0.join("tsconfig.tsbuildinfo");
+        let build_info = std::fs::read_to_string(&build_info_path).expect("build info");
+        let bad = build_info.replace(r#""end":39,"#, &format!(r#""end":{end},"#));
+        assert_ne!(bad, build_info, "end in {build_info}");
+        dir.write("tsconfig.tsbuildinfo", &bad);
+        let want = Run {
+            code: Some(2),
+            stdout: "\u{1b}[96msrc/b.ts\u{1b}[0m:\u{1b}[93m1\u{1b}[0m:\u{1b}[93m39\u{1b}[0m - \u{1b}[91merror\u{1b}[0m\u{1b}[90m TS2322: \u{1b}[0mType 'number' is not assignable to type 'string'.\n".to_string(),
+            panic: "panic: runtime error: slice bounds out of range [:2147483648] with length 53"
+                .to_string(),
+        };
+        assert_eq!(tsgo(&dir.0, &["-p", ".", "--pretty"]), want, "end {end}");
+    }
+}
+
+// Go: diagnosticwriter/diagnosticwriter.go:266 on a source file with bytes
+// that are not valid UTF-8. The port text holds each such byte as a marker
+// unit, which is longer than the byte (`scanner_util::GO_STRING_MARKER`),
+// and a diagnostic's ends are port offsets. The `--pretty` panic text has
+// Go's offset and length: the wrapped end `38 + 2147483610`, from Go's ends.
+// Texts from the pin N oracle.
+// PORT: a `pos` or `end` within the marker bytes of `i32::MAX` has no `i32`
+// port offset. It wraps to a negative one, and the panic text is not Go's
+// (as at R172). The full fix needs i64 diagnostic offsets in core.rs
+// (PORTING.md, "Go `int` past the int32 range").
+#[test]
+fn far_positions_in_a_file_with_raw_bytes_panic_as_go() {
+    for end in ["2147483648", "-2147483648"] {
+        let dir = TmpDir::new("build-info-raw-bytes");
+        dir.write(
+            "tsconfig.json",
+            r#"{ "compilerOptions": { "outDir": "dist", "rootDir": "src", "incremental": true, "strict": true, "lib": ["es5"] }, "include": ["src"] }"#,
+        );
+        dir.write("src/a.ts", "export const a: number = 1;\n");
+        std::fs::write(
+            dir.0.join("src/b.ts"),
+            b"import { a } from \"./a\"; export const b: string = a; // \xff\xfe\n",
+        )
+        .expect("write src/b.ts");
+        let first = tsgo(&dir.0, &["-p", "."]);
+        assert_eq!(first.code, Some(2), "first build: {first:?}");
+        let build_info_path = dir.0.join("tsconfig.tsbuildinfo");
+        let build_info = std::fs::read_to_string(&build_info_path).expect("build info");
+        let from = r#""end":39,"#;
+        assert_eq!(
+            build_info.matches(from).count(),
+            1,
+            "{from:?} in {build_info}"
+        );
+        dir.write(
+            "tsconfig.tsbuildinfo",
+            &build_info.replace(from, &format!(r#""end":{end},"#)),
+        );
+        let want = Run {
+            code: Some(2),
+            stdout: "\u{1b}[96msrc/b.ts\u{1b}[0m:\u{1b}[93m1\u{1b}[0m:\u{1b}[93m39\u{1b}[0m - \u{1b}[91merror\u{1b}[0m\u{1b}[90m TS2322: \u{1b}[0mType 'number' is not assignable to type 'string'.\n".to_string(),
+            panic: "panic: runtime error: slice bounds out of range [:2147483648] with length 59"
+                .to_string(),
+        };
+        assert_eq!(tsgo(&dir.0, &["-p", ".", "--pretty"]), want, "end {end}");
+    }
+}

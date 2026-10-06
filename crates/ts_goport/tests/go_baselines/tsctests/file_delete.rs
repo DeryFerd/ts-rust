@@ -205,7 +205,8 @@ fn gone_files_mostly_global_change_all_files() {
 
 // Two files leave the program and one of them, `g.d.ts`, affects global
 // scope: a tie. Go meets the global file first in about half of the runs
-// (pin 673a5f17d713: 89 of 200), and the port takes the global branch on a
+// (pin 673a5f17d713, `followups23/tools/tie_go.sh`: 22 of 40 runs, and 105
+// of 200 in a later count), and the port takes the global branch on a
 // tie, so the unchanged `a.ts` is emitted again. With a strict majority
 // rule (`>` in place of `>=`), it would not be.
 #[test]

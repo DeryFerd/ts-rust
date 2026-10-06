@@ -19,6 +19,7 @@
 //!   only avoid Go heap allocation, so they are not used here.
 
 use crate::flags_macros::{go_enum, go_flags};
+use crate::gostd::debug::kind_string;
 use crate::prelude::*;
 use crate::printer::semicolon_writer::get_trailing_semicolon_deferring_writer;
 use crate::printer::*;
@@ -672,7 +673,7 @@ impl Printer {
                 } else if is_js_doc_kind(node.kind()) {
                     self.emit_js_doc_node(node);
                 } else {
-                    panic!("unhandled Node: {:?}", node.kind());
+                    panic!("unhandled Node: {}", kind_string(node.kind()));
                 }
             }
         }

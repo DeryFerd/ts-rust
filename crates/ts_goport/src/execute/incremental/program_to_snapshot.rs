@@ -900,13 +900,15 @@ pub fn repopulate_diagnostic_message_chain(
                 source: c.source().to_string(),
                 message_text: c.message_text().to_string(),
                 message_key: c.message_key().to_string(),
-                message_args: c.message_args().to_vec(),
+                message_args: Some(c.message_args().to_vec()),
                 repopulate_info: Some(repopulate_info),
                 ..Default::default()
             };
             // Recursively handle nested chains
             for nested in c.message_chain() {
-                b.message_chain.push(ast_diag_to_build_info_diag(nested));
+                b.message_chain
+                    .get_or_insert_with(Vec::new)
+                    .push(ast_diag_to_build_info_diag(nested));
             }
             result.push(repopulate_diagnostic_chain(&b, file));
             changed = true;
@@ -941,12 +943,14 @@ pub fn ast_diag_to_build_info_diag(d: &Diagnostic) -> BuildInfoDiagnosticWithFil
         source: d.source().to_string(),
         message_text: d.message_text().to_string(),
         message_key: d.message_key().to_string(),
-        message_args: d.message_args().to_vec(),
+        message_args: Some(d.message_args().to_vec()),
         repopulate_info: d.repopulate_info(),
         ..Default::default()
     };
     for nested in d.message_chain() {
-        b.message_chain.push(ast_diag_to_build_info_diag(nested));
+        b.message_chain
+            .get_or_insert_with(Vec::new)
+            .push(ast_diag_to_build_info_diag(nested));
     }
     b
 }

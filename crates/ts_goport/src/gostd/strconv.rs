@@ -7,7 +7,9 @@
 //! result equals Go's for every rune.
 //!
 //! PORT: Go strings may hold invalid UTF-8, which `Quote` writes as `\x..`.
-//! A Rust `&str` is always valid UTF-8, so that branch cannot run.
+//! A port string holds such bytes (and lone surrogates) in the port form
+//! (`scanner_util::GO_STRING_MARKER`). The quote functions quote a string
+//! with marker units from its Go bytes, as Go does (`quote_bytes`).
 
 use crate::prelude::*;
 
@@ -21,7 +23,18 @@ const LOWERHEX: &[u8; 16] = b"0123456789abcdef";
 const RUNE_SELF: u32 = 0x80;
 
 // Go: strconv/quote.go:23 quoteWith
+// PORT: `s` is a Go string in the port form. One with marker units is
+// quoted from its Go bytes, so a raw byte is `\x..` as in Go (not the
+// escapes of the marker chars).
 fn quote_with(s: &str, quote: u8, ascii_only: bool, graphic_only: bool) -> String {
+    if crate::scanner_util::contains_go_string_marker(s) {
+        return quote_bytes_with(
+            &crate::scanner_util::go_string_bytes(s),
+            quote,
+            ascii_only,
+            graphic_only,
+        );
+    }
     let buf = append_quoted_with(
         Vec::with_capacity(3 * s.len() / 2),
         s,
@@ -29,6 +42,35 @@ fn quote_with(s: &str, quote: u8, ascii_only: bool, graphic_only: bool) -> Strin
         ascii_only,
         graphic_only,
     );
+    String::from_utf8(buf).expect("quote writes UTF-8")
+}
+
+/// Go `strconv.Quote(string(b))`: `b` are Go bytes, which can hold invalid
+/// UTF-8.
+#[must_use]
+pub fn quote_bytes(b: &[u8]) -> String {
+    quote_bytes_with(b, b'"', false, false)
+}
+
+// Go: strconv/quote.go:23 quoteWith, on Go bytes.
+fn quote_bytes_with(s: &[u8], quote: u8, ascii_only: bool, graphic_only: bool) -> String {
+    let mut buf = Vec::with_capacity(3 * s.len() / 2 + 2);
+    buf.push(quote);
+    // Go: strconv/quote.go:40 to :49. A valid rune is escaped as in
+    // `append_quoted_with`. Go decodes an invalid sequence one byte at a
+    // time (`width == 1 && r == utf8.RuneError`), and each byte of an
+    // invalid chunk is one such byte.
+    for chunk in s.utf8_chunks() {
+        for r in chunk.valid().chars() {
+            buf = append_escaped_rune(buf, r, quote, ascii_only, graphic_only);
+        }
+        for &b in chunk.invalid() {
+            buf.extend_from_slice(b"\\x");
+            buf.push(LOWERHEX[(b >> 4) as usize]);
+            buf.push(LOWERHEX[(b & 0xF) as usize]);
+        }
+    }
+    buf.push(quote);
     String::from_utf8(buf).expect("quote writes UTF-8")
 }
 
@@ -303,5 +345,35 @@ mod tests {
         assert_eq!(quote("\u{10D50}"), "\"\u{10D50}\"");
         assert_eq!(quote("\u{16EA0}"), "\"\u{16EA0}\"");
         assert_eq!(quote("a\u{378}b"), "\"a\\u0378b\"");
+    }
+
+    // Go `%q` of a string with raw bytes writes each byte that is not
+    // valid UTF-8 as `\x..` (strconv/quote.go:42). The port form holds
+    // such bytes as marker units (`go_string_from_bytes`, as an OS argument
+    // gets them), and a real U+FDD0 as two markers. Texts from Go N:
+    // `--lsp -clientProcessId=$'\xff\xfe'` gives `invalid value "\xff\xfe"`
+    // (followups24 skeptic).
+    #[test]
+    fn quote_writes_the_go_bytes_of_marker_units() {
+        use crate::scanner_util::go_string_from_bytes;
+        let quoted = |bytes: &[u8]| quote(&go_string_from_bytes(bytes.to_vec()));
+        assert_eq!(quoted(b"\xff\xfe"), r#""\xff\xfe""#);
+        assert_eq!(quoted(b"a\xffb\n"), r#""a\xffb\n""#);
+        assert_eq!(
+            quoted(&["\u{FDD0}xé".as_bytes(), b"\xff".as_slice()].concat()),
+            "\"\\ufdd0xé\\xff\""
+        );
+        // A WTF-8 lone surrogate is three invalid bytes in Go.
+        assert_eq!(quoted(b"\xed\xa0\x80"), r#""\xed\xa0\x80""#);
+        assert_eq!(
+            quote_bytes(b"\xe2\x82A\xf0\x9f\x98\x80"),
+            "\"\\xe2\\x82A\u{1F600}\""
+        );
+        assert_eq!(
+            quote_to_ascii(&go_string_from_bytes(
+                [b"\xff".as_slice(), "é".as_bytes()].concat()
+            )),
+            r#""\xff\u00e9""#
+        );
     }
 }

@@ -349,12 +349,15 @@ fn watch_step(elapsed: Duration, free: Option<u64>, min_free: u64) -> Watch {
 
 /// The wait before the next read when `free` bytes are free in 2 MiB
 /// blocks: the time the free memory takes to fall to `min_free` at
-/// `MAX_FALL_PER_MS`, from `POLL_MIN` to `POLL_MAX`. So the watcher reads
-/// before the memory can reach the limit, and near the limit it reads as
-/// often as it did with a fixed 5 ms (cliperf1 rank 9: the fixed 5 ms read
-/// cost 1.2% to 1.5% of the CPU of a single-threaded run on cup2). Less
-/// than 256 MiB free (zbook in cliperf1 gapA: 166 MiB): 5 ms. 1,664 MiB or
-/// more free: 50 ms.
+/// `MAX_FALL_PER_MS`, from `POLL_MIN` to `POLL_MAX`. With 160 MiB or more
+/// above `min_free` (5 ms of that fall), the watcher reads again before
+/// such a fall can reach the limit. Nearer the limit it reads every 5 ms,
+/// as often as it did with a fixed 5 ms (cliperf1 rank 9: the fixed 5 ms
+/// read cost 1.2% to 1.5% of the CPU of a single-threaded run on cup2),
+/// and a fall at `MAX_FALL_PER_MS` can pass the limit before the next
+/// read. Less than 192 MiB above `min_free`: 5 ms (at the default limit,
+/// less than 256 MiB free; zbook in cliperf1 gapA had 166 MiB). 1,600 MiB
+/// or more above it: 50 ms (at the default limit, 1,664 MiB free).
 fn next_poll(free: u64, min_free: u64) -> Duration {
     let ms = free.saturating_sub(min_free) / MAX_FALL_PER_MS;
     Duration::from_millis(ms).clamp(POLL_MIN, POLL_MAX)
@@ -523,11 +526,21 @@ Node 0, zone   Normal 616681 607866 455781 337376 229283 129647  50350  16747   
         for (window, fall) in [(5, 122), (10, 168), (50, 268)] {
             assert!(next_poll(limit + fall * MIB, limit) <= ms(window));
         }
-        // A wait never lets the planned fall pass the limit.
-        for free in (limit..limit + 4096 * MIB).step_by(7 * MIB as usize) {
+        // The planned fall of one wait stays above the limit exactly when
+        // 160 MiB or more are above it. Nearer, the 5 ms wait can pass it.
+        for free in (limit..limit + 4096 * MIB).step_by(MIB as usize) {
             let wait = next_poll(free, limit);
             let fall = MAX_FALL_PER_MS * wait.as_millis() as u64;
-            assert!(wait == POLL_MIN || free - fall >= limit, "{free}");
+            let above = free - limit;
+            assert_eq!(fall <= above, above >= 160 * MIB, "{free}");
+            assert!(wait == POLL_MIN || fall <= above, "{free}");
         }
+        // The bounds are above the limit, so another limit
+        // (`GOPORT_THP_GUARD_MIB=128`) moves them: 1,664 MiB free is 48 ms.
+        let other = 128 * MIB;
+        assert_eq!(next_poll(other + 191 * MIB, other), POLL_MIN);
+        assert_eq!(next_poll(256 * MIB, other), POLL_MIN);
+        assert_eq!(next_poll(1664 * MIB, other), ms(48));
+        assert_eq!(next_poll(other + 1600 * MIB, other), POLL_MAX);
     }
 }

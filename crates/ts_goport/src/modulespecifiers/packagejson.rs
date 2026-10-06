@@ -1,9 +1,10 @@
 //! The parts of Go `internal/packagejson` that modulespecifiers uses.
 //!
-//! PORT: the full port in `src/frontend/packagejson.rs` depends on the
-//! frontend JSON decoder, which `lib.rs` does not compile. This file keeps
-//! the same data model (JSONValue, Expected, ExportsOrImports, VersionPaths,
-//! InfoCacheEntry) with a small strict JSON parser:
+//! PORT: the full port in `src/frontend/packagejson.rs` is not thread-safe
+//! (`Rc`), and module specifier generation runs on checker threads. This
+//! file keeps the same data model (JSONValue, Expected, ExportsOrImports,
+//! VersionPaths, InfoCacheEntry) as a thread-safe copy of a frontend value
+//! (`PackageJson::of_frontend`), or with a small strict JSON parser:
 //! - Duplicate object members are allowed and the last one wins, as with
 //!   `json.AllowDuplicateNames(true)`. In objects kept as `JSONValue`, the
 //!   member keeps the position of its first occurrence (OrderedMap.Set).
@@ -59,6 +60,34 @@ pub enum JSONValue {
 }
 
 impl JSONValue {
+    /// A copy of a frontend value (`PackageJson::of_frontend`).
+    fn of_frontend(value: &crate::frontend::packagejson::JSONValue) -> Self {
+        use crate::frontend::packagejson::{JSONValueType as Type, JsonAny};
+        match &value.value {
+            JsonAny::Nil if value.type_ == Type::NULL => JSONValue::Null,
+            JsonAny::Nil => JSONValue::NotPresent,
+            JsonAny::String(s) => JSONValue::String(s.clone()),
+            JsonAny::Number(n) => JSONValue::Number(*n),
+            JsonAny::Bool(b) => JSONValue::Boolean(*b),
+            JsonAny::Array(a) => JSONValue::Array(a.iter().map(JSONValue::of_frontend).collect()),
+            JsonAny::Object(o) => JSONValue::Object(
+                o.iter()
+                    .map(|(k, v)| (k.clone(), JSONValue::of_frontend(v)))
+                    .collect(),
+            ),
+            JsonAny::ExportsArray(a) => JSONValue::Array(
+                a.iter()
+                    .map(|v| JSONValue::of_frontend(&v.json_value))
+                    .collect(),
+            ),
+            JsonAny::ExportsObject(o) => JSONValue::Object(
+                o.iter()
+                    .map(|(k, v)| (k.clone(), JSONValue::of_frontend(&v.json_value)))
+                    .collect(),
+            ),
+        }
+    }
+
     pub fn type_(&self) -> JSONValueType {
         match self {
             JSONValue::NotPresent => JSONValueType::NotPresent,
@@ -197,7 +226,8 @@ pub struct Fields {
 impl Fields {
     // Go: packagejson/packagejson.go:89 GetRuntimeDependencyNames
     // PORT: Go returns a Set with random iteration order. This keeps the
-    // package.json order.
+    // order of the maps (the package.json order, or the frontend map order
+    // for `PackageJson::of_frontend`).
     pub fn get_runtime_dependency_names(&self) -> IndexSet<String> {
         let mut names = IndexSet::default();
         for name in self.dependencies.value.keys() {
@@ -314,6 +344,53 @@ impl PackageJson {
             parseable,
             version_paths: std::sync::OnceLock::new(),
         }
+    }
+
+    /// A copy of `package_json`, a package.json that the frontend resolver
+    /// read (Go has one type). Module specifier generation uses it on the
+    /// loading thread (`modulespecifiers::host`).
+    // PORT: the frontend dependency maps have no order, so the dependency
+    // fields of a copy are in that map order, not the package.json order.
+    pub(crate) fn of_frontend(package_json: &crate::frontend::packagejson::PackageJson) -> Self {
+        use crate::frontend::packagejson::Expected as FrontendExpected;
+        fn string(e: &FrontendExpected<String>) -> Expected<String> {
+            Expected {
+                null: e.null,
+                valid: e.valid,
+                value: e.value.clone(),
+            }
+        }
+        fn string_map(
+            e: &FrontendExpected<FxHashMap<String, String>>,
+        ) -> Expected<IndexMap<String, String>> {
+            Expected {
+                null: e.null,
+                valid: e.valid,
+                value: e
+                    .value
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            }
+        }
+        let f = &package_json.fields;
+        let (header, paths, deps) = (&f.header_fields, &f.path_fields, &f.dependency_fields);
+        let fields = Fields {
+            name: string(&header.name),
+            version: string(&header.version),
+            type_: string(&header.type_),
+            main: string(&paths.main),
+            types: string(&paths.types),
+            typings: string(&paths.typings),
+            types_versions: JSONValue::of_frontend(&paths.types_versions),
+            imports: JSONValue::of_frontend(&paths.imports.json_value),
+            exports: JSONValue::of_frontend(&paths.exports.json_value),
+            dependencies: string_map(&deps.dependencies),
+            dev_dependencies: string_map(&deps.dev_dependencies),
+            peer_dependencies: string_map(&deps.peer_dependencies),
+            optional_dependencies: string_map(&deps.optional_dependencies),
+        };
+        PackageJson::new(fields, package_json.parseable)
     }
 
     // Go: packagejson/cache.go:28 GetVersionPaths
