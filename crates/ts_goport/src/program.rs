@@ -1263,6 +1263,14 @@ fn state_of(program: &'static GoProgram) -> &'static ProgramState {
     program.state.get().expect("program not loaded")
 }
 
+/// The Go frontend program of the current program when this thread loaded
+/// it, else None (another thread, no current program, or an alias
+/// resolver program). It never panics.
+pub(crate) fn loading_thread_frontend() -> Option<Rc<crate::frontend::compiler::NewProgram>> {
+    let id = try_prog()?.id;
+    FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned())
+}
+
 /// The Go frontend program, or None for an alias resolver program. Panics
 /// on a checker worker thread, which must use the copies in
 /// `VersionTables::go`.

@@ -33,9 +33,17 @@ pub(crate) struct HostFsCache {
     /// loading thread (`program::file_exists`).
     file_exists: RwLock<FxHashMap<String, bool>>,
     /// Go module/resolver.go `packageJsonInfoCache`: the entries of the
-    /// module specifier lookups (`get_package_json_info_for_directory`), by
-    /// the `Path` of the package.json (Go `InfoCache.Get`).
+    /// module specifier lookups off the loading thread
+    /// (`get_package_json_info_for_directory`), by the `Path` of the
+    /// package.json (Go `InfoCache.Get`).
     package_json_info: RwLock<FxHashMap<tspath::Path, Arc<InfoCacheEntry>>>,
+    /// The copies of the package.json files that module specifier
+    /// generation found in the frontend resolver's cache on the loading
+    /// thread (`frontend_package_json_entry`), by the `Path` of the
+    /// package.json. That cache keeps the first entry of each path, and the
+    /// versions that share this cache share that resolver
+    /// (`VersionTables::package_json_cache`), so a copy stays valid.
+    frontend_package_jsons: RwLock<FxHashMap<tspath::Path, Arc<PackageJson>>>,
 }
 
 impl HostFsCache {
@@ -54,6 +62,23 @@ impl HostFsCache {
     // Go: packagejson/cache.go:182 Get
     fn get_package_json_info(&self, key: &tspath::Path) -> Option<Arc<InfoCacheEntry>> {
         read(&self.package_json_info).get(key).cloned()
+    }
+
+    /// The copy of `package_json` for `key` (`frontend_package_jsons`):
+    /// the stored one, or a new one, which is then stored.
+    fn frontend_package_json(
+        &self,
+        key: tspath::Path,
+        package_json: &crate::frontend::packagejson::PackageJson,
+    ) -> Arc<PackageJson> {
+        if let Some(copy) = read(&self.frontend_package_jsons).get(&key) {
+            return copy.clone();
+        }
+        let copy = Arc::new(PackageJson::of_frontend(package_json));
+        write(&self.frontend_package_jsons)
+            .entry(key)
+            .or_insert(copy)
+            .clone()
     }
 
     // Go: packagejson/cache.go:190 Set (the first stored value stays)
@@ -172,9 +197,10 @@ fn typings_location() -> Rc<str> {
 }
 
 // Go: module/resolver.go:1755 getPackageJsonInfo
-// PORT: tracing is not ported. The entries are in the program's
-// `HostFsCache`, not in the frontend resolver's cache; the build info reads
-// both (`incremental::checker_access::package_json_cache_entries`). The key
+// PORT: off the loading thread only (see `ProgramHost`). Tracing is not
+// ported. The entries are in the program's `HostFsCache`, not in the
+// frontend resolver's cache; the build info reads both
+// (`incremental::checker_access::package_json_cache_entries`). The key
 // is the `Path` of `<packageDirectory>/package.json`, so another spelling of
 // a directory (another case on a case-insensitive file system, or a trailing
 // separator) finds the entry of the first spelling, and
@@ -197,7 +223,10 @@ fn get_package_json_info_for_directory(package_directory: &str) -> Option<Arc<In
     }
 
     // PORT: the OS file system in the port form (see
-    // `scanner_util::GO_STRING_MARKER`); Go parses the file's bytes.
+    // `scanner_util::GO_STRING_MARKER`); Go parses the file's bytes. Go
+    // reads the program host's file system, which is the OS file system
+    // for a compile; a language server program reads on the loading
+    // thread.
     let fs = osvfs_fs();
     let directory_exists = fs.directory_exists(package_directory);
     if directory_exists && fs.file_exists(&package_json_path) {
@@ -228,6 +257,26 @@ fn get_package_json_info_for_directory(package_directory: &str) -> Option<Arc<In
         )
     });
     None
+}
+
+/// The module specifier form of `entry`, a package.json entry of the
+/// frontend resolver.
+fn frontend_package_json_entry(
+    entry: &crate::frontend::packagejson::InfoCacheEntry,
+) -> Arc<InfoCacheEntry> {
+    let contents = entry.contents.as_ref().map(|package_json| {
+        let key = tspath::to_path(
+            &tspath::combine_paths(&entry.package_directory, &["package.json"]),
+            crate::program::get_current_directory(),
+            crate::program::use_case_sensitive_file_names(),
+        );
+        crate::program::with_host_fs_cache(|cache| cache.frontend_package_json(key, package_json))
+    });
+    Arc::new(InfoCacheEntry {
+        package_directory: entry.package_directory.clone(),
+        directory_exists: entry.directory_exists,
+        contents,
+    })
 }
 
 // Go: module/resolver.go:485 getPackageScopeForPath
@@ -320,7 +369,16 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
     }
 
     // Go: compiler/program.go:148 GetNearestAncestorDirectoryWithPackageJson
+    // PORT: on the loading thread, the frontend program asks its resolver,
+    // as Go does: its cache holds the package.json files of the program
+    // load, and it reads the program host's file system (in the language
+    // server, the snapshot with the open files). Another thread cannot read
+    // them, so it looks up the package.json files itself, on the OS file
+    // system (`get_package_json_info_for_directory`).
     fn get_nearest_ancestor_directory_with_package_json(&self, dirname: &str) -> String {
+        if let Some(frontend) = crate::program::loading_thread_frontend() {
+            return frontend.get_nearest_ancestor_directory_with_package_json(dirname);
+        }
         match get_package_scope_for_path(dirname) {
             Some(scoped) if scoped.exists() => scoped.package_directory.clone(),
             _ => String::new(),
@@ -328,7 +386,13 @@ impl ModuleSpecifierGenerationHost for ProgramHost {
     }
 
     // Go: compiler/program.go:157 GetPackageJsonInfo
+    // PORT: see `get_nearest_ancestor_directory_with_package_json`.
     fn get_package_json_info(&self, pkg_json_path: &str) -> Option<Arc<InfoCacheEntry>> {
+        if let Some(frontend) = crate::program::loading_thread_frontend() {
+            return frontend
+                .get_package_json_info(pkg_json_path)
+                .map(|entry| frontend_package_json_entry(&entry));
+        }
         let directory = tspath::get_directory_path(pkg_json_path);
         match get_package_scope_for_path(&directory) {
             Some(scoped) if scoped.exists() && scoped.package_directory == directory => {
@@ -415,5 +479,65 @@ mod tests {
         assert_eq!(with_separator, format!("{pkg}/"));
         assert_eq!(info, Some(pkg.clone()));
         assert_eq!(without_separator, pkg);
+    }
+
+    // pkgimp1 (editfuzz5 PKG): Go's program finds package.json files with
+    // its resolver (compiler/program.go:147-163), whose cache holds the
+    // reads of the program load and which reads the program host's file
+    // system: in the language server, the snapshot with the open files.
+    // The port read the OS file system, so an "imports" map removed in the
+    // editor still gave `#m/...` specifiers. Here the program load reads
+    // the package.json, which then changes on disk: the loading thread
+    // keeps the read of the load, as Go does. Another thread cannot read
+    // the frontend resolver and reads the OS file system.
+    #[test]
+    fn a_loading_thread_lookup_reads_the_package_json_of_the_program() {
+        let dir = std::env::temp_dir().join(format!(
+            "goport-package-json-program-read-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in [
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"module":"preserve","types":[]},"files":["src/a.ts"]}"#,
+            ),
+            (
+                "package.json",
+                r##"{"name":"imp","imports":{"#m/*":"./src/*.ts"}}"##,
+            ),
+            ("src/a.ts", "export const a = 1;\n"),
+        ] {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let dir = dir.to_string_lossy().replace('\\', "/");
+        let program = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        let _scope = crate::core::enter_program(Some(program));
+        std::fs::write(format!("{dir}/package.json"), r#"{"name":"imp"}"#).unwrap();
+        let package_json = format!("{dir}/package.json");
+        let has_imports = |entry: Option<Arc<InfoCacheEntry>>| {
+            entry
+                .and_then(|entry| entry.contents.clone())
+                .map(|contents| contents.fields.imports.is_present())
+        };
+        let loading = (
+            ProgramHost.get_nearest_ancestor_directory_with_package_json(&format!("{dir}/src")),
+            has_imports(ProgramHost.get_package_json_info(&package_json)),
+        );
+        let thread_package_json = package_json.clone();
+        let other = std::thread::spawn(move || {
+            crate::core::set_thread_program(Some(program));
+            has_imports(ProgramHost.get_package_json_info(&thread_package_json))
+        })
+        .join()
+        .unwrap();
+        drop(_scope);
+        crate::program::release_program(program);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loading, (dir.clone(), Some(true)));
+        assert_eq!(other, Some(false));
     }
 }
