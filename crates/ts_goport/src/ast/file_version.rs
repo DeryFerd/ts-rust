@@ -49,7 +49,18 @@
 //! read of its node shell reads its pooled block: the data of that node
 //! until another version takes the block, then that version's data. With
 //! debug assertions that read panics with the same message (the owner
-//! check, `ast::store::file_block`).
+//! check, `ast::store::file_block`). A release build checks the owner only
+//! in the binder field reads (`check_block_owner`), so there a stale
+//! header or child read gives wrong data and no panic. The check in every
+//! `file_block` read (one load, compare and branch) costs too much for a
+//! release build (watchfix1 item 5, instructions:u of stable builds):
+//! `goport -p --singleThreaded` query +7.9%, hono +7.9%, zod +7.1%, effect
+//! +10.2% (+6.7% to +9.7% on the default threads), and the editor long
+//! sessions query-core +9.6%, hono +4.5%, effect +9.3%. A correct reader
+//! never sees a reuse: every holder of a node holds its version, and a
+//! given-back block waits two program releases (`BlockPool`). The
+//! debug-assertion runs (the protected tests, the corpus, the editor and
+//! oracle runs) find a missed holder.
 //!
 //! Freeable rule (`free_file_versions`, `freeable_path`): only a parse of
 //! a path that a publish on this thread published before, in a language
@@ -64,7 +75,9 @@
 //! rule to its new parses (the compiler host opens the freeable parse scope
 //! for them, M3c). A parse that a parse worker made (prefetch) keeps its
 //! nodes in the leaked AST arena; its version still frees its store and
-//! `GoFile`. Watch mode parses ahead only in its first build.
+//! `GoFile`. Watch mode parses ahead in its first build and after a config
+//! change or an overflow; there a worker parse of a published path owns
+//! its nodes (`CompilerHost::freeable_worker_parses`, watchcfg1).
 
 use super::store::VersionStore;
 use crate::prelude::*;
