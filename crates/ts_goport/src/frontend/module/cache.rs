@@ -1782,6 +1782,71 @@ mod tests {
         assert_eq!(entries, expected);
     }
 
+    /// Go `InfoCache.Set` keeps the first entry of each package.json
+    /// (packagejson/cache.go:190), and Go's parse tasks and loader share
+    /// that one cache. The parse workers' shared cache keeps the first read
+    /// of each file (`store_package_json_read`). The loader's cache keeps the
+    /// entry that it has when it takes worker reads
+    /// (`adopt_worker_package_jsons`): its own earlier read, or the first
+    /// worker read that it took, in lookup order.
+    #[test]
+    fn package_json_reads_keep_the_first() {
+        let root = std::env::temp_dir().join(format!(
+            "ts_goport_package_json_first_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("b/package.json"), r#"{ "name": "b-loader" }"#).unwrap();
+        let dir = root.to_string_lossy().replace('\\', "/");
+        let read = |package: &str, name: &str| WorkerPackageJsonRead {
+            package_directory: format!("{dir}/{package}"),
+            directory_exists: true,
+            taken: std::sync::atomic::AtomicBool::new(false),
+            text: std::sync::Mutex::new(Some(format!(r#"{{ "name": "{name}" }}"#).into())),
+        };
+        let lookup = |read: Arc<WorkerPackageJsonRead>| PackageJsonLookup {
+            package_directory: read.package_directory.clone(),
+            directory_exists: true,
+            exists: true,
+            read: Some(read),
+        };
+
+        let shared = SharedResolutionCache::default();
+        let a = format!("{dir}/a/package.json");
+        let first = shared.store_package_json_read(&a, || read("a", "a-first"));
+        let second = shared.store_package_json_read(&a, || read("a", "a-second"));
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the workers keep the first read"
+        );
+
+        let loader = test_resolver(&dir, None);
+        let name = |package: &str| {
+            loader
+                .get_package_scope_for_path(&format!("{dir}/{package}"))
+                .and_then(|entry| entry.contents.clone())
+                .map(|contents| contents.fields.header_fields.name.get_value().0)
+        };
+        // The loader's own read of b comes before the adoption.
+        assert_eq!(name("b").as_deref(), Some("b-loader"));
+        std::fs::remove_dir_all(&root).unwrap();
+        loader.caches.adopt_worker_package_jsons(&[
+            lookup(first),
+            lookup(second),
+            lookup(Arc::new(read("b", "b-worker"))),
+            lookup(Arc::new(read("c", "c-first"))),
+            lookup(Arc::new(read("c", "c-second"))),
+        ]);
+        assert_eq!(
+            [name("a"), name("b"), name("c")],
+            [
+                Some("a-first".to_string()),
+                Some("b-loader".to_string()),
+                Some("c-first".to_string())
+            ]
+        );
+    }
+
     /// The loader's wait for a key in a worker's hands (`wait_or_take`): a
     /// free key is the loader's, an ended key needs no sleep, and a key
     /// that a worker holds past the spin makes the loader sleep until the
