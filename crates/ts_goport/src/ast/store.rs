@@ -6012,8 +6012,9 @@ impl FileStore {
     // PERF: factscol1b (cliperf1 rank 6). `FileStore::new` reserves for one
     // slot per 12 text bytes. A dense file (a 5 MB JS file of 1.09 bytes
     // per slot) doubled its columns 4 times, and each `realloc` moved them
-    // (801 MB of new buffers). Normal TypeScript (6 to 8 bytes per slot)
-    // grows once, by doubling, as before.
+    // (801 MB of new buffers). It now grows 4 times, twice. Normal
+    // TypeScript (6 to 8 bytes per slot) grows once, by doubling, as
+    // before.
     #[cold]
     #[inline(never)]
     fn reserve_slots_for_text(&mut self) {
@@ -6046,21 +6047,25 @@ impl FileStore {
     }
 }
 
-/// The most a growth of full slot columns multiplies their slots by
-/// (`slots_for_text`).
-// factscol1b round c: 4, not 16. The columns first fill at text/12 slots,
-// so 16 times that is always more than the cap of one slot per text byte.
-// At 4 a file of dense code and a sparse tail reserves at most text/3
-// slots at its first growth; the densest file (1.09 bytes per slot) grows
-// twice, not once.
+/// The factor of a growth of full slot columns whose text at the density
+/// so far holds more than double their slots (`slots_for_text`): a power
+/// of two, so the columns stay on the ladder of doublings from the
+/// `FileStore::new` capacity that `Vec::push` climbs, and skip one step.
+// factscol1b round c. Round b grew to the estimate, at most 16 times and
+// one slot per text byte. 16 never applied (the first fill is at text/12
+// slots). Off the ladder, a growth can end above the capacity that
+// doublings reach: a 25 MB file of 1.3 slots per byte grew to the text
+// (25 M slots) and then doubled to 50 M, where R172 ends at 33 M, and the
+// wasm32 build ran out of its 4 GiB. On the ladder, a growth never ends
+// above the R172 capacity unless the density falls later in the text,
+// and then at most one step above it.
 const SLOT_GROWTH_LIMIT: usize = 4;
 
 /// The slots that full slot columns `records` of a store of a text of
-/// `text` bytes grow to (`FileStore::reserve_slots_for_text`): the slots
-/// so far at the node density of the text parsed so far, plus 1/8, and at
-/// least double the slots so far. Never more than one slot per text byte,
-/// nor `SLOT_GROWTH_LIMIT` times the slots so far, unless that is less
-/// than double.
+/// `text` bytes grow to (`FileStore::reserve_slots_for_text`):
+/// `SLOT_GROWTH_LIMIT` times the slots so far when the text at the node
+/// density of the text parsed so far holds more than double, else double,
+/// as a `Vec` grows.
 ///
 /// The parsed length is the largest end of all node slots, which only
 /// grows with the parse. The ends of the last slots can be far before it:
@@ -6073,30 +6078,29 @@ fn slots_for_text(records: &[NodeRecord], text: usize) -> usize {
     let slots = records.len();
     let doubled = slots.saturating_mul(2);
     // PERF: factscol1b round c. The ends of the last slots give a parsed
-    // length at most the real one. When its estimate is a doubling, the
-    // full pass over the records gives one too (its estimate is `slots`
-    // or at most the same). A TypeScript file (6 to 8 bytes per slot)
-    // stops here.
+    // length at most the real one. When the density so far from it holds
+    // at most double, the full pass over the records gives a doubling too
+    // (`slots_at_density` is `slots` or at most the same). A TypeScript
+    // file (6 to 8 bytes per slot) stops here.
     let tail = parsed_length(&records[slots.saturating_sub(LOOK_BACK)..]);
     if tail > 0 && slots_at_density(slots, text, tail) <= doubled {
         return doubled;
     }
-    slots_at_density(slots, text, parsed_length(records)).max(doubled)
+    if slots_at_density(slots, text, parsed_length(records)) <= doubled {
+        return doubled;
+    }
+    slots.saturating_mul(SLOT_GROWTH_LIMIT)
 }
 
 /// The slots of a text of `text` bytes at the density of `slots` slots in
-/// its first `parsed` bytes, plus 1/8 so a file a bit denser at its end
-/// does not grow again near the end, at most one slot per text byte and
-/// `SLOT_GROWTH_LIMIT` times `slots`. `slots` when `parsed` is 0 or the
-/// whole text (`slots_for_text`).
+/// its first `parsed` bytes, at most one slot per text byte. `slots` when
+/// `parsed` is 0 or the whole text (`slots_for_text`).
 fn slots_at_density(slots: usize, text: usize, parsed: usize) -> usize {
     if parsed == 0 || parsed >= text {
         return slots;
     }
-    let limit = text.min(slots.saturating_mul(SLOT_GROWTH_LIMIT));
     let estimate = (slots as u64).saturating_mul(text as u64) / parsed as u64;
-    let wanted = estimate.saturating_add(estimate / 8);
-    usize::try_from(wanted).map_or(limit, |wanted| wanted.min(limit))
+    usize::try_from(estimate).map_or(text, |estimate| estimate.min(text))
 }
 
 /// The largest end of the node slots of `records`, or 0
@@ -7237,32 +7241,22 @@ mod tests {
     }
 
     // factscol1b (cliperf1 rank 6): `FileStore::new` reserves for one slot
-    // per 12 text bytes. When the columns of a dense file fill, they get
-    // room for the slots of the whole text at the density so far, not one
-    // doubling (a 5 MB JS file of about 1 byte per slot doubled 4 times).
-    // Round c: never more than `SLOT_GROWTH_LIMIT` times the slots so far.
+    // per 12 text bytes. When the columns of a dense file fill, they skip a
+    // doubling: they grow 4 times when the text at the density so far
+    // holds more than double the slots, not one doubling at a time (a 5 MB
+    // JS file of about 1 byte per slot doubled 4 times).
     #[test]
-    fn full_slot_columns_reserve_for_the_whole_text() {
-        // 1 slot per 4 bytes: room for the whole text in one growth.
-        let mut s = store_with_full_slot_columns(1200, 4);
-        let slots = s.records.len();
-        assert!(slots < 200, "{slots} slots reserved for 1,200 bytes");
-        s.reserve_slots_for_text();
-        for cap in slot_column_capacities(&s) {
-            assert!(
-                (300..=400).contains(&cap),
-                "{cap} slots after the first growth"
-            );
-        }
-        // 1 slot per byte: `SLOT_GROWTH_LIMIT` times the slots so far.
-        let mut s = store_with_full_slot_columns(1200, 1);
-        let slots = s.records.len();
-        s.reserve_slots_for_text();
-        for cap in slot_column_capacities(&s) {
+    fn full_slot_columns_of_a_dense_text_grow_by_four() {
+        for (bytes_per_slot, factor) in [(1, 4), (4, 4), (8, 2)] {
+            let mut s = store_with_full_slot_columns(1200, bytes_per_slot);
+            let slots = s.records.len();
+            assert!(slots < 200, "{slots} slots reserved for 1,200 bytes");
+            s.reserve_slots_for_text();
+            let want = [factor * slots; 5];
             assert_eq!(
-                cap,
-                slots * SLOT_GROWTH_LIMIT,
-                "slots after the first growth"
+                slot_column_capacities(&s),
+                want,
+                "{bytes_per_slot} bytes per slot"
             );
         }
     }
@@ -7280,11 +7274,10 @@ mod tests {
 
     /// factscol1b round b: parses JS file `text` and calls `check(kinds,
     /// wanted)` with the kinds of the first `k` slots and their
-    /// `slots_for_text` estimate, at each `k` at which the slot columns of
+    /// `slots_for_text` growth, at each `k` at which the slot columns of
     /// the parse can fill: from the capacity of `FileStore::new` to the
-    /// slot count of the parse. Each estimate is a doubling (`2 * k`), or
-    /// more but at most one slot per text byte and `SLOT_GROWTH_LIMIT`
-    /// times `k`.
+    /// slot count of the parse. Each growth is the one of the full pass
+    /// over the `k` records: a doubling, or `SLOT_GROWTH_LIMIT` times `k`.
     fn check_slot_reserves(name: &str, text: String, mut check: impl FnMut(&[SyntaxKind], usize)) {
         let text: &'static str = text.leak();
         use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
@@ -7302,11 +7295,12 @@ mod tests {
                 // Round c: the end of the last 64 slots gives the result of
                 // the full pass, or skips it.
                 let parsed = parsed_length(&s.records[..k]);
-                let full = slots_at_density(k, text.len(), parsed).max(2 * k);
+                let full = if slots_at_density(k, text.len(), parsed) <= 2 * k {
+                    2 * k
+                } else {
+                    k * SLOT_GROWTH_LIMIT
+                };
                 assert_eq!(wanted, full, "{name}: {k} slots");
-                let bound = (2 * k).max(text.len().min(k * SLOT_GROWTH_LIMIT));
-                assert!(wanted >= 2 * k, "{name}: {wanted} slots at {k}");
-                assert!(wanted <= bound, "{name}: {wanted} slots at {k}");
                 check(&s.kinds[..k], wanted);
             }
         });
