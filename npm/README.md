@@ -95,10 +95,11 @@ scripts/goport/npm-test.sh --name tsc-rs <out>/pkg <out>/test
 
 npm trusts the workflow file `release.yml` of `pingdotgg/ts-rust`, in the GitHub environment
 `npm`, to publish each of the 3 packages (OIDC, no token). Set it up once with
-`npm/trust-setup.sh`, logged in to npm with 2FA and npm 11.15.0 or later. It publishes a 0.0.1
-placeholder for a package that is not on npm yet, because npm can only trust a workflow for a
-package that exists. npm drops a new trust that publishes nothing in 2 days, so run it shortly
-before the first tag. Add required reviewers to the `npm` environment (repo settings,
+`npm/trust-setup.sh`, logged in to npm with 2FA and npm 11.15.0 or later. It publishes a
+`0.0.0-placeholder` version of a package that is not on npm yet, because npm can only trust a
+workflow for a package that exists. The workflow refuses `0.0.x` tags, so a release never
+collides with a placeholder. npm drops a new trust that publishes nothing in 2 days, so run it
+shortly before the first tag. Add required reviewers to the `npm` environment (repo settings,
 Environments) to approve each publish by hand.
 
 While the repo is private, npm publishes with no provenance. From a public repo it adds

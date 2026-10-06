@@ -52,6 +52,8 @@ jobs:
           if [[ $GITHUB_REF_TYPE == tag ]]; then
             v=${GITHUB_REF_NAME#v}
             [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]] || { echo "::error::tag $GITHUB_REF_NAME is not v<semver>"; exit 1; }
+            # 0.0.x are the npm placeholders (npm/trust-setup.sh); the publish would skip them.
+            [[ $v != 0.0.* ]] || { echo "::error::0.0.x versions are the npm placeholders"; exit 1; }
             echo "release=true" >> "$GITHUB_OUTPUT"
           else
             v=0.0.0-ci.$GITHUB_RUN_NUMBER
