@@ -1,3 +1,4 @@
+use crate::gostd::debug::kind_string;
 use crate::prelude::*;
 
 // Port of printer/printer.go lines 3690 to 4691: declarations, module
@@ -311,7 +312,7 @@ impl Printer {
             SyntaxKind::Identifier => self.emit_identifier_reference(node),
             SyntaxKind::QualifiedName => self.emit_qualified_name(node),
             SyntaxKind::ExternalModuleReference => self.emit_external_module_reference(node),
-            kind => panic!("unhandled ModuleReference: {kind:?}"),
+            kind => panic!("unhandled ModuleReference: {}", kind_string(kind)),
         }
     }
 
@@ -408,7 +409,7 @@ impl Printer {
         match node.kind() {
             SyntaxKind::NamespaceImport => self.emit_namespace_import(node),
             SyntaxKind::NamedImports => self.emit_named_imports(node),
-            kind => panic!("unhandled NamedImportBindings: {kind:?}"),
+            kind => panic!("unhandled NamedImportBindings: {}", kind_string(kind)),
         }
     }
 
@@ -609,7 +610,7 @@ impl Printer {
         match node.kind() {
             SyntaxKind::NamespaceExport => self.emit_namespace_export(node),
             SyntaxKind::NamedExports => self.emit_named_exports(node),
-            kind => panic!("unhandled NamedExportBindings: {kind:?}"),
+            kind => panic!("unhandled NamedExportBindings: {}", kind_string(kind)),
         }
     }
 
@@ -713,7 +714,7 @@ impl Printer {
             SyntaxKind::ExportAssignment => self.emit_export_assignment(node),
             SyntaxKind::ExportDeclaration => self.emit_export_declaration(node),
 
-            kind => panic!("unhandled statement: {kind:?}"),
+            kind => panic!("unhandled statement: {}", kind_string(kind)),
         }
     }
 }
@@ -866,7 +867,7 @@ impl Printer {
         match node.kind() {
             SyntaxKind::JsxAttribute => self.emit_jsx_attribute(node),
             SyntaxKind::JsxSpreadAttribute => self.emit_jsx_spread_attribute(node),
-            kind => panic!("unhandled JsxAttributeLike: {kind:?}"),
+            kind => panic!("unhandled JsxAttributeLike: {}", kind_string(kind)),
         }
     }
 
@@ -922,7 +923,7 @@ impl Printer {
             SyntaxKind::JsxElement => self.emit_jsx_element(node),
             SyntaxKind::JsxSelfClosingElement => self.emit_jsx_self_closing_element(node),
             SyntaxKind::JsxFragment => self.emit_jsx_fragment(node),
-            kind => panic!("unhandled JsxChild: {kind:?}"),
+            kind => panic!("unhandled JsxChild: {}", kind_string(kind)),
         }
     }
 
@@ -933,7 +934,7 @@ impl Printer {
             SyntaxKind::ThisKeyword => self.emit_keyword_expression(node),
             SyntaxKind::JsxNamespacedName => self.emit_jsx_namespaced_name(node),
             SyntaxKind::PropertyAccessExpression => self.emit_property_access_expression(node),
-            kind => panic!("unhandled JsxTagName: {kind:?}"),
+            kind => panic!("unhandled JsxTagName: {}", kind_string(kind)),
         }
     }
 
@@ -942,7 +943,7 @@ impl Printer {
         match node.kind() {
             SyntaxKind::Identifier => self.emit_identifier_name(node),
             SyntaxKind::JsxNamespacedName => self.emit_jsx_namespaced_name(node),
-            kind => panic!("unhandled JsxAttributeName: {kind:?}"),
+            kind => panic!("unhandled JsxAttributeName: {}", kind_string(kind)),
         }
     }
 
@@ -1030,7 +1031,7 @@ impl Printer {
         match node.kind() {
             SyntaxKind::CaseClause => self.emit_case_clause(node),
             SyntaxKind::DefaultClause => self.emit_default_clause(node),
-            kind => panic!("unhandled CaseOrDefaultClause: {kind:?}"),
+            kind => panic!("unhandled CaseOrDefaultClause: {}", kind_string(kind)),
         }
     }
 
@@ -1058,7 +1059,7 @@ impl Printer {
                 self.emit_expression_with_type_arguments(node)
             }
             SyntaxKind::TypeReference => self.emit_type_reference(node),
-            kind => panic!("unhandled HeritageClauseElement: {kind:?}"),
+            kind => panic!("unhandled HeritageClauseElement: {}", kind_string(kind)),
         }
     }
 
@@ -1342,5 +1343,28 @@ impl Printer {
             ));
             self.write_line();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::AssertUnwindSafe;
+
+    // Go prints `Kind.String()` in an unhandled-kind panic
+    // (printer/printer.go:4233 `panic(fmt.Sprintf("unhandled statement: %v", node.Kind))`).
+    // The API's printNode answers this text for a reparsed `@import` (apifuzz2 N1).
+    #[test]
+    fn unhandled_statement_panic_names_the_go_kind() {
+        let f = NodeFactory::new();
+        let specifier = f.new_string_literal("y", TokenFlags::NONE);
+        let decl = f.new_js_import_declaration(ModifierList::NIL, Node::NIL, specifier, Node::NIL);
+        let mut printer = new_printer(PrinterOptions::default(), PrintHandlers::default(), None);
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| printer.emit(decl, Node::NIL)))
+            .expect_err("no panic");
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some("unhandled statement: KindJSImportDeclaration")
+        );
     }
 }
