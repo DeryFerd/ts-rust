@@ -18,5 +18,6 @@ mod tsc_contentmapper;
 mod tscwatch;
 mod watch_build_downstream;
 mod watch_config_parse_options;
+mod watch_dedup_package;
 mod watch_specifier_package_json;
 mod watcher_race;

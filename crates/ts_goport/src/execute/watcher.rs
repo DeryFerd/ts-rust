@@ -61,6 +61,34 @@ pub struct WatchCompilerHost {
     pub config_parses: RefCell<FxHashMap<Path, Rc<CachedSourceFile>>>,
 }
 
+/// PORT: not in Go. Records a new parse that a watch host keeps for later
+/// builds (`WatchCompilerHost::get_source_file`, the build host's
+/// `watch_source_file`). A kept parse can be left out of the program that
+/// loaded it and be a program file of a later one: Go keeps one copy of a
+/// package that two `node_modules` directories hold with the same name and
+/// version (filesparser.go:448, the other path maps to the kept file at
+/// :473), and its watcher keeps the parse of the other copy, because that
+/// path is in `FilesByPath` (watcher.go:516). When the versions differ
+/// later, the next program takes that parse. So the publish of this
+/// program gives the store its complete Go file
+/// (`program::note_parsed_source_file`), where it gave it the name only
+/// and the next build stopped with exit 70 ("published as a store that is
+/// not a source file"). A new parse of a path that this thread published
+/// before gets its `FileVersion` here, as `program::mark_freeable_parses`
+/// gives one to the files of the program, so it is freed with its last
+/// holder, also when no program takes it. Without one, each edit of the
+/// left-out copy published a static store (9 MiB for each edit of a
+/// 335 KB `.d.ts` copy).
+pub(crate) fn note_kept_parse(file: &Rc<ParsedSourceFile>) {
+    if crate::ast::is_published(file.store) {
+        return;
+    }
+    if file.version.get().is_none() && crate::ast::freeable_path(&file.path().0) {
+        let _ = file.version.set(crate::ast::FileVersion::new(file.store));
+    }
+    crate::program::note_parsed_source_file(file);
+}
+
 impl WatchCompilerHost {
     /// PORT: not in Go. The parse that the source file cache had before a
     /// config change, when a parse now gives the same file: the same text
@@ -126,6 +154,7 @@ impl CompilerHost for WatchCompilerHost {
             .or_else(|| self.compiler_host.get_source_file(opts));
         if let Some(file) = &file {
             if let Some(info) = &info {
+                note_kept_parse(file);
                 self.cache.borrow_mut().insert(
                     opts.path.clone(),
                     Rc::new(CachedSourceFile {

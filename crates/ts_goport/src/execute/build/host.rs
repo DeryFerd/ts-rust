@@ -330,12 +330,8 @@ impl BuildHost {
     /// of a cycle ran on one thread (query-persist-client-core rebuilds took
     /// 2.7 times as long). A parse of the same text with the same options is
     /// the same file, so the output does not change. A bundled lib never
-    /// changes. `shared` is a `.d.ts` or `.json` file (see `get_source_file`).
-    fn watch_source_file(
-        &self,
-        opts: &SourceFileParseOptions,
-        shared: bool,
-    ) -> Option<Rc<ParsedSourceFile>> {
+    /// changes.
+    fn watch_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
         let key = SourceFileCacheKey(opts.clone());
         let fixed = crate::frontend::bundled::is_bundled(&opts.file_name);
         // The OS file system, not the one this cycle caches: a build of this
@@ -373,11 +369,11 @@ impl BuildHost {
             return Some(file);
         }
         let file = self.host.get_source_file(opts);
-        if shared {
-            // See the note in `get_source_file`.
-            if let Some(file) = &file {
-                crate::program::note_parsed_source_file(file);
-            }
+        // Each parse here can be kept and be a program file of a later
+        // build, also a `.ts` file that one program leaves out (see
+        // `note_kept_parse`, and the note in `get_source_file`).
+        if let Some(file) = &file {
+            crate::execute::watcher::note_kept_parse(file);
         }
         if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
             match &file {
@@ -659,12 +655,12 @@ impl CompilerHost for BuildHost {
 
     // Go: build/host.go:54 (*host).GetSourceFile
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
-        let shared = is_declaration_file_name(&opts.file_name)
-            || file_extension_is(&opts.file_name, EXTENSION_JSON);
         if self.watch_sources.borrow().is_some() {
-            return self.watch_source_file(opts, shared);
+            return self.watch_source_file(opts);
         }
-        if shared {
+        if is_declaration_file_name(&opts.file_name)
+            || file_extension_is(&opts.file_name, EXTENSION_JSON)
+        {
             // Cache dts and json files as they will be reused
             // PORT: a parse that the cache keeps can be left out of one
             // program (a deduplicated package, or a file that only such a
