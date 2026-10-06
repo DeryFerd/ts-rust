@@ -206,6 +206,50 @@ fn get_external_module_indicator(
     Node::NIL
 }
 
+/// PORT: not in Go (perf). `file` as a parse of its text with `opts` gives
+/// it, so a watch build can keep a parse after a config change: `file`
+/// itself for its own options, a copy with `opts` when the two differ only
+/// in module indicator options that its parse did not read, else `None`.
+/// Go parses the file again. A parse reads its module indicator options
+/// only in `get_external_module_indicator`, and only when the file has no
+/// import, export or `import.meta` and is not a declaration or JSON file:
+/// the parse worker rule (`read_module_indicator_options`). The copy has
+/// the same nodes and the new options, which a later `UpdateProgram` and
+/// the watch fast path read (Go `oldFile.ParseOptions()`).
+#[must_use]
+pub fn parse_with_options(
+    file: &Rc<ParsedSourceFile>,
+    opts: &SourceFileParseOptions,
+) -> Option<Rc<ParsedSourceFile>> {
+    let own = file.parse_options();
+    if own == opts {
+        return Some(file.clone());
+    }
+    if own.file_name != opts.file_name
+        || own.path != opts.path
+        || reads_module_indicator_options(file)
+        || !file.content_mapper().is_empty()
+    {
+        return None;
+    }
+    Some(Rc::new(ParsedSourceFile {
+        parse_options: opts.clone(),
+        ..(**file).clone()
+    }))
+}
+
+/// PORT: not in Go (see `parse_with_options`). True when the parse of
+/// `file` read its module indicator options (`get_external_module_indicator`):
+/// a file that is not JSON or a declaration file and has no import, export
+/// or `import.meta`.
+#[must_use]
+// PERF: the statement walk goes last, so a lib file needs none.
+pub fn reads_module_indicator_options(file: &ParsedSourceFile) -> bool {
+    file.script_kind != ScriptKind::JSON
+        && !file.is_declaration_file
+        && is_file_probably_external_module(file.root).is_nil()
+}
+
 // Go: ast/parseoptions.go:86 isFileProbablyExternalModule
 // PORT: takes the SourceFile node.
 fn is_file_probably_external_module(source_file: Node) -> Node {

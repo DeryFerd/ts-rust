@@ -6,6 +6,7 @@ use crate::api::callbackfs::{CallbackFS, new_callback_fs};
 use crate::api::protocol_msgpack::new_message_pack_protocol;
 use crate::contentmapper;
 use crate::frontend::bundled;
+use crate::frontend::json_ext::{AnyValue, JsonValue};
 use crate::frontend::vfs::{self, Fs};
 use crate::gostd::{Context, GoError, errors};
 use crate::ipc::{
@@ -14,6 +15,7 @@ use crate::ipc::{
 };
 use crate::lsp::lsproto;
 use crate::project;
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -69,6 +71,56 @@ pub fn new_stdio_server(options: StdioServerOptions) -> StdioServer {
     }
 
     StdioServer { options }
+}
+
+/// Not in Go: the handler of the stdio connection. It runs the frees that
+/// its messages leave (`gostd::local::drop_later`: released programs, the
+/// pin release of a released source file lease) when a message that the
+/// connection read at the top level ends. A request that a client makes
+/// while it answers a callback (ts#64299) runs inside the request that made
+/// the callback, so its frees wait for the end of that request. Go's GC
+/// frees in the background.
+struct FreeAfterMessage {
+    /// The session.
+    inner: Rc<dyn Handler>,
+    /// The messages that run now, the outer one first.
+    depth: Cell<u32>,
+}
+
+impl FreeAfterMessage {
+    /// Counts one more running message until the guard drops, also on a
+    /// panic. The guard of the top-level message runs the frees.
+    fn enter(&self) -> Defer<impl FnMut() + '_> {
+        self.depth.set(self.depth.get() + 1);
+        Defer(move || {
+            self.depth.set(self.depth.get() - 1);
+            if self.depth.get() == 0 {
+                crate::gostd::local::drop_garbage(|| false);
+            }
+        })
+    }
+}
+
+impl Handler for FreeAfterMessage {
+    fn handle_request(
+        &self,
+        ctx: &Context,
+        method: &str,
+        params: JsonValue,
+    ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+        let _message = self.enter();
+        self.inner.handle_request(ctx, method, params)
+    }
+
+    fn handle_notification(
+        &self,
+        ctx: &Context,
+        method: &str,
+        params: JsonValue,
+    ) -> Result<(), GoError> {
+        let _message = self.enter();
+        self.inner.handle_notification(ctx, method, params)
+    }
 }
 
 // Go `defer f()`: runs `f` when the guard leaves scope, on every return
@@ -170,7 +222,12 @@ impl StdioServer {
         };
 
         // Create protocol and connection based on async mode
-        let handler: Rc<dyn Handler> = session.clone();
+        // PORT: the frees of a message wait until it ends (`FreeAfterMessage`).
+        crate::gostd::local::keep_garbage();
+        let handler: Rc<dyn Handler> = Rc::new(FreeAfterMessage {
+            inner: session.clone(),
+            depth: Cell::new(0),
+        });
         let conn: Rc<dyn Conn>;
         if self.options.async_ {
             let protocol = new_jsonrpc_protocol(rwc.clone());
@@ -209,6 +266,61 @@ fn server_run_error(ctx: &Context, err: Result<(), GoError>) -> Result<(), GoErr
 mod server_tests {
     use super::*;
     use crate::gostd::context;
+
+    // PORT: no Go counterpart. A free that a nested message leaves (a
+    // request that a client makes while it answers a callback, ts#64299)
+    // waits for the end of the top-level message.
+    #[test]
+    fn frees_wait_for_the_end_of_the_top_level_message() {
+        struct Answers;
+        impl Handler for Answers {
+            fn handle_request(
+                &self,
+                _ctx: &Context,
+                _method: &str,
+                _params: JsonValue,
+            ) -> Result<Option<Box<dyn AnyValue>>, GoError> {
+                Ok(None)
+            }
+            fn handle_notification(
+                &self,
+                _ctx: &Context,
+                _method: &str,
+                _params: JsonValue,
+            ) -> Result<(), GoError> {
+                Ok(())
+            }
+        }
+        struct Freed(Rc<Cell<bool>>);
+        impl Drop for Freed {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        crate::gostd::local::keep_garbage();
+        let handler = FreeAfterMessage {
+            inner: Rc::new(Answers),
+            depth: Cell::new(0),
+        };
+        let freed = Rc::new(Cell::new(false));
+        {
+            let _outer = handler.enter();
+            {
+                let _nested = handler.enter();
+                crate::gostd::local::drop_later(Box::new(Freed(freed.clone())));
+            }
+            assert!(!freed.get(), "a nested message keeps its frees");
+        }
+        assert!(freed.get(), "the top-level message runs them at its end");
+        let freed = Rc::new(Cell::new(false));
+        crate::gostd::local::drop_later(Box::new(Freed(freed.clone())));
+        assert!(
+            handler
+                .handle_notification(&context::background(), "x", JsonValue::default())
+                .is_ok()
+        );
+        assert!(freed.get(), "a message runs the frees that wait");
+    }
 
     // Go: api/server_test.go:14 TestServerRunError/EOF
     #[test]

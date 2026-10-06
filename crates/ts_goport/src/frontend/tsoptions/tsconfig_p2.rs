@@ -5,7 +5,8 @@ use crate::frontend::prelude::*;
 // PORT: Go `any` values are `CompilerOptionsValue`. Go
 // `*collections.OrderedMap[string, any]` is `IndexMap<String,
 // CompilerOptionsValue>` (the `Map` variant). Go
-// `collections.OrderedMap[string, string]` is `IndexMap<String, String>`.
+// `collections.OrderedMap[string, string]` is `IndexMap<String, String>`
+// (`FxIndexMap` in `get_file_names_from_config_specs`).
 // Go `*ast.SourceFile` is the source file `Node` (`Node::NIL` is Go nil).
 // Go `[][]string` extension groups are `Vec<Vec<String>>`. Go `int` is
 // `i32`.
@@ -1758,7 +1759,7 @@ fn has_file_with_higher_priority_extension(
 // PORT: `priority` has the file's extension group (`ExtensionPriority::start`).
 fn remove_wildcard_files_with_lower_priority_extension(
     file: &str,
-    wildcard_files: &mut IndexMap<String, String>,
+    wildcard_files: &mut crate::core::FxIndexMap<String, String>,
     priority: &mut ExtensionPriority<'_>,
     use_case_sensitive_file_names: bool,
 ) {
@@ -1804,15 +1805,17 @@ pub(crate) fn get_file_names_from_config_specs(
     // Literal file names (provided via the "files" array in tsconfig.json) are stored in a
     // file map with a possibly case insensitive key. We use this map later when when including
     // wildcard paths.
-    let mut literal_file_map: IndexMap<String, String> = IndexMap::new();
+    // PERF (cfgwalk1): the maps keep the insertion order (Go
+    // `collections.OrderedMap`), so their hasher does not change the result.
+    let mut literal_file_map: crate::core::FxIndexMap<String, String> = Default::default();
     // Wildcard paths (provided via the "includes" array in tsconfig.json) are stored in a
     // file map with a possibly case insensitive key. We use this map to store paths matched
     // via wildcard, and to handle extension priority.
-    let mut wildcard_file_map: IndexMap<String, String> = IndexMap::new();
+    let mut wildcard_file_map: crate::core::FxIndexMap<String, String> = Default::default();
     // Wildcard paths of json files (provided via the "includes" array in tsconfig.json) are stored in a
     // file map with a possibly case insensitive key. We use this map to store paths matched
     // via wildcard of *.json kind
-    let mut wild_card_json_file_map: IndexMap<String, String> = IndexMap::new();
+    let mut wild_card_json_file_map: crate::core::FxIndexMap<String, String> = Default::default();
     let validated_files_spec = &config_file_specs.validated_files_spec;
     let validated_include_specs = &config_file_specs.validated_include_specs;
     let validated_exclude_specs = &config_file_specs.validated_exclude_specs;

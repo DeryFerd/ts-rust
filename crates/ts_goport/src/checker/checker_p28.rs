@@ -1268,10 +1268,21 @@ impl Checker {
         if origin.is_nil() && includes.intersects(TypeFlags::UNION) {
             let named_unions = self.add_named_unions(Vec::new(), types);
             let mut reduced_types: Vec<TypeId> = Vec::new();
+            // Go: checker/checker.go:26175 `containsType(u.Types(), t)` for
+            // each `t` and named union `u`, until one contains `t`.
+            // PERF: unionsort1. The keys of each named union's types are read
+            // once, when it is first searched, and the key of each `t` once.
+            // The keyed searches make Go's comparisons (`search_keyed_types`).
+            // Before, these searches made most of the union comparisons.
+            let mut named_keys: Vec<Vec<(u128, TypeId)>> = vec![Vec::new(); named_unions.len()];
             for &t in &type_set {
+                let key = self.union_sort_key(t);
                 let mut in_named = false;
-                for &u in &named_unions {
-                    if self.contains_type(self.ty(u).types(), t) {
+                for (i, &u) in named_unions.iter().enumerate() {
+                    if named_keys[i].is_empty() {
+                        named_keys[i] = self.union_sort_keys(self.ty(u).types());
+                    }
+                    if self.search_keyed_types(&named_keys[i], key, t).1 {
                         in_named = true;
                         break;
                     }
@@ -1410,8 +1421,8 @@ impl Checker {
         }
         if types.len() >= 2 {
             // Sort and deduplicate types
-            // Go: checker/checker.go:25933 slices.SortStableFunc(types, CompareTypes)
-            crate::gostd::slices::sort_stable_func(&mut types, |&a, &b| self.compare_types(a, b));
+            // Go: checker/checker.go:26275 slices.SortStableFunc(types, CompareTypes)
+            self.sort_union_types(&mut types);
             types.dedup();
         }
         (types, includes)
@@ -1571,9 +1582,8 @@ impl Checker {
                     }
                 }
                 // Go `insertType(types, typeVariable)`, in place.
-                if let Err(index) = types
-                    .binary_search_by(|&probe| self.compare_types(probe, type_variable).cmp(&0))
-                {
+                let (index, found) = self.search_union_types(types, type_variable);
+                if !found {
                     types.insert(index, type_variable);
                 }
             }

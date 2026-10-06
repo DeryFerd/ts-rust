@@ -2,6 +2,29 @@ use crate::prelude::*;
 
 use crate::diagnostics::Message;
 
+/// The flags of the arms of Go `getTypeFactsWorker` up to its intersection
+/// arm. A type takes that arm when these flags give `INTERSECTION`.
+const INTERSECTION_ARM: TypeFlags = TypeFlags::STRING
+    .union(TypeFlags::STRING_MAPPING)
+    .union(TypeFlags::STRING_LITERAL)
+    .union(TypeFlags::TEMPLATE_LITERAL)
+    .union(TypeFlags::NUMBER)
+    .union(TypeFlags::ENUM)
+    .union(TypeFlags::NUMBER_LITERAL)
+    .union(TypeFlags::BIG_INT)
+    .union(TypeFlags::BIG_INT_LITERAL)
+    .union(TypeFlags::BOOLEAN)
+    .union(TypeFlags::BOOLEAN_LIKE)
+    .union(TypeFlags::OBJECT)
+    .union(TypeFlags::VOID)
+    .union(TypeFlags::UNDEFINED)
+    .union(TypeFlags::NULL)
+    .union(TypeFlags::ES_SYMBOL_LIKE)
+    .union(TypeFlags::NON_PRIMITIVE)
+    .union(TypeFlags::NEVER)
+    .union(TypeFlags::UNION)
+    .union(TypeFlags::INTERSECTION);
+
 impl Checker {
     // Go: checker/checker.go:31339 instantiateInstantiableTypes
     pub fn instantiate_instantiable_types(&mut self, t: TypeId, mapper: MapperId) -> TypeId {
@@ -201,6 +224,12 @@ impl Checker {
                 t = self.unknown_type;
             }
             flags = self.ty(t).flags;
+            // PERF: chkfacts1. An intersection (the base constraint of a
+            // plain intersection is the intersection itself) goes to its arm
+            // at once when it has none of the flags of an earlier arm.
+            if flags & INTERSECTION_ARM == TypeFlags::INTERSECTION {
+                return self.get_intersection_type_facts(t, caller_only_needs);
+            }
         }
         match self.type_facts_of_flags(t, flags, caller_only_needs) {
             Some(facts) => facts,
@@ -347,8 +376,17 @@ impl Checker {
     ) -> TypeFacts {
         let strict = self.strict_null_checks;
         if flags.intersects(TypeFlags::OBJECT) {
-            if self.ty(t).object_flags.intersects(ObjectFlags::ANONYMOUS)
-                && self.is_empty_object_type(t)
+            let object_flags = self.ty(t).object_flags;
+            // PERF: chkfacts1. Go `isEmptyObjectType` of an object that is
+            // not a mapped type is its members and `isEmptyResolvedType`
+            // (`isGenericMappedType` is false), without the two calls.
+            if object_flags.intersects(ObjectFlags::ANONYMOUS)
+                && if object_flags.intersects(ObjectFlags::MAPPED) {
+                    self.is_empty_object_type(t)
+                } else {
+                    self.resolve_structured_type_members(t);
+                    self.is_empty_resolved_type(t)
+                }
             {
                 if strict {
                     return TypeFacts::EMPTY_OBJECT_STRICT_FACTS;
@@ -365,40 +403,124 @@ impl Checker {
             return TypeFacts::OBJECT_FACTS;
         }
         if flags.intersects(TypeFlags::UNION) {
-            // The list never changes after the type is made, so the loop
-            // keeps a handle (no copy of the elements).
-            let types = self.ty(t).as_union_or_intersection_type().types.clone();
-            let mut facts = TypeFacts::NONE;
-            for &m in types.iter() {
-                let member_flags = self.ty(m).flags;
-                facts = facts | self.constituent_type_facts(m, member_flags, caller_only_needs);
-            }
-            return facts;
+            // The list never changes after the type is made. PERF:
+            // chkfacts1. The loop reads it in place (`detach`), not through
+            // a handle copied on the stack.
+            let mut buf: SharedListBuf<TypeId> = Default::default();
+            let list = &self.ty(t).as_union_or_intersection_type().types;
+            let Some(types) = list.detach(&mut buf) else {
+                let types = list.clone();
+                return self.union_type_facts(&types, caller_only_needs);
+            };
+            return self.union_type_facts(types, caller_only_needs);
         }
         self.get_intersection_type_facts(t, caller_only_needs)
     }
 
+    /// The union arm of Go `getTypeFactsWorker` over the constituents
+    /// `types`.
+    #[inline(always)]
+    fn union_type_facts(&mut self, types: &[TypeId], caller_only_needs: TypeFacts) -> TypeFacts {
+        let mut facts = TypeFacts::NONE;
+        for &m in types {
+            let member_flags = self.ty(m).flags;
+            facts |= self.constituent_type_facts(m, member_flags, caller_only_needs);
+        }
+        facts
+    }
+
     // Go: checker/checker.go:31602 getIntersectionTypeFacts
+    // PERF: chkfacts1. Go walks the list twice: `maybeTypeOfKind(t,
+    // Primitive)`, then `getTypeFactsWorker` of each member. Here the first
+    // walk does the kind test and also takes the facts of each member that
+    // `type_facts_of_flags` gives: they read only the member and have no
+    // effects. A second walk, only when a member needs more (a constraint, an
+    // object whose facts the caller needs, a union), takes those members in
+    // Go's order, so their effects come in Go's order. `|` and `&` give the
+    // same facts in any order. The list is read in place (`detach`).
     pub fn get_intersection_type_facts(
         &mut self,
         t: TypeId,
         caller_only_needs: TypeFacts,
     ) -> TypeFacts {
+        let mut buf: SharedListBuf<TypeId> = Default::default();
+        let list = &self.ty(t).as_union_or_intersection_type().types;
+        let Some(types) = list.detach(&mut buf) else {
+            let types = list.clone();
+            return self.intersection_type_facts(&types, caller_only_needs);
+        };
+        self.intersection_type_facts(types, caller_only_needs)
+    }
+
+    /// `get_intersection_type_facts` over the constituents `types`.
+    #[inline(always)]
+    fn intersection_type_facts(
+        &mut self,
+        types: &[TypeId],
+        caller_only_needs: TypeFacts,
+    ) -> TypeFacts {
         // When an intersection contains a primitive type we ignore object type constituents as they are
         // presumably type tags. For example, in string & { __kind__: "name" } we ignore the object type.
-        let ignore_objects = self.maybe_type_of_kind(t, TypeFlags::PRIMITIVE);
+        let mut ignore_objects = false;
         // When computing the type facts of an intersection type, certain type facts are computed as `and`
         // and others are computed as `or`.
         let mut ored_facts = TypeFacts::NONE;
         let mut anded_facts = TypeFacts::ALL;
-        // PERF: unionfn1. A handle on the list, as in `type_facts_slow`.
-        let types = self.ty(t).as_union_or_intersection_type().types.clone();
-        for &m in types.iter() {
+        // The flags-only facts of object members, which count only when
+        // `ignore_objects` stays false.
+        let mut ored_object_facts = TypeFacts::NONE;
+        let mut anded_object_facts = TypeFacts::ALL;
+        let mut second_walk = false;
+        for &m in types {
             let member_flags = self.ty(m).flags;
-            if !(ignore_objects && member_flags.intersects(TypeFlags::OBJECT)) {
-                let f = self.constituent_type_facts(m, member_flags, caller_only_needs);
-                ored_facts = ored_facts | f;
-                anded_facts = anded_facts & f;
+            // Go `maybeTypeOfKind` of a member, as `maybe_type_of_kind`
+            // tests it.
+            if member_flags.intersects(TypeFlags::PRIMITIVE)
+                || (member_flags.intersects(TypeFlags::UNION_OR_INTERSECTION)
+                    && self.maybe_type_of_kind(m, TypeFlags::PRIMITIVE))
+            {
+                ignore_objects = true;
+            }
+            if member_flags.intersects(TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE) {
+                second_walk = true;
+                continue;
+            }
+            match self.type_facts_of_flags(m, member_flags, caller_only_needs) {
+                Some(f) if member_flags.intersects(TypeFlags::OBJECT) => {
+                    ored_object_facts |= f;
+                    anded_object_facts &= f;
+                }
+                Some(f) => {
+                    ored_facts |= f;
+                    anded_facts &= f;
+                }
+                None => second_walk = true,
+            }
+        }
+        if !ignore_objects {
+            ored_facts |= ored_object_facts;
+            anded_facts &= anded_object_facts;
+        }
+        if second_walk {
+            for &m in types {
+                let member_flags = self.ty(m).flags;
+                if ignore_objects && member_flags.intersects(TypeFlags::OBJECT) {
+                    continue;
+                }
+                let f =
+                    if member_flags.intersects(TypeFlags::INTERSECTION | TypeFlags::INSTANTIABLE) {
+                        self.get_type_facts_worker(m, caller_only_needs)
+                    } else if self
+                        .type_facts_of_flags(m, member_flags, caller_only_needs)
+                        .is_none()
+                    {
+                        self.type_facts_slow(m, member_flags, caller_only_needs)
+                    } else {
+                        // Taken in the first walk.
+                        continue;
+                    };
+                ored_facts |= f;
+                anded_facts &= f;
             }
         }
         (ored_facts & TypeFacts::OR_FACTS_MASK) | (anded_facts & TypeFacts::AND_FACTS_MASK)
@@ -1545,5 +1667,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Go `getIntersectionTypeFacts` (checker.go:31602) where chkfacts1's
+    /// first walk takes some members and its second walk the others: a
+    /// primitive after an object, a member that needs its constraint, and a
+    /// caller that needs no object facts.
+    #[test]
+    fn intersection_type_facts_match_go() {
+        type F = TypeFacts;
+        let aliases = [
+            r#"{ __kind: "name" } & string"#,
+            "<X extends string> = { a: 1 } & X",
+            "{ a: 1 } & { b: 1 }",
+        ];
+        for strict in [true, false] {
+            let (object, string) = if strict {
+                (F::OBJECT_STRICT_FACTS, F::STRING_STRICT_FACTS)
+            } else {
+                (F::OBJECT_FACTS, F::STRING_FACTS)
+            };
+            let both =
+                ((object | string) & F::OR_FACTS_MASK) | (object & string & F::AND_FACTS_MASK);
+            // Go's object arm gives none when the caller needs none of the
+            // object facts.
+            let possible = if strict {
+                F::EMPTY_OBJECT_STRICT_FACTS | F::FUNCTION_STRICT_FACTS | F::OBJECT_STRICT_FACTS
+            } else {
+                F::EMPTY_OBJECT_FACTS | F::FUNCTION_FACTS | F::OBJECT_FACTS
+            };
+            let needs = F::EQ_UNDEFINED;
+            let object_for_needs = if needs.intersects(possible) {
+                object
+            } else {
+                F::NONE
+            };
+            let objects = ((object_for_needs & F::OR_FACTS_MASK)
+                | (object_for_needs & F::AND_FACTS_MASK))
+                & needs;
+            let got = with_alias_types("isect_facts", &aliases, strict, move |checker, types| {
+                vec![
+                    checker.get_type_facts(types[0], F::ALL),
+                    checker.get_intersection_type_facts(types[1], F::ALL),
+                    // The base constraint of the intersection is
+                    // `{ a: 1 } & string`.
+                    checker.get_type_facts(types[1], F::ALL),
+                    checker.get_type_facts(types[2], F::ALL),
+                    checker.get_type_facts(types[2], needs),
+                ]
+            });
+            assert_eq!(
+                got,
+                [string, both, string, object, objects],
+                "strictNullChecks {strict}"
+            );
+        }
+    }
+
+    /// Go `getBaseConstraintOfType` (checker.go:27901) gives the same
+    /// constraint before and after it is resolved (chkfacts1 reads a
+    /// resolved one inline): a constraint, none, a circular one and an
+    /// intersection (its own constraint).
+    #[test]
+    fn base_constraint_of_type_when_resolved() {
+        let aliases = [
+            "<X extends string> = X",
+            "<X> = X",
+            "<X extends Y, Y extends X> = X",
+            "{ a: 1 } & { b: 2 }",
+        ];
+        let got = with_alias_types("base_constraint", &aliases, true, |checker, types| {
+            let string_type = checker.string_type;
+            types
+                .iter()
+                .map(|&t| {
+                    let first = checker.get_base_constraint_of_type(t);
+                    let second = checker.get_base_constraint_of_type(t);
+                    assert_eq!(first, second);
+                    if first.is_nil() {
+                        "none"
+                    } else if first == string_type {
+                        "string"
+                    } else if first == t {
+                        "itself"
+                    } else {
+                        "other"
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(got, ["string", "none", "none", "itself"]);
     }
 }

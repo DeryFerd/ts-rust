@@ -626,6 +626,80 @@ impl IoFs for DirFs {
 // the port. Go returns the entries read before an error; the port returns
 // only the error (callers here drop the entries on error).
 fn os_read_dir(dirname: &str) -> io::Result<Vec<DirEntry>> {
+    // PERF (cfgwalk1): the entries share one directory path for `lstat`
+    // (`DirEntryInfo::Lstat`).
+    let dir: Rc<str> = Rc::from(dirname);
+    let mut entries = read_dir_entries(dirname, &dir)?;
+    // Go sorts by the name bytes.
+    // Go: os/dir.go:122 ReadDir: slices.SortFunc(dirs, bytealg.CompareString on the names)
+    // PERF (cfgwalk1): names without a marker are their Go bytes (see
+    // `scanner_util::GO_STRING_MARKER`). The names of a directory differ,
+    // so any sort gives Go's order.
+    if entries
+        .iter()
+        .any(|e| crate::scanner_util::contains_go_string_marker(&e.name))
+    {
+        crate::gostd::slices::sort_func(&mut entries, |a, b| {
+            crate::scanner_util::go_string_bytes(&a.name)
+                .cmp(&crate::scanner_util::go_string_bytes(&b.name)) as i32
+        });
+    } else {
+        entries.sort_unstable_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    }
+    Ok(entries)
+}
+
+/// The entries of `os_read_dir`, not sorted.
+/// PERF (cfgwalk1): on Linux, `getdents64` into one buffer, as Go does. std
+/// `read_dir` also calls `fstat` for each directory (glibc `opendir`) and
+/// copies each name twice.
+#[cfg(target_os = "linux")]
+fn read_dir_entries(dirname: &str, dir: &Rc<str>) -> io::Result<Vec<DirEntry>> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, RawDir, openat, statat};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let fd = openat(rustix::fs::CWD, &*os_path(dirname), flags, Mode::empty())?;
+    // Go: os/dir_unix.go blockSize. On the stack, so a read allocates no
+    // buffer.
+    let mut buf = [std::mem::MaybeUninit::<u8>::uninit(); 8192];
+    let mut raw = RawDir::new(&fd, &mut buf);
+    let mut entries = Vec::new();
+    while let Some(entry) = raw.next() {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        let file_type = match entry.file_type() {
+            // Go and std `lstat` an entry of an unknown type.
+            FileType::Unknown => match statat(&fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(err) => return Err(err.into()),
+            },
+            file_type => file_type,
+        };
+        let typ = match file_type {
+            FileType::Directory => FileMode::DIR,
+            FileType::Symlink => FileMode::SYMLINK,
+            FileType::RegularFile => FileMode(0),
+            FileType::BlockDevice => FileMode::DEVICE,
+            FileType::CharacterDevice => FileMode::DEVICE | FileMode::CHAR_DEVICE,
+            FileType::Fifo => FileMode::NAMED_PIPE,
+            FileType::Socket => FileMode::SOCKET,
+            FileType::Unknown => FileMode::IRREGULAR,
+        };
+        entries.push(DirEntry {
+            name: go_string_from_os(OsStr::from_bytes(name)),
+            typ,
+            info: DirEntryInfo::Lstat(Rc::clone(dir)),
+        });
+    }
+    Ok(entries)
+}
+
+/// The entries of `os_read_dir`, not sorted.
+#[cfg(not(target_os = "linux"))]
+fn read_dir_entries(dirname: &str, dir: &Rc<str>) -> io::Result<Vec<DirEntry>> {
     let mut entries = Vec::new();
     for entry in std::fs::read_dir(os_path(dirname))? {
         let entry = entry?;
@@ -643,26 +717,18 @@ fn os_read_dir(dirname: &str) -> io::Result<Vec<DirEntry>> {
         } else {
             special_file_mode(file_type)
         };
-        let name = go_string_from_os(entry.file_name());
-        let full_path = format!("{}/{}", dirname, name);
         entries.push(DirEntry {
-            name,
+            name: go_string_from_os(entry.file_name()),
             typ,
-            info: DirEntryInfo::Lstat(full_path),
+            info: DirEntryInfo::Lstat(Rc::clone(dir)),
         });
     }
-    // Go sorts by the name bytes.
-    // Go: os/dir.go:122 ReadDir: slices.SortFunc(dirs, bytealg.CompareString on the names)
-    crate::gostd::slices::sort_func(&mut entries, |a, b| {
-        crate::scanner_util::go_string_bytes(&a.name)
-            .cmp(&crate::scanner_util::go_string_bytes(&b.name)) as i32
-    });
     Ok(entries)
 }
 
 // PORT: the `os_read_dir` mode of an entry that is not a directory, a link
-// or a regular file.
-#[cfg(unix)]
+// or a regular file. Linux maps the `d_type` in `read_dir_entries`.
+#[cfg(all(unix, not(target_os = "linux")))]
 fn special_file_mode(file_type: std::fs::FileType) -> FileMode {
     if file_type.is_block_device() {
         FileMode::DEVICE

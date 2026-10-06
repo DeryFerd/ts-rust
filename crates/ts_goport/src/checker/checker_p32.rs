@@ -258,9 +258,24 @@ impl Checker {
         // PERF (tcsplit1): reserve the texts and the direct string literal
         // spans once, so a long joined text is not copied as it grows. The
         // reserve stops at the length limit: past it the type is an error.
+        // PERF (perffu1): a span type with one of these flags is not a
+        // literal, a template, a generic index type or a placeholder, so
+        // `add_spans` returns `string` there. Then only the first text,
+        // which is written before the spans, is reserved.
+        const STRING_SPAN: TypeFlags = TypeFlags(
+            TypeFlags::OBJECT.bits()
+                | TypeFlags::UNKNOWN.bits()
+                | TypeFlags::ES_SYMBOL_LIKE.bits()
+                | TypeFlags::VOID.bits()
+                | TypeFlags::NON_PRIMITIVE.bits(),
+        );
         let mut capacity: usize = texts.iter().map(String::len).sum();
         for &t in types {
             let ty = self.ty(t);
+            if ty.flags.intersects(STRING_SPAN) {
+                capacity = texts[0].len();
+                break;
+            }
             if ty.flags.intersects(TypeFlags::STRING_LITERAL)
                 && let Some(LiteralValue::String(s)) = &ty.as_literal_type().value
             {
