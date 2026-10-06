@@ -120,9 +120,11 @@ else {
     input.author = "Theo Browne";
     input.description = "A Rust port of the TypeScript 7 compiler";
     input.keywords = ["typescript", "tsc", "compiler", "rust"];
-    delete input.homepage;
-    delete input.bugs;
-    delete input.repository;
+    // npm trusted publishing (the release workflow) needs repository.url to name the repo that
+    // publishes. The platform packages copy it.
+    input.homepage = "https://github.com/pingdotgg/ts-rust";
+    input.bugs = { url: "https://github.com/pingdotgg/ts-rust/issues" };
+    input.repository = { type: "git", url: "git+https://github.com/pingdotgg/ts-rust.git" };
 }
 delete input.scripts;
 delete input.devDependencies;

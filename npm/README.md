@@ -72,8 +72,8 @@ The release workflow (`.github/workflows/release.yml`) makes a release:
    makes one archive per platform (the tsc, the lib files, LICENSE and NOTICE.txt) and installs
    the packages in a fresh project on each platform.
 4. It publishes the platform packages, then `tsc-rs`, under the dist-tag `next`, and creates a
-   GitHub prerelease with the archives, the .tgz files and `SHA256SUMS`. It needs the repo secret
-   `NPM_TOKEN`.
+   GitHub prerelease with the archives, the .tgz files and `SHA256SUMS`. The publish uses npm
+   trusted publishing (see below), so there is no npm token in the repo.
 
 Pull requests that change the release files run steps 2 and 3 with the version `0.0.0-ci.<run>`.
 After a check of `npx tsc-rs@next` on each platform, `npm dist-tag add tsc-rs@<v> latest` (and the
@@ -90,6 +90,19 @@ GOPORT_PIN=<pin> scripts/goport/npm-pack.sh --name tsc-rs --package-version <v> 
   --also darwin-arm64=<darwin tsc from the release workflow> <out>/pkg <out>/linux-x64/bin/tsgo
 scripts/goport/npm-test.sh --name tsc-rs <out>/pkg <out>/test
 ```
+
+### Trusted publishing
+
+npm trusts the workflow file `release.yml` of `pingdotgg/ts-rust`, in the GitHub environment
+`npm`, to publish each of the 3 packages (OIDC, no token). Set it up once with
+`npm/trust-setup.sh`, logged in to npm with 2FA and npm 11.15.0 or later. It publishes a 0.0.1
+placeholder for a package that is not on npm yet, because npm can only trust a workflow for a
+package that exists. npm drops a new trust that publishes nothing in 2 days, so run it shortly
+before the first tag. Add required reviewers to the `npm` environment (repo settings,
+Environments) to approve each publish by hand.
+
+While the repo is private, npm publishes with no provenance. From a public repo it adds
+provenance by itself.
 
 The packages carry the port's MIT LICENSE and a NOTICE.txt with the licenses of TypeScript
 (Apache-2.0) and Go (BSD-3-Clause), from `NOTICE.md` and `licenses/` at the repo root.

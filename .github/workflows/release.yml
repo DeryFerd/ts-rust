@@ -2,9 +2,10 @@
 # @tsc-rs/darwin-arm64, and one standalone archive per platform (tsc and the lib files).
 #
 # A tag v<version> (for example v0.1.0-preview.1) also creates a GitHub prerelease and publishes
-# the npm packages under the dist-tag `next`. It needs the repo secret NPM_TOKEN (an npm token that
-# can publish tsc-rs and the @tsc-rs scope). Pull requests that change the release files, and a
-# manual run, do everything but the release and the publish.
+# the npm packages under the dist-tag `next`. npm trusted publishing (OIDC) authenticates the
+# publish: no npm token. Each of the 3 packages trusts this workflow file and the environment `npm`
+# (npm/README.md, "Trusted publishing"). Pull requests that change the release files, and a manual
+# run, do everything but the release and the publish.
 #
 # These builds are the plain shipped profile (fat LTO), without the PGO and BOLT of
 # crates/ts_goport/scripts/build-release.sh, which needs a host with BOLT and the project inputs.
@@ -247,28 +248,31 @@ jobs:
   release:
     if: needs.version.outputs.release == 'true'
     needs: [version, verify]
+    # Trusted publishing needs a GitHub-hosted runner. The environment is part of the trust: add
+    # required reviewers to it in the repo settings to approve each publish.
     runs-on: ubuntu-latest
+    environment: npm
     timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
     env:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/setup-node@v5
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later.
+      - run: npm install -g npm@11 && npm --version
       - uses: actions/download-artifact@v5
         with:
           name: release
           path: dist
       # Platform packages first, then the main package that depends on them. A version that is
-      # already on npm is skipped, so a failed run can run again.
+      # already on npm is skipped, so a failed run can run again. While the repo is private, npm
+      # makes no provenance; from a public repo it adds it by itself.
       - name: Publish to npm (next)
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          [[ -n $NODE_AUTH_TOKEN ]] || { echo "::error::the repo secret NPM_TOKEN is not set"; exit 1; }
           for pkg in @tsc-rs/linux-x64:tsc-rs-linux-x64 @tsc-rs/darwin-arm64:tsc-rs-darwin-arm64 tsc-rs:tsc-rs; do
             name=${pkg%%:*} file=dist/${pkg#*:}-$VERSION.tgz
             if npm view "$name@$VERSION" version > /dev/null 2>&1; then
