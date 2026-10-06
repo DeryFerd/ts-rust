@@ -1423,7 +1423,12 @@ mod tests {
         assert_eq!(from_lstat, want_lstat);
         assert_eq!(locked_d_type.ok(), Some(1));
         match locked_lstat {
-            Ok(_) => eprintln!("skipped: the lstat works in a directory with no search permission"),
+            // An lstat that works there (root) lists x.ts; an lstat error
+            // that the read skipped would list nothing.
+            Ok(n) => {
+                assert_eq!(n, 1, "an lstat that works there lists x.ts");
+                eprintln!("skipped: the lstat works in a directory with no search permission")
+            }
             Err(err) => assert_eq!(err.kind(), io::ErrorKind::PermissionDenied),
         }
     }
