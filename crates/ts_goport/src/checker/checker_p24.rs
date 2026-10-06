@@ -1586,13 +1586,14 @@ impl Checker {
     // member, so each position of every such table has the same
     // `get_named_members` inputs, except the symbol id. When no member is an
     // alias (then `symbol_is_value` reads only the flags) and each sorted part
-    // is in strictly increasing packed order (then the sort compares only
-    // those orders: no name text and no `get_symbol_id`), every such table
-    // gives the same result positions. The first table runs
-    // `get_named_members` and keeps its positions for `(declared,
-    // container)`. Later tables read their result at those positions: the
-    // same list, with none of the reads and no sort. Debug builds compare
-    // it with `get_named_members`.
+    // is in strictly increasing sort order (`SymbolSortKey::order`: the
+    // packed declaration position, or for a member with no declaration the
+    // name prefix; then the sort compares only those orders: no name text
+    // and no `get_symbol_id`), every such table gives the same result
+    // positions. The first table runs `get_named_members` and keeps its
+    // positions for `(declared, container)`. Later tables read their result
+    // at those positions: the same list, with none of the reads and no sort.
+    // Debug builds compare it with `get_named_members`.
     pub(crate) fn get_named_members_of_instantiation(
         &mut self,
         members: SymbolTable,

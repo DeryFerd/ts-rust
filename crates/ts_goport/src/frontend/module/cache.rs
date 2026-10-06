@@ -987,7 +987,9 @@ pub fn note_worker_lookup(kind: StatKind, path: &str) {
 }
 
 /// One Go `getPackageJsonInfo` call of a parse worker's resolution: the
-/// package.json cache entry that it read or stored, without the contents.
+/// package.json cache entry that it read or stored. The parsed contents stay
+/// on the worker; a lookup of the metadata scope walk carries the text of
+/// the first read (`read`).
 #[derive(Clone, Debug)]
 pub struct PackageJsonLookup {
     pub package_directory: String,
@@ -1545,7 +1547,7 @@ impl Caches {
     /// resolver, so a later lookup on the loading thread (the loader's own
     /// resolutions, Go `Program.GetPackageJsonInfo`) finds what the load
     /// read and does not read the file again. The text is parsed as Go
-    /// `getPackageJsonInfo` parses it (module/resolver.go:1775).
+    /// `getPackageJsonInfo` parses it (module/resolver.go:1776).
     // PORT: not in Go (see `WorkerPackageJsonRead`). The package.json
     // entries of the other worker answers stay out of the loader's cache,
     // as before loadpar1: parsing them again on the loading thread costs

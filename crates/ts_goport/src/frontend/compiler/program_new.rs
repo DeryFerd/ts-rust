@@ -161,7 +161,7 @@ impl NewProgram {
         self.opts.typings_location.clone()
     }
 
-    // Go: program.go:137 (*Program).GetNearestAncestorDirectoryWithPackageJson
+    // Go: program.go:148 (*Program).GetNearestAncestorDirectoryWithPackageJson
     pub fn get_nearest_ancestor_directory_with_package_json(&self, dirname: &str) -> String {
         let scoped = self.resolver_ref().get_package_scope_for_path(dirname);
         if let Some(scoped) = scoped
@@ -172,7 +172,7 @@ impl NewProgram {
         String::new()
     }
 
-    // Go: program.go:146 (*Program).GetPackageJsonInfo
+    // Go: program.go:157 (*Program).GetPackageJsonInfo
     pub fn get_package_json_info(&self, pkg_json_path: &str) -> Option<Rc<InfoCacheEntry>> {
         let directory = get_directory_path(pkg_json_path);
         let scoped = self.resolver_ref().get_package_scope_for_path(&directory);
@@ -185,7 +185,7 @@ impl NewProgram {
         None
     }
 
-    // Go: program.go:156 (*Program).PackageJsonCacheEntries (tsgo#4301)
+    // Go: program.go:167 (*Program).PackageJsonCacheEntries (tsgo#4301)
     // PackageJsonCacheEntries iterates on all package json cache entries.
     pub fn package_json_cache_entries(
         &self,
