@@ -219,6 +219,13 @@ pub struct Caches {
     /// (`DefaultResolver::package_json_cache_entries`).
     pub worker_package_jsons: RefCell<Vec<Arc<[PackageJsonLookup]>>>,
 
+    /// A parse worker's resolver (files_parser.rs `WorkerResolver`): what
+    /// it read for each entry of its package.json cache, by the address of
+    /// the entry (`WorkerPackageJsonRead`). The worker's cache keeps each
+    /// entry while the resolver lives, so an address names one entry.
+    /// `None` for other resolvers.
+    pub worker_package_json_reads: Option<RefCell<FxHashMap<usize, Arc<WorkerPackageJsonRead>>>>,
+
     /// The loader's resolver in `tsc -b`: the file system lookups of the
     /// worker answers that it took from `shared` (`SharedResolution::lookups`).
     /// The load adds them to the build host's cache at its end
@@ -582,6 +589,7 @@ impl Caches {
             shared: None,
             package_json_log: RefCell::new(Vec::new()),
             worker_package_jsons: RefCell::new(Vec::new()),
+            worker_package_json_reads: None,
             worker_lookups: RefCell::new(Vec::new()),
             ahead: RefCell::new(None),
         }
@@ -985,6 +993,75 @@ pub struct PackageJsonLookup {
     pub directory_exists: bool,
     /// The package.json file exists (`InfoCacheEntry::exists`).
     pub exists: bool,
+    /// What the worker read for the entry, which the loader puts into its
+    /// own cache (`Caches::adopt_worker_package_jsons`). `None` from a
+    /// resolver that does not keep it (a resolve-ahead worker).
+    pub read: Option<Arc<WorkerPackageJsonRead>>,
+}
+
+/// What a parse worker read for one entry of its package.json cache (Go
+/// `getPackageJsonInfo`, module/resolver.go:1755): the text of the file,
+/// or no file. Every lookup of the entry shares it. The entry itself has
+/// `Rc` contents, which stay on the worker's thread, so the loader parses
+/// the text again when it takes the entry (`take`).
+// PORT: not in Go. Go's parse tasks share the resolver's one package.json
+// cache, which keeps the first read of each file (packagejson/cache.go:190
+// `Set`).
+pub struct WorkerPackageJsonRead {
+    /// Set when the loader has taken the entry.
+    taken: std::sync::atomic::AtomicBool,
+    /// The text that the worker read and parsed, until the loader takes
+    /// it. `None`: the package.json does not exist.
+    text: std::sync::Mutex<Option<Box<str>>>,
+}
+
+impl std::fmt::Debug for WorkerPackageJsonRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WorkerPackageJsonRead")
+    }
+}
+
+impl WorkerPackageJsonRead {
+    /// The text of the read, the first time: `Some(None)` when the
+    /// package.json does not exist. `None` after the first time.
+    fn take(&self) -> Option<Option<Box<str>>> {
+        use std::sync::atomic::Ordering;
+        if self.taken.load(Ordering::Relaxed) || self.taken.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        Some(lock_shared(&self.text).take())
+    }
+}
+
+thread_local! {
+    /// The last package.json that the resolver of the parse worker on this
+    /// thread read (`note_worker_package_json_read`): its file name and
+    /// text. `log_package_json` takes it for the entry that the read makes.
+    static WORKER_PACKAGE_JSON_READ: RefCell<Option<(String, Box<str>)>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The entries that `adopt_worker_package_jsons` put into a loader's
+    /// cache on this thread (tests).
+    static ADOPTED_PACKAGE_JSONS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The entries that loaders on this thread took from parse workers so far
+/// (`Caches::adopt_worker_package_jsons`), for tests.
+#[cfg(test)]
+pub(crate) fn adopted_package_jsons() -> usize {
+    ADOPTED_PACKAGE_JSONS.with(Cell::get)
+}
+
+/// Keeps `text`, the text of the package.json `file_name` that the
+/// resolver of the parse worker on this thread just read, for the entry
+/// that the read makes (`Caches::worker_package_json_reads`).
+// PORT: not in Go (see `WorkerPackageJsonRead`).
+pub fn note_worker_package_json_read(file_name: &str, text: &str) {
+    WORKER_PACKAGE_JSON_READ
+        .with(|read| *read.borrow_mut() = Some((file_name.to_string(), text.into())));
 }
 
 /// One entry of `DefaultResolver::package_json_cache_entries`: the parts
@@ -1117,6 +1194,7 @@ impl Caches {
                 package_directory: entry.package_directory.clone(),
                 directory_exists: entry.directory_exists,
                 exists: entry.exists(),
+                read: self.worker_package_json_read(entry),
             });
             if WORKER_LOOKUPS.with(|log| log.borrow().is_some()) {
                 note_worker_lookup(StatKind::DirectoryExists, &entry.package_directory);
@@ -1129,6 +1207,37 @@ impl Caches {
             }
             log_ahead_package_json(entry);
         }
+    }
+
+    /// What the parse worker read for `entry`, an entry of its package.json
+    /// cache (`worker_package_json_reads`). The first lookup of an entry is
+    /// the one that made it, right after the read
+    /// (`note_worker_package_json_read`). `None` for another resolver.
+    fn worker_package_json_read(
+        &self,
+        entry: &InfoCacheEntry,
+    ) -> Option<Arc<WorkerPackageJsonRead>> {
+        let reads = self.worker_package_json_reads.as_ref()?;
+        let key = std::ptr::from_ref(entry) as usize;
+        if let Some(read) = reads.borrow().get(&key) {
+            return Some(read.clone());
+        }
+        let text = if entry.exists() {
+            let file_name = combine_paths(&entry.package_directory, &["package.json"]);
+            let (_, text) = WORKER_PACKAGE_JSON_READ.with(|read| {
+                read.borrow_mut()
+                    .take_if(|(read_name, _)| *read_name == file_name)
+            })?;
+            Some(text)
+        } else {
+            None
+        };
+        let read = Arc::new(WorkerPackageJsonRead {
+            taken: std::sync::atomic::AtomicBool::new(false),
+            text: std::sync::Mutex::new(text),
+        });
+        reads.borrow_mut().insert(key, read.clone());
+        Some(read)
     }
 
     /// Starts the package.json log of a parse worker's resolution. The
@@ -1317,12 +1426,57 @@ impl Caches {
     }
 
     /// Keeps the package.json lookups of a worker answer that the loader's
-    /// resolver took (`worker_package_jsons`).
+    /// resolver took (`worker_package_jsons`), and puts their entries into
+    /// its package.json cache (`adopt_worker_package_jsons`).
     pub fn note_worker_package_jsons(&self, package_jsons: &Arc<[PackageJsonLookup]>) {
         if !package_jsons.is_empty() {
+            if !self.publishes() {
+                self.adopt_worker_package_jsons(package_jsons);
+            }
             self.worker_package_jsons
                 .borrow_mut()
                 .push(package_jsons.clone());
+        }
+    }
+
+    /// The loader's resolver: puts each package.json entry of `package_jsons`,
+    /// the lookups of a worker answer that it took, into its package.json
+    /// cache as the worker read it (`PackageJsonLookup::read`), unless the
+    /// cache has the entry: Go `InfoCache.Set` keeps the first. Go's parse
+    /// tasks share one cache, so a later lookup on the loading thread (the
+    /// loader's own resolutions, Go `Program.GetPackageJsonInfo`) finds what
+    /// the load read and does not read the file again. The text is parsed
+    /// as Go `getPackageJsonInfo` parses it (module/resolver.go:1775).
+    // PORT: not in Go (see `WorkerPackageJsonRead`).
+    fn adopt_worker_package_jsons(&self, package_jsons: &[PackageJsonLookup]) {
+        let cache = &self.package_json_info_cache;
+        for lookup in package_jsons {
+            let Some(text) = lookup.read.as_ref().and_then(|read| read.take()) else {
+                continue;
+            };
+            let package_json_path = combine_paths(&lookup.package_directory, &["package.json"]);
+            if cache.get(&package_json_path).is_some() {
+                continue;
+            }
+            let contents = text.map(|text| {
+                let parsed = crate::frontend::packagejson::parse(&go_string_bytes(&text));
+                let parseable = parsed.is_ok();
+                Rc::new(PackageJson {
+                    fields: parsed.unwrap_or_default(),
+                    parseable,
+                    ..Default::default()
+                })
+            });
+            cache.set(
+                &package_json_path,
+                Rc::new(InfoCacheEntry {
+                    package_directory: lookup.package_directory.clone(),
+                    directory_exists: lookup.directory_exists,
+                    contents,
+                }),
+            );
+            #[cfg(test)]
+            ADOPTED_PACKAGE_JSONS.with(|count| count.set(count.get() + 1));
         }
     }
 

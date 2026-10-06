@@ -2573,9 +2573,18 @@ impl FileRefs {
 fn run_prefetch_worker(shared: &PrefetchShared) {
     // Go: sys.FS() is bundled.WrapFS(osvfs.FS()). The workers share one
     // stat cache, like the Go parse tasks share the host's cachedvfs.
+    let os_fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
     let fs: Rc<dyn Fs> = Rc::new(WorkerFs {
-        fs: crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs()),
+        fs: os_fs.clone(),
         stats: shared.stats.clone(),
+        keep_package_jsons: false,
+    });
+    // The resolver's file system keeps the package.json files that it
+    // reads, for the loader's package.json cache (`WorkerResolver::new`).
+    let resolver_fs: Rc<dyn Fs> = Rc::new(WorkerFs {
+        fs: os_fs,
+        stats: shared.stats.clone(),
+        keep_package_jsons: true,
     });
     let mut resolver: Option<WorkerResolver> = None;
     let mut resolver_failed = false;
@@ -2617,7 +2626,7 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
         {
             resolver = Some(WorkerResolver::new(
                 config,
-                fs.clone(),
+                resolver_fs.clone(),
                 &shared.config.current_directory,
                 shared.stats.host.get().is_some(),
             ));
@@ -2793,6 +2802,12 @@ impl WorkerResolver {
             cache,
             publish: true,
         });
+        // What the worker reads for each package.json entry goes with the
+        // lookups of its answers, and the loader puts the entries of the
+        // answers that it takes into its own cache, as Go's parse tasks
+        // share one cache (`Caches::adopt_worker_package_jsons`). `fs`
+        // keeps the texts (`WorkerFs::keep_package_jsons`).
+        resolver.caches.worker_package_json_reads = Some(RefCell::default());
         set_worker_lookup_log(log_lookups);
         WorkerResolver {
             resolver,
@@ -3280,6 +3295,9 @@ impl SharedStatCache {
 struct WorkerFs {
     fs: Rc<dyn Fs>,
     stats: Arc<SharedStatCache>,
+    /// The file system of the worker's resolver: it keeps the text of each
+    /// package.json that it reads (`note_worker_package_json_read`).
+    keep_package_jsons: bool,
 }
 
 impl Fs for WorkerFs {
@@ -3297,7 +3315,11 @@ impl Fs for WorkerFs {
     }
 
     fn read_file(&self, path: &str) -> (String, bool) {
-        self.fs.read_file(path)
+        let read = self.fs.read_file(path);
+        if self.keep_package_jsons && path.ends_with("/package.json") {
+            note_worker_package_json_read(path, &read.0);
+        }
+        read
     }
 
     fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {

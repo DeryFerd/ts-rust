@@ -2840,4 +2840,119 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         );
         assert_eq!(names, ["a.ts", "d.json"]);
     }
+
+    /// Writes `files` and a tsconfig.json with `tsconfig` to a temp dir and
+    /// loads the program with parse workers (not single threaded). Returns
+    /// the load, the dir and its name; the caller removes the dir.
+    fn load_with_workers(
+        label: &str,
+        tsconfig: &str,
+        files: &[(&str, &str)],
+    ) -> (ProcessedFiles, std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_file_loader_{label}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        std::fs::write(dir.join("tsconfig.json"), tsconfig).unwrap();
+        let cwd = dir.to_string_lossy().replace('\\', "/");
+        let fs = bundled::wrap_fs(osvfs_fs());
+        let sys = System {
+            fs: fs.clone(),
+            current_directory: cwd.clone(),
+        };
+        let (config, errors) = get_parsed_command_line_of_config_file(
+            &format!("{cwd}/tsconfig.json"),
+            None,
+            None,
+            &sys,
+            None,
+        );
+        assert!(errors.is_empty());
+        let host = new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, None, None);
+        let processed = process_all_program_files(
+            ProgramOptions {
+                host,
+                config: Rc::new(config.unwrap()),
+                use_source_of_project_reference: false,
+                single_threaded: Tristate::False,
+                typings_location: String::new(),
+                project_name: String::new(),
+                create_module_resolver: None,
+                skip_module_resolution: false,
+            },
+            false,
+        );
+        (processed, dir, cwd)
+    }
+
+    // The parse workers read the package.json files of the load (the
+    // package scope of each file and the packages of its imports), and the
+    // loader puts the entries of the worker answers that it takes into the
+    // program resolver's cache (`Caches::adopt_worker_package_jsons`), as
+    // Go's parse tasks share one cache (module/resolver.go:1755
+    // getPackageJsonInfo, packagejson/cache.go:190 Set keeps the first). A
+    // lookup on the loading thread after the load (Go
+    // `Program.GetPackageJsonInfo`, compiler/program.go:157) finds what the
+    // load read, also when the files changed on disk since.
+    #[test]
+    fn the_loader_keeps_the_package_json_files_that_workers_read() {
+        let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "types": [],
+             "noEmit": true }, "include": ["src"] }"#;
+        let files = [
+            ("package.json", r#"{ "name": "app", "type": "module" }"#),
+            (
+                "src/a.ts",
+                "import { x } from \"lib\";\nexport const a = x;\n",
+            ),
+            (
+                "node_modules/lib/package.json",
+                r#"{ "name": "lib", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/lib/index.d.ts",
+                "export declare const x: number;\n",
+            ),
+        ];
+        for prep in [true, false] {
+            set_load_prep(Some(prep));
+            let before = crate::frontend::module::cache::adopted_package_jsons();
+            let (processed, dir, cwd) =
+                load_with_workers(&format!("keeps_package_jsons_{prep}"), tsconfig, &files);
+            for path in ["package.json", "node_modules/lib/package.json"] {
+                std::fs::write(dir.join(path), r#"{ "name": "changed" }"#).unwrap();
+            }
+            let resolver = processed
+                .resolver
+                .as_ref()
+                .and_then(|resolver| resolver.as_default_resolver())
+                .expect("the default resolver");
+            let name = |directory: &str| {
+                resolver
+                    .get_package_scope_for_path(&format!("{cwd}/{directory}"))
+                    .and_then(|entry| entry.contents.clone())
+                    .map(|contents| contents.fields.header_fields.name.get_value().0)
+            };
+            let names = (name("src"), name("node_modules/lib"));
+            let adopted = crate::frontend::module::cache::adopted_package_jsons() - before;
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(
+                names,
+                (Some("app".to_string()), Some("lib".to_string())),
+                "prep {prep}"
+            );
+            // With parse workers the loader takes the metadata of `src/a.ts`
+            // from its worker (prep on): with no parse workers (one CPU, or
+            // `GOPORT_PARSE_THREADS=0`) the loader reads every file itself.
+            if prep && super::super::files_parser::parse_workers_enabled() {
+                assert!(adopted > 0, "no worker package.json taken");
+            }
+        }
+        set_load_prep(None);
+    }
 }
