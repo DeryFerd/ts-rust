@@ -325,7 +325,7 @@ pub(crate) fn path_error(op: &str, path: &str, err: &io::Error) -> GoError {
 // PORT: Go guards it with a mutex. The atomic swap does the same job.
 static CPU_PROFILING: AtomicBool = AtomicBool::new(false);
 
-// Go: runtime/mprof.go:880 MemProfileRate. tsgo does not change it.
+// Go: runtime/mprof.go:870 MemProfileRate. tsgo does not change it.
 const MEM_PROFILE_RATE: i64 = 512 * 1024;
 
 // Go: runtime/pprof/pprof.go:885 StartCPUProfile

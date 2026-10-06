@@ -57,6 +57,7 @@ pub(crate) mod projecttestutil;
 pub(crate) mod util;
 
 mod api_createsourcefile_freeable_test;
+mod api_createsourcefile_stdio_test;
 mod api_session_apistate_test;
 mod api_session_batch_test;
 mod api_session_completion_test;
