@@ -503,11 +503,14 @@ The batch that adds it is not accepted until Theo approves.
   kept as a copy, as in `tsc --watch`
   (`BuildHost::keep_watch_sources_for_config_change`). A config change
   that gives a project other module indicator inputs
-  (`ModuleIndicatorInputs`) drops the kept parses that read them
-  (`BuildHost::drop_kept_parses_that_read_module_indicator_options`), and
-  an overflow drops all. Parse workers parse ahead in the first build and
-  in the cycles with a config change or an overflow
-  (`BuildHost::prefetch`); they skip the kept parses, as in `tsc --watch`.
+  (`ModuleIndicatorInputs`) drops the kept parses of that project's files
+  that read their options when the file's options under the new inputs
+  are not those of the parse
+  (`BuildHost::drop_kept_parses_whose_module_indicator_options_change`);
+  the parses of the other projects stay. An overflow drops all. Parse
+  workers parse ahead in the first build and in the cycles with a config
+  change or an overflow (`BuildHost::prefetch`); they skip the kept
+  parses, as in `tsc --watch`.
   A task keeps the versions that its errors point at until its next build
   or a reset of its status (`BuildTask::held_file_versions`). A file
   version's parse holds it (`ParsedSourceFile::version`), and so do the

@@ -91,17 +91,17 @@ pub struct WatchSource {
 /// the compiler options (Go `GetExternalModuleIndicatorOptions`,
 /// parseoptions.go:19; the rest is the file name and its package.json):
 /// the detection kind, and with `auto` only, whether `jsx` is react-jsx or
-/// react-jsxdev, whether `module` is in Node16..NodeNext
-/// (`GetImpliedNodeFormatForEmitWorker`, utilities.go:2622) and whether the
-/// module resolution is, which reads the package.json `type`
-/// (`loadSourceFileMetaData`, fileloader.go:384). Two configs with the same
-/// inputs give each file the same module indicator options. See
-/// `BuildHost::drop_kept_parses_that_read_module_indicator_options`.
+/// react-jsxdev and whether the module resolution is in Node16..NodeNext,
+/// which reads the package.json `type` (`loadSourceFileMetaData`,
+/// fileloader.go:384). `module` is not one: once the `type` is known,
+/// `GetImpliedNodeFormatForEmitWorker` (utilities.go:2622) gives ESNext to
+/// the same files with any module kind. Two configs with the same inputs
+/// give each file the same module indicator options. See
+/// `BuildHost::drop_kept_parses_whose_module_indicator_options_change`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ModuleIndicatorInputs {
     detection: ModuleDetectionKind,
     jsx: bool,
-    node_module: bool,
     node_resolution: bool,
 }
 
@@ -110,16 +110,47 @@ impl ModuleIndicatorInputs {
     pub fn of(options: &CompilerOptions) -> Self {
         let detection = options.get_emit_module_detection_kind();
         let auto = detection == ModuleDetectionKind::AUTO;
-        let module = options.get_emit_module_kind();
         let resolution = options.get_module_resolution_kind();
         ModuleIndicatorInputs {
             detection,
             jsx: auto
                 && (options.jsx == JsxEmit::REACT_JSX || options.jsx == JsxEmit::REACT_JSX_DEV),
-            node_module: auto && ModuleKind::NODE16 <= module && module <= ModuleKind::NODE_NEXT,
             node_resolution: auto
                 && ModuleResolutionKind::NODE16 <= resolution
                 && resolution <= ModuleResolutionKind::NODE_NEXT,
+        }
+    }
+
+    /// The module indicator options of `file_name` under these inputs
+    /// (Go `GetExternalModuleIndicatorOptions`), or `None` when they take
+    /// the package.json `type`, which is not read here: with `auto`, for a
+    /// file that is not .mts, .cts, .mjs or .cjs, under a Node16..NodeNext
+    /// resolution or in node_modules (fileloader.go:384).
+    #[must_use]
+    pub fn options_of(self, file_name: &str) -> Option<ExternalModuleIndicatorOptions> {
+        if is_declaration_file_name(file_name) {
+            return Some(ExternalModuleIndicatorOptions::default());
+        }
+        match self.detection {
+            ModuleDetectionKind::FORCE => Some(ExternalModuleIndicatorOptions {
+                jsx: false,
+                force: true,
+            }),
+            ModuleDetectionKind::AUTO => {
+                // `isFileForcedToBeModuleByFormat` (parseoptions.go:46).
+                let force = file_extension_is_one_of(
+                    file_name,
+                    &[EXTENSION_CJS, EXTENSION_CTS, EXTENSION_MJS, EXTENSION_MTS],
+                );
+                if !force && (self.node_resolution || file_name.contains("/node_modules/")) {
+                    return None;
+                }
+                Some(ExternalModuleIndicatorOptions {
+                    jsx: self.jsx,
+                    force,
+                })
+            }
+            _ => Some(ExternalModuleIndicatorOptions::default()),
         }
     }
 }
@@ -514,31 +545,52 @@ impl BuildHost {
     }
 
     /// PORT: not in Go (`keep_watch_sources_for_config_change`). Drops the
-    /// kept parses from before the config change of this cycle that read
-    /// their module indicator options (`WatchSource::reads_options`).
-    /// `Orchestrator::do_cycle` calls it when the change gave a project
-    /// other `ModuleIndicatorInputs`: then such a parse fits only a parse
-    /// with its own options, so the builds of the cycle parse these files
-    /// again. Before, it stayed until `end_config_change_cycle`: on 600
+    /// kept parses from before the config change of this cycle that its
+    /// builds will not take, so that they are freed before the builds parse
+    /// these files again. `Orchestrator::do_cycle` gives each project whose
+    /// change gave it other `ModuleIndicatorInputs`: its config from before
+    /// the change, whose files are the parses it holds, and its new inputs
+    /// (`None` when its config is gone). A kept parse that read its module
+    /// indicator options (`WatchSource::reads_options`) fits only a parse
+    /// with its own options. If it is a file of such a project, it goes
+    /// unless the options of the file under the new inputs of one of these
+    /// projects are its own (`ModuleIndicatorInputs::options_of`); when
+    /// such a project parses the file again with other options, it would
+    /// go at `end_config_change_cycle` all the same. The parses of the
+    /// other projects stay: Go shares no such parse between the programs
+    /// of a build (build/host.go:54 keeps only `.d.ts` and `.json` files,
+    /// and orchestrator.go:511 resets that cache in each cycle). Before,
+    /// the dropped parses stayed until `end_config_change_cycle`: on 600
     /// script files with 12 `moduleDetection` edits, `tsc -b -w` held 24%
     /// more RSS than R173, which dropped every kept parse before a config
-    /// change build. A change of options that the inputs do not hold, such
-    /// as `module` es2020 to esnext or `jsx` preserve to react, keeps every
-    /// parse. Only a file with no import, export or `import.meta` reads
-    /// these options, so a project whose inputs stayed the same parses
-    /// again at most its script files. The file versions are freed on the
-    /// free thread, beside the build, as Go's GC frees the files of the old
-    /// program.
-    pub fn drop_kept_parses_that_read_module_indicator_options(&self) {
+    /// change build. The file versions are freed on the free thread, beside
+    /// the build, as Go's GC frees the files of the old program.
+    pub fn drop_kept_parses_whose_module_indicator_options_change(
+        &self,
+        changed: &[(Option<ModuleIndicatorInputs>, Rc<ParsedCommandLine>)],
+    ) {
         let mut versions = Vec::new();
         self.watch_sources_before_config_change
             .borrow_mut()
-            .retain(|_, source| {
+            .retain(|key, source| {
                 if !source.reads_options {
                     return true;
                 }
-                versions.extend(source.file.version.get().cloned());
-                false
+                let mut held = false;
+                for (inputs, config) in changed {
+                    if !config.file_names_by_path().contains_key(&key.0.path) {
+                        continue;
+                    }
+                    let options = inputs.and_then(|inputs| inputs.options_of(&key.0.file_name));
+                    if options == Some(key.0.external_module_indicator_options) {
+                        return true;
+                    }
+                    held = true;
+                }
+                if held {
+                    versions.extend(source.file.version.get().cloned());
+                }
+                !held
             });
         crate::execute::build::build_task::drop_in_background(versions);
     }

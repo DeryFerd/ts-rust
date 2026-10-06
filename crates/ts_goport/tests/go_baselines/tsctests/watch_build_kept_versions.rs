@@ -1,15 +1,16 @@
 //! Port-only tests of the file versions that `tsc -b --watch` keeps
-//! (watchfix1 part 2): a config change that changes the module indicator
-//! options drops the kept parses that read them, and one that does not
-//! keeps them (item 3), and a task whose status is reset lets go of the
-//! versions that its errors held (item 4).
+//! (watchfix1 part 2): a config change drops the kept parses of a project
+//! whose module indicator options it changes, and keeps the parses whose
+//! options stay and those of the other projects (item 3), and a task
+//! whose status is reset lets go of the versions that its errors held
+//! (item 4).
 //!
 //! Go has no file versions: its GC frees a file when no program, cache or
 //! diagnostic holds it. The output of each cycle is Go's: the lines that
 //! the tests check are those of `tsgo-oracle-673a5f17d713 -b -w` on the same
 //! files and edits with the OS watcher
-//! (target/continuation-r97-goport/watchfix1/runs, mdrop and held2, and
-//! watchfix1/rb/runs/mjx).
+//! (target/continuation-r97-goport/watchfix1/runs, mdrop and held2,
+//! watchfix1/rb/runs/mjx, and watchfix1/rc/watch/runs, leg, frc and two).
 //! The first version of each file is static; each later parse of it is a
 //! freeable version (`ast::file_versions_made`, `ast::dead_file_versions`).
 
@@ -66,7 +67,7 @@ fn session(
 
 /// `(made, dead)` file versions once the dead count reaches `dead` or 10 s
 /// pass: the free thread frees the dropped versions
-/// (`BuildHost::drop_kept_parses_that_read_module_indicator_options`).
+/// (`BuildHost::drop_kept_parses_whose_module_indicator_options_change`).
 fn file_versions(dead: usize) -> (usize, usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -177,6 +178,165 @@ fn build_watch_keeps_kept_parses_whose_module_indicator_inputs_stay() {
                         // s1.ts is parsed again and its kept v2 goes. The
                         // kept m1.ts did not read it, so it stays.
                         _ => (2, 1),
+                    };
+                    assert_eq!(file_versions(expected.1), expected, "edit {i}");
+                },
+            );
+        },
+    );
+}
+
+/// A config of the files `files` with the `moduleDetection` value
+/// `detection` (none for `None`).
+fn detection_config(detection: Option<&str>, files: &str) -> String {
+    let detection = detection.map_or(String::new(), |kind| {
+        format!(r#","moduleDetection":"{kind}""#)
+    });
+    format!(
+        r#"{{"compilerOptions":{{"strict":true,"outDir":"out","rootDir":"src","types":[],"lib":["es5"]{detection}}},"files":[{files}]}}"#
+    )
+}
+
+#[test]
+fn build_watch_keeps_script_parses_from_legacy_to_auto_and_back() {
+    run_test_in_child(
+        "tsctests::watch_build_kept_versions::build_watch_keeps_script_parses_from_legacy_to_auto_and_back",
+        || {
+            // Two script files, s1.ts and q1.mts, and a module file.
+            let files = r#""src/s1.ts","src/q1.mts","src/m1.ts""#;
+            let legacy = detection_config(Some("legacy"), files);
+            session(
+                &[
+                    ("tsconfig.json", &legacy),
+                    ("src/s1.ts", "const one: number = 1;\n"),
+                    ("src/q1.mts", "const q: number = 1;\n"),
+                    ("src/m1.ts", "export const m: number = 1;\n"),
+                ],
+                &["--build", "--watch", "--pretty", "false"],
+                &[
+                    ("src/s1.ts", "const one: number = 11;\n"),
+                    ("src/q1.mts", "const q: number = 11;\n"),
+                    ("tsconfig.json", &detection_config(None, files)),
+                    ("tsconfig.json", &legacy),
+                ],
+                |i, out| {
+                    assert!(
+                        out.contains("Found 0 errors. Watching for file changes."),
+                        "edit {i}: {out}"
+                    );
+                    let expected = match i {
+                        // s1.ts v2, then q1.mts v2.
+                        0 => (1, 0),
+                        1 => (2, 0),
+                        // `auto` (the default) and `legacy` give s1.ts the
+                        // same options, so its kept v2 stays. They give
+                        // q1.mts other ones (`force` by its extension with
+                        // `auto`): it is parsed again and its kept version
+                        // goes. Before, s1.ts v2 went too, and s1.ts was
+                        // parsed again.
+                        2 => (3, 1),
+                        _ => (4, 2),
+                    };
+                    assert_eq!(file_versions(expected.1), expected, "edit {i}");
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn build_watch_keeps_mts_and_cts_script_parses_on_a_force_edit() {
+    run_test_in_child(
+        "tsctests::watch_build_kept_versions::build_watch_keeps_mts_and_cts_script_parses_on_a_force_edit",
+        || {
+            // Three script files.
+            let files = r#""src/s1.ts","src/q1.mts","src/c1.cts""#;
+            let auto = detection_config(None, files);
+            session(
+                &[
+                    ("tsconfig.json", &auto),
+                    ("src/s1.ts", "const one: number = 1;\n"),
+                    ("src/q1.mts", "const q: number = 1;\n"),
+                    ("src/c1.cts", "const c: number = 1;\n"),
+                ],
+                &["--build", "--watch", "--pretty", "false"],
+                &[
+                    ("src/q1.mts", "const q: number = 11;\n"),
+                    ("src/c1.cts", "const c: number = 11;\n"),
+                    ("tsconfig.json", &detection_config(Some("force"), files)),
+                    ("tsconfig.json", &auto),
+                ],
+                |i, out| {
+                    assert!(
+                        out.contains("Found 0 errors. Watching for file changes."),
+                        "edit {i}: {out}"
+                    );
+                    let expected = match i {
+                        // q1.mts v2, then c1.cts v2.
+                        0 => (1, 0),
+                        1 => (2, 0),
+                        // `auto` already forces q1.mts and c1.cts by their
+                        // extension, so their kept v2 stay with `force`
+                        // and back. Only s1.ts is parsed again, and its
+                        // `force` parse goes at the edit back. Before, q1
+                        // and c1 were parsed again at both edits.
+                        2 => (3, 0),
+                        _ => (4, 1),
+                    };
+                    assert_eq!(file_versions(expected.1), expected, "edit {i}");
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn build_watch_keeps_the_parses_of_a_project_whose_config_stays() {
+    run_test_in_child(
+        "tsctests::watch_build_kept_versions::build_watch_keeps_the_parses_of_a_project_whose_config_stays",
+        || {
+            let project = |detection: &str, files: &str| {
+                format!(
+                    r#"{{"compilerOptions":{{"composite":true,"strict":true,"outDir":"out","rootDir":"src","types":[],"lib":["es5"]{detection}}},"files":[{files}]}}"#
+                )
+            };
+            // Projects `a` and `b` do not reference each other.
+            session(
+                &[
+                    (
+                        "tsconfig.json",
+                        r#"{"files":[],"references":[{"path":"./a"},{"path":"./b"}]}"#,
+                    ),
+                    ("a/tsconfig.json", &project("", r#""src/s.ts""#)),
+                    ("b/tsconfig.json", &project("", r#""src/s.ts","src/m.ts""#)),
+                    ("a/src/s.ts", "const a: number = 1;\n"),
+                    ("b/src/s.ts", "const b: number = 1;\n"),
+                    ("b/src/m.ts", "export const m: number = 1;\n"),
+                ],
+                &["--build", "--watch", "--pretty", "false"],
+                &[
+                    ("b/src/s.ts", "const b: number = 11;\n"),
+                    (
+                        "a/tsconfig.json",
+                        &project(r#","moduleDetection":"force""#, r#""src/s.ts""#),
+                    ),
+                    ("b/src/m.ts", "export const m: number = 11;\n"),
+                ],
+                |i, out| {
+                    assert!(
+                        out.contains("Found 0 errors. Watching for file changes."),
+                        "edit {i}: {out}"
+                    );
+                    let expected = match i {
+                        // b/src/s.ts v2.
+                        0 => (1, 0),
+                        // `force` in `a` parses a/src/s.ts again. The kept
+                        // b/src/s.ts v2 is not a file of `a`, so it stays.
+                        // Before, it went.
+                        1 => (2, 0),
+                        // b/src/m.ts v2. The build of `b` takes the kept
+                        // b/src/s.ts v2. Before, it parsed it again.
+                        _ => (3, 0),
                     };
                     assert_eq!(file_versions(expected.1), expected, "edit {i}");
                 },
