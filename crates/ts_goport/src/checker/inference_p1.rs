@@ -43,32 +43,26 @@ pub type InferenceVisitedMap = FlatMap<InferenceKey, InferencePriority>;
 /// PORT: perf. Not in Go. `stack_recursion_id` as one word, so the inference
 /// stacks store and compare ids with plain 8-byte moves. 0 is `None`. A node
 /// handle has nonzero low 32 bits, so it is its own key. A symbol or type
-/// id goes in the high 32 bits with zero low bits: a type as its id with
-/// bit 31 set; a symbol as its id with bit 31 clear and bit 30 for the
-/// checker's own symbols (`OWN`, which merged globals such as `Array` and
-/// `Promise` are). An id that does not fit (a node with zero low bits, a nil
-/// symbol, a type id of 2^31 or more, or a symbol index of 2^30 or more in
-/// its part) is stored as `None`. Such an entry is not a mapped type, an
-/// indexed access or an intersection, so `has_matching_recursion_identity`
-/// on it only compares `get_recursion_identity_from_target` and gives the
-/// same answer.
+/// id goes in the high 32 bits with zero low bits: a symbol as its id, a
+/// type as its id with bit 31 set. An id that does not fit (a node with
+/// zero low bits, a nil symbol, or a symbol or type id of 2^31 or more) is
+/// stored as `None`. Such an entry is not a mapped type, an indexed access
+/// or an intersection, so `has_matching_recursion_identity` on it only
+/// compares `get_recursion_identity_from_target` and gives the same answer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecursionKey(u64);
 
 impl RecursionKey {
     pub const NONE: Self = Self(0);
     const TYPE_BIT: u32 = 1 << 31;
-    /// The bit of a symbol key that holds `OWN`.
-    const OWN_BIT: u32 = 1 << 30;
 
     #[inline]
     #[must_use]
     pub fn new(id: Option<RecursionId>) -> Self {
         match id {
             Some(RecursionId::Node(n)) if n.0 as u32 != 0 => Self(n.0),
-            // `OWN` moves to bit 30, so bit 30 of the id must be clear.
-            Some(RecursionId::Symbol(s)) if s.0 != 0 && s.0 & Self::OWN_BIT == 0 => {
-                Self(u64::from(s.0 & !OWN | (s.0 & OWN) >> 1) << 32)
+            Some(RecursionId::Symbol(s)) if s.0 != 0 && s.0 < Self::TYPE_BIT => {
+                Self(u64::from(s.0) << 32)
             }
             Some(RecursionId::Type(t)) if t.0 < Self::TYPE_BIT => {
                 Self(u64::from(t.0 | Self::TYPE_BIT) << 32)
@@ -89,10 +83,7 @@ impl From<RecursionKey> for Option<RecursionId> {
         } else if high & RecursionKey::TYPE_BIT != 0 {
             Some(RecursionId::Type(TypeId(high & !RecursionKey::TYPE_BIT)))
         } else {
-            let own = (high & RecursionKey::OWN_BIT) << 1;
-            Some(RecursionId::Symbol(SymbolId(
-                high & !RecursionKey::OWN_BIT | own,
-            )))
+            Some(RecursionId::Symbol(SymbolId(high)))
         }
     }
 }
@@ -2147,10 +2138,7 @@ mod tests {
             RecursionId::Node(Node((7 << 32) | 3)),
             RecursionId::Node(Node((0xffff_fffe << 32) | 0xffff_ffff)),
             RecursionId::Symbol(SymbolId(1)),
-            RecursionId::Symbol(SymbolId(0x3fff_ffff)),
-            RecursionId::Symbol(SymbolId(OWN)),
-            RecursionId::Symbol(SymbolId(OWN | 1)),
-            RecursionId::Symbol(SymbolId(OWN | 0x3fff_ffff)),
+            RecursionId::Symbol(SymbolId(0x7fff_ffff)),
             RecursionId::Type(TypeId(0)),
             RecursionId::Type(TypeId(1)),
             RecursionId::Type(TypeId(0x7fff_ffff)),
@@ -2167,8 +2155,7 @@ mod tests {
             None,
             Some(RecursionId::Node(Node(5 << 32))),
             Some(RecursionId::Symbol(SymbolId(0))),
-            Some(RecursionId::Symbol(SymbolId(0x4000_0000))),
-            Some(RecursionId::Symbol(SymbolId(OWN | 0x4000_0000))),
+            Some(RecursionId::Symbol(SymbolId(0x8000_0000))),
             Some(RecursionId::Type(TypeId(0x8000_0000))),
         ] {
             assert_eq!(RecursionKey::new(id), RecursionKey::NONE);
@@ -2204,7 +2191,6 @@ mod tests {
             RecursionKey::NONE,
             RecursionKey::new(Some(RecursionId::Node(Node((1 << 32) | 9)))),
             RecursionKey::new(Some(RecursionId::Symbol(SymbolId(9)))),
-            RecursionKey::new(Some(RecursionId::Symbol(SymbolId(OWN | 9)))),
             RecursionKey::new(Some(RecursionId::Type(TypeId(9)))),
             RecursionKey::new(Some(RecursionId::Type(TypeId(10)))),
         ];
@@ -2223,7 +2209,7 @@ mod tests {
                     let key = if r % 1000 < 20 {
                         keys[0]
                     } else {
-                        keys[1 + (r / 100 % 5) as usize]
+                        keys[1 + (r / 100 % 4) as usize]
                     };
                     stack.push(TypeId((r / 1000 % 6) as u32 + 1), key);
                     let has_none = stack.entries.iter().any(|e| e.id == RecursionKey::NONE);

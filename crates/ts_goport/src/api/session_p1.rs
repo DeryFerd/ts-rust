@@ -588,7 +588,7 @@ impl SnapshotData {
 /// (`program::catch_up_checker`): then it holds every binder symbol and
 /// table of a live file version under the index that `owner` has, also a
 /// version bound after `checker` was made. A symbol that `owner` made
-/// (`OWN`) becomes a shadow (`import_symbol`).
+/// (`is_own_index`) becomes a shadow (`import_symbol`).
 pub fn checker_symbol(
     checker: &Rc<RefCell<Checker>>,
     owner: &Rc<RefCell<Checker>>,
@@ -665,7 +665,7 @@ fn import_table(
     table: SymbolTable,
     work: &mut Vec<(SymbolId, SymbolId)>,
 ) -> SymbolTable {
-    if table.is_nil() || table.0 & OWN == 0 {
+    if table.is_nil() || !is_own_index(table.0) {
         return table;
     }
     let entries: Vec<_> = from

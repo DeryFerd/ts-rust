@@ -1704,7 +1704,7 @@ fn bind_files_last_queued_first(lineage: &mut Lineage) {
         .rev()
         .map(|(file, freeable)| {
             let _trace = trace_bind_source_file(file);
-            let mut file_symbols = SymbolArena::new();
+            let mut file_symbols = SymbolArena::new_file();
             let bound = bind_source_file_detached(file, &mut file_symbols);
             (bound, file_symbols, freeable)
         })
@@ -2235,7 +2235,7 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                             let before = bind_thread_fingerprint();
                             let result = std::panic::catch_unwind(|| {
                                 let _trace = trace_bind_source_file(file);
-                                let mut file_symbols = SymbolArena::new();
+                                let mut file_symbols = SymbolArena::new_file();
                                 let bound = bind_source_file_detached(file, &mut file_symbols);
                                 (bound, file_symbols)
                             })

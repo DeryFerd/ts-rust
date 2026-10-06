@@ -1675,10 +1675,10 @@ mod symbol_id_tests {
     use super::*;
 
     /// Two checker arenas made from one binder arena share the ids of the
-    /// binder symbols. Their own symbols (`OWN`) get ids of their own, also
-    /// at one index in both arenas, and no later bind uses their index, so a
-    /// checker that catches up reads the later binder symbol with its
-    /// shared id.
+    /// binder symbols. Their own symbols (`is_own_index`) get ids of their
+    /// own, also at one index in both arenas, and no later bind uses their
+    /// index, so a checker that catches up reads the later binder symbol
+    /// with its shared id.
     #[test]
     fn checker_symbols_have_ids_of_their_own() {
         let mut binder = SymbolArena::new();
@@ -1693,8 +1693,7 @@ mod symbol_id_tests {
             own_first, own_second,
             "the test needs one index for two symbols"
         );
-        assert_eq!(own_first.0 & OWN, OWN);
-        assert_eq!(later.0 & OWN, 0);
+        assert!(is_own_index(own_first.0) && !is_own_index(later.0));
 
         let id_later = get_symbol_id(&second, later);
         let id_own_first = get_symbol_id(&first, own_first);
@@ -1764,7 +1763,7 @@ mod symbol_id_tests {
     /// chunk, so a freed lineage range frees whole id chunks.
     #[test]
     fn lineage_id_chunks_are_symbol_chunks() {
-        let mut arena = SymbolArena::new();
+        let mut arena = SymbolArena::new_file();
         arena.new_symbol(SymbolFlags::NONE, "a");
         arena.end_chunk();
         assert_eq!(arena.symbol_count(), LINEAGE_ID_CHUNK);
