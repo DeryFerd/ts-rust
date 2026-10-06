@@ -4,6 +4,7 @@
 //! PORT: Go `opts.Tracing` is the process tracing session
 //! (`crate::tracing::get`).
 
+use super::files_parser::{TakenParse, count_prep, note_prep_taken};
 use crate::contentmapper::{
     DiagnosticDirectiveError, DiagnosticDirectiveErrorKind, InitializeError, InitializeErrorKind,
     InvalidVirtualExtensionError, Mapper, ProjectError, ProjectErrorKind,
@@ -77,6 +78,12 @@ pub struct FileLoader {
     /// parse are kept for the next loads (`import_names`).
     // PORT: not in Go (perf).
     pub keeps_import_names: bool,
+    /// The lookup logs of the worker answers that the load took from a
+    /// prep (`FilePrep`, `WorkerMeta`), by the address of each log: each
+    /// is noted once (`note_worker_logs`). The shared cache holds every
+    /// such log during the load, so no address is used twice.
+    // PORT: not in Go (loadpar1).
+    pub noted_worker_logs: RefCell<FxHashSet<usize>>,
 
     // contentMapperMu guards the content-mapper bookkeeping below, which is written concurrently as
     // content-mapped files are parsed across worker goroutines.
@@ -254,6 +261,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         path_for_lib_file_resolutions: RefCell::new(FxHashMap::default()),
         shared_resolution: None,
         keeps_import_names: false,
+        noted_worker_logs: RefCell::new(FxHashSet::default()),
         content_mapper_failures: RefCell::new(FxHashMap::default()),
         content_mapper_init_failed: RefCell::new(FxHashSet::default()),
         content_mapper_diagnostics: RefCell::new(Vec::new()),
@@ -1518,7 +1526,11 @@ impl FileLoader {
     // checker/types.rs. It is reused here.
 
     // Go: fileloader.go:830 (*fileLoader).resolveImportsAndModuleAugmentations
-    pub fn resolve_imports_and_module_augmentations(&self, t: &mut ParseTask) {
+    pub(crate) fn resolve_imports_and_module_augmentations(
+        &self,
+        t: &mut ParseTask,
+        prep: Option<TakenParse>,
+    ) {
         let _trace = crate::tracing::get().map(|tr| {
             let containing_file_name = t
                 .file
@@ -1542,13 +1554,6 @@ impl FileLoader {
         let mut module_names: Vec<Node> =
             Vec::with_capacity(file.imports.len() + file.module_augmentations.len() + 2);
 
-        // PORT: Go `ast.IsSourceFileJS(file)` and `ast.IsExternalModule(file)`
-        // read the `ast.SourceFile` fields. The crate versions read
-        // `source_file_info`, which does not exist during load, so the
-        // fields of `ParsedSourceFile` are read here.
-        let is_java_script_file = file.is_js();
-        let is_external_module_file = file.external_module_indicator.is_some();
-
         let (redirect, file_name) = self
             .project_reference_file_mapper
             .borrow()
@@ -1558,31 +1563,20 @@ impl FileLoader {
             .map(|r| r as &dyn ModuleResolvedProjectReference);
         let options_for_file =
             get_compiler_options_with_redirect(self.opts.config.compiler_options(), redirect_ref);
-        if is_java_script_file
-            || (!file.is_declaration_file
-                && (options_for_file.get_isolated_modules() || is_external_module_file))
-        {
-            if options_for_file.import_helpers.is_true() {
-                let specifier =
-                    self.create_synthetic_import(EXTERNAL_HELPERS_MODULE_NAME_TEXT, &file);
-                module_names.push(specifier);
-                t.import_helpers_import_specifier = specifier;
-            }
+        let synthetic = SyntheticImports::of(&file, &options_for_file);
+        if synthetic.helpers {
+            let specifier = self.create_synthetic_import(EXTERNAL_HELPERS_MODULE_NAME_TEXT, &file);
+            module_names.push(specifier);
+            t.import_helpers_import_specifier = specifier;
         }
 
-        if is_java_script_file || file.script_kind == ScriptKind::TSX {
-            let jsx_import = get_jsx_runtime_import(
-                &get_jsx_implicit_import_base_of_file(&options_for_file, &file),
-                &options_for_file,
-            );
-            if !jsx_import.is_empty() {
-                let specifier = self.create_synthetic_import(&jsx_import, &file);
-                module_names.push(specifier);
-                t.jsx_runtime_import_specifier = Some(Rc::new(JsxRuntimeImportSpecifier {
-                    module_reference: jsx_import,
-                    specifier,
-                }));
-            }
+        if !synthetic.jsx.is_empty() {
+            let specifier = self.create_synthetic_import(&synthetic.jsx, &file);
+            module_names.push(specifier);
+            t.jsx_runtime_import_specifier = Some(Rc::new(JsxRuntimeImportSpecifier {
+                module_reference: synthetic.jsx.clone(),
+                specifier,
+            }));
         }
 
         let imports_start = module_names.len() as i32;
@@ -1600,6 +1594,26 @@ impl FileLoader {
         }
 
         if !module_names.is_empty() {
+            // PERF (loadpar1): the answers that the parse worker of this
+            // file resolved, when it resolved for this loader. Else every
+            // name resolves here, as in Go.
+            let prep = prep
+                .filter(|_| self.shared_resolution.is_some() && crate::tracing::get().is_none())
+                .and_then(TakenParse::take_prep)
+                .filter(|prep| {
+                    let usable = prep.fits(
+                        &meta,
+                        redirect_ref.map_or("", |r| r.config_name()),
+                        &file_name,
+                        &synthetic,
+                        file.imports.len(),
+                    );
+                    if !usable {
+                        count_prep(|c| c.preps_unfit += 1);
+                    }
+                    usable
+                });
+            let (mut names_taken, mut names_own) = (0, 0);
             let mut resolutions_in_file: ModeAwareCache<Arc<ResolvedModule>> =
                 ModeAwareCache::default();
             resolutions_in_file.reserve(module_names.len());
@@ -1630,17 +1644,33 @@ impl FileLoader {
                     Some(&options_for_file),
                     &mut file_emit_mode,
                 );
-                let (resolved_module, trace, err) = self.resolver().resolve_module_name(
-                    module_name,
-                    &file_name,
-                    mode,
-                    redirect_ref,
-                );
-                if let Some(err) = err {
-                    self.note_module_resolution_error(err);
-                }
+                // The worker resolved name `index` with one mode for the
+                // whole file (`guess_import_mode`): most names have it.
+                let taken = prep
+                    .as_ref()
+                    .and_then(|prep| prep.answer(index, mode))
+                    .map(|answer| {
+                        self.note_worker_logs(&answer.package_jsons, &answer.lookups);
+                        answer.value.clone()
+                    });
                 let resolved_module =
-                    resolved_module.unwrap_or_else(|| Arc::new(ResolvedModule::default()));
+                    match taken {
+                        Some(resolved_module) => {
+                            names_taken += 1;
+                            resolved_module
+                        }
+                        None => {
+                            names_own += 1;
+                            let (resolved_module, trace, err) = self
+                                .resolver()
+                                .resolve_module_name(module_name, &file_name, mode, redirect_ref);
+                            if let Some(err) = err {
+                                self.note_module_resolution_error(err);
+                            }
+                            resolutions_trace.extend(trace);
+                            resolved_module.unwrap_or_else(|| Arc::new(ResolvedModule::default()))
+                        }
+                    };
                 resolutions_in_file.insert(
                     ModeAwareCacheKey {
                         name: module_name.to_string(),
@@ -1648,7 +1678,6 @@ impl FileLoader {
                     },
                     resolved_module.clone(),
                 );
-                resolutions_trace.extend(trace);
 
                 if !resolved_module.is_resolved() {
                     continue;
@@ -1715,8 +1744,46 @@ impl FileLoader {
                 }
             }
 
+            if prep.is_some() {
+                note_prep_taken();
+                count_prep(|c| {
+                    c.preps_taken += 1;
+                    c.names_taken += names_taken;
+                    c.names_own += names_own;
+                });
+            }
             t.resolutions_in_file = resolutions_in_file;
             t.resolutions_trace = resolutions_trace;
+        }
+    }
+
+    /// Notes the lookup logs of a worker answer that the load took from a
+    /// prep, once per log (`noted_worker_logs`): the package.json lookups
+    /// for the build info, and the `tsc -b` stat lookups for the build
+    /// host's cache, as the resolver notes a shared answer that it reads.
+    // PORT: not in Go (loadpar1).
+    pub(crate) fn note_worker_logs(
+        &self,
+        package_jsons: &Arc<[PackageJsonLookup]>,
+        lookups: &Option<Arc<[StatLookup]>>,
+    ) {
+        let Some(resolver) = self
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.as_default_resolver())
+        else {
+            return;
+        };
+        let mut noted = self.noted_worker_logs.borrow_mut();
+        if !package_jsons.is_empty()
+            && noted.insert(Arc::as_ptr(package_jsons) as *const () as usize)
+        {
+            resolver.caches.note_worker_package_jsons(package_jsons);
+        }
+        if let Some(lookups) = lookups.as_ref().filter(|lookups| !lookups.is_empty())
+            && noted.insert(Arc::as_ptr(lookups) as *const () as usize)
+        {
+            resolver.caches.note_worker_lookups(&Some(lookups.clone()));
         }
     }
 
@@ -1856,6 +1923,18 @@ pub(crate) fn source_file_meta_data(
         .as_default_resolver()
         .and_then(|default| default.caches.package_scope_ahead(&directory, find))
         .unwrap_or_else(find);
+    meta_of_package_scope(package_json_scope, options, file_name)
+}
+
+/// The metadata of `file_name` in the package scope `package_json_scope`
+/// (`source_file_meta_data` after its scope lookup). A parse worker finds
+/// the scope of a directory once for all its files (`FilePrep`).
+// Go: fileloader.go:384 (*fileLoader).loadSourceFileMetaData
+pub(crate) fn meta_of_package_scope(
+    package_json_scope: Option<PackageScope>,
+    options: &CompilerOptions,
+    file_name: &str,
+) -> SourceFileMetaData {
     let module_resolution_kind = options.get_module_resolution_kind();
 
     let mut package_json_type = String::new();
@@ -2257,6 +2336,52 @@ pub(crate) fn guess_import_mode(
     ModuleKind::NONE
 }
 
+/// The synthetic imports of a file (Go `resolveImportsAndModuleAugmentations`,
+/// before its imports): `tslib` for `importHelpers`, then the JSX runtime
+/// import. The parse worker of the file resolves them too (`FilePrep`).
+// Go: fileloader.go:844 to :862 (resolveImportsAndModuleAugmentations)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SyntheticImports {
+    /// The file gets the `tslib` import (`EXTERNAL_HELPERS_MODULE_NAME_TEXT`).
+    pub helpers: bool,
+    /// The JSX runtime import, or empty.
+    pub jsx: String,
+}
+
+impl SyntheticImports {
+    /// The synthetic imports of `file` with the options of the file
+    /// (with its project reference redirect).
+    pub(crate) fn of(file: &ParsedSourceFile, options_for_file: &CompilerOptions) -> Self {
+        // PORT: Go `ast.IsSourceFileJS(file)` and `ast.IsExternalModule(file)`
+        // read the `ast.SourceFile` fields. The crate versions read
+        // `source_file_info`, which does not exist during load, so the
+        // fields of `ParsedSourceFile` are read here.
+        let is_java_script_file = file.is_js();
+        let is_external_module_file = file.external_module_indicator.is_some();
+        let helpers = (is_java_script_file
+            || (!file.is_declaration_file
+                && (options_for_file.get_isolated_modules() || is_external_module_file)))
+            && options_for_file.import_helpers.is_true();
+        let jsx = if is_java_script_file || file.script_kind == ScriptKind::TSX {
+            get_jsx_runtime_import(
+                &get_jsx_implicit_import_base_of_file(options_for_file, file),
+                options_for_file,
+            )
+        } else {
+            String::new()
+        };
+        SyntheticImports { helpers, jsx }
+    }
+
+    /// The module names, in their order.
+    pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+        self.helpers
+            .then_some(EXTERNAL_HELPERS_MODULE_NAME_TEXT)
+            .into_iter()
+            .chain((!self.jsx.is_empty()).then_some(self.jsx.as_str()))
+    }
+}
+
 /// Go `ast.GetJSXImplicitImportBase(options, file)` for a file that is still
 /// loading.
 // PORT: the crate `get_jsx_implicit_import_base` reads the pragmas through
@@ -2294,6 +2419,7 @@ pub(crate) fn get_jsx_implicit_import_base_of_file(
 
 #[cfg(test)]
 mod tests {
+    use super::super::files_parser::{preps_taken, set_load_prep};
     use super::*;
     use crate::frontend::bundled;
     use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
@@ -2366,6 +2492,256 @@ mod tests {
                 None => get_base_file_name(file.file_name()),
             })
             .collect()
+    }
+
+    /// Writes `files` and a tsconfig.json with `tsconfig` to a temp dir,
+    /// loads the program with parse workers (not single threaded), and
+    /// returns what the load found, as text: the files in program order,
+    /// the metadata, module and type reference resolutions (in map order)
+    /// and include reasons of each file, the synthetic imports, the
+    /// processing diagnostics, the missing files and the package.json
+    /// entries of the resolver.
+    fn parallel_load(label: &str, tsconfig: &str, files: &[(&str, &str)]) -> String {
+        use std::fmt::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_file_loader_{label}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (path, text) in files {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        std::fs::write(dir.join("tsconfig.json"), tsconfig).unwrap();
+        let cwd = dir.to_string_lossy().replace('\\', "/");
+        let fs = bundled::wrap_fs(osvfs_fs());
+        let sys = System {
+            fs: fs.clone(),
+            current_directory: cwd.clone(),
+        };
+        let (config, errors) = get_parsed_command_line_of_config_file(
+            &format!("{cwd}/tsconfig.json"),
+            None,
+            None,
+            &sys,
+            None,
+        );
+        assert!(errors.is_empty());
+        let host = new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, None, None);
+        let processed = process_all_program_files(
+            ProgramOptions {
+                host,
+                config: Rc::new(config.unwrap()),
+                use_source_of_project_reference: false,
+                single_threaded: Tristate::False,
+                typings_location: String::new(),
+                project_name: String::new(),
+                create_module_resolver: None,
+                skip_module_resolution: false,
+            },
+            false,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut out = String::new();
+        let name = |file_name: &str| file_name.replace(&cwd, "<dir>");
+        for file in &processed.files {
+            let path = file.path();
+            writeln!(out, "file {}", name(file.file_name())).unwrap();
+            let meta = format!("{:?}", processed.source_file_meta_datas.get(path));
+            writeln!(out, "  meta {}", name(&meta)).unwrap();
+            for (key, resolved) in processed.resolved_modules.get(path).into_iter().flatten() {
+                writeln!(
+                    out,
+                    "  module {:?} {:?} -> {} {:?} external {} package {}",
+                    key.name,
+                    key.mode,
+                    name(&resolved.resolved_file_name),
+                    resolved.extension,
+                    resolved.is_external_library_import,
+                    resolved.package_id.string(),
+                )
+                .unwrap();
+            }
+            for (key, resolved) in processed
+                .type_resolutions_in_file
+                .get(path)
+                .into_iter()
+                .flatten()
+            {
+                writeln!(
+                    out,
+                    "  type {:?} {:?} -> {}",
+                    key.name,
+                    key.mode,
+                    name(&resolved.resolved_file_name)
+                )
+                .unwrap();
+            }
+            for reason in processed
+                .include_processor
+                .file_include_reasons
+                .get(path)
+                .into_iter()
+                .flatten()
+            {
+                let data = match &reason.data {
+                    FileIncludeData::ReferencedFile(data) => format!(
+                        "{} #{} synthetic {}",
+                        name(&data.file.0),
+                        data.index,
+                        data.synthetic.is_some()
+                    ),
+                    other => format!("{other:?}"),
+                };
+                writeln!(out, "  reason {:?} {data}", reason.kind).unwrap();
+            }
+            let jsx = processed
+                .jsx_runtime_import_specifiers
+                .as_ref()
+                .and_then(|map| map.get(path))
+                .map(|jsx| jsx.module_reference.clone());
+            let helpers = processed
+                .import_helpers_import_specifiers
+                .as_ref()
+                .is_some_and(|map| map.contains_key(path));
+            writeln!(out, "  jsx {jsx:?} helpers {helpers}").unwrap();
+        }
+        for diagnostic in &processed.include_processor.processing_diagnostics {
+            writeln!(out, "processing diagnostic {:?}", diagnostic.kind.0).unwrap();
+        }
+        writeln!(out, "missing {:?}", processed.missing_files).unwrap();
+        let mut package_jsons = Vec::new();
+        if let Some(resolver) = processed
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.as_default_resolver())
+        {
+            resolver.package_json_cache_entries(|_, entry| {
+                package_jsons.push(format!(
+                    "{} {} {}",
+                    name(entry.package_directory),
+                    entry.directory_exists,
+                    entry.exists
+                ));
+                true
+            });
+        }
+        package_jsons.sort();
+        package_jsons.dedup();
+        writeln!(out, "package.json {package_jsons:?}").unwrap();
+        out
+    }
+
+    // loadpar1: the parse workers resolve each file's synthetic imports and
+    // imports for the loader (`FilePrep`). A load that takes their answers
+    // finds what a load that resolves every name itself finds, in the same
+    // order: node16 modes from package.json `type`, `.cts` and `.mts`,
+    // `require`, `import()` (another mode than the worker's), type-only
+    // imports with `resolution-mode`, JSDoc imports in TS and JS files,
+    // `importHelpers`, the JSX runtime import, `/// <reference types>` and
+    // a module augmentation.
+    #[test]
+    fn worker_prep_gives_the_same_load() {
+        let tsconfig = r#"{ "compilerOptions": { "module": "node16", "allowJs": true,
+             "checkJs": true, "importHelpers": true, "jsx": "react-jsx", "types": [],
+             "noEmit": true }, "include": ["src"] }"#;
+        let files = [
+            ("package.json", r#"{ "name": "app", "type": "commonjs" }"#),
+            ("src/esm/package.json", r#"{ "type": "module" }"#),
+            (
+                "src/esm/a.ts",
+                r#"import { b } from "../b.js";
+import type { T } from "lib" with { "resolution-mode": "require" };
+import { e } from "lib";
+export const a = b + e;
+export type U = T;
+export const later = () => import("../c.cjs");
+"#,
+            ),
+            (
+                "src/b.ts",
+                r#"/// <reference types="node-ish" />
+import x = require("./c.cjs");
+import { e } from "lib";
+export const b: number = x.c + e;
+export const lazy = () => import("lib");
+declare module "lib" { export const extra: number; }
+"#,
+            ),
+            ("src/c.cts", "export const c = 1;\n"),
+            (
+                "src/d.mts",
+                "import { e } from \"lib\";\nexport const d = e;\n",
+            ),
+            (
+                "src/j.js",
+                r#"/** @import { T } from "lib" */
+const { c } = require("./c.cjs");
+/** @type {T} */
+export const j = c;
+"#,
+            ),
+            (
+                "src/k.ts",
+                "/** @import { T } from \"./c.cjs\" */\nexport const k = 1;\n",
+            ),
+            ("src/v.tsx", "export const v = <div />;\n"),
+            (
+                "node_modules/lib/package.json",
+                r#"{ "name": "lib", "version": "1.0.0",
+                   "exports": { ".": { "import": "./esm.d.mts", "require": "./cjs.d.cts" } } }"#,
+            ),
+            (
+                "node_modules/lib/esm.d.mts",
+                "export declare const e: number;\nexport type T = string;\n",
+            ),
+            (
+                "node_modules/lib/cjs.d.cts",
+                "export declare const e: number;\nexport type T = number;\n",
+            ),
+            (
+                "node_modules/tslib/package.json",
+                r#"{ "name": "tslib", "version": "2.0.0", "types": "tslib.d.ts" }"#,
+            ),
+            (
+                "node_modules/tslib/tslib.d.ts",
+                "export declare function __assign(t: any): any;\n",
+            ),
+            (
+                "node_modules/react/package.json",
+                r#"{ "name": "react", "version": "18.0.0",
+                   "exports": { "./jsx-runtime": { "types": "./jsx-runtime.d.ts" } } }"#,
+            ),
+            (
+                "node_modules/react/jsx-runtime.d.ts",
+                r#"export declare function jsx(): any;
+export declare namespace JSX { interface IntrinsicElements { [name: string]: any } }
+"#,
+            ),
+            (
+                "node_modules/@types/node-ish/package.json",
+                r#"{ "name": "@types/node-ish", "version": "1.0.0", "types": "index.d.ts" }"#,
+            ),
+            (
+                "node_modules/@types/node-ish/index.d.ts",
+                "declare var nodeIsh: number;\n",
+            ),
+        ];
+        set_load_prep(Some(true));
+        let before = preps_taken();
+        let with_prep = parallel_load("prep_on", tsconfig, &files);
+        let taken = preps_taken() - before;
+        set_load_prep(Some(false));
+        let without_prep = parallel_load("prep_off", tsconfig, &files);
+        set_load_prep(None);
+        assert_eq!(with_prep, without_prep);
+        assert!(with_prep.contains(r#"module "lib""#), "{with_prep}");
+        // With no parse workers (one CPU, or `GOPORT_PARSE_THREADS=0`) the
+        // loader resolves every name itself.
+        if super::super::files_parser::parse_workers_enabled() {
+            assert!(taken > 0, "no prep taken:\n{with_prep}");
+        }
     }
 
     /// Loads a one-file project with `compilerOptions` and returns the base

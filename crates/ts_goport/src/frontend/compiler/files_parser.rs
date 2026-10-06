@@ -1,9 +1,11 @@
 //! Go: compiler/filesparser.go (parse tasks, the files parser and
 //! `getProcessedFiles`).
 
+use super::file_loader::SyntheticImports;
 use crate::frontend::prelude::*;
 use crate::gostd::slices::stable_sort_by;
 use crate::program::ThreadBudget;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -130,10 +132,14 @@ impl ParseTask {
                 ..Default::default()
             };
         } else {
-            self.metadata = loader.load_source_file_meta_data(&self.normalized_file_path);
+            // PERF (loadpar1): the metadata that the parse worker of the
+            // file found, when it found it for this loader.
+            self.metadata = take_prefetched_meta(loader, &self.normalized_file_path)
+                .unwrap_or_else(|| loader.load_source_file_meta_data(&self.normalized_file_path));
         }
 
         // tsgo#4712: a content mapper supplemental task comes with its file.
+        TAKEN.with(|taken| taken.borrow_mut().take());
         let file = match self.file.clone() {
             Some(file) => Some(file),
             None => loader.parse_source_file(self),
@@ -141,6 +147,8 @@ impl ParseTask {
         let Some(file) = file else {
             return;
         };
+        // The worker parse that `parse_source_file` took, if `file` is it.
+        let taken = TakenParse::of(&file);
 
         self.file = Some(file.clone());
         let virtual_file_name = file.virtual_file_name();
@@ -204,7 +212,7 @@ impl ParseTask {
             }
         }
 
-        loader.resolve_imports_and_module_augmentations(self);
+        loader.resolve_imports_and_module_augmentations(self, taken);
         // tsgo#4712
         for supplemental in file.supplemental_source_files() {
             self.sub_tasks.push(Rc::new(RefCell::new(ParseTask {
@@ -1408,6 +1416,9 @@ struct PrefetchJob {
     freeable: bool,
     state: Mutex<PrefetchState>,
     done: Condvar,
+    /// What the worker that parsed the file resolved for the loader after
+    /// the parse (`FilePrep`), once it is there.
+    prep: Mutex<Option<Box<FilePrep>>>,
 }
 
 enum PrefetchState {
@@ -1426,6 +1437,192 @@ struct PrefetchResult {
     /// The parse of `text`. `None`: the parse is not usable (it made
     /// thread-local state, or it panicked).
     parse: Option<DetachedParse>,
+    /// The metadata that the worker found before the parse and parsed
+    /// with, when the loader takes worker answers (`take_prefetched_meta`).
+    meta: Option<WorkerMeta>,
+}
+
+/// Go `loadSourceFileMetaData` of a file on its parse worker: the metadata,
+/// and the lookup logs of the package scope walk of its directory
+/// (`SharedResolutionCache::store_scope`), which the loader notes when it
+/// takes the metadata, as for a shared answer.
+// PORT: not in Go (loadpar1). Go finds the metadata in the parse task.
+#[derive(Clone)]
+struct WorkerMeta {
+    meta: SourceFileMetaData,
+    package_jsons: Arc<[PackageJsonLookup]>,
+    lookups: Option<Arc<[StatLookup]>>,
+}
+
+/// What the parse worker of a file resolved for the loader, after the
+/// parse, with the shared resolution cache: the answer of each synthetic
+/// import and each import of the file (Go `resolveImportsAndModuleAugmentations`),
+/// with the inputs that it resolved them with. The loader takes an answer
+/// only when these inputs are its own (`fits`) and the name has the mode
+/// that the worker used (`answer`); it still builds the subtasks, the
+/// synthetic nodes and the per-file maps itself, in the queue order.
+// PORT: not in Go (loadpar1). Go resolves in each parse task, which runs
+// on its own goroutine; here the loader runs the tasks in order on one
+// thread, so the resolutions run ahead on the workers.
+pub(crate) struct FilePrep {
+    meta: SourceFileMetaData,
+    /// The config name of the project reference redirect, or empty.
+    redirect: String,
+    /// The containing file of the resolutions (Go `getRedirectForResolution`).
+    containing_file: String,
+    synthetic: SyntheticImports,
+    /// The number of `file.imports`.
+    imports: usize,
+    /// The mode of every answer: Go `getModeForUsageLocation` of a plain
+    /// `import .. from` in the file (`guess_import_mode`). The worker
+    /// cannot read the import nodes (`DetachedParse::import_specifiers`).
+    mode: ResolutionMode,
+    /// The synthetic imports, then the imports, by module name index.
+    /// `None` for an empty name.
+    answers: Vec<Option<SharedResolution<Arc<ResolvedModule>>>>,
+}
+
+impl FilePrep {
+    /// True when the worker resolved with the loader's inputs: the
+    /// metadata, the redirect and the containing file, the same synthetic
+    /// imports and import count.
+    pub(crate) fn fits(
+        &self,
+        meta: &SourceFileMetaData,
+        redirect: &str,
+        containing_file: &str,
+        synthetic: &SyntheticImports,
+        imports: usize,
+    ) -> bool {
+        self.meta == *meta
+            && self.redirect == redirect
+            && self.containing_file == containing_file
+            && self.synthetic == *synthetic
+            && self.imports == imports
+            && self.answers.len() == synthetic.names().count() + imports
+    }
+
+    /// The worker answer of module name `index` (the synthetic imports,
+    /// then the imports), when the loader resolves it with `mode`.
+    pub(crate) fn answer(
+        &self,
+        index: usize,
+        mode: ResolutionMode,
+    ) -> Option<&SharedResolution<Arc<ResolvedModule>>> {
+        if mode != self.mode {
+            return None;
+        }
+        self.answers.get(index)?.as_ref()
+    }
+}
+
+/// The job of the worker parse that the loader took for the file that it
+/// loads now (`take_prefetched`, `ParseTask::load`).
+pub(crate) struct TakenParse(Arc<PrefetchJob>);
+
+impl TakenParse {
+    /// The job whose parse `take_prefetched` gave last, when `file` is
+    /// that parse (the host gave it as it is).
+    fn of(file: &ParsedSourceFile) -> Option<Self> {
+        TAKEN
+            .with(|taken| taken.borrow_mut().take())
+            .filter(|(_, root)| *root == file.root)
+            .map(|(job, _)| TakenParse(job))
+    }
+
+    /// The prep of the file, when its worker has published it. The loader
+    /// does not wait for a worker that still resolves (or makes no prep):
+    /// it resolves the names itself, and reads each answer that the worker
+    /// has stored in the shared cache by then, so it is not later than the
+    /// worker.
+    pub(crate) fn take_prep(self) -> Option<Box<FilePrep>> {
+        let prep = lock(&self.0.prep).take();
+        if prep.is_none() {
+            count_prep(|c| c.preps_missing += 1);
+        }
+        prep
+    }
+}
+
+/// The metadata of `file_name` that its parse worker found, when the
+/// loader takes worker answers (`WorkerMeta`). Waits for a running worker
+/// parse, as `take_prefetched` does. `None`: the loader finds it.
+// PORT: not in Go (loadpar1).
+fn take_prefetched_meta(loader: &FileLoader, file_name: &str) -> Option<SourceFileMetaData> {
+    if loader.shared_resolution.is_none() || loader.opts.skip_module_resolution {
+        return None;
+    }
+    let shared = PREFETCH.with(|p| p.borrow().clone())?;
+    let job = lock(&shared.queue).by_name.get(file_name).cloned()?;
+    let mut state = lock(&job.state);
+    let mut waited: Option<std::time::Instant> = None;
+    let meta = loop {
+        match &*state {
+            PrefetchState::Running => {
+                waited.get_or_insert_with(std::time::Instant::now);
+                state = job
+                    .done
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            PrefetchState::Done(Some(result)) => break result.meta.clone(),
+            _ => break None,
+        }
+    };
+    drop(state);
+    shared.count(|c| {
+        if let Some(start) = waited {
+            c.waited += 1;
+            c.wait += start.elapsed();
+        }
+        if meta.is_some() {
+            c.meta_taken += 1;
+        }
+    });
+    let meta = meta?;
+    loader.note_worker_logs(&meta.package_jsons, &meta.lookups);
+    Some(meta.meta)
+}
+
+thread_local! {
+    /// A test's choice of `load_prep_enabled` for its loads on this thread.
+    static LOAD_PREP: Cell<Option<bool>> = const { Cell::new(None) };
+    /// The preps that loads on this thread took (`FilePrep`), for tests.
+    static PREPS_TAKEN: Cell<usize> = const { Cell::new(0) };
+}
+
+/// True when the parse workers of a load on this thread make preps for
+/// the loader (`FilePrep`): unless `GOPORT_LOAD_PREP` is `0` (an A/B
+/// switch), or a test chose (`set_load_prep`).
+fn load_prep_enabled() -> bool {
+    LOAD_PREP
+        .with(Cell::get)
+        .unwrap_or_else(|| std::env::var_os("GOPORT_LOAD_PREP").is_none_or(|value| value != "0"))
+}
+
+/// Sets `load_prep_enabled` for the loads on this thread (tests).
+#[cfg(test)]
+pub(crate) fn set_load_prep(on: Option<bool>) {
+    LOAD_PREP.with(|prep| prep.set(on));
+}
+
+/// The preps that loads on this thread took so far (tests).
+#[cfg(test)]
+pub(crate) fn preps_taken() -> usize {
+    PREPS_TAKEN.with(Cell::get)
+}
+
+/// Notes a prep that the loader took.
+pub(crate) fn note_prep_taken() {
+    PREPS_TAKEN.with(|count| count.set(count.get() + 1));
+}
+
+/// Updates the debug counts of the prefetch of this load
+/// (`GOPORT_PREFETCH_STATS`), when parse workers run.
+pub(crate) fn count_prep(update: impl FnOnce(&mut PrefetchStats)) {
+    if let Some(shared) = PREFETCH.with(|p| p.borrow().clone()) {
+        shared.count(update);
+    }
 }
 
 /// What the loader can take from the parse workers for one file
@@ -1517,6 +1714,7 @@ impl PrefetchQueue {
             freeable,
             state: Mutex::new(PrefetchState::Queued),
             done: Condvar::new(),
+            prep: Mutex::new(None),
         });
         self.next_job += 1;
         self.by_name.insert(job.opts.file_name.clone(), job.clone());
@@ -1628,6 +1826,10 @@ struct WorkerResolveConfig {
     /// references of such a file with the reference's options, from its
     /// source file (`getRedirectForResolution`).
     redirects: FxHashMap<Path, (String, usize)>,
+    /// True when the workers find the metadata of each file and resolve
+    /// its names for the loader (`FilePrep`): the loader takes worker
+    /// answers, and `GOPORT_LOAD_PREP` is not `0`.
+    prep: bool,
 }
 
 impl WorkerResolveConfig {
@@ -1671,6 +1873,7 @@ impl WorkerResolveConfig {
             shared: loader.shared_resolution.clone(),
             references,
             redirects,
+            prep: loader.shared_resolution.is_some() && load_prep_enabled(),
         })
     }
 }
@@ -1694,7 +1897,7 @@ struct PrefetchShared {
 
 /// What `take_prefetched` gave the loader during one program load.
 #[derive(Default)]
-struct PrefetchStats {
+pub(crate) struct PrefetchStats {
     /// Worker parses that the loader took.
     taken: usize,
     /// The files that the loader parsed itself, and why: no worker had
@@ -1710,6 +1913,18 @@ struct PrefetchStats {
     /// text bytes (`PrefetchShared::untaken`).
     untaken: usize,
     untaken_bytes: u64,
+    /// Worker metadata that the loader took (`take_prefetched_meta`).
+    meta_taken: usize,
+    /// Preps that the loader took, and that did not fit (`FilePrep::fits`).
+    pub(crate) preps_taken: usize,
+    pub(crate) preps_unfit: usize,
+    /// Worker parses with no prep when the loader needed it: the worker
+    /// still resolved, or it made none.
+    preps_missing: usize,
+    /// Module names of taken preps with a worker answer, and with none
+    /// (another mode than the worker's).
+    pub(crate) names_taken: usize,
+    pub(crate) names_own: usize,
 }
 
 impl PrefetchStats {
@@ -1749,6 +1964,15 @@ impl PrefetchStats {
                 .map(|(size, name)| format!("{name} {} KB", size / 1024))
                 .collect::<Vec<_>>()
                 .join(", "),
+        );
+        eprintln!(
+            "goport prefetch: took {} worker metadata; preps: took {} ({} names, {} resolved here), unfit {}, missing {}",
+            self.meta_taken,
+            self.preps_taken,
+            self.names_taken,
+            self.names_own,
+            self.preps_unfit,
+            self.preps_missing,
         );
     }
 }
@@ -1803,6 +2027,10 @@ thread_local! {
     /// loader exists. The next `FilesParser::parse` on this thread takes
     /// them.
     static EARLY_POOL: RefCell<Option<PrefetchPool>> = const { RefCell::new(None) };
+
+    /// The job of the worker parse that `take_prefetched` gave last, and
+    /// the root node of the adopted parse (`TakenParse::of`).
+    static TAKEN: RefCell<Option<(Arc<PrefetchJob>, Node)>> = const { RefCell::new(None) };
 }
 
 impl PrefetchShared {
@@ -2023,7 +2251,13 @@ impl PrefetchShared {
     /// file. This follows `ParseTask::load` (`resolve_tripleslash_path_reference`,
     /// `path_for_lib_file`, module resolution); the loader checks every
     /// guess.
-    fn queue_references(&self, fs: &dyn Fs, refs: &FileRefs, resolver: Option<&WorkerResolver>) {
+    fn queue_references(
+        &self,
+        fs: &dyn Fs,
+        refs: &FileRefs,
+        resolver: Option<&WorkerResolver>,
+        prep: Option<(PrepInput, &PrefetchJob)>,
+    ) {
         let config = &self.config;
         let mut names = Vec::new();
         for reference in &refs.referenced_files {
@@ -2052,7 +2286,13 @@ impl PrefetchShared {
             Some(resolver) => {
                 // The references need no resolution, so they queue first.
                 self.queue_names(std::mem::take(&mut names));
-                resolver.resolve(self, refs, &mut names);
+                let (input, job) = prep.unzip();
+                // The loader may need the prep now, so it goes first.
+                if let Some(prep) = resolver.resolve(self, refs, input, &mut names)
+                    && let Some(job) = job
+                {
+                    *lock(&job.prep) = Some(Box::new(prep));
+                }
             }
             None => {
                 for specifier in &refs.import_specifiers {
@@ -2371,27 +2611,6 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
             }
             *state = PrefetchState::Running;
         }
-        // A cached file's job reads nothing: `Done(None)` makes the loader
-        // parse the file itself if it asks for it (a cache miss).
-        let (result, refs) = match &job.cached {
-            Some(refs) => (None, Some(refs.clone())),
-            None => {
-                let mut result = prefetch_parse(&*fs, &job);
-                if result.is_some() {
-                    WORKER_READS.fetch_add(1, AtomicOrdering::Relaxed);
-                }
-                let refs = result
-                    .as_mut()
-                    .and_then(|result| result.parse.as_mut())
-                    .map(|parse| Arc::new(FileRefs::take_from(parse)));
-                (result, refs)
-            }
-        };
-        *lock(&job.state) = PrefetchState::Done(result);
-        job.done.notify_all();
-        let Some(refs) = refs else {
-            continue;
-        };
         if resolver.is_none()
             && !resolver_failed
             && let Some(Some(config)) = shared.resolve.get()
@@ -2403,10 +2622,94 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
                 shared.stats.host.get().is_some(),
             ));
         }
+        // PERF (loadpar1): for a loader that takes worker answers, the
+        // worker finds the file's metadata first, as Go `load` does, and
+        // parses with the options of that metadata. A bundled lib (a lib
+        // task's metadata is a constant) and a cached file get none.
+        let prep_config = match (shared.resolve.get(), &resolver) {
+            (Some(Some(config)), Some(_))
+                if config.prep
+                    && job.cached.is_none()
+                    && bundled_text(&job.opts.file_name).is_none() =>
+            {
+                Some(config)
+            }
+            _ => None,
+        };
+        let meta = match (prep_config, &resolver) {
+            (Some(config), Some(worker)) => {
+                // A lookup that panics (a Go panic) panics on the loader
+                // too. The worker only stops resolving.
+                let meta = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    worker.meta(config, &job.opts.file_name)
+                }));
+                meta.unwrap_or_else(|_| {
+                    resolver = None;
+                    resolver_failed = true;
+                    None
+                })
+            }
+            _ => None,
+        };
+        // A cached file's job reads nothing: `Done(None)` makes the loader
+        // parse the file itself if it asks for it (a cache miss).
+        let (result, refs, synthetic) = match &job.cached {
+            Some(refs) => (None, Some(refs.clone()), None),
+            None => {
+                let opts =
+                    meta.as_ref()
+                        .zip(prep_config)
+                        .map(|(meta, config)| SourceFileParseOptions {
+                            external_module_indicator_options:
+                                get_external_module_indicator_options(
+                                    &job.opts.file_name,
+                                    &config.options,
+                                    &meta.meta,
+                                ),
+                            ..job.opts.clone()
+                        });
+                let mut result = prefetch_parse(&*fs, &job, opts.as_ref().unwrap_or(&job.opts));
+                if let Some(result) = &mut result {
+                    WORKER_READS.fetch_add(1, AtomicOrdering::Relaxed);
+                    result.meta = meta.clone();
+                }
+                let (refs, synthetic) = match result
+                    .as_mut()
+                    .and_then(|result| result.parse.as_mut())
+                {
+                    Some(parse) => {
+                        // The synthetic imports read the parse, which
+                        // the loader takes.
+                        let synthetic = meta.as_ref().and(resolver.as_ref()).zip(prep_config).map(
+                            |(resolver, config)| {
+                                resolver.synthetic_imports(config, &job.opts.path, &parse.file)
+                            },
+                        );
+                        (Some(Arc::new(FileRefs::take_from(parse))), synthetic)
+                    }
+                    None => (None, None),
+                };
+                (result, refs, synthetic)
+            }
+        };
+        *lock(&job.state) = PrefetchState::Done(result);
+        job.done.notify_all();
+        let Some(refs) = refs else {
+            continue;
+        };
+        let prep = meta.zip(synthetic).map(|(meta, synthetic)| {
+            (
+                PrepInput {
+                    meta: meta.meta,
+                    synthetic,
+                },
+                &*job,
+            )
+        });
         // A resolution that panics (a Go panic) panics on the loader too
         // when it resolves the same import. The worker only stops resolving.
         let queued = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            shared.queue_references(&*fs, &refs, resolver.as_ref());
+            shared.queue_references(&*fs, &refs, resolver.as_ref(), prep);
         }));
         if queued.is_err() {
             resolver = None;
@@ -2511,19 +2814,97 @@ impl WorkerResolver {
             .clone()
     }
 
+    /// The project reference redirect of the file of `path`: the source
+    /// file and the redirect. Go resolves the references of the output
+    /// `.d.ts` file of a project reference with the reference's options,
+    /// from its source file (`getRedirectForResolution`).
+    fn redirect_of<'c>(
+        &self,
+        config: &'c WorkerResolveConfig,
+        path: &Path,
+    ) -> Option<(&'c str, Rc<WorkerRedirect>)> {
+        config
+            .redirects
+            .get(path)
+            .map(|(source, index)| (source.as_str(), self.redirect(config, *index)))
+    }
+
+    /// Go `loadSourceFileMetaData` of `file_name` with the program's
+    /// options: the scope of its directory comes from the shared cache, or
+    /// the worker finds it and stores it there with its lookup logs.
+    fn meta(&self, config: &WorkerResolveConfig, file_name: &str) -> Option<WorkerMeta> {
+        let cache = config.shared.as_ref()?;
+        let directory = get_directory_path(file_name);
+        let scope = match cache.get_scope(&directory) {
+            Some(scope) => scope,
+            None => {
+                let caches = &self.resolver.caches;
+                caches.start_package_json_log();
+                let value = PackageScope::of(
+                    self.resolver
+                        .get_package_scope_for_path(&directory)
+                        .as_deref(),
+                );
+                let package_jsons = caches.take_package_json_log();
+                let lookups = caches.take_worker_lookup_log();
+                cache.store_scope(
+                    &directory,
+                    SharedResolution {
+                        value,
+                        package_jsons,
+                        lookups,
+                        ahead: None,
+                    },
+                )
+            }
+        };
+        Some(WorkerMeta {
+            meta: super::file_loader::meta_of_package_scope(scope.value, &self.options, file_name),
+            package_jsons: scope.package_jsons,
+            lookups: scope.lookups,
+        })
+    }
+
+    /// The synthetic imports of the parse `file` of `path`, with the
+    /// options of its redirect.
+    fn synthetic_imports(
+        &self,
+        config: &WorkerResolveConfig,
+        path: &Path,
+        file: &ParsedSourceFile,
+    ) -> SyntheticImports {
+        match self.redirect_of(config, path) {
+            Some((_, redirect)) => SyntheticImports::of(file, &redirect.options),
+            None => SyntheticImports::of(file, &self.options),
+        }
+    }
+
     /// Resolves the type reference directives and imports of `refs` as
     /// `ParseTask::load` does (`resolve_type_reference_directives`,
     /// `resolve_imports_and_module_augmentations`), and adds to `names`
     /// the files that the loader would add. The output `.d.ts` file of a
     /// project reference resolves with the reference's options, from its
-    /// source file (Go `getRedirectForResolution`). Stops when the queue
-    /// closes.
-    fn resolve(&self, shared: &PrefetchShared, refs: &FileRefs, names: &mut Vec<String>) {
-        if refs.type_reference_directives.is_empty() && refs.import_specifiers.is_empty() {
-            return;
+    /// source file (`redirect_of`). Stops when the queue closes.
+    ///
+    /// With `prep` (the file's metadata and synthetic imports), the
+    /// synthetic imports resolve too, and the answers go to the loader
+    /// (`FilePrep`). The module names have no import nodes here, so each
+    /// resolves with the mode of a plain import (`guess_import_mode`).
+    fn resolve(
+        &self,
+        shared: &PrefetchShared,
+        refs: &FileRefs,
+        prep: Option<PrepInput>,
+        names: &mut Vec<String>,
+    ) -> Option<FilePrep> {
+        if prep.is_none()
+            && refs.type_reference_directives.is_empty()
+            && refs.import_specifiers.is_empty()
+        {
+            return None;
         }
         let Some(Some(config)) = shared.resolve.get() else {
-            return;
+            return None;
         };
         let file_name = refs.file_name.as_str();
         let redirect = if config.redirects.is_empty() {
@@ -2534,10 +2915,7 @@ impl WorkerResolver {
                 &shared.config.current_directory,
                 shared.config.use_case_sensitive_file_names,
             );
-            config
-                .redirects
-                .get(&path)
-                .map(|(source, index)| (source.as_str(), self.redirect(config, *index)))
+            self.redirect_of(config, &path)
         };
         let (containing_file, options) = match &redirect {
             Some((source, redirect)) => (*source, redirect.options.clone()),
@@ -2545,17 +2923,22 @@ impl WorkerResolver {
         };
         // Another module resolution kind panics in the resolver.
         if !super::file_loader::workers_resolve_imports(&options) {
-            return;
+            return None;
         }
         let redirect = redirect
             .as_ref()
             .map(|(_, redirect)| &**redirect as &dyn ModuleResolvedProjectReference);
-        // Go `loadSourceFileMetaData` reads the program's options.
-        let meta =
-            super::file_loader::source_file_meta_data(&self.resolver, &self.options, file_name);
+        let (meta, synthetic) = match prep {
+            Some(PrepInput { meta, synthetic }) => (meta, Some(synthetic)),
+            // Go `loadSourceFileMetaData` reads the program's options.
+            None => (
+                super::file_loader::source_file_meta_data(&self.resolver, &self.options, file_name),
+                None,
+            ),
+        };
         for reference in &refs.type_reference_directives {
             if shared.is_closed() {
-                return;
+                return None;
             }
             // Go: fileloader.go:1033 getModeForTypeReferenceDirectiveInFile
             let mode = if reference.resolution_mode != RESOLUTION_MODE_NONE {
@@ -2574,16 +2957,45 @@ impl WorkerResolver {
             }
         }
         let mode = super::file_loader::guess_import_mode(file_name, &meta, &options);
-        for specifier in &refs.import_specifiers {
+        // The shared cache keeps the first answer of each key with its
+        // lookup logs: the prep takes that entry.
+        let answers_from = synthetic
+            .as_ref()
+            .and(config.shared.as_deref())
+            .map(|cache| {
+                (
+                    cache,
+                    get_directory_path(containing_file),
+                    get_redirect_config_name(redirect),
+                )
+            });
+        let synthetic_names = synthetic
+            .as_ref()
+            .map_or(0, |synthetic| synthetic.names().count());
+        let mut answers = Vec::with_capacity(synthetic_names + refs.import_specifiers.len());
+        let specifiers = synthetic
+            .iter()
+            .flat_map(SyntheticImports::names)
+            .chain(refs.import_specifiers.iter().map(String::as_str));
+        for specifier in specifiers {
             if shared.is_closed() {
-                return;
+                return None;
             }
             if specifier.is_empty() {
+                answers.push(None);
                 continue;
             }
             let (resolved, _, _) =
                 self.resolver
                     .resolve_module_name(specifier, containing_file, mode, redirect);
+            if let Some((cache, directory, redirect_name)) = &answers_from {
+                answers.push(cache.get_module(&(
+                    directory.as_str(),
+                    specifier,
+                    mode,
+                    redirect_name.as_str(),
+                )));
+            }
             if !resolved.is_resolved() {
                 continue;
             }
@@ -2597,7 +3009,24 @@ impl WorkerResolver {
             }
             names.push(normalize_path(resolved_file_name));
         }
+        let (_, _, redirect) = answers_from?;
+        Some(FilePrep {
+            meta,
+            redirect,
+            containing_file: containing_file.to_string(),
+            synthetic: synthetic?,
+            imports: refs.import_specifiers.len(),
+            mode,
+            answers,
+        })
     }
+}
+
+/// What a parse worker knows of its file for the prep (`FilePrep`) before
+/// it resolves: the metadata and the synthetic imports.
+struct PrepInput {
+    meta: SourceFileMetaData,
+    synthetic: SyntheticImports,
 }
 
 /// The lookups that Go `cachedvfs` caches (all but `Stat`), in maps that
@@ -2963,10 +3392,15 @@ fn guess_relative_import(fs: &dyn Fs, containing: &str, specifier: &str) -> Opti
     candidates.into_iter().find(|name| fs.file_exists(name))
 }
 
-/// Reads and parses the file of `job` into a detached store. The parse is
-/// usable only when it made no thread-local state that the loading thread
-/// would need (synthetic nodes, node ids) and did not panic.
-fn prefetch_parse(fs: &dyn Fs, job: &PrefetchJob) -> Option<PrefetchResult> {
+/// Reads and parses the file of `job` with `opts` (the job's file name and
+/// path) into a detached store. The parse is usable only when it made no
+/// thread-local state that the loading thread would need (synthetic nodes,
+/// node ids) and did not panic.
+fn prefetch_parse(
+    fs: &dyn Fs,
+    job: &PrefetchJob,
+    opts: &SourceFileParseOptions,
+) -> Option<PrefetchResult> {
     // A bundled lib text is embedded, so it needs no copy. Another text is
     // leaked, as the loader's is, except the text of a freeable file
     // version (`FileText::new`).
@@ -2987,7 +3421,7 @@ fn prefetch_parse(fs: &dyn Fs, job: &PrefetchJob) -> Option<PrefetchResult> {
         // the version frees them, and a parse that the loader does not take
         // is freed with the pool.
         let _owned_nodes = job.freeable.then(crate::ast::enter_freeable_parse);
-        parse_source_file_detached(job.job, &job.opts, text.clone(), job.script_kind)
+        parse_source_file_detached(job.job, opts, text.clone(), job.script_kind)
     }));
     let parse = match parse {
         Ok(parse) => (parse.store.is_self_contained()
@@ -2998,7 +3432,11 @@ fn prefetch_parse(fs: &dyn Fs, job: &PrefetchJob) -> Option<PrefetchResult> {
             None
         }
     };
-    Some(PrefetchResult { text, parse })
+    Some(PrefetchResult {
+        text,
+        parse,
+        meta: None,
+    })
 }
 
 /// What the loader can take from the parse workers for the file of
@@ -3049,6 +3487,7 @@ pub fn take_prefetched(
     let Some(PrefetchResult {
         text: worker_text,
         parse,
+        ..
     }) = result
     else {
         return Prefetched::Nothing;
@@ -3071,7 +3510,9 @@ pub fn take_prefetched(
                 == opts.external_module_indicator_options);
     if same {
         shared.count(|c| c.taken += 1);
-        Prefetched::Parse(adopt_detached_parse(parse, opts))
+        let file = adopt_detached_parse(parse, opts);
+        TAKEN.with(|taken| *taken.borrow_mut() = Some((job, file.root)));
+        Prefetched::Parse(file)
     } else {
         unusable();
         Prefetched::Text(worker_text)
