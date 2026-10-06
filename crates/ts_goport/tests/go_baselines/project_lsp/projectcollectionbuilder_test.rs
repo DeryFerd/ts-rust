@@ -728,7 +728,10 @@ child_test! {
     // first program and its host; the port releases the first program at
     // the end of the clone (`Snapshot::clone`,
     // `ProjectCollectionBuilder::made_programs`), and the second program,
-    // which the project keeps, still answers.
+    // which the project keeps, still answers. With push diagnostics on (the
+    // `projecttestutil::setup` default), the queued diagnostics task of a
+    // snapshot holds that snapshot's programs until it runs, as Go's task
+    // keeps its pointer, so the count waits for the background tasks.
     fn project_updated_twice_in_a_clone_releases_its_first_program() {
         const A: &str = "/home/projects/loose/a.ts";
         const A_URI: &str = "file:///home/projects/loose/a.ts";
@@ -749,6 +752,7 @@ child_test! {
         let program = program(&session, A_URI);
         assert!(has_file(&program, B), "b.ts should be a root of the inferred project");
         assert_eq!(sem_diag_count(&program, B), 0);
+        session.wait_for_background_tasks();
         assert_eq!(
             ts_goport::program::ls_program::registered_programs(),
             1,

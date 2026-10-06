@@ -73,6 +73,25 @@ impl SourceFileLease {
     }
 }
 
+/// Not in Go: drops `lease` after its `release`. When it held the last
+/// holder of a freeable parse (no cache entry, other lease or program has
+/// it), the pins of the parse's version go after the answer
+/// (`ast::release_file_version_pins_later`), so the version dies, as Go's GC
+/// frees the leased `*ast.SourceFile`. Without this, the encoder's reads keep
+/// it pinned on this thread until the next program release.
+// PORT: the count sees the holders on this thread only. A version that a
+// worker thread still holds (a program version's tables) dies later, with
+// that holder.
+pub fn drop_released_lease(lease: Rc<SourceFileLease>) {
+    let parsed = Rc::clone(&lease.source_file);
+    drop(lease);
+    let dies = parsed.version.get().is_some() && Rc::strong_count(&parsed) == 1;
+    drop(parsed);
+    if dies {
+        crate::ast::release_file_version_pins_later();
+    }
+}
+
 /// Go `logging.Logger` as the session logger argument of `Snapshot.Clone`,
 /// `cloneForProgram` and `CloneSnapshotWithAutoImports`.
 // PORT: Go passes the session's logger (a non-nil interface, also for the nop
@@ -99,6 +118,12 @@ impl SnapshotHost {
     ) -> Rc<SourceFileLease> {
         let file_handle = new_cached_file_handle(&options.file_name, text.to_string());
         let key = new_parse_cache_key(&options, file_handle.hash(), script_kind);
+        // Not in Go: a new parse of a leased text is a freeable file version
+        // also for a path that no publish published yet (the freeable rule,
+        // `ast::freeable_path`, keeps the first version of a path static), so
+        // the release of its last lease frees it (`drop_released_lease`), as
+        // Go's GC frees it. The publish of the parse notes the path anyway.
+        crate::ast::note_published_path(&key.path.0);
         // PORT: `acquire_bound` is Go `Acquire`, whose parse cache binds.
         let source_file = acquire_bound(
             &self.parse_cache,

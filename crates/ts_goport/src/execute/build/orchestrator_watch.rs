@@ -88,6 +88,8 @@ impl Orchestrator {
         // PORT: watch mode keeps its parses in `watch_sources` (see
         // `BuildHost::watch_source_file`), so this one is empty.
         self.host.source_files.reset();
+        // PORT: not in Go (see `BuildHost::end_config_change_cycle`).
+        self.host.end_config_change_cycle();
         *self.host.config_times.borrow_mut() = FxHashMap::default();
     }
 
@@ -494,9 +496,11 @@ impl Orchestrator {
         }
 
         // PORT: not in Go (`BuildHost::watch_source_file`). A changed file
-        // is parsed again; an overflow or a config change parses every file
-        // again, as Go does in each cycle.
-        if overflow || needs_config_update {
+        // is parsed again, and an overflow parses every file again, as Go
+        // does in each cycle. A config change keeps the other parses for
+        // the files whose parse options stay the same
+        // (`BuildHost::keep_watch_sources_for_config_change`).
+        if overflow {
             self.host.evict_watch_sources(None);
         } else {
             let paths: FxHashSet<Path> = changed_paths
@@ -504,6 +508,9 @@ impl Orchestrator {
                 .map(|path| self.to_path(path))
                 .collect();
             self.host.evict_watch_sources(Some(&paths));
+            if needs_config_update {
+                self.host.keep_watch_sources_for_config_change();
+            }
         }
 
         if !needs_update {
@@ -524,7 +531,12 @@ impl Orchestrator {
             self.generate_graph_reusing_old_tasks();
         }
 
+        // PORT: not in Go (see `BuildHost::prefetch`). Go parses the files
+        // of each build on goroutines. A cycle with a config change or an
+        // overflow can parse many files again, so its builds parse ahead.
+        self.host.prefetch.set(needs_config_update);
         self.build_or_clean();
+        self.host.prefetch.set(false);
         self.update_watch();
         let desired_dirs = self.compute_desired_watches();
         let reconciled = self.wm.borrow().reconcile_watches(&desired_dirs);

@@ -189,14 +189,16 @@ impl FileInfo {
 }
 
 // PORT: where `DirEntry.Info()` gets its data. Entries from `os.ReadDir`
-// call `lstat` on the full path; entries made from a `FileInfo`
+// call `lstat` on the full path (`Lstat` holds the directory path, which
+// the entries of one directory share, and `info` adds the name, as Go's
+// `unixDirent` keeps `parent` and `name`); entries made from a `FileInfo`
 // (`fs.FileInfoToDirEntry`, the bundled file system) return that value.
 // `NotExist` is a `vfs.WalkDir` entry whose `Stat` found nothing (Go
 // `walkDirEntry.Info` returns `ErrNotExist`, ts#64277).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirEntryInfo {
     Known(FileInfo),
-    Lstat(String),
+    Lstat(Rc<str>),
     NotExist,
 }
 
@@ -224,10 +226,13 @@ impl DirEntry {
     pub fn info(&self) -> Result<FileInfo, FsError> {
         match &self.info {
             DirEntryInfo::Known(info) => Ok(info.clone()),
-            DirEntryInfo::Lstat(full_path) => match std::fs::symlink_metadata(os_path(full_path)) {
-                Ok(md) => Ok(file_info_from_metadata(basename(full_path), &md)),
-                Err(err) => Err(FsError::path("lstat", full_path, err)),
-            },
+            DirEntryInfo::Lstat(dir) => {
+                let full_path = format!("{}/{}", dir, self.name);
+                match std::fs::symlink_metadata(os_path(&full_path)) {
+                    Ok(md) => Ok(file_info_from_metadata(basename(&full_path), &md)),
+                    Err(err) => Err(FsError::path("lstat", &full_path, err)),
+                }
+            }
             DirEntryInfo::NotExist => Err(FsError::NotExist),
         }
     }
@@ -368,34 +373,45 @@ impl Common {
         };
 
         // PORT: the Go closure `addToResult` takes the result explicitly.
-        fn add_to_result(result: &mut Entries, name: &str, mode: FileMode, is_link: bool) -> bool {
-            if mode.is_dir() {
-                result.directories.push(name.to_string());
+        // PERF (cfgwalk1): it takes the entry's name, so a name is not
+        // copied (a link's name is copied once, into `symlinks`).
+        fn add_to_result(
+            result: &mut Entries,
+            name: String,
+            mode: FileMode,
+            is_link: bool,
+        ) -> bool {
+            let list = if mode.is_dir() {
+                &mut result.directories
             } else if mode.is_regular() {
-                result.files.push(name.to_string());
+                &mut result.files
             } else {
                 return false;
-            }
+            };
 
             if is_link {
                 if let Some(symlinks) = result.symlinks.as_mut() {
-                    symlinks.insert(name.to_string());
+                    symlinks.insert(name.clone());
                 }
             }
+            list.push(name);
             true
         }
 
         for entry in self.get_entries(path) {
             let entry_type = entry.type_();
 
-            if add_to_result(&mut result, entry.name(), entry_type, false) {
+            // PORT: Go calls `addToResult(name, entryType, false)` first; it
+            // adds exactly the directories and regular files.
+            if entry_type.is_dir() || entry_type.is_regular() {
+                add_to_result(&mut result, entry.name, entry_type, false);
                 continue;
             }
 
             if entry_type.intersects(FileMode::SYMLINK) {
                 // Easy case; UNIX-like system will clearly mark symlinks.
                 if let Some(stat) = self.stat(&format!("{}/{}", path, entry.name())) {
-                    add_to_result(&mut result, entry.name(), stat.mode(), true);
+                    add_to_result(&mut result, entry.name, stat.mode(), true);
                 }
                 continue;
             }
@@ -407,7 +423,7 @@ impl Common {
                     let full_path = format!("{}/{}", path, entry.name());
                     if is_reparse_point(&full_path) {
                         if let Some(stat) = self.stat(&full_path) {
-                            add_to_result(&mut result, entry.name(), stat.mode(), true);
+                            add_to_result(&mut result, entry.name, stat.mode(), true);
                         }
                     }
                     continue;

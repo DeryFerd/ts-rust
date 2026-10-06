@@ -1652,16 +1652,20 @@ impl Checker {
                 self.instantiate_type(source, report_unreliable_mapper);
             }
             // PORT: the target data is cloned so the checker is not borrowed during the call.
-            let target_template = self.ty(target).as_template_literal_type().clone();
-            let rr = r.clone();
-            if self.is_type_matched_by_template_literal_type(
-                source,
-                &target_template,
-                &mut |c: &mut Checker, s: TypeId, t: TypeId, report_errors: bool| {
-                    c.is_related_to_worker(&rr, s, t, report_errors)
-                },
-            ) {
-                return Ternary::TRUE;
+            // PERF (perffu1): most pairs fail Go's first test, which makes no
+            // type, so the clone comes after it.
+            if !self.template_literal_match_fails_early(source, target) {
+                let target_template = self.ty(target).as_template_literal_type().clone();
+                let rr = r.clone();
+                if self.is_type_matched_by_template_literal_type(
+                    source,
+                    &target_template,
+                    &mut |c: &mut Checker, s: TypeId, t: TypeId, report_errors: bool| {
+                        c.is_related_to_worker(&rr, s, t, report_errors)
+                    },
+                ) {
+                    return Ternary::TRUE;
+                }
             }
         } else if target_flags.intersects(TypeFlags::STRING_MAPPING) {
             if !source_flags.intersects(TypeFlags::STRING_MAPPING) {

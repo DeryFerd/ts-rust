@@ -375,16 +375,34 @@ pub struct ParseTaskData {
     pub package_id: PackageId,
 }
 
-/// True when `cached` has the file of every root task, and there is one.
-/// The task of the automatic type directives has no file.
+/// True when `cached` has the file of every root task, and there is one,
+/// for the parse options that the workers guess (`FileRefs::fits`). The
+/// task of the automatic type directives has no file.
 // PORT: not in Go (parse workers, `FilesParser::parse`).
-fn all_roots_cached(tasks: &[ParseTaskRef], cached: &FxHashMap<String, Arc<FileRefs>>) -> bool {
+fn all_roots_cached(
+    loader: &FileLoader,
+    tasks: &[ParseTaskRef],
+    cached: &FxHashMap<String, Arc<FileRefs>>,
+) -> bool {
+    let options = loader.opts.config.compiler_options();
     let mut files = tasks
         .iter()
         .map(|task| task.borrow())
         .filter(|task| !task.is_for_automatic_type_directive)
         .peekable();
-    files.peek().is_some() && files.all(|task| cached.contains_key(&task.normalized_file_path))
+    files.peek().is_some()
+        && files.all(|task| {
+            let file_name = &task.normalized_file_path;
+            cached.get(file_name).is_some_and(|refs| {
+                refs.fits(|| {
+                    get_external_module_indicator_options(
+                        file_name,
+                        &options,
+                        &SourceFileMetaData::default(),
+                    )
+                })
+            })
+        })
 }
 
 impl FilesParser {
@@ -397,7 +415,20 @@ impl FilesParser {
         // A large program gets more parse workers (below) and bind threads.
         let large = crate::program::note_program_load(tasks.len());
         // Workers that `start_default_lib_prefetch` started for this load.
-        let early = EARLY_POOL.with(|early| early.borrow_mut().take());
+        let mut early = EARLY_POOL.with(|early| early.borrow_mut().take());
+        // The worker parses of these paths are freeable file versions
+        // (`PrefetchQueue::freeable`). An early pool queued its jobs before
+        // this set existed, so its parses would be static: it goes.
+        let freeable = if loader.opts.host.freeable_worker_parses() {
+            crate::ast::published_paths()
+        } else {
+            Arc::default()
+        };
+        if !freeable.is_empty()
+            && let Some(early) = early.take()
+        {
+            early.discard();
+        }
         // A host with its own file cache (`CompilerHost::prefetch_parses`)
         // gets no workers. This does not set `single_threaded`, so the
         // queue order stays that of a parallel load.
@@ -421,7 +452,7 @@ impl FilesParser {
         // When the host gives every root file from its cache, no worker
         // parse can be used, so no worker starts. The loader parses the
         // other files itself, as a load with no workers.
-        if !cached.is_empty() && all_roots_cached(tasks, &cached) {
+        if !cached.is_empty() && all_roots_cached(loader, tasks, &cached) {
             CACHED_LOADS.fetch_add(1, AtomicOrdering::Relaxed);
             workers = 0;
         }
@@ -462,7 +493,11 @@ impl FilesParser {
             .shared
             .resolve
             .set(WorkerResolveConfig::of_loader(loader));
-        lock(&pool.shared.queue).cached = cached;
+        {
+            let mut queue = lock(&pool.shared.queue);
+            queue.cached = cached;
+            queue.freeable = freeable;
+        }
         // A `tsc -b` program loads the output `.d.ts` files of its
         // references in place of their sources, so the workers parse those.
         if build_host && !loader.opts.can_use_project_reference_source() {
@@ -1366,6 +1401,11 @@ struct PrefetchJob {
     /// cache (`CompilerHost::cached_source_file_refs`). The worker does not
     /// parse such a file: it only resolves and queues its references.
     cached: Option<Arc<FileRefs>>,
+    /// True when the parse is the parse of a freeable file version
+    /// (`PrefetchQueue::freeable`): the worker parses it as the loader
+    /// would in `ast::enter_freeable_parse`, so its store owns its nodes and
+    /// its text is not leaked.
+    freeable: bool,
     state: Mutex<PrefetchState>,
     done: Condvar,
 }
@@ -1382,7 +1422,7 @@ enum PrefetchState {
 /// A parse worker's read and parse of one file.
 struct PrefetchResult {
     /// The file text as the worker's OS file system read it.
-    text: &'static str,
+    text: FileText,
     /// The parse of `text`. `None`: the parse is not usable (it made
     /// thread-local state, or it panicked).
     parse: Option<DetachedParse>,
@@ -1395,7 +1435,7 @@ pub enum Prefetched {
     /// It equals what `parse_source_file` would make here now.
     Parse(ParsedSourceFile),
     /// The text that a worker read, when its parse is not usable.
-    Text(&'static str),
+    Text(FileText),
     /// No worker read the file, the read failed, or the worker text is not
     /// the text that the loader read.
     Nothing,
@@ -1429,8 +1469,14 @@ struct PrefetchQueue {
     by_name: FxHashMap<String, Arc<PrefetchJob>>,
     /// The files that the loader's host gives from its cache, with their
     /// references (`CompilerHost::cached_source_file_refs`). Their jobs
-    /// parse nothing (`PrefetchJob::cached`).
+    /// parse nothing (`PrefetchJob::cached`), unless the cached parse does
+    /// not fit the job's options (`FileRefs::fits`).
     cached: FxHashMap<String, Arc<FileRefs>>,
+    /// The paths whose new parse is a freeable file version
+    /// (`ast::freeable_path`, which reads the loading thread's state), when
+    /// the host asks for it (`CompilerHost::freeable_worker_parses`). Empty
+    /// otherwise: every worker parse is static.
+    freeable: Arc<FxHashSet<String>>,
     /// The source files of the project references whose output `.d.ts`
     /// file the loader loads in their place, by source file name, and the
     /// output file name and path (`get_parse_file_redirect`, a program
@@ -1457,12 +1503,18 @@ impl PrefetchQueue {
         if let Some(job) = self.by_name.get(&opts.file_name) {
             return Some(job.clone());
         }
-        let cached = self.cached.get(&opts.file_name).cloned();
+        let cached = self
+            .cached
+            .get(&opts.file_name)
+            .filter(|refs| refs.fits(|| opts.external_module_indicator_options))
+            .cloned();
+        let freeable = !self.freeable.is_empty() && self.freeable.contains(&opts.path.0);
         let job = Arc::new(PrefetchJob {
             job: self.next_job,
             opts,
             script_kind,
             cached,
+            freeable,
             state: Mutex::new(PrefetchState::Queued),
             done: Condvar::new(),
         });
@@ -1919,6 +1971,16 @@ impl PrefetchShared {
     /// normalized absolute name with a known extension).
     fn queue_names(&self, names: Vec<String>) {
         let config = &self.config;
+        // PERF (perffu1): with the program options the guess is the one of
+        // `FilesParser::prefetch_request`. With the default options, a
+        // file with no import or export that the loader parses with other
+        // options (a `.cjs`, `.mjs`, `.cts` or `.mts` file, or any file with
+        // `moduleDetection: force` or a `react-jsx` emit) was parsed again.
+        // Without a worker resolver the options are not known here.
+        let options = match self.resolve.get() {
+            Some(Some(resolve)) => Some(&resolve.options),
+            _ => None,
+        };
         for file_name in names {
             let script_kind = get_script_kind_from_file_name(&file_name);
             if script_kind == ScriptKind::UNKNOWN
@@ -1933,12 +1995,20 @@ impl PrefetchShared {
                 &config.current_directory,
                 config.use_case_sensitive_file_names,
             );
-            // PORT: the options are a guess (see `FilesParser::prefetch`).
+            // PORT: the options are a guess (see `FilesParser::prefetch_request`).
+            let external_module_indicator_options =
+                options.map_or_else(Default::default, |options| {
+                    get_external_module_indicator_options(
+                        &file_name,
+                        options,
+                        &SourceFileMetaData::default(),
+                    )
+                });
             self.queue(
                 SourceFileParseOptions {
                     file_name,
                     path,
-                    external_module_indicator_options: ExternalModuleIndicatorOptions::default(),
+                    external_module_indicator_options,
                 },
                 script_kind,
             );
@@ -2200,6 +2270,10 @@ pub struct FileRefs {
     lib_reference_directives: Vec<FileReference>,
     type_reference_directives: Vec<FileReference>,
     import_specifiers: Vec<String>,
+    /// The module indicator options that the cached parse read
+    /// (`FileRefs::of_kept_parse`): the host gives the parse only for these
+    /// options (`fits`). `None`: any options.
+    module_indicator_options: Option<ExternalModuleIndicatorOptions>,
 }
 
 impl FileRefs {
@@ -2213,7 +2287,28 @@ impl FileRefs {
             lib_reference_directives: file.lib_reference_directives.clone(),
             type_reference_directives: file.type_reference_directives.clone(),
             import_specifiers: file.imports.iter().map(|n| n.text().to_string()).collect(),
+            module_indicator_options: None,
         }
+    }
+
+    /// `of_file` for a parse that a watch host keeps across a config change
+    /// (`tsc --watch` and `tsc -b --watch`): the host gives it only for the
+    /// module indicator options that it read, if it read them
+    /// (`parse_with_options`), so a job with other options parses the file.
+    pub fn of_kept_parse(file: &ParsedSourceFile) -> Self {
+        FileRefs {
+            module_indicator_options: crate::frontend::parser::reads_module_indicator_options(file)
+                .then(|| file.parse_options().external_module_indicator_options),
+            ..Self::of_file(file)
+        }
+    }
+
+    /// True when the host probably gives the cached parse for a parse with
+    /// module indicator options `options()`. A wrong guess only costs time:
+    /// the loader checks each parse.
+    fn fits(&self, options: impl FnOnce() -> ExternalModuleIndicatorOptions) -> bool {
+        self.module_indicator_options
+            .is_none_or(|read| read == options())
     }
 
     fn take_from(parse: &mut DetachedParse) -> Self {
@@ -2226,6 +2321,7 @@ impl FileRefs {
             lib_reference_directives: file.lib_reference_directives.clone(),
             type_reference_directives: file.type_reference_directives.clone(),
             import_specifiers,
+            module_indicator_options: None,
         }
     }
 }
@@ -2871,20 +2967,27 @@ fn guess_relative_import(fs: &dyn Fs, containing: &str, specifier: &str) -> Opti
 /// usable only when it made no thread-local state that the loading thread
 /// would need (synthetic nodes, node ids) and did not panic.
 fn prefetch_parse(fs: &dyn Fs, job: &PrefetchJob) -> Option<PrefetchResult> {
-    // A bundled lib text is embedded, so it needs no copy.
-    let text = match crate::frontend::bundled::bundled_text(&job.opts.file_name) {
-        Some(text) => text,
+    // A bundled lib text is embedded, so it needs no copy. Another text is
+    // leaked, as the loader's is, except the text of a freeable file
+    // version (`FileText::new`).
+    let text: FileText = match crate::frontend::bundled::bundled_text(&job.opts.file_name) {
+        Some(text) => text.into(),
         None => {
             let (text, ok) = fs.read_file(&job.opts.file_name);
             if !ok {
                 return None;
             }
-            Box::leak(text.into_boxed_str())
+            FileText::new(text, job.freeable)
         }
     };
     let before = (synthetic_slot_count(), next_ids());
     let parse = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parse_source_file_detached(job.job, &job.opts, text, job.script_kind)
+        // The parse of a freeable file version owns its nodes, as the
+        // loader's parse of it does (`CompilerHostImpl::get_source_file`), so
+        // the version frees them, and a parse that the loader does not take
+        // is freed with the pool.
+        let _owned_nodes = job.freeable.then(crate::ast::enter_freeable_parse);
+        parse_source_file_detached(job.job, &job.opts, text.clone(), job.script_kind)
     }));
     let parse = match parse {
         Ok(parse) => (parse.store.is_self_contained()
@@ -2951,7 +3054,7 @@ pub fn take_prefetched(
         return Prefetched::Nothing;
     };
     let unusable = || shared.count(|c| c.unusable.push(opts.file_name.clone()));
-    if text.is_some_and(|text| text != worker_text) {
+    if text.is_some_and(|text| text != &*worker_text) {
         unusable();
         return Prefetched::Nothing;
     }

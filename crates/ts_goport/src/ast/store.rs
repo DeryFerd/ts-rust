@@ -3191,6 +3191,8 @@ impl DetachedStore {
 /// Makes the detached store of this thread with provisional id
 /// `DETACHED_STORE_BASE + job` and returns that id. A parse worker parses
 /// one file at a time; the store stays until `take_detached_file_store`.
+/// Inside a freeable parse scope the store owns its astdata nodes, as in
+/// `new_file_store`, so they go with the store, whichever thread drops it.
 pub fn new_detached_file_store(
     job: usize,
     file_name: &'static str,
@@ -3202,10 +3204,19 @@ pub fn new_detached_file_store(
         DETACHED.get().is_none(),
         "this thread already has a detached store"
     );
+    // PERF: watchcfg1 round c. The first cell of a thread is leaked with its
+    // own malloc, not in the AST arena: the first value in a thread's arena
+    // leaks a 128 KiB chunk, and a watch build after a config change starts
+    // new parse workers, whose owned parses put nothing else there. With
+    // the arena an x1 session grew 0.24 MiB per op over 500 config edits.
     let store = SPARE_CELL
         .take()
-        .unwrap_or_else(|| leak_in_ast_arena(RefCell::default()));
-    *store.borrow_mut() = FileStore::new(file_name, text.into());
+        .unwrap_or_else(|| Box::leak(Box::default()));
+    let mut new = FileStore::new(file_name, text.into());
+    if FREEABLE_PARSE.get() {
+        new.owned = Some(Box::new(OwnedAst::new(new.records.capacity())));
+    }
+    *store.borrow_mut() = new;
     DETACHED.set(Some((id, store)));
     ACTIVE.set(Some((id, store)));
     id
@@ -3279,6 +3290,16 @@ pub fn adopt_detached_store(detached: DetachedStore) -> StoreRemap {
             .collect();
         // The lazy JSDoc nodes are synthetic nodes of the parse worker.
         store.lazy_jsdoc_cache = FxHashMap::default();
+        // A store that owns its nodes keeps the JSDoc cache there.
+        if let Some(owned) = store.owned.as_deref_mut() {
+            owned.jsdoc = std::mem::take(&mut owned.jsdoc)
+                .into_iter()
+                .map(|(node, jsdocs)| {
+                    let jsdocs = jsdocs.iter().map(|&n| remap.node(n)).collect();
+                    (remap.node(node), jsdocs)
+                })
+                .collect();
+        }
         // The records, kids and R2-5 links are slot-indexed and hold no
         // store id (a parent in the store is a `LOCAL_STORE` handle, and a
         // self-contained store has no alias slot), so they stay.
@@ -6731,6 +6752,70 @@ mod tests {
                 Some(jsdocs.clone())
             );
         }
+    }
+
+    // watchcfg1 round c: a parse worker's parse in a freeable parse scope
+    // owns its nodes (`new_detached_file_store`), the adopted parse reads
+    // like a static parse of the same text with its JSDoc cache on the real
+    // store id, and a worker parse that the loader does not take frees its
+    // store and text when it is dropped.
+    #[test]
+    fn owned_detached_parse_reads_like_a_static_parse() {
+        use crate::frontend::parser::{
+            SourceFileParseOptions, adopt_detached_parse, parse_source_file,
+            parse_source_file_detached,
+        };
+        // A JS file: its parse makes the JSDoc cache (a TS file's is lazy).
+        let text = "/** @param {number} a */\nexport async function f(a, b = 1) { return a + b; }\n\
+            /** @type {string[]} */\nlet x = [1, 2].map(y => `${y}`);\n";
+        let opts = |name: &str| SourceFileParseOptions {
+            file_name: name.to_string(),
+            ..Default::default()
+        };
+        let fixed = parse_source_file(&opts("/static.js"), text, ScriptKind::JS);
+        let worker = |job: usize, name: &'static str| {
+            let worker_opts = opts(name);
+            let text = FileText::Shared(Arc::from(text));
+            let weak = text.weak().expect("a shared text");
+            let parse = std::thread::spawn(move || {
+                let _scope = enter_owned_parse();
+                parse_source_file_detached(job, &worker_opts, text, ScriptKind::JS)
+            })
+            .join()
+            .unwrap();
+            (parse, weak)
+        };
+
+        let (detached, _) = worker(8, "/owned.js");
+        assert!(detached.freeable);
+        assert!(detached.store.is_self_contained());
+        assert!(
+            detached.store.store.owned.is_some(),
+            "the worker parse owns its nodes"
+        );
+        let owned = adopt_detached_parse(detached, &opts("/owned.js"));
+        assert!(with_store(owned.store, |s| s.owned.is_some()));
+        let (a, b) = (tree(fixed.root), tree(owned.root));
+        assert_eq!(a.len(), b.len());
+        for (&a, &b) in a.iter().zip(&b) {
+            assert_eq!(twin_facts(a), twin_facts(b), "{:?}", a.kind());
+        }
+        assert_eq!(owned.jsdoc_cache.len(), 2);
+        for (node, jsdocs) in &owned.jsdoc_cache {
+            assert_eq!(node.file_index(), owned.store);
+            assert_eq!(
+                file_store_js_doc(owned.store, *node).map(NodeSlice::to_vec),
+                Some(jsdocs.clone())
+            );
+        }
+
+        let (untaken, text) = worker(9, "/untaken.js");
+        assert!(text.upgrade().is_some());
+        drop(untaken);
+        assert!(
+            text.upgrade().is_none(),
+            "a worker parse that the loader does not take is freed"
+        );
     }
 
     /// The nodes of the tree of `root` in `for_each_child` order.

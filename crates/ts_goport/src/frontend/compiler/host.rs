@@ -105,6 +105,17 @@ pub trait CompilerHost {
         FxHashMap::default()
     }
 
+    /// True when a parse worker's parse of a path that this thread
+    /// published before is a freeable parse (`ast::freeable_path`), as the
+    /// loader's own parse of it is: its store owns its nodes, so the file
+    /// version frees them, and a parse that the loader does not take is
+    /// freed after the load. False: such a worker parse is static, and a
+    /// file version of it leaks its nodes. The watch hosts return true.
+    // PORT: not in Go (see `prefetch_parses`).
+    fn freeable_worker_parses(&self) -> bool {
+        false
+    }
+
     /// Drops the data that the host keeps for its programs (for example a
     /// snapshot file system). `ls_program` calls it when the last live
     /// program that uses this host is released. The host must not read
@@ -257,7 +268,7 @@ impl CompilerHost for CompilerHostImpl {
             // its embedded text (what `WrappedFs::read_file` copies).
             match take_prefetched(opts, script_kind, None) {
                 Prefetched::Parse(file) => return Some(Rc::new(file)),
-                Prefetched::Text(text) => text.into(),
+                Prefetched::Text(text) => text,
                 Prefetched::Nothing => match bundled_text(&opts.file_name) {
                     Some(text) => text.into(),
                     None => {
@@ -279,7 +290,7 @@ impl CompilerHost for CompilerHostImpl {
             // text.
             match take_prefetched(opts, script_kind, Some(text.as_str())) {
                 Prefetched::Parse(file) => return Some(Rc::new(file)),
-                Prefetched::Text(worker_text) => worker_text.into(),
+                Prefetched::Text(worker_text) => worker_text,
                 Prefetched::Nothing => FileText::new(text, freeable),
             }
         };
