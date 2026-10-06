@@ -8,6 +8,8 @@
 # It needs no root: unshare makes a user and mount namespace, and the kernel needs tmpfs
 # casefold (Linux 6.13 or later). /usr, /etc, /dev, /proc and /home (the checkout, for tests that
 # read repo files) are bind mounts in the chroot.
+# Known setup failure: go_baselines units_platform::osvfs::test_os asserts that Linux is
+# case-sensitive (as Go's os_test.go), so it fails here and not on a Mac.
 #
 # usage: macos-like-test.sh <test-bin> [test args]...
 #   <test-bin>   for example the ts_goport lib tests:
@@ -15,7 +17,7 @@
 #   test args    passed to the binary, for example a name filter
 # One test thread (RUST_TEST_THREADS=1), as goport-tests.sh runs them.
 set -euo pipefail
-[[ $# -ge 1 && $1 != help ]] || { sed -n '2,17p' "$0" >&2; exit 2; }
+[[ $# -ge 1 && $1 != help ]] || { sed -n '2,18p' "$0" >&2; exit 2; }
 bin=$(realpath "$1")
 shift
 mnt=$(mktemp -d "${TMPDIR:-/tmp}/macos-like.XXXXXX")
