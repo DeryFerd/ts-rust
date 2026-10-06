@@ -1,12 +1,13 @@
 //! Port-only tests of the file versions that `tsc -b --watch` keeps
-//! (watchfix1 part 2): a task whose status is reset lets go of the versions
-//! that its errors held (item 4).
+//! (watchfix1 part 2): a config change that changes the module indicator
+//! options drops the kept parses that read them (item 3), and a task whose
+//! status is reset lets go of the versions that its errors held (item 4).
 //!
 //! Go has no file versions: its GC frees a file when no program, cache or
 //! diagnostic holds it. The output of each cycle is Go's: the lines that
 //! the tests check are those of `tsgo-oracle-673a5f17d713 -b -w` on the same
 //! files and edits with the OS watcher
-//! (target/continuation-r97-goport/watchfix1/runs/held2).
+//! (target/continuation-r97-goport/watchfix1/runs, mdrop and held2).
 //! The first version of each file is static; each later parse of it is a
 //! freeable version (`ast::file_versions_made`, `ast::dead_file_versions`).
 
@@ -62,7 +63,8 @@ fn session(
 }
 
 /// `(made, dead)` file versions once the dead count reaches `dead` or 10 s
-/// pass.
+/// pass: the free thread frees the dropped versions
+/// (`BuildHost::drop_kept_parses_that_read_module_indicator_options`).
 fn file_versions(dead: usize) -> (usize, usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -76,6 +78,58 @@ fn file_versions(dead: usize) -> (usize, usize) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Two script files, so each parse reads its module indicator options.
+fn config(detection: &str, new_line: &str, files: &str) -> String {
+    format!(
+        r#"{{"compilerOptions":{{"strict":true,"outDir":"out","rootDir":"src","types":[],"lib":["es5"],"moduleDetection":"{detection}"{new_line}}},"files":[{files}]}}"#
+    )
+}
+
+#[test]
+fn build_watch_drops_kept_parses_whose_module_indicator_options_changed() {
+    run_test_in_child(
+        "tsctests::watch_build_kept_versions::build_watch_drops_kept_parses_whose_module_indicator_options_changed",
+        || {
+            let both = r#""src/s1.ts","src/s2.ts""#;
+            let first = config("auto", "", both);
+            let new_line = config("auto", r#","newLine":"lf""#, both);
+            let force = config("force", r#","newLine":"lf""#, r#""src/s1.ts""#);
+            session(
+                &[
+                    ("tsconfig.json", &first),
+                    ("src/s1.ts", "const one: number = 1;\n"),
+                    ("src/s2.ts", "const two: number = 2;\n"),
+                ],
+                &["--build", "--watch", "--pretty", "false"],
+                &[
+                    ("src/s2.ts", "const two: number = 22;\n"),
+                    ("tsconfig.json", &new_line),
+                    ("tsconfig.json", &force),
+                ],
+                |i, out| {
+                    assert!(
+                        out.contains("Found 0 errors. Watching for file changes."),
+                        "edit {i}: {out}"
+                    );
+                    let expected = match i {
+                        // s2.ts v2.
+                        0 => (1, 0),
+                        // The module indicator inputs stay: both kept
+                        // parses are used again, nothing is parsed.
+                        1 => (1, 0),
+                        // `force` changes them: s1.ts is parsed again, and
+                        // the kept s2.ts v2, which no build of the cycle
+                        // takes, goes. Before, it went back to the kept
+                        // parses for the rest of the session.
+                        _ => (2, 1),
+                    };
+                    assert_eq!(file_versions(expected.1), expected, "edit {i}");
+                },
+            );
+        },
+    );
 }
 
 #[test]

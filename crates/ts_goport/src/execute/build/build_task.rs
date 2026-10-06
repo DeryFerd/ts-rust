@@ -417,7 +417,7 @@ impl<T: Send + 'static> Drop for DropInBackground<T> {
 /// sent to it in order, as Go's GC frees memory beside the build. Frees it
 /// here when that thread cannot start. A value still queued at exit is not
 /// freed.
-fn drop_in_background<T: Send + 'static>(value: T) {
+pub(crate) fn drop_in_background<T: Send + 'static>(value: T) {
     // wasm32-wasip1 has no threads, so the thread cannot start. Saying so
     // leaves the thread out of the wasm module.
     if cfg!(target_family = "wasm") {

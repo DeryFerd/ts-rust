@@ -80,6 +80,27 @@ pub struct SourceFileCacheKey(pub SourceFileParseOptions);
 pub struct WatchSource {
     file: Rc<ParsedSourceFile>,
     mod_time: Option<std::time::SystemTime>,
+    /// `reads_module_indicator_options(file)`, found at the parse: a later
+    /// node read of a freeable version pins it on this thread until the
+    /// next program release (`ast::with_file_version`), so a test of a
+    /// kept parse before a build would keep it through the build.
+    reads_options: bool,
+}
+
+/// PORT: not in Go. The compiler options that the module indicator options
+/// of a parse come from (`get_external_module_indicator_options`; the rest
+/// is the file name and its metadata). See
+/// `BuildHost::drop_kept_parses_that_read_module_indicator_options`.
+pub type ModuleIndicatorInputs = (ModuleDetectionKind, JsxEmit, ModuleKind);
+
+/// The `ModuleIndicatorInputs` of `options`.
+#[must_use]
+pub fn module_indicator_inputs(options: &CompilerOptions) -> ModuleIndicatorInputs {
+    (
+        options.get_emit_module_detection_kind(),
+        options.jsx,
+        options.get_emit_module_kind(),
+    )
 }
 
 impl Hash for SourceFileCacheKey {
@@ -383,6 +404,9 @@ impl BuildHost {
                         WatchSource {
                             file: file.clone(),
                             mod_time,
+                            reads_options: crate::frontend::parser::reads_module_indicator_options(
+                                file,
+                            ),
                         },
                     );
                 }
@@ -451,12 +475,49 @@ impl BuildHost {
             let Some(source) = before.get(&key) else {
                 continue;
             };
+            // Such a parse fits only its own options (no node read here,
+            // see `WatchSource::reads_options`).
+            if source.reads_options {
+                return None;
+            }
             let file = crate::frontend::parser::parse_with_options(&source.file, opts)?;
             let mod_time = source.mod_time;
             before.remove(&key);
-            return Some(WatchSource { file, mod_time });
+            return Some(WatchSource {
+                file,
+                mod_time,
+                reads_options: false,
+            });
         }
         None
+    }
+
+    /// PORT: not in Go (`keep_watch_sources_for_config_change`). Drops the
+    /// kept parses from before the config change of this cycle that read
+    /// their module indicator options (`WatchSource::reads_options`).
+    /// `Orchestrator::do_cycle` calls it when the change gave a project
+    /// other module indicator inputs (`module_indicator_inputs`). Such a
+    /// parse fits only a parse with its own options, so the builds of the
+    /// cycle parse these files again. Before, it stayed until
+    /// `end_config_change_cycle`: on 600 script files with 12
+    /// `moduleDetection` edits, `tsc -b -w` held 24% more RSS than R173,
+    /// which dropped every kept parse before a config change build. Only a
+    /// file with no import, export or `import.meta` reads these options, so
+    /// a project whose inputs stayed the same parses again at most its
+    /// script files. The file versions are freed on the free thread, beside
+    /// the build, as Go's GC frees the files of the old program.
+    pub fn drop_kept_parses_that_read_module_indicator_options(&self) {
+        let mut versions = Vec::new();
+        self.watch_sources_before_config_change
+            .borrow_mut()
+            .retain(|_, source| {
+                if !source.reads_options {
+                    return true;
+                }
+                versions.extend(source.file.version.get().cloned());
+                false
+            });
+        crate::execute::build::build_task::drop_in_background(versions);
     }
 
     /// PORT: not in Go (`keep_watch_sources_for_config_change`). At the end
