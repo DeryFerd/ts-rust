@@ -2578,14 +2578,7 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
     let fs: Rc<dyn Fs> = Rc::new(WorkerFs {
         fs: os_fs.clone(),
         stats: shared.stats.clone(),
-        keep_package_jsons: false,
-    });
-    // The resolver's file system keeps the package.json files that it
-    // reads, for the loader's package.json cache (`WorkerResolver::new`).
-    let resolver_fs: Rc<dyn Fs> = Rc::new(WorkerFs {
-        fs: os_fs,
-        stats: shared.stats.clone(),
-        keep_package_jsons: true,
+        keep_package_jsons: None,
     });
     let mut resolver: Option<WorkerResolver> = None;
     let mut resolver_failed = false;
@@ -2625,9 +2618,17 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
             && !resolver_failed
             && let Some(Some(config)) = shared.resolve.get()
         {
+            // The resolver's file system keeps the package.json files that
+            // it reads first in the load, for the loader's package.json cache
+            // (`WorkerResolver::new`).
+            let resolver_fs: Rc<dyn Fs> = Rc::new(WorkerFs {
+                fs: os_fs.clone(),
+                stats: shared.stats.clone(),
+                keep_package_jsons: config.shared.clone(),
+            });
             resolver = Some(WorkerResolver::new(
                 config,
-                resolver_fs.clone(),
+                resolver_fs,
                 &shared.config.current_directory,
                 shared.stats.host.get().is_some(),
             ));
@@ -3304,8 +3305,9 @@ struct WorkerFs {
     fs: Rc<dyn Fs>,
     stats: Arc<SharedStatCache>,
     /// The file system of the worker's resolver: it keeps the text of each
-    /// package.json that it reads (`note_worker_package_json_read`).
-    keep_package_jsons: bool,
+    /// package.json that it reads and the load has no read of yet
+    /// (`note_worker_package_json_read`, `SharedResolutionCache::has_package_json_read`).
+    keep_package_jsons: Option<Arc<SharedResolutionCache>>,
 }
 
 impl Fs for WorkerFs {
@@ -3324,7 +3326,10 @@ impl Fs for WorkerFs {
 
     fn read_file(&self, path: &str) -> (String, bool) {
         let read = self.fs.read_file(path);
-        if self.keep_package_jsons && path.ends_with("/package.json") {
+        if let Some(shared) = &self.keep_package_jsons
+            && path.ends_with("/package.json")
+            && !shared.has_package_json_read(path)
+        {
             note_worker_package_json_read(path, &read.0);
         }
         read

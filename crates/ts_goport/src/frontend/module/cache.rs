@@ -651,9 +651,8 @@ pub struct SharedResolutionCache {
     /// found for the metadata of the files they parse (`store_scope`).
     scopes: std::sync::Mutex<FxHashMap<String, SharedResolution<Option<PackageScope>>>>,
     /// The first read of each package.json that a parse worker made in this
-    /// load, by the key of its package.json cache entry
-    /// (`store_package_json_read`).
-    package_json_reads: std::sync::Mutex<FxHashMap<Path, Arc<WorkerPackageJsonRead>>>,
+    /// load, by file name (`store_package_json_read`).
+    package_json_reads: std::sync::Mutex<FxHashMap<String, Arc<WorkerPackageJsonRead>>>,
 }
 
 /// A parse worker's answer in the `SharedResolutionCache`.
@@ -1148,19 +1147,37 @@ impl SharedResolutionCache {
         lock_shared(&self.scopes).entry(directory).or_insert(value);
     }
 
-    /// Stores `read()`, a parse worker's read of the package.json of `key`,
-    /// unless the load has one, and returns the one that the cache keeps:
-    /// the first, as Go `InfoCache.Set` keeps the first entry.
+    /// Stores `read()`, a parse worker's read of the package.json
+    /// `file_name`, unless the load has one, and returns the one that the
+    /// cache keeps: the first, as Go `InfoCache.Set` keeps the first entry.
     // PORT: not in Go (see `WorkerPackageJsonRead`).
     pub fn store_package_json_read(
         &self,
-        key: Path,
+        file_name: &str,
         read: impl FnOnce() -> WorkerPackageJsonRead,
     ) -> Arc<WorkerPackageJsonRead> {
         lock_shared(&self.package_json_reads)
-            .entry(key)
+            .entry(file_name.to_string())
             .or_insert_with(|| Arc::new(read()))
             .clone()
+    }
+
+    /// The read of the package.json `file_name` that the load keeps
+    /// (`store_package_json_read`).
+    // PORT: not in Go (see `WorkerPackageJsonRead`).
+    #[must_use]
+    pub fn package_json_read(&self, file_name: &str) -> Option<Arc<WorkerPackageJsonRead>> {
+        lock_shared(&self.package_json_reads)
+            .get(file_name)
+            .cloned()
+    }
+
+    /// True when the load has a read of the package.json `file_name`, so a
+    /// worker that reads the file again need not keep its text.
+    // PORT: not in Go (see `WorkerPackageJsonRead`).
+    #[must_use]
+    pub fn has_package_json_read(&self, file_name: &str) -> bool {
+        lock_shared(&self.package_json_reads).contains_key(file_name)
     }
 
     /// Drops the package.json reads of the load and their texts that the
@@ -1259,11 +1276,13 @@ impl Caches {
     /// parse worker's package.json cache (`worker_package_json_reads`), for
     /// a lookup of the package scope walk (`WorkerPackageJsonReads::attach`).
     /// The lookup that made an entry of a package.json file comes right
-    /// after the worker read the file (`note_worker_package_json_read`), in
-    /// any resolution: it stores the read in the shared cache, which keeps
-    /// the first read of the load. An entry of a missing package.json needs
-    /// no text, so the scope walk stores its read when it first meets it.
-    /// `None` for another lookup or resolver.
+    /// after the worker read the file, in any resolution: when the worker
+    /// kept the text (`note_worker_package_json_read`), the read goes into
+    /// the shared cache, which keeps the first read of the load. Else the
+    /// load had a read of the file already, and the scope walk takes that
+    /// one. An entry of a missing package.json needs no text, so the scope
+    /// walk stores its read when it first meets it. `None` for another
+    /// lookup or resolver.
     fn worker_package_json_read(
         &self,
         entry: &InfoCacheEntry,
@@ -1283,10 +1302,15 @@ impl Caches {
             None if !reads.attach.get() => return None,
             None => match reads.reads.borrow().get(&address) {
                 Some(read) => return Some(read.clone()),
-                None if entry.exists() => return None,
                 None => {
                     let file_name = combine_paths(&entry.package_directory, &["package.json"]);
-                    self.store_package_json_read(entry, &file_name, None)
+                    if entry.exists() {
+                        self.shared
+                            .as_ref()
+                            .and_then(|shared| shared.cache.package_json_read(&file_name))
+                    } else {
+                        self.store_package_json_read(entry, &file_name, None)
+                    }
                 }
             },
         }?;
@@ -1304,11 +1328,10 @@ impl Caches {
         text: Option<Box<str>>,
     ) -> Option<Arc<WorkerPackageJsonRead>> {
         let shared = self.shared.as_ref()?;
-        let key = self.package_json_info_cache.key(file_name);
         Some(
             shared
                 .cache
-                .store_package_json_read(key, || WorkerPackageJsonRead {
+                .store_package_json_read(file_name, || WorkerPackageJsonRead {
                     package_directory: entry.package_directory.clone(),
                     directory_exists: entry.directory_exists,
                     taken: std::sync::atomic::AtomicBool::new(false),
