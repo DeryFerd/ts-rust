@@ -1904,14 +1904,6 @@ impl FileLoader {
     }
 }
 
-/// The body of Go `(*fileLoader).loadSourceFileMetaData` with the loader's
-/// resolver and options as parameters, so a parse worker can run it with
-/// its own resolver (`files_parser.rs`).
-// Go: fileloader.go:384 (*fileLoader).loadSourceFileMetaData
-// PORT: the scope is the parts of it that this function reads
-// (`PackageScope`). In a resolve-ahead load, the loader takes the scope that
-// the workers found, or the scope that it found for the directory before
-// (`Caches::package_scope_ahead`).
 /// Whether Go `loadSourceFileMetaData` takes the package.json `type` of the
 /// scope of `file_name` (fileloader.go:398 to :401): for node16 to nodenext
 /// module resolution (not for `.mts`, `.cts`, `.mjs` and `.cjs` files), or
@@ -1928,6 +1920,14 @@ pub(crate) fn package_json_type_applies(
         || file_name.contains("/node_modules/")
 }
 
+/// The body of Go `(*fileLoader).loadSourceFileMetaData` with the loader's
+/// resolver and options as parameters, so a parse worker can run it with
+/// its own resolver (`files_parser.rs`).
+// Go: fileloader.go:384 (*fileLoader).loadSourceFileMetaData
+// PORT: the scope is the parts of it that this function reads
+// (`PackageScope`). In a resolve-ahead load, the loader takes the scope that
+// the workers found, or the scope that it found for the directory before
+// (`Caches::package_scope_ahead`).
 pub(crate) fn source_file_meta_data(
     resolver: &dyn Resolver,
     options: &CompilerOptions,
