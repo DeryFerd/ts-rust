@@ -540,8 +540,6 @@ impl Project {
     }
 
     // Go: project/project.go:357 Project.GetProgram
-    // PORT: Go returns a nil program as nil; the `ls::Project` impl below
-    // (which returns a program handle) panics on it.
     pub fn get_program(&self) -> Option<Rc<compiler::NewProgram>> {
         self.program.clone()
     }
@@ -1085,12 +1083,8 @@ impl ls::Project for Project {
     }
 
     // Go: project/project.go:357 Project.GetProgram
-    // PORT: `ls::Project` returns a program handle; Go returns nil for a
-    // project without a program, which the port can not represent.
-    fn get_program(&self) -> Rc<compiler::NewProgram> {
-        self.program
-            .clone()
-            .unwrap_or_else(|| crate::core::go_nil_dereference())
+    fn get_program(&self) -> Option<Rc<compiler::NewProgram>> {
+        Project::get_program(self)
     }
 
     // Go: project/project.go:380 Project.HasFile
@@ -1106,7 +1100,7 @@ impl ls::Project for RefCell<Project> {
         ls::Project::id(&*self.borrow())
     }
 
-    fn get_program(&self) -> Rc<compiler::NewProgram> {
+    fn get_program(&self) -> Option<Rc<compiler::NewProgram>> {
         ls::Project::get_program(&*self.borrow())
     }
 

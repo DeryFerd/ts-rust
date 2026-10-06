@@ -48,11 +48,11 @@ use std::panic::AssertUnwindSafe;
 use std::sync::mpsc;
 
 // Go: ls/crossproject.go:17 Project
-// PORT: plan contract C4. Go `*compiler.Program` is
-// `Rc<compiler::NewProgram>`, which is never nil.
+// PORT: Go `GetProgram()` is nil for a project without a program (a
+// solution tsconfig with `files: []` and references); the port gives `None`.
 pub trait Project {
     fn id(&self) -> String;
-    fn get_program(&self) -> Rc<compiler::NewProgram>;
+    fn get_program(&self) -> Option<Rc<compiler::NewProgram>>;
     fn has_file(&self, file_name: &str) -> bool;
 }
 
@@ -271,11 +271,9 @@ where
                     }
 
                     // Can loop forever without this (enqueue here, dequeue above, repeat)
-                    // PORT: Go also skips a project whose `GetProgram()` is
-                    // nil. The `Project` contract (plan C4) returns a
-                    // program that is never nil, so that test is always
-                    // false here.
-                    if !state.can_search_project(&loaded_project) {
+                    if !state.can_search_project(&loaded_project)
+                        || loaded_project.get_program().is_none()
+                    {
                         return true;
                     }
 
