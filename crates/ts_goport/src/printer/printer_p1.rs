@@ -5,6 +5,7 @@
 //! Other parts (printer_p2 to printer_p5) add more `impl Printer` blocks.
 
 use crate::flags_macros::go_enum;
+use crate::gostd::debug::kind_string;
 use crate::prelude::*;
 use std::borrow::Cow;
 use std::cell::{Cell, RefMut};
@@ -686,7 +687,7 @@ fn get_text_of_node_worker(
                 GetLiteralTextFlags::NONE,
             );
         }
-        kind => panic!("unexpected node: {:?}", kind),
+        kind => panic!("unexpected node: {}", kind_string(kind)),
     }
     source_text_of_node_cow(
         current_source_file,
@@ -1771,7 +1772,7 @@ impl Printer {
         } else if is_punctuation_kind(node.kind()) {
             self.emit_punctuation_node_ex(node, flags);
         } else {
-            panic!("unexpected TokenNode: {:?}", node.kind());
+            panic!("unexpected TokenNode: {}", kind_string(node.kind()));
         }
     }
 
@@ -2079,7 +2080,7 @@ impl Printer {
                 // TS's emitter handles this via generic emit(); we dispatch to expression emitter here.
                 self.emit_expression(node, OperatorPrecedence::DISALLOW_COMMA);
             }
-            kind => panic!("unexpected EntityName: {:?}", kind),
+            kind => panic!("unexpected EntityName: {}", kind_string(kind)),
         }
     }
 
@@ -2093,7 +2094,7 @@ impl Printer {
             SyntaxKind::Identifier => self.emit_binding_identifier(node),
             SyntaxKind::ObjectBindingPattern => self.emit_object_binding_pattern(node),
             SyntaxKind::ArrayBindingPattern => self.emit_array_binding_pattern(node),
-            kind => panic!("unexpected BindingName: {:?}", kind),
+            kind => panic!("unexpected BindingName: {}", kind_string(kind)),
         }
     }
 
@@ -2116,7 +2117,7 @@ impl Printer {
             SyntaxKind::NumericLiteral => self.emit_numeric_literal(node),
             SyntaxKind::BigIntLiteral => self.emit_big_int_literal(node),
             SyntaxKind::ComputedPropertyName => self.emit_computed_property_name(node),
-            kind => panic!("unexpected PropertyName: {:?}", kind),
+            kind => panic!("unexpected PropertyName: {}", kind_string(kind)),
         }
 
         self.write_kind = saved_write_kind;
@@ -2131,7 +2132,7 @@ impl Printer {
         match node.kind() {
             SyntaxKind::Identifier => self.emit_identifier_name(node),
             SyntaxKind::PrivateIdentifier => self.emit_private_identifier(node),
-            kind => panic!("unexpected MemberName: {:?}", kind),
+            kind => panic!("unexpected MemberName: {}", kind_string(kind)),
         }
     }
 
@@ -2144,7 +2145,7 @@ impl Printer {
         match node.kind() {
             SyntaxKind::Identifier => self.emit_binding_identifier(node),
             SyntaxKind::StringLiteral => self.emit_string_literal(node),
-            kind => panic!("unexpected ModuleName: {:?}", kind),
+            kind => panic!("unexpected ModuleName: {}", kind_string(kind)),
         }
     }
 
@@ -2157,7 +2158,7 @@ impl Printer {
         match node.kind() {
             SyntaxKind::Identifier => self.emit_identifier_name(node),
             SyntaxKind::StringLiteral => self.emit_string_literal(node),
-            kind => panic!("unexpected ModuleExportName: {:?}", kind),
+            kind => panic!("unexpected ModuleExportName: {}", kind_string(kind)),
         }
     }
 
@@ -2166,7 +2167,7 @@ impl Printer {
         match node.kind() {
             SyntaxKind::Identifier => self.emit_identifier_name(node),
             SyntaxKind::StringLiteral => self.emit_string_literal(node),
-            kind => panic!("unexpected ImportAttributeName: {:?}", kind),
+            kind => panic!("unexpected ImportAttributeName: {}", kind_string(kind)),
         }
     }
 
@@ -2179,7 +2180,7 @@ impl Printer {
         match node.kind() {
             SyntaxKind::Identifier => self.emit_identifier_name(node),
             SyntaxKind::StringLiteral => self.emit_string_literal(node),
-            kind => panic!("unexpected ModuleName: {:?}", kind),
+            kind => panic!("unexpected ModuleName: {}", kind_string(kind)),
         }
     }
 }

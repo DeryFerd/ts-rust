@@ -1,6 +1,7 @@
 //! Go `printer/printer.go` lines 2455 to 3689: expressions, misc and
 //! statements. The `Printer` struct is in `printer_p1.rs`.
 
+use crate::gostd::debug::kind_string;
 use crate::prelude::*;
 
 // PORT: Go uses local `printerState`, `tokenEmitFlags`, `ListFormat`,
@@ -250,7 +251,7 @@ impl Printer {
                 self.emit_no_substitution_template_literal(node)
             }
             SyntaxKind::TemplateExpression => self.emit_template_expression(node),
-            _ => panic!("unhandled TemplateLiteral: {:?}", node.kind()),
+            _ => panic!("unhandled TemplateLiteral: {}", kind_string(node.kind())),
         }
     }
 
@@ -335,7 +336,7 @@ impl Printer {
         } else if is_expression(node) {
             self.emit_expression(node, OperatorPrecedence::YIELD);
         } else {
-            panic!("unexpected ConciseBody: {:?}", node.kind());
+            panic!("unexpected ConciseBody: {}", kind_string(node.kind()));
         }
     }
 
@@ -1120,7 +1121,7 @@ impl Printer {
                 panic!("SyntheticReferenceExpression should not be printed")
             }
 
-            _ => panic!("unexpected Expression: {:?}", node.kind()),
+            _ => panic!("unexpected Expression: {}", kind_string(node.kind())),
         }
 
         if parens {

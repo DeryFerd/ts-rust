@@ -11,6 +11,7 @@
 //! Go `PrintHandlers` is embedded in `Printer`; here it is the field
 //! `print_handlers`.
 
+use crate::gostd::debug::kind_string;
 use crate::prelude::*;
 use crate::printer::*;
 
@@ -210,7 +211,7 @@ impl Printer {
         } else if is_modifier(node) {
             self.emit_keyword_node(node);
         } else {
-            panic!("unhandled ModifierLike: {:?}", node.kind());
+            panic!("unhandled ModifierLike: {}", kind_string(node.kind()));
         }
     }
 
@@ -610,7 +611,7 @@ impl Printer {
             SyntaxKind::SemicolonClassElement => self.emit_semicolon_class_element(node),
             SyntaxKind::NotEmittedStatement => self.emit_not_emitted_statement(node),
             SyntaxKind::JsTypeAliasDeclaration => self.emit_type_alias_declaration(node),
-            _ => panic!("unexpected ClassElement: {:?}", node.kind()),
+            _ => panic!("unexpected ClassElement: {}", kind_string(node.kind())),
         }
     }
 
@@ -625,7 +626,7 @@ impl Printer {
             SyntaxKind::SetAccessor => self.emit_set_accessor_declaration(node),
             SyntaxKind::IndexSignature => self.emit_index_signature(node),
             SyntaxKind::NotEmittedTypeElement => self.emit_not_emitted_type_element(node),
-            _ => panic!("unexpected TypeElement: {:?}", node.kind()),
+            _ => panic!("unexpected TypeElement: {}", kind_string(node.kind())),
         }
     }
 
@@ -640,7 +641,10 @@ impl Printer {
             SyntaxKind::MethodDeclaration => self.emit_method_declaration(node),
             SyntaxKind::GetAccessor => self.emit_get_accessor_declaration(node),
             SyntaxKind::SetAccessor => self.emit_set_accessor_declaration(node),
-            _ => panic!("unhandled ObjectLiteralElement: {:?}", node.kind()),
+            _ => panic!(
+                "unhandled ObjectLiteralElement: {}",
+                kind_string(node.kind())
+            ),
         }
     }
 
@@ -658,7 +662,10 @@ impl Printer {
         match node.kind() {
             SyntaxKind::Identifier => self.emit_identifier_reference(node),
             SyntaxKind::ThisType => self.emit_this_type(node),
-            _ => panic!("unexpected TypePredicateParameterName: {:?}", node.kind()),
+            _ => panic!(
+                "unexpected TypePredicateParameterName: {}",
+                kind_string(node.kind())
+            ),
         }
     }
 
@@ -1262,7 +1269,7 @@ impl Printer {
             SyntaxKind::JsDocOptionalType => self.emit_js_doc_optional_type(node),
             SyntaxKind::JsDocVariadicType => self.emit_js_doc_variadic_type(node),
 
-            _ => panic!("unhandled TypeNode: {:?}", node.kind()),
+            _ => panic!("unhandled TypeNode: {}", kind_string(node.kind())),
         }
 
         if parens {
