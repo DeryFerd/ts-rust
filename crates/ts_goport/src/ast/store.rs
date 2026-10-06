@@ -5981,11 +5981,26 @@ impl FileStore {
     /// The record of a new node slot (`alloc_store_slot_node`).
     #[inline]
     fn push_node_header(&mut self, kind: SyntaxKind, text_is_keyword: bool) {
-        if self.records.len() == self.records.capacity() {
-            self.reserve_slots_for_text();
+        // PERF: factscol1b round c. Each arm pushes, so the push of the
+        // fast arm knows there is room and makes no second check of the
+        // capacity. With the push after one `if` that grows, both checks
+        // stayed (hono noEmit +0.08% instructions). The record is made in
+        // each arm: made before, it went through the stack.
+        if self.records.len() < self.records.capacity() {
+            self.records.push(NodeRecord::node(text_is_keyword));
+        } else {
+            self.push_record_into_full_columns(text_is_keyword);
         }
-        self.records.push(NodeRecord::node(text_is_keyword));
         self.kinds.push(kind);
+    }
+
+    /// `push_node_header` when the slot columns are full: grows them
+    /// (`reserve_slots_for_text`) and pushes the record.
+    #[cold]
+    #[inline(never)]
+    fn push_record_into_full_columns(&mut self, text_is_keyword: bool) {
+        self.reserve_slots_for_text();
+        self.records.push(NodeRecord::node(text_is_keyword));
     }
 
     /// The kids (U1, U4) and link entries of a new node slot of kind
@@ -6006,17 +6021,15 @@ impl FileStore {
         self.debug_assert_build_columns();
     }
 
-    /// The slot columns are full (`push_node_header`): grows each to the
-    /// `slots_for_text` slots, or doubles it, as a `Vec` grows, when that
-    /// is a doubling or the memory for more is not free.
+    /// The slot columns are full (`push_record_into_full_columns`): grows
+    /// each to the `slots_for_text` slots, or doubles it, as a `Vec` grows,
+    /// when that is a doubling or the memory for more is not free.
     // PERF: factscol1b (cliperf1 rank 6). `FileStore::new` reserves for one
     // slot per 12 text bytes. A dense file (a 5 MB JS file of 1.09 bytes
     // per slot) doubled its columns 4 times, and each `realloc` moved them
     // (801 MB of new buffers). It now grows 4 times, twice. Normal
     // TypeScript (6 to 8 bytes per slot) grows once, by doubling, as
     // before.
-    #[cold]
-    #[inline(never)]
     fn reserve_slots_for_text(&mut self) {
         let wanted = slots_for_text(&self.records, self.text.len());
         self.grow_slot_columns(wanted);
