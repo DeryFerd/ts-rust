@@ -1565,6 +1565,16 @@ fn take_prefetched_meta(loader: &FileLoader, file_name: &str) -> Option<SourceFi
                     .wait(state)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
+            // A test can make the loader wait for a job that no worker has
+            // started yet (`set_meta_wait`), so the worker finds the
+            // metadata whatever the timing.
+            #[cfg(test)]
+            PrefetchState::Queued if META_WAIT.with(Cell::get) => {
+                state = job
+                    .done
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
             PrefetchState::Done(Some(result)) => break result.meta.clone(),
             _ => break None,
         }
@@ -1605,6 +1615,23 @@ fn load_prep_enabled() -> bool {
 #[cfg(test)]
 pub(crate) fn set_load_prep(on: Option<bool>) {
     LOAD_PREP.with(|prep| prep.set(on));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice to make the loads on this thread wait in
+    /// `take_prefetched_meta` for a job that is still queued.
+    static META_WAIT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the loads on this thread wait for the parse worker of each file
+/// in `take_prefetched_meta`, also when no worker has started it yet, so
+/// the loader always takes the worker's metadata (tests). Only for loads
+/// with parse workers (`parse_workers_enabled`): with none, a queued job
+/// never starts.
+#[cfg(test)]
+pub(crate) fn set_meta_wait(on: bool) {
+    META_WAIT.with(|wait| wait.set(on));
 }
 
 /// The preps that loads on this thread took so far (tests).

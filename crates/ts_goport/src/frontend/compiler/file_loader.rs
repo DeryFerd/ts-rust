@@ -2452,7 +2452,7 @@ pub(crate) fn get_jsx_implicit_import_base_of_file(
 
 #[cfg(test)]
 mod tests {
-    use super::super::files_parser::{preps_taken, set_load_prep};
+    use super::super::files_parser::{preps_taken, set_load_prep, set_meta_wait};
     use super::*;
     use crate::frontend::bundled;
     use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
@@ -2923,7 +2923,9 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
     // (Go `Program.GetPackageJsonInfo`, compiler/program.go:157) finds what
     // the load read, also when the files changed on disk since: the
     // project's package.json (the scope of `src/a.ts`) and the package
-    // that `src/a.ts` imports (the scope of its `index.d.ts`).
+    // that `src/a.ts` imports (the scope of its `index.d.ts`). With the prep
+    // on, the loader waits for the worker of each file (`set_meta_wait`), so
+    // it takes the worker's metadata whatever the timing.
     #[test]
     fn the_loader_keeps_the_package_json_files_that_workers_read() {
         let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "types": [],
@@ -2943,8 +2945,12 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 "export declare const x: number;\n",
             ),
         ];
+        // With no parse workers (one CPU, or `GOPORT_PARSE_THREADS=0`) the
+        // loader reads every file itself.
+        let workers = super::super::files_parser::parse_workers_enabled();
         for prep in [true, false] {
             set_load_prep(Some(prep));
+            set_meta_wait(prep && workers);
             let before = crate::frontend::module::cache::adopted_package_jsons();
             let (processed, dir, cwd) =
                 load_with_workers(&format!("keeps_package_jsons_{prep}"), tsconfig, &files);
@@ -2970,13 +2976,11 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 (Some("app".to_string()), Some("lib".to_string())),
                 "prep {prep}"
             );
-            // With parse workers the loader takes the metadata of `src/a.ts`
-            // from its worker (prep on): with no parse workers (one CPU, or
-            // `GOPORT_PARSE_THREADS=0`) the loader reads every file itself.
-            if prep && super::super::files_parser::parse_workers_enabled() {
+            if prep && workers {
                 assert!(adopted > 0, "no worker package.json taken");
             }
         }
         set_load_prep(None);
+        set_meta_wait(false);
     }
 }
