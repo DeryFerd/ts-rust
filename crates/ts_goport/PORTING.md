@@ -501,13 +501,17 @@ The batch that adds it is not accepted until Theo approves.
   A config change keeps the parses too: their key holds the parse options,
   and a parse with other module indicator options that it did not read is
   kept as a copy, as in `tsc --watch`
-  (`BuildHost::keep_watch_sources_for_config_change`); only an overflow
-  drops them. Parse workers parse ahead in the first build and in the
-  cycles with a config change or an overflow (`BuildHost::prefetch`); they
-  skip the kept parses, as in `tsc --watch`. A task keeps the versions that its errors point at until its
-  next build (`BuildTask::held_file_versions`). A file version's parse
-  holds it (`ParsedSourceFile::version`), and so
-  do the `VersionTables` of each program version that has the file, so a
+  (`BuildHost::keep_watch_sources_for_config_change`). A config change
+  that gives a project other module indicator inputs
+  (`ModuleIndicatorInputs`) drops the kept parses that read them
+  (`BuildHost::drop_kept_parses_that_read_module_indicator_options`), and
+  an overflow drops all. Parse workers parse ahead in the first build and
+  in the cycles with a config change or an overflow
+  (`BuildHost::prefetch`); they skip the kept parses, as in `tsc --watch`.
+  A task keeps the versions that its errors point at until its next build
+  or a reset of its status (`BuildTask::held_file_versions`). A file
+  version's parse holds it (`ParsedSourceFile::version`), and so do the
+  `VersionTables` of each program version that has the file, so a
   seeded thread keeps it too. A thread that reads it pins it until the
   next program release (`release_file_version_pins`, run when a
   `ReleasedProgram` drops) or its end, and a `FileRef` guard holds it. The

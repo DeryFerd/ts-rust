@@ -1,13 +1,15 @@
 //! Port-only tests of the file versions that `tsc -b --watch` keeps
 //! (watchfix1 part 2): a config change that changes the module indicator
-//! options drops the kept parses that read them (item 3), and a task whose
-//! status is reset lets go of the versions that its errors held (item 4).
+//! options drops the kept parses that read them, and one that does not
+//! keeps them (item 3), and a task whose status is reset lets go of the
+//! versions that its errors held (item 4).
 //!
 //! Go has no file versions: its GC frees a file when no program, cache or
 //! diagnostic holds it. The output of each cycle is Go's: the lines that
 //! the tests check are those of `tsgo-oracle-673a5f17d713 -b -w` on the same
 //! files and edits with the OS watcher
-//! (target/continuation-r97-goport/watchfix1/runs, mdrop and held2).
+//! (target/continuation-r97-goport/watchfix1/runs, mdrop and held2, and
+//! watchfix1/rb/runs/mjx).
 //! The first version of each file is static; each later parse of it is a
 //! freeable version (`ast::file_versions_made`, `ast::dead_file_versions`).
 
@@ -123,6 +125,57 @@ fn build_watch_drops_kept_parses_whose_module_indicator_options_changed() {
                         // the kept s2.ts v2, which no build of the cycle
                         // takes, goes. Before, it went back to the kept
                         // parses for the rest of the session.
+                        _ => (2, 1),
+                    };
+                    assert_eq!(file_versions(expected.1), expected, "edit {i}");
+                },
+            );
+        },
+    );
+}
+
+#[test]
+fn build_watch_keeps_kept_parses_whose_module_indicator_inputs_stay() {
+    run_test_in_child(
+        "tsctests::watch_build_kept_versions::build_watch_keeps_kept_parses_whose_module_indicator_inputs_stay",
+        || {
+            // A script file, whose parse reads its module indicator
+            // options, and a module file, whose parse does not.
+            let config = |module: &str, jsx: &str| {
+                format!(
+                    r#"{{"compilerOptions":{{"strict":true,"outDir":"out","rootDir":"src","types":[],"lib":["es5"],"module":"{module}","jsx":"{jsx}"}},"files":["src/s1.ts","src/m1.ts"]}}"#
+                )
+            };
+            session(
+                &[
+                    ("tsconfig.json", &config("es2020", "preserve")),
+                    ("src/s1.ts", "const one: number = 1;\n"),
+                    ("src/m1.ts", "export const m: number = 1;\n"),
+                ],
+                &["--build", "--watch", "--pretty", "false"],
+                &[
+                    ("src/s1.ts", "const one: number = 11;\n"),
+                    ("tsconfig.json", &config("esnext", "preserve")),
+                    ("tsconfig.json", &config("esnext", "react")),
+                    ("tsconfig.json", &config("esnext", "react-jsx")),
+                ],
+                |i, out| {
+                    assert!(
+                        out.contains("Found 0 errors. Watching for file changes."),
+                        "edit {i}: {out}"
+                    );
+                    let expected = match i {
+                        // s1.ts v2.
+                        0 => (1, 0),
+                        // The `module` and `jsx` edits give no file other
+                        // module indicator options (Go
+                        // `GetExternalModuleIndicatorOptions`): both kept
+                        // parses are used again, nothing is parsed. Before,
+                        // each of these edits dropped the kept s1.ts.
+                        1 | 2 => (1, 0),
+                        // react-jsx gives every file the `jsx` option:
+                        // s1.ts is parsed again and its kept v2 goes. The
+                        // kept m1.ts did not read it, so it stays.
                         _ => (2, 1),
                     };
                     assert_eq!(file_versions(expected.1), expected, "edit {i}");

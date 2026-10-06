@@ -20,7 +20,7 @@
 //! mode (buildtask.go:251).
 
 use crate::execute::build::build_task::BuildTask;
-use crate::execute::build::host::{ModuleIndicatorInputs, module_indicator_inputs};
+use crate::execute::build::host::ModuleIndicatorInputs;
 use crate::execute::build::orchestrator::Orchestrator;
 use crate::execute::tsc::compile::{Watcher, write_str};
 use crate::execute::watchmanager::{DirWatchSet, can_watch_directory, new_dir_watch_set};
@@ -579,7 +579,7 @@ impl Orchestrator {
                 let resolved = task.resolved.as_ref();
                 inputs.insert(
                     path.clone(),
-                    resolved.map(|config| module_indicator_inputs(config.compiler_options())),
+                    resolved.map(|config| ModuleIndicatorInputs::of(config.compiler_options())),
                 );
             }
         });
