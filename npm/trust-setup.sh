@@ -43,17 +43,26 @@ EOF
 done
 
 for name in "${packages[@]}"; do
-  # A configuration has an id (npm trust revoke --id). npm keeps one per package.
-  trust=$(npm trust list "$name" --json 2> /dev/null || true)
-  if ! grep -q '"id"' <<< "$trust"; then
-    npm trust github "$name" --file release.yml --repo "$repo" --env npm --allow-publish --yes
-    sleep 2
-  elif ! { grep -q "$repo" <<< "$trust" && grep -q 'release\.yml' <<< "$trust" &&
-    grep -q '"npm"' <<< "$trust"; }; then
-    echo "$name trusts another repo, workflow or environment:" >&2
-    npm trust list "$name" >&2
-    echo "revoke it with: npm trust revoke $name --id <id>, then run this again" >&2
-    exit 1
-  fi
+  # `npm trust list --json` prints one JSON object per trust (npm/cli lib/trust-cmd.js
+  # logOptions): id, type, file, repository, environment and permissions. createPackage is
+  # --allow-publish.
+  state=$(npm trust list "$name" --json 2> /dev/null | node -e '
+    const text = require("fs").readFileSync(0, "utf8").trim();
+    const trusts = text ? JSON.parse(`[${text.replace(/}\s*{/g, "},{")}]`) : [];
+    const ok = trusts.some(t => t.type === "github" && t.repository === process.argv[1] &&
+      t.file === "release.yml" && t.environment === "npm" &&
+      (t.permissions ?? []).includes("createPackage"));
+    console.log(ok ? "ok" : trusts.length ? "other" : "none");
+  ' "$repo")
+  case $state in
+    none)
+      npm trust github "$name" --file release.yml --repo "$repo" --env npm --allow-publish --yes
+      sleep 2 ;;
+    other)
+      echo "$name trusts another repo, workflow, environment or permission:" >&2
+      npm trust list "$name" >&2
+      echo "revoke it with: npm trust revoke $name --id <id>, then run this again" >&2
+      exit 1 ;;
+  esac
   npm trust list "$name"
 done
