@@ -1489,6 +1489,65 @@ impl<T: Clone> CowChunks<T> {
         }
     }
 
+    /// Adds the values of `from` from this array's length on. `from` is a
+    /// later state of the array that this one is a clone of (the binder
+    /// lineage, `SymbolArena::catch_up`), so each index below this length
+    /// holds the same value in both, except where this array wrote. The
+    /// values here do not change. The values that fill a partial last chunk
+    /// here, and the tail of `from`, are copies. The chunks after them are
+    /// shared as `from` holds them: static, shared by `Arc`, or freed.
+    /// When `from` ended this partial chunk (`end_chunk`), its indexes after
+    /// the values are holes here too.
+    pub fn catch_up(&mut self, from: &CowChunks<T>) {
+        if from.len <= self.len {
+            return;
+        }
+        if self.len & COW_CHUNK_MASK != 0 {
+            if self.len < self.tail_start() {
+                self.take_back_tail();
+            }
+            let chunk = self.chunks.len();
+            let start = chunk << COW_CHUNK_SHIFT;
+            let held = match from.chunks.get(chunk) {
+                Some(Chunk::Fixed(_)) => COW_CHUNK_LEN,
+                Some(Chunk::Shared(values)) => values.len(),
+                Some(Chunk::Freed) => 0,
+                None => from.tail.len(),
+            };
+            let end = start + held;
+            if end > self.len {
+                self.tail.reserve_exact(end - self.len);
+                for i in self.len..end {
+                    self.tail.push(from.get(i).clone());
+                }
+                self.len = end;
+            }
+            if from.len < start + COW_CHUNK_LEN {
+                // `from` still ends in this chunk: its tail.
+                debug_assert_eq!(self.len, from.len, "caught up inside the last chunk");
+                return;
+            }
+            if self.tail.len() == COW_CHUNK_LEN {
+                self.seal_full_tail();
+            } else {
+                // `from` ended the chunk here: the rest are holes.
+                let values = std::mem::take(&mut self.tail);
+                self.chunks.push(Chunk::Shared(Arc::new(values)));
+            }
+            self.len = start + COW_CHUNK_LEN;
+        }
+        // A full tail that no push has sealed yet.
+        self.seal_full_tail();
+        debug_assert!(
+            self.tail.is_empty() && self.len == self.tail_start(),
+            "catch up from a chunk start"
+        );
+        let first = self.chunks.len();
+        self.chunks.extend(from.chunks[first..].iter().cloned());
+        self.tail = from.tail.clone();
+        self.len = from.len;
+    }
+
     /// The number of chunks that hold values (freed chunks do not count),
     /// with the tail.
     #[must_use]
@@ -1753,6 +1812,115 @@ mod hole_tests {
         arena.free_range(start, arena.mark());
         assert_eq!(arena.live_chunk_count(), live - 2);
         assert_eq!(arena.sym(before).name.as_str(), "before");
+    }
+
+    // apisym1c: a clone catches up to a later state of its array. It keeps
+    // what it wrote, fills its partial tail, shares the later chunks, takes
+    // the holes of a chunk that the array ended, and catches up again.
+    #[test]
+    fn a_clone_catches_up_to_later_values() {
+        let mut values = CowChunks::new();
+        push_to(&mut values, 300);
+        values.freeze_from(0);
+        let mut clone = values.clone();
+        *clone.get_mut(5) = 1005;
+        *clone.get_mut(290) = 1290;
+        // A static file fills the partial chunk and more.
+        push_to(&mut values, 600);
+        values.freeze_from(0);
+        // A freeable version: its own chunks, shared, then the chunk ends.
+        values.end_chunk();
+        let start = values.len();
+        push_to(&mut values, start + 10);
+        values.end_chunk();
+        values.share_from(start);
+        let end = values.len() + 3;
+        push_to(&mut values, end);
+        clone.catch_up(&values);
+        assert_eq!(clone.len(), values.len());
+        for index in (0..600).chain(start..start + 10) {
+            let expected = match index {
+                5 => 1005,
+                290 => 1290,
+                _ => index,
+            };
+            assert_eq!(*clone.get(index), expected, "{index}");
+        }
+        let last = values.len() - 1;
+        assert_eq!(*clone.get(last), last);
+        let read = |values: &CowChunks<usize>, index: usize| {
+            std::panic::catch_unwind(|| *values.get(index)).is_err()
+        };
+        assert!(read(&clone, 650) && read(&clone, start + 10), "holes");
+        // Nothing new: no change. Then more values in the same tail.
+        clone.catch_up(&values);
+        assert_eq!(clone.len(), values.len());
+        push_to(&mut values, last + 300);
+        clone.catch_up(&values);
+        assert_eq!(
+            (clone.len(), *clone.get(last + 299)),
+            (values.len(), last + 299)
+        );
+        assert_eq!(*clone.get(290), 1290);
+    }
+
+    // apisym1c: a checker arena makes its own symbols and tables in part 1
+    // (`OWN`). It catches up to the lineage: it reads a later binder symbol,
+    // its table and its members by the lineage ids, keeps its own symbols,
+    // and frees the ranges that the lineage freed.
+    #[test]
+    fn a_checker_arena_catches_up_to_the_lineage() {
+        let mut lineage = SymbolArena::new();
+        let early = lineage.new_symbol(SymbolFlags::NONE, "early");
+        let mut checker = lineage.for_checker();
+        let own = checker.new_symbol(SymbolFlags::TRANSIENT, "own");
+        let own_table = checker.new_table();
+        checker.set(own_table, "early", early);
+        assert_eq!((own.0 & OWN, own_table.0 & OWN), (OWN, OWN));
+        assert_eq!(checker.symbol_count(), 2);
+        assert_eq!(checker.own_symbols().collect::<Vec<_>>(), [own]);
+
+        // A freeable version binds after the copy, then dies.
+        lineage.end_chunk();
+        let start = lineage.mark();
+        let later = lineage.new_symbol(SymbolFlags::NONE, "later");
+        let members = lineage.new_table();
+        lineage.set(members, "m", later);
+        lineage.sym_mut(later).members = members;
+        lineage.end_chunk();
+        lineage.share_since(start);
+        let end = lineage.mark();
+        lineage.set_lineage_seen(LineageSeen {
+            generation: 1,
+            freed: 0,
+        });
+        checker.catch_up(&lineage, &[]);
+        assert_eq!(checker.sym(later).name.as_str(), "later");
+        assert_eq!(checker.get(checker.sym(later).members, "m"), later);
+        assert_eq!(checker.sym(own).name.as_str(), "own");
+        assert_eq!(checker.get(own_table, "early"), early);
+        assert_eq!(
+            checker.id_slot(later),
+            IdSlot {
+                key: 0,
+                place: later.0
+            }
+        );
+        assert_eq!(checker.symbol_at_slot(checker.id_slot(own)), Some(own));
+        let live = checker.live_chunk_count();
+
+        lineage.free_range(start, end);
+        let freed = [(start, end)];
+        lineage.set_lineage_seen(LineageSeen {
+            generation: 2,
+            freed: 1,
+        });
+        checker.catch_up(&lineage, &freed);
+        assert_eq!(checker.lineage_seen().freed, 1);
+        assert_eq!(checker.live_chunk_count(), live - 2);
+        assert!(std::panic::catch_unwind(|| checker.sym(later).flags).is_err());
+        assert_eq!(checker.sym(early).name.as_str(), "early");
+        assert_eq!(checker.sym(own).name.as_str(), "own");
     }
 }
 
@@ -2066,6 +2234,51 @@ impl Table {
     }
 }
 
+/// The index bit of the symbols and tables that a checker arena makes
+/// (`SymbolArena::for_checker`). Binder lineage indexes stay below it. So an
+/// index without it names one lineage symbol or table in every arena, as a
+/// Go `*ast.Symbol` is one object for every checker, and a checker can add
+/// the lineage chunks bound after its copy (`SymbolArena::catch_up`).
+pub const OWN: u32 = 1 << 31;
+
+/// The part of a `SymbolArena` (0: binder lineage, 1: own) and the index in
+/// it of symbol or table index `index`.
+// PERF: no branch. The part is the top bit, so the bounds test of the part
+// array goes too.
+#[inline(always)]
+const fn arena_part(index: u32) -> (usize, usize) {
+    ((index >> 31) as usize, (index & !OWN) as usize)
+}
+
+/// One part of a `SymbolArena` array.
+// PERF: 64 bytes, so the address of a part is a shift of the part, not a
+// multiply (`arena_part`).
+#[derive(Clone, Debug)]
+#[repr(align(64))]
+struct Part<T: 'static>(CowChunks<T>);
+
+impl<T: Clone> Default for Part<T> {
+    fn default() -> Self {
+        Part(CowChunks::new())
+    }
+}
+
+impl<T> std::ops::Deref for Part<T> {
+    type Target = CowChunks<T>;
+
+    #[inline(always)]
+    fn deref(&self) -> &CowChunks<T> {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for Part<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut CowChunks<T> {
+        &mut self.0
+    }
+}
+
 /// Owns all symbols and symbol tables. The binder fills one arena. Each
 /// checker starts from a copy (`for_checker`), so binder ids stay valid and
 /// checker (transient) symbols stay private to that checker. The API can add
@@ -2078,33 +2291,51 @@ impl Table {
 /// shared (`share_since`). The binder lineage (`program.rs`) binds a
 /// freeable version into whole chunks of its own (`end_chunk`) and frees
 /// them when the version dies (`free_range`, lsshells M3d).
+///
+/// apisym1c: each array has two parts. Part 0 holds the binder symbols and
+/// tables: every symbol of a binder arena, and the lineage copy of a
+/// checker arena. Part 1 holds the symbols and tables that a checker arena
+/// makes, with the index bit `OWN`. So a later lineage index is never one of
+/// a checker's own, and a checker can add the chunks that the lineage bound
+/// after its copy (`catch_up`), as a Go checker reads every bound file.
 #[derive(Clone, Debug)]
 pub struct SymbolArena {
-    symbols: CowChunks<Symbol>,
-    tables: CowChunks<Table>,
+    symbols: [Part<Symbol>; 2],
+    tables: [Part<Table>; 2],
+    /// `OWN` in a checker arena, whose pushes go to part 1; 0 in a binder
+    /// arena.
+    own: u32,
     /// The names that the binder gave private identifier symbols
     /// (`get_symbol_name_for_private_identifier`), as intern ids. Each holds
     /// a symbol id, which `prepare_file_arena` moves.
     private_names: Vec<u32>,
     /// Where `crate::ast::get_symbol_id` keeps the ids of these symbols.
     ids: SymbolIds,
+    /// The state of the binder lineage that part 0 copies
+    /// (`program::catch_up_checker`).
+    seen: LineageSeen,
+}
+
+/// A state of the binder lineage (`program.rs`): its generation, which each
+/// bind and free makes new, and the number of ranges that it has freed. A
+/// copy of the lineage keeps the state that it copies, so a checker knows
+/// when it must catch up (`SymbolArena::catch_up`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LineageSeen {
+    pub generation: u64,
+    pub freed: usize,
 }
 
 /// Where `crate::ast::get_symbol_id` keeps the ids of the symbols of one
 /// arena. Every binder arena of the process (the binder lineage in
 /// `program.rs` and its copies) gives a symbol one id, like Go, where a
 /// bound file keeps its symbols in every program. A checker arena
-/// (`SymbolArena::for_checker`) adds its own symbols after the binder
-/// symbols, at indexes where other checkers and later binds put other
-/// symbols, so those symbols have ids of their own, kept by `key`.
+/// (`SymbolArena::for_checker`) makes its own symbols (index bit `OWN`),
+/// which other checkers do not have, so those symbols have ids of their
+/// own, kept by `key`.
 #[derive(Debug)]
 struct SymbolIds {
-    /// Symbols below this index have the shared id of their index.
-    shared: u32,
-    /// Tables below this index are binder lineage tables, which every
-    /// checker copy of the lineage made after them has too.
-    shared_tables: u32,
-    /// Keys the ids of the other symbols. 0 when every symbol is shared.
+    /// Keys the ids of the own symbols. 0 in a binder arena.
     key: u32,
     /// The shadows in this arena (`SymbolArena::push_shadow`), if any.
     shadows: Option<Box<Shadows>>,
@@ -2123,18 +2354,14 @@ struct Shadows {
 impl SymbolIds {
     /// Every symbol has the shared id of its index.
     const SHARED: SymbolIds = SymbolIds {
-        shared: u32::MAX,
-        shared_tables: u32::MAX,
         key: 0,
         shadows: None,
     };
 
-    /// Symbols from index `shared` on have ids of their own.
-    fn own_from(shared: usize, shared_tables: usize) -> SymbolIds {
+    /// The own symbols (part 1) have ids of their own, under a new key.
+    fn own() -> SymbolIds {
         static NEXT_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
         SymbolIds {
-            shared: u32::try_from(shared).expect("symbol overflow"),
-            shared_tables: u32::try_from(shared_tables).expect("table overflow"),
             key: NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             shadows: None,
         }
@@ -2148,7 +2375,7 @@ impl Clone for SymbolIds {
         if self.key == 0 {
             SymbolIds::SHARED
         } else {
-            SymbolIds::own_from(self.shared as usize, self.shared_tables as usize)
+            SymbolIds::own()
         }
     }
 }
@@ -2171,8 +2398,8 @@ pub struct IdSlot {
     /// 0 for a binder lineage symbol, whose id every arena shares. Else the
     /// key of the checker arena that made the symbol.
     pub key: u32,
-    /// The lineage index (key 0), or the place of the symbol among the own
-    /// symbols of that arena.
+    /// The lineage index (key 0), or the index of the symbol among the own
+    /// symbols of that arena (its index without `OWN`).
     pub place: u32,
 }
 
@@ -2190,17 +2417,19 @@ impl SymbolArena {
         let mut tables = CowChunks::new();
         tables.push(Table::default());
         Self {
-            symbols,
-            tables,
+            symbols: [Part(symbols), Part::default()],
+            tables: [Part(tables), Part::default()],
+            own: 0,
             private_names: Vec::new(),
             ids: SymbolIds::SHARED,
+            seen: LineageSeen::default(),
         }
     }
 
     /// A copy of this binder arena for a checker (Go `NewChecker` reads the
-    /// bound program). The symbols that the checker adds have ids of their
-    /// own (`crate::ast::get_symbol_id`), so checkers of any program can
-    /// share a thread.
+    /// bound program). The symbols and tables that the checker adds go to
+    /// part 1 (`OWN`) and have ids of their own (`crate::ast::get_symbol_id`),
+    /// so checkers of any program can share a thread.
     #[must_use]
     pub fn for_checker(&self) -> SymbolArena {
         debug_assert!(
@@ -2208,11 +2437,56 @@ impl SymbolArena {
             "a checker arena is made from a binder arena"
         );
         SymbolArena {
-            symbols: self.symbols.clone(),
-            tables: self.tables.clone(),
+            symbols: [self.symbols[0].clone(), Part::default()],
+            tables: [self.tables[0].clone(), Part::default()],
+            own: OWN,
             private_names: self.private_names.clone(),
-            ids: SymbolIds::own_from(self.symbols.len(), self.tables.len()),
+            ids: SymbolIds::own(),
+            seen: self.seen,
         }
+    }
+
+    /// The state of the binder lineage that this arena copies (or is, for
+    /// the lineage itself).
+    #[must_use]
+    pub fn lineage_seen(&self) -> LineageSeen {
+        self.seen
+    }
+
+    /// Notes that this binder arena (the lineage) is now in state `seen`, so
+    /// the copies made from now on keep it.
+    pub fn set_lineage_seen(&mut self, seen: LineageSeen) {
+        debug_assert!(self.ids.key == 0, "the lineage is a binder arena");
+        self.seen = seen;
+    }
+
+    /// Brings the lineage copy (part 0) of this checker arena up to
+    /// `lineage`, the binder lineage now, which `freed` ranges of has freed
+    /// (`free_range`), in order. It adds the chunks that the lineage bound
+    /// after the copy (`CowChunks::catch_up`) and frees the ranges freed
+    /// after it, so a symbol of any live file version is the same index
+    /// here as in the lineage. The values that this arena holds stay as
+    /// they are, so its own writes to lineage symbols stay. The own part
+    /// does not change.
+    // PORT: Go has one object per symbol, so a checker reads any bound file
+    // with no step like this. The frees are the lineage's (lsshells M3d):
+    // a request reaches a file version only while a snapshot holds it.
+    pub fn catch_up(&mut self, lineage: &SymbolArena, freed: &[(ArenaMark, ArenaMark)]) {
+        debug_assert!(
+            self.ids.key != 0 && lineage.ids.key == 0,
+            "a checker arena catches up to the binder lineage"
+        );
+        debug_assert_eq!(
+            lineage.seen.freed,
+            freed.len(),
+            "the lineage's freed ranges"
+        );
+        self.symbols[0].catch_up(&lineage.symbols[0]);
+        self.tables[0].catch_up(&lineage.tables[0]);
+        for &(start, end) in &freed[self.seen.freed..] {
+            self.free_range(start, end);
+        }
+        self.seen = lineage.seen;
     }
 
     /// Where `crate::ast::get_symbol_id` keeps the id of `symbol`: the
@@ -2222,8 +2496,7 @@ impl SymbolArena {
     #[inline]
     #[must_use]
     pub fn id_slot(&self, symbol: SymbolId) -> IdSlot {
-        let shared = self.ids.shared;
-        if symbol.0 < shared {
+        if symbol.0 & OWN == 0 {
             return IdSlot {
                 key: 0,
                 place: symbol.0,
@@ -2236,7 +2509,7 @@ impl SymbolArena {
         }
         IdSlot {
             key: self.ids.key,
-            place: symbol.0 - shared,
+            place: symbol.0 & !OWN,
         }
     }
 
@@ -2252,11 +2525,11 @@ impl SymbolArena {
     /// symbol itself, or its shadow. None when this arena has neither.
     #[must_use]
     pub fn symbol_at_slot(&self, slot: IdSlot) -> Option<SymbolId> {
-        if slot.key == 0 && slot.place < self.ids.shared {
+        if slot.key == 0 && (slot.place as usize) < self.symbols[0].len() {
             return Some(SymbolId(slot.place));
         }
         if slot.key != 0 && slot.key == self.ids.key {
-            return Some(SymbolId(self.ids.shared + slot.place));
+            return Some(SymbolId(OWN | slot.place));
         }
         let shadows = self.ids.shadows.as_ref()?;
         shadows.by_origin.get(&slot).copied()
@@ -2282,18 +2555,18 @@ impl SymbolArena {
         shadow
     }
 
-    /// The number of binder lineage tables in this checker arena: a table
-    /// below this index is the same table in every checker arena whose
-    /// count is above it.
-    #[must_use]
-    pub fn shared_table_count(&self) -> usize {
-        self.ids.shared_tables as usize
-    }
-
-    /// The number of symbols, with the nil symbol at index 0.
+    /// The number of binder symbols (part 0), with the nil symbol at index
+    /// 0: the lineage copy of a checker arena.
     #[must_use]
     pub fn symbol_count(&self) -> usize {
-        self.symbols.len()
+        self.symbols[0].len()
+    }
+
+    /// The symbols that this checker arena made (part 1, `OWN`), in order.
+    /// None in a binder arena.
+    pub fn own_symbols(&self) -> impl Iterator<Item = SymbolId> + use<> {
+        let count = u32::try_from(self.symbols[1].len()).expect("symbol overflow");
+        (0..count).map(|place| SymbolId(OWN | place))
     }
 
     // The dump and load API of the lib bind snapshot
@@ -2307,13 +2580,17 @@ impl SymbolArena {
     /// symbol and table, and no private names.
     #[must_use]
     pub fn is_new(&self) -> bool {
-        self.symbols.len() == 1 && self.tables.len() == 1 && self.private_names.is_empty()
+        self.symbols[0].len() == 1
+            && self.tables[0].len() == 1
+            && self.symbols[1].is_empty()
+            && self.tables[1].is_empty()
+            && self.private_names.is_empty()
     }
 
-    /// The number of tables, with the nil table at index 0.
+    /// The number of binder tables (part 0), with the nil table at index 0.
     #[must_use]
     pub fn table_count(&self) -> usize {
-        self.tables.len()
+        self.tables[0].len()
     }
 
     /// The names given to `note_private_name`, in order.
@@ -2364,8 +2641,8 @@ impl SymbolArena {
     #[must_use]
     pub fn mark(&self) -> ArenaMark {
         ArenaMark {
-            symbols: self.symbols.len(),
-            tables: self.tables.len(),
+            symbols: self.symbols[0].len(),
+            tables: self.tables[0].len(),
         }
     }
 
@@ -2373,8 +2650,8 @@ impl SymbolArena {
     /// (`CowChunks::share_from`). Call it after binding, before the arena is
     /// cloned.
     pub fn share_since(&mut self, mark: ArenaMark) {
-        self.symbols.share_from(mark.symbols);
-        self.tables.share_from(mark.tables);
+        self.symbols[0].share_from(mark.symbols);
+        self.tables[0].share_from(mark.tables);
     }
 
     /// Leaks the full chunks of the symbols and tables added since `mark`
@@ -2384,8 +2661,8 @@ impl SymbolArena {
     // PERF: a read of a static chunk has no pointer hop, and a checker copy
     // changes no reference count.
     pub fn freeze_since(&mut self, mark: ArenaMark) {
-        self.symbols.freeze_from(mark.symbols);
-        self.tables.freeze_from(mark.tables);
+        self.symbols[0].freeze_from(mark.symbols);
+        self.tables[0].freeze_from(mark.tables);
     }
 
     /// Ends the last symbol chunk and the last table chunk, so the next
@@ -2393,8 +2670,8 @@ impl SymbolArena {
     /// skipped here hold nothing, and the ended chunks are shared.
     /// `next_file_offsets` is then `ArenaOffsets::aligned`.
     pub fn end_chunk(&mut self) {
-        self.symbols.end_chunk();
-        self.tables.end_chunk();
+        self.symbols[0].end_chunk();
+        self.tables[0].end_chunk();
     }
 
     /// Frees the symbols and tables from `start` to `end`: the range of one
@@ -2403,15 +2680,23 @@ impl SymbolArena {
     /// shares the chunks (a program copy, a checker arena) keeps them until
     /// it drops.
     pub fn free_range(&mut self, start: ArenaMark, end: ArenaMark) {
-        self.symbols.free_chunks(start.symbols, end.symbols);
-        self.tables.free_chunks(start.tables, end.tables);
+        self.symbols[0].free_chunks(start.symbols, end.symbols);
+        self.tables[0].free_chunks(start.tables, end.tables);
     }
 
-    /// The symbol and table chunks that hold values. Tests use it to see
-    /// that `free_range` frees.
+    /// The symbol and table chunks that hold values, in both parts. Tests
+    /// use it to see that `free_range` frees.
     #[must_use]
     pub fn live_chunk_count(&self) -> usize {
-        self.symbols.live_chunks() + self.tables.live_chunks()
+        self.symbols
+            .iter()
+            .map(|part| part.live_chunks())
+            .sum::<usize>()
+            + self
+                .tables
+                .iter()
+                .map(|part| part.live_chunks())
+                .sum::<usize>()
     }
 
     /// Go `&ast.Symbol{Flags: flags, Name: name}`.
@@ -2428,25 +2713,47 @@ impl SymbolArena {
     /// `new_symbol` plus `sym_mut` writes when every field is known.
     // PERF: inlined with `CowChunks::push`, so the symbol is built in its
     // chunk slot.
+    // apisym1c: a binder arena pushes to part 0, a checker arena to part 1
+    // (`own`). Each part stays below `OWN`.
     #[inline]
     pub fn push_symbol(&mut self, symbol: Symbol) -> SymbolId {
-        let id = SymbolId(u32::try_from(self.symbols.len()).expect("symbol overflow"));
-        self.symbols.push(symbol);
-        id
+        let own = self.own;
+        let part = &mut self.symbols[(own >> 31) as usize];
+        let index = part.len();
+        assert!(index < OWN as usize, "symbol overflow");
+        part.push(symbol);
+        SymbolId(own | index as u32)
     }
 
     fn push_table(&mut self, table: Table) -> SymbolTable {
-        let id = SymbolTable(u32::try_from(self.tables.len()).expect("table overflow"));
-        self.tables.push(table);
-        id
+        let own = self.own;
+        let part = &mut self.tables[(own >> 31) as usize];
+        let index = part.len();
+        assert!(index < OWN as usize, "table overflow");
+        part.push(table);
+        SymbolTable(own | index as u32)
+    }
+
+    /// The table of handle `table` (not nil).
+    #[inline(always)]
+    fn table(&self, table: SymbolTable) -> &Table {
+        let (part, index) = arena_part(table.0);
+        self.tables[part].get(index)
+    }
+
+    /// `table` for a write: takes its chunk back first if it is not owned.
+    #[inline(always)]
+    fn table_mut(&mut self, table: SymbolTable) -> &mut Table {
+        let (part, index) = arena_part(table.0);
+        self.tables[part].get_mut(index)
     }
 
     /// Makes room for `symbols` more symbols and `tables` more tables, so
     /// binding a file does not grow the arena step by step. Capacity only:
     /// ids and contents do not change.
     pub fn reserve_arena(&mut self, symbols: usize, tables: usize) {
-        self.symbols.reserve(symbols);
-        self.tables.reserve(tables);
+        self.symbols[0].reserve(symbols);
+        self.tables[0].reserve(tables);
     }
 
     /// Go `make(ast.SymbolTable)`.
@@ -2464,10 +2771,10 @@ impl SymbolArena {
     /// lookups do not change. A nil table stays nil. A table that has room
     /// is not written, so a shared chunk is not taken back.
     pub fn reserve(&mut self, table: SymbolTable, additional: usize) {
-        if table.is_nil() || self.tables.get(table.index()).has_room(additional) {
+        if table.is_nil() || self.table(table).has_room(additional) {
             return;
         }
-        self.tables.get_mut(table.index()).reserve(additional);
+        self.table_mut(table).reserve(additional);
     }
 
     /// Go `table[name]`, plus the slot of `name` in `table`, so that
@@ -2481,7 +2788,7 @@ impl SymbolArena {
         let hash = name.table_hash();
         let mut found = (SymbolId::NIL, None);
         if table.is_some() {
-            let current = self.tables.get(table.index());
+            let current = self.table(table);
             if let Some(position) = current.find_id(hash, name.0) {
                 found = (current.entries[position].symbol, Some(position));
             }
@@ -2501,7 +2808,7 @@ impl SymbolArena {
     #[inline(always)]
     pub fn set_slot(&mut self, slot: TableSlot, symbol: SymbolId) {
         assert!(slot.table.is_some(), "assignment to entry in nil map");
-        let current = self.tables.get_mut(slot.table.index());
+        let current = self.table_mut(slot.table);
         match slot.position {
             Some(position) => current.entries[position].symbol = symbol,
             None => {
@@ -2520,8 +2827,8 @@ impl SymbolArena {
     #[must_use]
     pub fn next_file_offsets(&self) -> ArenaOffsets {
         ArenaOffsets {
-            symbols: u32::try_from(self.symbols.len() - 1).expect("symbol overflow"),
-            tables: u32::try_from(self.tables.len() - 1).expect("table overflow"),
+            symbols: u32::try_from(self.symbols[0].len() - 1).expect("symbol overflow"),
+            tables: u32::try_from(self.tables[0].len() - 1).expect("table overflow"),
         }
     }
 
@@ -2554,10 +2861,12 @@ impl SymbolArena {
     #[must_use]
     pub fn prepare_file_arena(self, offsets: ArenaOffsets, freeable: bool) -> PreparedFileArena {
         let SymbolArena {
-            symbols,
-            tables,
+            symbols: [Part(symbols), _],
+            tables: [Part(tables), _],
+            own: _,
             private_names,
             ids: _,
+            seen: _,
         } = self;
         // The file symbols whose names hold a symbol id.
         let mut private_symbols = FxHashSet::default();
@@ -2629,8 +2938,8 @@ impl SymbolArena {
         );
         // The entries were moved on the bind thread; their chunks stay in
         // use here.
-        self.symbols.append_aligned(prepared.symbols);
-        self.tables.append_aligned(prepared.tables);
+        self.symbols[0].append_aligned(prepared.symbols);
+        self.tables[0].append_aligned(prepared.tables);
         offsets
     }
 
@@ -2639,7 +2948,7 @@ impl SymbolArena {
         if table.is_nil() {
             return SymbolTable::NIL;
         }
-        let cloned = self.tables.get(table.index()).clone();
+        let cloned = self.table(table).clone();
         self.push_table(cloned)
     }
 
@@ -2647,13 +2956,15 @@ impl SymbolArena {
     #[must_use]
     pub fn sym(&self, symbol: SymbolId) -> &Symbol {
         debug_assert!(symbol.is_some(), "nil symbol dereference");
-        self.symbols.get(symbol.index())
+        let (part, index) = arena_part(symbol.0);
+        self.symbols[part].get(index)
     }
 
     #[inline]
     pub fn sym_mut(&mut self, symbol: SymbolId) -> &mut Symbol {
         debug_assert!(symbol.is_some(), "nil symbol dereference");
-        self.symbols.get_mut(symbol.index())
+        let (part, index) = arena_part(symbol.0);
+        self.symbols[part].get_mut(index)
     }
 
     /// Go `table[name]`. A nil table reads as empty.
@@ -2662,7 +2973,7 @@ impl SymbolArena {
         if table.is_nil() {
             return SymbolId::NIL;
         }
-        let table = self.tables.get(table.index());
+        let table = self.table(table);
         if table.entries.is_empty() {
             return SymbolId::NIL;
         }
@@ -2678,7 +2989,7 @@ impl SymbolArena {
         if table.is_nil() {
             return SymbolId::NIL;
         }
-        let table = self.tables.get(table.index());
+        let table = self.table(table);
         if table.entries.is_empty() {
             return SymbolId::NIL;
         }
@@ -2701,7 +3012,7 @@ impl SymbolArena {
     pub fn set(&mut self, table: SymbolTable, name: impl Into<Name>, symbol: SymbolId) {
         assert!(table.is_some(), "assignment to entry in nil map");
         let name = name.into();
-        self.tables.get_mut(table.index()).insert(&name, symbol);
+        self.table_mut(table).insert(&name, symbol);
     }
 
     /// Go `if table[name] == nil { table[name] = symbol }` with one lookup.
@@ -2724,7 +3035,7 @@ impl SymbolArena {
         assert!(table.is_some(), "assignment to entry in nil map");
         let hash = name.table_hash();
         let found = {
-            let current = self.tables.get(table.index());
+            let current = self.table(table);
             current
                 .find_id(hash, name.0)
                 .map(|position| (position, current.entries[position].symbol))
@@ -2735,7 +3046,7 @@ impl SymbolArena {
             }
         }
         // Only a write takes a shared table chunk back, like `set`.
-        let current = self.tables.get_mut(table.index());
+        let current = self.table_mut(table);
         match found {
             Some((position, _)) => current.entries[position].symbol = symbol,
             None => current.push(hash, name.0, symbol),
@@ -2746,7 +3057,7 @@ impl SymbolArena {
     /// Go `delete(table, name)`.
     pub fn delete(&mut self, table: SymbolTable, name: &str) {
         if table.is_some() {
-            self.tables.get_mut(table.index()).remove(name);
+            self.table_mut(table).remove(name);
         }
     }
 
@@ -2756,7 +3067,7 @@ impl SymbolArena {
         if table.is_nil() {
             0
         } else {
-            self.tables.get(table.index()).entries.len()
+            self.table(table).entries.len()
         }
     }
 
@@ -2764,7 +3075,7 @@ impl SymbolArena {
         if table.is_nil() {
             &[]
         } else {
-            &self.tables.get(table.index()).entries
+            &self.table(table).entries
         }
     }
 
@@ -3223,12 +3534,14 @@ pub enum LinkSlot {
     /// An arena handle (`TypeId`, ...): an index into one page table for
     /// the whole arena.
     Arena(usize),
-    /// A binder lineage index (`SymbolId`). The lineage never reuses an
-    /// index, so in a long watch or editor session most indexes belong to
-    /// dead file versions, which a new checker never reads. Indexes below
-    /// `LINK_FLAT_IDS` use the arena table, as `Arena` does. The others use
-    /// one page table per block of indexes that the store reads
-    /// (`LinkStore::far_cell`), so a store pays only for the blocks it uses.
+    /// A symbol or table index (`SymbolId`, `SymbolTable`). The binder
+    /// lineage never reuses an index, so in a long watch or editor session
+    /// most lineage indexes belong to dead file versions, which a new
+    /// checker never reads. Lineage indexes below `LINK_FLAT_IDS` use the
+    /// arena table, as `Arena` does. The others use one page table per
+    /// block of indexes that the store reads (`LinkStore::far_cell`), so a
+    /// store pays only for the blocks it uses. A checker's own index (`OWN`)
+    /// uses the second arena table (`link_part`).
     Lineage(usize),
     /// A node or flow node handle: (file, local index + 1). Each file has
     /// its own page table.
@@ -3262,8 +3575,7 @@ arena_link_key!(
     IndexInfoId,
     TypePredicateId,
     MapperId,
-    InferenceContextId,
-    SymbolTable
+    InferenceContextId
 );
 
 impl LinkKey for SymbolId {
@@ -3271,6 +3583,22 @@ impl LinkKey for SymbolId {
     fn link_slot(self) -> LinkSlot {
         LinkSlot::Lineage(self.index())
     }
+}
+
+impl LinkKey for SymbolTable {
+    #[inline]
+    fn link_slot(self) -> LinkSlot {
+        LinkSlot::Lineage(self.index())
+    }
+}
+
+/// The arena table (0: lineage, 1: own) and the index in it of a
+/// `LinkSlot::Lineage` index, as `arena_part` splits a symbol index.
+// PERF: no branch, as `arena_part`: a checker reads the links of lineage
+// and own symbols in any order.
+#[inline(always)]
+const fn link_part(index: usize) -> (usize, usize) {
+    ((index >> 31) & 1, index & (OWN as usize - 1))
 }
 
 /// Lineage indexes below this use the flat arena table: at most 512 KiB of
@@ -3355,9 +3683,10 @@ fn new_link_record<V: Default>(cell: &mut Option<V>) -> &mut V {
 /// one more load.
 #[derive(Clone, Debug)]
 pub struct LinkStore<K: LinkKey, V: Default> {
-    /// Page table of arena keys: one flat table for the whole arena (for
-    /// lineage keys, up to `LINK_FLAT_IDS`).
-    arena: PageTable<V>,
+    /// Page tables of arena keys: one flat table for the whole arena (for
+    /// lineage keys, up to `LINK_FLAT_IDS`), in 0. Table 1 holds the own
+    /// symbols of a checker (`link_part`), one flat table.
+    arena: [PageTable<V>; 2],
     /// Page tables of file keys, by file. A store of lineage keys has no
     /// file keys: it keeps the page tables of its blocks here (`far_slot`).
     files: Vec<PageTable<V>>,
@@ -3367,7 +3696,7 @@ pub struct LinkStore<K: LinkKey, V: Default> {
 impl<K: LinkKey, V: Default> Default for LinkStore<K, V> {
     fn default() -> Self {
         Self {
-            arena: Vec::new(),
+            arena: [Vec::new(), Vec::new()],
             files: Vec::new(),
             map: FxHashMap::default(),
         }
@@ -3381,11 +3710,15 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
     #[inline(always)]
     fn cell(&self, slot: LinkSlot) -> Option<&Option<V>> {
         let (table, index) = match slot {
-            LinkSlot::Arena(index) => (&self.arena, index),
-            LinkSlot::Lineage(index) if index / LINK_PAGE_SIZE < self.arena.len() => {
-                (&self.arena, index)
+            LinkSlot::Arena(index) => (&self.arena[0], index),
+            LinkSlot::Lineage(index) => {
+                let (part, local) = link_part(index);
+                let table = &self.arena[part];
+                if local / LINK_PAGE_SIZE >= table.len() {
+                    return self.far_cell(index);
+                }
+                (table, local)
             }
-            LinkSlot::Lineage(index) => return self.far_cell(index),
             LinkSlot::File(file, index) => (self.files.get(file)?, index),
             LinkSlot::Map => return None,
         };
@@ -3393,10 +3726,14 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
         Some(&page[index % LINK_PAGE_SIZE])
     }
 
-    /// `cell` of a lineage key past the flat table: its block page, or
-    /// `None` when the page is absent or the key belongs in the flat table.
+    /// `cell` of a lineage key past its flat table: its block page, or
+    /// `None` when the page is absent, the key belongs in the flat table or
+    /// it is an own key (whose table is all flat).
     #[inline(never)]
     fn far_cell(&self, index: usize) -> Option<&Option<V>> {
+        if link_part(index).0 != 0 {
+            return None;
+        }
         self.far_lookup(index)
     }
 
@@ -3419,7 +3756,7 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
     #[cold]
     #[inline(never)]
     fn far_cell_mut(&mut self, key: K, index: usize) -> &mut Option<V> {
-        if self.far_lookup(index).is_none() {
+        if link_part(index).0 != 0 || self.far_lookup(index).is_none() {
             return self.add_page(key);
         }
         let (block, index) = far_slot(index);
@@ -3437,16 +3774,21 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
     // `cell` takes only its flat arm here and the merge above still holds.
     #[inline(always)]
     fn cell_mut(&mut self, key: K, slot: LinkSlot) -> &mut Option<V> {
-        if let LinkSlot::Lineage(index) = slot
-            && index / LINK_PAGE_SIZE >= self.arena.len()
-        {
-            return self.far_cell_mut(key, index);
+        if let LinkSlot::Lineage(index) = slot {
+            let (part, local) = link_part(index);
+            if local / LINK_PAGE_SIZE >= self.arena[part].len() {
+                return self.far_cell_mut(key, index);
+            }
         }
         if self.cell(slot).is_none() {
             return self.add_page(key);
         }
         let (table, index) = match slot {
-            LinkSlot::Arena(index) | LinkSlot::Lineage(index) => (&mut self.arena, index),
+            LinkSlot::Arena(index) => (&mut self.arena[0], index),
+            LinkSlot::Lineage(index) => {
+                let (part, local) = link_part(index);
+                (&mut self.arena[part], local)
+            }
             LinkSlot::File(file, index) => (&mut self.files[file], index),
             LinkSlot::Map => unreachable!("map keys have no slot"),
         };
@@ -3469,16 +3811,20 @@ impl<K: LinkKey, V: Default> LinkStore<K, V> {
             );
         }
         let (file, index) = match key.link_slot() {
-            LinkSlot::Arena(index) => return Self::page_cell(&mut self.arena, index),
+            LinkSlot::Arena(index) => return Self::page_cell(&mut self.arena[0], index),
+            LinkSlot::Lineage(index) if link_part(index).0 != 0 => {
+                return Self::page_cell(&mut self.arena[1], link_part(index).1);
+            }
             LinkSlot::Lineage(index) if index < LINK_FLAT_IDS => {
                 // The flat table stops at `LINK_FLAT_IDS`; so does its capacity.
                 let pages = index / LINK_PAGE_SIZE + 1;
-                if pages > self.arena.capacity() {
+                let flat = &mut self.arena[0];
+                if pages > flat.capacity() {
                     let capacity =
-                        (2 * self.arena.capacity()).clamp(pages, LINK_FLAT_IDS / LINK_PAGE_SIZE);
-                    self.arena.reserve_exact(capacity - self.arena.len());
+                        (2 * flat.capacity()).clamp(pages, LINK_FLAT_IDS / LINK_PAGE_SIZE);
+                    flat.reserve_exact(capacity - flat.len());
                 }
-                return Self::page_cell(&mut self.arena, index);
+                return Self::page_cell(flat, index);
             }
             LinkSlot::Lineage(index) => far_slot(index),
             LinkSlot::File(file, index) => (file, index),
@@ -3664,7 +4010,7 @@ mod link_store_tests {
             SymbolId(flat),
             SymbolId(flat + 70),
             SymbolId(flat + 900 * block + 3),
-            SymbolId(u32::MAX - 1),
+            SymbolId(OWN - 1),
         ];
         for (n, key) in keys.into_iter().enumerate() {
             assert!(!symbols.has(key) && symbols.try_get(key).is_none());
@@ -3683,13 +4029,41 @@ mod link_store_tests {
             flat + 1,
             flat + 64,
             flat + 899 * block,
-            u32::MAX - 2,
+            OWN - 2,
         ] {
             assert!(!symbols.has(SymbolId(absent)), "{absent}");
         }
-        assert_eq!(symbols.arena.len(), LINK_FLAT_IDS / LINK_PAGE_SIZE);
+        assert_eq!(symbols.arena[0].len(), LINK_FLAT_IDS / LINK_PAGE_SIZE);
         let far_entries: usize = symbols.files.iter().map(Vec::len).sum();
         assert!(far_entries < 3 * (1 << LINK_BLOCK_SHIFT) / LINK_PAGE_SIZE);
+    }
+
+    // apisym1c: a checker's own symbol keys (`OWN`) keep their records in
+    // the second flat table, apart from the lineage key of the same index,
+    // and add no block table.
+    #[test]
+    fn link_store_own_symbol_keys_use_their_own_table() {
+        let mut symbols = LinkStore::<SymbolId, u64>::default();
+        for index in [0, 1, 70, 5000] {
+            *symbols.get(SymbolId(index)) = u64::from(index) + 1;
+            assert!(!symbols.has(SymbolId(OWN | index)));
+        }
+        for index in [0, 1, 70, 5000] {
+            *symbols.insert_new(SymbolId(OWN | index), 7) += u64::from(index);
+        }
+        for index in [0, 1, 70, 5000] {
+            assert_eq!(
+                symbols.try_get(SymbolId(index)),
+                Some(&(u64::from(index) + 1))
+            );
+            assert_eq!(
+                symbols.try_get(SymbolId(OWN | index)),
+                Some(&(u64::from(index) + 7))
+            );
+        }
+        assert!(!symbols.has(SymbolId(OWN | 71)) && !symbols.has(SymbolId(OWN | 1 << 20)));
+        assert_eq!(symbols.arena[1].len(), 5000 / LINK_PAGE_SIZE + 1);
+        assert!(symbols.files.is_empty());
     }
 }
 

@@ -1675,8 +1675,10 @@ mod symbol_id_tests {
     use super::*;
 
     /// Two checker arenas made from one binder arena share the ids of the
-    /// binder symbols. Their own symbols get ids of their own, also at an
-    /// index where a later bind put another symbol.
+    /// binder symbols. Their own symbols (`OWN`) get ids of their own, also
+    /// at one index in both arenas, and no later bind uses their index, so a
+    /// checker that catches up reads the later binder symbol with its
+    /// shared id.
     #[test]
     fn checker_symbols_have_ids_of_their_own() {
         let mut binder = SymbolArena::new();
@@ -1687,7 +1689,12 @@ mod symbol_id_tests {
         let mut second = binder.for_checker();
         let own_first = first.new_symbol(SymbolFlags::NONE, "own");
         let own_second = second.new_symbol(SymbolFlags::NONE, "own");
-        assert_eq!(own_first, later, "the test needs one index for two symbols");
+        assert_eq!(
+            own_first, own_second,
+            "the test needs one index for two symbols"
+        );
+        assert_eq!(own_first.0 & OWN, OWN);
+        assert_eq!(later.0 & OWN, 0);
 
         let id_later = get_symbol_id(&second, later);
         let id_own_first = get_symbol_id(&first, own_first);
@@ -1703,6 +1710,13 @@ mod symbol_id_tests {
         // An id stays when the thread switches between arenas.
         assert_eq!(get_symbol_id(&first, own_first), id_own_first);
         assert_eq!(get_symbol_id(&second, own_second), id_own_second);
+        // `first` catches up to the later bind.
+        assert_eq!(first.symbol_at_slot(second.id_slot(later)), None);
+        first.catch_up(&binder, &[]);
+        assert_eq!(first.symbol_at_slot(second.id_slot(later)), Some(later));
+        assert_eq!(first.sym(later).name.as_str(), "later");
+        assert_eq!(get_symbol_id(&first, later), id_later);
+        assert_eq!(get_symbol_id(&first, own_first), id_own_first);
 
         // A dropped checker arena frees its ids on this thread.
         let key = first.id_slot(own_first).key;

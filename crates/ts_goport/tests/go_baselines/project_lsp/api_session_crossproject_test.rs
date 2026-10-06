@@ -1,20 +1,15 @@
 //! Port-only tests of a symbol of project A used in a request on project B
 //! (editfuzz4 triage G1, apisym1). Go hands the `*ast.Symbol` to B's checker
 //! (api/session.go:2439 handleGetTypeOfSymbol), which reads the bound
-//! declarations of any file. A port checker reads only the binder lineage
-//! ids of its copy. B's API checker copies the lineage when it is made
-//! (`ls_program::new_api_checker`), so it gets Go's answer for a file version
-//! bound before that. When B's API checker is older than the version, the
-//! port answers an `unported` panic (`api::checker_symbol`), not a wrong type,
-//! and B's next answers do not change. Handlers that read only names,
-//! declarations and parents, and sort, still give Go's answer
-//! (`api::checker_symbol_for_names`).
+//! declarations of any file. A port checker reads the binder lineage ids of
+//! its copy. B's API checker copies the lineage when it is made
+//! (`ls_program::new_api_checker`), and catches up to the lineage before a
+//! symbol of another checker enters it (`api::checker_symbol`, apisym1c). So
+//! it gets Go's answer also for a file version bound after it was made, and
+//! B's next answers do not change.
 //!
-//! PORT: the tests call the session handlers directly and catch the panic
-//! that the server turns into the `panic: <text>` answer, as
-//! `api_session_misuse_test` does.
+//! PORT: the tests call the session handlers directly.
 
-use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 
 use ts_goport::api::requestfilesystem::{Kind, RequestFileSystem};
@@ -105,6 +100,19 @@ impl Api {
     /// and m.d.ts `M_EDITED`, and `ensurePrograms.all`. A gets a new program
     /// with new versions of both; B keeps its program.
     fn edit_x(&mut self) {
+        self.edit(&[(X_TS, X_EDITED), (M_TS, M_EDITED)]);
+    }
+
+    /// `edit_x` with x.ts text `text` only, then Go `release` of the snapshot
+    /// before, so the x.ts version before dies.
+    fn edit_x_and_release(&mut self, text: &str) {
+        let before = self.snapshot;
+        self.edit(&[(X_TS, text)]);
+        nil_error(self.session.release_snapshot(before));
+    }
+
+    /// `updateSnapshot` with a layer of `layer` and `ensurePrograms.all`.
+    fn edit(&mut self, layer: &[(&str, &str)]) {
         let b_before = project_program(&snapshot_of(&self.session, self.snapshot), &self.b.0);
         self.snapshot = nil_error(self.session.handle_update_snapshot(
             &self.ctx,
@@ -120,7 +128,7 @@ impl Api {
                     },
                     file_system: Some(RequestFileSystem {
                         kind: Kind::LAYER,
-                        files: request_files(&[(X_TS, X_EDITED), (M_TS, M_EDITED)]),
+                        files: request_files(layer),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -129,7 +137,10 @@ impl Api {
         ))
         .snapshot;
         let snapshot = snapshot_of(&self.session, self.snapshot);
-        assert_eq!(text(&project_program(&snapshot, &self.a.0), X_TS), X_EDITED);
+        assert_eq!(
+            text(&project_program(&snapshot, &self.a.0), X_TS),
+            layer[0].1
+        );
         assert!(Rc::ptr_eq(
             &project_program(&snapshot, &self.b.0),
             &b_before
@@ -231,17 +242,19 @@ impl Api {
             .collect()
     }
 
+    /// The symbol and table chunks that B's API checker holds
+    /// (`SymbolArena::live_chunk_count`).
+    fn b_live_chunks(&self) -> usize {
+        let setup = nil_error(
+            self.session
+                .setup_checker(&self.ctx, self.snapshot, &self.b),
+        );
+        setup.checker.borrow().symbols.live_chunk_count()
+    }
+
     fn close(self) {
         self.session.close();
         self.project_session.close();
-    }
-}
-
-/// The text of the Go panic of `f`.
-fn go_panic_text<R>(f: impl FnOnce() -> R) -> String {
-    match std::panic::catch_unwind(AssertUnwindSafe(f)) {
-        Ok(_) => panic!("no panic"),
-        Err(payload) => ts_goport::ipc::conn::recovered_value(payload.as_ref()),
     }
 }
 
@@ -262,10 +275,10 @@ child_test! {
 }
 
 child_test! {
-    // g1-b-alias, g1-z-alias3: B's API checker exists before the edit, so
-    // its copy of the lineage lacks the new x.ts version. Go answers the
-    // type (part B, on hold). The port answers an `unported` panic each
-    // time, and B and A answer as before.
+    // g1-b-alias, g1-z-alias3, r-kl-min (apisym1c): B's API checker exists
+    // before the edit, so its copy of the lineage lacks the new x.ts
+    // version. Go answers the type. The port catches B up to the lineage
+    // and answers the type too, each time, and B and A answer as before.
     fn symbol_of_later_file_version_on_older_api_checker() {
         let mut api = Api::new();
         let g = api.symbol(&api.b, B_TS, B_TEXT, "g =");
@@ -273,10 +286,7 @@ child_test! {
         api.edit_x();
         let f = api.symbol(&api.a, X_TS, X_EDITED, "f =");
         for _ in 0..2 {
-            assert_eq!(
-                go_panic_text(|| api.type_text(&api.b, f)),
-                "unported Go code: api: symbol of a file bound after the checker was made"
-            );
+            assert_eq!(api.type_text(&api.b, f), F_TYPE);
         }
         let g = api.symbol(&api.b, B_TS, B_TEXT, "g =");
         assert_eq!(api.type_text(&api.b, g), G_TYPE);
@@ -286,14 +296,12 @@ child_test! {
 }
 
 child_test! {
-    // sk-h-late, sk-fx-lib-late (apisym1 round b): with B's API checker older
-    // than the versions, getFullyQualifiedName, getExportsOfSymbol and
-    // getMembersOfSymbol on B read only names, declarations and parents,
-    // and sort, so they give Go's answer. The type requests after them stay
-    // `unported`. The name of an ambient module reads its file symbol, so
-    // it stays `unported` too.
+    // sk-h-late, sk-fx-lib-late, b-fx-names (apisym1 round b, apisym1c): with
+    // B's API checker older than the versions, getFullyQualifiedName,
+    // getExportsOfSymbol and getMembersOfSymbol on B give Go's answer. So do
+    // the type requests after them, and the name of an ambient module, which
+    // reads its file symbol.
     fn names_of_later_file_version_on_older_api_checker() {
-        let unported = "unported Go code: api: symbol of a file bound after the checker was made";
         let mut api = Api::new();
         let g = api.symbol(&api.b, B_TS, B_TEXT, "g =");
         assert_eq!(api.type_text(&api.b, g), G_TYPE);
@@ -313,15 +321,38 @@ child_test! {
         // The name of `#p` holds the id of its class `K`, as on A.
         assert!(members[0].1.ends_with(&format!("#{}@#p", k.0)), "{}", members[0].1);
         assert_eq!(api.table(&api.a, k, false), members);
-        assert_eq!(go_panic_text(|| api.type_text(&api.b, f)), unported);
-        assert_eq!(go_panic_text(|| api.type_text(&api.b, members[1].0)), unported);
+        assert_eq!(api.type_text(&api.b, f), F_TYPE);
+        assert_eq!(api.type_text(&api.b, members[1].0), "number");
         let v = api.symbol(&api.a, M_TS, M_EDITED, "v:");
-        assert_eq!(go_panic_text(|| api.qualified_name(&api.b, v)), unported);
+        assert_eq!(api.qualified_name(&api.b, v), r#""m".v"#);
         assert_eq!(api.qualified_name(&api.a, v), r#""m".v"#);
         assert_eq!(api.type_text(&api.a, f), F_TYPE);
         assert_eq!(api.type_text(&api.a, members[1].0), "number");
         let g = api.symbol(&api.b, B_TS, B_TEXT, "g =");
         assert_eq!(api.type_text(&api.b, g), G_TYPE);
+        api.close();
+    }
+}
+
+child_test! {
+    // apisym1c: an edit loop with a request on B's older API checker after
+    // each edit. B catches up to each new x.ts version, and frees the
+    // versions that died with the released snapshots, so the chunks that
+    // it holds do not grow with the edits (it gained 2 or more per edit
+    // without the frees).
+    fn older_api_checker_frees_dead_versions_when_it_catches_up() {
+        let mut api = Api::new();
+        let g = api.symbol(&api.b, B_TS, B_TEXT, "g =");
+        assert_eq!(api.type_text(&api.b, g), G_TYPE);
+        let mut chunks = Vec::new();
+        for n in 0..30 {
+            let text = format!("{X_EDITED}// {n}\n");
+            api.edit_x_and_release(&text);
+            let f = api.symbol(&api.a, X_TS, &text, "f =");
+            assert_eq!(api.type_text(&api.b, f), F_TYPE);
+            chunks.push(api.b_live_chunks());
+        }
+        assert!(chunks[29] <= chunks[4] + 4, "{chunks:?}");
         api.close();
     }
 }
