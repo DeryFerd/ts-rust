@@ -549,10 +549,11 @@ impl Checker {
     pub(crate) fn sort_symbol_sort_keys(&self, keys: &mut [SymbolSortKey]) {
         crate::gostd::slices::sort_func(keys, |a, b| {
             // PERF: two different packed orders give the sign that the full
-            // comparator gets from `compare_nodes` (see `SymbolSortKey::order`),
-            // and the full comparator returns there before its name and id
-            // steps. So every comparison has the same sign, the sort makes the
-            // same comparisons, and `get_symbol_id` runs in the same order.
+            // comparator gets from `compare_nodes`, from the declaration
+            // test or from the names (see `SymbolSortKey::order`), and the
+            // full comparator returns there before its id step. So every
+            // comparison has the same sign, the sort makes the same
+            // comparisons, and `get_symbol_id` runs in the same order.
             if a.order != b.order && a.order != NO_SORT_ORDER && b.order != NO_SORT_ORDER {
                 let r = a.order.cmp(&b.order);
                 debug_assert_eq!(r, self.compare_symbol_sort_keys(a, b).cmp(&0));
@@ -605,8 +606,13 @@ impl Checker {
                 // A map miss reads as index 0 (Go map zero value).
                 (file, 0, pos, NO_SORT_ORDER)
             }
-        } else {
+        } else if has_declaration {
             (Node::NIL, 0, 0, NO_SORT_ORDER)
+        } else {
+            // The first 63 bits of the name's Go bytes, after every
+            // declared symbol (see `SymbolSortKey::order`).
+            let order = NO_DECLARATION_ORDER | (go_bytes_prefix(&sym.name) >> 25) as u64;
+            (Node::NIL, 0, 0, order)
         };
         SymbolSortKey {
             symbol,
@@ -734,21 +740,41 @@ pub(crate) struct SymbolSortKey {
     /// `file_index_map[file]`, zero when absent (Go map miss).
     file_index: i32,
     pos: i32,
-    /// `(file_index, pos)` packed so that `u64` order is `(file_index, pos)`
-    /// order, or `NO_SORT_ORDER` when there is no declaration or its file is
-    /// not in `file_index_map`. Map indexes are unique and not negative, so
-    /// two different orders mean `compare_nodes` returns nonzero with the
-    /// same sign: `file_index` difference for different files, `pos`
-    /// difference in one file. Equal orders (same declaration, or the same
-    /// position) fall through to the full comparator.
+    /// A `u64` whose order is the order of the full comparator where two
+    /// orders differ:
+    /// - a declaration in a file of `file_index_map`: `(file_index, pos)`
+    ///   packed so that `u64` order is `(file_index, pos)` order (below
+    ///   2^63). Map indexes are unique and not negative, so two different
+    ///   orders mean `compare_nodes` returns nonzero with the same sign:
+    ///   `file_index` difference for different files, `pos` difference in
+    ///   one file;
+    /// - no declaration: `NO_DECLARATION_ORDER` and the first 63 bits of
+    ///   the name's Go bytes (`go_bytes_prefix`). The full comparator puts a
+    ///   symbol with a declaration first, which these orders, at 2^63 and
+    ///   above, do too. Two symbols without a declaration compare by name
+    ///   (Go `strings.Compare`), and different prefixes have its sign;
+    /// - `NO_SORT_ORDER` for a nil symbol, a nil first declaration or a
+    ///   file that is not in `file_index_map`.
+    ///
+    /// Equal orders (same declaration, same position, or names with the
+    /// same prefix) fall through to the full comparator.
+    // PERF (sortmisc1): on elysia-eden 86% of the `get_named_members`
+    // comparisons (1.59 M of 1.85 M; Go makes 1.59 M of 1.99 M) are of two
+    // symbols without a declaration (mapped type members), which the full
+    // comparator orders by name text. The prefix decides all of them there.
     pub(crate) order: u64,
-    /// Its text is read only when the declarations tie.
+    /// Its text is read only when the orders tie.
     name: Name,
 }
 
-/// `SymbolSortKey::order` when the packed order does not apply. A real
-/// order is below 2^63.
+/// `SymbolSortKey::order` when the packed order does not apply. A
+/// declaration order is below 2^63, and a name order is below this
+/// (`go_bytes_prefix` never gives all one bits).
 pub(crate) const NO_SORT_ORDER: u64 = u64::MAX;
+
+/// The bit of `SymbolSortKey::order` that marks a symbol without a
+/// declaration (its other bits are the name prefix).
+const NO_DECLARATION_ORDER: u64 = 1 << 63;
 
 // PORT: Go `strings.Compare` (byte order, returns -1/0/1). It compares the
 // Go bytes, so lone surrogates and the internal symbol name prefix sort as in
@@ -1936,7 +1962,7 @@ pub fn is_this_property(node: Node) -> bool {
 }
 
 #[cfg(test)]
-mod union_sort_tests {
+pub(crate) mod union_sort_tests {
     use super::*;
     use crate::gostd::slices::{binary_search_func, sort_stable_func};
     use crate::scanner_util::go_string_from_bytes;
@@ -2032,7 +2058,7 @@ mod union_sort_tests {
     /// The types of the type aliases in `source` (one file `a.ts`), then
     /// the members of those that are unions or intersections, on the
     /// checker of that file.
-    fn with_alias_types<R: Send + 'static>(
+    pub(crate) fn with_alias_types<R: Send + 'static>(
         source: &str,
         f: impl FnOnce(&mut Checker, &[TypeId]) -> R + Send + 'static,
     ) -> R {
@@ -2081,6 +2107,95 @@ mod union_sort_tests {
         drop(scope);
         crate::program::release_program(program);
         result
+    }
+
+    /// Members with a declaration (interfaces, a class, an object literal
+    /// type) and mapped type members without one, whose names share long
+    /// prefixes or are not ASCII.
+    const SYMBOL_SOURCE: &str = r#"
+interface I { b: 1; a: 1; abcdefghij1: 1; abcdefghij2: 1 }
+interface J { a: 2; z: 2 }
+class C { m() {} n = 1 }
+type O = { q: 1; p: 2 }
+type K = "b" | "a" | "abcdefghij1" | "abcdefghij2" | "abcdefgh" | "abcdefghX" | "abcdefg" | "abcdefgX" | "é" | "aé" | "Z" | "";
+type M = { [P in K]: P };
+type M2 = { [P in K | "extra" | "q"]: 1 };
+type H = { [P in keyof I]: 2 };
+type U = I & M & O;
+"#;
+
+    /// The `SymbolSortKey` order never contradicts `compareSymbolsWorker`,
+    /// and `sort_symbol_sort_keys` gives Go's sort (`gostd` with
+    /// `compare_symbols_worker`) on many orders of the symbols.
+    #[test]
+    fn symbol_sort_order_agrees_with_compare_symbols() {
+        with_alias_types(SYMBOL_SOURCE, |c, types| {
+            let mut symbols: Vec<SymbolId> = Vec::new();
+            for &t in types {
+                for &s in c.get_properties_of_type(t).iter() {
+                    if !symbols.contains(&s) {
+                        symbols.push(s);
+                    }
+                }
+            }
+            let mut last_file = (Node::NIL, 0);
+            let keys: Vec<SymbolSortKey> = symbols
+                .iter()
+                .map(|&s| c.symbol_sort_key(s, &mut last_file))
+                .collect();
+            let mut decided = 0;
+            let mut by_name = 0;
+            let mut ties = 0;
+            for a in &keys {
+                for b in &keys {
+                    if a.symbol == b.symbol {
+                        continue;
+                    }
+                    assert!(a.order != NO_SORT_ORDER, "{:?}", a.name);
+                    let s = c.compare_symbols_worker(a.symbol, b.symbol).signum();
+                    match a.order.cmp(&b.order) {
+                        Ordering::Less => assert_eq!(s, -1, "{:?} {:?}", a.name, b.name),
+                        Ordering::Greater => assert_eq!(s, 1, "{:?} {:?}", a.name, b.name),
+                        Ordering::Equal => ties += 1,
+                    }
+                    decided += usize::from(a.order != b.order);
+                    by_name +=
+                        usize::from(a.order != b.order && !a.has_declaration && !b.has_declaration);
+                }
+            }
+            // Names that share their first 8 bytes tie (the order keeps 63
+            // bits of them).
+            let key = |name: &str| {
+                keys.iter()
+                    .find(|k| !k.has_declaration && &*k.name == name)
+                    .unwrap_or_else(|| panic!("no member {name:?} without a declaration"))
+                    .order
+            };
+            assert_eq!(key("abcdefghij1"), key("abcdefghij2"));
+            assert_eq!(key("abcdefgh"), key("abcdefghX"));
+            assert_ne!(key("abcdefg"), key("abcdefgX"));
+            assert!(
+                decided > 400 && by_name > 100 && ties > 0,
+                "{decided} {by_name} {ties}"
+            );
+            let mut state = 0x9e37_79b9_7f4a_7c15u64;
+            for round in 0..64 {
+                let mut list: Vec<SymbolId> = symbols.clone();
+                for i in (1..list.len()).rev() {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    list.swap(i, (state % (i as u64 + 1)) as usize);
+                }
+                let n = 2 + round % (list.len() - 1);
+                list.truncate(n);
+                let mut keyed = list.clone();
+                c.sort_symbols(&mut keyed);
+                let mut go = list;
+                crate::gostd::slices::sort_func(&mut go, |&a, &b| c.compare_symbols_worker(a, b));
+                assert_eq!(keyed, go, "round {round}");
+            }
+        });
     }
 
     /// Each arm of `compare_types`, and the ties: two interfaces with one
