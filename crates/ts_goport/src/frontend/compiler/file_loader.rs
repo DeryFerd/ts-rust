@@ -421,6 +421,12 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         stats.end_load(&taken);
     }
 
+    // The loader took the metadata of the files; the package.json texts of
+    // the parse workers that it did not take go now.
+    if let Some(shared) = &loader.shared_resolution {
+        shared.end_package_json_reads();
+    }
+
     // Clear out loader and host to ensure its not used post program creation
     {
         let mut mapper = loader.project_reference_file_mapper.borrow_mut();
@@ -1787,6 +1793,22 @@ impl FileLoader {
         }
     }
 
+    /// Puts the package.json entries of the package scope walk of a file's
+    /// metadata that a parse worker made into the program resolver's cache
+    /// (`Caches::adopt_worker_package_jsons`), when the load takes the
+    /// metadata (`take_prefetched_meta`).
+    // PORT: not in Go (loadpar1). Go finds the metadata with the program's
+    // resolver (fileloader.go:391).
+    pub(crate) fn adopt_worker_package_jsons(&self, package_jsons: &[PackageJsonLookup]) {
+        if let Some(resolver) = self
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.as_default_resolver())
+        {
+            resolver.caches.adopt_worker_package_jsons(package_jsons);
+        }
+    }
+
     // Go: fileloader.go:951 (*fileLoader).createSyntheticImport
     pub fn create_synthetic_import(&self, text: &str, file: &ParsedSourceFile) -> Node {
         let external_helpers_module_reference =
@@ -2891,15 +2913,17 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         (processed, dir, cwd)
     }
 
-    // The parse workers read the package.json files of the load (the
-    // package scope of each file and the packages of its imports), and the
-    // loader puts the entries of the worker answers that it takes into the
-    // program resolver's cache (`Caches::adopt_worker_package_jsons`), as
-    // Go's parse tasks share one cache (module/resolver.go:1755
-    // getPackageJsonInfo, packagejson/cache.go:190 Set keeps the first). A
-    // lookup on the loading thread after the load (Go
-    // `Program.GetPackageJsonInfo`, compiler/program.go:157) finds what the
-    // load read, also when the files changed on disk since.
+    // The parse workers find the package scope of each file for its
+    // metadata, and the loader puts the package.json entries of that walk
+    // into the program resolver's cache when it takes the metadata
+    // (`Caches::adopt_worker_package_jsons`), as the Go loader finds the
+    // metadata with the program's resolver (fileloader.go:391,
+    // module/resolver.go:1755 getPackageJsonInfo, packagejson/cache.go:190
+    // Set keeps the first). A lookup on the loading thread after the load
+    // (Go `Program.GetPackageJsonInfo`, compiler/program.go:157) finds what
+    // the load read, also when the files changed on disk since: the
+    // project's package.json (the scope of `src/a.ts`) and the package
+    // that `src/a.ts` imports (the scope of its `index.d.ts`).
     #[test]
     fn the_loader_keeps_the_package_json_files_that_workers_read() {
         let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "types": [],

@@ -220,11 +220,9 @@ pub struct Caches {
     pub worker_package_jsons: RefCell<Vec<Arc<[PackageJsonLookup]>>>,
 
     /// A parse worker's resolver (files_parser.rs `WorkerResolver`): the
-    /// read of the load for each entry of its package.json cache
-    /// (`SharedResolutionCache::store_package_json_read`), by the address of
-    /// the entry. The worker's cache keeps each entry while the resolver
-    /// lives, so an address names one entry. `None` for other resolvers.
-    pub worker_package_json_reads: Option<RefCell<FxHashMap<usize, Arc<WorkerPackageJsonRead>>>>,
+    /// reads of its package.json cache entries (`WorkerPackageJsonReads`).
+    /// `None` for other resolvers.
+    pub worker_package_json_reads: Option<WorkerPackageJsonReads>,
 
     /// The loader's resolver in `tsc -b`: the file system lookups of the
     /// worker answers that it took from `shared` (`SharedResolution::lookups`).
@@ -999,14 +997,30 @@ pub struct PackageJsonLookup {
     pub exists: bool,
     /// The first read of the load for the entry's package.json, which the
     /// loader puts into its own cache (`Caches::adopt_worker_package_jsons`).
-    /// `None` from a resolver that does not keep it (a resolve-ahead worker).
+    /// Only the lookups of a parse worker's package scope walk for the
+    /// metadata of a file have it (`WorkerPackageJsonReads::attach`).
     pub read: Option<Arc<WorkerPackageJsonRead>>,
+}
+
+/// A parse worker's reads of its package.json cache entries.
+// PORT: not in Go (see `WorkerPackageJsonRead`).
+#[derive(Default)]
+pub struct WorkerPackageJsonReads {
+    /// The read of the load for each entry
+    /// (`SharedResolutionCache::store_package_json_read`), by the address of
+    /// the entry. The worker's cache keeps each entry while the resolver
+    /// lives, so an address names one entry.
+    reads: RefCell<FxHashMap<usize, Arc<WorkerPackageJsonRead>>>,
+    /// True while the worker finds the package scope of a file's directory
+    /// for its metadata (Go `loadSourceFileMetaData`, which the loader runs
+    /// in Go): the lookups then carry their reads, for the loader's cache.
+    pub attach: Cell<bool>,
 }
 
 /// The first read of one package.json by the parse workers of a load (Go
 /// `getPackageJsonInfo`, module/resolver.go:1755): the parts of the
-/// package.json cache entry that it made, with the text of the file. Every
-/// lookup of the file in the load shares it. A worker's entry has `Rc`
+/// package.json cache entry that it made, with the text of the file. The
+/// lookups of the file that carry a read share it. A worker's entry has `Rc`
 /// contents, which stay on the worker's thread, so the loader parses the
 /// text again when it takes the read (`take`), and the text goes then.
 // PORT: not in Go. Go's parse tasks share the resolver's one package.json
@@ -1149,6 +1163,16 @@ impl SharedResolutionCache {
             .clone()
     }
 
+    /// Drops the package.json reads of the load and their texts that the
+    /// loader did not take, when the load ends.
+    // PORT: not in Go (see `WorkerPackageJsonRead`).
+    pub fn end_package_json_reads(&self) {
+        let reads = std::mem::take(&mut *lock_shared(&self.package_json_reads));
+        for read in reads.values() {
+            let _ = read.take();
+        }
+    }
+
     /// Publishes the package scope of `directory` (the first value wins),
     /// and returns the value that the cache keeps. A parse worker finds
     /// the metadata of a file with it, so every file of a directory gets
@@ -1232,42 +1256,65 @@ impl Caches {
     }
 
     /// The load's read of the package.json of `entry`, an entry of this
-    /// parse worker's package.json cache (`worker_package_json_reads`). The
-    /// first lookup of an entry is the one that made it, right after the
-    /// worker read the file (`note_worker_package_json_read`); it stores the
-    /// read in the shared cache, which keeps the first read of the load.
-    /// `None` for another resolver.
+    /// parse worker's package.json cache (`worker_package_json_reads`), for
+    /// a lookup of the package scope walk (`WorkerPackageJsonReads::attach`).
+    /// The lookup that made an entry of a package.json file comes right
+    /// after the worker read the file (`note_worker_package_json_read`), in
+    /// any resolution: it stores the read in the shared cache, which keeps
+    /// the first read of the load. An entry of a missing package.json needs
+    /// no text, so the scope walk stores its read when it first meets it.
+    /// `None` for another lookup or resolver.
     fn worker_package_json_read(
         &self,
         entry: &InfoCacheEntry,
     ) -> Option<Arc<WorkerPackageJsonRead>> {
         let reads = self.worker_package_json_reads.as_ref()?;
         let address = std::ptr::from_ref(entry) as usize;
-        if let Some(read) = reads.borrow().get(&address) {
-            return Some(read.clone());
-        }
+        let made = WORKER_PACKAGE_JSON_READ.with(|read| {
+            let mut read = read.borrow_mut();
+            if read.is_none() || !entry.exists() {
+                return None;
+            }
+            let file_name = combine_paths(&entry.package_directory, &["package.json"]);
+            read.take_if(|(read_name, _)| *read_name == file_name)
+        });
+        let read = match made {
+            Some((file_name, text)) => self.store_package_json_read(entry, &file_name, Some(text)),
+            None if !reads.attach.get() => return None,
+            None => match reads.reads.borrow().get(&address) {
+                Some(read) => return Some(read.clone()),
+                None if entry.exists() => return None,
+                None => {
+                    let file_name = combine_paths(&entry.package_directory, &["package.json"]);
+                    self.store_package_json_read(entry, &file_name, None)
+                }
+            },
+        }?;
+        reads.reads.borrow_mut().insert(address, read.clone());
+        reads.attach.get().then_some(read)
+    }
+
+    /// Stores the read of `entry`, an entry of this parse worker's
+    /// package.json cache for `file_name`, in the shared cache, and returns
+    /// the read that the shared cache keeps.
+    fn store_package_json_read(
+        &self,
+        entry: &InfoCacheEntry,
+        file_name: &str,
+        text: Option<Box<str>>,
+    ) -> Option<Arc<WorkerPackageJsonRead>> {
         let shared = self.shared.as_ref()?;
-        let file_name = combine_paths(&entry.package_directory, &["package.json"]);
-        let text = if entry.exists() {
-            let (_, text) = WORKER_PACKAGE_JSON_READ.with(|read| {
-                read.borrow_mut()
-                    .take_if(|(read_name, _)| *read_name == file_name)
-            })?;
-            Some(text)
-        } else {
-            None
-        };
-        let key = self.package_json_info_cache.key(&file_name);
-        let read = shared
-            .cache
-            .store_package_json_read(key, || WorkerPackageJsonRead {
-                package_directory: entry.package_directory.clone(),
-                directory_exists: entry.directory_exists,
-                taken: std::sync::atomic::AtomicBool::new(false),
-                text: std::sync::Mutex::new(text),
-            });
-        reads.borrow_mut().insert(address, read.clone());
-        Some(read)
+        let key = self.package_json_info_cache.key(file_name);
+        Some(
+            shared
+                .cache
+                .store_package_json_read(key, || WorkerPackageJsonRead {
+                    package_directory: entry.package_directory.clone(),
+                    directory_exists: entry.directory_exists,
+                    taken: std::sync::atomic::AtomicBool::new(false),
+                    text: std::sync::Mutex::new(text),
+                }),
+        )
     }
 
     /// Starts the package.json log of a parse worker's resolution. The
@@ -1456,13 +1503,9 @@ impl Caches {
     }
 
     /// Keeps the package.json lookups of a worker answer that the loader's
-    /// resolver took (`worker_package_jsons`), and puts their entries into
-    /// its package.json cache (`adopt_worker_package_jsons`).
+    /// resolver took (`worker_package_jsons`).
     pub fn note_worker_package_jsons(&self, package_jsons: &Arc<[PackageJsonLookup]>) {
         if !package_jsons.is_empty() {
-            if !self.publishes() {
-                self.adopt_worker_package_jsons(package_jsons);
-            }
             self.worker_package_jsons
                 .borrow_mut()
                 .push(package_jsons.clone());
@@ -1470,16 +1513,21 @@ impl Caches {
     }
 
     /// The loader's resolver: puts the package.json entry of each lookup of
-    /// `package_jsons`, the lookups of a worker answer that it took, into
-    /// its package.json cache, as the first read of the load made it
+    /// `package_jsons` that has a read, the lookups of the package scope
+    /// walk of a file's metadata that a parse worker made, into its
+    /// package.json cache, as the first read of the load made it
     /// (`PackageJsonLookup::read`), unless the cache has the entry: Go
-    /// `InfoCache.Set` keeps the first. Go's parse tasks share one cache, so
-    /// a later lookup on the loading thread (the loader's own resolutions,
-    /// Go `Program.GetPackageJsonInfo`) finds what the load read and does
-    /// not read the file again. The text is parsed as Go
+    /// `InfoCache.Set` keeps the first. In Go the loader finds the metadata
+    /// (fileloader.go:391 `loadSourceFileMetaData`) with the program's
+    /// resolver, so a later lookup on the loading thread (the loader's own
+    /// resolutions, Go `Program.GetPackageJsonInfo`) finds what the load
+    /// read and does not read the file again. The text is parsed as Go
     /// `getPackageJsonInfo` parses it (module/resolver.go:1775).
-    // PORT: not in Go (see `WorkerPackageJsonRead`).
-    fn adopt_worker_package_jsons(&self, package_jsons: &[PackageJsonLookup]) {
+    // PORT: not in Go (see `WorkerPackageJsonRead`). The package.json
+    // entries of the other worker answers stay out of the loader's cache,
+    // as before loadpar1: parsing them again on the loading thread costs
+    // about 1% of the instructions of a load.
+    pub fn adopt_worker_package_jsons(&self, package_jsons: &[PackageJsonLookup]) {
         let cache = &self.package_json_info_cache;
         for read in package_jsons
             .iter()

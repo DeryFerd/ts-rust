@@ -1581,6 +1581,7 @@ fn take_prefetched_meta(loader: &FileLoader, file_name: &str) -> Option<SourceFi
     });
     let meta = meta?;
     loader.note_worker_logs(&meta.package_jsons, &meta.lookups);
+    loader.adopt_worker_package_jsons(&meta.package_jsons);
     Some(meta.meta)
 }
 
@@ -2802,12 +2803,13 @@ impl WorkerResolver {
             cache,
             publish: true,
         });
-        // What the worker reads for each package.json entry goes with the
-        // lookups of its answers, and the loader puts the entries of the
-        // answers that it takes into its own cache, as Go's parse tasks
-        // share one cache (`Caches::adopt_worker_package_jsons`). `fs`
-        // keeps the texts (`WorkerFs::keep_package_jsons`).
-        resolver.caches.worker_package_json_reads = Some(RefCell::default());
+        // The worker keeps what it reads for each package.json entry (`fs`
+        // keeps the texts, `WorkerFs::keep_package_jsons`), and the lookups
+        // of the package scope walk for a file's metadata carry it, so the
+        // loader puts those entries into its own cache when it takes the
+        // metadata, as the Go loader finds the metadata with the program's
+        // resolver (`Caches::adopt_worker_package_jsons`).
+        resolver.caches.worker_package_json_reads = Some(WorkerPackageJsonReads::default());
         set_worker_lookup_log(log_lookups);
         WorkerResolver {
             resolver,
@@ -2855,11 +2857,17 @@ impl WorkerResolver {
             None => {
                 let caches = &self.resolver.caches;
                 caches.start_package_json_log();
+                let attach = caches
+                    .worker_package_json_reads
+                    .as_ref()
+                    .map(|reads| &reads.attach);
+                attach.inspect(|attach| attach.set(true));
                 let value = PackageScope::of(
                     self.resolver
                         .get_package_scope_for_path(&directory)
                         .as_deref(),
                 );
+                attach.inspect(|attach| attach.set(false));
                 let package_jsons = caches.take_package_json_log();
                 let lookups = caches.take_worker_lookup_log();
                 cache.store_scope(
