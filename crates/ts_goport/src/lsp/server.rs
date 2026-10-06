@@ -4384,9 +4384,9 @@ impl Server {
         let mut ls_err: Option<GoError> = None;
         // PORT: Go maps the projects to their programs before this call (a
         // nil program stays nil) and reads a nil program in
-        // `ProvideWorkspaceSymbols`, under the recover. A port program is
-        // never nil, so `programs` reads each project's program inside the
-        // recover, where the port's nil read panics.
+        // `ProvideWorkspaceSymbols`, under the recover. The port's list
+        // holds no nil program, so `programs` reads each project's program
+        // inside the recover, where a `None` program panics as Go does.
         let mut provide_symbols =
             |snapshot: &Rc<Snapshot>, programs: &dyn Fn() -> Vec<Rc<compiler::NewProgram>>| {
                 self.recover_guard(
@@ -4420,7 +4420,13 @@ impl Server {
                 // Go: core.Map(snapshot.GetLanguageServiceProjectsContainingFile(uri), ls.Project.GetProgram) (ts#64204)
                 let projects = snapshot.get_language_service_projects_containing_file(uri);
                 provide_symbols(snapshot, &|| {
-                    projects.iter().map(|p| p.get_program()).collect()
+                    projects
+                        .iter()
+                        .map(|p| {
+                            p.get_program()
+                                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                        })
+                        .collect()
                 });
             });
         } else {

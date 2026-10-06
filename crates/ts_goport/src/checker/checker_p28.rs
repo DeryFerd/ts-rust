@@ -2,9 +2,11 @@
 //! type constructors, literal types, widening helpers, `mapType` and union
 //! type construction and reduction.
 
+use crate::checker::relater_p3::TemplateLiteralEnds;
 use crate::jsnum::{Number, PseudoBigInt};
 use crate::prelude::*;
 use rustc_hash::FxBuildHasher;
+use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::hash::BuildHasher;
 
@@ -1484,6 +1486,14 @@ impl Checker {
 
     // Go: checker/checker.go:26322 removeStringLiteralsMatchedByTemplateLiterals
     // PORT: Go returns the filtered slice; Rust filters `types` in place.
+    // PERF (sortmisc1): Go calls `isTypeMatchedByTemplateLiteralOrStringMapping`
+    // for each template until one matches. For a template literal, that call
+    // first tests the start and end texts (Go `inferFromLiteralPartsToTemplateLiteral`)
+    // and returns false with no other effect when they do not match, which
+    // is almost every pair. So the end texts of all templates are read once
+    // (`TemplateLiteralEnds`), each string literal is tested against them,
+    // and only the templates that pass (and string mappings) get Go's call,
+    // in Go's order. The calls with an effect and their order are Go's.
     pub fn remove_string_literals_matched_by_template_literals(&mut self, types: &mut TypeSet) {
         let templates: Vec<TypeId> = types
             .iter()
@@ -1491,15 +1501,20 @@ impl Checker {
             .filter(|&t| self.is_pattern_literal_type(t))
             .collect();
         if !templates.is_empty() {
+            let ends = TemplateLiteralEnds::new(self, &templates);
+            let mut candidates: SmallVec<[TypeId; 4]> = SmallVec::new();
             let mut i = types.len();
             while i > 0 {
                 i -= 1;
                 let t = types[i];
-                if self.ty(t).flags.intersects(TypeFlags::STRING_LITERAL)
-                    && templates.iter().any(|&template| {
-                        self.is_type_matched_by_template_literal_or_string_mapping(t, template)
-                    })
-                {
+                if !self.ty(t).flags.intersects(TypeFlags::STRING_LITERAL) {
+                    continue;
+                }
+                candidates.clear();
+                self.template_candidates_of_string_literal(t, &templates, &ends, &mut candidates);
+                if candidates.iter().any(|&template| {
+                    self.is_type_matched_by_template_literal_or_string_mapping(t, template)
+                }) {
                     types.remove(i);
                 }
             }

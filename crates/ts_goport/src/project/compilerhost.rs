@@ -221,13 +221,15 @@ impl CompilerHost {
         if self.builder.borrow().is_none() {
             crate::core::go_panic("freeze can only be called once".to_string());
         }
-        UNFROZEN_HOSTS.with(|unfrozen| unfrozen.set(unfrozen.get() - 1));
         *self.source_fs.source.borrow_mut() = snapshot_fs;
         self.source_fs.disable_tracking();
         *self.config_file_registry.borrow_mut() = Some(config_file_registry);
         // PORT: the old values are dropped after the borrows end, because
         // dropping the builder can drop other hosts and projects.
         let builder = self.builder.borrow_mut().take();
+        // The count goes down where the builder goes, so a panic before
+        // this line leaves the host counted once (`Drop` counts it down).
+        UNFROZEN_HOSTS.with(|unfrozen| unfrozen.set(unfrozen.get() - 1));
         let project = self.project.borrow_mut().take();
         let logger = self.logger.borrow_mut().take();
         drop(builder);
@@ -477,8 +479,11 @@ impl compiler::CompilerHost for CompilerHost {
     //   unknown kind TS.
     // - jsx and force: what this project's options give the name. force also
     //   depends on the file's package.json scope, which the load finds later
-    //   (ast/parseoptions.go:46 isFileForcedToBeModuleByFormat), so either
-    //   value that a scope can give passes. A project with references parses
+    //   (ast/parseoptions.go:46 isFileForcedToBeModuleByFormat). Only a
+    //   `"type": "module"` scope can set force, and the load reads the type
+    //   only where Go does (fileloader.go:398 to :401, node16 to nodenext
+    //   resolution or a `/node_modules/` path): there both values pass, and
+    //   elsewhere only the value with no scope. A project with references parses
     //   their source files with the reference's own options (Go
     //   projectreferencefilemapper.go:80 getCompilerOptionsForFile, from
     //   fileloader.go:418), which the host does not have yet, so then any
@@ -510,6 +515,7 @@ impl compiler::CompilerHost for CompilerHost {
             implied_node_format: ModuleKind::ES_NEXT,
             ..SourceFileMetaData::default()
         };
+        let module_resolution_kind = options.get_module_resolution_kind();
         let options_pass = |key: &ParseCacheKey| {
             if has_references {
                 return true;
@@ -519,7 +525,9 @@ impl compiler::CompilerHost for CompilerHost {
             };
             let plain = guess(&no_scope);
             key.jsx == plain.jsx
-                && (key.force == plain.force || key.force == guess(&esm_scope).force)
+                && (key.force == plain.force
+                    || compiler::package_json_type_applies(&key.file_name, module_resolution_kind)
+                        && key.force == guess(&esm_scope).force)
         };
         for (key, entry) in builder.parse_cache.entries.borrow().iter() {
             let (hash, kind) = match builder.fs.known_file(&key.path) {

@@ -6,9 +6,11 @@
 //!
 //! PORT: x/text is ported only as far as tsgo reaches it. tsgo parses a
 //! `--locale` value with `language.Parse` and matches the result against its
-//! fixed list of shipped locales. `gostd::collate` (organize imports) also
-//! needs `Compose`, `Builder`, `TypeForKey`, `SetTypeForKey`, `Parent`,
-//! `Extensions`, `Base` and the compact tags. Left out: the Accept-Language
+//! fixed list of shipped locales. `gostd::collate` also needs `Compose`,
+//! `Builder`, `TypeForKey`, `SetTypeForKey`, `Parent`, `Extensions`, `Base`
+//! and the compact tags. No port code calls `gostd::collate` now: Go
+//! organize imports has its own comparer from pin 52168999f3dc on, and Go N
+//! imports no `x/text/collate`. Left out: the Accept-Language
 //! parser, coverage, match options, and the part of `Match` that adjusts the
 //! matched tag (tsgo drops the tag and reads only the index and the
 //! confidence).

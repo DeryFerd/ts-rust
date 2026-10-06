@@ -116,13 +116,15 @@ impl ToSnapshot<'_> {
     }
 
     // Go: incremental/buildinfotosnapshot.go:69 toBuildInfoDiagnosticsWithFileName
+    // PORT: Go `core.Map` gives nil (`None`) for nil and an empty slice for
+    // an empty one.
     fn to_build_info_diagnostics_with_file_name(
         &self,
         diagnostics: Option<&Vec<BuildInfoDiagnostic>>,
-    ) -> Vec<BuildInfoDiagnosticWithFileName> {
-        diagnostics
-            .into_iter()
-            .flatten()
+    ) -> Option<Vec<BuildInfoDiagnosticWithFileName>> {
+        let diagnostics = diagnostics?;
+        let converted = diagnostics
+            .iter()
             .map(|d| {
                 let mut file = Path::default();
                 if d.file.0 != 0 {
@@ -138,7 +140,7 @@ impl ToSnapshot<'_> {
                     source: d.source.clone(),
                     message_text: d.message_text.clone(),
                     message_key: d.message_key.clone(),
-                    message_args: d.message_args.clone().unwrap_or_default(),
+                    message_args: d.message_args.clone(),
                     message_chain: self
                         .to_build_info_diagnostics_with_file_name(d.message_chain.as_ref()),
                     related_information: self
@@ -149,7 +151,8 @@ impl ToSnapshot<'_> {
                     repopulate_info: from_build_info_repopulate_info(d.repopulate_info.as_ref()),
                 }
             })
-            .collect()
+            .collect();
+        Some(converted)
     }
 
     // Go: incremental/buildinfotosnapshot.go:96 toDiagnosticsOrBuildInfoDiagnosticsWithFileName
@@ -160,7 +163,8 @@ impl ToSnapshot<'_> {
         DiagnosticsOrBuildInfoDiagnosticsWithFileName {
             diagnostics: None,
             build_info_diagnostics: self
-                .to_build_info_diagnostics_with_file_name(Some(&dig.diagnostics)),
+                .to_build_info_diagnostics_with_file_name(Some(&dig.diagnostics))
+                .unwrap_or_default(),
             // PORT: testing (see `DiagnosticsOrBuildInfoDiagnosticsWithFileName`)
             id: new_diagnostics_id(),
         }

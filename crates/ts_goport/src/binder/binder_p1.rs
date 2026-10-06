@@ -572,9 +572,13 @@ impl Binder {
 
     /// Go `node.AsBinaryExpression()` of BinaryExpression `node` of `file`,
     /// with its fields read once (`BinaryView`).
+    // The view reads the child ids of the bound file (`frozen_ids`), so a
+    // node of another file would give wrong ids with no panic. The check
+    // stays in release builds: one compare per binary expression, with no
+    // measurable cost (followups25).
     #[inline]
     pub fn binary_view(&self, node: Node) -> BinaryView {
-        debug_assert_eq!(node.file_index(), self.file_index, "node from another file");
+        assert_eq!(node.file_index(), self.file_index, "node from another file");
         BinaryView::with_ids(node, self.frozen_ids)
     }
 

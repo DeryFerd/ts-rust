@@ -1447,9 +1447,16 @@ impl Checker {
     //   before its scan and is used only while `merge_version` is the same. A
     //   merge during the scan (from an alias candidate's resolution) makes the
     //   entry old at once.
-    // - Aliases: an alias candidate's target is set once. While it is being
-    //   resolved, `try_resolve_alias` gives nil and the candidate is left out.
-    //   Such a result is not kept.
+    // - Aliases: while an alias candidate's target is being resolved,
+    //   `try_resolve_alias` gives nil and the candidate is left out. Such a
+    //   result is not kept. A target can still change after a kept scan
+    //   read it, with no merge: a nested resolution (after
+    //   `get_resolved_signature` moves `resolution_start`, Go
+    //   checker.go:8591) sets it, and the outer one (checker.go:16603 to
+    //   16606) writes it again, so a kept entry can have seen `unknown`
+    //   where a late member is now. Both are Property-like value symbols,
+    //   so no meaning that a name lookup asks for tells them apart (spell1
+    //   skeptic case c17 matches Go).
     // The primitive type alias symbols are made on each call, as before, so a
     // hit makes the same symbols as a miss.
     // A project where a test runner's types are missing asks this for

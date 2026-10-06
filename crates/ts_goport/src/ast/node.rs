@@ -20,6 +20,7 @@
 use crate::ast::synthetic::{list_of, modifiers_of, with_data};
 use crate::astdata::NodeData;
 use crate::prelude::*;
+use std::sync::atomic::Ordering;
 
 // ──────────────────────────────────────────────────────────────────────
 // Arena helpers
@@ -2221,12 +2222,14 @@ thread_local! {
     /// It forgets the nodes of dead file versions (`PerFileMap`, lsshells
     /// M3c); their small slices stay leaked.
     static DECORATORS: RefCell<PerFileMap<NodeSlice>> = const { RefCell::new(PerFileMap::new()) };
-    /// Go `CompositeBase.facts` of parsed nodes: per file (keyed by
-    /// `facts_file_key`), the cached `SubtreeFacts` of each node of a
-    /// `CompositeBase` kind (`is_composite_data`) by its index, with
-    /// `COMPUTED` set once cached. It forgets the files of dead file
-    /// versions (`PerFileMap`, lsshells M3a). A factory node keeps its facts
-    /// in its arena slot (`synthetic_subtree_facts`).
+    /// Go `CompositeBase.facts` of the parsed nodes that have no facts
+    /// column (`static_facts_word`): nodes of freeable file versions and of
+    /// unpublished stores. Per file (keyed by `facts_file_key`), the cached
+    /// `SubtreeFacts` of each node of a `CompositeBase` kind
+    /// (`is_composite_data`) by its index, with `COMPUTED` set once cached.
+    /// It forgets the files of dead file versions (`PerFileMap`, lsshells
+    /// M3a). A factory node keeps its facts in its arena slot
+    /// (`synthetic_subtree_facts`).
     // PERF: emitast1 F1. A column per file, not a map entry per node: no
     // hash per read and no growth rehash of a map with one entry per node.
     static SUBTREE_FACTS: RefCell<PerFileMap<Vec<SubtreeFacts>>> = const { RefCell::new(PerFileMap::new()) };
@@ -2257,10 +2260,20 @@ fn facts_file_key(n: Node) -> Node {
 }
 
 /// The cached `Node::subtree_facts` of `n`, a node of a `CompositeBase`
-/// kind, if any. A factory node keeps them in its arena slot (emitast1 F1),
-/// any other node in `SUBTREE_FACTS`.
-#[inline]
+/// kind, if any. A node of a static publish keeps them in the facts column
+/// of its file (`static_facts_word`, factscol1b), a factory node in its
+/// arena slot (emitast1 F1), any other node in `SUBTREE_FACTS`.
+#[cfg(test)]
 fn cached_subtree_facts(n: Node) -> Option<SubtreeFacts> {
+    if let Some(word) = super::store::static_facts_word(n) {
+        return computed_facts(SubtreeFacts(word.load(Ordering::Relaxed)));
+    }
+    cached_unpublished_subtree_facts(n)
+}
+
+/// `cached_subtree_facts` for a node with no facts column.
+#[inline(never)]
+fn cached_unpublished_subtree_facts(n: Node) -> Option<SubtreeFacts> {
     if is_synthetic_node(n) {
         return synthetic_subtree_facts(n);
     }
@@ -2268,17 +2281,22 @@ fn cached_subtree_facts(n: Node) -> Option<SubtreeFacts> {
     if index >= FACTS_COLUMN_LIMIT {
         return SUBTREE_FACTS_SPARSE.with(|c| c.borrow().get(&n).copied());
     }
-    SUBTREE_FACTS.with(|c| {
-        let facts = *c.borrow().get(&facts_file_key(n))?.get(index)?;
-        facts
-            .intersects(SubtreeFacts::COMPUTED)
-            .then(|| facts.without(SubtreeFacts::COMPUTED))
-    })
+    SUBTREE_FACTS.with(|c| computed_facts(*c.borrow().get(&facts_file_key(n))?.get(index)?))
 }
 
-/// Caches `facts` as the `Node::subtree_facts` of `n`.
+/// The facts of a cache entry `facts`, or `None` when it has no `COMPUTED`
+/// bit (no facts cached).
 #[inline]
-fn cache_subtree_facts(n: Node, facts: SubtreeFacts) {
+fn computed_facts(facts: SubtreeFacts) -> Option<SubtreeFacts> {
+    facts
+        .intersects(SubtreeFacts::COMPUTED)
+        .then(|| facts.without(SubtreeFacts::COMPUTED))
+}
+
+/// Caches `facts` as the `Node::subtree_facts` of `n`, a node with no facts
+/// column (`cached_unpublished_subtree_facts`).
+#[inline(never)]
+fn cache_unpublished_subtree_facts(n: Node, facts: SubtreeFacts) {
     if is_synthetic_node(n) {
         return set_synthetic_subtree_facts(n, facts);
     }
@@ -4658,7 +4676,7 @@ fn propagate_node_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
     if is_type_syntax_data(n, d) {
         return TS;
     }
-    let facts = subtree_facts_with_data(n, d);
+    let facts = non_type_subtree_facts(n, d);
     let f = n.file_index();
     match d {
         NodeData::CatchClause(_) => facts.without(EXCL_CATCH_CLAUSE),
@@ -4697,17 +4715,50 @@ fn propagate_node_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
 /// node of a `CompositeBase` kind gets the cached facts, or the facts
 /// computed from `d` (and cached). Any other node (a token, an identifier,
 /// a literal, type syntax) gets the facts computed from `d`, not cached.
+fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
+    if is_type_syntax_data(n, d) {
+        // Go: ast.go:1619 (*TypeSyntaxBase).computeSubtreeFacts
+        return TS;
+    }
+    non_type_subtree_facts(n, d)
+}
+
+/// `subtree_facts_with_data` for a node that is not type syntax
+/// (`is_type_syntax_data`), which the caller checked.
 // PERF: factscol1a. Caching every node cost 2 thread-local map accesses per
 // node (4.9x Go's instructions in the facts walk of a 5 MB JS file).
-fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
+// PERF: factscol1b. A node of a static publish reads and writes one atomic
+// word of the facts column of its file, as Go does. Two threads can both
+// compute the facts of a node; Go's `computeSubtreeFacts` is idempotent, so
+// they write the same word. The type syntax test is made once per node,
+// not once more here: in a deep chain of nodes that Go does not cache
+// (`await await ... x`), each step was 2 tests.
+#[inline]
+fn non_type_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
+    debug_assert!(!is_type_syntax_data(n, d), "{:?} is type syntax", n.kind());
     if !is_composite_data(n, d) {
         return subtree_facts_of_data(n, d);
     }
-    if let Some(facts) = cached_subtree_facts(n) {
+    composite_subtree_facts(n, d)
+}
+
+/// `non_type_subtree_facts` for a node of a `CompositeBase` kind: the
+/// cached facts, or the facts computed from `d`, cached.
+#[inline(never)]
+fn composite_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
+    if let Some(word) = super::store::static_facts_word(n) {
+        if let Some(facts) = computed_facts(SubtreeFacts(word.load(Ordering::Relaxed))) {
+            return facts;
+        }
+        let facts = subtree_facts_of_data(n, d).without(SubtreeFacts::COMPUTED);
+        word.store((facts | SubtreeFacts::COMPUTED).0, Ordering::Relaxed);
+        return facts;
+    }
+    if let Some(facts) = cached_unpublished_subtree_facts(n) {
         return facts;
     }
     let facts = subtree_facts_of_data(n, d).without(SubtreeFacts::COMPUTED);
-    cache_subtree_facts(n, facts);
+    cache_unpublished_subtree_facts(n, facts);
     facts
 }
 
@@ -4715,12 +4766,10 @@ fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
 // ast_generated.go computeSubtreeFacts methods.
 // PORT: the Go per-type methods are merged into one match. Types without an
 // override use Go `(*NodeDefault).computeSubtreeFacts`, which is None.
-/// Go `computeSubtreeFacts` over the data `d` of `n`, read in place.
+// `(*TypeSyntaxBase).computeSubtreeFacts` is in `subtree_facts_with_data`.
+/// Go `computeSubtreeFacts` over the data `d` of `n`, read in place, for a
+/// node that is not type syntax (`non_type_subtree_facts`).
 fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
-    if is_type_syntax_data(n, d) {
-        // Go: ast.go:1619 (*TypeSyntaxBase).computeSubtreeFacts
-        return TS;
-    }
     let f = n.file_index();
     macro_rules! p {
         ($x:expr) => {

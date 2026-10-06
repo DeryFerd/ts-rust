@@ -96,11 +96,11 @@ impl Protocol for MessagePackProtocol {
                 // Note: Method must be empty for IsResponse() to return true
                 let id = jsonrpc::new_id_string(&method);
                 msg.id = Some(id);
-                // PORT: Go `string(payload)` keeps invalid UTF-8 bytes; a
-                // Rust `String` holds U+FFFD for them.
+                // PORT: Go `string(payload)` keeps any bytes; the port form
+                // holds them (`go_string_from_bytes`).
                 msg.error = Some(jsonrpc::ResponseError {
                     code: jsonrpc::CODE_INTERNAL_ERROR,
-                    message: String::from_utf8_lossy(&payload).into_owned(),
+                    message: crate::scanner_util::go_string_from_bytes(payload),
                     data: None,
                 });
             }
@@ -192,7 +192,12 @@ impl Protocol for MessagePackProtocol {
         if let Some(id) = id {
             method = id.string();
         }
-        self.write_tuple(MessageType::ERROR, &method, resp_err.message.as_bytes())
+        // PORT: the message is in the port form; Go writes its bytes.
+        self.write_tuple(
+            MessageType::ERROR,
+            &method,
+            &crate::scanner_util::go_string_bytes(&resp_err.message),
+        )
     }
 }
 
@@ -234,8 +239,10 @@ impl MessagePackProtocol {
 
         // Read method (binary)
         let method_bytes = self.read_bin()?;
-        // PORT: Go `string(methodBytes)` keeps invalid UTF-8 bytes.
-        let method = String::from_utf8_lossy(&method_bytes).into_owned();
+        // PORT: Go `string(methodBytes)` keeps any bytes; the port form
+        // holds them (`go_string_from_bytes`), so `%q` of the method quotes
+        // Go's bytes and the response gives them back (`write_tuple`).
+        let method = crate::scanner_util::go_string_from_bytes(method_bytes);
 
         // Read payload (binary)
         let payload = self.read_bin()?;
@@ -277,6 +284,7 @@ impl MessagePackProtocol {
     }
 
     // Go: protocol_msgpack.go:231 writeTuple
+    // PORT: `method` is in the port form; Go writes its bytes.
     fn write_tuple(
         &mut self,
         msg_type: MessageType,
@@ -288,7 +296,7 @@ impl MessagePackProtocol {
         // Write message type as positive fixint (values 0-127 are written directly)
         write_all(&mut self.w, &[msg_type.0])?;
         // Write method
-        self.write_bin(method.as_bytes())?;
+        self.write_bin(&crate::scanner_util::go_string_bytes(method))?;
         // Write payload
         self.write_bin(payload)?;
         self.w.flush().map_err(io_error)
@@ -396,5 +404,82 @@ impl MarshalerTo for RawBinary {
         }
         enc.push('"');
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::Mutex;
+
+    /// A connection that reads `input` and keeps what is written.
+    struct Pipe {
+        input: Mutex<std::io::Cursor<Vec<u8>>>,
+        output: Mutex<Vec<u8>>,
+    }
+
+    impl ReadWriteCloser for Pipe {
+        fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.input.lock().expect("input").read(buf)
+        }
+        fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.lock().expect("output").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn close(&self) -> Result<(), GoError> {
+            Ok(())
+        }
+    }
+
+    /// The tuple frame `[msg_type, method, payload]` with bin8 strings.
+    fn frame(msg_type: MessageType, method: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![MSGPACK_FIXED_ARRAY3, msg_type.0];
+        for data in [method, payload] {
+            out.extend_from_slice(&[MSGPACK_BIN8, data.len() as u8]);
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
+    // Go `string(methodBytes)` keeps any bytes (protocol_msgpack.go:135):
+    // `%q` of an unknown method quotes them (proto.go:2029), and the error
+    // response gives the method back as the same bytes (writeTuple). Texts
+    // from Go N (`tsgo --api`, followups25 skeptic apiraw.py): a real U+FDD0
+    // stays one char, and a byte that is not valid UTF-8 is `\x..`.
+    #[test]
+    fn a_method_keeps_its_go_bytes() {
+        let method: &[u8] = b"a\xef\xb7\x90\xef\xb7\x90b\xff";
+        let pipe = Arc::new(Pipe {
+            input: Mutex::new(std::io::Cursor::new(frame(
+                MessageType::REQUEST,
+                method,
+                b"null",
+            ))),
+            output: Mutex::new(Vec::new()),
+        });
+        let mut protocol = new_message_pack_protocol(pipe.clone());
+        let msg = protocol.read_message().expect("read the request");
+        let err = crate::api::proto::unmarshal_payload(&msg.method, b"null")
+            .err()
+            .expect("an unknown method");
+        assert_eq!(err.error(), r#"unknown API method "a\ufdd0\ufdd0b\xff""#);
+        protocol
+            .write_error(
+                msg.id.as_ref(),
+                &jsonrpc::ResponseError {
+                    code: jsonrpc::CODE_INTERNAL_ERROR,
+                    message: err.error(),
+                    data: None,
+                },
+            )
+            .expect("write the error");
+        assert_eq!(
+            *pipe.output.lock().expect("output"),
+            frame(MessageType::ERROR, method, err.error().as_bytes())
+        );
     }
 }

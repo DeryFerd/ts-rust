@@ -808,7 +808,7 @@ fn invalid_text_error(label: &str, what: &[u8], at: &str) -> String {
     let quoted = if runes == 1 {
         go_quote_rune_bytes(what)
     } else if need_escape {
-        go_quote_bytes(what)
+        crate::gostd::strconv::quote_bytes(what)
     } else {
         format!("`{}`", String::from_utf8_lossy(what))
     };
@@ -858,30 +858,6 @@ fn go_quote_rune_bytes(b: &[u8]) -> String {
         None if b.is_empty() => crate::gostd::strconv::quote_rune('\u{FFFD}'),
         None => format!("'\\x{:x}'", b[0]),
     }
-}
-
-// Go `strconv.Quote` of a byte string: a byte that is not valid UTF-8 is
-// `\x` and two hex digits.
-fn go_quote_bytes(b: &[u8]) -> String {
-    let mut out = String::from("\"");
-    let mut i = 0;
-    while i < b.len() {
-        let start = i;
-        while let Some((_, n)) = decode_utf8(&b[i..]) {
-            i += n;
-        }
-        if i > start {
-            let run = std::str::from_utf8(&b[start..i]).expect("valid UTF-8 run");
-            let quoted = crate::gostd::strconv::quote(run);
-            out.push_str(&quoted[1..quoted.len() - 1]);
-        }
-        if i < b.len() {
-            out.push_str(&format!("\\x{:02x}", b[i]));
-            i += 1;
-        }
-    }
-    out.push('"');
-    out
 }
 
 // Go: jsonwire/decode.go:299 hasEscapedUTF16Prefix
@@ -976,10 +952,13 @@ fn escape_pointer_token(name: &str) -> String {
     b
 }
 
-// The pointer token of the object name `quoted` (a JSON string with its
-// quotes), unquoted as Go `jsonwire.UnquoteMayCopy` does (invalid UTF-8
-// becomes U+FFFD).
-fn pointer_token_of_name(quoted: &[u8]) -> String {
+/// The object name `quoted` (a JSON string with its quotes), unquoted as
+/// Go's name stack holds it for a JSON pointer (`jsonwire.AppendUnquote`,
+/// jsontext/state.go:664: invalid UTF-8 becomes U+FFFD).
+// PORT: the result is Go's bytes, which are valid UTF-8, not the port form
+// (a real U+FDD0 is one char). So is every JSON pointer, and its `%q` is
+// `strconv::quote_bytes`.
+pub(crate) fn unquote_pointer_name(quoted: &[u8]) -> String {
     let dec = JsonDecoder::new(
         quoted,
         JsonOptions {
@@ -987,16 +966,21 @@ fn pointer_token_of_name(quoted: &[u8]) -> String {
             ..JsonOptions::default()
         },
     );
-    escape_pointer_token(
-        &dec.consume_string_raw(0)
-            .map(|(_, s)| s)
-            .unwrap_or_default(),
-    )
+    dec.consume_string_raw(0)
+        .map(|(_, s)| s)
+        .unwrap_or_default()
+}
+
+// The pointer token of the object name `quoted` (`unquote_pointer_name`).
+fn pointer_token_of_name(quoted: &[u8]) -> String {
+    escape_pointer_token(&unquote_pointer_name(quoted))
 }
 
 // Go: jsontext/errors.go:120 (*SyntacticError).Error
+// PORT: the pointer is Go's bytes (`unquote_pointer_name`), so `%q` is
+// `quote_bytes`.
 fn syntactic_error_text(err: &SyntaxErr, mut pointer: String, mut offset: usize) -> String {
-    use crate::gostd::strconv::quote;
+    use crate::gostd::strconv::quote_bytes;
     let mut b = String::from("jsontext: ");
     b.push_str(&err.text());
     if *err == SyntaxErr::DuplicateName {
@@ -1007,15 +991,15 @@ fn syntactic_error_text(err: &SyntaxErr, mut pointer: String, mut offset: usize)
             .unwrap_or(&pointer[slash..]);
         let last = last.replace("~1", "/").replace("~0", "~");
         b.push(' ');
-        b.push_str(&quote(&last));
+        b.push_str(&quote_bytes(last.as_bytes()));
         pointer.truncate(slash);
         offset = 0; // not useful to print offset for duplicate names
     }
     if !pointer.is_empty() {
         b.push_str(" within ");
-        b.push_str(&quote(&crate::frontend::json_ext::truncate_pointer(
-            &pointer, 100,
-        )));
+        b.push_str(&quote_bytes(
+            crate::frontend::json_ext::truncate_pointer(&pointer, 100).as_bytes(),
+        ));
     }
     if offset > 0 {
         b.push_str(" after offset ");
@@ -2607,6 +2591,42 @@ mod decode_string_tests {
                 }
             }
         }
+    }
+
+    // A JSON pointer holds Go's bytes of the names, where a real U+FDD0 is
+    // one char, and `%q` quotes them (jsontext/errors.go:127 and :135). Texts
+    // from Go N (encoding/json/v2 of Go 1.27.1, followups25 round b
+    // tools-b/gojsonptr).
+    #[test]
+    fn pointer_names_are_quoted_from_go_bytes() {
+        let read_all = |text: &[u8]| {
+            let mut dec = JsonDecoder::new(
+                text,
+                JsonOptions {
+                    allow_invalid_utf8: true,
+                    ..JsonOptions::default()
+                },
+            );
+            dec.skip_value().and_then(|()| dec.check_eof())
+        };
+        assert_eq!(
+            read_all("{\"\\ufdd0\\ufdd0\":1,\"\u{fdd0}\u{fdd0}\":2}".as_bytes())
+                .unwrap_err()
+                .message,
+            r#"jsontext: duplicate object member name "\ufdd0\ufdd0""#
+        );
+        assert_eq!(
+            read_all("{\"\u{fdd0}\u{fdd0}\":{\"a\":1,\"a\":2}}".as_bytes())
+                .unwrap_err()
+                .message,
+            r#"jsontext: duplicate object member name "a" within "/\ufdd0\ufdd0""#
+        );
+        assert_eq!(
+            read_all(b"{\"x\xffy\":{\"a\":1,\"a\":2}}")
+                .unwrap_err()
+                .message,
+            "jsontext: duplicate object member name \"a\" within \"/x\u{fffd}y\""
+        );
     }
 
     // Names with and without escapes share one namespace per object, and a

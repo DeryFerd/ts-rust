@@ -4866,9 +4866,7 @@ impl Default for DiagnosticResponse {
 }
 
 // PORT: the Go v2 default struct unmarshal of `DiagnosticResponse`
-// (`CreateProgramOptions.ConfigFileParsingDiagnostics`, ts#63950). A
-// `category` outside the four Go constants is a decode error here (the Rust
-// enum holds only those).
+// (`CreateProgramOptions.ConfigFileParsingDiagnostics`, ts#63950).
 impl UnmarshalerFrom for DiagnosticResponse {
     fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
         let is_object = unmarshal_struct_fields(dec, "api.DiagnosticResponse", |name, dec| {
@@ -4881,20 +4879,20 @@ impl UnmarshalerFrom for DiagnosticResponse {
                 "sourceLines" => json_unmarshal_decode(dec, &mut self.source_lines)?,
                 "code" => json_unmarshal_decode(dec, &mut self.code)?,
                 "category" => {
+                    // Go `diagnostics.Category` is an int32 type: any int32
+                    // is kept (diagnostics/diagnostics.go:18), and an error
+                    // names that type.
                     let mut category: i32 = 0;
-                    json_unmarshal_decode(dec, &mut category)?;
-                    self.category = match category {
-                        0 => crate::diagnostics::Category::Warning,
-                        1 => crate::diagnostics::Category::Error,
-                        2 => crate::diagnostics::Category::Suggestion,
-                        3 => crate::diagnostics::Category::Message,
-                        _ => {
-                            return Err(SemanticError::method(
-                                ErrorPos::After,
-                                format!("invalid diagnostics.Category {category}"),
-                            ));
-                        }
-                    };
+                    json_unmarshal_decode(dec, &mut category).map_err(
+                        |err| match SemanticError::of(&err) {
+                            Some(mut s) => {
+                                s.go_type = "diagnostics.Category".to_string();
+                                s.into_json_error()
+                            }
+                            None => err,
+                        },
+                    )?;
+                    self.category = crate::diagnostics::Category(category);
                 }
                 "source" => json_unmarshal_decode(dec, &mut self.source)?,
                 "text" => json_unmarshal_decode(dec, &mut self.text)?,
@@ -5215,6 +5213,34 @@ mod unmarshal_error_tests {
         assert_eq!(
             err_text::<GetSourceFileParams>(r#"{"snapshot":1,"file":5}"#),
             r#"failed to unmarshal *api.GetSourceFileParams: json: cannot unmarshal into Go api.DocumentIdentifier within "/file": DocumentIdentifier: expected string or object, got number"#
+        );
+    }
+
+    // Go `diagnostics.Category` is `type Category int32`
+    // (diagnostics/diagnostics.go:18): a config file parsing diagnostic that
+    // the client sends keeps any int32 category, and a number out of range
+    // names that type. The error text is Go N's for the same
+    // `updateSnapshot` request.
+    #[test]
+    fn a_sent_diagnostic_category_is_any_int32() {
+        let decode = |category: &str| {
+            let data = format!(
+                r#"{{"configFileParsingDiagnostics":[{{"code":1,"category":{category},"text":"x"}}]}}"#
+            );
+            let mut options = CreateProgramOptions::default();
+            crate::frontend::json_ext::unmarshal_root(data.as_bytes(), &mut options)
+                .map(|()| options.config_file_parsing_diagnostics[0].category)
+                .map_err(|err| err.message)
+        };
+        assert_eq!(decode("1"), Ok(crate::diagnostics::Category::Error));
+        assert_eq!(decode("999"), Ok(crate::diagnostics::Category(999)));
+        assert_eq!(
+            decode("-2147483648"),
+            Ok(crate::diagnostics::Category(i32::MIN))
+        );
+        assert_eq!(
+            decode("3000000000"),
+            Err(r#"json: cannot unmarshal JSON number 3000000000 into Go diagnostics.Category within "/configFileParsingDiagnostics/0/category": value out of range"#.to_string())
         );
     }
 

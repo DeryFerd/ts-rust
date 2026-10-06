@@ -898,6 +898,42 @@ impl Checker {
         )
     }
 
+    /// Pushes onto `out`, in list order, each type of `templates` that the
+    /// string literal `source` can match: every string mapping, and every
+    /// template literal whose start and end text test it passes (the
+    /// opposite of `string_literal_misses_template_literal_ends`). `ends`
+    /// holds the end texts of `templates`.
+    pub(crate) fn template_candidates_of_string_literal(
+        &self,
+        source: TypeId,
+        templates: &[TypeId],
+        ends: &TemplateLiteralEnds,
+        out: &mut SmallVec<[TypeId; 4]>,
+    ) {
+        let value = go_bytes_of(
+            self.get_string_literal_value_ref(source),
+            self.string_literal_go_plain(source),
+        );
+        for (&template, span) in templates.iter().zip(&ends.spans) {
+            let Some((offset, start_len, end_len)) = *span else {
+                out.push(template);
+                continue;
+            };
+            let start = &ends.bytes[offset..offset + start_len];
+            let end = &ends.bytes[offset + start_len..offset + start_len + end_len];
+            // The first byte of each text rejects most pairs without a
+            // `memcmp` call. The length test comes first, so `value` has
+            // those bytes when a text is not empty.
+            if value.len() >= start_len + end_len
+                && start.first().is_none_or(|b| value[0] == *b)
+                && end.last().is_none_or(|b| value[value.len() - 1] == *b)
+                && literal_part_ends_match(&value, &value, true, start, end)
+            {
+                out.push(template);
+            }
+        }
+    }
+
     // Go: checker/relater.go:2365 isTypeMatchedByTemplateLiteralType
     pub fn is_type_matched_by_template_literal_type(
         &mut self,
@@ -1982,6 +2018,44 @@ fn go_bytes_of(text: &str, plain: bool) -> Cow<'_, [u8]> {
     }
 }
 
+/// The start and end texts (Go bytes) of the template literals in a list of
+/// template and string mapping types, read once, so that each string
+/// literal of a union is tested against them without reading each template
+/// again (`template_candidates_of_string_literal`).
+// PERF (sortmisc1): no Go type. Go `removeStringLiteralsMatchedByTemplateLiterals`
+// tests every (string literal, template) pair, and almost every pair fails
+// this test (immich: 22.3 M pairs, none passed).
+pub(crate) struct TemplateLiteralEnds {
+    /// The start text and then the end text of each template literal.
+    bytes: Vec<u8>,
+    /// For each type of the list: the offset of its start text in `bytes`
+    /// and the lengths of its start and end texts, or `None` for a string
+    /// mapping.
+    spans: Vec<Option<(usize, usize, usize)>>,
+}
+
+impl TemplateLiteralEnds {
+    pub(crate) fn new(c: &Checker, templates: &[TypeId]) -> Self {
+        let mut bytes = Vec::new();
+        let spans = templates
+            .iter()
+            .map(|&template| {
+                if !c.ty(template).flags.intersects(TypeFlags::TEMPLATE_LITERAL) {
+                    return None;
+                }
+                let target = c.ty(template).as_template_literal_type();
+                let start = go_bytes_of(&target.texts[0], target.go_plain);
+                let end = go_bytes_of(&target.texts[target.texts.len() - 1], target.go_plain);
+                let offset = bytes.len();
+                bytes.extend_from_slice(&start);
+                bytes.extend_from_slice(&end);
+                Some((offset, start.len(), end.len()))
+            })
+            .collect();
+        TemplateLiteralEnds { bytes, spans }
+    }
+}
+
 /// The first test of Go `inferFromLiteralPartsToTemplateLiteral`: the source
 /// starts with the target start text and ends with the target end text, and
 /// a single source text is long enough for both. False is Go's early `nil`.
@@ -2103,4 +2177,93 @@ fn match_literal_parts_to_template_literal<S: AsRef<[u8]>, T: AsRef<[u8]>>(
     let end = get_source_text(last_source_index).len();
     add_match(&mut seg, &mut pos, last_source_index, end);
     true
+}
+
+#[cfg(test)]
+mod template_ends_tests {
+    use super::*;
+    use crate::checker::utilities_p1::union_sort_tests::with_alias_types;
+
+    /// String literals and template literal types whose start and end texts
+    /// share bytes, are empty, are longer than the string, or are not ASCII,
+    /// and a string mapping type.
+    const SOURCE: &str = r#"
+type S1 = "a.b";
+type S2 = "x";
+type S3 = "abc";
+type S4 = "";
+type S5 = "é.z";
+type S6 = "aXz";
+type S7 = "123.b";
+type S8 = "ab";
+type T1 = `${number}.b`;
+type T2 = `a.${string}`;
+type T3 = `${string}z`;
+type T4 = `a${string}b${string}c`;
+type T5 = `${string}`;
+type T6 = `é${string}`;
+type T7 = `ab${string}ab`;
+type T8 = `${string}.${string}`;
+type T9 = Uppercase<string>;
+"#;
+
+    /// `template_candidates_of_string_literal` gives, in list order, every
+    /// string mapping and every template literal that
+    /// `string_literal_misses_template_literal_ends` does not reject, and so
+    /// every template that matches the string.
+    #[test]
+    fn template_candidates_are_the_templates_that_pass_the_end_test() {
+        with_alias_types(SOURCE, |c, types| {
+            let strings: Vec<TypeId> = types
+                .iter()
+                .copied()
+                .filter(|&t| c.ty(t).flags.intersects(TypeFlags::STRING_LITERAL))
+                .collect();
+            let templates: Vec<TypeId> = types
+                .iter()
+                .copied()
+                .filter(|&t| {
+                    c.is_pattern_literal_type(t)
+                        || c.ty(t).flags.intersects(TypeFlags::STRING_MAPPING)
+                })
+                .collect();
+            // `${string}` is `string`, not a template.
+            assert_eq!((strings.len(), templates.len()), (8, 8));
+            let ends = TemplateLiteralEnds::new(c, &templates);
+            let (mut kept, mut matched) = (0, 0);
+            for &s in &strings {
+                let mut candidates = SmallVec::new();
+                c.template_candidates_of_string_literal(s, &templates, &ends, &mut candidates);
+                let want: Vec<TypeId> = templates
+                    .iter()
+                    .copied()
+                    .filter(|&t| {
+                        !c.ty(t).flags.intersects(TypeFlags::TEMPLATE_LITERAL)
+                            || !c.string_literal_misses_template_literal_ends(s, t)
+                    })
+                    .collect();
+                assert_eq!(
+                    &candidates[..],
+                    &want[..],
+                    "{:?}",
+                    c.get_string_literal_value_ref(s)
+                );
+                kept += candidates.len();
+                for &t in &templates {
+                    if c.is_type_matched_by_template_literal_or_string_mapping(s, t) {
+                        matched += 1;
+                        assert!(
+                            candidates.contains(&t),
+                            "{:?}",
+                            c.get_string_literal_value_ref(s)
+                        );
+                    }
+                }
+            }
+            assert!(
+                kept > matched && matched > 5 && kept < strings.len() * templates.len(),
+                "{kept} {matched}"
+            );
+        });
+    }
 }

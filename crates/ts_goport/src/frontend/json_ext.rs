@@ -339,7 +339,10 @@ impl std::fmt::Display for SemanticError {
         match self.pointer.as_deref() {
             Some(ptr) if !ptr.is_empty() => {
                 sb.push_str(" within ");
-                sb.push_str(&crate::gostd::strconv::quote(&truncate_pointer(ptr, 100)));
+                // PORT: the pointer is Go's bytes (`json::unquote_pointer_name`).
+                sb.push_str(&crate::gostd::strconv::quote_bytes(
+                    truncate_pointer(ptr, 100).as_bytes(),
+                ));
             }
             _ if self.byte_offset > 0 => {
                 sb.push_str(" after offset ");
@@ -574,11 +577,7 @@ fn stack_at(data: &[u8], end: usize) -> Vec<StackEntry> {
                 i = (i + 1).min(data.len());
                 if let Some(e) = stack.last_mut() {
                     if e.is_object && e.len.is_multiple_of(2) {
-                        let mut name = JsonDecoder::new(&data[start..i], JsonOptions::default());
-                        e.name = match name.read_token() {
-                            Ok(JsonToken::String(s)) => s,
-                            _ => String::new(),
-                        };
+                        e.name = crate::frontend::json::unquote_pointer_name(&data[start..i]);
                     }
                     e.len += 1;
                 }
@@ -1604,6 +1603,17 @@ mod unmarshal_error_tests {
         assert_eq!(
             err_text::<FxHashMap<String, Vec<u32>>>(r#"{"a/b":[0,-1]}"#),
             r#"json: cannot unmarshal JSON number -1 into Go uint32 within "/a~1b/1": invalid syntax"#
+        );
+    }
+
+    // The pointer holds Go's bytes of the names (a real U+FDD0 is one
+    // char), and `%q` quotes them. Text from Go N (encoding/json/v2 of Go
+    // 1.27.1, followups25 round b tools-b/gojsonptr).
+    #[test]
+    fn pointer_names_are_quoted_from_go_bytes() {
+        assert_eq!(
+            err_text::<FxHashMap<String, Vec<u32>>>("{\"\u{fdd0}\u{fdd0}\":[0,-1]}"),
+            r#"json: cannot unmarshal JSON number -1 into Go uint32 within "/\ufdd0\ufdd0/1": invalid syntax"#
         );
     }
 }
