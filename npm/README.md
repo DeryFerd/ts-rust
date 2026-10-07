@@ -104,6 +104,10 @@ collides with a placeholder. npm drops a new trust that publishes nothing in 2 d
 shortly before the first tag. Add required reviewers to the `npm` environment (repo settings,
 Environments) to approve each publish by hand.
 
+The first publish binds each trust to the repo's GitHub ID, not only its name. The repo was
+recreated on 2026-10-07 (history cleanup), so before the next release run
+`npm/trust-setup.sh --relink`: it revokes the old trusts and creates new ones for the new repo.
+
 While the repo is private, npm publishes with no provenance. From a public repo it adds
 provenance by itself.
 
