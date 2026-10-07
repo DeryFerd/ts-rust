@@ -1380,7 +1380,8 @@ impl ipc::Conn for ProcessConn {
 // state; this is what a parse worker needs to send the transform request of
 // a file of an open project, as `transform_locked` does: the mapper's
 // connection, which threads can share (`MuxConn`), the project handle, the
-// host context, the timing and what decoding needs.
+// host context, the timing and what decoding needs. The loader disables it
+// when the mapper fails (`disable`), so that the workers send no more.
 pub struct ConcurrentTransform {
     conn: ProcessConn,
     ctx: Context,
@@ -1388,19 +1389,23 @@ pub struct ConcurrentTransform {
     position_encoding: PositionEncoding,
     diagnostic_source: String,
     timing: Arc<MapperTimingCollector>,
+    disabled: AtomicBool,
 }
 
 impl ConcurrentTransform {
     /// The transform of `content` of `file_name`, as `transform_locked`
-    /// makes it, errors and timings included. `None` when the connection's
-    /// read loop panicked: then the loader transforms the file itself, and
-    /// its call panics.
+    /// makes it, errors and timings included. `None` when the mapper is
+    /// disabled, or when the connection's read loop panicked: then the
+    /// loader transforms the file itself, and its call panics.
     // Go: contentmapper/hostimpl.go:770 host.transformLocked
     pub fn transform(
         &self,
         file_name: &str,
         content: &str,
     ) -> Option<std::result::Result<Result, GoError>> {
+        if self.disabled.load(Ordering::Relaxed) {
+            return None;
+        }
         let start = self.timing.start_request();
         let raw = self.conn.call_any_thread(
             &self.ctx,
@@ -1434,6 +1439,12 @@ impl ConcurrentTransform {
                 new_transform_error(TransformErrorKind::RESPONSE, Some(err)).to_go_error()
             }),
         )
+    }
+
+    /// Stops the transforms that the workers start after this: the loader
+    /// disabled the mapper (`FileLoader::content_mapper_unavailable`).
+    pub fn disable(&self) {
+        self.disabled.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1877,6 +1888,7 @@ impl HostImpl {
             position_encoding: conn.position_encoding.clone(),
             diagnostic_source: conn.diagnostic_source.clone(),
             timing: self.timing.mapper(&identity),
+            disabled: AtomicBool::new(false),
         }))
     }
 

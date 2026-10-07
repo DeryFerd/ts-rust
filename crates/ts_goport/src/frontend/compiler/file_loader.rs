@@ -1281,6 +1281,14 @@ impl FileLoader {
         self.mapped_prefetch_ready.set(true);
     }
 
+    /// Stops the worker transforms of a mapper that the loader disabled.
+    // PORT: not in Go (see `concurrent_transforms`).
+    fn disable_concurrent_transform(&self, mapper: &Rc<Mapper>) {
+        if let Some(transform) = self.concurrent_transforms.borrow().get(&Rc::as_ptr(mapper)) {
+            transform.disable();
+        }
+    }
+
     // Go: fileloader.go:638 (*fileLoader).contentMapperUnavailable (tsgo#4712)
     // contentMapperUnavailable reports whether mapper failed initialization or exceeded its failure budget.
     fn content_mapper_unavailable(&self, mapper: Option<&Rc<Mapper>>) -> bool {
@@ -1315,6 +1323,7 @@ impl FileLoader {
         self.content_mapper_diagnostics
             .borrow_mut()
             .push(content_mapper_initialization_diagnostic(label, err));
+        self.disable_concurrent_transform(mapper);
     }
 
     // Go: fileloader.go:660 (*fileLoader).recordContentMapperFailure (tsgo#4712)
@@ -1335,6 +1344,8 @@ impl FileLoader {
                     diag::The_content_mapper_0_failed_1_times_and_will_not_be_used,
                     args![label, MAX_CONTENT_MAPPER_FAILURES],
                 ));
+            drop(failures);
+            self.disable_concurrent_transform(mapper);
         }
         true
     }
