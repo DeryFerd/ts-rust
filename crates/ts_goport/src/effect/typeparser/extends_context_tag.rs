@@ -19,7 +19,9 @@ impl TypeParser<'_> {
     /// ExtendsContextTag checks if a class declaration extends Context.Tag("key")<Self, Shape>().
     /// It detects the pattern:
     ///
-    ///     class X extends Context.Tag("key")<X, Shape>() {}
+    /// ```text
+    /// class X extends Context.Tag("key")<X, Shape>() {}
+    /// ```
     ///
     /// where the ExpressionWithTypeArguments.expression is a CallExpression (outer call)
     /// that has type arguments <Self, Shape>, and whose own .expression is a CallExpression

@@ -13,7 +13,9 @@ impl TypeParser<'_> {
     // Go: typeparser/extends_schema_opaque.go ExtendsSchemaOpaque
     /// ExtendsSchemaOpaque checks for the exact Schema.Opaque double-call heritage shape:
     ///
-    ///     class X extends Schema.Opaque<X>()(schema) {}
+    /// ```text
+    /// class X extends Schema.Opaque<X>()(schema) {}
+    /// ```
     pub fn extends_schema_opaque(&mut self, class_node: Node) -> Option<Rc<SchemaOpaqueResult>> {
         if class_node.is_nil() {
             return None;

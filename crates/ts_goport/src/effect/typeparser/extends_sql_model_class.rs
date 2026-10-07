@@ -17,7 +17,9 @@ impl TypeParser<'_> {
     /// ExtendsEffectSqlModelClass checks if a class declaration extends Model.Class<Self>(...)({...}).
     /// It detects the double-call pattern:
     ///
-    ///     class X extends Model.Class<X>("name")({}) {}
+    /// ```text
+    /// class X extends Model.Class<X>("name")({}) {}
+    /// ```
     ///
     /// where the ExpressionWithTypeArguments.expression is a CallExpression (outer call)
     /// whose own .expression is also a CallExpression (inner call) with type arguments,

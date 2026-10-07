@@ -17,7 +17,9 @@ impl TypeParser<'_> {
     /// ExtendsDataTaggedError checks if a class declaration extends Data.TaggedError("key")<Fields>.
     /// It detects the pattern:
     ///
-    ///     class X extends Data.TaggedError("key")<{ msg: string }> {}
+    /// ```text
+    /// class X extends Data.TaggedError("key")<{ msg: string }> {}
+    /// ```
     ///
     /// where the ExpressionWithTypeArguments.expression is a CallExpression (Data.TaggedError("key")),
     /// the call's expression is a PropertyAccessExpression resolving to Data.TaggedError,

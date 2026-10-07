@@ -21,7 +21,9 @@ impl TypeParser<'_> {
     /// ExtendsEffectV3Service checks if a class declaration extends Effect.Service<Self>()(key, options).
     /// It detects the double-call pattern:
     ///
-    ///     class X extends Effect.Service<X>()("key", { ... }) {}
+    /// ```text
+    /// class X extends Effect.Service<X>()("key", { ... }) {}
+    /// ```
     ///
     /// where the ExpressionWithTypeArguments.expression is a CallExpression (outer call)
     /// whose own .expression is also a CallExpression (inner call) with type arguments,

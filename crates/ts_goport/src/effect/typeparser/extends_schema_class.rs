@@ -17,7 +17,9 @@ impl TypeParser<'_> {
     /// ExtendsSchemaClass checks if a class declaration extends Schema.Class<Self>("name")({}).
     /// It detects the double-call pattern:
     ///
-    ///     class X extends Schema.Class<X>("name")({}) {}
+    /// ```text
+    /// class X extends Schema.Class<X>("name")({}) {}
+    /// ```
     ///
     /// where the ExpressionWithTypeArguments.expression is a CallExpression (outer call)
     /// whose own .expression is also a CallExpression (inner call) with type arguments,

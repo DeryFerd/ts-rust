@@ -19,7 +19,9 @@ impl TypeParser<'_> {
     /// ExtendsEffectTag checks if a class declaration extends Effect.Tag("key")<Self, Shape>().
     /// It detects the pattern:
     ///
-    ///     class X extends Effect.Tag("key")<X, Shape>() {}
+    /// ```text
+    /// class X extends Effect.Tag("key")<X, Shape>() {}
+    /// ```
     ///
     /// where the ExpressionWithTypeArguments.expression is a CallExpression (outer call)
     /// that has type arguments <Self, Shape>, and whose own .expression is a CallExpression

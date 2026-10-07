@@ -21,7 +21,9 @@ impl TypeParser<'_> {
     /// extendsSchemaTagged checks if a class declaration extends Schema.<memberName>
     /// with the double-call pattern:
     ///
-    ///     class X extends Schema.TaggedClass<X>("identifier")("tag", { ... }) {}
+    /// ```text
+    /// class X extends Schema.TaggedClass<X>("identifier")("tag", { ... }) {}
+    /// ```
     ///
     /// where the ExpressionWithTypeArguments.expression is a CallExpression (outer call)
     /// whose own .expression is also a CallExpression (inner call) with type arguments,

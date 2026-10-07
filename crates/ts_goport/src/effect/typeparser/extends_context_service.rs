@@ -19,7 +19,9 @@ impl TypeParser<'_> {
     /// ExtendsContextService checks if a class declaration extends Context.Service<Self, Shape>()(key).
     /// It detects the double-call pattern:
     ///
-    ///     class X extends Context.Service<X, Shape>()("key") {}
+    /// ```text
+    /// class X extends Context.Service<X, Shape>()("key") {}
+    /// ```
     ///
     /// where the ExpressionWithTypeArguments.expression is a CallExpression (outer call)
     /// whose own .expression is also a CallExpression (inner call) with type arguments,
