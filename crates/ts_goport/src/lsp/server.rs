@@ -2064,29 +2064,33 @@ impl Server {
         lsp_exit: &CancelCauseFunc,
     ) -> Result<(), GoError> {
         let busy = || self.shared.queued_requests.load(Ordering::SeqCst) != 0;
-        // PORT: the frees that the last message or wake-up left
-        // (`gostd::local::drop_later`) run after its answer, while no
-        // message waits.
-        gostd::local::drop_garbage(busy);
         // PORT: idle work (the auto-import warm) runs only when no message
         // waits: at once or after a quiet period with no message, as the job
         // asks, so it does not delay a request that has arrived. Work it
         // queues runs right after it, as it did when the warm ran inside
-        // `run_pending`.
-        while ctx.err().is_none()
-            && let Some(start) = gostd::local::next_idle()
-            && self.shared.wait_quiet(
-                self.free_since.get()
-                    + match start {
-                        gostd::local::IdleStart::AtOnce => Duration::ZERO,
-                        gostd::local::IdleStart::AfterQuiet => IDLE_QUIET_PERIOD,
-                    },
-            )
-            && gostd::local::run_idle()
-        {
+        // `run_pending`. The frees that the last message or wake-up left
+        // (`gostd::local::drop_later`) run after its answer, while no
+        // message waits, but after a job that starts at once: Go's warm runs
+        // on a goroutine from before the answer, and Go's garbage collector
+        // frees in the background, so the frees do not delay Go's warm.
+        loop {
+            let quiet = match gostd::local::next_idle() {
+                Some(gostd::local::IdleStart::AtOnce) => Duration::ZERO,
+                Some(gostd::local::IdleStart::AfterQuiet) => {
+                    gostd::local::drop_garbage(busy);
+                    IDLE_QUIET_PERIOD
+                }
+                None => break,
+            };
+            if ctx.err().is_some()
+                || !self.shared.wait_quiet(self.free_since.get() + quiet)
+                || !gostd::local::run_idle()
+            {
+                break;
+            }
             gostd::local::run_pending();
-            gostd::local::drop_garbage(busy);
         }
+        gostd::local::drop_garbage(busy);
 
         let item = self.shared.request_queue.get(ctx)?;
         if matches!(item, QueuedRequest::Request(_)) {
