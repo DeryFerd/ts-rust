@@ -46,7 +46,7 @@ for name in "${packages[@]}"; do
   # `npm trust list --json` prints one JSON object per trust (npm/cli lib/trust-cmd.js
   # logOptions): id, type, file, repository, environment and permissions. createPackage is
   # --allow-publish.
-  state=$(npm trust list "$name" --json 2> /dev/null | node -e '
+  state=$(npm trust list "$name" --json | node -e '
     const text = require("fs").readFileSync(0, "utf8").trim();
     const trusts = text ? JSON.parse(`[${text.replace(/}\s*{/g, "},{")}]`) : [];
     const ok = trusts.some(t => t.type === "github" && t.repository === process.argv[1] &&
