@@ -2924,8 +2924,8 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
     }
 
     // The parse workers find the package scope of each file for its
-    // metadata, and the loader puts the package.json entries of that walk
-    // into the program resolver's cache when it takes the metadata
+    // metadata, and the loader keeps the package.json reads of that walk
+    // in the program resolver's cache when it takes the metadata
     // (`Caches::adopt_worker_package_jsons`), as the Go loader finds the
     // metadata with the program's resolver (fileloader.go:391,
     // module/resolver.go:1755 getPackageJsonInfo, packagejson/cache.go:190
