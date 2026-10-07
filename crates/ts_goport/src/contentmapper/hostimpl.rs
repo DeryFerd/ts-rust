@@ -1375,14 +1375,15 @@ impl ipc::Conn for ProcessConn {
     }
 }
 
-// PORT: not in Go, where the parse goroutines call `Project.Transform`. The
-// project is dispatch-thread state; this is what a parse worker needs to
-// transform a file of the project: the mapper's connection, which threads
-// can share (`MuxConn`), the project handle and what decoding needs. A
-// worker's call that fails because the connection ended closes the process,
-// as the loading thread's does (`ProcessConn`).
+// PORT: not in Go, where the parse goroutines call `projectLease.Transform`
+// (hostimpl.go:1000) on an open project. The project is dispatch-thread
+// state; this is what a parse worker needs to send the transform request of
+// a file of an open project, as `transform_locked` does: the mapper's
+// connection, which threads can share (`MuxConn`), the project handle, the
+// host context, the timing and what decoding needs.
 pub struct ConcurrentTransform {
     conn: ProcessConn,
+    ctx: Context,
     project_handle: String,
     position_encoding: PositionEncoding,
     diagnostic_source: String,
@@ -1400,7 +1401,7 @@ impl ConcurrentTransform {
     ) -> std::result::Result<Result, GoError> {
         let start = self.timing.start_request();
         let raw = self.conn.call_any_thread(
-            &context::background(),
+            &self.ctx,
             METHOD_TRANSFORM,
             Some(Box::new(TransformParams {
                 file_name: file_name.to_string(),
@@ -1826,24 +1827,39 @@ impl HostImpl {
         self.conn_for_locked(mapper)
     }
 
-    // PORT: not in Go (see `ConcurrentTransform`). `None` when the mapper
-    // has no process connection (it failed to start, or a test dialer).
+    // PORT: not in Go (see `ConcurrentTransform`). What a parse worker can
+    // send the transforms of the project of `entry` with, once the project
+    // is open. `None` before (Go opens it on the first transform, here the
+    // loader's), and when the mapper's connection is not a process
+    // connection (a test dialer). It never dials.
     fn concurrent_transform(
         &self,
         mapper: &Rc<Mapper>,
-        project_handle: String,
+        entry: &Rc<RefCell<ProjectEntry>>,
     ) -> Option<Arc<ConcurrentTransform>> {
-        if project_handle.is_empty() {
-            return None;
-        }
-        let (conn, position_encoding, diagnostic_source) = self.conn_for(mapper).ok()?;
-        let process = conn.as_any()?.downcast_ref::<ProcessConn>()?;
+        let project_handle = {
+            let entry = entry.borrow();
+            if !entry.opened || entry.project_handle.is_empty() {
+                return None;
+            }
+            entry.project_handle.clone()
+        };
+        let identity = mapper.identity();
+        let conn = self.conns.borrow().as_ref()?.get(&identity)?.clone();
+        let conn = conn.borrow();
+        let process = conn
+            .conn
+            .as_ref()?
+            .as_any()?
+            .downcast_ref::<ProcessConn>()?
+            .clone();
         Some(Arc::new(ConcurrentTransform {
-            conn: process.clone(),
+            conn: process,
+            ctx: self.ctx.clone(),
             project_handle,
-            position_encoding,
-            diagnostic_source,
-            timing: self.timing.mapper(&mapper.identity()),
+            position_encoding: conn.position_encoding.clone(),
+            diagnostic_source: conn.diagnostic_source.clone(),
+            timing: self.timing.mapper(&identity),
         }))
     }
 
@@ -2428,14 +2444,11 @@ impl Project for ProjectLease {
         host.transform_locked(mapper, request, &handle)
     }
 
+    // PORT: not in Go (see `ConcurrentTransform`).
     fn concurrent_transform(&self, mapper: &Rc<Mapper>) -> Option<Arc<ConcurrentTransform>> {
         let host = &self.host;
-        let key = self.entry_key(mapper).cloned().unwrap_or_default();
-        let entry = host.project_entry(&key)?;
-        // An open that fails here fails again in `transform`, which reports it.
-        host.open_project_locked(&host.ctx, &entry).ok()?;
-        let handle = entry.borrow().project_handle.clone();
-        host.concurrent_transform(mapper, handle)
+        let entry = host.project_entry(self.entry_key(mapper)?)?;
+        host.concurrent_transform(mapper, &entry)
     }
 
     // Go: contentmapper/hostimpl.go:1021 projectLease.Close

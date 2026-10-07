@@ -530,10 +530,7 @@ impl FilesParser {
             .rank_roots(tasks, ROOT_RANK_PER_WORKER * pool.threads.len());
         // The root jobs are queued now, so the added workers start at once.
         pool.add_workers(extra_worker_count(large));
-        if !lock(&pool.shared.queue).mapped.is_empty() {
-            pool.add_mapped_workers(mapped_worker_count());
-        }
-        self.run_queue(loader);
+        self.run_queue(loader, Some(&mut pool));
         // Closes the queue, then waits for the workers.
         drop(prefetch);
         drop(pool);
@@ -543,7 +540,7 @@ impl FilesParser {
     /// queue until it is empty.
     fn run(&mut self, loader: &FileLoader, tasks: &[ParseTaskRef]) {
         self.start(loader, tasks, 0);
-        self.run_queue(loader);
+        self.run_queue(loader, None);
     }
 
     // Go: core/workgroup.go singleThreadedWorkGroup.RunAndWait
@@ -551,13 +548,47 @@ impl FilesParser {
     // own goroutine unless single threaded. The port runs them here in
     // queue order. With `go_work_group_task`, a Go panic in a queued func
     // ends the run as it does in Go.
-    fn run_queue(&mut self, loader: &FileLoader) {
+    // PORT: with the parse workers (`pool`), a run that opened a mapper
+    // project queues the content-mapped jobs (`queue_mapped_prefetch`).
+    fn run_queue(&mut self, loader: &FileLoader, mut pool: Option<&mut PrefetchPool>) {
         while let Some(queued) = self.queue.pop() {
             if self.single_threaded {
                 self.run_queued(loader, queued);
             } else {
                 crate::core::go_work_group_task(|| self.run_queued(loader, queued));
             }
+            if let Some(pool) = pool.as_deref_mut()
+                && loader.mapped_prefetch_ready.replace(false)
+            {
+                self.queue_mapped_prefetch(loader, pool);
+            }
+        }
+    }
+
+    /// Queues the worker jobs of the content-mapped files of the queued
+    /// tasks once the loader's transform of a first file opened their
+    /// mapper project (`FileLoader::note_content_mapper_transform`), and
+    /// starts the workers of such jobs with the first. Later tasks get
+    /// their jobs when they are queued (`start`).
+    // PORT: not in Go (see `PrefetchJob::mapped`).
+    fn queue_mapped_prefetch(&self, loader: &FileLoader, pool: &mut PrefetchPool) {
+        let requests: Vec<PrefetchRequest> = self
+            .queue
+            .iter()
+            .filter(|queued| !queued.loaded)
+            .filter_map(|queued| {
+                let task = queued.task.borrow();
+                self.prefetch_request(loader, &task, Some(task.path.clone()), queued.depth)
+            })
+            .filter(|request| matches!(request, PrefetchRequest::Mapped(..)))
+            .collect();
+        if requests.is_empty() {
+            return;
+        }
+        pool.shared.queue_batch(requests);
+        if !pool.mapped_workers {
+            pool.mapped_workers = true;
+            pool.add_mapped_workers(mapped_worker_count());
         }
     }
 
@@ -642,9 +673,11 @@ impl FilesParser {
             return None;
         }
         let file_name = &task.normalized_file_path;
-        // tsgo#4712: the host transforms a content-mapped file on the
-        // loading thread. PORT: a worker transforms and parses it ahead,
-        // when the mapper's connection allows it (`take_prefetched_mapped`).
+        // tsgo#4712: the host transforms a content-mapped file. PORT: a
+        // worker sends its transform and parses the virtual text ahead,
+        // once the loader's transform of a file of the mapper opened the
+        // mapper project (`FileLoader::concurrent_content_mapper_transform`);
+        // the host takes the result (`take_prefetched_mapped`).
         let mapped = if !loader.content_mapper_extensions.is_empty()
             && file_extension_is_one_of(
                 file_name,
@@ -1832,6 +1865,11 @@ impl PrefetchQueue {
             PrefetchRequest::New(opts, script_kind) => (opts, script_kind, None),
             // The script kind is the one of the virtual text, which the
             // worker finds.
+            // The loader loads the output `.d.ts` file of a redirected
+            // source (`redirects`), and sends no transform for it.
+            PrefetchRequest::Mapped(opts, _) if self.redirects.contains_key(&opts.file_name) => {
+                return None;
+            }
             PrefetchRequest::Mapped(opts, transform) => {
                 (opts, ScriptKind::UNKNOWN, Some(transform))
             }
@@ -2421,6 +2459,9 @@ impl PrefetchShared {
 struct PrefetchPool {
     shared: Arc<PrefetchShared>,
     threads: Vec<std::thread::JoinHandle<()>>,
+    /// True once the workers of content-mapped jobs started
+    /// (`FilesParser::queue_mapped_prefetch`).
+    mapped_workers: bool,
 }
 
 impl PrefetchPool {
@@ -2428,6 +2469,7 @@ impl PrefetchPool {
         let mut pool = Self {
             shared: Arc::new(PrefetchShared::new(config)),
             threads: Vec::new(),
+            mapped_workers: false,
         };
         pool.add_workers(workers);
         pool

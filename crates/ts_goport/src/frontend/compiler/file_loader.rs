@@ -93,12 +93,18 @@ pub struct FileLoader {
     pub content_mapper_failures: RefCell<FxHashMap<*const Mapper, i32>>,
     pub content_mapper_init_failed: RefCell<FxHashSet<*const Mapper>>,
     pub content_mapper_diagnostics: RefCell<Vec<Diagnostic>>,
-    /// What the parse workers transform the files of each mapper with
-    /// (`concurrent_content_mapper_transform`). Keyed as the maps above:
-    /// two mappers of one package and version have their own options, and
-    /// so their own project.
-    // PORT: not in Go (see `FilesParser::prefetch_request`).
-    pub concurrent_transforms: RefCell<FxHashMap<*const Mapper, Option<Arc<ConcurrentTransform>>>>,
+    /// What the parse workers send the transforms of each mapper's files
+    /// with, from the loader's first transform of a file of the mapper on
+    /// (`note_content_mapper_transform`). Keyed as the maps above: two
+    /// mappers of one package and version have their own options, and so
+    /// their own project.
+    // PORT: not in Go, where the parse goroutines transform.
+    pub concurrent_transforms: RefCell<FxHashMap<*const Mapper, Arc<ConcurrentTransform>>>,
+    /// Set when `concurrent_transforms` gets a mapper, so that the files
+    /// parser queues the worker jobs of the files of that mapper that wait
+    /// in its queue (`FilesParser::queue_mapped_prefetch`).
+    // PORT: not in Go (see `concurrent_transforms`).
+    pub mapped_prefetch_ready: Cell<bool>,
     // ts#64299. PORT: Go `moduleResolutionErrorOnce` plus the error is an
     // `Option` that keeps the first error.
     pub module_resolution_error: RefCell<Option<GoError>>,
@@ -272,6 +278,7 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         content_mapper_init_failed: RefCell::new(FxHashSet::default()),
         content_mapper_diagnostics: RefCell::new(Vec::new()),
         concurrent_transforms: RefCell::new(FxHashMap::default()),
+        mapped_prefetch_ready: Cell::new(false),
         module_resolution_error: RefCell::new(None),
         opts,
     };
@@ -1134,11 +1141,12 @@ impl FileLoader {
                 &transform_identity,
             )));
         }
-        match self
+        let files = self
             .opts
             .host
-            .get_content_mapped_source_files(&opts, &mapper)
-        {
+            .get_content_mapped_source_files(&opts, &mapper);
+        self.note_content_mapper_transform(&mapper);
+        match files {
             Ok(files) => files.canonical,
             Err(err) => {
                 let mut source_file =
@@ -1221,19 +1229,17 @@ impl FileLoader {
         source_file
     }
 
-    // Go: fileloader.go:638 (*fileLoader).contentMapperUnavailable (tsgo#4712)
-    // contentMapperUnavailable reports whether mapper failed initialization or exceeded its failure budget.
-    /// What a parse worker can transform the content-mapped file
-    /// `file_name` with, cached per mapper. `None` keeps the file's
-    /// transform on this thread: the mapper failed, its host has no
-    /// concurrent transform, or `GOPORT_MAPPED_PREFETCH` is `0` (an A/B
-    /// switch).
+    /// What a parse worker sends the transform of the content-mapped file
+    /// `file_name` with (`FilesParser::prefetch_request`): `None` until
+    /// the loader's transform of a file of its mapper opened the mapper
+    /// project, and after the mapper is disabled.
     // PORT: not in Go, where the parse goroutines transform (tsgo#4712).
     pub(crate) fn concurrent_content_mapper_transform(
         &self,
         file_name: &str,
     ) -> Option<Arc<ConcurrentTransform>> {
-        if std::env::var_os("GOPORT_MAPPED_PREFETCH").is_some_and(|value| value == "0") {
+        let transforms = self.concurrent_transforms.borrow();
+        if transforms.is_empty() {
             return None;
         }
         let mapper = self
@@ -1243,21 +1249,38 @@ impl FileLoader {
         if self.content_mapper_unavailable(Some(&mapper)) {
             return None;
         }
-        let key = Rc::as_ptr(&mapper);
-        if let Some(transform) = self.concurrent_transforms.borrow().get(&key) {
-            return transform.clone();
+        transforms.get(&Rc::as_ptr(&mapper)).cloned()
+    }
+
+    /// After the loader's transform of a file of `mapper`: when the
+    /// transform opened the mapper project, keeps what the parse workers
+    /// send the later transforms with. Go opens the project on the first
+    /// transform too, so no request goes out that Go does not send.
+    /// `GOPORT_MAPPED_PREFETCH=0` turns it off (an A/B switch).
+    // PORT: not in Go (see `concurrent_transforms`).
+    fn note_content_mapper_transform(&self, mapper: &Rc<Mapper>) {
+        let key = Rc::as_ptr(mapper);
+        if self.concurrent_transforms.borrow().contains_key(&key)
+            || std::env::var_os("GOPORT_MAPPED_PREFETCH").is_some_and(|value| value == "0")
+        {
+            return;
         }
-        let transform = self
+        let Some(transform) = self
             .opts
             .host
             .content_mapper_project()
-            .and_then(|project| project.concurrent_transform(&mapper));
+            .and_then(|project| project.concurrent_transform(mapper))
+        else {
+            return;
+        };
         self.concurrent_transforms
             .borrow_mut()
-            .insert(key, transform.clone());
-        transform
+            .insert(key, transform);
+        self.mapped_prefetch_ready.set(true);
     }
 
+    // Go: fileloader.go:638 (*fileLoader).contentMapperUnavailable (tsgo#4712)
+    // contentMapperUnavailable reports whether mapper failed initialization or exceeded its failure budget.
     fn content_mapper_unavailable(&self, mapper: Option<&Rc<Mapper>>) -> bool {
         let Some(mapper) = mapper else {
             return false;
