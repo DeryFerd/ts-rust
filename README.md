@@ -7,13 +7,13 @@ ts-rust is a direct port of Microsoft's native TypeScript compiler, which is wri
 [typescript-go](https://github.com/microsoft/typescript-go)). It keeps Go's algorithms and
 behavior and has the same command line (`tsc`), language server and API.
 
-**This is a preview.** It is not yet a full replacement for `tsc`. See
+**This is an early release.** It is not yet a full replacement for `tsc` in every project. See
 [Known problems](#known-problems).
 
 ## Install
 
 ```sh
-npm install -D tsc-rs@next
+npm install -D tsc-rs
 npx tsc-rs -p tsconfig.json
 ```
 
@@ -25,6 +25,21 @@ Platforms: Linux x64 (static, any distribution) and macOS arm64. Windows and Lin
 available yet.
 
 To use it in VS Code, see the [npm package README](npm/tsc-rs-readme.md#vs-code).
+
+## Effect diagnostics
+
+`tsc-rs` has the [Effect](https://effect.website) language service diagnostics built in (codes
+377xxx), so an Effect project needs no second compiler. They come from the same check as the
+TypeScript diagnostics, and the language server shows them too. They run only when the tsconfig has
+the plugin, as with `@effect/language-service`:
+
+```json
+{ "compilerOptions": { "plugins": [{ "name": "@effect/language-service" }] } }
+```
+
+The rules, options and `@effect-diagnostics` comments are a port of
+[Effect-TS/tsgo](https://github.com/Effect-TS/tsgo) 0.46.1. The editor features of the language
+service (quick fixes, refactors, hover, completions) are not ported.
 
 ## Status
 
@@ -81,9 +96,10 @@ run with
 
 ## Releases
 
-Push a tag `v<version>` (for example `v0.1.0-preview.1`). The
+Push a tag `v<version>` (for example `v0.1.0`). The
 [release workflow](.github/workflows/release.yml) builds, packs and tests the packages, publishes
-them to npm under the dist-tag `next` and creates a GitHub prerelease. See
+them to npm and creates a GitHub release. A stable version goes to the dist-tag `latest`, and a
+prerelease version (`v0.2.0-beta.1`) to `next` and a GitHub prerelease. See
 [npm/README.md](npm/README.md#tsc-rs-releases).
 
 ## License

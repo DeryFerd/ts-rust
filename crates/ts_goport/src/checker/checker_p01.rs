@@ -1170,6 +1170,14 @@ pub struct Checker {
     /// Go `tracer *Tracer` (checker.go:897): optional tracer for trace
     /// events and type recording (for --generateTrace). None is Go nil.
     pub tracer: Option<crate::tracing::Tracer>,
+
+    /// Effect-TS/tsgo patch 023 `EffectLinks`: the Effect type parser caches
+    /// (`effect::typeparser`). None until a rule first runs.
+    pub effect_links: Option<Box<crate::effect::typeparser::EffectLinks>>,
+    /// Effect-TS/tsgo patches 002 and 004 `SourceFileLinks.relationErrors`:
+    /// the relation errors of each source file, for Effect rules. Kept only
+    /// when the program has Effect diagnostics options.
+    pub effect_relation_errors: FxHashMap<Node, Vec<crate::effect::RelationError>>,
 }
 
 // Arena accessors (PORTING.md "Checker data"). Handles index their arena
@@ -1637,6 +1645,8 @@ impl Checker {
             // Go: compiler/checkerpool.go:104 makes the tracer when the pool
             // has a tracing session; NewChecker stores it (checker.go:905).
             tracer: crate::tracing::new_checker_tracer(checker_index),
+            effect_links: None,
+            effect_relation_errors: FxHashMap::default(),
         };
         // Closure optimization
         c.compare_symbols = Rc::new(|c: &mut Checker, s1: SymbolId, s2: SymbolId| -> i32 {

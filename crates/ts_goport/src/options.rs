@@ -203,6 +203,9 @@ pub struct CompilerOptions {
     pub paths: Option<IndexMap<String, Option<Vec<String>>>>,
     // Plugins are parsed only so tools can report that native TypeScript does not support them.
     pub plugins: Option<Vec<PluginImport>>,
+    /// Effect-TS/tsgo patch 007: the parsed `@effect/language-service`
+    /// plugin options (`effect::etscore`), from `plugins` in tsconfig.json.
+    pub effect: Option<std::sync::Arc<crate::effect::etscore::EffectPluginOptions>>,
     pub preserve_const_enums: Tristate,
     pub preserve_symlinks: Tristate,
     pub project: String,

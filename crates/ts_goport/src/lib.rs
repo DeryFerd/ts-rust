@@ -30,6 +30,8 @@ pub mod cmd;
 pub mod contentmapper;
 pub mod core;
 pub mod declarations;
+// Native Effect diagnostics (Effect-TS/tsgo port).
+pub mod effect;
 pub use goport_util::diag;
 pub use goport_util::diagnostics;
 pub mod diagnostics_loc;
