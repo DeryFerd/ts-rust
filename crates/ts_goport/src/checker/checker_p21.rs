@@ -682,8 +682,22 @@ impl Checker {
     }
 
     // Go: checker/checker.go:19348 getApplicableIndexInfo
+    // PERF: a type with no index infos (most types) returns at once, as
+    // `find_applicable_index_info` of an empty list returns nil with no call.
+    // The list is read in place for the test, so the empty case makes no
+    // `SharedList` (`get_index_infos_of_structured_type` builds an empty one
+    // when the type has no signature data).
     pub fn get_applicable_index_info(&mut self, t: TypeId, key_type: TypeId) -> IndexInfoId {
-        let index_infos = self.get_index_infos_of_type(t);
+        let t = self.get_reduced_apparent_type(t);
+        if !self.ty(t).flags.intersects(TypeFlags::STRUCTURED_TYPE)
+            || self
+                .resolve_structured_type_members(t)
+                .index_infos()
+                .is_empty()
+        {
+            return IndexInfoId::NIL;
+        }
+        let index_infos = self.get_index_infos_of_structured_type(t);
         self.find_applicable_index_info(&index_infos, key_type)
     }
 
