@@ -678,7 +678,10 @@ impl NodeFactory {
             SyntaxKind::PartiallyEmittedExpression => {
                 self.update_partially_emitted_expression(outer_expression, expression)
             }
-            kind => panic!("Unexpected outer expression kind: {kind:?}"),
+            kind => panic!(
+                "Unexpected outer expression kind: {}",
+                crate::gostd::debug::kind_string(kind)
+            ),
         }
     }
 
@@ -1990,5 +1993,28 @@ impl NodeFactory {
             self.new_node_list(&arguments),
             NodeFlags::NONE,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::AssertUnwindSafe;
+
+    // Go prints `%s` of the Kind in this panic (printer/factory.go:433
+    // `panic(fmt.Sprintf("Unexpected outer expression kind: %s",
+    // outerExpression.Kind))`), which is `Kind.String()`.
+    #[test]
+    fn unexpected_outer_expression_panic_names_the_go_kind() {
+        let context = super::super::emit_context::new_emit_context();
+        let f = NodeFactory::new(&context);
+        let (outer, inner) = (f.new_identifier("x"), f.new_identifier("y"));
+        let payload =
+            std::panic::catch_unwind(AssertUnwindSafe(|| f.update_outer_expression(outer, inner)))
+                .expect_err("no panic");
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some("Unexpected outer expression kind: KindIdentifier")
+        );
     }
 }

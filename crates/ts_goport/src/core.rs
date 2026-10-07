@@ -1181,12 +1181,24 @@ pub struct Symbol {
 /// `free_chunks` frees whole chunks. A hole is in a shared chunk that holds
 /// only the values before it, or in a freed chunk, so a read of a hole
 /// panics. Indexes never move and are never used again.
+///
+/// Interleaved arrays (apisym1c, `new_interleaved`): the binder lineage
+/// puts its values in the even chunks only, and a checker copy of it
+/// (`for_checker`) puts its own values in the odd chunks only. A sealed
+/// chunk is followed by a freed chunk, so the tail keeps its parity. So a
+/// later lineage index is never one of a checker's own, and a checker can
+/// add the chunks that the lineage bound after its copy (`catch_up`), as a
+/// Go checker reads every bound file. In a checker copy, the lineage chunk
+/// that held the copy's last values is an owned chunk padded with default
+/// values: its indexes after those values read as default, not as holes.
 // PERF: an owned or static chunk is a fixed array behind a thin pointer at
 // the same place in the chunk entry, so `get` of one is one bounds test (the
 // chunk list), one kind test and one load, with no branch between the two
 // kinds and no pointer hop. A read of the tail is one bounds test more (its
 // `Vec`), and that test also stops a read at or above the length. Shared and
 // freed chunks (only in the language service) go out of line.
+// PERF (apisym1c): the parity is in the index, so `get` does not select a
+// part (a second array cost 0.8 to 2.5 percent instructions in a check).
 #[derive(Clone, Debug)]
 pub struct CowChunks<T: 'static> {
     chunks: Vec<Chunk<T>>,
@@ -1195,6 +1207,8 @@ pub struct CowChunks<T: 'static> {
     /// shared chunk).
     tail: Vec<T>,
     len: usize,
+    /// Each sealed chunk is followed by a freed chunk (`new_interleaved`).
+    interleaved: bool,
 }
 
 const COW_CHUNK_SHIFT: usize = 8;
@@ -1302,12 +1316,48 @@ impl<T: Clone> CowChunks<T> {
             chunks: Vec::new(),
             tail: Vec::new(),
             len: 0,
+            interleaved: false,
+        }
+    }
+
+    /// An empty interleaved array (see `CowChunks`): the values of the
+    /// binder lineage, in the even chunks.
+    #[must_use]
+    pub fn new_interleaved() -> Self {
+        Self {
+            interleaved: true,
+            ..Self::new()
         }
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// The index that the next push gets: the length, or in an interleaved
+    /// array whose tail is full, the start of the chunk after the freed
+    /// chunk that the push puts after the tail (`seal_full_tail`).
+    #[must_use]
+    pub fn next_index(&self) -> usize {
+        if self.interleaved && self.tail.len() == COW_CHUNK_LEN {
+            self.len + COW_CHUNK_LEN
+        } else {
+            self.len
+        }
+    }
+
+    /// The number of indexes below `next_index` that the array's parity
+    /// holds: in an interleaved binder array, the lineage indexes (even
+    /// chunks), as `ArenaOffsets` counts them; else `next_index`.
+    #[must_use]
+    pub fn dense_len(&self) -> usize {
+        let next = self.next_index();
+        if self.interleaved {
+            next - ((next >> (COW_CHUNK_SHIFT + 1)) << COW_CHUNK_SHIFT)
+        } else {
+            next
+        }
     }
 
     #[must_use]
@@ -1362,11 +1412,16 @@ impl<T: Clone> CowChunks<T> {
         };
     }
 
-    /// Makes a full tail an owned chunk.
+    /// Makes a full tail an owned chunk. In an interleaved array a freed
+    /// chunk follows it, and the length moves to the chunk after that.
     fn seal_full_tail(&mut self) {
         if self.tail.len() == COW_CHUNK_LEN {
             let values = std::mem::take(&mut self.tail);
             self.chunks.push(full_chunk(values));
+            if self.interleaved {
+                self.chunks.push(Chunk::Freed);
+                self.len = self.tail_start();
+            }
         }
     }
 
@@ -1462,18 +1517,30 @@ impl<T: Clone> CowChunks<T> {
     /// starts a new chunk. The indexes left in the last chunk hold no value:
     /// the tail becomes a shared chunk that holds its values only. Does
     /// nothing when the length is at a chunk start.
+    ///
+    /// In an interleaved array the next value starts the next chunk of the
+    /// same parity: a freed chunk follows the ended one, and a full tail is
+    /// sealed now.
     pub fn end_chunk(&mut self) {
         if self.len & COW_CHUNK_MASK == 0 {
+            if self.interleaved {
+                self.seal_full_tail();
+            }
             return;
         }
         self.share_from(self.len);
         self.len = self.len.next_multiple_of(COW_CHUNK_LEN);
+        if self.interleaved {
+            self.chunks.push(Chunk::Freed);
+            self.len += COW_CHUNK_LEN;
+        }
     }
 
     /// Frees the chunks of the indexes from `from` to `to`, which are chunk
     /// starts (`end_chunk`). A read of one of these indexes panics and later
     /// indexes do not move. A clone that shares a freed chunk keeps its
-    /// values until it drops.
+    /// values until it drops. In an interleaved array only the even chunks
+    /// (the lineage's) are freed: an odd chunk is a checker's own.
     pub fn free_chunks(&mut self, from: usize, to: usize) {
         debug_assert!(
             from & COW_CHUNK_MASK == 0 && to & COW_CHUNK_MASK == 0,
@@ -1484,8 +1551,11 @@ impl<T: Clone> CowChunks<T> {
         self.seal_full_tail();
         let end = (to >> COW_CHUNK_SHIFT).min(self.chunks.len());
         let first = from.div_ceil(COW_CHUNK_LEN).min(end);
-        for chunk in &mut self.chunks[first..end] {
-            *chunk = Chunk::Freed;
+        let interleaved = self.interleaved;
+        for (position, chunk) in self.chunks.iter_mut().enumerate().take(end).skip(first) {
+            if !interleaved || position % 2 == 0 {
+                *chunk = Chunk::Freed;
+            }
         }
     }
 
@@ -1514,6 +1584,7 @@ impl<T: Clone> CowChunks<T> {
         at: usize,
         mut f: impl FnMut(&mut T),
     ) -> AlignedChunks<T> {
+        debug_assert!(!self.interleaved, "a file arena is not interleaved");
         let len = self.len.saturating_sub(skip);
         let room = (COW_CHUNK_LEN - (at & COW_CHUNK_MASK)) & COW_CHUNK_MASK;
         let head_len = room.min(len);
@@ -1556,10 +1627,12 @@ impl<T: Clone> CowChunks<T> {
     }
 
     /// Appends the values of `aligned`, which `into_aligned` made for the
-    /// current length.
+    /// current length (`dense_len`). In an interleaved array a freed chunk
+    /// follows each of its chunks.
     pub fn append_aligned(&mut self, aligned: AlignedChunks<T>) {
         assert_eq!(
-            self.len, aligned.at,
+            self.dense_len(),
+            aligned.at,
             "aligned chunks made for another index"
         );
         if self.len < self.tail_start() {
@@ -1571,10 +1644,149 @@ impl<T: Clone> CowChunks<T> {
         if !aligned.chunks.is_empty() || !aligned.tail.is_empty() {
             self.seal_full_tail();
             debug_assert!(self.tail.is_empty(), "aligned chunks after a partial tail");
-            self.chunks.extend(aligned.chunks);
+            if self.interleaved {
+                self.chunks.reserve(2 * aligned.chunks.len());
+                for chunk in aligned.chunks {
+                    self.chunks.extend([chunk, Chunk::Freed]);
+                }
+            } else {
+                self.chunks.extend(aligned.chunks);
+            }
             self.tail = aligned.tail;
         }
-        self.len += aligned.len;
+        self.len = self.tail_start() + self.tail.len();
+    }
+
+    /// The values that chunk `position` holds: the tail at the chunk after
+    /// the last, and none after it.
+    fn chunk_values(&self, position: usize) -> &[T] {
+        match self.chunks.get(position) {
+            Some(Chunk::Fixed(values)) => values.values(),
+            Some(Chunk::Shared(values)) => values,
+            Some(Chunk::Freed) => &[],
+            None if position == self.chunks.len() => &self.tail,
+            None => &[],
+        }
+    }
+
+    /// The indexes of the values in the odd chunks, the tail too when it is
+    /// in one, in order: the own values of a checker copy (`for_checker`).
+    pub fn odd_indexes(&self) -> impl Iterator<Item = usize> + '_ {
+        (1..=self.chunks.len())
+            .step_by(2)
+            .flat_map(move |position| {
+                let start = position << COW_CHUNK_SHIFT;
+                start..start + self.chunk_values(position).len()
+            })
+    }
+}
+
+/// An owned chunk that holds `values` (at most one chunk) and default
+/// values after them (see `CowChunks`).
+fn padded_chunk<T: Clone + Default>(values: &[T]) -> Chunk<T> {
+    let mut padded = Vec::with_capacity(COW_CHUNK_LEN);
+    padded.extend_from_slice(values);
+    padded.resize_with(COW_CHUNK_LEN, T::default);
+    full_chunk(padded)
+}
+
+// apisym1c: the checker copies of the binder lineage.
+impl<T: Clone + Default> CowChunks<T> {
+    /// A checker copy of this interleaved lineage array. It shares the
+    /// lineage chunks as a clone does, holds the lineage's tail as an owned
+    /// chunk padded with default values, and pushes its own values from the
+    /// next odd chunk on.
+    #[must_use]
+    pub fn for_checker(&self) -> CowChunks<T> {
+        debug_assert!(self.interleaved, "a checker copies the binder lineage");
+        let mut chunks = Vec::with_capacity(self.chunks.len() + 2);
+        chunks.extend(self.chunks.iter().cloned());
+        if !self.tail.is_empty() {
+            chunks.push(padded_chunk(&self.tail));
+        }
+        if chunks.len() % 2 == 0 {
+            chunks.push(Chunk::Freed);
+        }
+        CowChunks {
+            len: chunks.len() << COW_CHUNK_SHIFT,
+            chunks,
+            tail: Vec::new(),
+            interleaved: true,
+        }
+    }
+
+    /// Adds the lineage values of `from` from index `seen` on. `from` is
+    /// the binder lineage now, and this array a checker copy of it
+    /// (`for_checker`) whose lineage length was `seen`, so each lineage
+    /// index below `seen` holds the same value in both, except where this
+    /// array wrote. The values here do not change. The later lineage chunks
+    /// are shared as `from` holds them (static, shared by `Arc`, or freed),
+    /// and a chunk that `from` still fills is padded. When the lineage
+    /// passes this array's tail, the tail ends in its chunk, as `end_chunk`
+    /// ends one, and the next own value starts after the lineage.
+    pub fn catch_up(&mut self, seen: usize, from: &CowChunks<T>) {
+        debug_assert!(
+            self.interleaved && from.interleaved,
+            "a checker copy catches up to the binder lineage"
+        );
+        if from.len <= seen {
+            return;
+        }
+        // The last even chunk with indexes below the lineage length.
+        let last = ((from.len - 1) >> COW_CHUNK_SHIFT) & !1;
+        if last >= self.chunks.len() {
+            let own = std::mem::take(&mut self.tail);
+            self.chunks.push(match own.len() {
+                0 => Chunk::Freed,
+                COW_CHUNK_LEN => full_chunk(own),
+                _ => Chunk::Shared(Arc::new(own)),
+            });
+            self.chunks.resize_with(last + 1, || Chunk::Freed);
+            self.len = self.tail_start();
+        }
+        let first = seen >> COW_CHUNK_SHIFT;
+        for position in (first..=last).filter(|position| position % 2 == 0) {
+            let values = from.chunk_values(position);
+            let start = position << COW_CHUNK_SHIFT;
+            if start < seen {
+                // This array holds the values before `seen` in this chunk.
+                let held = seen - start;
+                if values.len() > held {
+                    let chunk = self.padded_chunk_mut(position);
+                    chunk[held..values.len()].clone_from_slice(&values[held..]);
+                }
+                continue;
+            }
+            debug_assert!(
+                matches!(self.chunks[position], Chunk::Freed),
+                "lineage chunk {position} is new here"
+            );
+            self.chunks[position] = match from.chunks.get(position) {
+                Some(
+                    chunk @ (Chunk::Fixed(Fixed::Static(_)) | Chunk::Shared(_) | Chunk::Freed),
+                ) => chunk.clone(),
+                _ if values.is_empty() => Chunk::Freed,
+                // An owned chunk of `from`, or its tail.
+                _ => padded_chunk(values),
+            };
+        }
+    }
+
+    /// The values of chunk `position` for a write, as an owned chunk padded
+    /// with default values.
+    fn padded_chunk_mut(&mut self, position: usize) -> &mut ChunkValues<T> {
+        let chunk = &mut self.chunks[position];
+        if !matches!(chunk, Chunk::Fixed(Fixed::Owned(_))) {
+            *chunk = match std::mem::replace(chunk, Chunk::Freed) {
+                Chunk::Fixed(Fixed::Static(values)) => full_chunk(values.to_vec()),
+                Chunk::Shared(values) => padded_chunk(&values),
+                _ => padded_chunk(&[]),
+            };
+        }
+        match chunk {
+            Chunk::Fixed(Fixed::Owned(values)) => values,
+            _ => unreachable!("chunk was just padded"),
+        }
     }
 }
 
@@ -1720,9 +1932,9 @@ mod hole_tests {
     }
 
     // A file arena joins at aligned offsets as it would bind there: the
-    // offsets are `ArenaOffsets::aligned`, its ids start at a chunk start,
-    // and its tables point to its symbols. Freeing its range keeps the
-    // symbols before it.
+    // offsets are `ArenaOffsets::aligned`, its ids start at a chunk start
+    // (the next even chunk of the interleaved lineage), and its tables
+    // point to its symbols. Freeing its range keeps the symbols before it.
     #[test]
     fn file_arena_joins_at_a_chunk_start() {
         let mut arena = SymbolArena::new();
@@ -1735,7 +1947,7 @@ mod hole_tests {
         assert_eq!(arena.next_file_offsets(), offsets.aligned());
         assert_eq!(offsets.aligned().aligned(), offsets.aligned());
 
-        let mut file = SymbolArena::new();
+        let mut file = SymbolArena::new_file();
         let symbol = file.new_symbol(SymbolFlags::NONE, "f");
         let members = file.new_table();
         file.set(members, "f", symbol);
@@ -1744,7 +1956,7 @@ mod hole_tests {
         let moved = arena.append_file_arena(file, true);
         assert_eq!(moved, offsets.aligned());
         let id = moved.symbol(symbol);
-        assert_eq!(id.index(), 2 * COW_CHUNK_LEN);
+        assert_eq!(id.index(), 4 * COW_CHUNK_LEN);
         assert_eq!(arena.sym(id).name.as_str(), "f");
         assert_eq!(arena.get(arena.sym(id).members, "f"), id);
 
@@ -1753,6 +1965,181 @@ mod hole_tests {
         arena.free_range(start, arena.mark());
         assert_eq!(arena.live_chunk_count(), live - 2);
         assert_eq!(arena.sym(before).name.as_str(), "before");
+    }
+
+    /// Pushes `count` values, each its own index, and returns the indexes.
+    fn push_indexes(values: &mut CowChunks<usize>, count: usize) -> Vec<usize> {
+        (0..count)
+            .map(|_| {
+                let index = values.next_index();
+                values.push(index);
+                assert_eq!(values.len() - 1, index, "next_index");
+                index
+            })
+            .collect()
+    }
+
+    // apisym1c: an interleaved array puts its values in the even chunks, a
+    // freed chunk after each, so a read of an odd index panics. `end_chunk`
+    // and a full tail move to the next even chunk, and `dense_len` counts
+    // the even indexes.
+    #[test]
+    fn an_interleaved_array_skips_the_odd_chunks() {
+        let mut values = CowChunks::new_interleaved();
+        let pushed = push_indexes(&mut values, 600);
+        let chunk = |index: usize| index >> COW_CHUNK_SHIFT;
+        assert!(pushed.iter().all(|&index| chunk(index) % 2 == 0));
+        assert_eq!(
+            (pushed[255], pushed[256], pushed[599]),
+            (255, 2 * COW_CHUNK_LEN, 4 * COW_CHUNK_LEN + 87)
+        );
+        assert!(pushed.iter().all(|&index| *values.get(index) == index));
+        let read = |values: &CowChunks<usize>, index: usize| {
+            std::panic::catch_unwind(|| *values.get(index)).is_err()
+        };
+        assert!(read(&values, COW_CHUNK_LEN) && read(&values, 3 * COW_CHUNK_LEN + 1));
+        assert_eq!(values.dense_len(), 600);
+        values.end_chunk();
+        assert_eq!((values.len(), values.dense_len()), (6 * COW_CHUNK_LEN, 768));
+        push_indexes(&mut values, COW_CHUNK_LEN);
+        assert_eq!(values.next_index(), 8 * COW_CHUNK_LEN, "a full tail");
+        assert_eq!(values.dense_len(), 4 * COW_CHUNK_LEN);
+        values.end_chunk();
+        assert_eq!(values.len(), 8 * COW_CHUNK_LEN);
+        values.free_chunks(6 * COW_CHUNK_LEN, 8 * COW_CHUNK_LEN);
+        assert!(read(&values, 6 * COW_CHUNK_LEN) && !read(&values, pushed[599]));
+    }
+
+    // apisym1c: a checker copy of the lineage makes its own values in the
+    // odd chunks and catches up to later lineage values. It keeps what it
+    // wrote and its own values, takes the lineage chunks bound since (a
+    // partial one padded), ends its tail when the lineage passes it, and
+    // catches up again inside a chunk.
+    #[test]
+    fn a_checker_copy_catches_up_to_later_lineage_values() {
+        let mut lineage = CowChunks::new_interleaved();
+        let mut bound = push_indexes(&mut lineage, 300);
+        lineage.freeze_from(0);
+        let mut checker = lineage.for_checker();
+        let seen = lineage.len();
+        let own: Vec<usize> = (0..300)
+            .map(|n| {
+                checker.push(10_000 + n);
+                checker.len() - 1
+            })
+            .collect();
+        assert!(own.iter().all(|&index| (index >> COW_CHUNK_SHIFT) % 2 == 1));
+        assert_eq!(own[0], 3 * COW_CHUNK_LEN, "after the lineage's tail chunk");
+        assert_eq!(checker.odd_indexes().collect::<Vec<_>>(), own);
+        *checker.get_mut(5) = 1005;
+        *checker.get_mut(bound[290]) = 1290;
+
+        // A static file fills the tail chunk and two more; then a freeable
+        // version on chunks of its own, and the tail of a static file.
+        bound.extend(push_indexes(&mut lineage, 600));
+        lineage.freeze_from(0);
+        lineage.end_chunk();
+        let start = lineage.len();
+        let version = push_indexes(&mut lineage, 10);
+        lineage.end_chunk();
+        lineage.share_from(start);
+        bound.extend(push_indexes(&mut lineage, 3));
+        checker.catch_up(seen, &lineage);
+        for &index in bound.iter().chain(&version) {
+            let expected = match index {
+                5 => 1005,
+                _ if index == bound[290] => 1290,
+                _ => index,
+            };
+            assert_eq!(*checker.get(index), expected, "{index}");
+        }
+        for (n, &index) in own.iter().enumerate() {
+            assert_eq!(*checker.get(index), 10_000 + n, "own {index}");
+        }
+        // The lineage passed the own tail (chunk 5): the next own value
+        // starts after the lineage's last chunk.
+        checker.push(20_000);
+        let next = checker.len() - 1;
+        assert_eq!(
+            next >> COW_CHUNK_SHIFT,
+            (lineage.len() >> COW_CHUNK_SHIFT) + 1
+        );
+        let mut all_own = own.clone();
+        all_own.push(next);
+        assert_eq!(checker.odd_indexes().collect::<Vec<_>>(), all_own);
+
+        // More values in the lineage's tail chunk: a catch-up inside it.
+        let seen = lineage.len();
+        let more = push_indexes(&mut lineage, 5);
+        checker.catch_up(seen, &lineage);
+        assert!(more.iter().all(|&index| *checker.get(index) == index));
+        assert_eq!(*checker.get(next), 20_000);
+
+        // The version dies: its chunks go, the own chunks stay.
+        checker.free_chunks(start, start + 2 * COW_CHUNK_LEN);
+        let read = |index: usize| std::panic::catch_unwind(|| *checker.get(index)).is_err();
+        assert!(read(version[0]));
+        assert_eq!(*checker.get(own[299]), 10_299);
+    }
+
+    // apisym1c: a checker arena makes its own symbols and tables in the odd
+    // chunks. It catches up to the lineage: it reads a later binder symbol,
+    // its table and its members by the lineage ids, keeps its own symbols,
+    // and frees the ranges that the lineage freed.
+    #[test]
+    fn a_checker_arena_catches_up_to_the_lineage() {
+        let mut lineage = SymbolArena::new();
+        let early = lineage.new_symbol(SymbolFlags::NONE, "early");
+        let mut checker = lineage.for_checker();
+        let own = checker.new_symbol(SymbolFlags::TRANSIENT, "own");
+        let own_table = checker.new_table();
+        checker.set(own_table, "early", early);
+        assert!(is_own_index(own.0) && is_own_index(own_table.0));
+        assert_eq!(checker.symbol_count(), 2);
+        assert_eq!(checker.own_symbols().collect::<Vec<_>>(), [own]);
+
+        // A freeable version binds after the copy, then dies.
+        lineage.end_chunk();
+        let start = lineage.mark();
+        let later = lineage.new_symbol(SymbolFlags::NONE, "later");
+        let members = lineage.new_table();
+        lineage.set(members, "m", later);
+        lineage.sym_mut(later).members = members;
+        lineage.end_chunk();
+        lineage.share_since(start);
+        let end = lineage.mark();
+        lineage.set_lineage_seen(LineageSeen {
+            generation: 1,
+            freed: 0,
+        });
+        checker.catch_up(&lineage, &[]);
+        assert_eq!(checker.sym(later).name.as_str(), "later");
+        assert_eq!(checker.get(checker.sym(later).members, "m"), later);
+        assert_eq!(checker.sym(own).name.as_str(), "own");
+        assert_eq!(checker.get(own_table, "early"), early);
+        assert_eq!(
+            checker.id_slot(later),
+            IdSlot {
+                key: 0,
+                place: later.0
+            }
+        );
+        assert_eq!(checker.symbol_at_slot(checker.id_slot(own)), Some(own));
+        assert_eq!(checker.own_symbols().collect::<Vec<_>>(), [own]);
+        let live = checker.live_chunk_count();
+
+        lineage.free_range(start, end);
+        let freed = [(start, end)];
+        lineage.set_lineage_seen(LineageSeen {
+            generation: 2,
+            freed: 1,
+        });
+        checker.catch_up(&lineage, &freed);
+        assert_eq!(checker.lineage_seen().freed, 1);
+        assert_eq!(checker.live_chunk_count(), live - 2);
+        assert!(std::panic::catch_unwind(|| checker.sym(later).flags).is_err());
+        assert_eq!(checker.sym(early).name.as_str(), "early");
+        assert_eq!(checker.sym(own).name.as_str(), "own");
     }
 }
 
@@ -2078,6 +2465,15 @@ impl Table {
 /// shared (`share_since`). The binder lineage (`program.rs`) binds a
 /// freeable version into whole chunks of its own (`end_chunk`) and frees
 /// them when the version dies (`free_range`, lsshells M3d).
+///
+/// apisym1c: the binder lineage and its copies are interleaved
+/// (`CowChunks::new_interleaved`): lineage symbols and tables are in the
+/// even chunks, and a checker arena makes its own in the odd chunks
+/// (`is_own_index`). So a lineage index names one lineage symbol or table
+/// in every arena, as a Go `*ast.Symbol` is one object for every checker,
+/// and a checker can add the lineage chunks bound after its copy
+/// (`catch_up`). A file arena (`new_file`) is not interleaved: its ids move
+/// to lineage ids when it joins (`ArenaOffsets`).
 #[derive(Clone, Debug)]
 pub struct SymbolArena {
     symbols: CowChunks<Symbol>,
@@ -2088,23 +2484,49 @@ pub struct SymbolArena {
     private_names: Vec<u32>,
     /// Where `crate::ast::get_symbol_id` keeps the ids of these symbols.
     ids: SymbolIds,
+    /// The state of the binder lineage that this arena copies
+    /// (`program::catch_up_checker`).
+    seen: LineageSeen,
+}
+
+/// A state of the binder lineage (`program.rs`): its generation, which each
+/// bind and free makes new, and the number of ranges that it has freed. A
+/// copy of the lineage keeps the state that it copies, so a checker knows
+/// when it must catch up (`SymbolArena::catch_up`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LineageSeen {
+    pub generation: u64,
+    pub freed: usize,
+}
+
+/// Whether symbol or table index `index` of a checker arena is one that the
+/// checker made (an odd chunk, see `SymbolArena`), not a lineage index.
+#[inline(always)]
+#[must_use]
+pub const fn is_own_index(index: u32) -> bool {
+    index as usize & COW_CHUNK_LEN != 0
 }
 
 /// Where `crate::ast::get_symbol_id` keeps the ids of the symbols of one
 /// arena. Every binder arena of the process (the binder lineage in
 /// `program.rs` and its copies) gives a symbol one id, like Go, where a
 /// bound file keeps its symbols in every program. A checker arena
-/// (`SymbolArena::for_checker`) adds its own symbols after the binder
-/// symbols, at indexes where other checkers and later binds put other
-/// symbols, so those symbols have ids of their own, kept by `key`.
+/// (`SymbolArena::for_checker`) makes its own symbols (`is_own_index`),
+/// which other checkers do not have, so those symbols have ids of their
+/// own, kept by `key`.
 #[derive(Debug)]
 struct SymbolIds {
-    /// Symbols below this index have the shared id of their index.
-    shared: u32,
-    /// Tables below this index are binder lineage tables, which every
-    /// checker copy of the lineage made after them has too.
-    shared_tables: u32,
-    /// Keys the ids of the other symbols. 0 when every symbol is shared.
+    /// `COW_CHUNK_LEN`, the index bit of an own symbol, in a checker arena;
+    /// 0 in a binder arena, whose symbols all have shared ids.
+    own_bit: u32,
+    /// The first own chunk of a checker arena, as a chunk pair (chunk
+    /// `2 * own_base + 1`): own symbol places count from it (`own_place`).
+    own_base: u32,
+    /// The lineage symbol and table lengths that a checker arena copies
+    /// (`catch_up` moves them); `u32::MAX` in a binder arena.
+    lineage_symbols: u32,
+    lineage_tables: u32,
+    /// Keys the ids of the own symbols. 0 in a binder arena.
     key: u32,
     /// The shadows in this arena (`SymbolArena::push_shadow`), if any.
     shadows: Option<Box<Shadows>>,
@@ -2123,21 +2545,41 @@ struct Shadows {
 impl SymbolIds {
     /// Every symbol has the shared id of its index.
     const SHARED: SymbolIds = SymbolIds {
-        shared: u32::MAX,
-        shared_tables: u32::MAX,
+        own_bit: 0,
+        own_base: 0,
+        lineage_symbols: u32::MAX,
+        lineage_tables: u32::MAX,
         key: 0,
         shadows: None,
     };
 
-    /// Symbols from index `shared` on have ids of their own.
-    fn own_from(shared: usize, shared_tables: usize) -> SymbolIds {
+    /// The own symbols (from chunk pair `own_base` on) have ids of their
+    /// own, under a new key.
+    fn own(own_base: u32, lineage_symbols: usize, lineage_tables: usize) -> SymbolIds {
         static NEXT_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
         SymbolIds {
-            shared: u32::try_from(shared).expect("symbol overflow"),
-            shared_tables: u32::try_from(shared_tables).expect("table overflow"),
+            own_bit: COW_CHUNK_LEN as u32,
+            own_base,
+            lineage_symbols: u32::try_from(lineage_symbols).expect("symbol overflow"),
+            lineage_tables: u32::try_from(lineage_tables).expect("table overflow"),
             key: NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             shadows: None,
         }
+    }
+
+    /// The place of own symbol index `index` among the own symbols: its
+    /// index without the lineage chunks, from `own_base` on.
+    #[inline]
+    fn own_place(&self, index: u32) -> u32 {
+        (((index >> (COW_CHUNK_SHIFT + 1)) - self.own_base) << COW_CHUNK_SHIFT)
+            | (index & COW_CHUNK_MASK as u32)
+    }
+
+    /// The own symbol index of place `place` (`own_place`).
+    fn own_index(&self, place: u32) -> u32 {
+        (((place >> COW_CHUNK_SHIFT) + self.own_base) << (COW_CHUNK_SHIFT + 1))
+            | self.own_bit
+            | (place & COW_CHUNK_MASK as u32)
     }
 }
 
@@ -2148,7 +2590,11 @@ impl Clone for SymbolIds {
         if self.key == 0 {
             SymbolIds::SHARED
         } else {
-            SymbolIds::own_from(self.shared as usize, self.shared_tables as usize)
+            SymbolIds::own(
+                self.own_base,
+                self.lineage_symbols as usize,
+                self.lineage_tables as usize,
+            )
         }
     }
 }
@@ -2183,36 +2629,107 @@ impl Default for SymbolArena {
 }
 
 impl SymbolArena {
+    /// A binder lineage arena: interleaved (see `SymbolArena`).
     #[must_use]
     pub fn new() -> Self {
-        let mut symbols = CowChunks::new();
+        Self::with_arrays(CowChunks::new_interleaved(), CowChunks::new_interleaved())
+    }
+
+    /// A file arena: one file binds into it on its own, and it joins a
+    /// lineage arena (`append_file_arena`, `prepare_file_arena`). It is not
+    /// interleaved, so its ids are dense, as the lib bind snapshot keeps
+    /// them.
+    #[must_use]
+    pub fn new_file() -> Self {
+        Self::with_arrays(CowChunks::new(), CowChunks::new())
+    }
+
+    fn with_arrays(mut symbols: CowChunks<Symbol>, mut tables: CowChunks<Table>) -> Self {
         symbols.push(Symbol::default());
-        let mut tables = CowChunks::new();
         tables.push(Table::default());
         Self {
             symbols,
             tables,
             private_names: Vec::new(),
             ids: SymbolIds::SHARED,
+            seen: LineageSeen::default(),
         }
     }
 
+    /// Whether this is a lineage arena or a copy of one (`new`), not a
+    /// file arena (`new_file`).
+    #[must_use]
+    pub fn is_interleaved(&self) -> bool {
+        self.symbols.interleaved
+    }
+
     /// A copy of this binder arena for a checker (Go `NewChecker` reads the
-    /// bound program). The symbols that the checker adds have ids of their
-    /// own (`crate::ast::get_symbol_id`), so checkers of any program can
-    /// share a thread.
+    /// bound program). The symbols and tables that the checker adds go to
+    /// the odd chunks (`is_own_index`) and have ids of their own
+    /// (`crate::ast::get_symbol_id`), so checkers of any program can share
+    /// a thread.
     #[must_use]
     pub fn for_checker(&self) -> SymbolArena {
         debug_assert!(
-            self.ids.key == 0,
-            "a checker arena is made from a binder arena"
+            self.ids.key == 0 && self.is_interleaved(),
+            "a checker arena is made from a binder lineage arena"
         );
+        let symbols = self.symbols.for_checker();
+        let own_base = u32::try_from(symbols.chunks.len() >> 1).expect("symbol overflow");
         SymbolArena {
-            symbols: self.symbols.clone(),
-            tables: self.tables.clone(),
+            symbols,
+            tables: self.tables.for_checker(),
             private_names: self.private_names.clone(),
-            ids: SymbolIds::own_from(self.symbols.len(), self.tables.len()),
+            ids: SymbolIds::own(own_base, self.symbols.len(), self.tables.len()),
+            seen: self.seen,
         }
+    }
+
+    /// The state of the binder lineage that this arena copies (or is, for
+    /// the lineage itself).
+    #[must_use]
+    pub fn lineage_seen(&self) -> LineageSeen {
+        self.seen
+    }
+
+    /// Notes that this binder arena (the lineage) is now in state `seen`, so
+    /// the copies made from now on keep it.
+    pub fn set_lineage_seen(&mut self, seen: LineageSeen) {
+        debug_assert!(self.ids.key == 0, "the lineage is a binder arena");
+        self.seen = seen;
+    }
+
+    /// Brings the lineage copy of this checker arena up to `lineage`, the
+    /// binder lineage now, which has freed the ranges `freed`
+    /// (`free_range`), in order. It adds the chunks that the lineage bound
+    /// after the copy (`CowChunks::catch_up`) and frees the ranges freed
+    /// after it, so a symbol of any live file version is the same index
+    /// here as in the lineage. The values that this arena holds stay as
+    /// they are, so its own writes to lineage symbols stay, and its own
+    /// symbols and tables keep their indexes.
+    // PORT: Go has one object per symbol, so a checker reads any bound file
+    // with no step like this. The frees are the lineage's (lsshells M3d):
+    // a request reaches a file version only while a snapshot holds it.
+    pub fn catch_up(&mut self, lineage: &SymbolArena, freed: &[(ArenaMark, ArenaMark)]) {
+        debug_assert!(
+            self.ids.key != 0 && lineage.ids.key == 0,
+            "a checker arena catches up to the binder lineage"
+        );
+        debug_assert_eq!(
+            lineage.seen.freed,
+            freed.len(),
+            "the lineage's freed ranges"
+        );
+        self.symbols
+            .catch_up(self.ids.lineage_symbols as usize, &lineage.symbols);
+        self.tables
+            .catch_up(self.ids.lineage_tables as usize, &lineage.tables);
+        self.ids.lineage_symbols = u32::try_from(lineage.symbols.len()).expect("symbol overflow");
+        self.ids.lineage_tables = u32::try_from(lineage.tables.len()).expect("table overflow");
+        for &(start, end) in &freed[self.seen.freed..] {
+            self.free_range(start, end);
+        }
+        self.seen = lineage.seen;
     }
 
     /// Where `crate::ast::get_symbol_id` keeps the id of `symbol`: the
@@ -2222,8 +2739,7 @@ impl SymbolArena {
     #[inline]
     #[must_use]
     pub fn id_slot(&self, symbol: SymbolId) -> IdSlot {
-        let shared = self.ids.shared;
-        if symbol.0 < shared {
+        if symbol.0 & self.ids.own_bit == 0 {
             return IdSlot {
                 key: 0,
                 place: symbol.0,
@@ -2236,7 +2752,7 @@ impl SymbolArena {
         }
         IdSlot {
             key: self.ids.key,
-            place: symbol.0 - shared,
+            place: self.ids.own_place(symbol.0),
         }
     }
 
@@ -2252,11 +2768,11 @@ impl SymbolArena {
     /// symbol itself, or its shadow. None when this arena has neither.
     #[must_use]
     pub fn symbol_at_slot(&self, slot: IdSlot) -> Option<SymbolId> {
-        if slot.key == 0 && slot.place < self.ids.shared {
+        if slot.key == 0 && slot.place < self.ids.lineage_symbols {
             return Some(SymbolId(slot.place));
         }
         if slot.key != 0 && slot.key == self.ids.key {
-            return Some(SymbolId(self.ids.shared + slot.place));
+            return Some(SymbolId(self.ids.own_index(slot.place)));
         }
         let shadows = self.ids.shadows.as_ref()?;
         shadows.by_origin.get(&slot).copied()
@@ -2282,38 +2798,52 @@ impl SymbolArena {
         shadow
     }
 
-    /// The number of binder lineage tables in this checker arena: a table
-    /// below this index is the same table in every checker arena whose
-    /// count is above it.
-    #[must_use]
-    pub fn shared_table_count(&self) -> usize {
-        self.ids.shared_tables as usize
-    }
-
-    /// The number of symbols, with the nil symbol at index 0.
+    /// The index after the last lineage symbol, with the nil symbol at
+    /// index 0: in a binder arena the next symbol's index, in a checker
+    /// arena that of the lineage copy.
     #[must_use]
     pub fn symbol_count(&self) -> usize {
-        self.symbols.len()
+        if self.ids.key == 0 {
+            self.symbols.next_index()
+        } else {
+            self.ids.lineage_symbols as usize
+        }
+    }
+
+    /// The symbols that this checker arena made (`is_own_index`), in
+    /// order. None in a binder arena.
+    pub fn own_symbols(&self) -> impl Iterator<Item = SymbolId> + '_ {
+        let own = self.ids.key != 0;
+        self.symbols
+            .odd_indexes()
+            .filter(move |_| own)
+            .map(|index| SymbolId(u32::try_from(index).expect("symbol overflow")))
     }
 
     // The dump and load API of the lib bind snapshot
     // (`binder/lib_snapshot.rs`). A dump reads symbols `1..symbol_count()`
     // (`sym`), tables `1..table_count()` (`iter_names`) and
     // `private_names`. A load pushes them in the same order into a new
-    // arena (`is_new`): `push_symbol`, `push_table_from_entries` and
-    // `note_private_name`. Ids are indexes, so they equal the dumped ones.
+    // file arena (`new_file`, `is_new`): `push_symbol`,
+    // `push_table_from_entries` and `note_private_name`. Ids are indexes, so
+    // they equal the dumped ones.
 
-    /// True for an arena as `SymbolArena::new` makes it: only the nil
-    /// symbol and table, and no private names.
+    /// True for an arena as `SymbolArena::new` or `new_file` makes it: only
+    /// the nil symbol and table, and no private names.
     #[must_use]
     pub fn is_new(&self) -> bool {
         self.symbols.len() == 1 && self.tables.len() == 1 && self.private_names.is_empty()
     }
 
-    /// The number of tables, with the nil table at index 0.
+    /// The index after the last lineage table, with the nil table at index
+    /// 0, as `symbol_count`.
     #[must_use]
     pub fn table_count(&self) -> usize {
-        self.tables.len()
+        if self.ids.key == 0 {
+            self.tables.next_index()
+        } else {
+            self.ids.lineage_tables as usize
+        }
     }
 
     /// The names given to `note_private_name`, in order.
@@ -2364,8 +2894,8 @@ impl SymbolArena {
     #[must_use]
     pub fn mark(&self) -> ArenaMark {
         ArenaMark {
-            symbols: self.symbols.len(),
-            tables: self.tables.len(),
+            symbols: self.symbols.next_index(),
+            tables: self.tables.next_index(),
         }
     }
 
@@ -2428,17 +2958,17 @@ impl SymbolArena {
     /// `new_symbol` plus `sym_mut` writes when every field is known.
     // PERF: inlined with `CowChunks::push`, so the symbol is built in its
     // chunk slot.
+    // apisym1c: the id is read after the push, which can move the tail to
+    // the next chunk of its parity (`CowChunks::seal_full_tail`).
     #[inline]
     pub fn push_symbol(&mut self, symbol: Symbol) -> SymbolId {
-        let id = SymbolId(u32::try_from(self.symbols.len()).expect("symbol overflow"));
         self.symbols.push(symbol);
-        id
+        SymbolId(u32::try_from(self.symbols.len() - 1).expect("symbol overflow"))
     }
 
     fn push_table(&mut self, table: Table) -> SymbolTable {
-        let id = SymbolTable(u32::try_from(self.tables.len()).expect("table overflow"));
         self.tables.push(table);
-        id
+        SymbolTable(u32::try_from(self.tables.len() - 1).expect("table overflow"))
     }
 
     /// Makes room for `symbols` more symbols and `tables` more tables, so
@@ -2516,12 +3046,16 @@ impl SymbolArena {
 
     /// The id offsets that a file arena appended now gets
     /// (`append_file_arena`): every id moves by the number of entries already
-    /// here.
+    /// here, counted without the odd chunks (`CowChunks::dense_len`).
     #[must_use]
     pub fn next_file_offsets(&self) -> ArenaOffsets {
+        debug_assert!(
+            self.ids.key == 0 && self.is_interleaved(),
+            "a file arena joins a binder lineage arena"
+        );
         ArenaOffsets {
-            symbols: u32::try_from(self.symbols.len() - 1).expect("symbol overflow"),
-            tables: u32::try_from(self.tables.len() - 1).expect("table overflow"),
+            symbols: u32::try_from(self.symbols.dense_len() - 1).expect("symbol overflow"),
+            tables: u32::try_from(self.tables.dense_len() - 1).expect("table overflow"),
         }
     }
 
@@ -2558,10 +3092,12 @@ impl SymbolArena {
             tables,
             private_names,
             ids: _,
+            seen: _,
         } = self;
         // The file symbols whose names hold a symbol id.
+        // apisym1c: ids move with offset 0 too, from the second chunk on.
         let mut private_symbols = FxHashSet::default();
-        if offsets.symbols != 0 && !private_names.is_empty() {
+        if !private_names.is_empty() {
             let private_names: FxHashSet<u32> = private_names.into_iter().collect();
             for i in 1..symbols.len() {
                 let symbol = symbols.get(i);
@@ -2833,10 +3369,21 @@ pub struct PreparedFileArena {
 }
 
 /// How the ids of a file arena moved in `SymbolArena::append_file_arena`.
+/// An offset counts the lineage entries before the file, without the nil
+/// entry and the odd chunks (`CowChunks::dense_len`), so a file arena id
+/// plus its offset is a dense lineage place (`lineage_index`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArenaOffsets {
     symbols: u32,
     tables: u32,
+}
+
+/// The lineage index of dense lineage place `place`: chunk `n` of the
+/// places is the even chunk `2 * n` of the interleaved lineage
+/// (`SymbolArena`).
+#[inline]
+const fn lineage_index(place: u32) -> u32 {
+    place + (place & !(COW_CHUNK_MASK as u32))
 }
 
 impl ArenaOffsets {
@@ -2846,7 +3393,8 @@ impl ArenaOffsets {
     /// it, these offsets (lsshells M3d).
     #[must_use]
     pub fn aligned(self) -> ArenaOffsets {
-        // An offset is the index of the next entry minus 1 (the nil entry).
+        // An offset is the dense place of the next entry minus 1 (the nil
+        // entry). A dense chunk start is an even lineage chunk start.
         let align = |offset: u32| {
             let next = (offset as usize + 1).next_multiple_of(COW_CHUNK_LEN);
             u32::try_from(next - 1).expect("arena overflow")
@@ -2881,7 +3429,7 @@ impl ArenaOffsets {
         if symbol.is_nil() {
             symbol
         } else {
-            SymbolId(symbol.0 + self.symbols)
+            SymbolId(lineage_index(symbol.0 + self.symbols))
         }
     }
 
@@ -2891,7 +3439,7 @@ impl ArenaOffsets {
         if table.is_nil() {
             table
         } else {
-            SymbolTable(table.0 + self.tables)
+            SymbolTable(lineage_index(table.0 + self.tables))
         }
     }
 

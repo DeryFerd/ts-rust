@@ -640,14 +640,14 @@ pub fn new_checker_for_version(version: &'static GoProgram) -> Checker {
 /// (`project::checkerpool` `get_persistent_checker`). Its symbol arena
 /// copies the binder lineage as it is when the checker is made
 /// (`program::lineage_for_checker`), not the program's older copy
-/// (`program::bound_symbols`).
+/// (`program::bound_symbols`), which can still hold the chunks of versions
+/// that died after the program bound.
 // PORT: Go's API hands a symbol of any project to this checker
 // (api/session.go:2439 handleGetTypeOfSymbol), and a Go checker reads
-// `node.Symbol()` of every bound file. A port checker reads only the
-// lineage ids of its copy, so this checker can read the file versions that
-// other programs bound after its program did. Lineage ids are global, so
-// its reads of its own files do not change. It keeps the lineage chunks of
-// its copy until it drops.
+// `node.Symbol()` of every bound file. A port checker reads the lineage ids
+// of its copy, and `api::checker_symbol` catches it up to the lineage
+// (`program::catch_up_checker`) before a symbol of another checker enters
+// it. Lineage ids are global, so its reads of its own files do not change.
 pub fn new_api_checker(p: &NewProgram) -> Checker {
     let _program = enter_version(program_version(p));
     crate::program::bind_all();

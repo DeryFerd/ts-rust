@@ -704,6 +704,16 @@ pub fn new_external_diagnostic(
 /// (tsgo#4901), so a replaced SourceFile of the same path shares its list.
 /// Here the key is the file name: one program has one file name per path, so
 /// the lists are the same.
+/// PORT (diagfix1): Go's stored `*Diagnostic` keeps its `*SourceFile` alive,
+/// so `Add` and the sorts can read the file name of a stored diagnostic at
+/// any time. Here a freeable file version can die while a diagnostic of it
+/// is stored (an API checker reads a symbol of a version that another
+/// snapshot holds, and that snapshot is released), and a read of its name
+/// then panics. So `add` keeps the name of each file that the stored
+/// diagnostic and its related information point at (`file_names`), and
+/// the compares of stored diagnostics read the name there
+/// (`stored_diagnostic_path`). A related information that a caller adds
+/// to the stored diagnostic after `add` has its name read from its file.
 #[derive(Clone, Debug, Default)]
 pub struct DiagnosticsCollection {
     pub count: i32,
@@ -715,6 +725,10 @@ pub struct DiagnosticsCollection {
     // #4825: the stored diagnostics by location, for the `add` dedup.
     diagnostic_index: FxHashMap<DiagnosticLocationKey, usize>,
     diagnostic_collisions: FxHashMap<DiagnosticLocationKey, Vec<usize>>,
+    // diagfix1: the file name of each source file node that a stored
+    // diagnostic or its related information points at. Empty in a process
+    // that frees no file version (`any_freeable_published`).
+    file_names: FxHashMap<Node, &'static str>,
 }
 
 impl DiagnosticsCollection {
@@ -739,12 +753,16 @@ impl DiagnosticsCollection {
         self.count += 1;
 
         if diagnostic.file().is_some() {
-            let path = source_file_file_name(diagnostic.file());
+            // The key path is the file name (`get_diagnostic_path`).
+            let path = key.path;
             self.file_diagnostics.entry(path).or_default().push(id);
             self.file_diagnostics_sorted.remove(path);
         } else {
             self.non_file_diagnostics.push(id);
             self.non_file_diagnostics_sorted = false;
+        }
+        if super::file_version::any_freeable_published() {
+            note_file_names(&mut self.file_names, &diagnostic);
         }
         self.diagnostics.push(diagnostic);
         &mut self.diagnostics[id]
@@ -754,30 +772,40 @@ impl DiagnosticsCollection {
     // PORT: split out so `add` can return the stored entry after the search
     // borrows end.
     fn find_equal(&self, key: DiagnosticLocationKey, diagnostic: &Diagnostic) -> Option<usize> {
+        let path = |d: &Diagnostic| stored_diagnostic_path(&self.file_names, d);
         let existing = *self.diagnostic_index.get(&key)?;
-        if equal_diagnostics(&self.diagnostics[existing], diagnostic) {
+        if equal_diagnostics_by(&self.diagnostics[existing], diagnostic, &path) {
             return Some(existing);
         }
         self.diagnostic_collisions
             .get(&key)?
             .iter()
             .copied()
-            .find(|&collision| equal_diagnostics(&self.diagnostics[collision], diagnostic))
+            .find(|&collision| {
+                equal_diagnostics_by(&self.diagnostics[collision], diagnostic, &path)
+            })
     }
 
     // Go: ast/diagnostic.go:330 Lookup
     // PORT: returns the stored diagnostic (Go returns the pointer).
+    // `diagnostic` can be a copy of a stored one, so its path is read as a
+    // stored one's.
     pub fn lookup(&mut self, diagnostic: &Diagnostic) -> Option<&mut Diagnostic> {
         let diagnostics = if diagnostic.file().is_some() {
-            self.get_diagnostics_for_file_locked(source_file_file_name(diagnostic.file()))
+            self.get_diagnostics_for_file_locked(stored_diagnostic_path(
+                &self.file_names,
+                diagnostic,
+            ))
         } else {
             self.get_global_diagnostics_locked()
         };
+        let path = |d: &Diagnostic| stored_diagnostic_path(&self.file_names, d);
         // Go slices.BinarySearchFunc: the first index where cmp >= 0.
-        let i = diagnostics
-            .partition_point(|&d| compare_diagnostics(&self.diagnostics[d], diagnostic) < 0);
+        let i = diagnostics.partition_point(|&d| {
+            compare_diagnostics_by(&self.diagnostics[d], diagnostic, &path) < 0
+        });
         if i < diagnostics.len()
-            && compare_diagnostics(&self.diagnostics[diagnostics[i]], diagnostic) == 0
+            && compare_diagnostics_by(&self.diagnostics[diagnostics[i]], diagnostic, &path) == 0
         {
             return Some(&mut self.diagnostics[diagnostics[i]]);
         }
@@ -795,7 +823,11 @@ impl DiagnosticsCollection {
     fn get_global_diagnostics_locked(&mut self) -> Vec<usize> {
         if !self.non_file_diagnostics_sorted {
             // Go: ast/diagnostic.go:331 slices.SortStableFunc(c.nonFileDiagnostics, CompareDiagnostics)
-            sort_diagnostic_ids(&mut self.non_file_diagnostics, &self.diagnostics);
+            sort_diagnostic_ids(
+                &mut self.non_file_diagnostics,
+                &self.diagnostics,
+                &self.file_names,
+            );
             self.non_file_diagnostics_sorted = true;
         }
         self.non_file_diagnostics.clone()
@@ -827,7 +859,7 @@ impl DiagnosticsCollection {
         if !self.file_diagnostics_sorted.contains(path) {
             if let Some(ids) = self.file_diagnostics.get_mut(path) {
                 // Go: ast/diagnostic.go:347 slices.SortStableFunc(c.fileDiagnostics[path], CompareDiagnostics)
-                sort_diagnostic_ids(ids, &self.diagnostics);
+                sort_diagnostic_ids(ids, &self.diagnostics, &self.file_names);
             }
             self.file_diagnostics_sorted.insert(path);
         }
@@ -844,17 +876,59 @@ impl DiagnosticsCollection {
             diagnostics.extend(ids.iter().map(|&id| self.diagnostics[id].clone()));
         }
         // Go: ast/diagnostic.go:362 slices.SortFunc(diagnostics, CompareDiagnostics)
-        crate::gostd::slices::sort_func(&mut diagnostics, compare_diagnostics);
+        let path = |d: &Diagnostic| stored_diagnostic_path(&self.file_names, d);
+        crate::gostd::slices::sort_func(&mut diagnostics, |a, b| {
+            compare_diagnostics_by(a, b, &path)
+        });
         diagnostics
     }
 }
 
 // Go `slices.SortStableFunc(list, CompareDiagnostics)` on a list of
-// positions in `diagnostics`.
-fn sort_diagnostic_ids(ids: &mut [usize], diagnostics: &[Diagnostic]) {
+// positions in `diagnostics`, with the paths of `file_names`
+// (`stored_diagnostic_path`).
+fn sort_diagnostic_ids(
+    ids: &mut [usize],
+    diagnostics: &[Diagnostic],
+    file_names: &FxHashMap<Node, &'static str>,
+) {
+    let path = |d: &Diagnostic| stored_diagnostic_path(file_names, d);
     crate::gostd::slices::sort_stable_func(ids, |&a, &b| {
-        compare_diagnostics(&diagnostics[a], &diagnostics[b])
+        compare_diagnostics_by(&diagnostics[a], &diagnostics[b], &path)
     });
+}
+
+/// diagfix1: adds the file names of `diagnostic` and of its related
+/// information (the files whose names `equal_diagnostics` and
+/// `compare_diagnostics` read) to `file_names`. Called when `diagnostic` is
+/// stored, while its files are alive. A factory-made source file is left
+/// out: its name is read from it, as before.
+fn note_file_names(file_names: &mut FxHashMap<Node, &'static str>, diagnostic: &Diagnostic) {
+    let file = diagnostic.file();
+    if file.is_some() && !super::is_synthetic_node(file) {
+        file_names
+            .entry(file)
+            .or_insert_with(|| source_file_file_name(file));
+    }
+    for related in diagnostic.related_information() {
+        note_file_names(file_names, related);
+    }
+}
+
+/// Go `getDiagnosticPath` of a stored diagnostic, or of a copy of one:
+/// the name that `add` kept for its file (`note_file_names`), so it does
+/// not read a file version that died after `add`. Else the name of the
+/// file.
+fn stored_diagnostic_path(
+    file_names: &FxHashMap<Node, &'static str>,
+    d: &Diagnostic,
+) -> &'static str {
+    if !file_names.is_empty()
+        && let Some(&name) = file_names.get(&d.file())
+    {
+        return name;
+    }
+    get_diagnostic_path(d)
 }
 
 // Go: ast/diagnostic.go:312 diagnosticLocationKey (#4825)
@@ -892,25 +966,45 @@ fn get_diagnostic_path(d: &Diagnostic) -> &'static str {
 // Go: ast/diagnostic.go:397 EqualDiagnostics
 #[must_use]
 pub fn equal_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> bool {
+    equal_diagnostics_by(d1, d2, &get_diagnostic_path)
+}
+
+/// `equal_diagnostics` with Go `getDiagnosticPath` read by `path`
+/// (`stored_diagnostic_path` in `DiagnosticsCollection`).
+fn equal_diagnostics_by<P: Fn(&Diagnostic) -> &'static str>(
+    d1: &Diagnostic,
+    d2: &Diagnostic,
+    path: &P,
+) -> bool {
     if std::ptr::eq(d1, d2) {
         return true;
     }
-    equal_diagnostics_no_related_info(d1, d2)
+    equal_diagnostics_no_related_info_by(d1, d2, path)
         && d1.related_information().len() == d2.related_information().len()
         && d1
             .related_information()
             .iter()
             .zip(d2.related_information())
-            .all(|(a, b)| equal_diagnostics(a, b))
+            .all(|(a, b)| equal_diagnostics_by(a, b, path))
 }
 
 // Go: ast/diagnostic.go:405 EqualDiagnosticsNoRelatedInfo
 #[must_use]
 pub fn equal_diagnostics_no_related_info(d1: &Diagnostic, d2: &Diagnostic) -> bool {
+    equal_diagnostics_no_related_info_by(d1, d2, &get_diagnostic_path)
+}
+
+/// `equal_diagnostics_no_related_info` with Go `getDiagnosticPath` read by
+/// `path`.
+fn equal_diagnostics_no_related_info_by<P: Fn(&Diagnostic) -> &'static str>(
+    d1: &Diagnostic,
+    d2: &Diagnostic,
+    path: &P,
+) -> bool {
     if std::ptr::eq(d1, d2) {
         return true;
     }
-    get_diagnostic_path(d1) == get_diagnostic_path(d2)
+    path(d1) == path(d2)
         && d1.pos() == d2.pos()
         && d1.end() == d2.end()
         && d1.code() == d2.code()
@@ -1005,13 +1099,18 @@ fn compare_message_chain_content(c1: &[Diagnostic], c2: &[Diagnostic]) -> i32 {
 }
 
 // Go: ast/diagnostic.go:468 compareRelatedInfo
-fn compare_related_info(r1: &[Diagnostic], r2: &[Diagnostic]) -> i32 {
+// PORT: Go `getDiagnosticPath` is read by `path` (`compare_diagnostics_by`).
+fn compare_related_info<P: Fn(&Diagnostic) -> &'static str>(
+    r1: &[Diagnostic],
+    r2: &[Diagnostic],
+    path: &P,
+) -> i32 {
     let mut c = r2.len() as i32 - r1.len() as i32;
     if c != 0 {
         return c;
     }
     for i in 0..r1.len() {
-        c = compare_diagnostics(&r1[i], &r2[i]);
+        c = compare_diagnostics_by(&r1[i], &r2[i], path);
         if c != 0 {
             return c;
         }
@@ -1022,15 +1121,22 @@ fn compare_related_info(r1: &[Diagnostic], r2: &[Diagnostic]) -> i32 {
 // Go: ast/diagnostic.go:482 CompareDiagnostics
 #[must_use]
 pub fn compare_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
+    compare_diagnostics_by(d1, d2, &get_diagnostic_path)
+}
+
+/// `compare_diagnostics` with Go `getDiagnosticPath` read by `path`
+/// (`stored_diagnostic_path` in `DiagnosticsCollection`).
+fn compare_diagnostics_by<P: Fn(&Diagnostic) -> &'static str>(
+    d1: &Diagnostic,
+    d2: &Diagnostic,
+    path: &P,
+) -> i32 {
     if std::ptr::eq(d1, d2) {
         return 0;
     }
     // PORT: Go compares the bytes of the strings, which are port forms here
     // (see `scanner_util::compare_go_bytes`).
-    let mut c = ordering_to_int(compare_go_bytes(
-        get_diagnostic_path(d1),
-        get_diagnostic_path(d2),
-    ));
+    let mut c = ordering_to_int(compare_go_bytes(path(d1), path(d2)));
     if c != 0 {
         return c;
     }
@@ -1084,7 +1190,7 @@ pub fn compare_diagnostics(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
     if c != 0 {
         return c;
     }
-    compare_related_info(d1.related_information(), d2.related_information())
+    compare_related_info(d1.related_information(), d2.related_information(), path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,7 +1468,11 @@ pub fn get_type_node_precedence(n: Node) -> TypePrecedence {
         // These occur in pseudo-types like `f<T>.C`, where `f` is a generic function and `C` is a local type
         | SyntaxKind::PropertyAccessExpression
         | SyntaxKind::ExpressionWithTypeArguments => TypePrecedence::NON_ARRAY,
-        kind => panic!("unhandled TypeNode: {kind:?}"),
+        // Go `%v` of a Kind is `Kind.String()`.
+        kind => panic!(
+            "unhandled TypeNode: {}",
+            crate::gostd::debug::kind_string(kind)
+        ),
     }
 }
 
@@ -1651,3 +1761,25 @@ impl PositionMap {
 // PORT: Go `ast.NodeId` and `ast.SymbolId` are plain `uint64` ids. The port
 // uses the `core::Node` and `core::SymbolId` handles instead, so there is
 // nothing to define here.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::AssertUnwindSafe;
+
+    // Go prints `%v` of the Kind in this panic (ast/precedence.go:715
+    // `panic(fmt.Sprintf("unhandled TypeNode: %v", n.Kind))`), which is
+    // `Kind.String()`. The API's printNode reaches it (gaps2a skeptic repro
+    // r-typenode).
+    #[test]
+    fn unhandled_type_node_panic_names_the_go_kind() {
+        let f = NodeFactory::new();
+        let name = f.new_identifier("x");
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| get_type_node_precedence(name)))
+            .expect_err("no panic");
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some("unhandled TypeNode: KindIdentifier")
+        );
+    }
+}

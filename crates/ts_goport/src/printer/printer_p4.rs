@@ -1367,4 +1367,26 @@ mod tests {
             Some("unhandled statement: KindJSImportDeclaration")
         );
     }
+
+    // Go prints `%v` of the precedence (printer/printer.go:2867
+    // `panic(fmt.Sprintf("unhandled precedence: %v", precedence))`).
+    // `ast.OperatorPrecedence` is an int with no `String` method, so Go prints
+    // the number. A binary expression whose operator is not a binary operator
+    // has the invalid precedence -1 (gaps2a skeptic repro r-prec).
+    #[test]
+    fn unhandled_precedence_panic_prints_the_number() {
+        let f = NodeFactory::new();
+        let (left, right) = (f.new_identifier("x"), f.new_identifier("y"));
+        let operator = f.new_token(SyntaxKind::OpenBraceToken);
+        let binary = f.new_binary_expression(ModifierList::NIL, left, Node::NIL, operator, right);
+        let mut printer = new_printer(PrinterOptions::default(), PrintHandlers::default(), None);
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            printer.get_binary_expression_precedence(binary)
+        }))
+        .expect_err("no panic");
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some("unhandled precedence: -1")
+        );
+    }
 }
