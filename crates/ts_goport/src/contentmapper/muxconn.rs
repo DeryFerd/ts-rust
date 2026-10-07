@@ -74,7 +74,7 @@ impl Calls {
         false
     }
 
-    // Go: ipc/conn_async.go:149 closePendingCallsLocked
+    // Go: ipc/conn_async.go:150 closePendingCallsLocked
     // PORT: dropping a sender wakes its call, as Go `close(ch)` does.
     fn close_pending_calls(&mut self) {
         self.pending.clear();
