@@ -1149,6 +1149,8 @@ pub struct Checker {
     /// a merge adds knows when to read them again (`MatchingReferenceMemo`,
     /// `global_spelling_suggestions`).
     pub(crate) merge_version: u64,
+    /// PERF: not in Go. See `is_type_subset_of_union`.
+    pub(crate) union_subset_answers: FxHashMap<(TypeId, TypeId), bool>,
 
     // Arenas (PORTING.md "Checker data"). Index 0 of each is a dummy entry
     // so handle value 0 stays nil.
@@ -1626,6 +1628,7 @@ impl Checker {
             alternative_module_import_misses: FxHashSet::default(),
             matching_reference_memo: Default::default(),
             merge_version: 0,
+            union_subset_answers: FxHashMap::default(),
             symbols,
             types: ChunkedArena::with_nil(Type::default()),
             object_type_instantiations: vec![InstantiationMap::default()],
