@@ -95,6 +95,39 @@ that revision:
 - **Real projects.** On 120 open-source repos, the command-line output differs from Go's only in
   the problems below and where Go's own output changes from run to run.
 
+## Benchmark: T3 Code
+
+Full type check of [T3 Code](https://github.com/pingdotgg/t3code), compared with `tsc` 7 and
+the new `bun check` in Bun. T3 Code uses Effect, so there are two cases: without the Effect
+diagnostics and with them. The multiplier compares with `tsc` 7 in the same case. Lower is faster.
+
+**Without Effect diagnostics**
+
+| Checker     |   Time | vs `tsc` 7     |                                       |
+| ----------- | -----: | -------------- | ------------------------------------- |
+| `bun check` |  4.21s | 4.09× faster   | `████`                                |
+| `tsc-rs`    |  7.70s | 2.24× faster   | `████████`                            |
+| `tsc` 7     | 17.22s | 1.00× baseline | `█████████████████`                   |
+
+**With Effect diagnostics**
+
+| Checker                             |   Time | vs `tsc` 7 + Effect |                                         |
+| ----------------------------------- | -----: | ------------------- | --------------------------------------- |
+| `tsc-rs` (Effect built in)          | 11.35s | 1.94× faster        | `███████████`                           |
+| `tsc` 7 + `@effect/tsgo`            | 22.07s | 1.00× baseline      | `██████████████████████`                |
+| `bun check` + separate Effect pass  | 37.17s | 1.68× slower        | `█████████████████████████████████████` |
+
+`bun check` is the fastest when you do not need the Effect diagnostics. It does not have them, so
+an Effect project needs a second pass. `tsc-rs` gets them from its one check.
+
+How it was measured: the sum of per-project medians (3 runs each) for the five T3 Code projects
+`apps/server`, `apps/web`, `apps/mobile`, `packages/client-runtime` and `packages/shared`.
+Apple M5 Max, warm filesystem cache, compiler caches cleared before each run. This is not a timed
+full-workspace or parallel CI run. Versions: `tsc-rs` 0.1.0, TypeScript 7.0.2, Bun canary
+`bd599f5af`, `@effect/tsgo` 0.46.1. The results come from separate rounds. The `tsc-rs` switch in
+T3 Code is [pingdotgg/t3code#16704](https://github.com/pingdotgg/t3code/pull/16704), with a
+per-project table.
+
 ## Known problems
 
 - In some monorepos, the source files of a workspace package are reachable both through
