@@ -494,7 +494,6 @@ impl FilesParser {
             .host
             .stat_cache()
             .filter(|_| loader.opts.host.is_plain_os_fs());
-        let build_host = build_host_cache.is_some();
         if let Some(cache) = build_host_cache {
             cache.start_load();
             let _ = pool.shared.stats.host.set(cache);
@@ -508,9 +507,10 @@ impl FilesParser {
             queue.cached = cached;
             queue.freeable = freeable;
         }
-        // A `tsc -b` program loads the output `.d.ts` files of its
-        // references in place of their sources, so the workers parse those.
-        if build_host && !loader.opts.can_use_project_reference_source() {
+        // A program that does not use the sources of its references loads
+        // their output `.d.ts` files in place of the sources (Go
+        // `getParseFileRedirect`), so the workers parse those.
+        if !loader.opts.can_use_project_reference_source() {
             lock(&pool.shared.queue).redirects = loader
                 .project_reference_file_mapper
                 .borrow()
@@ -1963,13 +1963,18 @@ struct WorkerResolveConfig {
     /// The cache that the loader's resolver reads (`FileLoader::shared_resolution`).
     /// `None`: the worker answers are only hints for the parse queue.
     shared: Option<Arc<SharedResolutionCache>>,
-    /// The project references whose output `.d.ts` files are in
-    /// `redirects`: config name and options.
+    /// The project references of the files in `redirects`: config name
+    /// and options.
     references: Vec<(String, CompilerOptions)>,
-    /// The output `.d.ts` files of the project references, by path: the
-    /// source file name and the index in `references`. Go resolves the
-    /// references of such a file with the reference's options, from its
-    /// source file (`getRedirectForResolution`).
+    /// The source and output `.d.ts` files of the project references, by
+    /// path: the source file name and the index in `references`. Go
+    /// resolves the references of such a file with the reference's
+    /// options, from its source file (`getRedirectForResolution`).
+    // PORT: Go's third rule, the real path of a `.d.ts` file under
+    // node_modules with `preserveSymlinks`, is not here: the worker
+    // resolves such a file without a redirect, and the loader, which
+    // resolves it with one, takes none of those answers (`FilePrep::fits`
+    // and the cache key).
     redirects: FxHashMap<Path, (String, usize)>,
     /// True when the workers find the metadata of each file and resolve
     /// its names for the loader (`FilePrep`): the loader takes worker
@@ -1996,7 +2001,11 @@ impl WorkerResolveConfig {
         if loader.shared_resolution.is_some() {
             let mapper = loader.project_reference_file_mapper.borrow();
             let mut index_of: FxHashMap<*const ParsedCommandLine, usize> = FxHashMap::default();
-            for (path, reference) in &mapper.output_dts_to_project_reference {
+            // Go `getRedirectForResolution` tries the sources first, so a
+            // source entry replaces an output entry of the same path.
+            let outputs = mapper.output_dts_to_project_reference.iter();
+            let sources = mapper.source_to_project_reference.iter();
+            for (path, reference) in outputs.chain(sources) {
                 let Some(resolved) = reference.resolved.upgrade() else {
                     continue;
                 };

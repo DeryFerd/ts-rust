@@ -309,10 +309,12 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         // `BuildStatCache`), no project reference faking host (only a
         // program that uses the sources of its references has one) and no
         // traced resolution (Go then skips the cache too). A worker resolves
-        // the output `.d.ts` file of a project reference with its redirect, as
-        // the loader does; the redirect is part of the cache key. A program
-        // with project references shares answers only in `tsc -b`. Only for
-        // the default resolver: a parse worker cannot run a
+        // the files of a project reference with its redirect, from the
+        // source file, as the loader does (Go `getRedirectForResolution`,
+        // `WorkerResolveConfig::redirects`); the redirect is part of the
+        // cache key, and the loader takes a file's answers only when the
+        // worker used its redirect and containing file (`FilePrep::fits`).
+        // Only for the default resolver: a parse worker cannot run a
         // `create_module_resolver` one.
         // PORT: with `skip_module_resolution` the loader resolves nothing
         // (ts#64024), so the workers do not either.
@@ -322,12 +324,6 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
             && !loader.opts.skip_module_resolution
             && loader.opts.host.is_plain_os_fs()
             && compiler_options.trace_resolution != Tristate::True
-            && (loader
-                .opts
-                .config
-                .resolved_project_reference_paths()
-                .is_empty()
-                || loader.opts.host.stat_cache().is_some())
             && !loader.opts.can_use_project_reference_source()
         {
             let shared = Arc::new(SharedResolutionCache::default());
@@ -465,6 +461,14 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         std::mem::forget(loader);
     }
     processed_files
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Each worker prep that the loads on this thread looked at: the file
+    /// name and whether the loader could use it (`FilePrep::fits`).
+    static PREP_FITS: std::cell::RefCell<Vec<(String, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -1704,6 +1708,11 @@ impl FileLoader {
                     if !usable {
                         count_prep(|c| c.preps_unfit += 1);
                     }
+                    #[cfg(test)]
+                    PREP_FITS.with(|fits| {
+                        fits.borrow_mut()
+                            .push((file.file_name().to_string(), usable));
+                    });
                     usable
                 });
             let (mut names_taken, mut names_own) = (0, 0);
@@ -2618,12 +2627,23 @@ mod tests {
 
     /// Writes `files` and a tsconfig.json with `tsconfig` to a temp dir,
     /// loads the program with parse workers (not single threaded), and
-    /// returns what the load found, as text: the files in program order,
-    /// the metadata, module and type reference resolutions (in map order)
-    /// and include reasons of each file, the synthetic imports, the
-    /// processing diagnostics, the missing files and the package.json
-    /// entries of the resolver.
+    /// returns what the load found (`load_text`).
     fn parallel_load(label: &str, tsconfig: &str, files: &[(&str, &str)]) -> String {
+        load_text(label, tsconfig, files, false)
+    }
+
+    /// Writes `files` and a tsconfig.json with `tsconfig` to a temp dir,
+    /// loads the program, and returns what the load found, as text: the
+    /// files in program order, the metadata, module and type reference
+    /// resolutions (in map order) and include reasons of each file, the
+    /// synthetic imports, the processing diagnostics, the missing files
+    /// and the package.json entries of the resolver.
+    fn load_text(
+        label: &str,
+        tsconfig: &str,
+        files: &[(&str, &str)],
+        single_threaded: bool,
+    ) -> String {
         use std::fmt::Write as _;
         let dir = std::env::temp_dir().join(format!(
             "ts_goport_file_loader_{label}_{}",
@@ -2656,13 +2676,17 @@ mod tests {
                 host,
                 config: Rc::new(config.unwrap()),
                 use_source_of_project_reference: false,
-                single_threaded: Tristate::False,
+                single_threaded: if single_threaded {
+                    Tristate::True
+                } else {
+                    Tristate::False
+                },
                 typings_location: String::new(),
                 project_name: String::new(),
                 create_module_resolver: None,
                 skip_module_resolution: false,
             },
-            false,
+            single_threaded,
         );
         let _ = std::fs::remove_dir_all(&dir);
         let mut out = String::new();
@@ -2866,6 +2890,121 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         // loader resolves every name itself.
         if super::super::files_parser::parse_workers_enabled() {
             assert!(taken > 0, "no prep taken:\n{with_prep}");
+        }
+    }
+
+    /// A program with a project reference (`lib`) that it loads by the
+    /// output `.d.ts` files (Go `getParseFileRedirect`, a program that does
+    /// not use the sources of its references). The names in `lib/out` and
+    /// in `lib/src/types.d.ts` (a source with no output) resolve with the
+    /// options of `lib/tsconfig.json`, from their source files (Go
+    /// `getRedirectForResolution`): its `paths` find `@lib/helper`, and its
+    /// custom condition finds `dep/lib.d.ts`. `src/a.ts` resolves `dep`
+    /// with the root options, to `dep/index.d.ts`.
+    const REFERENCE_TSCONFIG: &str = r#"{ "compilerOptions": { "module": "esnext",
+         "moduleResolution": "bundler", "types": [], "noEmit": true },
+         "include": ["src"], "references": [{ "path": "./lib" }] }"#;
+    const REFERENCE_FILES: [(&str, &str); 10] = [
+        (
+            "lib/tsconfig.json",
+            r#"{ "compilerOptions": { "composite": true, "module": "esnext",
+                 "moduleResolution": "bundler", "types": [], "rootDir": "src",
+                 "outDir": "out", "paths": { "@lib/*": ["./src/*"] },
+                 "customConditions": ["lib"] }, "include": ["src"] }"#,
+        ),
+        (
+            "lib/src/index.ts",
+            "export { h } from \"@lib/helper\";\nexport const x = 1;\n",
+        ),
+        ("lib/src/helper.ts", "export const h = 2;\n"),
+        (
+            "lib/src/types.d.ts",
+            "import type { Dep } from \"dep\";\nimport type { h } from \"@lib/helper\";\nexport type T = Dep | typeof h;\n",
+        ),
+        (
+            "lib/out/index.d.ts",
+            "export { h } from \"@lib/helper\";\nexport declare const x = 1;\n",
+        ),
+        (
+            "lib/out/helper.d.ts",
+            "import type { Dep } from \"dep\";\nexport declare const h: Dep;\n",
+        ),
+        (
+            "node_modules/dep/package.json",
+            r#"{ "name": "dep", "version": "1.0.0",
+               "exports": { ".": { "lib": "./lib.d.ts", "types": "./index.d.ts" } } }"#,
+        ),
+        ("node_modules/dep/lib.d.ts", "export type Dep = \"lib\";\n"),
+        (
+            "node_modules/dep/index.d.ts",
+            "export type Dep = \"root\";\n",
+        ),
+        (
+            "src/a.ts",
+            r#"import { x, h } from "../lib/src/index";
+import type { T } from "../lib/src/types";
+import type { Dep } from "dep";
+export const a: T | Dep | number = x + (h as never);
+"#,
+        ),
+    ];
+
+    // loadcrit2: with project references, the parse workers resolve each
+    // file of a reference with the reference's options, from its source
+    // file, as the loader does (Go `getRedirectForResolution`,
+    // fileloader.go:842): the output `.d.ts` files and a `.d.ts` source.
+    // The loader takes their preps (`FilePrep::fits`), and the load finds
+    // what a load that resolves every name itself finds, and what a single
+    // threaded load finds.
+    #[test]
+    fn workers_resolve_with_the_reference_redirect_of_the_loader() {
+        let load = |label: &str, prep: bool, single_threaded: bool| {
+            set_load_prep(Some(prep));
+            set_meta_wait(prep && !single_threaded);
+            let text = load_text(label, REFERENCE_TSCONFIG, &REFERENCE_FILES, single_threaded);
+            set_load_prep(None);
+            set_meta_wait(false);
+            text
+        };
+        let single = load("refs_st", false, true);
+        assert_eq!(load("refs_prep_off", false, false), single);
+        for name in [
+            "lib/out/index.d.ts",
+            "lib/out/helper.d.ts",
+            "lib/src/types.d.ts",
+        ] {
+            assert!(single.contains(&format!("file <dir>/{name}")), "{single}");
+        }
+        for target in ["dep/lib.d.ts", "dep/index.d.ts"] {
+            assert!(
+                single.contains(&format!("-> <dir>/node_modules/{target} ")),
+                "{single}"
+            );
+        }
+        // A worker publishes its prep after the parse that the loader
+        // waits for, so the loader may resolve a file itself before it.
+        // Each redirected file's prep fits in some load, and no prep is
+        // unfit.
+        let redirected = [
+            "/lib/out/index.d.ts",
+            "/lib/out/helper.d.ts",
+            "/lib/src/types.d.ts",
+        ];
+        let mut fitted = [false; 3];
+        for run in 0..20 {
+            PREP_FITS.with(|fits| fits.borrow_mut().clear());
+            assert_eq!(load(&format!("refs_prep_on_{run}"), true, false), single);
+            let fits = PREP_FITS.with(|fits| std::mem::take(&mut *fits.borrow_mut()));
+            assert!(fits.iter().all(|(_, fit)| *fit), "unfit preps: {fits:?}");
+            for (index, name) in redirected.iter().enumerate() {
+                fitted[index] |= fits.iter().any(|(file, _)| file.ends_with(name));
+            }
+            if !super::super::files_parser::parse_workers_enabled() || fitted.iter().all(|f| *f) {
+                break;
+            }
+        }
+        if super::super::files_parser::parse_workers_enabled() {
+            assert_eq!(fitted, [true; 3], "{redirected:?}");
         }
     }
 
@@ -3219,6 +3358,55 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         let loaded =
             loaded.expect("the loader still waits for the job of the worker that panicked");
         assert_eq!(loaded, Some(ModuleKind::ES_NEXT), "{a}");
+    }
+
+    // loadcrit2: the job of an output `.d.ts` file of a project reference,
+    // which a worker parses in place of its source (`PrefetchQueue::redirects`)
+    // and resolves with the reference's redirect. When its worker panics
+    // after it starts the job, the loader that waits for it still loads the
+    // file and resolves its names with the redirect. Without the wake the
+    // test fails after 60 s.
+    #[test]
+    fn a_worker_panic_in_a_redirected_job_leaves_no_loader_waiting() {
+        use super::super::files_parser::{PANIC_IN_JOB, parse_workers_enabled};
+        if !parse_workers_enabled() {
+            return;
+        }
+        let label = "worker_panic_redirect";
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_file_loader_{label}_{}",
+            std::process::id()
+        ));
+        let output = format!(
+            "{}/lib/out/helper.d.ts",
+            dir.to_string_lossy().replace('\\', "/")
+        );
+        *PANIC_IN_JOB.lock().unwrap() = Some(output.clone());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            set_load_prep(Some(true));
+            set_meta_wait(true);
+            let (processed, dir, _) =
+                load_with_workers(label, REFERENCE_TSCONFIG, &REFERENCE_FILES);
+            let _ = std::fs::remove_dir_all(&dir);
+            let dep = processed
+                .files
+                .iter()
+                .find(|file| file.file_name().ends_with("/lib/out/helper.d.ts"))
+                .and_then(|file| processed.resolved_modules.get(file.path()))
+                .and_then(|resolutions| {
+                    resolutions
+                        .iter()
+                        .find(|(key, _)| key.name == "dep")
+                        .map(|(_, resolved)| get_base_file_name(&resolved.resolved_file_name))
+                });
+            let _ = sender.send(dep);
+        });
+        let loaded = receiver.recv_timeout(std::time::Duration::from_secs(60));
+        *PANIC_IN_JOB.lock().unwrap() = None;
+        let loaded =
+            loaded.expect("the loader still waits for the job of the worker that panicked");
+        assert_eq!(loaded, Some("lib.d.ts".to_string()), "{output}");
     }
 
     // lazypj1: the parse workers also read package.json files for the
