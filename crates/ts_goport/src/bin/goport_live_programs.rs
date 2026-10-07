@@ -304,13 +304,14 @@ fn check_file(checker: &mut Checker, file: Node, text: &mut String) {
 }
 
 /// Step 4 of `live`. `arenas` holds each checker arena with the symbol
-/// count of its program's binder arena. The ids of binder symbols must
-/// agree between arenas, and the ids of the symbols that a checker added
-/// must be unique.
+/// count of its program's binder arena. The ids of binder symbols (the
+/// even chunks below the count) must agree between arenas, and the ids of
+/// the symbols that a checker added (`SymbolArena::own_symbols`) must be
+/// unique.
 fn check_symbol_ids(arenas: &[(&SymbolArena, usize)]) {
     let mut binder: BTreeMap<usize, u64> = BTreeMap::new();
     for (arena, shared) in arenas {
-        for index in 1..*shared {
+        for index in (1..*shared).filter(|&index| !is_own_index(symbol_at(index).0)) {
             let id = get_symbol_id(arena, symbol_at(index));
             let known = *binder.entry(index).or_insert(id);
             assert!(
@@ -327,12 +328,13 @@ fn check_symbol_ids(arenas: &[(&SymbolArena, usize)]) {
             panic!("binder symbols {index} and {other:?} have id {id}");
         }
     }
-    for (checker, (arena, shared)) in arenas.iter().enumerate() {
-        for index in *shared..arena.symbol_count() {
-            let id = get_symbol_id(arena, symbol_at(index));
+    for (checker, (arena, _)) in arenas.iter().enumerate() {
+        for symbol in arena.own_symbols() {
+            let id = get_symbol_id(arena, symbol);
+            let index = symbol.index();
             if let Some(other) = owners.insert(id, (Some(checker), index)) {
                 panic!(
-                    "symbol {index} of checker {checker} (binder symbols below {shared}) has id {id}, like symbol {other:?}"
+                    "own symbol {index:#x} of checker {checker} has id {id}, like symbol {other:?}"
                 );
             }
         }
