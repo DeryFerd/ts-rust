@@ -32,7 +32,7 @@ pub fn snapshot_to_build_info(
         crate::program::go_frontend_program().and_then(|program| program.content_mapper_project());
     let content_mapper_identities = content_mapper_identities(content_mapper_project.as_deref())?;
     let build_info = BuildInfo {
-        version: version().to_string(),
+        version: build_info_version(snapshot.options.effect.is_some()).into_owned(),
         content_mapper_identities,
         // Effect-TS/tsgo patch 028.
         effect: snapshot.options.effect.as_ref().map(|e| e.to_value()),
