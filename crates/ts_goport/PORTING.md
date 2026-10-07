@@ -559,9 +559,10 @@ The batch that adds it is not accepted until Theo approves.
   `GOPORT_OWNED_NODES=0` turns them off) its parse was a freeable parse
   (`enter_freeable_parse`, opened by the parse cache), so its store owns
   its astdata nodes, pending lists, JSDoc cache and parse diagnostics
-  (`OwnedAst`), and they are freed with the version; its node data reads
-  are pinned reads, and its lists are `StoreList` handles. Only with them
-  do 1000-edit sessions pass memory. Their cost against R139 (M3g, pin B):
+  (`OwnedAst`), and they are freed with its store, when the version dies
+  or after it on a free thread (`FileVersion::take_data`); its node data
+  reads are pinned reads, and its lists are `StoreList` handles. Only with
+  them do 1000-edit sessions pass memory. Their cost against R139 (M3g, pin B):
   session instructions +6.40% on effect and +4.68% on query-core (+2.2%
   with owned nodes off); edit median +0.5 to +2.1 ms on effect and +0.8 to
   +1.7 ms on query-core in 200-edit sessions, +0.9 ms (query-core) and
