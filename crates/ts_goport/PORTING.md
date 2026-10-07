@@ -408,9 +408,13 @@ methods reach the AST through it.
   reuse, never undefined behavior. Its kind column is never reused, so a
   stale kind read gives the old kind. Its store, `GoFile`, extras, flow,
   node data and list reads panic. Every holder of a node of a version
-  holds the version, so a correct reader never sees a reuse; the
-  debug-assertion runs (protected tests, the corpus, and the editor and
-  oracle runs) find a missed holder. This is the owner check that the R141
+  holds the version, so a correct reader never sees a reuse. No standing
+  run has debug assertions: the protected tests run `--release`
+  (`build-goport-tests.sh`), and the corpus, editor and oracle runs use
+  release bins. So those runs find a missed holder only through the
+  release checks (the binder field reads above and the reads that
+  panic). A debug test build (`cargo test` without `--release`) also
+  checks each header and kids read. This is the owner check that the R141
   reviewer asked for before any step that reuses records: it replaces step
   2's tripwire (`freeable_version_owns_its_lists_and_a_stale_read_panics`
   reads the old values inside the quarantine), and
