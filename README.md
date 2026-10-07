@@ -128,6 +128,58 @@ full-workspace or parallel CI run. Versions: `tsc-rs` 0.1.0, TypeScript 7.0.2, B
 T3 Code is [pingdotgg/t3code#16704](https://github.com/pingdotgg/t3code/pull/16704), with a
 per-project table.
 
+## Benchmark: real-world apps
+
+Full type check of six open-source apps with `tsc` 6 (the JavaScript compiler), `tsc` 7 (the Go
+compiler), `tsc-rs` and `bun check`. The multiplier is the speedup over `tsc` 6. Lower times are
+faster.
+
+| App | Lines checked | `tsc` 6 | `tsc` 7 | `tsc-rs` | `bun check` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| [VS Code](https://github.com/microsoft/vscode/tree/3f07e1aba32acacb8b08ae91bfdc954b580ad1fd) | 3.75M | 54.56s | 6.84s (8.0×) | 4.20s (13.0×) | 1.62s (33.7×) |
+| [Sentry](https://github.com/getsentry/sentry/tree/8294650589dbd26f230c73f4ab26b62a68aede8f) (frontend) | 2.11M | 58.76s | 7.90s (7.4×) | 4.46s (13.2×) | 3.14s (18.7×) |
+| [Playwright](https://github.com/microsoft/playwright/tree/d469960fdfc461e2d5795a3fa48a58a52a91ecaf) | 585k | 4.48s | 0.66s (6.8×) | 0.34s (13.2×) | 0.18s (25.0×) |
+| [Excalidraw](https://github.com/excalidraw/excalidraw/tree/53973c3a423fbd75a4ce68107786b4fcb90e4968) | 449k | 5.32s | 0.80s (6.7×) | 0.70s (7.6×) | 0.18s (29.0×) |
+| [TypeORM](https://github.com/typeorm/typeorm/tree/c64a1f052fc39f6688b6b73b83d065d7147ba8bb) | 386k | 3.86s | 0.55s (7.0×) | 0.36s (10.7×) | 0.19s (20.0×) |
+| [tRPC](https://github.com/trpc/trpc/tree/d756e591a5e37ef20b8d75ecd4d736c195497289) (server package) | 209k | 1.10s | 0.16s (6.8×) | 0.09s (12.0×) | 0.12s (9.1×) |
+| **Geometric mean** | | | **7.1×** | **11.4×** | **20.9×** |
+
+Compared with `tsc` 7, `tsc-rs` is 1.61× faster and `bun check` is 2.95× faster (geometric
+means). `bun check` is the fastest on every app except tRPC.
+
+Errors. Each config checks with 0 errors under `tsc` 7.0.2. The other checkers differ in these
+places:
+
+- `tsc-rs` reports 10 errors on VS Code and 2 on Sentry. TypeScript 7.1.0-dev (`typescript@next`)
+  reports the same errors, line for line. `tsc-rs` ports a 7.1 dev revision, which has checks that
+  7.0.2 does not have.
+- `tsc` 6 reports 9 errors on VS Code.
+- `bun check` reports 3 errors on Sentry and 2 on tRPC that none of the other checkers report.
+
+How it was measured: Apple M4 Pro (12 cores, 48 GB), macOS 26.5.1. [hyperfine](https://github.com/sharkdp/hyperfine),
+median of 5 runs after 1 warmup run, with `--noEmit --incremental false`. Each checker uses its
+default thread count. `tsc` 7 and `tsc-rs` run as native binaries, without the npm launcher.
+`tsc` 6 runs on Node 24.19 with a 16 GB heap, because it runs out of memory on VS Code and Sentry
+with the default heap. Versions: `tsc-rs` 0.1.0, TypeScript 7.0.2 and 6.0.3, Bun canary
+`bd599f5af`. Lines checked is the `tsc` 7 `--extendedDiagnostics` count, with the `.d.ts` files.
+This is a different machine from the T3 Code benchmark, so do not compare times across the two
+tables.
+
+Four apps needed changes to check with 0 errors under `tsc` 7. Nothing else changed:
+
+- Excalidraw: no `baseUrl`, because TS 7 removed it.
+- TypeORM: `moduleResolution` changed from `node` to `nodenext`, because TS 7 removed `node`.
+- VS Code: the `electron` typings that its postinstall adds.
+- Playwright: the sources that its build generates.
+
+Two apps are not in the table:
+
+- rxjs main needs its workspace packages built first.
+- date-fns uses project references. There, `tsc -p` and `bun check` do different work.
+
+The scripts are in [scripts/bench-apps](scripts/bench-apps): `setup.sh <dir>`, then
+`run.sh <dir>` and `summary.py <dir>`.
+
 ## Known problems
 
 - In some monorepos, the source files of a workspace package are reachable both through
