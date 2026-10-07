@@ -2486,6 +2486,9 @@ pub struct ConditionalRoot {
     // PORT: Go nil map is `None`.
     pub instantiations: Option<InstantiationMap>,
     pub alias: Option<Rc<TypeAlias>>,
+    // PERF: not in Go. The answer of `is_distribution_dependent` once its
+    // first walk ends (`None` before), so a repeat call does not walk again.
+    pub distribution_dependent: Option<bool>,
 }
 
 // Go: checker/types.go:1269 ConditionalType
