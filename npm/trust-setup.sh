@@ -48,10 +48,12 @@ done
 
 for name in "${packages[@]}"; do
   if ((relink)); then
-    for id in $(npm trust list "$name" --json | node -e '
+    # An assignment, not `for id in $(...)`: set -e stops the script when the list or the parse fails.
+    ids=$(npm trust list "$name" --json | node -e '
       const text = require("fs").readFileSync(0, "utf8").trim();
       for (const t of text ? JSON.parse(`[${text.replace(/}\s*{/g, "},{")}]`) : []) console.log(t.id);
-    '); do
+    ')
+    for id in $ids; do
       npm trust revoke "$name" --id="$id"
       sleep 2
     done
