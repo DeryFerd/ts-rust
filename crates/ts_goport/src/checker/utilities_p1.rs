@@ -1413,27 +1413,29 @@ impl Checker {
     fn sort_large_union_types(&self, types: &mut [TypeId]) {
         let mut slot_of: FxHashMap<TypeId, u32> = FxHashMap::default();
         let mut table: Vec<LargeSortEntry> = Vec::new();
-        let mut slots: Vec<u32> = Vec::with_capacity(types.len());
-        for &t in types.iter() {
-            let slot = *slot_of.entry(t).or_insert_with(|| {
-                table.push(self.large_sort_entry(t));
+        // The slots live in `types` while it is sorted (each `TypeId` holds
+        // a table index), so the sort needs no second list of its length.
+        for t in types.iter_mut() {
+            let ty = *t;
+            let slot = *slot_of.entry(ty).or_insert_with(|| {
+                table.push(self.large_sort_entry(ty));
                 (table.len() - 1) as u32
             });
-            slots.push(slot);
+            *t = TypeId(slot);
         }
-        crate::gostd::slices::sort_stable_func(&mut slots, |&a, &b| {
+        crate::gostd::slices::sort_stable_func(types, |&a, &b| {
             if a == b {
                 return 0;
             }
-            let (x, y) = (&table[a as usize], &table[b as usize]);
+            let (x, y) = (&table[a.0 as usize], &table[b.0 as usize]);
             match x.keyed_order(y) {
                 Ordering::Less => -1,
                 Ordering::Greater => 1,
                 Ordering::Equal => self.compare_types(x.t, y.t),
             }
         });
-        for (slot, &s) in types.iter_mut().zip(&slots) {
-            *slot = table[s as usize].t;
+        for t in types.iter_mut() {
+            *t = table[t.0 as usize].t;
         }
     }
 
