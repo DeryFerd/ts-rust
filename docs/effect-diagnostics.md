@@ -16,7 +16,10 @@ The code is `crates/ts_goport/src/effect`, a port of
   with the reference defaults. A child config that `extends` a base merges
   only the keys it sets: `diagnosticSeverity` merges by rule, `overrides`
   are appended, and override globs stay relative to the config that
-  declares them.
+  declares them. As in the reference, a child `"plugins": []` (or `null`)
+  replaces the plugin list but keeps the base's Effect options, so Effect
+  still runs. To turn the rules off in a child, list the plugin with
+  `"diagnostics": false`.
 - Runs all 116 rules after the checker has checked each project file
   (not declaration files and not files from `node_modules`). Rule
   severities come from `diagnosticSeverity`, matching `overrides`, and
@@ -25,7 +28,11 @@ The code is `crates/ts_goport/src/effect`, a port of
   (`ignoreEffect{Errors,Warnings,Suggestions}InTscExitCode`).
   `@ts-ignore` does not hide Effect diagnostics.
 - Effect options are stored in `.tsbuildinfo`, so a change to them
-  invalidates the cached diagnostics. The language server shows the same
+  invalidates the cached diagnostics. With the plugin on, `.tsbuildinfo`
+  records the version `<version>+effect-tsgo.0.46.1`, as effect-tsgo does.
+  Plain tsgo and tsc-rs without the plugin then check the project again
+  instead of reading Effect diagnostics (plain tsgo panics on those:
+  "Unknown diagnostic message"). The language server shows the same
   diagnostics.
 - With no plugin entry, nothing runs. An entry with only a `name` runs every
   rule at its default severity. `"diagnostics": false` or
@@ -53,7 +60,9 @@ All take the reference Effect-patched `tsc` as `--ref`:
 - `scripts/effect/focused-fixtures.mjs`: `crates/ts_goport/tests/effect_fixtures`,
   each with expected codes and exit status.
 - `scripts/effect/incremental-check.mjs`: `--incremental` and `--watch`
-  after source, imported type, config and directive edits.
+  after source, imported type, config and directive edits. With `--plain`
+  (the tsgo oracle), plain tsgo and tsc-rs also take turns on one
+  `.tsbuildinfo`.
 - `scripts/effect/t3-parity.mjs` and `scripts/effect/bench-t3.mjs`: T3 Code
   parity and timing.
 

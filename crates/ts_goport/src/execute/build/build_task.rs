@@ -4,7 +4,8 @@ use crate::execute::build::command_line::ParsedBuildCommandLine;
 use crate::execute::build::host::{BuildCompilerHost, BuildHost, WrittenPaths};
 use crate::execute::build::up_to_date_status::*;
 use crate::execute::incremental::build_info::{
-    BuildInfoRootInfoReader, content_mapper_identities, is_build_info_file_name_default_library,
+    BuildInfoRootInfoReader, build_info_version, content_mapper_identities,
+    is_build_info_file_name_default_library,
 };
 use crate::execute::incremental::emit_files::{buffer_early_emit_writes, fs_error_text};
 use crate::execute::incremental::incremental::Host as IncrementalHost;
@@ -130,6 +131,8 @@ pub struct StatusCheckOptions {
     emit_declarations: bool,
     no_check: bool,
     no_emit: bool,
+    /// The Effect rules run (`BuildInfo::is_valid_version`).
+    effect: bool,
 }
 
 impl StatusCheckOptions {
@@ -139,6 +142,7 @@ impl StatusCheckOptions {
             emit_declarations: options.get_emit_declarations(),
             no_check: options.no_check.is_true(),
             no_emit: options.no_emit.is_true(),
+            effect: crate::effect::rulerunner::enabled_options(options).is_some(),
         }
     }
 
@@ -147,7 +151,7 @@ impl StatusCheckOptions {
     /// that read only the build info and these options. True otherwise,
     /// also when the check may return early for another reason.
     pub fn reads_input_times(self, build_info: &BuildInfo) -> bool {
-        if !build_info.is_valid_version() {
+        if !build_info.is_valid_version(self.effect) {
             return false;
         }
         if build_info.errors
@@ -1381,7 +1385,9 @@ impl BuildTask {
         };
 
         // build info version
-        if !build_info.is_valid_version() {
+        if !build_info.is_valid_version(
+            crate::effect::rulerunner::enabled_options(resolved.compiler_options()).is_some(),
+        ) {
             return UpToDateStatus::with_data(
                 UpToDateStatusType::TsVersionOutputOfDate,
                 UpToDateStatusData::String(build_info.version.clone()),
@@ -1954,7 +1960,13 @@ impl BuildTask {
             }
             UpToDateStatusType::TsVersionOutputOfDate => new_compiler_diagnostic(
                 diag::Project_0_is_out_of_date_because_output_for_it_was_generated_with_version_1_that_differs_with_current_version_2,
-                args![config, o.relative_file_name(status.data_string()), version()],
+                args![
+                    config,
+                    o.relative_file_name(status.data_string()),
+                    build_info_version(self.resolved.as_ref().is_some_and(|r| {
+                        crate::effect::rulerunner::enabled_options(r.compiler_options()).is_some()
+                    }))
+                ],
             ),
             UpToDateStatusType::ForceBuild => new_compiler_diagnostic(
                 diag::Project_0_is_being_forcibly_rebuilt,
