@@ -2,12 +2,13 @@
 //!
 //! PORT: threads. The host, its projects and its connections are
 //! dispatch-thread values (see the module comment in `mod.rs`): Go's
-//! `lifecycleMu`, `mu` and the timing atomics are dropped, and the maps are
-//! `RefCell`s. Go holds `mu` across some protocol calls; here each call runs
-//! with no map borrowed. The spawned process (`ProcessExitState`, an
-//! `ipc::ReadWriteCloser`) and the stderr logger are shared with other
-//! threads (the spawner's stderr pump, the context callbacks), so they use
-//! `Arc` and `Mutex`.
+//! `lifecycleMu` and `mu` are dropped, and the maps are `RefCell`s. Go holds
+//! `mu` across some protocol calls; here each call runs with no map
+//! borrowed. Other threads share the spawned process (`ProcessExitState`, an
+//! `ipc::ReadWriteCloser`), its connection (`MuxConn`, whose read loop runs
+//! on its own thread), the timing collector and the stderr logger, so these
+//! use `Arc`, `Mutex` and atomics. A parse worker sends the transform
+//! requests of an open project through a `ConcurrentTransform`.
 //!
 //! PORT: Go map iteration order is random. The host maps are `IndexMap`s in
 //! insertion order, so the order of the close calls is fixed.

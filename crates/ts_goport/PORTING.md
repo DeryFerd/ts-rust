@@ -891,6 +891,22 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   checker. `GOPORT_DTS_TWIN=0` turns the twins off.
   `GOPORT_DTS_TWIN_CHECK=1` also prints each part on the checker, and the
   twin panics when its writes differ.
+- The content mapper host is dispatch-thread state (`contentmapper`
+  module docs). Each mapper connection (`contentmapper::muxconn::MuxConn`)
+  reads on its own thread, as Go's `AsyncConn.Run` goroutine does, and
+  answers a request from the mapper on a short thread (Go `handlers.Go`).
+  Once the loader's transform of a first file of a mapper opened the
+  mapper project, the parse workers send the transform requests of the
+  later files of that mapper (`ConcurrentTransform`) and parse the virtual
+  texts, as Go's parse goroutines do. The loader takes each result in load
+  order (`take_prefetched_mapped`), so a file gets one request, and the
+  ids, diagnostics and failure budget are those of a serial load. Mapped
+  jobs have their own workers (`GOPORT_MAPPED_THREADS`, default the parse
+  worker count), because such a job mostly waits for the mapper. The
+  compiler host, the `tsc -b` project host and the watch host take part
+  (`CompilerHost::prefetch_content_mapped`); the language server
+  transforms on its dispatch thread. `GOPORT_MAPPED_PREFETCH=0` turns the
+  worker transforms off.
 - A thread that runs Go code (the work thread of a binary, the parse,
   bind, checker, emit, search and goroutine threads, the `tsc -b` config
   and build info threads, the file watcher thread and the LSP read thread)

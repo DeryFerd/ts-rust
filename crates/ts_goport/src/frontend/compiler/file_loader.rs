@@ -1118,8 +1118,11 @@ impl FileLoader {
     // subsequent files. Other failures produce per-file diagnostics and count toward a failure budget; after
     // maxContentMapperFailures, one program diagnostic reports that the mapper was disabled and subsequent
     // files are silently substituted with empty files. It returns nil only if the file cannot be read.
-    // PORT: the host transforms on this (the loading) thread; the content
-    // mapper host is dispatch-thread state (`contentmapper` module docs).
+    // PORT: the content mapper host is dispatch-thread state
+    // (`contentmapper` module docs), so the host transforms on this (the
+    // loading) thread. Once that opened the mapper project, the parse
+    // workers send the transforms of the later files, and the host takes
+    // their results (`note_content_mapper_transform`).
     pub fn parse_content_mapped_file(
         &self,
         opts: SourceFileParseOptions,
