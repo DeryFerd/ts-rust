@@ -31,7 +31,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::io::Write;
 use std::rc::Weak;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -815,7 +815,7 @@ pub struct HostImpl {
     cancel: CancelFunc,
     stop: AfterFuncStop,
     dial: DialFunc,
-    timing: Rc<TimingCollector>,
+    timing: Arc<TimingCollector>,
 
     diagnostic_locale: RefCell<Locale>,
 
@@ -859,35 +859,45 @@ struct MapperConn {
 // Go: contentmapper/hostimpl.go:260 operationTiming
 // PORT: Go `operationTiming` and `OperationTiming` (host.go) are both
 // `OperationTiming` in Rust; the unexported one is `OperationTimingImpl`.
-// Go's atomics are cells (dispatch thread).
+// The parse workers record transforms too (`ConcurrentTransform`), so the
+// collectors keep Go's atomics and mutex.
 #[derive(Default)]
 struct OperationTimingImpl {
-    count: Cell<u64>,
-    duration: Cell<Duration>,
+    count: AtomicU64,
+    /// Nanoseconds (Go `atomic.Int64` of a `time.Duration`).
+    duration: AtomicU64,
 }
 
 impl OperationTimingImpl {
     // Go: contentmapper/hostimpl.go:265 operationTiming.record
     fn record(&self, start: Instant) {
-        self.count.set(self.count.get() + 1);
-        self.duration.set(self.duration.get() + start.elapsed());
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.duration.fetch_add(
+            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     // Go: contentmapper/hostimpl.go:270 operationTiming.snapshot
     fn snapshot(&self) -> OperationTiming {
         OperationTiming {
-            count: self.count.get(),
-            duration: self.duration.get(),
+            count: self.count.load(Ordering::Relaxed),
+            duration: Duration::from_nanos(self.duration.load(Ordering::Relaxed)),
         }
     }
 }
 
 // Go: contentmapper/hostimpl.go:274 timingCollector
 struct TimingCollector {
-    mappers: RefCell<IndexMap<String, Rc<MapperTimingCollector>>>,
-    active_requests: Cell<u64>,
-    request_wait_start: Cell<Instant>,
-    request_wait_elapsed: Cell<Duration>,
+    mu: Mutex<TimingState>,
+}
+
+/// The fields of Go `timingCollector` that its `mu` guards.
+struct TimingState {
+    mappers: IndexMap<String, Arc<MapperTimingCollector>>,
+    active_requests: u64,
+    request_wait_start: Instant,
+    request_wait_elapsed: Duration,
 }
 
 // Go: contentmapper/hostimpl.go:282 mapperTimingCollector
@@ -900,47 +910,46 @@ struct MapperTimingCollector {
     open_project: OperationTimingImpl,
     close_project: OperationTimingImpl,
     transform: OperationTimingImpl,
-    owner: Weak<TimingCollector>,
+    owner: std::sync::Weak<TimingCollector>,
 }
 
 impl TimingCollector {
     /// Go `&timingCollector{mappers: make(map[string]*mapperTimingCollector)}`.
     fn new() -> TimingCollector {
         TimingCollector {
-            mappers: RefCell::new(IndexMap::new()),
-            active_requests: Cell::new(0),
-            request_wait_start: Cell::new(Instant::now()),
-            request_wait_elapsed: Cell::new(Duration::ZERO),
+            mu: Mutex::new(TimingState {
+                mappers: IndexMap::new(),
+                active_requests: 0,
+                request_wait_start: Instant::now(),
+                request_wait_elapsed: Duration::ZERO,
+            }),
         }
     }
 
     // Go: contentmapper/hostimpl.go:291 timingCollector.mapper
-    fn mapper(self: &Rc<Self>, identity: &str) -> Rc<MapperTimingCollector> {
-        if let Some(timing) = self.mappers.borrow().get(identity) {
+    fn mapper(self: &Arc<Self>, identity: &str) -> Arc<MapperTimingCollector> {
+        let mut state = lock(&self.mu);
+        if let Some(timing) = state.mappers.get(identity) {
             return timing.clone();
         }
-        let timing = Rc::new(MapperTimingCollector {
-            owner: Rc::downgrade(self),
+        let timing = Arc::new(MapperTimingCollector {
+            owner: Arc::downgrade(self),
             ..Default::default()
         });
-        self.mappers
-            .borrow_mut()
-            .insert(identity.to_string(), timing.clone());
+        state.mappers.insert(identity.to_string(), timing.clone());
         timing
     }
 
     // Go: contentmapper/hostimpl.go:302 timingCollector.snapshot
     fn snapshot(&self) -> Timings {
-        let mut request_wait = self.request_wait_elapsed.get();
-        if self.active_requests.get() != 0 {
-            request_wait += self.request_wait_start.get().elapsed();
-        }
-        let mappers: Vec<(String, Rc<MapperTimingCollector>)> = self
-            .mappers
-            .borrow()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let (request_wait, mappers) = {
+            let state = lock(&self.mu);
+            let mut request_wait = state.request_wait_elapsed;
+            if state.active_requests != 0 {
+                request_wait += state.request_wait_start.elapsed();
+            }
+            (request_wait, state.mappers.clone())
+        };
         let mut result = Timings {
             mappers: IndexMap::with_capacity(mappers.len()),
             request_wait,
@@ -962,7 +971,7 @@ impl TimingCollector {
 }
 
 impl MapperTimingCollector {
-    fn owner(&self) -> Rc<TimingCollector> {
+    fn owner(&self) -> Arc<TimingCollector> {
         self.owner
             .upgrade()
             .expect("content mapper timing collector outlives its host")
@@ -971,10 +980,12 @@ impl MapperTimingCollector {
     // Go: contentmapper/hostimpl.go:324 mapperTimingCollector.startRequest
     fn start_request(&self) -> Instant {
         let owner = self.owner();
-        if owner.active_requests.get() == 0 {
-            owner.request_wait_start.set(Instant::now());
+        let mut state = lock(&owner.mu);
+        if state.active_requests == 0 {
+            state.request_wait_start = Instant::now();
         }
-        owner.active_requests.set(owner.active_requests.get() + 1);
+        state.active_requests += 1;
+        drop(state);
         Instant::now()
     }
 
@@ -982,11 +993,11 @@ impl MapperTimingCollector {
     fn finish_request(&self, operation: &OperationTimingImpl, start: Instant) {
         operation.record(start);
         let owner = self.owner();
-        owner.active_requests.set(owner.active_requests.get() - 1);
-        if owner.active_requests.get() == 0 {
-            owner
-                .request_wait_elapsed
-                .set(owner.request_wait_elapsed.get() + owner.request_wait_start.get().elapsed());
+        let mut state = lock(&owner.mu);
+        state.active_requests -= 1;
+        if state.active_requests == 0 {
+            let elapsed = state.request_wait_start.elapsed();
+            state.request_wait_elapsed += elapsed;
         }
     }
 }
@@ -1375,16 +1386,19 @@ pub struct ConcurrentTransform {
     project_handle: String,
     position_encoding: PositionEncoding,
     diagnostic_source: String,
+    timing: Arc<MapperTimingCollector>,
 }
 
 impl ConcurrentTransform {
     /// The mapper's result for `content` of `file_name`, as
-    /// `Project::transform` decodes it.
+    /// `Project::transform` decodes it. The call counts in the timings, as
+    /// in `transform_locked`.
     pub fn transform(
         &self,
         file_name: &str,
         content: &str,
     ) -> std::result::Result<Result, GoError> {
+        let start = self.timing.start_request();
         let raw = self.conn.call_any_thread(
             &context::background(),
             METHOD_TRANSFORM,
@@ -1393,7 +1407,9 @@ impl ConcurrentTransform {
                 content: content.to_string(),
                 project_handle: self.project_handle.clone(),
             })),
-        )?;
+        );
+        self.timing.finish_request(&self.timing.transform, start);
+        let raw = raw?;
         decode_transform_result(
             &raw,
             content,
@@ -1425,7 +1441,7 @@ pub fn new_host_with_options(
     options: HostOptions,
 ) -> Rc<dyn Host> {
     let logger = options.logger;
-    let timing = Rc::new(TimingCollector::new());
+    let timing = Arc::new(TimingCollector::new());
     let dial_timing = timing.clone();
     let dial: DialFunc = Rc::new(
         move |ctx: &Context, mapper: &Rc<Mapper>, diagnostic_locale: &Locale| {
@@ -1565,7 +1581,7 @@ pub fn new_host_with_options(
 fn new_with_dial(
     ctx: &Context,
     diagnostic_locale: Locale,
-    timing: Rc<TimingCollector>,
+    timing: Arc<TimingCollector>,
     dial: DialFunc,
 ) -> Rc<HostImpl> {
     let (host_ctx, cancel) = context::with_cancel(ctx);
@@ -1827,6 +1843,7 @@ impl HostImpl {
             project_handle,
             position_encoding,
             diagnostic_source,
+            timing: self.timing.mapper(&mapper.identity()),
         }))
     }
 
