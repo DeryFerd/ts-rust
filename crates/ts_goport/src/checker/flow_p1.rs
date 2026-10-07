@@ -277,8 +277,11 @@ impl Checker {
         // lsshells M3 repair: one guard for the whole walk, so the steps in
         // one freeable file version share one pin (`get_flow_in`).
         let mut flow_data_guard = None;
+        // flowskip1 verify mode: record each loop turn (read once per call;
+        // a nested verify restores the recording before it returns).
+        let recording = self.flow_skip.recording.is_some();
         loop {
-            if self.flow_skip.recording.is_some() {
+            if recording {
                 let depth = f.borrow().depth;
                 self.flow_skip_record(flow, depth);
             }

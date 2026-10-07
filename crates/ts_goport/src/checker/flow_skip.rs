@@ -29,13 +29,17 @@
 //! is two binary searches. Per class of reference (kind x union declared
 //! type x constant reference), candidates that are settled and have nothing
 //! to check per walk are joined to their parent (union-find), so a walk
-//! over settled nodes costs about O(1).
+//! over settled nodes costs about O(1). A file is indexed only once its
+//! walks have taken 16 steps per flow node (sampled), so files with short
+//! walks pay almost nothing.
 //!
-//! `GOPORT_FLOWSKIP`: unset or `1` on, `0` off, `verify` tests each walk and
-//! then runs Go's walk anyway, and panics when the skip would differ (result,
-//! counters of made things and effects, visited nodes, depth).
-//! `GOPORT_FLOWSKIP_STATS=<file>` writes the process totals of the tests to
-//! `<file>` (updated every 256 tests per checker).
+//! `GOPORT_FLOWSKIP`: unset or `1` on, `0` off, `verify` indexes every file,
+//! tests each walk, then runs Go's walk anyway, and panics when the skip
+//! would differ (result, counters of made things and effects, visited nodes,
+//! depth). `GOPORT_FLOWSKIP_STATS=<file>` writes the process totals of the
+//! tests to `<file>` (updated every 256 tests per checker).
+//! `GOPORT_FLOWSKIP_BUILD_STEPS` and `GOPORT_FLOWSKIP_MIN_STEPS` set the
+//! tuning values for A/B runs.
 
 use crate::prelude::*;
 use smallvec::SmallVec;
@@ -102,6 +106,19 @@ pub fn flow_skip_mode_from_env() -> FlowSkipMode {
         Ok("verify") => FlowSkipMode::Verify,
         _ => FlowSkipMode::On,
     })
+}
+
+/// A tuning value from the environment (read once per process), else
+/// `default`.
+fn tuning(name: &'static str, default: u32) -> u32 {
+    static VALUES: OnceLock<FxHashMap<&'static str, u32>> = OnceLock::new();
+    let values = VALUES.get_or_init(|| {
+        ["GOPORT_FLOWSKIP_BUILD_STEPS", "GOPORT_FLOWSKIP_MIN_STEPS"]
+            .into_iter()
+            .filter_map(|n| Some((n, std::env::var(n).ok()?.parse().ok()?)))
+            .collect()
+    });
+    values.get(name).copied().unwrap_or(default)
 }
 
 /// Why a test said no (stats only).
@@ -218,9 +235,11 @@ pub struct FlowSkipRecording {
 /// The flow skip state of one checker (`Checker::flow_skip`).
 pub struct FlowSkip {
     pub mode: FlowSkipMode,
-    /// Walks (that pass the cheap tests) per file before the file is
-    /// indexed. Files with few walks pay only this counter.
-    pub build_after: u32,
+    /// A file is indexed when the steps of its walks so far reach this many
+    /// per flow node of the file (the index costs about as much as 10 walk
+    /// steps per flow node, so a file with few or short walks would lose).
+    /// Such files pay only the sample.
+    pub build_steps: u32,
     /// A walk with fewer loop turns to its root (and no move to an outer
     /// function there) is not tested: Go's walk is cheaper than the test.
     pub min_steps: u32,
@@ -235,20 +254,28 @@ pub struct FlowSkip {
     stats_flushed: FlowSkipStats,
     /// Tests: each tested reference and whether the test skipped it.
     pub trace: Option<Vec<(Node, bool)>>,
+    /// Final answers of `isConstantReference` for identifier symbols.
+    constant_references: FxHashMap<SymbolId, bool>,
 }
 
 impl Default for FlowSkip {
     fn default() -> Self {
+        let mode = flow_skip_mode_from_env();
         FlowSkip {
-            mode: flow_skip_mode_from_env(),
-            build_after: 64,
-            min_steps: 8,
+            mode,
+            // Verify mode indexes every file at once, so it tests every walk.
+            build_steps: tuning(
+                "GOPORT_FLOWSKIP_BUILD_STEPS",
+                if mode == FlowSkipMode::Verify { 0 } else { 16 },
+            ),
+            min_steps: tuning("GOPORT_FLOWSKIP_MIN_STEPS", 8),
             files: FxHashMap::default(),
             effects: 0,
             recording: None,
             stats: FlowSkipStats::default(),
             stats_flushed: FlowSkipStats::default(),
             trace: None,
+            constant_references: FxHashMap::default(),
         }
     }
 }
@@ -263,9 +290,35 @@ impl std::fmt::Debug for FlowSkip {
 }
 
 enum FileState {
-    Counting(u32),
+    /// Walks so far, and the estimated sum of their path lengths (every
+    /// `SAMPLE_EVERY`th walk is measured, at most `DRY_CAP` steps).
+    Counting {
+        walks: u32,
+        steps: u64,
+    },
     Built(Box<FileIndex>),
+    /// Not a static file: never indexed.
     Unsupported,
+}
+
+/// A measured walk counts at most this many steps.
+const DRY_CAP: u32 = 256;
+/// One walk in this many is measured.
+const SAMPLE_EVERY: u32 = 4;
+
+/// Steps of pi(u) to its root (no move to an outer function), at most
+/// `DRY_CAP`: the length of Go's walk when nothing narrows.
+fn dry_steps(flows: &[FlowNode], file: usize, u: usize) -> u32 {
+    let mut x = u;
+    let mut steps = 1;
+    while steps < DRY_CAP {
+        match next_of(flows, file, &flows[x]) {
+            Ok((p, _)) => x = p as usize,
+            Err(_) => break,
+        }
+        steps += 1;
+    }
+    steps
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -677,185 +730,160 @@ enum Alias {
     D(Node),
 }
 
-/// What the events of a node mean for one kind; `u` marks the part that
+/// Bit of a resolve list or block for kind `k`; `u` marks the part that
 /// runs only for a union declared type.
+const fn slot(k: u8, u: bool) -> u8 {
+    1 << (k * 2 + u as u8)
+}
+const ALL_BASE: u8 = 0b0101_0101;
+const ALL_UNION: u8 = 0b1010_1010;
+const ACC_BASE: u8 = slot(K_ACC_IDENT, false) | slot(K_ACC_THIS, false);
+
+/// What the events of a node mean. Mention keys and chain sites carry
+/// their family, which names the kinds that compare them, so they are kept
+/// for every kind. Resolves and blocks carry the bits of the kinds (and
+/// union part) that Go evaluates them for.
 #[derive(Default)]
-struct Sink {
-    mentions: [Vec<u64>; 2],
-    chains: [Vec<(u64, Node)>; 2],
-    resolves: [Vec<Node>; 2],
-    blocked: [bool; 2],
-    aliases: [Vec<Alias>; 2],
+struct Out {
+    mentions: Vec<u64>,
+    chains: Vec<(u64, Node)>,
+    resolves: Vec<(Node, u8)>,
+    blocked: u8,
+    aliases: Vec<Alias>,
 }
 
-impl Sink {
+impl Out {
     fn clear(&mut self) {
-        for u in 0..2 {
-            self.mentions[u].clear();
-            self.chains[u].clear();
-            self.resolves[u].clear();
-            self.blocked[u] = false;
-            self.aliases[u].clear();
-        }
+        self.mentions.clear();
+        self.chains.clear();
+        self.resolves.clear();
+        self.blocked = 0;
+        self.aliases.clear();
     }
-}
 
-fn add_chain_mention(sink: &mut Sink, u: usize, kind: u8, chain: Chain, family: u8, site: u8) {
-    match chain {
-        Chain::KeySite => sink.blocked[u] = true,
-        Chain::Ok(names, root) => {
-            sink.mentions[u].push(chain_key(family, &names, root_text(root)));
-            if kind == K_ACC_IDENT && root.kind() == SyntaxKind::Identifier && !names.is_empty() {
-                sink.chains[u].push((names_key(site, &names), root));
+    /// An access chain met by an access reference: its mention, and its
+    /// chain site when its root is an identifier.
+    fn chain(&mut self, chain: Chain, family: u8, site: u8, blocks: u8) {
+        match chain {
+            Chain::KeySite => self.blocked |= blocks,
+            Chain::Ok(names, root) => {
+                self.mentions
+                    .push(chain_key(family, &names, root_text(root)));
+                if root.kind() == SyntaxKind::Identifier && !names.is_empty() {
+                    self.chains.push((names_key(site, &names), root));
+                }
             }
+            Chain::None => {}
         }
-        Chain::None => {}
     }
-}
 
-/// `isMatchingReference(R, x)` for a reference of `kind`, x a target.
-fn interpret_m(x: Node, u: usize, kind: u8, sink: &mut Sink) {
-    let t = unwrap_target(x);
-    let t_kind = t.kind();
-    match kind {
-        K_IDENT => match t_kind {
+    /// `isMatchingReference(R, x)`, x a target (flow.go:1597): an
+    /// identifier reference resolves an identifier target; an access
+    /// reference reads the names of an access target.
+    fn m(&mut self, x: Node, u: bool) {
+        let t = unwrap_target(x);
+        let family = if u { F_IDENT_U } else { F_IDENT };
+        match t.kind() {
             SyntaxKind::Identifier => {
-                sink.mentions[u].push(chain_key(ident_family(u), &[], t.text()));
-                sink.resolves[u].push(t);
+                self.mentions.push(chain_key(family, &[], t.text()));
+                self.resolves.push((t, slot(K_IDENT, u)));
             }
             SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement => {
                 // A hole of an array binding pattern is a binding element
                 // with no name.
                 let name = t.name();
                 if name.is_some() && is_identifier(name) {
-                    sink.mentions[u].push(chain_key(ident_family(u), &[], name.text()));
+                    self.mentions.push(chain_key(family, &[], name.text()));
                 }
+            }
+            SyntaxKind::ThisKeyword => self.mentions.push(chain_key(family, &[], "this")),
+            SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
+                let (family, site) = if u { (F_ACC_U, C_M_U) } else { (F_ACC, C_M) };
+                self.chain(
+                    read_chain(t, false),
+                    family,
+                    site,
+                    slot(K_ACC_IDENT, u) | slot(K_ACC_THIS, u),
+                );
             }
             _ => {}
-        },
-        K_THIS => {
-            if t_kind == SyntaxKind::ThisKeyword {
-                sink.mentions[u].push(chain_key(ident_family(u), &[], "this"));
-            }
-        }
-        _ => {
-            if matches!(
-                t_kind,
-                SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression
-            ) {
-                let (family, site) = if u == 1 {
-                    (F_ACC_U, C_M_U)
-                } else {
-                    (F_ACC, C_M)
-                };
-                add_chain_mention(sink, u, kind, read_chain(t, false), family, site);
-            }
         }
     }
-}
 
-fn ident_family(u: usize) -> u8 {
-    if u == 1 { F_IDENT_U } else { F_IDENT }
-}
-
-/// `optionalChainContainsReference(x, R)`: each prefix of the chain is a
-/// source of `isMatchingReference` with R as the target.
-fn interpret_oc(x: Node, kind: u8, sink: &mut Sink) {
-    let mut s = x;
-    while is_optional_chain(s) {
-        s = s.expression();
-        let src = unwrap_source(s);
-        match src.kind() {
-            SyntaxKind::Identifier => {
-                let this_in_type_query = is_this_in_type_query(src);
-                if kind == K_IDENT && !this_in_type_query {
-                    sink.mentions[0].push(chain_key(F_IDENT, &[], src.text()));
-                    sink.resolves[0].push(src);
-                } else if kind == K_THIS && this_in_type_query {
-                    sink.mentions[0].push(chain_key(F_IDENT, &[], "this"));
+    /// `optionalChainContainsReference(x, R)` (flow.go:1851): each prefix
+    /// of the chain is a source of `isMatchingReference` with R as the
+    /// target.
+    fn oc(&mut self, x: Node) {
+        let mut s = x;
+        while is_optional_chain(s) {
+            s = s.expression();
+            let src = unwrap_source(s);
+            match src.kind() {
+                SyntaxKind::Identifier => {
+                    if is_this_in_type_query(src) {
+                        self.mentions.push(chain_key(F_IDENT, &[], "this"));
+                    } else {
+                        self.mentions.push(chain_key(F_IDENT, &[], src.text()));
+                        self.resolves.push((src, slot(K_IDENT, false)));
+                    }
                 }
-            }
-            SyntaxKind::ThisKeyword => {
-                if kind == K_THIS {
-                    sink.mentions[0].push(chain_key(F_IDENT, &[], "this"));
-                }
-            }
-            SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
-                if kind == K_IDENT || kind == K_THIS {
+                SyntaxKind::ThisKeyword => self.mentions.push(chain_key(F_IDENT, &[], "this")),
+                SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
                     // The port reads the name of an element access source
                     // before it looks at the target (flow_p2.rs
-                    // is_matching_reference_kind).
+                    // is_matching_reference_kind), for every kind.
                     if src.kind() == SyntaxKind::ElementAccessExpression
                         && is_entity_name_expression(src.argument_expression())
                     {
-                        sink.blocked[0] = true;
+                        self.blocked |= ALL_BASE;
+                    } else {
+                        self.chain(read_chain(src, true), F_ACC, C_M, ACC_BASE);
                     }
-                } else {
-                    add_chain_mention(sink, 0, kind, read_chain(src, true), F_ACC, C_M);
                 }
+                _ => {}
+            }
+        }
+    }
+
+    /// `containsMatchingReference(R, x)` (flow.go:1841): each proper prefix
+    /// of an access reference is a source with x as the target.
+    fn cm(&mut self, x: Node) {
+        let t = unwrap_target(x);
+        match t.kind() {
+            SyntaxKind::Identifier => {
+                self.mentions.push(chain_key(F_ACCP, &[], t.text()));
+                self.resolves.push((t, slot(K_ACC_IDENT, false)));
+            }
+            SyntaxKind::ThisKeyword => self.mentions.push(chain_key(F_ACCP, &[], "this")),
+            SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement => {
+                let name = t.name();
+                if name.is_some() && is_identifier(name) {
+                    self.mentions.push(chain_key(F_ACCP, &[], name.text()));
+                }
+            }
+            SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
+                self.chain(read_chain(t, false), F_ACCP, C_CM, ACC_BASE);
             }
             _ => {}
         }
     }
-}
 
-/// `containsMatchingReference(R, x)` for an access reference: each proper
-/// prefix of R is a source with x as the target.
-fn interpret_cm(x: Node, kind: u8, sink: &mut Sink) {
-    if kind != K_ACC_IDENT && kind != K_ACC_THIS {
-        return;
-    }
-    let t = unwrap_target(x);
-    match t.kind() {
-        SyntaxKind::Identifier => {
-            if kind == K_ACC_IDENT {
-                sink.mentions[0].push(chain_key(F_ACCP, &[], t.text()));
-                sink.resolves[0].push(t);
-            }
-        }
-        SyntaxKind::ThisKeyword => {
-            if kind == K_ACC_THIS {
-                sink.mentions[0].push(chain_key(F_ACCP, &[], "this"));
-            }
-        }
-        SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement => {
-            let name = t.name();
-            if kind == K_ACC_IDENT && name.is_some() && is_identifier(name) {
-                sink.mentions[0].push(chain_key(F_ACCP, &[], name.text()));
-            }
-        }
-        SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
-            add_chain_mention(sink, 0, kind, read_chain(t, false), F_ACCP, C_CM);
-        }
-        _ => {}
-    }
-}
-
-/// The meaning of `events` for `kind`. With `union_too` false the
-/// union-only part is left out.
-fn interpret(events: &[Ev], kind: u8, union_too: bool, sink: &mut Sink) {
-    for &ev in events {
+    fn event(&mut self, ev: Ev) {
         match ev {
-            Ev::M(x, u) => {
-                if u && !union_too {
-                    continue;
-                }
-                interpret_m(x, usize::from(u), kind, sink);
-            }
-            Ev::Oc(x) => interpret_oc(x, kind, sink),
-            Ev::Cm(x) => interpret_cm(x, kind, sink),
+            Ev::M(x, u) => self.m(x, u),
+            Ev::Oc(x) => self.oc(x),
+            Ev::Cm(x) => self.cm(x),
             Ev::NIdent(x, at, d) => {
-                interpret_m(x, 0, kind, sink);
-                sink.resolves[0].push(x);
-                sink.aliases[0].push(Alias::N(x, at, d));
+                self.m(x, false);
+                // narrowType resolves it for every kind (flow.go:388).
+                self.resolves.push((x, ALL_BASE));
+                self.aliases.push(Alias::N(x, at, d));
             }
             Ev::DIdent(x) => {
-                if union_too {
-                    sink.resolves[1].push(x);
-                    sink.aliases[1].push(Alias::D(x));
-                }
+                self.resolves.push((x, ALL_UNION));
+                self.aliases.push(Alias::D(x));
             }
-            Ev::Block => sink.blocked[0] = true,
+            Ev::Block => self.blocked |= ALL_BASE,
         }
     }
 }
@@ -864,39 +892,15 @@ fn interpret(events: &[Ev], kind: u8, union_too: bool, sink: &mut Sink) {
 // The per-file index
 // ──────────────────────────────────────────────────────────────────────
 
-/// Sorted entry and exit numbers of the nodes that mention one key.
-#[derive(Default)]
-struct Mentions {
-    tins: Vec<u32>,
-    touts: Vec<u32>,
-}
-
-impl Mentions {
-    /// Mentions on the path from the node with entry number `p` to its
-    /// root: ancestors-or-self m have tin[m] <= p < tout[m].
-    fn on_path(&self, p: u32) -> usize {
-        self.tins.partition_point(|&t| t <= p) - self.touts.partition_point(|&t| t <= p)
-    }
-}
-
-/// Chain sites of one names key, sorted by entry number.
-#[derive(Default)]
-struct ChainSites {
-    tin: Vec<u32>,
-    tout: Vec<u32>,
-    root: Vec<Node>,
-    done: Vec<bool>,
-    remaining: u32,
-}
-
 struct Cand {
     node: u32,
     /// The call of a call node, else nil.
     call: Node,
-    /// Resolve lists by kind and union part: `res[k * 2 + u]` is
-    /// `res_pool[res_start[k * 2 + u]..res_start[k * 2 + u + 1]]`.
-    res_start: [u32; KINDS * 2 + 1],
-    /// Bits `k * 2 + u`: a key site or union-making operator.
+    /// `res_pool[res_start..res_end]`: identifiers Go resolves here, with
+    /// the bits (`slot`) of the kinds that resolve them.
+    res_start: u32,
+    res_end: u32,
+    /// Bits (`slot`): a key site or union-making operator.
     blocked: u8,
     alias_start: u32,
     alias_end: u32,
@@ -925,17 +929,22 @@ struct FileIndex {
     steps: Vec<u32>,
     tin: Vec<u32>,
     stop: Vec<u32>,
+    /// The root of each reached node's tree.
+    root_of: Vec<u32>,
     cand_of: Vec<u32>,
     cands: Vec<Cand>,
-    res_pool: Vec<Node>,
+    res_pool: Vec<(Node, u8)>,
     alias_pool: Vec<Alias>,
-    mentions: FxHashMap<u64, Mentions>,
-    chain_sites: FxHashMap<u64, ChainSites>,
+    /// Mentions: `(key, tin)` and `(key, tout)` of each mentioning node,
+    /// sorted; `mention_range[key]` is the part of both lists with `key`.
+    mention_in: Vec<u32>,
+    mention_out: Vec<u32>,
+    mention_range: FxHashMap<u64, (u32, u32)>,
+    /// Chain sites sorted by key, then tin: key, tin, tout, root.
+    chain_sites: Vec<(u64, u32, u32, Node)>,
     classes: Vec<Option<Box<ClassState>>>,
 }
 
-/// The class of a walk: kind x union declared type x constant reference
-/// (go-model-fix.md "Class").
 #[derive(Clone, Copy, Debug)]
 struct Class {
     kind: u8,
@@ -1016,11 +1025,25 @@ impl FileIndex {
         let mut parent = vec![NONE; n];
         let mut root_kind = vec![0u8; n];
         let mut nest_self = vec![0u32; n];
+        let mut cand_of = vec![NONE; n];
+        let mut cands: Vec<Cand> = Vec::new();
         for (i, flow) in flows.iter().enumerate() {
             match next_of(flows, file, flow) {
                 Ok((p, nest)) => {
                     parent[i] = p;
                     nest_self[i] = nest;
+                    if is_candidate(flow.flags) {
+                        cand_of[i] = cands.len() as u32;
+                        cands.push(Cand {
+                            node: i as u32,
+                            call: Node::NIL,
+                            res_start: 0,
+                            res_end: 0,
+                            blocked: 0,
+                            alias_start: 0,
+                            alias_end: 0,
+                        });
+                    }
                 }
                 Err(kind) => root_kind[i] = kind,
             }
@@ -1045,26 +1068,13 @@ impl FileIndex {
                 fill[p as usize] += 1;
             }
         }
+        drop(fill);
         let mut tin = vec![NONE; n];
         let mut tout = vec![NONE; n];
         let mut nest = vec![0u32; n];
         let mut steps = vec![0u32; n];
         let mut stop = vec![NONE; n];
-        let mut cand_of = vec![NONE; n];
-        let mut cands: Vec<Cand> = Vec::new();
-        for (i, flow) in flows.iter().enumerate() {
-            if root_kind[i] == 0 && is_candidate(flow.flags) {
-                cand_of[i] = cands.len() as u32;
-                cands.push(Cand {
-                    node: i as u32,
-                    call: Node::NIL,
-                    res_start: [0; KINDS * 2 + 1],
-                    blocked: 0,
-                    alias_start: 0,
-                    alias_end: 0,
-                });
-            }
-        }
+        let mut root_of = vec![NONE; n];
         let mut counter = 0u32;
         let mut stack: Vec<(u32, u32)> = Vec::new();
         for r in 0..n {
@@ -1075,6 +1085,7 @@ impl FileIndex {
             counter += 1;
             steps[r] = 1;
             stop[r] = r as u32;
+            root_of[r] = r as u32;
             stack.push((r as u32, child_start[r]));
             while let Some(top) = stack.last_mut() {
                 let (x, ci) = *top;
@@ -1090,6 +1101,7 @@ impl FileIndex {
                     } else {
                         stop[x as usize]
                     };
+                    root_of[c] = root_of[x as usize];
                     stack.push((c as u32, child_start[c]));
                 } else {
                     tout[x as usize] = counter;
@@ -1097,36 +1109,22 @@ impl FileIndex {
                 }
             }
         }
+        drop(children);
+        drop(child_start);
         // Events of the reached candidates.
-        let mut index = FileIndex {
-            flows,
-            file,
-            parent,
-            root_kind,
-            nest,
-            steps,
-            tin,
-            stop,
-            cand_of,
-            cands: Vec::new(),
-            res_pool: Vec::new(),
-            alias_pool: Vec::new(),
-            mentions: FxHashMap::default(),
-            chain_sites: FxHashMap::default(),
-            classes: (0..CLASSES).map(|_| None).collect(),
-        };
-        let mut mention_entries: FxHashMap<u64, Vec<(u32, u32)>> = FxHashMap::default();
-        let mut chain_entries: FxHashMap<u64, Vec<(u32, u32, Node)>> = FxHashMap::default();
+        let mut res_pool = Vec::new();
+        let mut alias_pool = Vec::new();
+        let mut mention_in = Vec::new();
+        let mut mention_out = Vec::new();
+        let mut chain_sites = Vec::new();
         let mut scan = Scan {
             strict,
             out: Vec::new(),
         };
-        let mut sink = Sink::default();
-        let mut keys: Vec<u64> = Vec::new();
-        let mut sites: Vec<(u64, Node)> = Vec::new();
+        let mut out = Out::default();
         for cand in &mut cands {
             let i = cand.node as usize;
-            if index.tin[i] == NONE {
+            if tin[i] == NONE {
                 continue;
             }
             let flow = &flows[i];
@@ -1136,76 +1134,89 @@ impl FileIndex {
                 scan.assignment(flow.node);
             } else if flags.intersects(FlowFlags::CALL) {
                 cand.call = flow.node;
+                continue;
             } else if flags.intersects(FlowFlags::CONDITION) {
                 scan.n(flow.node, flags.intersects(FlowFlags::TRUE_CONDITION), 0);
             } else {
                 scan.switch(flow.node);
             }
-            keys.clear();
-            sites.clear();
-            for kind in 0..KINDS as u8 {
-                sink.clear();
-                interpret(&scan.out, kind, true, &mut sink);
-                for u in 0..2 {
-                    let slot = usize::from(kind) * 2 + u;
-                    cand.res_start[slot] = index.res_pool.len() as u32;
-                    let list = &mut sink.resolves[u];
-                    list.sort_unstable();
-                    list.dedup();
-                    index.res_pool.extend_from_slice(list);
-                    if sink.blocked[u] {
-                        cand.blocked |= 1 << slot;
-                    }
-                    keys.extend_from_slice(&sink.mentions[u]);
-                    sites.extend_from_slice(&sink.chains[u]);
-                }
-            }
-            cand.res_start[KINDS * 2] = index.res_pool.len() as u32;
-            // Aliases do not depend on the kind: take them from the events.
-            cand.alias_start = index.alias_pool.len() as u32;
+            out.clear();
             for &ev in &scan.out {
-                match ev {
-                    Ev::NIdent(x, at, d) => index.alias_pool.push(Alias::N(x, at, d)),
-                    Ev::DIdent(x) => index.alias_pool.push(Alias::D(x)),
-                    _ => {}
+                out.event(ev);
+            }
+            cand.blocked = out.blocked;
+            out.resolves.sort_unstable_by_key(|r| r.0);
+            cand.res_start = res_pool.len() as u32;
+            for &(x, bits) in &out.resolves {
+                let merge = res_pool.len() as u32 > cand.res_start;
+                match res_pool.last_mut() {
+                    Some((last, last_bits)) if merge && *last == x => *last_bits |= bits,
+                    _ => res_pool.push((x, bits)),
                 }
             }
-            cand.alias_end = index.alias_pool.len() as u32;
-            keys.sort_unstable();
-            keys.dedup();
-            let (a, b) = (index.tin[i], tout[i]);
-            for &key in &keys {
-                mention_entries.entry(key).or_default().push((a, b));
+            cand.res_end = res_pool.len() as u32;
+            cand.alias_start = alias_pool.len() as u32;
+            alias_pool.extend_from_slice(&out.aliases);
+            cand.alias_end = alias_pool.len() as u32;
+            out.mentions.sort_unstable();
+            out.mentions.dedup();
+            for &key in &out.mentions {
+                mention_in.push((key, tin[i]));
+                mention_out.push((key, tout[i]));
             }
-            sites.sort_unstable();
-            sites.dedup();
-            for &(key, root) in &sites {
-                chain_entries.entry(key).or_default().push((a, b, root));
+            out.chains.sort_unstable();
+            out.chains.dedup();
+            for &(key, root) in &out.chains {
+                chain_sites.push((key, tin[i], tout[i], root));
             }
         }
-        index.cands = cands;
-        for (key, entries) in mention_entries {
-            let mut tins: Vec<u32> = entries.iter().map(|e| e.0).collect();
-            let mut touts: Vec<u32> = entries.iter().map(|e| e.1).collect();
-            tins.sort_unstable();
-            touts.sort_unstable();
-            index.mentions.insert(key, Mentions { tins, touts });
+        mention_in.sort_unstable();
+        mention_out.sort_unstable();
+        let mut mention_range = FxHashMap::default();
+        let mut start = 0;
+        while start < mention_in.len() {
+            let key = mention_in[start].0;
+            let mut end = start + 1;
+            while end < mention_in.len() && mention_in[end].0 == key {
+                end += 1;
+            }
+            mention_range.insert(key, (start as u32, end as u32));
+            start = end;
         }
-        for (key, mut entries) in chain_entries {
-            entries.sort_unstable_by_key(|e| e.0);
-            let len = entries.len();
-            index.chain_sites.insert(
-                key,
-                ChainSites {
-                    tin: entries.iter().map(|e| e.0).collect(),
-                    tout: entries.iter().map(|e| e.1).collect(),
-                    root: entries.iter().map(|e| e.2).collect(),
-                    done: vec![false; len],
-                    remaining: len as u32,
-                },
-            );
+        let mention_in = mention_in.into_iter().map(|e| e.1).collect();
+        let mention_out = mention_out.into_iter().map(|e| e.1).collect();
+        chain_sites.sort_unstable_by_key(|s| (s.0, s.1));
+        FileIndex {
+            flows,
+            file,
+            parent,
+            root_kind,
+            nest,
+            steps,
+            tin,
+            stop,
+            root_of,
+            cand_of,
+            cands,
+            res_pool,
+            alias_pool,
+            mention_in,
+            mention_out,
+            mention_range,
+            chain_sites,
+            classes: (0..CLASSES).map(|_| None).collect(),
         }
-        index
+    }
+
+    /// Nodes on the path from the node with entry number `p` to its root
+    /// that mention `key`.
+    fn mentions_on_path(&self, key: u64, p: u32) -> usize {
+        let Some(&(a, b)) = self.mention_range.get(&key) else {
+            return 0;
+        };
+        let (a, b) = (a as usize, b as usize);
+        self.mention_in[a..b].partition_point(|&t| t <= p)
+            - self.mention_out[a..b].partition_point(|&t| t <= p)
     }
 
     fn class_state(&mut self, class: Class) -> &mut ClassState {
@@ -1413,7 +1424,7 @@ impl Checker {
                 Some(value_declaration.is_some() && is_function_expression(value_declaration))
             }
             SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
-                if !self.flow_skip_constant_reference(node.expression())? {
+                if !self.flow_skip_constant_reference_cached(node.expression())? {
                     return Some(false);
                 }
                 let symbol = self
@@ -1483,25 +1494,31 @@ impl Checker {
             return Err(Refusal::Inline);
         }
         let file = flow.file_index();
-        let build_after = self.flow_skip.build_after;
+        let build_steps = self.flow_skip.build_steps;
         let state = self
             .flow_skip
             .files
             .entry(file as u32)
-            .or_insert(FileState::Counting(0));
+            .or_insert(FileState::Counting { walks: 0, steps: 0 });
         match state {
             FileState::Unsupported => return Err(Refusal::File),
-            FileState::Counting(count) => {
-                *count += 1;
-                if *count < build_after {
-                    return Err(Refusal::Counting);
-                }
+            FileState::Counting { walks, steps } => {
                 // Only a static file (the CLI case) is indexed: its flow
                 // nodes live for the process.
                 let Some(flows) = static_go_file(file).and_then(|g| g.flow_nodes.get()) else {
                     *state = FileState::Unsupported;
                     return Err(Refusal::File);
                 };
+                *walks += 1;
+                if *walks % SAMPLE_EVERY == 0 {
+                    let u = flow.local_index();
+                    if u < flows.len() {
+                        *steps += u64::from(dry_steps(flows, file, u) * SAMPLE_EVERY);
+                    }
+                }
+                if *steps < u64::from(build_steps) * flows.len() as u64 {
+                    return Err(Refusal::Counting);
+                }
                 let start = std::time::Instant::now();
                 let index = FileIndex::build(file, flows.as_slice(), self.strict_null_checks);
                 *state = FileState::Built(Box::new(index));
@@ -1512,11 +1529,104 @@ impl Checker {
             }
             FileState::Built(_) => {}
         }
+        let mut files = std::mem::take(&mut self.flow_skip.files);
+        let Some(FileState::Built(index)) = files.get_mut(&(file as u32)) else {
+            unreachable!("the file index was built above");
+        };
+        let result = self.flow_skip_check(index, reference, declared_type, flow_container, flow);
+        if result.is_ok() {
+            self.flow_skip.stats.skipped_steps += u64::from(index.steps[flow.local_index()]);
+        }
+        self.flow_skip.files = files;
+        result
+    }
+
+    /// Follows pi(u) through the index: first the static tests of every
+    /// segment (mentions, chain sites, depth, roots), then the candidates of
+    /// the class (go-model.md 4.4).
+    fn flow_skip_check(
+        &mut self,
+        index: &mut FileIndex,
+        reference: Node,
+        declared_type: TypeId,
+        flow_container: Node,
+        flow: FlowNodeId,
+    ) -> Result<u32, Refusal> {
+        let u = flow.local_index();
+        if u >= index.flows.len() || index.tin[u] == NONE {
+            return Err(Refusal::Unreached);
+        }
+        if index.steps[u] < self.flow_skip.min_steps {
+            // A short walk: test it only when its root may move to the
+            // containing function.
+            let root = index.root_of[u] as usize;
+            if index.root_kind[root] != ROOT_START || index.flows[root].node.is_nil() {
+                return Err(Refusal::Short);
+            }
+        }
         let union = self.ty(declared_type).flags.intersects(TypeFlags::UNION);
         let Some(keys) = self.flow_skip_ref_keys(reference, union) else {
             return Err(Refusal::Kind);
         };
-        let cr = match self.flow_skip_constant_reference(reference) {
+        let mut segments: SmallVec<[u32; 4]> = SmallVec::new();
+        let mut seg = u;
+        let mut total_nest = 0u32;
+        loop {
+            let p = index.tin[seg];
+            if p == NONE {
+                return Err(Refusal::Unreached);
+            }
+            for &key in &keys.mentions {
+                if index.mentions_on_path(key, p) > 0 {
+                    return Err(Refusal::Mention);
+                }
+            }
+            for &key in &keys.chains {
+                let first = index.chain_sites.partition_point(|s| s.0 < key);
+                for &(k, site_tin, site_tout, root) in &index.chain_sites[first..] {
+                    if k != key || site_tin > p {
+                        break;
+                    }
+                    if site_tout > p && !self.flow_skip_resolved(root) {
+                        return Err(Refusal::Chain);
+                    }
+                }
+            }
+            total_nest += index.nest[seg];
+            if total_nest >= 2000 {
+                return Err(Refusal::Depth);
+            }
+            segments.push(seg as u32);
+            let root = index.root_of[seg] as usize;
+            match index.root_kind[root] {
+                ROOT_UNREACHABLE => break,
+                ROOT_START => {
+                    // Go's rule for moving to the containing function
+                    // (flow.go:189).
+                    let container = index.flows[root].node;
+                    let crosses = container.is_some()
+                        && container != flow_container
+                        && match keys.kind {
+                            K_IDENT => true,
+                            K_THIS => is_arrow_function(container),
+                            _ => false,
+                        };
+                    if !crosses {
+                        break;
+                    }
+                    let outer = container.flow_node();
+                    if outer.is_nil()
+                        || outer.file_index() != index.file
+                        || outer.local_index() >= index.flows.len()
+                    {
+                        return Err(Refusal::Cross);
+                    }
+                    seg = outer.local_index();
+                }
+                _ => return Err(Refusal::Root),
+            }
+        }
+        let cr = match self.flow_skip_constant_reference_cached(reference) {
             Some(false) => 0,
             Some(true) => 1,
             None => 2,
@@ -1526,80 +1636,9 @@ impl Checker {
             union,
             cr,
         };
-        let mut files = std::mem::take(&mut self.flow_skip.files);
-        let Some(FileState::Built(index)) = files.get_mut(&(file as u32)) else {
-            unreachable!("the file index was built above");
-        };
-        let result = self.flow_skip_walk(index, &keys, class, flow_container, flow);
-        self.flow_skip.files = files;
-        if result.is_ok() {
-            self.flow_skip.stats.skipped_steps +=
-                u64::from(index_steps_hint(&self.flow_skip.files, file, flow).unwrap_or(0));
-        }
-        result
-    }
-
-    /// Follows pi(u) through the index, segment by segment.
-    fn flow_skip_walk(
-        &mut self,
-        index: &mut FileIndex,
-        keys: &RefKeys,
-        class: Class,
-        flow_container: Node,
-        flow: FlowNodeId,
-    ) -> Result<u32, Refusal> {
-        let mut seg = flow.local_index();
-        if seg >= index.flows.len() || index.tin[seg] == NONE {
-            return Err(Refusal::Unreached);
-        }
-        if index.steps[seg] < self.flow_skip.min_steps {
-            // A short walk: test it only when its root may move to the
-            // containing function.
-            let mut root = seg;
-            while index.root_kind[root] == 0 {
-                root = index.parent[root] as usize;
-            }
-            let root_flow = &index.flows[root];
-            if index.root_kind[root] != ROOT_START || root_flow.node.is_nil() {
-                return Err(Refusal::Short);
-            }
-        }
-        let mut total_nest = 0u32;
-        loop {
-            let p = index.tin[seg];
-            if p == NONE {
-                return Err(Refusal::Unreached);
-            }
-            for key in &keys.mentions {
-                if index.mentions.get(key).is_some_and(|m| m.on_path(p) > 0) {
-                    return Err(Refusal::Mention);
-                }
-            }
-            for key in &keys.chains {
-                if let Some(sites) = index.chain_sites.get_mut(key) {
-                    if sites.remaining != 0 {
-                        for i in 0..sites.tin.len() {
-                            if sites.tin[i] > p {
-                                break;
-                            }
-                            if sites.done[i] || sites.tout[i] <= p {
-                                continue;
-                            }
-                            if !self.flow_skip_resolved(sites.root[i]) {
-                                return Err(Refusal::Chain);
-                            }
-                            sites.done[i] = true;
-                            sites.remaining -= 1;
-                        }
-                    }
-                }
-            }
-            total_nest += index.nest[seg];
-            if total_nest >= 2000 {
-                return Err(Refusal::Depth);
-            }
+        for &seg in &segments {
             // Candidates on the path, through the joined ones.
-            let mut s = find(&mut index.class_state(class).next, seg as u32);
+            let mut s = find(&mut index.class_state(class).next, seg);
             loop {
                 let ci = index.cand_of[s as usize];
                 if ci == NONE {
@@ -1611,7 +1650,7 @@ impl Checker {
                     S_EXTRAS => {
                         let state = index.class_state(class);
                         let extras = &state.extras[&ci];
-                        if !self.flow_skip_extras_ok(extras, keys) {
+                        if !self.flow_skip_extras_ok(extras, &keys) {
                             return Err(Refusal::Extras);
                         }
                     }
@@ -1623,7 +1662,7 @@ impl Checker {
                             state.next[s as usize] = parent;
                         }
                         Settle::Extras(extras) => {
-                            let ok = self.flow_skip_extras_ok(&extras, keys);
+                            let ok = self.flow_skip_extras_ok(&extras, &keys);
                             let state = index.class_state(class);
                             state.state[ci as usize] = S_EXTRAS;
                             state.extras.insert(ci, extras);
@@ -1641,33 +1680,30 @@ impl Checker {
                 let parent = index.parent[s as usize];
                 s = find(&mut index.class_state(class).next, parent);
             }
-            // The root of this segment.
-            match index.root_kind[s as usize] {
-                ROOT_UNREACHABLE => return Ok(total_nest),
-                ROOT_START => {
-                    let container = index.flows[s as usize].node;
-                    let crosses = container.is_some()
-                        && container != flow_container
-                        && match keys.kind {
-                            K_IDENT => true,
-                            K_THIS => is_arrow_function(container),
-                            _ => false,
-                        };
-                    if !crosses {
-                        return Ok(total_nest);
-                    }
-                    let outer = container.flow_node();
-                    if outer.is_nil()
-                        || outer.file_index() != index.file
-                        || outer.local_index() >= index.flows.len()
-                    {
-                        return Err(Refusal::Cross);
-                    }
-                    seg = outer.local_index();
-                }
-                _ => return Err(Refusal::Root),
-            }
         }
+        Ok(total_nest)
+    }
+
+    /// `flow_skip_constant_reference` with the answer for an identifier
+    /// (or the identifier root of an access) kept once it is final: a
+    /// constant variable stays one, and the assignments of a marked
+    /// function do not change.
+    fn flow_skip_constant_reference_cached(&mut self, reference: Node) -> Option<bool> {
+        if reference.kind() != SyntaxKind::Identifier {
+            return self.flow_skip_constant_reference(reference);
+        }
+        let symbol = self
+            .symbol_node_links
+            .try_get(reference)
+            .map_or(SymbolId::NIL, |links| links.resolved_symbol);
+        if let Some(&known) = self.flow_skip.constant_references.get(&symbol) {
+            return Some(known);
+        }
+        let result = self.flow_skip_constant_reference(reference);
+        if let Some(known) = result {
+            self.flow_skip.constant_references.insert(symbol, known);
+        }
+        result
     }
 
     fn flow_skip_extras_ok(&self, extras: &Extras, keys: &RefKeys) -> bool {
@@ -1704,19 +1740,17 @@ impl Checker {
                 return Settle::Blocked;
             }
         }
-        let lists = if class.union { 2 } else { 1 };
-        for u in 0..lists {
-            let slot = k * 2 + u;
-            let (a, b) = (
-                cand.res_start[slot] as usize,
-                cand.res_start[slot + 1] as usize,
-            );
-            if !index.res_pool[a..b]
-                .iter()
-                .all(|&x| self.flow_skip_resolved(x))
-            {
-                return Settle::Unsettled;
-            }
+        let bits = slot(class.kind, false)
+            | if class.union {
+                slot(class.kind, true)
+            } else {
+                0
+            };
+        if !index.res_pool[cand.res_start as usize..cand.res_end as usize]
+            .iter()
+            .all(|&(x, b)| b & bits == 0 || self.flow_skip_resolved(x))
+        {
+            return Settle::Unsettled;
         }
         let mut extras = Extras::default();
         for alias in &index.alias_pool[cand.alias_start as usize..cand.alias_end as usize] {
@@ -1832,28 +1866,36 @@ impl Checker {
         class: Class,
         extras: &mut Extras,
     ) -> Result<(), Settle> {
-        let mut sink = Sink::default();
-        interpret(events, class.kind, class.union, &mut sink);
-        for u in 0..2 {
-            if sink.blocked[u] {
-                return Err(Settle::Blocked);
+        let mut out = Out::default();
+        for &ev in events {
+            // A non-union class leaves out the discriminant roles.
+            if class.union || !matches!(ev, Ev::M(_, true) | Ev::DIdent(_)) {
+                out.event(ev);
             }
-            if !sink.resolves[u].iter().all(|&x| self.flow_skip_resolved(x)) {
-                return Err(Settle::Unsettled);
-            }
-            extras.mentions.extend_from_slice(&sink.mentions[u]);
-            extras.chains.extend_from_slice(&sink.chains[u]);
         }
-        for u in 0..2 {
-            for &alias in &sink.aliases[u] {
-                match alias {
-                    Alias::N(x, at, d) => self.flow_skip_alias_n(x, at, d, class, extras)?,
-                    Alias::D(x) => {
-                        if class.union {
-                            self.flow_skip_alias_d(x, class, extras)?;
-                        }
-                    }
-                }
+        let bits = slot(class.kind, false)
+            | if class.union {
+                slot(class.kind, true)
+            } else {
+                0
+            };
+        if out.blocked & bits != 0 {
+            return Err(Settle::Blocked);
+        }
+        if !out
+            .resolves
+            .iter()
+            .all(|&(x, b)| b & bits == 0 || self.flow_skip_resolved(x))
+        {
+            return Err(Settle::Unsettled);
+        }
+        // Keys of other families never equal a key of this class.
+        extras.mentions.extend_from_slice(&out.mentions);
+        extras.chains.extend_from_slice(&out.chains);
+        for &alias in &out.aliases {
+            match alias {
+                Alias::N(x, at, d) => self.flow_skip_alias_n(x, at, d, class, extras)?,
+                Alias::D(x) => self.flow_skip_alias_d(x, class, extras)?,
             }
         }
         Ok(())
@@ -2013,17 +2055,6 @@ impl Checker {
     }
 }
 
-fn index_steps_hint(
-    files: &FxHashMap<u32, FileState>,
-    file: usize,
-    flow: FlowNodeId,
-) -> Option<u32> {
-    match files.get(&(file as u32))? {
-        FileState::Built(index) => index.steps.get(flow.local_index()).copied(),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2061,7 +2092,7 @@ mod tests {
             .root;
         let result = crate::program::with_type_checker_for_file(file, move |checker| {
             checker.flow_skip.mode = FlowSkipMode::Verify;
-            checker.flow_skip.build_after = 1;
+            checker.flow_skip.build_steps = 0;
             checker.flow_skip.min_steps = 0;
             checker.flow_skip.trace = Some(Vec::new());
             let ctx = crate::gostd::context::background();
