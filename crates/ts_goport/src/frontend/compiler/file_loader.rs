@@ -1252,15 +1252,17 @@ impl FileLoader {
         transforms.get(&Rc::as_ptr(&mapper)).cloned()
     }
 
-    /// After the loader's transform of a file of `mapper`: when the
-    /// transform opened the mapper project, keeps what the parse workers
-    /// send the later transforms with. Go opens the project on the first
+    /// After the loader's transform of a file of `mapper`: when the host
+    /// lets the parse workers transform (`prefetch_content_mapped`) and the
+    /// transform opened the mapper project, keeps what the workers send
+    /// the later transforms with. Go opens the project on the first
     /// transform too, so no request goes out that Go does not send.
     /// `GOPORT_MAPPED_PREFETCH=0` turns it off (an A/B switch).
     // PORT: not in Go (see `concurrent_transforms`).
     fn note_content_mapper_transform(&self, mapper: &Rc<Mapper>) {
         let key = Rc::as_ptr(mapper);
         if self.concurrent_transforms.borrow().contains_key(&key)
+            || !self.opts.host.prefetch_content_mapped()
             || std::env::var_os("GOPORT_MAPPED_PREFETCH").is_some_and(|value| value == "0")
         {
             return;

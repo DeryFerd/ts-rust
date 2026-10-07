@@ -89,6 +89,19 @@ pub trait CompilerHost {
         true
     }
 
+    /// True when the parse workers of a program load with this host send
+    /// the transform requests of the content-mapped files ahead of the
+    /// loader, once the loader's first transform opened the mapper project
+    /// (`FileLoader::concurrent_content_mapper_transform`). Then
+    /// `get_content_mapped_source_files` takes what they made
+    /// (`content_mapped_source_files`). The language server's project host
+    /// returns false: its parse cache makes each transform, of the editor
+    /// text.
+    // PORT: not in Go, where the parse goroutines send the transforms.
+    fn prefetch_content_mapped(&self) -> bool {
+        false
+    }
+
     /// The files that `get_source_file` gives now from the host's own
     /// cache, with no read and no parse, by name, with their references.
     /// The parse workers of a program load do not parse these files; they
@@ -344,6 +357,11 @@ impl CompilerHost for CompilerHostImpl {
             return Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone());
         };
         content_mapped_source_files(&*CompilerHost::fs(self), &**project, parse_options, mapper)
+    }
+
+    // PORT: not in Go (see `CompilerHost::prefetch_content_mapped`).
+    fn prefetch_content_mapped(&self) -> bool {
+        true
     }
 
     // Go: host.go:115 (*compilerHost).ContentMapperProject (tsgo#4712)
