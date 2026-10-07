@@ -15,6 +15,8 @@
 //! intersections, each by name (Go `strings.Compare`), and the
 //! intersections by their first member, then their second.
 
+use ts_goport::execute::tsc::ExitStatus;
+
 use crate::support::child::run_command_in_child;
 use crate::support::runner::TscInput;
 use crate::support::test_sys::new_test_sys;
@@ -84,6 +86,10 @@ fn a_union_over_4096_members_prints_in_go_order() {
     let args = ["-p", "tsconfig.json", "--pretty", "false"].map(String::from);
     let result = run_command_in_child(&sys, &args).unwrap_or_else(|err| panic!("tsgo: {err}"));
     assert!(result.unported.is_none(), "unported {:?}", result.unported);
+    assert_eq!(
+        result.status,
+        ExitStatus::DiagnosticsPresentOutputsGenerated
+    );
 
     let mut union: Vec<String> = sorted_names("s", 20)
         .into_iter()
@@ -99,7 +105,12 @@ fn a_union_over_4096_members_prints_in_go_order() {
          Type 'string' is not assignable to type 'number'.\n",
         union.join(" | ")
     );
+    // The test system adds the list of files after the diagnostics.
     let output = sys.output_text();
+    let output = output
+        .split("!!! List files start")
+        .next()
+        .unwrap_or_default();
     assert!(
         output == expected,
         "the union is not in Go's order: {} bytes, Go has {}; first difference at byte {}",
