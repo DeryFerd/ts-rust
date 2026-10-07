@@ -20,6 +20,7 @@
 //! mode (buildtask.go:251).
 
 use crate::execute::build::build_task::BuildTask;
+use crate::execute::build::host::ModuleIndicatorInputs;
 use crate::execute::build::orchestrator::Orchestrator;
 use crate::execute::tsc::compile::{Watcher, write_str};
 use crate::execute::watchmanager::{DirWatchSet, can_watch_directory, new_dir_watch_set};
@@ -499,7 +500,8 @@ impl Orchestrator {
         // is parsed again, and an overflow parses every file again, as Go
         // does in each cycle. A config change keeps the other parses for
         // the files whose parse options stay the same
-        // (`BuildHost::keep_watch_sources_for_config_change`).
+        // (`BuildHost::keep_watch_sources_for_config_change`), less the
+        // ones that read module indicator options that it changed (below).
         if overflow {
             self.host.evict_watch_sources(None);
         } else {
@@ -527,8 +529,16 @@ impl Orchestrator {
             args![],
         ));
         if needs_config_update {
+            // PORT: not in Go (see
+            // `BuildHost::drop_kept_parses_whose_module_indicator_options_change`).
+            let before = self.dirty_configs();
             // Generate new tasks
             self.generate_graph_reusing_old_tasks();
+            let changed = self.configs_with_new_module_indicator_inputs(before);
+            if !changed.is_empty() {
+                self.host
+                    .drop_kept_parses_whose_module_indicator_options_change(&changed);
+            }
         }
 
         // PORT: not in Go (see `BuildHost::prefetch`). Go parses the files
@@ -547,6 +557,50 @@ impl Orchestrator {
         }
         self.reset_caches();
         self.wm.borrow().unlock();
+    }
+
+    /// PORT: not in Go (see
+    /// `BuildHost::drop_kept_parses_whose_module_indicator_options_change`).
+    /// The config of each task whose config changed, from before the
+    /// change, by config path. A config that did not parse is left out.
+    fn dirty_configs(&self) -> FxHashMap<Path, Rc<ParsedCommandLine>> {
+        let mut configs = FxHashMap::default();
+        self.range_task(&mut |path: &Path, task: &Rc<RefCell<BuildTask>>| {
+            let task = task.borrow();
+            if task.dirty
+                && let Some(config) = &task.resolved
+            {
+                configs.insert(path.clone(), config.clone());
+            }
+        });
+        configs
+    }
+
+    /// PORT: not in Go (see
+    /// `BuildHost::drop_kept_parses_whose_module_indicator_options_change`).
+    /// The configs of `before` whose task now has other module indicator
+    /// inputs, each with those inputs: `None` when the task left the graph
+    /// or its config does not parse.
+    fn configs_with_new_module_indicator_inputs(
+        &self,
+        mut before: FxHashMap<Path, Rc<ParsedCommandLine>>,
+    ) -> Vec<(Option<ModuleIndicatorInputs>, Rc<ParsedCommandLine>)> {
+        let mut changed = Vec::new();
+        self.range_task(&mut |path: &Path, task: &Rc<RefCell<BuildTask>>| {
+            let Some(config) = before.remove(path) else {
+                return;
+            };
+            let inputs = task
+                .borrow()
+                .resolved
+                .as_ref()
+                .map(|now| ModuleIndicatorInputs::of(now.compiler_options()));
+            if inputs != Some(ModuleIndicatorInputs::of(config.compiler_options())) {
+                changed.push((inputs, config));
+            }
+        });
+        changed.extend(before.into_values().map(|config| (None, config)));
+        changed
     }
 
     // Go: build/orchestrator.go:919 (*Orchestrator).rangeTask

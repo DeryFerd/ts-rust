@@ -80,6 +80,79 @@ pub struct SourceFileCacheKey(pub SourceFileParseOptions);
 pub struct WatchSource {
     file: Rc<ParsedSourceFile>,
     mod_time: Option<std::time::SystemTime>,
+    /// `reads_module_indicator_options(file)`, found at the parse: a later
+    /// node read of a freeable version pins it on this thread until the
+    /// next program release (`ast::with_file_version`), so a test of a
+    /// kept parse before a build would keep it through the build.
+    reads_options: bool,
+}
+
+/// PORT: not in Go. What the module indicator options of a parse take from
+/// the compiler options (Go `GetExternalModuleIndicatorOptions`,
+/// parseoptions.go:19; the rest is the file name and its package.json):
+/// the detection kind, and with `auto` only, whether `jsx` is react-jsx or
+/// react-jsxdev and whether the module resolution is in Node16..NodeNext,
+/// which reads the package.json `type` (`loadSourceFileMetaData`,
+/// fileloader.go:384). `module` is not one: once the `type` is known,
+/// `GetImpliedNodeFormatForEmitWorker` (utilities.go:2622) gives ESNext to
+/// the same files with any module kind. Two configs with the same inputs
+/// give each file the same module indicator options. See
+/// `BuildHost::drop_kept_parses_whose_module_indicator_options_change`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ModuleIndicatorInputs {
+    detection: ModuleDetectionKind,
+    jsx: bool,
+    node_resolution: bool,
+}
+
+impl ModuleIndicatorInputs {
+    #[must_use]
+    pub fn of(options: &CompilerOptions) -> Self {
+        let detection = options.get_emit_module_detection_kind();
+        let auto = detection == ModuleDetectionKind::AUTO;
+        let resolution = options.get_module_resolution_kind();
+        ModuleIndicatorInputs {
+            detection,
+            jsx: auto
+                && (options.jsx == JsxEmit::REACT_JSX || options.jsx == JsxEmit::REACT_JSX_DEV),
+            node_resolution: auto
+                && ModuleResolutionKind::NODE16 <= resolution
+                && resolution <= ModuleResolutionKind::NODE_NEXT,
+        }
+    }
+
+    /// The module indicator options of `file_name` under these inputs
+    /// (Go `GetExternalModuleIndicatorOptions`), or `None` when they take
+    /// the package.json `type`, which is not read here: with `auto`, for a
+    /// file that is not .mts, .cts, .mjs or .cjs, under a Node16..NodeNext
+    /// resolution or in node_modules (fileloader.go:384).
+    #[must_use]
+    pub fn options_of(self, file_name: &str) -> Option<ExternalModuleIndicatorOptions> {
+        if is_declaration_file_name(file_name) {
+            return Some(ExternalModuleIndicatorOptions::default());
+        }
+        match self.detection {
+            ModuleDetectionKind::FORCE => Some(ExternalModuleIndicatorOptions {
+                jsx: false,
+                force: true,
+            }),
+            ModuleDetectionKind::AUTO => {
+                // `isFileForcedToBeModuleByFormat` (parseoptions.go:46).
+                let force = file_extension_is_one_of(
+                    file_name,
+                    &[EXTENSION_CJS, EXTENSION_CTS, EXTENSION_MJS, EXTENSION_MTS],
+                );
+                if !force && (self.node_resolution || file_name.contains("/node_modules/")) {
+                    return None;
+                }
+                Some(ExternalModuleIndicatorOptions {
+                    jsx: self.jsx,
+                    force,
+                })
+            }
+            _ => Some(ExternalModuleIndicatorOptions::default()),
+        }
+    }
 }
 
 impl Hash for SourceFileCacheKey {
@@ -330,12 +403,8 @@ impl BuildHost {
     /// of a cycle ran on one thread (query-persist-client-core rebuilds took
     /// 2.7 times as long). A parse of the same text with the same options is
     /// the same file, so the output does not change. A bundled lib never
-    /// changes. `shared` is a `.d.ts` or `.json` file (see `get_source_file`).
-    fn watch_source_file(
-        &self,
-        opts: &SourceFileParseOptions,
-        shared: bool,
-    ) -> Option<Rc<ParsedSourceFile>> {
+    /// changes.
+    fn watch_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
         let key = SourceFileCacheKey(opts.clone());
         let fixed = crate::frontend::bundled::is_bundled(&opts.file_name);
         // The OS file system, not the one this cycle caches: a build of this
@@ -373,11 +442,11 @@ impl BuildHost {
             return Some(file);
         }
         let file = self.host.get_source_file(opts);
-        if shared {
-            // See the note in `get_source_file`.
-            if let Some(file) = &file {
-                crate::program::note_parsed_source_file(file);
-            }
+        // Each parse here can be kept and be a program file of a later
+        // build, also a `.ts` file that one program leaves out (see
+        // `note_kept_parse`, and the note in `get_source_file`).
+        if let Some(file) = &file {
+            crate::execute::watcher::note_kept_parse(file);
         }
         if let Some(sources) = self.watch_sources.borrow_mut().as_mut() {
             match &file {
@@ -387,6 +456,9 @@ impl BuildHost {
                         WatchSource {
                             file: file.clone(),
                             mod_time,
+                            reads_options: crate::frontend::parser::reads_module_indicator_options(
+                                file,
+                            ),
                         },
                     );
                 }
@@ -455,12 +527,72 @@ impl BuildHost {
             let Some(source) = before.get(&key) else {
                 continue;
             };
+            // Such a parse fits only its own options (no node read here,
+            // see `WatchSource::reads_options`).
+            if source.reads_options {
+                return None;
+            }
             let file = crate::frontend::parser::parse_with_options(&source.file, opts)?;
             let mod_time = source.mod_time;
             before.remove(&key);
-            return Some(WatchSource { file, mod_time });
+            return Some(WatchSource {
+                file,
+                mod_time,
+                reads_options: false,
+            });
         }
         None
+    }
+
+    /// PORT: not in Go (`keep_watch_sources_for_config_change`). Drops the
+    /// kept parses from before the config change of this cycle that its
+    /// builds will not take, so that they are freed before the builds parse
+    /// these files again. `Orchestrator::do_cycle` gives each project whose
+    /// change gave it other `ModuleIndicatorInputs`: its config from before
+    /// the change, whose files are the parses it holds, and its new inputs
+    /// (`None` when its config is gone). A kept parse that read its module
+    /// indicator options (`WatchSource::reads_options`) fits only a parse
+    /// with its own options. If it is a file of such a project, it goes
+    /// unless the options of the file under the new inputs of one of these
+    /// projects are its own (`ModuleIndicatorInputs::options_of`); when
+    /// such a project parses the file again with other options, it would
+    /// go at `end_config_change_cycle` all the same. The parses of the
+    /// other projects stay: Go shares no such parse between the programs
+    /// of a build (build/host.go:54 keeps only `.d.ts` and `.json` files,
+    /// and orchestrator.go:511 resets that cache in each cycle). Before,
+    /// the dropped parses stayed until `end_config_change_cycle`: on 600
+    /// script files with 12 `moduleDetection` edits, `tsc -b -w` held 24%
+    /// more RSS than R173, which dropped every kept parse before a config
+    /// change build. The file versions are freed on the free thread, beside
+    /// the build, as Go's GC frees the files of the old program.
+    pub fn drop_kept_parses_whose_module_indicator_options_change(
+        &self,
+        changed: &[(Option<ModuleIndicatorInputs>, Rc<ParsedCommandLine>)],
+    ) {
+        let mut versions = Vec::new();
+        self.watch_sources_before_config_change
+            .borrow_mut()
+            .retain(|key, source| {
+                if !source.reads_options {
+                    return true;
+                }
+                let mut held = false;
+                for (inputs, config) in changed {
+                    if !config.file_names_by_path().contains_key(&key.0.path) {
+                        continue;
+                    }
+                    let options = inputs.and_then(|inputs| inputs.options_of(&key.0.file_name));
+                    if options == Some(key.0.external_module_indicator_options) {
+                        return true;
+                    }
+                    held = true;
+                }
+                if held {
+                    versions.extend(source.file.version.get().cloned());
+                }
+                !held
+            });
+        crate::execute::build::build_task::drop_in_background(versions);
     }
 
     /// PORT: not in Go (`keep_watch_sources_for_config_change`). At the end
@@ -659,12 +791,12 @@ impl CompilerHost for BuildHost {
 
     // Go: build/host.go:54 (*host).GetSourceFile
     fn get_source_file(&self, opts: &SourceFileParseOptions) -> Option<Rc<ParsedSourceFile>> {
-        let shared = is_declaration_file_name(&opts.file_name)
-            || file_extension_is(&opts.file_name, EXTENSION_JSON);
         if self.watch_sources.borrow().is_some() {
-            return self.watch_source_file(opts, shared);
+            return self.watch_source_file(opts);
         }
-        if shared {
+        if is_declaration_file_name(&opts.file_name)
+            || file_extension_is(&opts.file_name, EXTENSION_JSON)
+        {
             // Cache dts and json files as they will be reused
             // PORT: a parse that the cache keeps can be left out of one
             // program (a deduplicated package, or a file that only such a
