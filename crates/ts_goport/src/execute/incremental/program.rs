@@ -151,7 +151,9 @@ pub fn build_info_program(
     build_info: &BuildInfo,
     host: &dyn CompilerHost,
 ) -> Option<Program> {
-    if !build_info.is_valid_version() || !build_info.is_incremental() {
+    if !build_info.is_valid_version(config.compiler_options().effect.is_some())
+        || !build_info.is_incremental()
+    {
         return None;
     }
     // If any configured content mapper's identity has changed, files it produced may be stale, so the
