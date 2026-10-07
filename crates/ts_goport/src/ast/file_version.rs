@@ -59,9 +59,10 @@
 //! +10.2% (+6.7% to +9.7% on the default threads), and the editor long
 //! sessions query-core +9.6%, hono +4.5%, effect +9.3%. A correct reader
 //! never sees a reuse: every holder of a node holds its version, and a
-//! given-back block waits two pin releases (`BlockPool`). The
-//! debug-assertion runs (the protected tests, the corpus, the editor and
-//! oracle runs) find a missed holder.
+//! given-back block waits two pin releases (`BlockPool`). No standing run
+//! has debug assertions: the protected tests run `--release`
+//! (`build-goport-tests.sh`), and the corpus, editor and oracle runs use
+//! release bins. A debug test build checks each `file_block` read.
 //!
 //! Freeable rule (`free_file_versions`, `freeable_path`): only a parse of
 //! a path that a publish on this thread published before, in a language

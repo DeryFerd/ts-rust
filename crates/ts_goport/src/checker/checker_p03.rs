@@ -284,7 +284,9 @@ impl Checker {
             self.source_file_links.get(source_file).unused_checked = true;
         }
         if run_effect {
-            // Set first: a rule can check this file again (`get_relation_errors`).
+            // Set first as a guard, not a need: `get_relation_errors` checks a file only
+            // when `type_checked` is false, and every rule passes this file, which is
+            // already type checked here.
             self.source_file_links.get(source_file).effect_checked = true;
             crate::effect::after_check_source_file(ctx, self, source_file);
         }
