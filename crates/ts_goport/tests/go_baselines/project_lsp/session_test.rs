@@ -1864,7 +1864,6 @@ child_test! {
         session.wait_for_background_tasks();
         assert!(on_read_other.borrow().is_none(), "the warm did not read the file");
         assert_eq!(reads.get(), 2, "one read per attempt");
-        assert!(!session.warm_auto_import_slow.get(), "a clone ended");
 
         let after = session.snapshot();
         assert!(!Rc::ptr_eq(&after, &before), "the warm's clone was not adopted");

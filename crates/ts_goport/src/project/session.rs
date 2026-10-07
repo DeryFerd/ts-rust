@@ -195,9 +195,10 @@ pub struct Session {
     // `warm_auto_import_cache`), and whether an idle job for it is queued.
     pub warm_auto_import_pending: RefCell<Option<PendingWarm>>,
     pub warm_auto_import_queued: Cell<bool>,
-    // PORT: set when an eager attempt of the warm ends without its clone,
-    // cleared when a clone ends. While it is set, a warm waits for a quiet
-    // period (see `run_pending_warm`).
+    // PORT: set when an eager attempt of the warm ends without its clone or
+    // a clone takes longer than `WARM_AUTO_IMPORT_HOLD_CAP`, cleared when a
+    // clone ends sooner. While it is set, a warm waits for a quiet period
+    // (see `run_pending_warm`).
     pub warm_auto_import_slow: Cell<bool>,
 
     // idleCacheCleanTimer is a resettable timer for scheduling idle disk
@@ -3743,10 +3744,10 @@ impl Session {
     /// warm cannot starve.
     ///
     /// An eager attempt that ends without its clone marks the session slow
-    /// (`warm_auto_import_slow`), and a clone that ends clears the mark.
-    /// While it is set, a new warm also waits for a quiet period, so on a
-    /// project whose warm is long, fast typing pays the hold only once per
-    /// completed warm.
+    /// (`warm_auto_import_slow`), and so does a clone that takes longer than
+    /// the hold can be. A clone that ends sooner clears the mark. While it is
+    /// set, a new warm also waits for a quiet period, so on a project whose
+    /// warm is long, a message pays the hold only before the first warm ends.
     pub fn run_pending_warm(self: &Rc<Self>) {
         self.warm_auto_import_queued.set(false);
         let Some(warm) = self.warm_auto_import_pending.take() else {
@@ -3799,6 +3800,7 @@ impl Session {
         );
         // PORT: the clone takes the id kept for it when the warm started.
         let next_snapshot_id = self.snapshot_id.replace(warm.snapshot_id - 1);
+        let clone_start = Instant::now();
         let cloned_snapshot = warm.new_snapshot.clone_(
             &build_ctx,
             warm_change,
@@ -3812,7 +3814,8 @@ impl Session {
             .end_attempt(&warm.ctx, &attempt_ctx);
         attempt_cancel();
         if end == WarmAttemptEnd::Done {
-            self.warm_auto_import_slow.set(false);
+            self.warm_auto_import_slow
+                .set(clone_start.elapsed() > WARM_AUTO_IMPORT_HOLD_CAP);
         } else if hold.is_some() {
             self.warm_auto_import_slow.set(true);
         }
