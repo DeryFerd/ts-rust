@@ -1118,7 +1118,7 @@ fn store_node_data<'f>(
     Some(fast.nodes.data(node))
 }
 
-// Go: api/encoder/encoder.go:525 (the visitor.Visit func of encodeTree)
+// Go: api/encoder/encoder.go:540 (the visitor.Visit func of encodeTree)
 fn encode_visit(node: Node, visitor: &mut EncodeVisitor<'_>, fast: Option<&StoreFile<'_>>) -> Node {
     // PERF: (apiperf2) a node of the store file reads its record once.
     let in_file = fast.filter(|fast| node.file_index() == fast.file);
@@ -1362,7 +1362,7 @@ fn encode_store_children(
     mask
 }
 
-// Go: api/encoder/encoder.go:483 (the VisitNodes hook of encodeTree)
+// Go: api/encoder/encoder.go:503 (the VisitNodes hook of encodeTree)
 fn encode_visit_nodes(
     node_list: NodeList,
     visitor: &mut EncodeVisitor<'_>,

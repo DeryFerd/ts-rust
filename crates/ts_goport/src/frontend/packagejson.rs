@@ -1117,7 +1117,7 @@ pub struct PendingInfo {
 
 impl PendingInfo {
     /// The cache entry of the read, with the text parsed as Go
-    /// `getPackageJsonInfo` parses it (module/resolver.go:1775).
+    /// `getPackageJsonInfo` parses it (module/resolver.go:1776).
     fn into_entry(self) -> Rc<InfoCacheEntry> {
         let contents = self.text.map(|text| {
             let parsed = parse(&go_string_bytes(&text));
