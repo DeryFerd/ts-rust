@@ -18,7 +18,8 @@ pub fn validate(options: &CompilerOptions, source_file: Node) -> Vec<Diagnostic>
     let Some(config) = options.effect.as_deref() else {
         return Vec::new();
     };
-    if !diagnostics_enabled(Some(config)) {
+    // PORT: a standalone API process reports no Effect diagnostics.
+    if !diagnostics_enabled(Some(config)) || !crate::effect::rulerunner::rules_enabled() {
         return Vec::new();
     }
     let severity = config
