@@ -568,8 +568,10 @@ impl FilesParser {
     /// Queues the worker jobs of the content-mapped files of the queued
     /// tasks once the loader's transform of a first file opened their
     /// mapper project (`FileLoader::note_content_mapper_transform`), and
-    /// starts the workers of such jobs with the first. Later tasks get
-    /// their jobs when they are queued (`start`).
+    /// starts the workers of such jobs the first time. Later tasks get
+    /// their jobs when they are queued (`start`), so the workers start
+    /// also when no mapped task waits yet (the mapped files that later
+    /// imports reach).
     // PORT: not in Go (see `PrefetchJob::mapped`).
     fn queue_mapped_prefetch(&self, loader: &FileLoader, pool: &mut PrefetchPool) {
         let requests: Vec<PrefetchRequest> = self
@@ -582,9 +584,6 @@ impl FilesParser {
             })
             .filter(|request| matches!(request, PrefetchRequest::Mapped(..)))
             .collect();
-        if requests.is_empty() {
-            return;
-        }
         pool.shared.queue_batch(requests);
         if !pool.mapped_workers {
             pool.mapped_workers = true;
