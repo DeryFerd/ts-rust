@@ -2063,34 +2063,11 @@ impl Server {
         ctx: &Context,
         lsp_exit: &CancelCauseFunc,
     ) -> Result<(), GoError> {
-        let busy = || self.shared.queued_requests.load(Ordering::SeqCst) != 0;
-        // PORT: idle work (the auto-import warm) runs only when no message
-        // waits: at once or after a quiet period with no message, as the job
-        // asks, so it does not delay a request that has arrived. Work it
-        // queues runs right after it, as it did when the warm ran inside
-        // `run_pending`. The frees that the last message or wake-up left
-        // (`gostd::local::drop_later`) run after its answer, while no
-        // message waits, but after a job that starts at once: Go's warm runs
-        // on a goroutine from before the answer, and Go's garbage collector
-        // frees in the background, so the frees do not delay Go's warm.
-        loop {
-            let quiet = match gostd::local::next_idle() {
-                Some(gostd::local::IdleStart::AtOnce) => Duration::ZERO,
-                Some(gostd::local::IdleStart::AfterQuiet) => {
-                    gostd::local::drop_garbage(busy);
-                    IDLE_QUIET_PERIOD
-                }
-                None => break,
-            };
-            if ctx.err().is_some()
-                || !self.shared.wait_quiet(self.free_since.get() + quiet)
-                || !gostd::local::run_idle()
-            {
-                break;
-            }
-            gostd::local::run_pending();
-        }
-        gostd::local::drop_garbage(busy);
+        run_idle_work(
+            ctx,
+            || self.shared.queued_requests.load(Ordering::SeqCst) != 0,
+            |quiet| self.shared.wait_quiet(self.free_since.get() + quiet),
+        );
 
         let item = self.shared.request_queue.get(ctx)?;
         if matches!(item, QueuedRequest::Request(_)) {
@@ -2197,6 +2174,39 @@ impl Server {
             Ok(None) => remove_request(),
         }
     }
+}
+
+/// PORT: the idle part of a dispatch turn, before it takes the next
+/// message. Idle work (the auto-import warm) runs only when no message
+/// waits: at once or after a quiet period with no message, as the job asks
+/// (`wait_quiet(period)` is false when a message comes first), so it does
+/// not delay a request that has arrived. Work it queues runs right after
+/// it, as it did when the warm ran inside `run_pending`. The frees that the
+/// last message or wake-up left (`gostd::local::drop_later`) run after its
+/// answer, while no message waits (`busy`), but after a job that starts at
+/// once: Go's warm runs on a goroutine from before the answer, and Go's
+/// garbage collector frees in the background, so the frees do not delay
+/// Go's warm.
+fn run_idle_work(
+    ctx: &Context,
+    busy: impl Fn() -> bool,
+    mut wait_quiet: impl FnMut(Duration) -> bool,
+) {
+    loop {
+        let quiet = match gostd::local::next_idle() {
+            Some(gostd::local::IdleStart::AtOnce) => Duration::ZERO,
+            Some(gostd::local::IdleStart::AfterQuiet) => {
+                gostd::local::drop_garbage(&busy);
+                IDLE_QUIET_PERIOD
+            }
+            None => break,
+        };
+        if ctx.err().is_some() || !wait_quiet(quiet) || !gostd::local::run_idle() {
+            break;
+        }
+        gostd::local::run_pending();
+    }
+    gostd::local::drop_garbage(busy);
 }
 
 /// PORT: how long the dispatch loop waits with an empty request queue
@@ -5444,5 +5454,53 @@ mod tests {
             )
             .unwrap();
         assert!(next_edit_waits(&queue), "the next didChange waits");
+    }
+
+    /// Logs its name when it is dropped.
+    struct Freed(&'static str, Rc<RefCell<Vec<&'static str>>>);
+
+    impl Drop for Freed {
+        fn drop(&mut self) {
+            self.1.borrow_mut().push(self.0);
+        }
+    }
+
+    // PORT: no Go counterpart (lswarm1). An idle job that starts at once
+    // (the eager auto-import warm) runs before the frees that the last
+    // message left, and a job that waits for a quiet period runs after
+    // them. On the bitecs T1 repro the frees took 0.2 to 0.35 ms, and the
+    // next didChange came 0.3 to 0.4 ms after the answer.
+    #[test]
+    fn an_eager_idle_job_runs_before_the_frees() {
+        std::thread::spawn(|| {
+            let ctx = context::background();
+            gostd::local::keep_garbage();
+            for (start, want) in [
+                (gostd::local::IdleStart::AtOnce, ["warm", "free"]),
+                (gostd::local::IdleStart::AfterQuiet, ["free", "warm"]),
+            ] {
+                let log = Rc::new(RefCell::new(Vec::new()));
+                gostd::local::drop_later(Box::new(Freed("free", log.clone())));
+                let job_log = log.clone();
+                gostd::local::go_idle(start, Box::new(move || job_log.borrow_mut().push("warm")));
+                let mut quiet = Vec::new();
+                run_idle_work(
+                    &ctx,
+                    || false,
+                    |period| {
+                        quiet.push(period);
+                        true
+                    },
+                );
+                assert_eq!(*log.borrow(), want, "{start:?}");
+                let period = match start {
+                    gostd::local::IdleStart::AtOnce => Duration::ZERO,
+                    gostd::local::IdleStart::AfterQuiet => IDLE_QUIET_PERIOD,
+                };
+                assert_eq!(quiet, [period], "{start:?}");
+            }
+        })
+        .join()
+        .expect("idle test thread");
     }
 }

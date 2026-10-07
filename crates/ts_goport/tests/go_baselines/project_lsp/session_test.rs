@@ -1956,6 +1956,27 @@ child_test! {
 }
 
 child_test! {
+    // PORT: no Go counterpart (lswarm1). A clone that takes longer than
+    // `WARM_AUTO_IMPORT_HOLD_CAP` ends, is adopted, and keeps the session
+    // marked slow, so the next warm waits for a quiet period.
+    fn a_long_auto_import_warm_clone_marks_the_session_slow() {
+        use ts_goport::gostd::local::{self, IdleStart};
+        let (session, on_read_other, reads) = session_with_pending_warm();
+        *on_read_other.borrow_mut() = Some(Box::new(|| {
+            std::thread::sleep(project::WARM_AUTO_IMPORT_HOLD_CAP + Duration::from_millis(1));
+        }));
+        let before = session.snapshot();
+        local::run_pending();
+        assert_eq!(local::next_idle(), Some(IdleStart::AtOnce), "the first attempt waits");
+        assert!(local::run_idle());
+        assert_eq!(reads.get(), 1);
+        assert!(!Rc::ptr_eq(&session.snapshot(), &before), "the clone was not adopted");
+        assert!(session.warm_auto_import_slow.get(), "a long clone left the session eager");
+        session.close();
+    }
+}
+
+child_test! {
     // PORT: no Go counterpart (editfuzz2 P2-1). Only a released program
     // version loaded the node_modules entrypoint pk/node.d.ts; the parse
     // cache keeps its parse. The warm's auto-import extraction of package pk
