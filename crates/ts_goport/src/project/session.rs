@@ -3879,23 +3879,33 @@ mod tests {
         (preempt, ctx)
     }
 
-    /// Runs `on_message` on another thread. Returns its wait and whether it
-    /// queued the message.
+    /// Runs `on_message` on another thread, and returns once the message is
+    /// queued. The thread gives its wait, from the queue call, and whether it
+    /// queued the message. The wait does not count the thread's start, so a
+    /// slow start under load does not shorten it.
     fn message(
         preempt: &WarmAutoImportPreempt,
         file_event: bool,
     ) -> std::thread::JoinHandle<(Duration, bool)> {
         let preempt = preempt.clone();
-        std::thread::spawn(move || {
-            let start = Instant::now();
-            let queued = preempt.on_message(file_event, &NOP, || true);
-            (start.elapsed(), queued)
-        })
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut start = None;
+            let queued = preempt.on_message(file_event, &NOP, || {
+                start = Some(Instant::now());
+                queued_tx.send(()).expect("test thread");
+                true
+            });
+            (start.expect("message queued").elapsed(), queued)
+        });
+        queued_rx.recv().expect("reader thread");
+        reader
     }
 
     // A message that comes during an eager attempt waits for the clone, at
     // most for the hold. A clone that ends in time is neither cancelled nor
-    // yielded.
+    // yielded. The clone ends 20 ms after the message is queued, so the
+    // message waits at least that long, whatever the load.
     #[test]
     fn a_message_waits_for_an_eager_attempt_until_the_clone_ends() {
         let (preempt, warm_ctx) = preempt_with_warm();

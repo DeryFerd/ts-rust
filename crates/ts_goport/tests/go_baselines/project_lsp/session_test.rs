@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use ts_goport::flags::ScriptKind;
 use ts_goport::frontend::tspath;
@@ -1836,15 +1837,17 @@ fn session_with_pending_warm() -> (
 
 /// A message other than a file event, as the LSP reader thread sees it
 /// while the warm's clone runs: it waits for the hold, then makes the
-/// attempt yield.
-fn yield_warm_attempt(session: &Rc<Session>) {
+/// attempt yield. Returns the message's wait, from the queue call.
+fn yield_warm_attempt(session: &Rc<Session>) -> Duration {
     let preempt = session.warm_auto_import_preempt.clone();
     std::thread::spawn(move || {
         let logger: Option<Rc<dyn project::logging::Logger>> = None;
-        preempt.on_message(false, &logger, || ());
+        let mut queued_at = None;
+        preempt.on_message(false, &logger, || queued_at = Some(Instant::now()));
+        queued_at.expect("message queued").elapsed()
     })
     .join()
-    .expect("reader thread");
+    .expect("reader thread")
 }
 
 child_test! {
@@ -1907,6 +1910,47 @@ child_test! {
         assert!(Rc::ptr_eq(&session.snapshot(), &moved));
         assert!(session.warm_auto_import_pending.borrow().is_none());
         assert!(!ts_goport::gostd::local::run_idle());
+        session.close();
+    }
+}
+
+child_test! {
+    // PORT: no Go counterpart (lswarm1). The first attempt of a warm starts
+    // as soon as no message waits, and a message that comes during its
+    // clone waits up to the hold (Go's head start): the time since Go's warm
+    // would have started, at most `WARM_AUTO_IMPORT_HOLD_CAP`
+    // (`Session::run_pending_warm`). Here the attempt starts at least the
+    // cap after that time, so the message waits the whole cap, whatever the
+    // load. Only then does the attempt yield, and its retry waits for a
+    // quiet period.
+    fn an_eager_auto_import_warm_holds_a_message_for_the_cap() {
+        use ts_goport::gostd::local::{self, IdleStart};
+        let (session, on_read_other, reads) = session_with_pending_warm();
+        // The snapshot task has not run, so it starts after `t0`.
+        assert_eq!(local::next_idle(), None);
+        let t0 = Instant::now();
+        local::run_pending();
+        let t1 = Instant::now();
+        assert_eq!(local::next_idle(), Some(IdleStart::AtOnce), "the first attempt waits");
+        // The hold counts from queued_at + (queued_at - task start), which is
+        // at most t1 + (t1 - t0). The attempt starts at least the cap later.
+        std::thread::sleep((t1 - t0) + project::WARM_AUTO_IMPORT_HOLD_CAP);
+        let waited = Rc::new(std::cell::Cell::new(None));
+        {
+            let waited = waited.clone();
+            let weak = Rc::downgrade(&session);
+            *on_read_other.borrow_mut() = Some(Box::new(move || {
+                if let Some(session) = weak.upgrade() {
+                    waited.set(Some(yield_warm_attempt(&session)));
+                }
+            }));
+        }
+        assert!(local::run_idle());
+        let waited = waited.get().expect("the warm did not read the file");
+        assert!(waited >= project::WARM_AUTO_IMPORT_HOLD_CAP, "{waited:?}");
+        assert_eq!(reads.get(), 1);
+        assert!(session.warm_auto_import_slow.get(), "the eager attempt yielded");
+        assert_eq!(local::next_idle(), Some(IdleStart::AfterQuiet), "the retry is eager");
         session.close();
     }
 }
