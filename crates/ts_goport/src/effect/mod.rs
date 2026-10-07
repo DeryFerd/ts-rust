@@ -44,7 +44,9 @@ pub fn is_effect_code(code: i32) -> bool {
 
 // Go: etscheckerhooks/init.go afterCheckSourceFile
 /// Runs the Effect rules for `source_file` and adds their diagnostics to
-/// the checker. Called by `check_source_file` once the file is type checked.
+/// the checker. `check_source_file` calls it once per file, after the type
+/// check and the unused check (the reference calls it before the unused
+/// check; see the comment there).
 pub fn after_check_source_file(ctx: &Context, c: &mut Checker, source_file: Node) {
     let Some(effect_config) = c.compiler_options.effect.clone() else {
         return;
