@@ -97,36 +97,47 @@ that revision:
 
 ## Benchmark: T3 Code
 
-Full type check of [T3 Code](https://github.com/pingdotgg/t3code), compared with `tsc` 7 and
-the new `bun check` in Bun. T3 Code uses Effect, so there are two cases: without the Effect
-diagnostics and with them. The multiplier compares with `tsc` 7 in the same case. Lower is faster.
+Full type check of [T3 Code](https://github.com/pingdotgg/t3code), compared with `tsc` 6, `tsc` 7
+and the new `bun check` in Bun. T3 Code uses Effect, so there are two cases: without the Effect
+diagnostics and with them. Each time is the sum for the five T3 Code projects. Lower is faster.
 
 **Without Effect diagnostics**
 
-| Checker     |   Time | vs `tsc` 7     |                                       |
-| ----------- | -----: | -------------- | ------------------------------------- |
-| `bun check` |  4.21s | 4.09× faster   | `████`                                |
-| `tsc-rs`    |  7.70s | 2.24× faster   | `████████`                            |
-| `tsc` 7     | 17.22s | 1.00× baseline | `█████████████████`                   |
+| Checker     |   Time | vs `tsc` 6 | vs `tsc` 7   |                                            |
+| ----------- | -----: | ---------: | ------------ | ------------------------------------------ |
+| `bun check` |  4.07s |      15.4× | 3.95× faster | `█`                                        |
+| `tsc-rs`    |  7.25s |       8.6× | 2.22× faster | `██`                                       |
+| `tsc` 7     | 16.10s |       3.9× | baseline     | `█████`                                    |
+| `tsc` 6     | 62.63s |   baseline | 3.89× slower | `██████████████████`                       |
 
 **With Effect diagnostics**
 
-| Checker                             |   Time | vs `tsc` 7 + Effect |                                         |
-| ----------------------------------- | -----: | ------------------- | --------------------------------------- |
-| `tsc-rs` (Effect built in)          | 11.35s | 1.94× faster        | `███████████`                           |
-| `tsc` 7 + `@effect/tsgo`            | 22.07s | 1.00× baseline      | `██████████████████████`                |
-| `bun check` + separate Effect pass  | 37.17s | 1.68× slower        | `█████████████████████████████████████` |
+| Checker                                         |    Time | vs `tsc` 6 | vs `tsc` 7 + Effect |                                            |
+| ----------------------------------------------- | ------: | ---------: | ------------------- | ------------------------------------------ |
+| `tsc-rs` (Effect built in)                      |  11.13s |      12.5× | 1.89× faster        | `███`                                      |
+| `tsc` 7 + `@effect/tsgo`                        |  21.07s |       6.6× | baseline            | `██████`                                   |
+| `bun check`, then `effect-tsgo diagnostics`     |  37.60s |       3.7× | 1.78× slower        | `███████████`                              |
+| `tsc` 6 + `@effect/language-service`            | 138.63s |   baseline | 6.58× slower        | `████████████████████████████████████████` |
 
 `bun check` is the fastest when you do not need the Effect diagnostics. It does not have them, so
 an Effect project needs a second pass. `tsc-rs` gets them from its one check.
 
-How it was measured: the sum of per-project medians (3 runs each) for the five T3 Code projects
-`apps/server`, `apps/web`, `apps/mobile`, `packages/client-runtime` and `packages/shared`.
-Apple M5 Max, warm filesystem cache, compiler caches cleared before each run. This is not a timed
-full-workspace or parallel CI run. Versions: `tsc-rs` 0.1.0, TypeScript 7.0.2, Bun canary
-`bd599f5af`, `@effect/tsgo` 0.46.1. The results come from separate rounds. The `tsc-rs` switch in
-T3 Code is [pingdotgg/t3code#16704](https://github.com/pingdotgg/t3code/pull/16704), with a
-per-project table.
+Errors. `tsc-rs`, `tsc` 7 + `@effect/tsgo` and the `effect-tsgo diagnostics` pass report the same
+221 Effect diagnostics. `tsc` 6 uses the JavaScript Effect plugin
+(`@effect/language-service` 0.87.4), which has a different rule set: it reports 287 on
+`apps/server` where the others report 177. `tsc-rs` and `tsc` 6 report one more error, TS2322 in
+`apps/server/scripts/record-pi-rpc-replay-fixture.ts`. TypeScript 7.1.0-dev reports it too, and
+[pingdotgg/t3code#16704](https://github.com/pingdotgg/t3code/pull/16704) fixes it.
+
+How it was measured: the same machine and method as the real-world apps below, with
+`--composite false` added (`apps/web` is composite). T3 Code at
+[`cd41c4ad`](https://github.com/pingdotgg/t3code/tree/cd41c4ada0c70cc2eec95ecd7266f3dab010c58c),
+projects `apps/server`, `apps/web`, `apps/mobile`, `packages/client-runtime` and
+`packages/shared`. Without Effect, the configs have no Effect plugin. With Effect, `tsc` 7 is the
+Effect-patched 7.0.2 from `@effect/tsgo` 0.46.1, and `tsc` 6 is 6.0.3 patched with
+`@effect/language-service`. The script is
+[scripts/bench-apps/t3code.sh](scripts/bench-apps/t3code.sh). The `tsc-rs` switch in T3 Code is
+[pingdotgg/t3code#16704](https://github.com/pingdotgg/t3code/pull/16704).
 
 ## Benchmark: real-world apps
 
@@ -162,8 +173,7 @@ default thread count. `tsc` 7 and `tsc-rs` run as native binaries, without the n
 `tsc` 6 runs on Node 24.19 with a 16 GB heap, because it runs out of memory on VS Code and Sentry
 with the default heap. Versions: `tsc-rs` 0.1.0, TypeScript 7.0.2 and 6.0.3, Bun canary
 `bd599f5af`. Lines checked is the `tsc` 7 `--extendedDiagnostics` count, with the `.d.ts` files.
-This is a different machine from the T3 Code benchmark, so do not compare times across the two
-tables.
+The T3 Code benchmark above uses the same machine and method.
 
 Four apps needed changes to check with 0 errors under `tsc` 7. Nothing else changed:
 
@@ -178,7 +188,7 @@ Two apps are not in the table:
 - date-fns uses project references. There, `tsc -p` and `bun check` do different work.
 
 The scripts are in [scripts/bench-apps](scripts/bench-apps): `setup.sh <dir>`, then
-`run.sh <dir>` and `summary.py <dir>`.
+`run.sh <dir>` and `summary.py <dir>`, and `t3code.sh <dir>` for T3 Code.
 
 ## Known problems
 
