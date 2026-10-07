@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use crate::contentmapper::ConcurrentTransform;
+use crate::contentmapper::{ConcurrentTransform, PrefetchedTransform};
 
 // Go: filesparser.go:19 parseTask
 // PORT: Go `*parseTask` is shared by the root task list, sub task lists,
@@ -1515,18 +1515,15 @@ struct PrefetchResult {
     /// The metadata that the worker found before the parse and parsed
     /// with, when the loader takes worker answers (`take_prefetched_meta`).
     meta: Option<WorkerMeta>,
-    /// For a content-mapped file: what the mapper gave besides the virtual
-    /// text, which `parse` parsed (`take_prefetched_mapped`).
+    /// For a content-mapped file: the worker's transform result, whose
+    /// virtual text `parse` parsed (`take_prefetched_mapped`).
     mapped: Option<MappedPrefetch>,
 }
 
-/// The part of a content mapper result that the loader keeps with the
-/// virtual file (`contentmapper::parse_result`).
+/// The transform result of a content-mapped job (`prefetch_mapped`).
 // PORT: not in Go (see `PrefetchJob::mapped`).
-pub(crate) struct MappedPrefetch {
-    pub(crate) virtual_extension: String,
-    pub(crate) mappings: Arc<crate::spanmap::SpanMap>,
-    pub(crate) diagnostic_directives: Vec<crate::ast::MappedDiagnosticDirective>,
+struct MappedPrefetch {
+    result: Result<crate::contentmapper::Result, crate::gostd::GoError>,
 }
 
 /// Go `loadSourceFileMetaData` of a file on its parse worker: the metadata,
@@ -1641,6 +1638,11 @@ fn take_prefetched_meta(loader: &FileLoader, file_name: &str) -> Option<SourceFi
     }
     let shared = PREFETCH.with(|p| p.borrow().clone())?;
     let job = lock(&shared.queue).by_name.get(file_name).cloned()?;
+    // A content-mapped job finds no metadata, so the loader does not wait
+    // for its transform here.
+    if job.mapped.is_some() {
+        return None;
+    }
     let mut state = lock(&job.state);
     let mut waited: Option<std::time::Instant> = None;
     let meta = loop {
@@ -3685,13 +3687,13 @@ fn prefetch_parse(
     })
 }
 
-/// A parse worker's transform of a content-mapped file and parse of the
-/// mapper's virtual text, as `contentmapper::transform_and_parse` makes
-/// them on the loading thread. No parse, so that the loader transforms the
-/// file itself, when the transform fails (the loader reports it), or when
-/// the result has diagnostics or supplemental outputs (the loader attaches
-/// those), an unsupported virtual extension or mappings that do not
-/// validate (the loader reports those).
+/// A parse worker's transform of a content-mapped file: the transform
+/// request that `transform_locked` sends, and the parse of the virtual text
+/// that `contentmapper::parse_result` would make. The loader takes both
+/// (`take_prefetched_mapped`): it reports an error and attaches the other
+/// outputs, so each file gets one request, as in Go. `None` when the file
+/// cannot be read (Go sends no request then either), or when the loader
+/// must send the request itself (`ConcurrentTransform::transform`).
 // PORT: not in Go (see `PrefetchJob::mapped`).
 fn prefetch_mapped(
     fs: &dyn Fs,
@@ -3702,75 +3704,61 @@ fn prefetch_mapped(
     if !ok {
         return None;
     }
-    let unusable = |content: &str| {
-        Some(PrefetchResult {
-            text: FileText::Shared(Arc::from(content)),
-            parse: None,
-            meta: None,
-            mapped: None,
-        })
-    };
-    let Ok(result) = transform.transform(&job.opts.file_name, &content) else {
-        return unusable(&content);
-    };
-    let Some(mappings) = result.mappings.clone() else {
-        return unusable(&content);
-    };
-    if !result.diagnostics.is_empty()
-        || !result.supplemental.is_empty()
-        || !crate::contentmapper::is_supported_virtual_extension(&result.virtual_extension)
-        || crate::spanmap::SpanMap::validate(Some(&*mappings), &result.text, &content).is_some()
-    {
-        return unusable(&content);
-    }
-    let mut opts = job.opts.clone();
-    if crate::contentmapper::is_module_virtual_extension(&result.virtual_extension) {
-        opts.external_module_indicator_options.force = true;
-    }
-    let script_kind = get_script_kind_from_file_name(&format!(
-        "{}{}",
-        job.opts.file_name, result.virtual_extension
-    ));
-    // The virtual text is leaked, as the loader leaks it
-    // (`contentmapper::parse_result`).
-    let virtual_text = FileText::new(result.text, false);
-    let before = (synthetic_slot_count(), next_ids());
-    let parse = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parse_source_file_detached(job.job, &opts, virtual_text, script_kind)
-    }));
-    let parse = match parse {
-        Ok(parse) => (parse.store.is_self_contained()
-            && (synthetic_slot_count(), next_ids()) == before)
-            .then_some(parse),
-        Err(_) => {
-            let _ = take_detached_file_store();
-            None
+    let result = transform.transform(&job.opts.file_name, &content)?;
+    let parse = match &result {
+        Ok(result)
+            if result.mappings.is_some()
+                && crate::contentmapper::is_supported_virtual_extension(
+                    &result.virtual_extension,
+                ) =>
+        {
+            let mut opts = job.opts.clone();
+            if crate::contentmapper::is_module_virtual_extension(&result.virtual_extension) {
+                opts.external_module_indicator_options.force = true;
+            }
+            let script_kind = get_script_kind_from_file_name(&format!(
+                "{}{}",
+                job.opts.file_name, result.virtual_extension
+            ));
+            // The virtual text is leaked, as the loader leaks it
+            // (`contentmapper::parse_result`).
+            let virtual_text = FileText::new(result.text.clone(), false);
+            let before = (synthetic_slot_count(), next_ids());
+            let parse = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parse_source_file_detached(job.job, &opts, virtual_text, script_kind)
+            }));
+            match parse {
+                Ok(parse) => (parse.store.is_self_contained()
+                    && (synthetic_slot_count(), next_ids()) == before)
+                    .then_some(parse),
+                Err(_) => {
+                    let _ = take_detached_file_store();
+                    None
+                }
+            }
         }
+        _ => None,
     };
     Some(PrefetchResult {
         text: FileText::Shared(Arc::from(content.as_str())),
         parse,
         meta: None,
-        mapped: Some(MappedPrefetch {
-            virtual_extension: result.virtual_extension,
-            mappings,
-            diagnostic_directives: result.diagnostic_directives,
-        }),
+        mapped: Some(MappedPrefetch { result }),
     })
 }
 
-/// What the loader can take from the parse workers for the content-mapped
-/// file of `opts`, whose text it read as `content`: the worker's parse of
-/// the mapper's virtual text, adopted into the stores of this thread, and
-/// the rest of the mapper's result, when the parse equals what
-/// `contentmapper::parse_result` would make here now. Waits for a running
-/// worker; takes a job that no worker started, so that the loader
-/// transforms the file itself.
+/// What the loader takes from the parse workers for the content-mapped
+/// file of `opts`, whose text it read as `content`: the worker's transform
+/// result, and its parse of the virtual text, adopted into the stores of
+/// this thread, when that parse equals what `contentmapper::parse_result`
+/// would make here now. Waits for a running worker. `None`, so that the
+/// loader sends the transform itself: no worker started the job (the
+/// loader takes it), the worker read other text, or it sent nothing.
 // PORT: not in Go (see `PrefetchJob::mapped`).
 pub(crate) fn take_prefetched_mapped(
     opts: &SourceFileParseOptions,
     content: &str,
-) -> Option<(ParsedSourceFile, MappedPrefetch)> {
+) -> Option<PrefetchedTransform> {
     let shared = PREFETCH.with(|p| p.borrow().clone())?;
     let job = lock(&shared.queue).by_name.get(&opts.file_name).cloned()?;
     job.mapped.as_ref()?;
@@ -3800,37 +3788,40 @@ pub(crate) fn take_prefetched_mapped(
             c.wait += start.elapsed();
         });
     }
-    let unusable = || {
-        shared.count(|c| c.unusable.push(opts.file_name.clone()));
-        None
-    };
+    let unusable = || shared.count(|c| c.unusable.push(opts.file_name.clone()));
     let Some(PrefetchResult {
         text,
-        parse: Some(parse),
-        mapped: Some(mapped),
+        parse,
+        mapped: Some(MappedPrefetch { result }),
         ..
     }) = result
     else {
-        return unusable();
+        unusable();
+        return None;
     };
     if &*text != content {
-        return unusable();
+        unusable();
+        return None;
     }
-    let mut want = opts.clone();
-    if crate::contentmapper::is_module_virtual_extension(&mapped.virtual_extension) {
-        want.external_module_indicator_options.force = true;
-    }
-    let file_opts = &parse.file.parse_options;
-    let same = file_opts.file_name == want.file_name
-        && file_opts.path == want.path
-        && (!parse.read_module_indicator_options
-            || file_opts.external_module_indicator_options
-                == want.external_module_indicator_options);
-    if !same {
-        return unusable();
-    }
-    shared.count(|c| c.taken += 1);
-    Some((adopt_detached_parse(parse, &want), mapped))
+    let parse = parse.zip(result.as_ref().ok()).and_then(|(parse, result)| {
+        let mut want = opts.clone();
+        if crate::contentmapper::is_module_virtual_extension(&result.virtual_extension) {
+            want.external_module_indicator_options.force = true;
+        }
+        let file_opts = &parse.file.parse_options;
+        let same = file_opts.file_name == want.file_name
+            && file_opts.path == want.path
+            && (!parse.read_module_indicator_options
+                || file_opts.external_module_indicator_options
+                    == want.external_module_indicator_options);
+        if !same {
+            unusable();
+            return None;
+        }
+        shared.count(|c| c.taken += 1);
+        Some(adopt_detached_parse(parse, &want))
+    });
+    Some(PrefetchedTransform { result, parse })
 }
 
 /// What the loader can take from the parse workers for the file of

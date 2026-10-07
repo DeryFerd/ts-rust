@@ -1391,14 +1391,16 @@ pub struct ConcurrentTransform {
 }
 
 impl ConcurrentTransform {
-    /// The mapper's result for `content` of `file_name`, as
-    /// `Project::transform` decodes it. The call counts in the timings, as
-    /// in `transform_locked`.
+    /// The transform of `content` of `file_name`, as `transform_locked`
+    /// makes it, errors and timings included. `None` when the connection's
+    /// read loop panicked: then the loader transforms the file itself, and
+    /// its call panics.
+    // Go: contentmapper/hostimpl.go:770 host.transformLocked
     pub fn transform(
         &self,
         file_name: &str,
         content: &str,
-    ) -> std::result::Result<Result, GoError> {
+    ) -> Option<std::result::Result<Result, GoError>> {
         let start = self.timing.start_request();
         let raw = self.conn.call_any_thread(
             &self.ctx,
@@ -1410,12 +1412,27 @@ impl ConcurrentTransform {
             })),
         );
         self.timing.finish_request(&self.timing.transform, start);
-        let raw = raw?;
-        decode_transform_result(
-            &raw,
-            content,
-            &self.position_encoding,
-            &self.diagnostic_source,
+        let raw = match raw {
+            Ok(raw) => raw,
+            Err(_) if self.conn.conn.read_panicked() => return None,
+            Err(err) => {
+                return Some(Err(new_transform_error(
+                    TransformErrorKind::REQUEST,
+                    Some(err),
+                )
+                .to_go_error()));
+            }
+        };
+        Some(
+            decode_transform_result(
+                &raw,
+                content,
+                &self.position_encoding,
+                &self.diagnostic_source,
+            )
+            .map_err(|err| {
+                new_transform_error(TransformErrorKind::RESPONSE, Some(err)).to_go_error()
+            }),
         )
     }
 }
