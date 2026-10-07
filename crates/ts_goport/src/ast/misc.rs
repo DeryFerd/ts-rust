@@ -993,7 +993,8 @@ fn get_diagnostic_location_key(diagnostic: &Diagnostic) -> DiagnosticLocationKey
 
 // Go: ast/diagnostic.go:390 getDiagnosticPath
 // PORT: returns `&'static str` (file names live for the program).
-fn get_diagnostic_path(d: &Diagnostic) -> &'static str {
+#[must_use]
+pub fn get_diagnostic_path(d: &Diagnostic) -> &'static str {
     if d.file().is_some() {
         return source_file_file_name(d.file());
     }
@@ -1041,8 +1042,15 @@ fn equal_diagnostics_no_related_info_by<P: Fn(&Diagnostic) -> &'static str>(
     if std::ptr::eq(d1, d2) {
         return true;
     }
-    path(d1) == path(d2)
-        && d1.pos() == d2.pos()
+    path(d1) == path(d2) && equal_diagnostics_no_related_info_after_path(d1, d2)
+}
+
+/// `equal_diagnostics_no_related_info` of two diagnostics whose paths
+/// (`get_diagnostic_path`) are equal: the checks after the path.
+/// `program::sort_and_deduplicate_diagnostics` reads each file name once.
+#[must_use]
+pub fn equal_diagnostics_no_related_info_after_path(d1: &Diagnostic, d2: &Diagnostic) -> bool {
+    d1.pos() == d2.pos()
         && d1.end() == d2.end()
         && d1.code() == d2.code()
         // tsgo#4712
@@ -1173,15 +1181,32 @@ fn compare_diagnostics_by<P: Fn(&Diagnostic) -> &'static str>(
     }
     // PORT: Go compares the bytes of the strings, which are port forms here
     // (see `scanner_util::compare_go_bytes`).
-    let mut c = ordering_to_int(compare_go_bytes(path(d1), path(d2)));
+    let c = ordering_to_int(compare_go_bytes(path(d1), path(d2)));
     if c != 0 {
         return c;
     }
+    compare_diagnostics_after_path_by(d1, d2, path)
+}
+
+/// `compare_diagnostics` of two diagnostics whose paths
+/// (`get_diagnostic_path`) compare equal: the compares after the path.
+/// `program::sort_and_deduplicate_diagnostics` ranks each file name once.
+#[must_use]
+pub fn compare_diagnostics_after_path(d1: &Diagnostic, d2: &Diagnostic) -> i32 {
+    compare_diagnostics_after_path_by(d1, d2, &get_diagnostic_path)
+}
+
+/// `compare_diagnostics_by` after the path compare.
+fn compare_diagnostics_after_path_by<P: Fn(&Diagnostic) -> &'static str>(
+    d1: &Diagnostic,
+    d2: &Diagnostic,
+    path: &P,
+) -> i32 {
     // PORT: Go subtracts these int32 values as Go ints (64 bits), so the
     // sign is their true order. An `i32` difference can wrap on the values
     // of a bad `.tsbuildinfo` (category -2147483648 and 1), so the port
     // compares them.
-    c = ordering_to_int(d1.pos().cmp(&d2.pos()));
+    let mut c = ordering_to_int(d1.pos().cmp(&d2.pos()));
     if c != 0 {
         return c;
     }
