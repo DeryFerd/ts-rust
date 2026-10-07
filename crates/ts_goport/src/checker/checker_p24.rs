@@ -109,10 +109,7 @@ impl Checker {
     /// ids and hashes no text.
     pub fn get_property_of_object_type_key(&mut self, t: TypeId, name: TableKey<'_>) -> SymbolId {
         if self.ty(t).flags.intersects(TypeFlags::OBJECT) {
-            // PORT: Go keeps the returned `*StructuredType`; we resolve, then
-            // read the members from the arena.
-            self.resolve_structured_type_members(t);
-            let members = self.ty(t).as_structured_type().members;
+            let members = self.resolve_structured_type_members(t).members;
             let symbol = self.symbols.get_key(members, name);
             if symbol.is_some() && self.symbol_is_value(symbol) {
                 return symbol;
@@ -187,24 +184,7 @@ impl Checker {
         name: TableKey<'_>,
         skip_object_function_property_augment: bool,
     ) -> SymbolId {
-        let cache = if skip_object_function_property_augment {
-            let mut data = self
-                .ty(t)
-                .as_union_or_intersection_type()
-                .property_cache_without_function_property_augment;
-            let table = get_symbol_table(&mut self.symbols, &mut data);
-            self.ty_mut(t)
-                .as_union_or_intersection_type_mut()
-                .property_cache_without_function_property_augment = data;
-            table
-        } else {
-            let mut data = self.ty(t).as_union_or_intersection_type().property_cache;
-            let table = get_symbol_table(&mut self.symbols, &mut data);
-            self.ty_mut(t)
-                .as_union_or_intersection_type_mut()
-                .property_cache = data;
-            table
-        };
+        let cache = self.property_cache_table(t, skip_object_function_property_augment);
         let prop = self.symbols.get_key(cache, name);
         if prop.is_some() {
             return prop;
@@ -221,17 +201,37 @@ impl Checker {
             if skip_object_function_property_augment
                 && !self.sym(prop).check_flags.intersects(CheckFlags::PARTIAL)
             {
-                let mut data = self.ty(t).as_union_or_intersection_type().property_cache;
-                let augmented_cache = get_symbol_table(&mut self.symbols, &mut data);
-                self.ty_mut(t)
-                    .as_union_or_intersection_type_mut()
-                    .property_cache = data;
+                let augmented_cache = self.property_cache_table(t, false);
                 // PORT: Go `if augmentedCache[name] == nil { ... = prop }` in
                 // one lookup.
                 self.symbols.set_if_absent(augmented_cache, &name, prop);
             }
         }
         prop
+    }
+
+    /// Go `ast.GetSymbolTable(&t.AsUnionOrIntersectionType().propertyCache)`,
+    /// or of `propertyCacheWithoutFunctionPropertyAugment` when
+    /// `without_augment`: the table, made when it is nil.
+    // PERF: a table that exists is read with one cast and not written back.
+    fn property_cache_table(&mut self, t: TypeId, without_augment: bool) -> SymbolTable {
+        let u = self.ty(t).as_union_or_intersection_type();
+        let table = if without_augment {
+            u.property_cache_without_function_property_augment
+        } else {
+            u.property_cache
+        };
+        if table.is_some() {
+            return table;
+        }
+        let table = self.symbols.new_table();
+        let u = self.ty_mut(t).as_union_or_intersection_type_mut();
+        if without_augment {
+            u.property_cache_without_function_property_augment = table;
+        } else {
+            u.property_cache = table;
+        }
+        table
     }
 
     // Go: checker/checker.go:21789 createUnionOrIntersectionProperty
@@ -262,8 +262,17 @@ impl Checker {
         }
         let mut synthetic_flag = CheckFlags::SYNTHETIC_METHOD;
         let mut merged_instantiations = false;
-        for i in 0..self.ty(containing_type).types().len() {
-            let current = self.type_at(containing_type, i);
+        // PERF: the constituents are read from a copy of the list (no
+        // element copy), not from the containing type at each step.
+        let types = self.ty(containing_type).types_list();
+        // PERF: Go `getApplicableIndexInfoForName(t, name)` tests
+        // `isLateBoundName(name)` and makes or finds the string literal type
+        // of `name` for each constituent that lacks the property. Here the
+        // test is made once, and the type at the first such constituent,
+        // where Go first makes it; later constituents use it.
+        let late_bound_name = is_late_bound_name(name.text());
+        let mut name_literal_type = TypeId::NIL;
+        for &current in types.iter() {
             let t = self.get_apparent_type(current);
             if !self.is_error_type(t) && !self.ty(t).flags.intersects(TypeFlags::NEVER) {
                 let prop = self.get_property_of_type_ex(
@@ -375,8 +384,11 @@ impl Checker {
                     }
                 } else if is_union {
                     let mut index_info = IndexInfoId::NIL;
-                    if !is_late_bound_name(name.text()) {
-                        index_info = self.get_applicable_index_info_for_name(t, name.text());
+                    if !late_bound_name {
+                        if name_literal_type.is_nil() {
+                            name_literal_type = self.get_string_literal_type(name.text());
+                        }
+                        index_info = self.get_applicable_index_info(t, name_literal_type);
                     }
                     if index_info.is_some() {
                         prop_flags =
@@ -700,6 +712,12 @@ impl Checker {
         let flags = self.ty(t).flags;
         let object_flags = self.ty(t).object_flags;
         if object_flags.intersects(ObjectFlags::MAPPED) {
+            // PERF: the cached apparent type of a mapped type returns here,
+            // without the call that would read it.
+            let cached = self.ty(t).as_mapped_type().resolved_apparent_type;
+            if cached.is_some() {
+                return cached;
+            }
             return self.get_apparent_type_of_mapped_type(t);
         } else if object_flags.intersects(ObjectFlags::REFERENCE) && t != original_type {
             return self.get_type_with_this_argument(
@@ -1042,6 +1060,20 @@ impl Checker {
 
     // Go: checker/checker.go:22251 getReducedApparentType
     pub fn get_reduced_apparent_type(&mut self, t: TypeId) -> TypeId {
+        // PERF: an object type is its own reduced type. Its apparent type is
+        // itself, or for a mapped type the cached apparent type, read with no
+        // effect (`get_apparent_type`). So these return without the calls
+        // (property lookups in the constituents of large unions).
+        let ty = self.ty(t);
+        if ty.flags.intersects(TypeFlags::OBJECT) {
+            if !ty.object_flags.intersects(ObjectFlags::MAPPED) {
+                return t;
+            }
+            let cached = ty.as_mapped_type().resolved_apparent_type;
+            if cached.is_some() {
+                return self.get_reduced_type(cached);
+            }
+        }
         // Since getApparentType may return a non-reduced union or intersection type, we need to perform
         // type reduction both before and after obtaining the apparent type. For example, given a type parameter
         // 'T extends A | B', the type 'T & X' becomes 'A & X | B & X' after obtaining the apparent type, and
@@ -2319,5 +2351,54 @@ type I<T extends A<string> | A<number>> = A<string> & T & { kind: "b" };
             got,
             (true, true, 3, true, vec![true, false], true, [true, false])
         );
+    }
+
+    /// `get_reduced_apparent_type` returns early for object types (plain,
+    /// mapped, homomorphic mapped over an array) with the type that Go's
+    /// `getReducedType(getApparentType(getReducedType(t)))` gives
+    /// (checker.go:22251). A union property takes the value type of the
+    /// index signature of each member that lacks the property and has one
+    /// for the name's literal type (`a${string}` holds `"a"`, `x${string}`
+    /// does not), with the literal type made once (Go
+    /// `getApplicableIndexInfoForName`, checker.go:19352, per member).
+    #[test]
+    fn reduced_apparent_types_and_index_members_of_union_properties() {
+        const SOURCE: &str = r#"
+interface A { a: string }
+interface B { [k: string]: number }
+interface C { [k: string]: boolean }
+interface D { [k: `x${string}`]: null }
+interface E { [k: `a${string}`]: bigint }
+type U = A | B | C | D | E;
+type M = Record<"a" | "b", 1>;
+type H<T> = { [K in keyof T]: T[K] };
+type HA = H<string[]>;
+type I = A & M;
+"#;
+        let got = with_alias_types(SOURCE, |c, types| {
+            let same: Vec<bool> = types
+                .iter()
+                .map(|&t| {
+                    let fast = c.get_reduced_apparent_type(t);
+                    let reduced = c.get_reduced_type(t);
+                    let apparent = c.get_apparent_type(reduced);
+                    fast == c.get_reduced_type(apparent)
+                })
+                .collect();
+            let u = types[0];
+            let a = c.get_union_or_intersection_property(u, "a", false);
+            let partial = c.sym(a).check_flags & CheckFlags::PARTIAL;
+            let a_type = c.get_type_of_symbol(a);
+            (same, partial, c.type_to_string(a_type))
+        });
+        assert_eq!(
+            got,
+            (
+                vec![true; got.0.len()],
+                CheckFlags::READ_PARTIAL | CheckFlags::WRITE_PARTIAL,
+                "string | number | bigint | boolean".to_string(),
+            )
+        );
+        assert!(got.0.len() >= 4);
     }
 }
