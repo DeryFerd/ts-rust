@@ -1,14 +1,54 @@
-# ts-rust
+# ts-rust (aka tsc-rs)
 
-A Rust port of the TypeScript 7 compiler.
+I wanted to see if LLMs could port the TypeScript compiler, checker and lsp to Rust. Turns out they can.
+
+It [cost over $420,000](#how-did-this-go) in tokens to do it, but you could probably have done it for ~$20k (see below)
+
+## Motivations
+
+- Test model capabilities
+- Make a fast TypeScript type checker
+- Make a ts checker that can work in WASM with high performance
+- Memes
+
+## Warnings
+
+**This is an early release.** It is not yet a full replacement for `tsc` in every project. See
+[Known problems](#known-problems).
+
+Also worth mentioning: I've never read a line of this code.
+
+## Install
+
+Be warned, I have no idea if this will actually work.
+
+```sh
+npm install -D tsc-rs
+npx tsc-rs -p tsconfig.json
+```
+
+## How did this go?
+
+I used a lot of OpenAI models to try and complete this port. In total I did **over $400,000 in API priced tokens with GPT-5.6 Sol and GPT 6 Astra**. They wrote over 1.3m lines of Rust over multiple months of /goal loops and never got past like 84% compat.
+
+When I saw how little my Claude Code limits were burning, I figured it'd be fun to throw Opus 5.5 at this. It had a working v0 in 10 hours.
+
+I assumed it kept using the code the Codex models wrote. I was wrong. **Opus 5.5 started from scratch. It got further than Astra in 1/10th the time.**
+
+I let it keep going, and it definitely did. Total token spend was **~$24,047 of API spend over 2 weeks**. I was using my Claude accounts, and it worked out to somewhere between **925% and 983% of my $200 plan weekly limits**.
+
+Expensive, for sure, but not that bad considering how much work has went into typescript-go.
+
+# "The Slop Line"
+
+Everything below this was written by my LLMs, not me. 
+
+## What actually is this?
 
 ts-rust is a direct port of Microsoft's native TypeScript compiler, which is written in Go
 ([microsoft/TypeScript](https://github.com/microsoft/TypeScript), formerly
 [typescript-go](https://github.com/microsoft/typescript-go)). It keeps Go's algorithms and
 behavior and has the same command line (`tsc`), language server and API.
-
-**This is an early release.** It is not yet a full replacement for `tsc` in every project. See
-[Known problems](#known-problems).
 
 ## Install
 
