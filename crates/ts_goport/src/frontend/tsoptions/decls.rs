@@ -1700,6 +1700,12 @@ pub fn compiler_options_affect_semantic_diagnostics(
     old_options: Option<&CompilerOptions>,
     new_options: Option<&CompilerOptions>,
 ) -> bool {
+    // Effect-TS/tsgo patch 028: Effect plugin options affect Effect diagnostics.
+    if old_options.and_then(|o| o.effect.as_deref())
+        != new_options.and_then(|o| o.effect.as_deref())
+    {
+        return true;
+    }
     options_have_changes(old_options, new_options, &|option| {
         option.affects_semantic_diagnostics
     })

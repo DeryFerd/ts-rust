@@ -64,20 +64,22 @@ postinstall check.
 
 The release workflow (`.github/workflows/release.yml`) makes a release:
 
-1. Push a tag `v<version>`, for example `git tag v0.1.0-preview.1 && git push origin v0.1.0-preview.1`.
-   The npm version is the tag without the `v`.
+1. Push a tag `v<version>`, for example `git tag v0.1.0 && git push origin v0.1.0`. The npm
+   version is the tag without the `v`.
 2. It builds the tsc on Linux (static musl, non-PIE: it starts on any x86-64 Linux) and on a Mac
    (jemalloc does not cross-build for macOS with zig), from the same source.
 3. It packs the set with `npm-pack.sh --name tsc-rs --package-version <v> --also darwin-arm64=<tsc>`,
    makes one archive per platform (the tsc, the lib files, LICENSE and NOTICE.txt) and installs
    the packages in a fresh project on each platform.
-4. It publishes the platform packages, then `tsc-rs`, under the dist-tag `next`, and creates a
-   GitHub prerelease with the archives, the .tgz files and `SHA256SUMS`. It needs the repo secret
-   `NPM_TOKEN`.
+4. It publishes the platform packages, then `tsc-rs`, and creates a GitHub release with the
+   archives, the .tgz files and `SHA256SUMS`. A stable version goes to the dist-tag `latest` and a
+   normal release. A version with a prerelease part (`0.2.0-beta.1`) goes to `next` and a GitHub
+   prerelease. The publish uses npm
+   trusted publishing (see below), so there is no npm token in the repo.
 
 Pull requests that change the release files run steps 2 and 3 with the version `0.0.0-ci.<run>`.
-After a check of `npx tsc-rs@next` on each platform, `npm dist-tag add tsc-rs@<v> latest` (and the
-same for each platform package) makes it the default.
+To make a prerelease the default after a check of `npx tsc-rs@next` on each platform, run
+`npm dist-tag add tsc-rs@<v> latest`, and the same for each platform package.
 
 The CI builds are the plain shipped profile (fat LTO). They have no PGO and BOLT, which give 14 to
 15% fewer cycles (build-release.sh header), because those need a host with BOLT and the project
@@ -90,6 +92,24 @@ GOPORT_PIN=<pin> scripts/goport/npm-pack.sh --name tsc-rs --package-version <v> 
   --also darwin-arm64=<darwin tsc from the release workflow> <out>/pkg <out>/linux-x64/bin/tsgo
 scripts/goport/npm-test.sh --name tsc-rs <out>/pkg <out>/test
 ```
+
+### Trusted publishing
+
+npm trusts the workflow file `release.yml` of `pingdotgg/ts-rust`, in the GitHub environment
+`npm`, to publish each of the 3 packages (OIDC, no token). Set it up once with
+`npm/trust-setup.sh`, logged in to npm with 2FA and npm 11.15.0 or later. It publishes a
+`0.0.0-placeholder` version of a package that is not on npm yet, because npm can only trust a
+workflow for a package that exists. The workflow refuses `0.0.x` tags, so a release never
+collides with a placeholder. npm drops a new trust that publishes nothing in 2 days, so run it
+shortly before the first tag. Add required reviewers to the `npm` environment (repo settings,
+Environments) to approve each publish by hand.
+
+The first publish binds each trust to the repo's GitHub ID, not only its name. The repo was
+recreated on 2026-10-07 (history cleanup), so before the next release run
+`npm/trust-setup.sh --relink`: it revokes the old trusts and creates new ones for the new repo.
+
+While the repo is private, npm publishes with no provenance. From a public repo it adds
+provenance by itself.
 
 The packages carry the port's MIT LICENSE and a NOTICE.txt with the licenses of TypeScript
 (Apache-2.0) and Go (BSD-3-Clause), from `NOTICE.md` and `licenses/` at the repo root.

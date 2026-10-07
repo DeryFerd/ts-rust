@@ -1461,6 +1461,10 @@ pub struct BuildInfo {
     pub file_infos: Option<Vec<BuildInfoFileInfo>>,
     pub file_ids_list: Option<Vec<Vec<BuildInfoFileId>>>,
     pub options: Option<IndexMap<String, CompilerOptionsValue>>,
+    /// Effect-TS/tsgo patch 028: the Effect plugin options of the program
+    /// (`EffectPluginOptions::to_value`), so a change to them invalidates
+    /// the cached semantic diagnostics.
+    pub effect: Option<CompilerOptionsValue>,
     pub referenced_map: Option<Vec<BuildInfoReferenceMapEntry>>,
     pub semantic_diagnostics_per_file: Option<Vec<BuildInfoSemanticDiagnostic>>,
     pub emit_diagnostics_per_file: Option<Vec<BuildInfoDiagnosticsOfFilePtr>>,
@@ -1503,6 +1507,9 @@ impl MarshalerTo for BuildInfo {
                 marshal_any(enc, v)?;
             }
             enc.push('}');
+        }
+        if let Some(effect) = &self.effect {
+            marshal_any(w.name("effect"), effect)?;
         }
         w.slice_omitzero("referencedMap", self.referenced_map.as_ref())?;
         w.slice_omitzero(
@@ -1553,6 +1560,7 @@ impl UnmarshalerFrom for BuildInfo {
                     })?;
                 }
                 "options" => self.options = unmarshal_options(dec)?,
+                "effect" => self.effect = Some(unmarshal_any(dec)?),
                 "referencedMap" => self.referenced_map = unmarshal_slice(dec, unmarshal_elem)?,
                 "semanticDiagnosticsPerFile" => {
                     self.semantic_diagnostics_per_file = unmarshal_slice(dec, unmarshal_elem)?;
@@ -1660,6 +1668,12 @@ impl BuildInfo {
             }
             parse_compiler_options(option, value.clone(), &mut options);
         }
+        // Effect-TS/tsgo patch 028.
+        options.effect = self
+            .effect
+            .as_ref()
+            .and_then(crate::effect::etscore::EffectPluginOptions::from_value)
+            .map(std::sync::Arc::new);
         options
     }
 
