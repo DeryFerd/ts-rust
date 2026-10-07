@@ -713,18 +713,43 @@ pub fn new_external_diagnostic(
 /// diagnostic and its related information point at (`stored_file_names`),
 /// and the compares of stored diagnostics read the name there
 /// (`stored_diagnostic_path`).
-/// A related information that a caller adds to the stored diagnostic
-/// after `add` (the `Checker::add_diagnostic` callers,
-/// `add_related_info_to_reported_diagnostic`) has its name read from its
-/// file. No path reads it after that file dies (followups31): `add`
-/// compares related information only when the new diagnostic has as many
-/// as the stored one, and the new diagnostic of such a caller has none of
-/// the later ones yet. `lookup` and the sorts run only in a check of a
-/// file (`check_source_file`) or in `get_global_diagnostics`, on a checker
-/// whose program holds every file of its diagnostics. The API's persistent
-/// checker, the only one that gets symbols of other file versions
-/// (`api::checker_symbol`), runs neither. A change to that must also keep
-/// the names of the related information added after `add`.
+/// Related information that a caller adds to a stored diagnostic after
+/// `add` is not in `stored_file_names`, so a compare reads its name from
+/// its file. Only four callers can put it in another file:
+/// `add_duplicate_declaration_error` (the other declarations), the
+/// assertion call (the declarations of `get_type_of_dotted_name`), the
+/// circular constraint (the node that the checker is at) and
+/// `invocation_error_recovery` (the import, for `invocation_error` and the
+/// decorator call). `error_and_maybe_suggest_await` puts it in the
+/// diagnostic's own file, the regular expression errors give it no file,
+/// and `add_related_info_to_reported_diagnostic` runs only in deferred
+/// diagnostics. No path reads such a name after its file dies
+/// (followups31):
+/// - Go `Add` (ast/diagnostic.go:269) compares a new diagnostic of any
+///   caller with each stored one of the same path, location and code.
+///   `EqualDiagnostics` reads the related information only when all else
+///   is equal, the message chain too, and the two lists have the same
+///   length (`slices.EqualFunc`). The new diagnostic has only the related
+///   information that its caller added before `add`, and with an equal
+///   message and chain, that is the part that the stored diagnostic had at
+///   its own `add`: no caller gives the duplicate declaration codes, the
+///   assertion code or the circular constraint code related information
+///   before `add`, and an invocation error gets the semicolon note of its
+///   node and the await note of its apparent type, whose text is in the
+///   chain. So when the stored diagnostic has later information, the
+///   lengths are not equal, and `add` reads none of it.
+/// - `lookup` and the sorts compare stored diagnostics, and two of them
+///   can differ only in their later information (a second duplicate
+///   declaration error at a node does not equal the first one when the
+///   first one has information). They run only in a check of a file
+///   (`check_source_file`), in `get_diagnostics` and in
+///   `get_global_diagnostics`, on a checker whose program holds every file
+///   of its diagnostics.
+/// - The API's persistent checker, the only one that gets symbols of other
+///   file versions (`api::checker_symbol`), runs no `lookup` and no sort.
+///
+/// A change to any of these must also keep the names of the later
+/// related information.
 #[derive(Clone, Debug, Default)]
 pub struct DiagnosticsCollection {
     pub count: i32,
