@@ -276,7 +276,8 @@ jobs:
       - name: Publish to npm (next)
         run: |
           for pkg in @tsc-rs/linux-x64:tsc-rs-linux-x64 @tsc-rs/darwin-arm64:tsc-rs-darwin-arm64 tsc-rs:tsc-rs; do
-            name=${pkg%%:*} file=dist/${pkg#*:}-$VERSION.tgz
+            name=${pkg%%:*} file=./dist/${pkg#*:}-$VERSION.tgz
+            [[ -f $file ]] || { echo "::error::missing package $file"; exit 1; }
             if npm view "$name@$VERSION" version > /dev/null 2>&1; then
               echo "$name@$VERSION is already published"
             else
