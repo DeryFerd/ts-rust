@@ -6,7 +6,8 @@
 //! checked a source file, with the same checker, and add their diagnostics
 //! to the checker's diagnostics (codes 377000 to 377999). Nothing runs unless
 //! the tsconfig has an `@effect/language-service` plugin entry with
-//! diagnostics enabled.
+//! diagnostics enabled. A standalone API process (`tsgo --api`) runs nothing
+//! unless `TSGO_EFFECT_API=1` (`rulerunner::set_api_process`).
 //!
 //! Read `crates/ts_goport/src/effect/PORTING.md` before editing.
 

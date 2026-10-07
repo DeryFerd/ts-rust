@@ -264,8 +264,10 @@ impl Checker {
         // parameter of a `x is T` type predicate), which hides TS6133. The port runs them
         // once, after the unused check, so that check reads only the TypeScript references.
         // A file with Effect rules always gets the unused check first. Without noUnusedLocals
-        // and noUnusedParameters, that check only adds suggestions.
+        // and noUnusedParameters, that check only adds suggestions. A standalone API process
+        // runs no Effect rules (`rulerunner::rules_enabled`).
         let run_effect = self.compiler_options.effect.is_some()
+            && crate::effect::rulerunner::rules_enabled()
             && !self.source_file_links.get(source_file).effect_checked;
         if (check_unused || run_effect) && !self.source_file_links.get(source_file).unused_checked {
             // The unused identifiers check relies on a full type check having first been performed
