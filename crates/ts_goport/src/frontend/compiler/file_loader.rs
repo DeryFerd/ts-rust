@@ -2462,6 +2462,7 @@ mod tests {
     use super::super::files_parser::{preps_taken, set_load_prep, set_meta_wait};
     use super::*;
     use crate::frontend::bundled;
+    use crate::frontend::module::cache::set_answer_wait;
     use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
     use crate::frontend::vfs::osvfs_fs;
 
@@ -2881,6 +2882,18 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         tsconfig: &str,
         files: &[(&str, &str)],
     ) -> (ProcessedFiles, std::path::PathBuf, String) {
+        load_with_workers_on(label, tsconfig, files, bundled::wrap_fs(osvfs_fs()))
+    }
+
+    /// `load_with_workers` with `fs` as the loader's file system: the OS
+    /// file system, maybe wrapped (`wrapvfs`). The parse workers read the
+    /// OS file system (`run_prefetch_worker`).
+    fn load_with_workers_on(
+        label: &str,
+        tsconfig: &str,
+        files: &[(&str, &str)],
+        fs: Rc<dyn Fs>,
+    ) -> (ProcessedFiles, std::path::PathBuf, String) {
         let dir = std::env::temp_dir().join(format!(
             "ts_goport_file_loader_{label}_{}",
             std::process::id()
@@ -2893,9 +2906,8 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         }
         std::fs::write(dir.join("tsconfig.json"), tsconfig).unwrap();
         let cwd = dir.to_string_lossy().replace('\\', "/");
-        let fs = bundled::wrap_fs(osvfs_fs());
         let sys = System {
-            fs: fs.clone(),
+            fs: bundled::wrap_fs(osvfs_fs()),
             current_directory: cwd.clone(),
         };
         let (config, errors) = get_parsed_command_line_of_config_file(
@@ -2906,7 +2918,14 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
             None,
         );
         assert!(errors.is_empty());
-        let host = new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, None, None);
+        // The parse workers run when the host shows the plain OS file
+        // system (`CompilerHost::is_plain_os_fs`): `fs` reads it.
+        let host = super::super::host::new_compiler_host_over(
+            &cwd,
+            crate::frontend::vfs::cachedvfs_from(fs),
+            &bundled::wrap_fs(osvfs_fs()),
+            &bundled::lib_path(),
+        );
         let processed = process_all_program_files(
             ProgramOptions {
                 host,
@@ -3003,6 +3022,79 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         set_meta_wait(false);
     }
 
+    // followups32: when the loader takes a file's metadata from its parse
+    // worker, it keeps the package.json reads of the worker's package scope
+    // walk in the program resolver's cache (`Caches::adopt_worker_package_jsons`),
+    // so its own lookups later in the load find them and do not read the
+    // files again, as the Go loader finds the metadata with the program's
+    // resolver (fileloader.go:391, module/resolver.go:1755
+    // getPackageJsonInfo, packagejson/cache.go:190 Set). No worker resolves
+    // the module augmentation "aug" (the workers resolve imports), so the
+    // loader resolves it while it loads `src/a.ts`, after it took that
+    // file's metadata, and its self-name lookup (module/resolver.go:576
+    // loadModuleFromSelfNameReference) asks for the package scope of `src`,
+    // which the worker's walk read. The loader waits for the worker's
+    // metadata (`set_meta_wait`), so this holds whatever the timing. Without
+    // the take-time adoption the loader reads the project's package.json
+    // itself, and the end of the load does not change that.
+    #[test]
+    fn the_loader_reads_no_package_json_that_a_taken_metadata_walk_read() {
+        if !super::super::files_parser::parse_workers_enabled() {
+            return;
+        }
+        let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "types": [],
+             "noEmit": true }, "include": ["src"] }"#;
+        let files = [
+            ("package.json", r#"{ "name": "app", "type": "module" }"#),
+            (
+                "src/a.ts",
+                "export const a = 1;\ndeclare module \"aug\" {}\n",
+            ),
+        ];
+        // The package.json files that the loader reads.
+        let reads = Rc::new(RefCell::new(Vec::<String>::new()));
+        let os = bundled::wrap_fs(osvfs_fs());
+        let read_file = {
+            let (os, reads) = (os.clone(), reads.clone());
+            move |path: &str| {
+                if path.ends_with("/package.json") {
+                    reads.borrow_mut().push(path.to_string());
+                }
+                os.read_file(path)
+            }
+        };
+        let fs = crate::frontend::vfs::wrapvfs_wrap(
+            os,
+            crate::frontend::vfs::Replacements {
+                read_file: Some(Box::new(read_file)),
+                ..Default::default()
+            },
+        );
+        set_load_prep(Some(true));
+        set_meta_wait(true);
+        let before = crate::frontend::module::cache::adopted_package_jsons();
+        let (processed, dir, cwd) =
+            load_with_workers_on("no_package_json_reads", tsconfig, &files, fs);
+        let adopted = crate::frontend::module::cache::adopted_package_jsons() - before;
+        set_load_prep(None);
+        set_meta_wait(false);
+        let _ = std::fs::remove_dir_all(&dir);
+        let resolver = processed
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.as_default_resolver())
+            .expect("the default resolver");
+        let cache = &resolver.caches.package_json_info_cache;
+        assert!(adopted > 0, "no worker package.json taken");
+        // A lookup of the load asked for the entry (a read that no lookup
+        // asks for stays a pending read, which `contains_key` does not see).
+        assert!(
+            cache.contains_key(&cache.key(&format!("{cwd}/package.json"))),
+            "the loader did not look up the package scope of src"
+        );
+        assert_eq!(*reads.borrow(), Vec::<String>::new());
+    }
+
     // A parse worker that panics after it starts a job ends the job
     // (`RunningJob`), so the loader that waits for it finds the metadata and
     // parses the file itself, and the load ends with the file. The loader
@@ -3058,7 +3150,10 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
     // `lib` is in no file's package scope (its types are under `sub`, which
     // has its own package.json), so only the answer for "lib" reads it. A
     // lookup on the loading thread after the load finds what the load
-    // read, also when the file changed on disk since.
+    // read, also when the file changed on disk since. With the prep on, the
+    // loader waits for the worker's metadata (`set_meta_wait`) and answer
+    // (`set_answer_wait`), so it takes the answer for "lib" and does not
+    // read the file, whatever the timing.
     #[test]
     fn the_loader_keeps_the_package_json_files_of_worker_module_answers() {
         let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "types": [],
@@ -3079,8 +3174,12 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 "export declare const x: number;\n",
             ),
         ];
+        // With no parse workers the loader reads every file itself.
+        let workers = super::super::files_parser::parse_workers_enabled();
         for prep in [true, false] {
             set_load_prep(Some(prep));
+            set_meta_wait(prep && workers);
+            set_answer_wait(prep && workers);
             let (processed, dir, cwd) = load_with_workers(
                 &format!("keeps_answer_package_jsons_{prep}"),
                 tsconfig,
@@ -3106,10 +3205,12 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 .map(|contents| contents.fields.header_fields.name.get_value().0);
             let _ = std::fs::remove_dir_all(&dir);
             assert_eq!(name, Some("lib".to_string()), "prep {prep}");
-            if prep && super::super::files_parser::parse_workers_enabled() {
+            if prep && workers {
                 assert!(!loader_read, "the loader read the package.json of lib");
             }
         }
         set_load_prep(None);
+        set_meta_wait(false);
+        set_answer_wait(false);
     }
 }
