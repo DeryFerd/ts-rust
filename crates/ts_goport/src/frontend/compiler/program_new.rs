@@ -26,7 +26,7 @@ pub struct ProgramOptions {
 }
 
 impl ProgramOptions {
-    // Go: program.go:46 (*ProgramOptions).canUseProjectReferenceSource
+    // Go: program.go:52 (*ProgramOptions).canUseProjectReferenceSource
     pub fn can_use_project_reference_source(&self) -> bool {
         self.use_source_of_project_reference
             && !self
@@ -53,7 +53,7 @@ impl<T> Default for LazyValue<T> {
 }
 
 impl<T: Clone> LazyValue<T> {
-    // Go: program.go:56 (*lazyValue[T]).getValue
+    // Go: program.go:62 (*lazyValue[T]).getValue
     pub fn get_value(&self, compute: impl FnOnce() -> T) -> &T {
         self.value.get_or_init(compute)
     }
@@ -64,7 +64,7 @@ impl<T: Clone> LazyValue<T> {
         self.value.get()
     }
 
-    // Go: program.go:66 (*lazyValue[T]).tryReuse
+    // Go: program.go:72 (*lazyValue[T]).tryReuse
     pub fn try_reuse(&mut self, from: &LazyValue<T>) {
         if let Some(value) = from.value.get() {
             self.value = OnceCell::from(value.clone());
@@ -141,27 +141,27 @@ impl NewProgram {
             .borrow()
     }
 
-    // Go: program.go:122 (*Program).FileExists
+    // Go: program.go:129 (*Program).FileExists
     pub fn file_exists(&self, path: &str) -> bool {
         self.host().fs().file_exists(path)
     }
 
-    // Go: program.go:134 (*Program).ContentMapperProject (tsgo#4712)
+    // Go: program.go:138 (*Program).ContentMapperProject (tsgo#4712)
     pub fn content_mapper_project(&self) -> Option<Rc<dyn Project>> {
         self.opts.host.content_mapper_project()
     }
 
-    // Go: program.go:127 (*Program).GetCurrentDirectory
+    // Go: program.go:134 (*Program).GetCurrentDirectory
     pub fn get_current_directory(&self) -> String {
         self.host().get_current_directory()
     }
 
-    // Go: program.go:132 (*Program).GetGlobalTypingsCacheLocation
+    // Go: program.go:143 (*Program).GetGlobalTypingsCacheLocation
     pub fn get_global_typings_cache_location(&self) -> String {
         self.opts.typings_location.clone()
     }
 
-    // Go: program.go:137 (*Program).GetNearestAncestorDirectoryWithPackageJson
+    // Go: program.go:148 (*Program).GetNearestAncestorDirectoryWithPackageJson
     pub fn get_nearest_ancestor_directory_with_package_json(&self, dirname: &str) -> String {
         let scoped = self.resolver_ref().get_package_scope_for_path(dirname);
         if let Some(scoped) = scoped
@@ -172,7 +172,7 @@ impl NewProgram {
         String::new()
     }
 
-    // Go: program.go:146 (*Program).GetPackageJsonInfo
+    // Go: program.go:157 (*Program).GetPackageJsonInfo
     pub fn get_package_json_info(&self, pkg_json_path: &str) -> Option<Rc<InfoCacheEntry>> {
         let directory = get_directory_path(pkg_json_path);
         let scoped = self.resolver_ref().get_package_scope_for_path(&directory);
@@ -185,7 +185,7 @@ impl NewProgram {
         None
     }
 
-    // Go: program.go:156 (*Program).PackageJsonCacheEntries (tsgo#4301)
+    // Go: program.go:167 (*Program).PackageJsonCacheEntries (tsgo#4301)
     // PackageJsonCacheEntries iterates on all package json cache entries.
     pub fn package_json_cache_entries(
         &self,
@@ -194,7 +194,7 @@ impl NewProgram {
         self.resolver_ref().package_json_cache_entries(&mut f);
     }
 
-    // Go: program.go:157 (*Program).GetRedirectTargets
+    // Go: program.go:173 (*Program).GetRedirectTargets
     // GetRedirectTargets returns the list of file paths that redirect to the given path.
     // These are files from the same package (same name@version) installed in different locations.
     pub fn get_redirect_targets(&self, path: &Path) -> Vec<String> {
@@ -205,7 +205,7 @@ impl NewProgram {
             .unwrap_or_default()
     }
 
-    // Go: program.go:165 (*Program).GetSourceOfProjectReferenceIfOutputIncluded
+    // Go: program.go:181 (*Program).GetSourceOfProjectReferenceIfOutputIncluded
     // gets the original file that was included in program
     // this returns original source file name when including output of project reference
     // otherwise same name
@@ -223,7 +223,7 @@ impl NewProgram {
         file.file_name()
     }
 
-    // Go: program.go:173 (*Program).GetProjectReferenceFromSource
+    // Go: program.go:189 (*Program).GetProjectReferenceFromSource
     pub fn get_project_reference_from_source(
         &self,
         path: &Path,
@@ -231,12 +231,12 @@ impl NewProgram {
         self.mapper().get_project_reference_from_source(path)
     }
 
-    // Go: program.go:178 (*Program).IsSourceFromProjectReference
+    // Go: program.go:194 (*Program).IsSourceFromProjectReference
     pub fn is_source_from_project_reference(&self, path: &Path) -> bool {
         self.mapper().is_source_from_project_reference(path)
     }
 
-    // Go: program.go:182 (*Program).GetProjectReferenceFromOutputDts
+    // Go: program.go:198 (*Program).GetProjectReferenceFromOutputDts
     pub fn get_project_reference_from_output_dts(
         &self,
         path: &Path,
@@ -244,7 +244,7 @@ impl NewProgram {
         self.mapper().get_project_reference_from_output_dts(path)
     }
 
-    // Go: program.go:186 (*Program).GetResolvedProjectReferenceFor
+    // Go: program.go:202 (*Program).GetResolvedProjectReferenceFor
     pub fn get_resolved_project_reference_for(
         &self,
         path: &Path,
@@ -252,7 +252,7 @@ impl NewProgram {
         self.mapper().get_resolved_reference_for(path)
     }
 
-    // Go: program.go:190 (*Program).GetRedirectForResolution
+    // Go: program.go:206 (*Program).GetRedirectForResolution
     pub fn get_redirect_for_resolution(
         &self,
         file: &dyn HasFileName,
@@ -261,18 +261,18 @@ impl NewProgram {
         redirect
     }
 
-    // Go: program.go:195 (*Program).GetParseFileRedirect
+    // Go: program.go:211 (*Program).GetParseFileRedirect
     pub fn get_parse_file_redirect(&self, file_name: &str) -> String {
         self.mapper()
             .get_parse_file_redirect(&new_has_file_name(file_name, &self.to_path(file_name)))
     }
 
-    // Go: program.go:199 (*Program).GetResolvedProjectReferences
+    // Go: program.go:215 (*Program).GetResolvedProjectReferences
     pub fn get_resolved_project_references(&self) -> Vec<Option<Rc<ParsedCommandLine>>> {
         self.mapper().get_resolved_project_references()
     }
 
-    // Go: program.go:203 (*Program).RangeResolvedProjectReference
+    // Go: program.go:219 (*Program).RangeResolvedProjectReference
     pub fn range_resolved_project_reference(
         &self,
         f: impl FnMut(
@@ -285,7 +285,7 @@ impl NewProgram {
         self.mapper().range_resolved_project_reference(f)
     }
 
-    // Go: program.go:207 (*Program).RangeResolvedProjectReferenceInChildConfig
+    // Go: program.go:223 (*Program).RangeResolvedProjectReferenceInChildConfig
     pub fn range_resolved_project_reference_in_child_config(
         &self,
         child_config: &Rc<ParsedCommandLine>,
@@ -300,17 +300,17 @@ impl NewProgram {
             .range_resolved_project_reference_in_child_config(child_config, f)
     }
 
-    // Go: program.go:215 (*Program).UseCaseSensitiveFileNames
+    // Go: program.go:231 (*Program).UseCaseSensitiveFileNames
     pub fn use_case_sensitive_file_names(&self) -> bool {
         self.host().fs().use_case_sensitive_file_names()
     }
 
-    // Go: program.go:219 (*Program).UsesUriStyleNodeCoreModules
+    // Go: program.go:235 (*Program).UsesUriStyleNodeCoreModules
     pub fn uses_uri_style_node_core_modules(&self) -> Tristate {
         self.uses_uri_style_node_core_modules
     }
 
-    // Go: program.go:226 (*Program).GetSourceFileFromReference
+    // Go: program.go:242 (*Program).GetSourceFileFromReference
     /** This should have similar behavior to 'processSourceFile' without diagnostics or mutation. */
     pub fn get_source_file_from_reference(
         &self,
@@ -409,7 +409,7 @@ pub fn new_program(opts: ProgramOptions) -> NewProgram {
 }
 
 impl NewProgram {
-    // Go: program.go:288 (*Program).UpdateProgram
+    // Go: program.go:305 (*Program).UpdateProgram
     // Return an updated program for which it is known that only the file with the given path has changed.
     // In addition to a new program, return a boolean indicating whether the data of the old program was reused.
     // The returned source file is the changed file as acquired through newHost; it is None
@@ -445,7 +445,7 @@ impl NewProgram {
     // file cannot be replaced in place. Unlike UpdateProgram, it never constructs a
     // full fallback program, so callers that build their own fallback (e.g. with a
     // different host) do not pay for a discarded program build.
-    // Go: program.go:320 (*Program).ReuseProgram
+    // Go: program.go:332 (*Program).ReuseProgram
     // PORT: Go nil `*Program` is `None`. The `createCheckerPool` parameter is
     // dropped with the option.
     // PORT: tsgo#4712 Go copies `contentMapperOptionDiagnostics` into the new
@@ -609,7 +609,7 @@ impl NewProgram {
         (Some(result), Some(new_file), true)
     }
 
-    // Go: program.go:335 (*Program).initCheckerPool
+    // Go: program.go:435 (*Program).initCheckerPool
     // PORT: the checker pool stays in program.rs, so only the check is kept.
     pub fn init_checker_pool(&mut self) {
         if !self.finished_processing {
@@ -617,7 +617,7 @@ impl NewProgram {
         }
     }
 
-    // Go: program.go:434 (*Program).canReplaceFileInProgram
+    // Go: program.go:454 (*Program).canReplaceFileInProgram
     // #4792: a method, so each import also compares its resolution mode.
     pub fn can_replace_file_in_program(
         &self,
@@ -685,7 +685,7 @@ fn slices_equal_func<T>(s1: &[T], s2: &[T], eq: impl Fn(&T, &T) -> bool) -> bool
 }
 
 impl NewProgram {
-    // Go: program.go:367 (*Program).needsImportHelpersImportSpecifier
+    // Go: program.go:472 (*Program).needsImportHelpersImportSpecifier
     pub fn needs_import_helpers_import_specifier(&self, file: &ParsedSourceFile) -> bool {
         let (redirect, _) = self.mapper().get_redirect_for_resolution(file);
         let options_for_file = get_compiler_options_with_redirect(
@@ -726,7 +726,7 @@ impl NewProgram {
             .is_some_and(|specifiers| specifiers.contains_key(path))
     }
 
-    // Go: program.go:466 (*Program).jsxRuntimeImportSpecifier (tsgo#4712)
+    // Go: program.go:486 (*Program).jsxRuntimeImportSpecifier (tsgo#4712)
     // PORT: as `needs_import_helpers_import_specifier`, this reads the
     // `ParsedSourceFile` fields (`get_jsx_implicit_import_base_of_file`).
     pub fn jsx_runtime_import_specifier(&self, file: &ParsedSourceFile) -> String {
@@ -777,22 +777,22 @@ pub fn equal_check_js_directives(
 }
 
 impl NewProgram {
-    // Go: program.go:397 (*Program).SourceFiles
+    // Go: program.go:511 (*Program).SourceFiles
     pub fn source_files(&self) -> &[Rc<ParsedSourceFile>] {
         &self.files
     }
 
-    // Go: program.go:398 (*Program).DuplicateSourceFiles
+    // Go: program.go:512 (*Program).DuplicateSourceFiles
     pub fn duplicate_source_files(&self) -> &[DuplicateSourceFile] {
         &self.duplicate_source_files
     }
 
-    // Go: program.go:399 (*Program).Options
+    // Go: program.go:513 (*Program).Options
     pub fn options(&self) -> &CompilerOptions {
         self.opts.config.compiler_options()
     }
 
-    // Go: program.go:497 (*Program).GetContentMapper (tsgo#4712)
+    // Go: program.go:517 (*Program).GetContentMapper (tsgo#4712)
     // GetContentMapper returns the content mapper that produced the given source file, or nil if the
     // file was not produced by a content mapper.
     pub fn get_content_mapper(&self, file: &ParsedSourceFile) -> Option<Rc<Mapper>> {
@@ -809,17 +809,17 @@ impl NewProgram {
         None
     }
 
-    // Go: program.go:508 (*Program).ContentMapperExtensions (tsgo#4712)
+    // Go: program.go:528 (*Program).ContentMapperExtensions (tsgo#4712)
     pub fn content_mapper_extensions(&self) -> Vec<String> {
         self.opts.config.content_mapper_extensions()
     }
 
-    // Go: program.go:400 (*Program).CommandLine
+    // Go: program.go:529 (*Program).CommandLine
     pub fn command_line(&self) -> &Rc<ParsedCommandLine> {
         &self.opts.config
     }
 
-    // Go: program.go:401 (*Program).Host
+    // Go: program.go:530 (*Program).Host
     pub fn host(&self) -> &Rc<dyn CompilerHost> {
         &self.opts.host
     }
@@ -836,10 +836,10 @@ impl NewProgram {
         }
     }
 
-    // Go: program.go:402 (*Program).Tracing
+    // Go: program.go:531 (*Program).Tracing
     // PORT: the session is the process global `crate::tracing::get`.
 
-    // Go: program.go:403 (*Program).GetConfigFileParsingDiagnostics
+    // Go: program.go:532 (*Program).GetConfigFileParsingDiagnostics
     pub fn get_config_file_parsing_diagnostics(&self) -> Vec<Diagnostic> {
         self.opts
             .config
@@ -847,7 +847,7 @@ impl NewProgram {
             .to_vec()
     }
 
-    // Go: program.go:409 (*Program).GetUnresolvedImports
+    // Go: program.go:538 (*Program).GetUnresolvedImports
     // GetUnresolvedImports returns the unresolved imports for this program.
     // The result is cached and computed only once.
     pub fn get_unresolved_imports(&self) -> &FxHashSet<String> {
@@ -855,7 +855,7 @@ impl NewProgram {
             .get_value(|| self.extract_unresolved_imports())
     }
 
-    // Go: program.go:413 (*Program).extractUnresolvedImports
+    // Go: program.go:542 (*Program).extractUnresolvedImports
     fn extract_unresolved_imports(&self) -> FxHashSet<String> {
         let mut unresolved_set = FxHashSet::default();
 
@@ -869,7 +869,7 @@ impl NewProgram {
         unresolved_set
     }
 
-    // Go: program.go:426 (*Program).extractUnresolvedImportsFromSourceFile
+    // Go: program.go:555 (*Program).extractUnresolvedImportsFromSourceFile
     fn extract_unresolved_imports_from_source_file(&self, file: &ParsedSourceFile) -> Vec<String> {
         let mut unresolved_imports = Vec::new();
 
@@ -891,12 +891,12 @@ impl NewProgram {
         unresolved_imports
     }
 
-    // Go: program.go:441 (*Program).SingleThreaded
+    // Go: program.go:570 (*Program).SingleThreaded
     pub fn single_threaded(&self) -> bool {
         single_threaded(&self.opts)
     }
 
-    // Go: program.go:445 (*Program).BindSourceFiles
+    // Go: program.go:574 (*Program).BindSourceFiles
     // PORT: binding stays in program.rs (`bind_all`); not ported here.
 }
 

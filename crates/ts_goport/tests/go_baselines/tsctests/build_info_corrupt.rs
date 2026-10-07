@@ -367,7 +367,11 @@ fn empty_message_args_are_written_again() {
 // keeps a read empty list empty (buildinfotosnapshot.go:86 and :87,
 // snapshottobuildinfo.go:141 and :142), so the build info written again has
 // both `[]`. Bytes from the pin N oracle.
-// PORT: the ast path drops them, as for `messageArgs`.
+// When the read diagnostics are reported first (no syntax error), Go writes
+// them from its `ast.Diagnostic` copies. `toDiagnostic` builds these two
+// lists with `append` from nil (incremental/snapshot.go:170 to 177), so
+// `omitzero` drops both there, and the port drops them too (pin N oracle).
+// Only `messageArgs` differs on that path (see above).
 #[test]
 fn empty_message_chain_and_related_information_are_written_again() {
     let lists = r#""messageArgs":["number","string"],"messageChain":[],"relatedInformation":[]}"#;

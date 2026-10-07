@@ -1708,3 +1708,73 @@ impl Checker {
         t
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go `getSymbolNameForPrivateIdentifier` (binder/binder.go) writes the
+    // class symbol's id into the name of each private identifier symbol.
+    // Each file binds into its own arena here, and
+    // `SymbolArena::prepare_file_arena` moves the ids, and so these names,
+    // when the arena joins the program after the lib files. The members and
+    // exports tables must then find the moved names: their hash filter and
+    // index are built again (corefix1). The checker finds each private name
+    // as Go `lookupSymbolForPrivateIdentifierDeclaration` (checker.go:11674)
+    // does, in tables of 2, 8, 9 and 41 entries (with no index and with
+    // one).
+    #[test]
+    fn private_names_are_found_after_the_file_arena_moves() {
+        let mut source = String::new();
+        for (class, size) in [1, 7, 8, 40].into_iter().enumerate() {
+            source.push_str(&format!("export class C{class} {{\n"));
+            for k in 0..size {
+                source.push_str(&format!("    #p{k} = {k};\n    static #s{k} = {k};\n"));
+            }
+            source.push_str("    m() {}\n}\n");
+        }
+        let dir =
+            std::env::temp_dir().join(format!("ts_goport_private_names_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), source).unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "target": "es2022", "types": [] }, "files": ["a.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = crate::program::try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scope = crate::core::enter_program(Some(program));
+        let file = program
+            .source_files()
+            .find(|file| file.info.file_name.ends_with("/a.ts"))
+            .expect("a.ts is not in the program")
+            .root;
+        let (found, missing) = crate::program::with_type_checker_for_file(file, move |checker| {
+            let (mut found, mut missing) = (0, Vec::new());
+            for class in file.statements().iter() {
+                let method = class.members().iter().last().expect("m");
+                for member in class.members().iter() {
+                    let name = member.name();
+                    if !is_private_identifier(name) {
+                        continue;
+                    }
+                    let symbol = checker
+                        .lookup_symbol_for_private_identifier_declaration(name.text(), method);
+                    if symbol.is_some() && symbol == checker.get_symbol_of_declaration(member) {
+                        found += 1;
+                    } else {
+                        missing.push(name.text().to_string());
+                    }
+                }
+            }
+            (found, missing)
+        });
+        drop(scope);
+        crate::program::release_program(program);
+        assert!(missing.is_empty(), "not found: {missing:?}");
+        assert_eq!(found, 2 * (1 + 7 + 8 + 40));
+    }
+}

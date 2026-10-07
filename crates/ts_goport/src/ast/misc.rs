@@ -1468,7 +1468,11 @@ pub fn get_type_node_precedence(n: Node) -> TypePrecedence {
         // These occur in pseudo-types like `f<T>.C`, where `f` is a generic function and `C` is a local type
         | SyntaxKind::PropertyAccessExpression
         | SyntaxKind::ExpressionWithTypeArguments => TypePrecedence::NON_ARRAY,
-        kind => panic!("unhandled TypeNode: {kind:?}"),
+        // Go `%v` of a Kind is `Kind.String()`.
+        kind => panic!(
+            "unhandled TypeNode: {}",
+            crate::gostd::debug::kind_string(kind)
+        ),
     }
 }
 
@@ -1757,3 +1761,25 @@ impl PositionMap {
 // PORT: Go `ast.NodeId` and `ast.SymbolId` are plain `uint64` ids. The port
 // uses the `core::Node` and `core::SymbolId` handles instead, so there is
 // nothing to define here.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::AssertUnwindSafe;
+
+    // Go prints `%v` of the Kind in this panic (ast/precedence.go:715
+    // `panic(fmt.Sprintf("unhandled TypeNode: %v", n.Kind))`), which is
+    // `Kind.String()`. The API's printNode reaches it (gaps2a skeptic repro
+    // r-typenode).
+    #[test]
+    fn unhandled_type_node_panic_names_the_go_kind() {
+        let f = NodeFactory::new();
+        let name = f.new_identifier("x");
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| get_type_node_precedence(name)))
+            .expect_err("no panic");
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some("unhandled TypeNode: KindIdentifier")
+        );
+    }
+}
