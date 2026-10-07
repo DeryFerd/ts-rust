@@ -12,13 +12,13 @@
 //!   starts the async part on a goroutine, so Go can answer requests out of
 //!   order; the port answers them in order). Between the two parts, after
 //!   each message and after each wake-up it runs
-//!   `gostd::local::run_pending()`. After a quiet period with no message,
-//!   it runs `gostd::local::run_idle()`.
+//!   `gostd::local::run_pending()`. When no message waits, it runs
+//!   `gostd::local::run_idle()`.
 //! - The reader thread owns the `Reader`. It routes responses to
 //!   `pending_server_requests`, handles `$/cancelRequest` and the first
 //!   `initialize`, and queues all other messages (Go does the same on the
 //!   read goroutine). It also cancels the auto-import warm when a file
-//!   event arrives (below).
+//!   event arrives, or makes it yield (below).
 //! - The writer thread owns the `Writer` and drains the outgoing queue.
 //! - The progress thread (`progress.rs`) and the parent watchdog
 //!   (`cmd/tsgo/lsp.rs`) touch only `Send` data.
@@ -45,9 +45,8 @@
 //! - A background client request (`update_watches` registerCapability, 1 s
 //!   timeout) blocks the dispatch thread until the client answers. Go waits
 //!   on a goroutine.
-//! - A request that arrives while the auto-import warm runs waits for it,
-//!   unless it is a file event, which cancels the warm (below). Go runs
-//!   the request at the same time.
+//! - A request that arrives while the auto-import warm runs waits for it
+//!   (below). Go runs the request at the same time.
 //! - LSP messages wait while an API request runs, and API requests wait
 //!   while an LSP message runs. Go runs them at the same time. An API
 //!   connection that opens while another is connected holds the other's
@@ -68,13 +67,18 @@
 //!
 //! The one exception is idle work (`gostd::local::go_idle`): the clone of
 //! the auto-import warm, which sends nothing to the client. It starts only
-//! after `IDLE_QUIET_PERIOD` with an empty request queue
-//! (`queued_requests`), so fast edits and the requests right after them do
-//! not wait for it. Go runs it on a goroutine, at the same time. When a
-//! didOpen, didChange, didClose or didChangeWatchedFiles arrives while it
-//! runs, the reader thread cancels the warm
-//! (`project::WarmAutoImportPreempt`), as Go's dispatch goroutine does when
-//! it handles them. The warm stops at its next context check.
+//! with an empty request queue (`queued_requests`). Go runs it on a
+//! goroutine, at the same time, from before the answer of the request that
+//! made the snapshot. So the first attempt of a warm starts at once, and a
+//! message that comes during it waits only up to Go's head start (a few
+//! ms). Then a didOpen, didChange, didClose or didChangeWatchedFiles
+//! cancels the warm, as Go's dispatch goroutine does when it handles them,
+//! and any other message makes the attempt yield. An attempt after a
+//! yield, and each attempt while the session is marked slow (an eager
+//! attempt did not end), starts after `IDLE_QUIET_PERIOD`, and only a file
+//! event cancels it (`project::WarmAutoImportPreempt`,
+//! `project::Session::run_pending_warm`).
+//! The warm stops at its next context check.
 //!
 //! Large frees (`gostd::local::drop_later`: a released program, the parse
 //! tasks of a load) wait until the message is done, and then run only
@@ -459,7 +463,8 @@ pub struct ServerShared {
     pub flake_logging: OnceLock<lsproto::DiagnosticFlakeLogLevel>,
 
     // PORT: the session's `warm_auto_import_preempt`, set by
-    // `handle_initialized`. The reader thread cancels the warm with it.
+    // `handle_initialized`. The reader thread queues each message through
+    // it, and cancels the warm or makes it yield with it.
     pub warm_auto_import_preempt: OnceLock<project::WarmAutoImportPreempt>,
 }
 
@@ -1875,15 +1880,17 @@ impl ServerShared {
                     if let Ok(params) = lsproto::unmarshal_params::<lsproto::CancelParams>(&req) {
                         self.cancel_request(&params.id);
                     }
+                } else if let Some(preempt) = self.warm_auto_import_preempt.get() {
+                    // PORT: Go's handler cancels the warm when the dispatch
+                    // goroutine reaches this message, and other messages run
+                    // at the same time as the warm. Here the warm holds the
+                    // dispatch thread, so cancel it now, or make it yield.
+                    preempt.on_message(
+                        cancels_warm_auto_import(&req.method),
+                        &*self.logger,
+                        || self.queue_request(ctx, QueuedRequest::Request(req)),
+                    )?;
                 } else {
-                    if cancels_warm_auto_import(&req.method) {
-                        // PORT: Go's handler cancels the warm when the
-                        // dispatch goroutine reaches this message. Here the
-                        // warm holds the dispatch thread, so cancel it now.
-                        if let Some(preempt) = self.warm_auto_import_preempt.get() {
-                            preempt.cancel(&*self.logger);
-                        }
-                    }
                     self.queue_request(ctx, QueuedRequest::Request(req))?;
                 }
             }
@@ -2061,16 +2068,20 @@ impl Server {
         // (`gostd::local::drop_later`) run after its answer, while no
         // message waits.
         gostd::local::drop_garbage(busy);
-        // PORT: idle work (the auto-import warm) runs only after a
-        // quiet period with no message, so it does not delay a request
-        // that has arrived or that comes right after an answer. Work it
+        // PORT: idle work (the auto-import warm) runs only when no message
+        // waits: at once or after a quiet period with no message, as the job
+        // asks, so it does not delay a request that has arrived. Work it
         // queues runs right after it, as it did when the warm ran inside
         // `run_pending`.
         while ctx.err().is_none()
-            && gostd::local::has_idle()
-            && self
-                .shared
-                .wait_quiet(self.free_since.get() + IDLE_QUIET_PERIOD)
+            && let Some(start) = gostd::local::next_idle()
+            && self.shared.wait_quiet(
+                self.free_since.get()
+                    + match start {
+                        gostd::local::IdleStart::AtOnce => Duration::ZERO,
+                        gostd::local::IdleStart::AfterQuiet => IDLE_QUIET_PERIOD,
+                    },
+            )
             && gostd::local::run_idle()
         {
             gostd::local::run_pending();
@@ -2185,12 +2196,13 @@ impl Server {
 }
 
 /// PORT: how long the dispatch loop waits with an empty request queue
-/// before it starts idle work (the auto-import warm). No Go counterpart: Go
-/// runs the warm on a goroutine at once, and a request never waits for it.
-/// Here a request that arrives while the warm runs waits for it (a file
+/// before it starts idle work that asks for it (`IdleStart::AfterQuiet`: an
+/// attempt of the auto-import warm that is not eager). No Go counterpart: Go runs the
+/// warm on a goroutine at once, and a request never waits for it. Here a
+/// request that arrives while such an attempt runs waits for it (a file
 /// event only until the warm's next context check). Clients send the next
 /// message within about a millisecond of an answer (fast typing: didChange
-/// and a diagnostic pull), so the warm starts only when they pause.
+/// and a diagnostic pull), so the attempt starts only when they pause.
 pub const IDLE_QUIET_PERIOD: Duration = Duration::from_millis(50);
 
 impl ServerShared {
@@ -3641,6 +3653,15 @@ impl Server {
             content_mapped_parse_cache: None,
         });
         *self.session.borrow_mut() = Some(session.clone());
+        {
+            // Weak: the session does not keep the server alive.
+            let shared = Arc::downgrade(&self.shared);
+            session.warm_auto_import_preempt.set_busy(Box::new(move || {
+                shared
+                    .upgrade()
+                    .is_some_and(|s| s.queued_requests.load(Ordering::SeqCst) != 0)
+            }));
+        }
         let _ = self
             .shared
             .warm_auto_import_preempt

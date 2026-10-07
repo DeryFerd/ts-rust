@@ -1759,6 +1759,159 @@ child_test! {
     }
 }
 
+/// The session of the auto-import warm tests: an open index.ts whose last
+/// change queued a warm that has not run yet. Only the alias checker of the
+/// warm reads OTHER (foo's entrypoint re-exports it, and the program does
+/// not include it). Returns the session, the hook that runs once at the next
+/// read of OTHER, and the number of reads of OTHER.
+fn session_with_pending_warm() -> (
+    Rc<Session>,
+    Rc<RefCell<Option<Box<dyn FnOnce()>>>>,
+    Rc<std::cell::Cell<usize>>,
+) {
+    const INDEX_URI: &str = "file:///home/projects/app/index.ts";
+    const OTHER: &str = "/home/projects/node_modules/foo/other.d.ts";
+    let (_, map_fs) = projecttestutil::wrapped_map_fs(
+        files(&[
+            ("/home/projects/app/tsconfig.json", "{}"),
+            ("/home/projects/app/index.ts", ""),
+            (
+                "/home/projects/node_modules/foo/package.json",
+                r#"{ "types": "index.d.ts" }"#,
+            ),
+            (
+                "/home/projects/node_modules/foo/index.d.ts",
+                "export const foo = 0;\nexport * from \"./other\";",
+            ),
+            (OTHER, "export declare const bar: number;"),
+        ]),
+        false, /*useCaseSensitiveFileNames*/
+    );
+    let on_read_other: Rc<RefCell<Option<Box<dyn FnOnce()>>>> = Rc::default();
+    let reads = Rc::new(std::cell::Cell::new(0));
+    let fs = {
+        let inner = map_fs.clone();
+        let on_read_other = on_read_other.clone();
+        let reads = reads.clone();
+        wrapvfs_wrap(
+            map_fs,
+            Replacements {
+                read_file: Some(Box::new(move |path: &str| {
+                    if path == OTHER {
+                        reads.set(reads.get() + 1);
+                        let hook = on_read_other.borrow_mut().take();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
+                    inner.read_file(path)
+                })),
+                ..Default::default()
+            },
+        )
+    };
+    let session = project::new_session(&SessionInit {
+        background_ctx: bg(),
+        options: Rc::new(SessionOptions {
+            watch_enabled: false,
+            logging_enabled: false,
+            ..projecttestutil::session_options("/")
+        }),
+        fs,
+        client: None,
+        logger: None,
+        npm_executor: None,
+        spawner: None,
+        content_mapper_logger: None,
+        parse_cache: None,
+        content_mapped_parse_cache: None,
+    });
+    open(&session, INDEX_URI, "");
+    session.wait_for_background_tasks();
+    // A change of one open file queues a warm (Go warmAutoImportCache).
+    edit(&session, INDEX_URI, 2, (0, 0), (0, 0), "let a = 1;");
+    let _ = language_service(&session, INDEX_URI);
+    (session, on_read_other, reads)
+}
+
+/// A message other than a file event, as the LSP reader thread sees it
+/// while the warm's clone runs: it waits for the hold, then makes the
+/// attempt yield.
+fn yield_warm_attempt(session: &Rc<Session>) {
+    let preempt = session.warm_auto_import_preempt.clone();
+    std::thread::spawn(move || {
+        let logger: Option<Rc<dyn project::logging::Logger>> = None;
+        preempt.on_message(false, &logger, || ());
+    })
+    .join()
+    .expect("reader thread");
+}
+
+child_test! {
+    // PORT: no Go counterpart (lswarm1). A message that does not wait for
+    // the first (eager) attempt of the warm makes it yield. The warm drops
+    // that clone, keeps its snapshot, and runs again later; its second clone
+    // is adopted, as Go's one clone is.
+    fn yielded_auto_import_warm_runs_again_and_is_adopted() {
+        let (session, on_read_other, reads) = session_with_pending_warm();
+        let before = session.snapshot();
+        let weak = Rc::downgrade(&session);
+        *on_read_other.borrow_mut() = Some(Box::new(move || {
+            if let Some(session) = weak.upgrade() {
+                yield_warm_attempt(&session);
+            }
+        }));
+        session.wait_for_background_tasks();
+        assert!(on_read_other.borrow().is_none(), "the warm did not read the file");
+        assert_eq!(reads.get(), 2, "one read per attempt");
+        assert!(!session.warm_auto_import_slow.get(), "a clone ended");
+
+        let after = session.snapshot();
+        assert!(!Rc::ptr_eq(&after, &before), "the warm's clone was not adopted");
+        let names = node_modules_export_names(&session);
+        assert!(names.contains("foo") && names.contains("bar"), "{names:?}");
+        session.close();
+    }
+}
+
+child_test! {
+    // PORT: no Go counterpart (lswarm1). A yielded warm whose session has
+    // moved past its snapshot ends without a second clone: Go's adopt
+    // (session.go:1311) would discard it.
+    fn yielded_auto_import_warm_ends_when_the_session_moves() {
+        let (session, on_read_other, reads) = session_with_pending_warm();
+        let weak = Rc::downgrade(&session);
+        *on_read_other.borrow_mut() = Some(Box::new(move || {
+            if let Some(session) = weak.upgrade() {
+                yield_warm_attempt(&session);
+            }
+        }));
+        // The snapshot task queues the warm, and its first attempt yields.
+        ts_goport::gostd::local::run_pending();
+        assert!(ts_goport::gostd::local::run_idle());
+        assert_eq!(reads.get(), 1);
+        assert!(session.warm_auto_import_slow.get(), "the eager attempt yielded");
+
+        // A request with auto-imports adopts its own clone (Go
+        // GetLanguageServiceWithAutoImports), so the session moves.
+        let base = session.snapshot();
+        session
+            .get_current_language_service_with_auto_imports(&bg(), &uri("file:///home/projects/app/index.ts"))
+            .unwrap_or_else(|err| panic!("{}", err.error()));
+        ts_goport::gostd::local::run_pending();
+        let moved = session.snapshot();
+        assert!(!Rc::ptr_eq(&moved, &base), "the session did not move");
+
+        let reads_before_retry = reads.get();
+        assert!(ts_goport::gostd::local::run_idle(), "no retry was queued");
+        assert_eq!(reads.get(), reads_before_retry, "the retry cloned");
+        assert!(Rc::ptr_eq(&session.snapshot(), &moved));
+        assert!(session.warm_auto_import_pending.borrow().is_none());
+        assert!(!ts_goport::gostd::local::run_idle());
+        session.close();
+    }
+}
+
 child_test! {
     // PORT: no Go counterpart (editfuzz2 P2-1). Only a released program
     // version loaded the node_modules entrypoint pk/node.d.ts; the parse

@@ -406,3 +406,85 @@ child_test! {
         );
     }
 }
+
+/// A didChange of `u` to `text`, the whole document.
+fn change(client: &LspClient, u: &lsproto::DocumentUri, version: i32, text: &str) {
+    client.send_notification(
+        &lsproto::TEXT_DOCUMENT_DID_CHANGE_INFO,
+        lsproto::DidChangeTextDocumentParams {
+            text_document: lsproto::VersionedTextDocumentIdentifier {
+                uri: u.clone(),
+                version,
+            },
+            content_changes: vec![lsproto::TextDocumentContentChangePartialOrWholeDocument {
+                partial: None,
+                whole_document: Some(lsproto::TextDocumentContentChangeWholeDocument {
+                    text: text.to_string(),
+                }),
+            }],
+        },
+    );
+}
+
+child_test! {
+    // PORT: no Go counterpart (lswarm1, lspsweep2 g3-warm-race). The
+    // diagnostic pull flushes the change that imports ./ext/other, and that
+    // snapshot change starts the auto-import warm (Go warmAutoImportCache,
+    // session.go:2046), which indexes other.ts while the program has it. Go
+    // starts the warm on a goroutine before the diagnostic's answer. The
+    // next change removes the import 20 ms after the answer; Go's
+    // registry keeps the exports of a file that left the program
+    // (registry.go:1033-1040, :1137), so the last completion offers
+    // `widget`. The port started the warm only after 50 ms with no message,
+    // so the change cancelled it and the completion did not offer `widget`.
+    fn auto_import_warm_runs_before_the_next_change() {
+        let client = init_completion_client(
+            "/home/projects",
+            &[
+                (
+                    "/home/projects/tsconfig.json",
+                    r#"{"compilerOptions": {"strict": true, "target": "es2020", "module": "esnext", "moduleResolution": "bundler"}, "files": ["a.ts"]}"#,
+                ),
+                ("/home/projects/a.ts", "export function main() {\n  return 1;\n}\nwid\n"),
+                (
+                    "/home/projects/ext/other.ts",
+                    "export const other = 1;\nexport function widget(): number { return 2; }\n",
+                ),
+            ],
+        );
+        let a_uri = lsconv::file_name_to_document_uri("/home/projects/a.ts");
+        let text = "export function main() {\n  return 1;\n}\nwid\n";
+        open(&client, &a_uri, text);
+        let (msg, _) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_COMPLETION_INFO,
+            completion_params(&a_uri, 3, 3),
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+
+        change(&client, &a_uri, 2, &format!("import {{ other }} from './ext/other';\n{text}"));
+        let (msg, _) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_DIAGNOSTIC_INFO,
+            lsproto::DocumentDiagnosticParams {
+                text_document: lsproto::TextDocumentIdentifier { uri: a_uri.clone() },
+                ..Default::default()
+            },
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        change(&client, &a_uri, 3, text);
+
+        let (msg, resp) = client.send_request(
+            &lsproto::TEXT_DOCUMENT_COMPLETION_INFO,
+            completion_params(&a_uri, 3, 3),
+        );
+        assert!(msg.error.is_none(), "{:?}", msg.error);
+        let items = completion_items(resp);
+        let widget = find_completion_item(&items, "widget").expect("widget in the completions");
+        let auto_import = widget
+            .data
+            .as_ref()
+            .and_then(|data| data.auto_import.as_ref())
+            .expect("item.Data.AutoImport");
+        assert_eq!(auto_import.module_specifier, "./ext/other");
+    }
+}
