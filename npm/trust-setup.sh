@@ -10,10 +10,14 @@
 #      publish it. When the package already trusts something else, it stops and prints the
 #      revoke command (it does not revoke by itself).
 # npm drops a new trust that publishes nothing in 2 days. So run this shortly before the first tag.
+# The first publish binds a trust to the repo's GitHub ID, not only its name. After the repo is
+# recreated (as on 2026-10-07), run it with --relink: it revokes every trust of each package first.
 #
-# usage: npm/trust-setup.sh          needs npm 11.15.0 or later (npm trust)
+# usage: npm/trust-setup.sh [--relink]    needs npm 11.15.0 or later (npm trust)
 set -euo pipefail
-[[ ${1:-} != help ]] || { sed -n '2,14p' "$0" >&2; exit 2; }
+[[ ${1:-} != help ]] || { sed -n '2,16p' "$0" >&2; exit 2; }
+relink=0
+[[ ${1:-} != --relink ]] || relink=1
 repo=pingdotgg/ts-rust
 packages=(tsc-rs @tsc-rs/linux-x64 @tsc-rs/darwin-arm64)
 
@@ -43,6 +47,15 @@ EOF
 done
 
 for name in "${packages[@]}"; do
+  if ((relink)); then
+    for id in $(npm trust list "$name" --json | node -e '
+      const text = require("fs").readFileSync(0, "utf8").trim();
+      for (const t of text ? JSON.parse(`[${text.replace(/}\s*{/g, "},{")}]`) : []) console.log(t.id);
+    '); do
+      npm trust revoke "$name" --id="$id"
+      sleep 2
+    done
+  fi
   # `npm trust list --json` prints one JSON object per trust (npm/cli lib/trust-cmd.js
   # logOptions): id, type, file, repository, environment and permissions. createPackage is
   # --allow-publish.
