@@ -1101,12 +1101,51 @@ impl InfoCacheEntry {
     }
 }
 
+/// A package.json read that a parse worker made first in the program load,
+/// before the loader's cache has an entry for it (`InfoCache::add_pending`).
+// PORT: not in Go. Go's parse tasks share the resolver's one cache, so the
+// first read of a load is the cache entry. A worker's entry has `Rc`
+// contents on the worker's thread, so the loader keeps the text and parses
+// it only when a lookup asks for the entry (`InfoCache::get`).
+#[derive(Debug)]
+pub struct PendingInfo {
+    pub package_directory: String,
+    pub directory_exists: bool,
+    /// The text of the package.json. `None`: it does not exist.
+    pub text: Option<Box<str>>,
+}
+
+impl PendingInfo {
+    /// The cache entry of the read, with the text parsed as Go
+    /// `getPackageJsonInfo` parses it (module/resolver.go:1775).
+    fn into_entry(self) -> Rc<InfoCacheEntry> {
+        let contents = self.text.map(|text| {
+            let parsed = parse(&go_string_bytes(&text));
+            let parseable = parsed.is_ok();
+            Rc::new(PackageJson {
+                fields: parsed.unwrap_or_default(),
+                parseable,
+                ..Default::default()
+            })
+        });
+        Rc::new(InfoCacheEntry {
+            package_directory: self.package_directory,
+            directory_exists: self.directory_exists,
+            contents,
+        })
+    }
+}
+
 // Go: cache.go:169 InfoCache
 // PORT: Go `collections.SyncMap` is a `RefCell` map. The cache is shared as
 // `Rc<InfoCache>`, so its methods take `&self`.
 #[derive(Debug, Default)]
 pub struct InfoCache {
     cache: RefCell<FxHashMap<Path, Rc<InfoCacheEntry>>>,
+    /// PORT: not in Go. The reads of the parse workers that no lookup has
+    /// asked for yet (`add_pending`). They are not entries: `get` makes the
+    /// entry, and `range` and `contains_key` do not see them.
+    pending: RefCell<FxHashMap<Path, PendingInfo>>,
     current_directory: String,
     use_case_sensitive_file_names: bool,
 }
@@ -1116,6 +1155,7 @@ pub struct InfoCache {
 pub fn new_info_cache(current_directory: &str, use_case_sensitive_file_names: bool) -> InfoCache {
     InfoCache {
         cache: RefCell::new(FxHashMap::default()),
+        pending: RefCell::new(FxHashMap::default()),
         current_directory: current_directory.to_string(),
         use_case_sensitive_file_names,
     }
@@ -1123,6 +1163,8 @@ pub fn new_info_cache(current_directory: &str, use_case_sensitive_file_names: bo
 
 impl InfoCache {
     // Go: cache.go:182 Get
+    // PORT: a pending read of the key (`add_pending`) becomes its entry
+    // here, as Go's cache holds the first read of the load.
     #[must_use]
     pub fn get(&self, package_json_path: &str) -> Option<Rc<InfoCacheEntry>> {
         let key = to_path(
@@ -1130,7 +1172,25 @@ impl InfoCache {
             &self.current_directory,
             self.use_case_sensitive_file_names,
         );
-        self.cache.borrow().get(&key).cloned()
+        if let Some(entry) = self.cache.borrow().get(&key) {
+            return Some(entry.clone());
+        }
+        if self.pending.borrow().is_empty() {
+            return None;
+        }
+        let pending = self.pending.borrow_mut().remove(&key)?;
+        let entry = pending.into_entry();
+        Some(self.cache.borrow_mut().entry(key).or_insert(entry).clone())
+    }
+
+    /// PORT: not in Go. Keeps `read`, a parse worker's first read of
+    /// `package_json_path` in the program load, for `get`, unless the cache
+    /// has an entry or a pending read for the key: Go `Set` keeps the first.
+    pub fn add_pending(&self, package_json_path: &str, read: PendingInfo) {
+        let key = self.key(package_json_path);
+        if !self.cache.borrow().contains_key(&key) {
+            self.pending.borrow_mut().entry(key).or_insert(read);
+        }
     }
 
     /// PORT: not in Go. The key of `package_json_path` (the `toPath` of
@@ -1183,6 +1243,8 @@ impl InfoCache {
     // PORT: not in Go. Go's GC frees the cache with its last resolver.
     pub fn clear(&self) {
         let entries = std::mem::take(&mut *self.cache.borrow_mut());
+        let pending = std::mem::take(&mut *self.pending.borrow_mut());
         drop(entries);
+        drop(pending);
     }
 }

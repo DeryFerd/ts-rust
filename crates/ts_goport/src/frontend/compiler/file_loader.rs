@@ -421,10 +421,16 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         stats.end_load(&taken);
     }
 
-    // The loader took the metadata of the files; the package.json texts of
-    // the parse workers that it did not take go now.
-    if let Some(shared) = &loader.shared_resolution {
-        shared.end_package_json_reads();
+    // The parse workers have ended: the program resolver's package.json
+    // cache keeps the package.json texts that they read first and the
+    // loader did not take, and parses one only when a lookup asks for it.
+    if let Some(shared) = &loader.shared_resolution
+        && let Some(resolver) = loader
+            .resolver
+            .as_ref()
+            .and_then(|resolver| resolver.as_default_resolver())
+    {
+        shared.end_package_json_reads(&resolver.caches.package_json_info_cache);
     }
 
     // Clear out loader and host to ensure its not used post program creation
@@ -1793,10 +1799,11 @@ impl FileLoader {
         }
     }
 
-    /// Puts the package.json entries of the package scope walk of a file's
-    /// metadata that a parse worker made into the program resolver's cache
+    /// Keeps the package.json reads of the package scope walk of a file's
+    /// metadata that a parse worker made in the program resolver's cache
     /// (`Caches::adopt_worker_package_jsons`), when the load takes the
-    /// metadata (`take_prefetched_meta`).
+    /// metadata (`take_prefetched_meta`). The cache parses a read only when
+    /// a lookup asks for it.
     // PORT: not in Go (loadpar1). Go finds the metadata with the program's
     // resolver (fileloader.go:391).
     pub(crate) fn adopt_worker_package_jsons(&self, package_jsons: &[PackageJsonLookup]) {
@@ -2987,6 +2994,71 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
             // `GOPORT_PARSE_THREADS=0`) the loader reads every file itself.
             if prep && super::super::files_parser::parse_workers_enabled() {
                 assert!(adopted > 0, "no worker package.json taken");
+            }
+        }
+        set_load_prep(None);
+    }
+
+    // lazypj1: the parse workers also read package.json files for the
+    // module answers that the loader takes. At the end of the load those
+    // reads go into the program resolver's cache, which parses one only
+    // when a lookup asks for it (`SharedResolutionCache::end_package_json_reads`,
+    // `InfoCache::get`), as Go's parse tasks put every read into the
+    // resolver's one cache (module/resolver.go:1755 getPackageJsonInfo,
+    // packagejson/cache.go:190 Set keeps the first). The package.json of
+    // `lib` is in no file's package scope (its types are under `sub`, which
+    // has its own package.json), so only the answer for "lib" reads it. A
+    // lookup on the loading thread after the load finds what the load
+    // read, also when the file changed on disk since.
+    #[test]
+    fn the_loader_keeps_the_package_json_files_of_worker_module_answers() {
+        let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "types": [],
+             "noEmit": true }, "include": ["src"] }"#;
+        let files = [
+            ("package.json", r#"{ "name": "app", "type": "module" }"#),
+            (
+                "src/a.ts",
+                "import { x } from \"lib\";\nexport const a = x;\n",
+            ),
+            (
+                "node_modules/lib/package.json",
+                r#"{ "name": "lib", "version": "1.0.0", "types": "sub/index.d.ts" }"#,
+            ),
+            ("node_modules/lib/sub/package.json", r#"{ "name": "sub" }"#),
+            (
+                "node_modules/lib/sub/index.d.ts",
+                "export declare const x: number;\n",
+            ),
+        ];
+        for prep in [true, false] {
+            set_load_prep(Some(prep));
+            let (processed, dir, cwd) = load_with_workers(
+                &format!("keeps_answer_package_jsons_{prep}"),
+                tsconfig,
+                &files,
+            );
+            std::fs::write(
+                dir.join("node_modules/lib/package.json"),
+                r#"{ "name": "changed" }"#,
+            )
+            .unwrap();
+            let resolver = processed
+                .resolver
+                .as_ref()
+                .and_then(|resolver| resolver.as_default_resolver())
+                .expect("the default resolver");
+            let cache = &resolver.caches.package_json_info_cache;
+            let package_json = format!("{cwd}/node_modules/lib/package.json");
+            // The loader took the answer for "lib" and did not read the file.
+            let loader_read = cache.contains_key(&cache.key(&package_json));
+            let name = resolver
+                .get_package_scope_for_path(&format!("{cwd}/node_modules/lib"))
+                .and_then(|entry| entry.contents.clone())
+                .map(|contents| contents.fields.header_fields.name.get_value().0);
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(name, Some("lib".to_string()), "prep {prep}");
+            if prep && super::super::files_parser::parse_workers_enabled() {
+                assert!(!loader_read, "the loader read the package.json of lib");
             }
         }
         set_load_prep(None);
