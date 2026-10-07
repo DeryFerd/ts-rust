@@ -1489,7 +1489,12 @@ pub fn try_load_timed(
 /// thread then frees its `get_symbol_id` ids of those chunks
 /// (`ast::free_lineage_symbol_ids`). A static file keeps its symbols until
 /// exit. The program copies (`VersionTables::bound_symbols`) and checker
-/// arenas that share a freed chunk keep it until they drop.
+/// arenas that share a freed chunk keep it until they drop, or until a
+/// checker catches up (`catch_up_checker`).
+///
+/// apisym1c: each bind and free makes a new generation
+/// (`LINEAGE_GENERATION`, `SymbolArena::lineage_seen`), so a checker can
+/// tell when its copy is older.
 struct Lineage {
     symbols: SymbolArena,
     /// The arena range of each freeable file version bound here, by file
@@ -1497,9 +1502,18 @@ struct Lineage {
     freeable: FxHashMap<usize, (ArenaMark, ArenaMark, std::ops::Range<usize>)>,
     /// `ast::dead_file_versions` when `free_dead` last looked.
     seen_dead: usize,
+    /// The ranges freed so far, in order, for `catch_up_checker`.
+    // PERF: one entry per dead file version (32 bytes), as
+    // `ast::free_lineage_symbol_ids` keeps one per edit.
+    freed: Vec<(ArenaMark, ArenaMark)>,
 }
 
 static LINEAGE: Mutex<Option<Lineage>> = Mutex::new(None);
+
+/// The generation of the binder lineage (`LineageSeen::generation`), so a
+/// checker whose copy is current does not lock the lineage
+/// (`catch_up_checker`).
+static LINEAGE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Runs `f` with the binder lineage locked, after it frees the chunks of
 /// the file versions that died since its last use.
@@ -1513,6 +1527,7 @@ fn with_lineage<R>(f: impl FnOnce(&mut Lineage) -> R) -> R {
         symbols: SymbolArena::new(),
         freeable: FxHashMap::default(),
         seen_dead: 0,
+        freed: Vec::new(),
     });
     lineage.free_dead();
     f(lineage)
@@ -1528,12 +1543,28 @@ impl Lineage {
         }
         let (dead, seen) = crate::ast::dead_files_since(self.seen_dead);
         self.seen_dead = seen;
+        let freed = self.freed.len();
         for file in dead {
             if let Some((start, end, symbols)) = self.freeable.remove(&file) {
                 self.symbols.free_range(start, end);
+                self.freed.push((start, end));
                 crate::ast::free_lineage_symbol_ids(file, symbols);
             }
         }
+        if self.freed.len() != freed {
+            self.changed();
+        }
+    }
+
+    /// Starts a new generation after a bind or a free, so checker copies
+    /// catch up (`catch_up_checker`), and copies made from now on keep it.
+    fn changed(&mut self) {
+        let generation = self.symbols.lineage_seen().generation + 1;
+        self.symbols.set_lineage_seen(LineageSeen {
+            generation,
+            freed: self.freed.len(),
+        });
+        LINEAGE_GENERATION.store(generation, std::sync::atomic::Ordering::Release);
     }
 
     /// Runs `add`, which adds the symbols and tables of file `file` to the
@@ -1554,6 +1585,7 @@ impl Lineage {
             let mark = self.symbols.mark();
             let result = add(&mut self.symbols);
             self.symbols.freeze_since(mark);
+            self.changed();
             return result;
         }
         self.symbols.end_chunk();
@@ -1565,6 +1597,7 @@ impl Lineage {
         let symbols = first..self.symbols.symbol_count();
         self.freeable
             .insert(file, (start, self.symbols.mark(), symbols));
+        self.changed();
         result
     }
 
@@ -1595,11 +1628,28 @@ pub fn lineage_live_chunks() -> usize {
 /// A checker copy (`SymbolArena::for_checker`) of the binder lineage as it
 /// is now: every live file version bound so far, in any program. A
 /// program's own copy (`bound_symbols`) holds only the versions bound
-/// before the program bound its files. The API's persistent checker uses
-/// it (`ls_program::new_api_checker`).
+/// before the program bound its files, and the chunks of the versions that
+/// died after. The API's persistent checker uses it
+/// (`ls_program::new_api_checker`), so it holds no dead version until its
+/// first catch-up (`catch_up_checker`).
 #[must_use]
 pub fn lineage_for_checker() -> SymbolArena {
     with_lineage(|lineage| lineage.symbols.for_checker())
+}
+
+/// Brings the lineage copy of checker arena `symbols` up to the binder
+/// lineage now (`SymbolArena::catch_up`): it adds every file version bound
+/// after the copy and frees the dead ones. The API calls it before a symbol
+/// of another checker enters this one (`api::checker_symbol`). Go hands the
+/// `*ast.Symbol` of any bound file to any checker (api/session.go:2439), and
+/// the checker reads its declarations, `node.Symbol()` and `node.Locals()`.
+// PERF: one atomic load when the copy is current.
+pub fn catch_up_checker(symbols: &mut SymbolArena) {
+    let generation = LINEAGE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    if symbols.lineage_seen().generation == generation {
+        return;
+    }
+    with_lineage(|lineage| symbols.catch_up(&lineage.symbols, &lineage.freed));
 }
 
 // Go: compiler/program.go:574 BindSourceFiles
@@ -1654,7 +1704,7 @@ fn bind_files_last_queued_first(lineage: &mut Lineage) {
         .rev()
         .map(|(file, freeable)| {
             let _trace = trace_bind_source_file(file);
-            let mut file_symbols = SymbolArena::new();
+            let mut file_symbols = SymbolArena::new_file();
             let bound = bind_source_file_detached(file, &mut file_symbols);
             (bound, file_symbols, freeable)
         })
@@ -2185,7 +2235,7 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                             let before = bind_thread_fingerprint();
                             let result = std::panic::catch_unwind(|| {
                                 let _trace = trace_bind_source_file(file);
-                                let mut file_symbols = SymbolArena::new();
+                                let mut file_symbols = SymbolArena::new_file();
                                 let bound = bind_source_file_detached(file, &mut file_symbols);
                                 (bound, file_symbols)
                             })

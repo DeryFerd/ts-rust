@@ -1565,6 +1565,16 @@ fn take_prefetched_meta(loader: &FileLoader, file_name: &str) -> Option<SourceFi
                     .wait(state)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
+            // A test can make the loader wait for a job that no worker has
+            // started yet (`set_meta_wait`), so the worker finds the
+            // metadata whatever the timing.
+            #[cfg(test)]
+            PrefetchState::Queued if META_WAIT.with(Cell::get) => {
+                state = job
+                    .done
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
             PrefetchState::Done(Some(result)) => break result.meta.clone(),
             _ => break None,
         }
@@ -1605,6 +1615,23 @@ fn load_prep_enabled() -> bool {
 #[cfg(test)]
 pub(crate) fn set_load_prep(on: Option<bool>) {
     LOAD_PREP.with(|prep| prep.set(on));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice to make the loads on this thread wait in
+    /// `take_prefetched_meta` for a job that is still queued.
+    static META_WAIT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the loads on this thread wait for the parse worker of each file
+/// in `take_prefetched_meta`, also when no worker has started it yet, so
+/// the loader always takes the worker's metadata (tests). Only for loads
+/// with parse workers (`parse_workers_enabled`): with none, a queued job
+/// never starts.
+#[cfg(test)]
+pub(crate) fn set_meta_wait(on: bool) {
+    META_WAIT.with(|wait| wait.set(on));
 }
 
 /// The preps that loads on this thread took so far (tests).
@@ -2567,6 +2594,39 @@ impl FileRefs {
     }
 }
 
+/// A job that a parse worker started (`PrefetchState::Running`). If the
+/// worker panics before `finish`, the drop ends the job as `Done(None)`, so a
+/// loader that waits for it (`take_prefetched`, `take_prefetched_meta`)
+/// reads, parses and finds the metadata of the file itself, and meets the
+/// same panic there when it is a Go panic. The worker thread ends.
+// PORT: not in Go (loadpar1). Go has no parse worker: its parse task does
+// this work, and a panic there is the program's panic. Here the loader does
+// the work again, so a Go panic comes from the loader.
+struct RunningJob<'a>(&'a PrefetchJob);
+
+impl RunningJob<'_> {
+    /// Publishes the worker's result and wakes the loaders that wait.
+    fn finish(self, result: Option<PrefetchResult>) {
+        let job = self.0;
+        std::mem::forget(self);
+        *lock(&job.state) = PrefetchState::Done(result);
+        job.done.notify_all();
+    }
+}
+
+impl Drop for RunningJob<'_> {
+    fn drop(&mut self) {
+        *lock(&self.0.state) = PrefetchState::Done(None);
+        self.0.done.notify_all();
+    }
+}
+
+/// The file whose worker job panics after it starts, for the tests of
+/// `RunningJob`. Any thread's load sees it, so a test names a file of its
+/// own temp dir.
+#[cfg(test)]
+pub(crate) static PANIC_IN_JOB: Mutex<Option<String>> = Mutex::new(None);
+
 /// A parse worker: parses queued files, newest first (the loader's queue
 /// is a stack too), until the queue closes. After each parse it queues the
 /// files that the parse references. The first free worker after the root
@@ -2613,6 +2673,11 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
                 continue;
             }
             *state = PrefetchState::Running;
+        }
+        let running = RunningJob(&job);
+        #[cfg(test)]
+        if lock(&PANIC_IN_JOB).as_deref() == Some(job.opts.file_name.as_str()) {
+            panic!("test panic in the worker job of {}", job.opts.file_name);
         }
         if resolver.is_none()
             && !resolver_failed
@@ -2703,8 +2768,7 @@ fn run_prefetch_worker(shared: &PrefetchShared) {
                 (result, refs, synthetic)
             }
         };
-        *lock(&job.state) = PrefetchState::Done(result);
-        job.done.notify_all();
+        running.finish(result);
         let Some(refs) = refs else {
             continue;
         };

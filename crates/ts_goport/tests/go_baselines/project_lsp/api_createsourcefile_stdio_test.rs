@@ -9,6 +9,8 @@
 //! encodes both from one `*ast.SourceFile` (api/session.go:1876
 //! encodeLeasedSourceFile), so the two answers differ only in the lease id.
 
+use std::rc::Rc;
+use ts_goport::api::encoder::encoder::encode_parsed_source_file;
 use ts_goport::api::requestfilesystem::{Kind, RequestFileSystem};
 use ts_goport::api::{
     self, CreateSnapshotParams, CreateSourceFileOptions, EnsurePrograms, FileNotifications,
@@ -16,6 +18,7 @@ use ts_goport::api::{
     SourceFileLeaseID, SourceFileResponse, UpdateSnapshotParams,
 };
 use ts_goport::core::Node;
+use ts_goport::frontend::parser::ParsedSourceFile;
 use ts_goport::program::ls_program;
 
 use super::api_util::{doc, nil_error, project_program, snapshot_of};
@@ -136,6 +139,55 @@ child_test! {
                 lease: lease_id(data),
             })));
         }
+        session.close();
+    }
+}
+
+// The encode of a lease reads the Go `SourceFile` fields that the parser
+// sets from the record that the lease holds, as Go reads them from the
+// leased `*ast.SourceFile` (api/encoder/encoder.go:603
+// `encodeStringArray(sf.AmbientModuleNames, ...)`), and not from the
+// published `GoFile` of the program that shares the parse (R173 reviewer
+// item 9). In a real lease the two have the same lists, so the test gives
+// the encoder a copy of the lease's record with one more ambient module
+// name: the answer has it. An encode that reads the `GoFile` does not.
+child_test! {
+    fn lease_encode_reads_the_parser_fields_of_the_lease() {
+        const PROBE: &str = "item9-ambient-probe";
+        let (init, _) = projecttestutil::get_session_init_options(
+            files(&[
+                (CONFIG, r#"{"compilerOptions":{"noLib":true}}"#),
+                (INDEX_FILE, "import { a } from './a';\nexport const x = a + 1;"),
+                (A_FILE, A_TEXT),
+            ]),
+            None,
+            TypingsInstallerOptions::default(),
+        );
+        let session = api::new_standalone_session(&init, None);
+        let snapshot = nil_error(session.handle_create_snapshot(
+            &bg(),
+            &CreateSnapshotParams {
+                snapshot_request_changes_params: SnapshotRequestChangesParams {
+                    open_projects: vec![doc(CONFIG)],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ))
+        .snapshot;
+        let (loaded, _) = program_parse(&session, snapshot);
+        let lease =
+            nil_error(session.create_source_file(A_FILE, A_TEXT, &CreateSourceFileOptions::default()));
+        assert_eq!(lease.source_file(), loaded, "the lease shares the program's parse");
+
+        let mut record = ParsedSourceFile::clone(lease.parsed_source_file());
+        record.ambient_module_names.push(PROBE.to_string());
+        let (changed, _) = nil_error(encode_parsed_source_file(&Rc::new(record)));
+        let (plain, _) = nil_error(encode_parsed_source_file(lease.parsed_source_file()));
+        let has_probe = |data: &[u8]| data.windows(PROBE.len()).any(|w| w == PROBE.as_bytes());
+        assert!(has_probe(&changed), "the encode reads the lease's record");
+        assert!(!has_probe(&plain));
+        lease.release();
         session.close();
     }
 }

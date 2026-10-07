@@ -568,7 +568,9 @@ impl Printer {
                 // exponentiation is right-associative
                 left_prec = OperatorPrecedence::UPDATE;
             }
-            _ => panic!("unhandled precedence: {:?}", precedence),
+            // Go `%v` of an `ast.OperatorPrecedence` (an int with no
+            // `String` method) is the number.
+            _ => panic!("unhandled precedence: {}", precedence.0),
         }
         (left_prec, right_prec)
     }

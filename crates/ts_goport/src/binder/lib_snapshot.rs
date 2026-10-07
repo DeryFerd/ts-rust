@@ -361,7 +361,9 @@ pub(crate) fn read_entries(blob: &'static [u8], magic: &[u8; 8]) -> Option<Vec<S
 /// The bind output of `file` from the snapshot, with its symbols and
 /// tables in `symbols`, which must be a new arena. `None` (bind live) when
 /// `file` is not a snapshot lib, `symbols` is not new, the key does not
-/// match or the section does not load. Then `symbols` is unchanged.
+/// match or the section does not load. Then `symbols` is unchanged. A new
+/// lineage arena (`SymbolArena::new`, a serial bind) gets the file arena
+/// joined, with its ids moved (`SymbolArena::append_file_arena`).
 pub fn load(file: Node, symbols: &mut SymbolArena) -> Option<BoundFile> {
     let mode = mode();
     if mode == Mode::Off || !symbols.is_new() {
@@ -382,8 +384,13 @@ pub fn load(file: Node, symbols: &mut SymbolArena) -> Option<BoundFile> {
             start.elapsed().as_micros()
         );
     }
-    let (bound, arena) = result.ok()?;
-    *symbols = arena;
+    let (mut bound, arena) = result.ok()?;
+    if symbols.is_interleaved() {
+        let freeable = crate::ast::go_file(file.file_index()).version().is_some();
+        bound.remap(symbols.append_file_arena(arena, freeable));
+    } else {
+        *symbols = arena;
+    }
     Some(bound)
 }
 
@@ -730,7 +737,7 @@ fn decode(file: Node, nodes: u32, r: SnapshotReader<'_>) -> Option<(BoundFile, S
 
     // Symbols, then tables, then private names, in arena order, so every
     // id equals its index as in the live bind.
-    let mut arena = SymbolArena::new();
+    let mut arena = SymbolArena::new_file();
     arena.reserve_arena(d.symbols as usize, d.tables as usize);
     for _ in 0..d.symbols {
         let symbol = d.symbol_value()?;
@@ -1218,7 +1225,7 @@ mod tests {
     /// changes state of this thread that a snapshot load would not change.
     fn live_bind(file: Node) -> Result<(BoundFile, SymbolArena), String> {
         let before = (synthetic_slot_count(), next_ids());
-        let mut arena = SymbolArena::new();
+        let mut arena = SymbolArena::new_file();
         let bound = bind_source_file_live(file, &mut arena);
         if (synthetic_slot_count(), next_ids()) != before {
             return Err("the live bind made synthetic nodes or ids".into());

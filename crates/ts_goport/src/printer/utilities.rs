@@ -651,7 +651,9 @@ pub(crate) fn get_containing_node_array(node: Node) -> NodeList {
             } else if is_infer_type_node(parent) {
                 // infer type nodes have no associated type parameter list
             } else {
-                panic!("Unexpected TypeParameter parent: {:?}", parent.kind());
+                // Go `%#v` of a Kind (an int16 with no `GoString` method) is
+                // the number, which `SyntaxKind` keeps.
+                panic!("Unexpected TypeParameter parent: {}", parent.kind() as i16);
             }
         }
 
@@ -1310,6 +1312,32 @@ impl LineCharacterCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Go prints `%#v` of the parent's Kind in this panic
+    // (printer/utilities.go:457 `panic(fmt.Sprintf("Unexpected TypeParameter
+    // parent: %#v", parent.Kind))`). Kind is an int16 with no `GoString`
+    // method, so Go prints the number: 201 is `KindMappedType` at pin N
+    // (ast/kind_generated.go).
+    #[test]
+    fn unexpected_type_parameter_parent_panic_prints_the_kind_number() {
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+        use std::panic::AssertUnwindSafe;
+        let opts = SourceFileParseOptions {
+            file_name: "/mapped.ts".to_string(),
+            ..Default::default()
+        };
+        let root = parse_source_file(&opts, "type M = { [K in string]: K };", ScriptKind::TS).root;
+        let alias = root.statements().iter().next().expect("the alias");
+        let type_parameter = alias.type_().type_parameter();
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            get_containing_node_array(type_parameter)
+        }))
+        .expect_err("no panic");
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some("Unexpected TypeParameter parent: 201")
+        );
+    }
 
     /// The escape with the skipped start (`escape_string_worker`) gives the
     /// same text as the Go loop from the first byte, for every quote char,

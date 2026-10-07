@@ -417,7 +417,7 @@ impl<T: Send + 'static> Drop for DropInBackground<T> {
 /// sent to it in order, as Go's GC frees memory beside the build. Frees it
 /// here when that thread cannot start. A value still queued at exit is not
 /// freed.
-fn drop_in_background<T: Send + 'static>(value: T) {
+pub(crate) fn drop_in_background<T: Send + 'static>(value: T) {
     // wasm32-wasip1 has no threads, so the thread cannot start. Saying so
     // leaves the thread out of the wasm module.
     if cfg!(target_family = "wasm") {
@@ -529,7 +529,9 @@ pub struct BuildTask {
     /// PORT: not in Go. The freeable file versions that `errors` point at
     /// (`ast::diagnostic_file_versions`). The task's program is released
     /// when the task is built, before the task and the build summary report
-    /// `errors` (`tsc -b --watch`; watchfree1).
+    /// `errors` (`tsc -b --watch`; watchfree1). It is set after the
+    /// compile, and cleared with `errors` (`compile_and_emit_start`,
+    /// `reset_status`).
     held_file_versions: Vec<std::sync::Arc<crate::ast::FileVersion>>,
     pub pending: bool,
     pub is_initial_cycle: bool,
@@ -2095,6 +2097,10 @@ impl BuildTask {
         self.status = None;
         self.pending = true;
         self.errors = Vec::new();
+        // PORT: Go's GC frees a file that only `t.errors` held. The versions
+        // that `errors` held go with them, also when the task is not built
+        // again in this cycle (a dependency with errors).
+        self.held_file_versions = Vec::new();
     }
 
     // Go: build/buildtask.go:837 (*BuildTask).resetConfig

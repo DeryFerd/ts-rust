@@ -2452,7 +2452,7 @@ pub(crate) fn get_jsx_implicit_import_base_of_file(
 
 #[cfg(test)]
 mod tests {
-    use super::super::files_parser::{preps_taken, set_load_prep};
+    use super::super::files_parser::{preps_taken, set_load_prep, set_meta_wait};
     use super::*;
     use crate::frontend::bundled;
     use crate::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
@@ -2577,7 +2577,10 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let mut out = String::new();
-        let name = |file_name: &str| file_name.replace(&cwd, "<dir>");
+        // The include reasons name files by path (Go `tspath.Path`), which
+        // is in lower case on a case-insensitive file system (macOS).
+        let cwd_path = to_path(&cwd, "", osvfs_fs().use_case_sensitive_file_names()).0;
+        let name = |file_name: &str| file_name.replace(&cwd, "<dir>").replace(&cwd_path, "<dir>");
         for file in &processed.files {
             let path = file.path();
             writeln!(out, "file {}", name(file.file_name())).unwrap();
@@ -2923,7 +2926,9 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
     // (Go `Program.GetPackageJsonInfo`, compiler/program.go:157) finds what
     // the load read, also when the files changed on disk since: the
     // project's package.json (the scope of `src/a.ts`) and the package
-    // that `src/a.ts` imports (the scope of its `index.d.ts`).
+    // that `src/a.ts` imports (the scope of its `index.d.ts`). With the prep
+    // on, the loader waits for the worker of each file (`set_meta_wait`), so
+    // it takes the worker's metadata whatever the timing.
     #[test]
     fn the_loader_keeps_the_package_json_files_that_workers_read() {
         let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "types": [],
@@ -2943,8 +2948,12 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 "export declare const x: number;\n",
             ),
         ];
+        // With no parse workers (one CPU, or `GOPORT_PARSE_THREADS=0`) the
+        // loader reads every file itself.
+        let workers = super::super::files_parser::parse_workers_enabled();
         for prep in [true, false] {
             set_load_prep(Some(prep));
+            set_meta_wait(prep && workers);
             let before = crate::frontend::module::cache::adopted_package_jsons();
             let (processed, dir, cwd) =
                 load_with_workers(&format!("keeps_package_jsons_{prep}"), tsconfig, &files);
@@ -2956,13 +2965,22 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 .as_ref()
                 .and_then(|resolver| resolver.as_default_resolver())
                 .expect("the default resolver");
-            let name = |directory: &str| {
+            // The name in the package.json of the package scope of `path`.
+            let name = |path: &str| {
                 resolver
-                    .get_package_scope_for_path(&format!("{cwd}/{directory}"))
+                    .get_package_scope_for_path(path)
                     .and_then(|entry| entry.contents.clone())
                     .map(|contents| contents.fields.header_fields.name.get_value().0)
             };
-            let names = (name("src"), name("node_modules/lib"));
+            // The resolver gives a node_modules file by its real path (Go
+            // `resolutionState.realPath`, module/resolver.go:1859), so the
+            // scope of `lib/index.d.ts` is under the real path of the dir.
+            // On macOS the temp dir is under /var, a symlink to /private/var.
+            let real = osvfs_fs().realpath(&cwd);
+            let names = (
+                name(&format!("{cwd}/src")),
+                name(&format!("{real}/node_modules/lib")),
+            );
             let adopted = crate::frontend::module::cache::adopted_package_jsons() - before;
             let _ = std::fs::remove_dir_all(&dir);
             assert_eq!(
@@ -2970,13 +2988,56 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 (Some("app".to_string()), Some("lib".to_string())),
                 "prep {prep}"
             );
-            // With parse workers the loader takes the metadata of `src/a.ts`
-            // from its worker (prep on): with no parse workers (one CPU, or
-            // `GOPORT_PARSE_THREADS=0`) the loader reads every file itself.
-            if prep && super::super::files_parser::parse_workers_enabled() {
+            if prep && workers {
                 assert!(adopted > 0, "no worker package.json taken");
             }
         }
         set_load_prep(None);
+        set_meta_wait(false);
+    }
+
+    // A parse worker that panics after it starts a job ends the job
+    // (`RunningJob`), so the loader that waits for it finds the metadata and
+    // parses the file itself, and the load ends with the file. The loader
+    // waits for the worker of each file (`set_meta_wait`), so without the
+    // guard it would wait forever: the test fails after 60 s. Go has no
+    // parse worker; its loader finds the metadata (fileloader.go:391).
+    #[test]
+    fn a_worker_panic_leaves_no_loader_waiting() {
+        use super::super::files_parser::{PANIC_IN_JOB, parse_workers_enabled};
+        if !parse_workers_enabled() {
+            return;
+        }
+        let label = "worker_panic";
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_file_loader_{label}_{}",
+            std::process::id()
+        ));
+        let a = format!("{}/src/a.ts", dir.to_string_lossy().replace('\\', "/"));
+        *PANIC_IN_JOB.lock().unwrap() = Some(a.clone());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            set_load_prep(Some(true));
+            set_meta_wait(true);
+            let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "types": [],
+                 "noEmit": true }, "include": ["src"] }"#;
+            let files = [
+                ("package.json", r#"{ "name": "app", "type": "module" }"#),
+                ("src/a.ts", "export const a = 1;\n"),
+            ];
+            let (processed, dir, _) = load_with_workers(label, tsconfig, &files);
+            let _ = std::fs::remove_dir_all(&dir);
+            let a = processed
+                .files
+                .iter()
+                .find(|file| file.file_name().ends_with("/src/a.ts"))
+                .map(|file| processed.source_file_meta_datas[file.path()].implied_node_format);
+            let _ = sender.send(a);
+        });
+        let loaded = receiver.recv_timeout(std::time::Duration::from_secs(60));
+        *PANIC_IN_JOB.lock().unwrap() = None;
+        let loaded =
+            loaded.expect("the loader still waits for the job of the worker that panicked");
+        assert_eq!(loaded, Some(ModuleKind::ES_NEXT), "{a}");
     }
 }
