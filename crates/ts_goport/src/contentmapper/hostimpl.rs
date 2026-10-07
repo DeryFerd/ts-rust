@@ -1300,6 +1300,21 @@ struct ProcessConn {
 }
 
 impl ProcessConn {
+    /// `MuxConn::call`, then the process close of a call that failed
+    /// because the connection ended. Any thread can call it.
+    fn call_any_thread(
+        &self,
+        ctx: &Context,
+        method: &str,
+        params: Option<Box<dyn AnyValue>>,
+    ) -> std::result::Result<JsonValue, GoError> {
+        let result = ipc::Conn::call(&*self.conn, ctx, method, params);
+        if let Err(err) = &result {
+            self.close_if_ended(ctx, err);
+        }
+        result
+    }
+
     fn close_if_ended(&self, ctx: &Context, err: &GoError) {
         if ctx.err().is_none() && !err.error().starts_with(IPC_REMOTE_ERROR_PREFIX) {
             let _ = self.rwc.close();
@@ -1314,15 +1329,19 @@ impl ipc::Conn for ProcessConn {
         result
     }
 
+    // PORT: a panic of the read loop ends the process in Go. Here it
+    // panics on the loading thread, in the first call after it.
     fn call(
         &self,
         ctx: &Context,
         method: &str,
         params: Option<Box<dyn AnyValue>>,
     ) -> std::result::Result<JsonValue, GoError> {
-        let result = ipc::Conn::call(&*self.conn, ctx, method, params);
-        if let Err(err) = &result {
-            self.close_if_ended(ctx, err);
+        let result = self.call_any_thread(ctx, method, params);
+        if result.is_err()
+            && let Some(payload) = self.conn.take_read_panic()
+        {
+            std::panic::resume_unwind(payload);
         }
         result
     }
@@ -1366,8 +1385,7 @@ impl ConcurrentTransform {
         file_name: &str,
         content: &str,
     ) -> std::result::Result<Result, GoError> {
-        let raw = ipc::Conn::call(
-            &self.conn,
+        let raw = self.conn.call_any_thread(
             &context::background(),
             METHOD_TRANSFORM,
             Some(Box::new(TransformParams {
@@ -1481,28 +1499,13 @@ pub fn new_host_with_options(
             // Go starts the read loop here (`go conn.Run(ctx)`); `MuxConn`
             // starts its reader thread.
             let conn: Rc<dyn ipc::Conn> = Rc::new(ProcessConn {
-                conn: MuxConn::start(new_protocol),
+                conn: MuxConn::start(new_protocol, Arc::new(RejectHandler)),
                 rwc: rwc.clone(),
             });
             let (initialize_ctx, cancel) = context::with_timeout(ctx, INITIALIZE_TIMEOUT);
-            // PORT: Go's `Call` returns at the deadline while its read
-            // goroutine keeps waiting. The ipc port reads inside the call, so
-            // at the deadline this closes the process to end the read. Go
-            // reports that case as no response, before it looks at the exit
-            // state, and so does the check below.
-            let closed_at_deadline = Arc::new(AtomicBool::new(false));
-            let stop_deadline_close = {
-                let rwc = rwc.clone();
-                let closed_at_deadline = closed_at_deadline.clone();
-                context::after_func(&initialize_ctx, move || {
-                    closed_at_deadline.store(true, Ordering::SeqCst);
-                    let _ = rwc.close();
-                })
-            };
             let initialize_start = mapper_timing.start_request();
             let handshake_result = handshake(&initialize_ctx, &conn, diagnostic_locale);
             mapper_timing.finish_request(&mapper_timing.initialize, initialize_start);
-            stop_deadline_close();
             let initialize_ctx_err = initialize_ctx.err();
             cancel();
             match handshake_result {
@@ -1517,15 +1520,6 @@ pub fn new_host_with_options(
                         // error is `err` itself, so the port returns a copy.
                         initialize_error.mapper_name = diagnostic_name;
                         return Err(initialize_error.to_go_error());
-                    }
-                    if closed_at_deadline.load(Ordering::SeqCst) {
-                        return Err(InitializeError {
-                            kind: InitializeErrorKind::NO_RESPONSE,
-                            mapper_name: diagnostic_name,
-                            timeout_seconds: INITIALIZE_TIMEOUT_SECONDS,
-                            ..Default::default()
-                        }
-                        .to_go_error());
                     }
                     if exited {
                         return Err(InitializeError {
