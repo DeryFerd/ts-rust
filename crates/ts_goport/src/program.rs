@@ -4798,10 +4798,11 @@ pub fn get_diagnostics_of_any_program(
     // Effect-TS/tsgo patch 009: Effect diagnostics ignored for the exit code
     // do not block emit under noEmitOnError.
     if skip_no_emit_check_for_dts_diagnostics {
-        all_diagnostics = crate::effect::filter_diagnostics_for_exit_code(
-            options.effect.as_deref(),
-            &all_diagnostics,
-        );
+        if let Some(effect) = options.effect.as_deref() {
+            all_diagnostics =
+                crate::effect::filter_diagnostics_for_exit_code(Some(effect), &all_diagnostics)
+                    .into_owned();
+        }
     }
     all_diagnostics
 }

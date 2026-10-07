@@ -27,7 +27,9 @@ The code is `crates/ts_goport/src/effect`, a port of
 - Effect options are stored in `.tsbuildinfo`, so a change to them
   invalidates the cached diagnostics. The language server shows the same
   diagnostics.
-- With no plugin entry, or without `diagnosticSeverity`, nothing runs.
+- With no plugin entry, nothing runs. An entry with only a `name` runs every
+  rule at its default severity. `"diagnostics": false` or
+  `"diagnosticSeverity": null` turns the rules off.
 
 ## Where it hooks in
 

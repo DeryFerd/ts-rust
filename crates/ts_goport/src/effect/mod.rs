@@ -73,9 +73,12 @@ impl Checker {
     /// first when it is not checked yet.
     pub fn get_relation_errors(&mut self, sf: Node) -> Vec<RelationError> {
         if !self.source_file_links.get(sf).type_checked {
-            if let Some(ctx) = self.ctx.clone() {
-                self.get_diagnostics(&ctx, sf, false);
-            }
+            // Go passes `c.ctx`, which can be nil; the file is checked either way.
+            let ctx = self
+                .ctx
+                .clone()
+                .unwrap_or_else(crate::gostd::context::background);
+            self.get_diagnostics(&ctx, sf, false);
         }
         self.effect_relation_errors
             .get(&sf)
@@ -88,19 +91,22 @@ impl Checker {
 /// The diagnostics that decide the tsc exit code: Effect diagnostics whose
 /// category the plugin options ignore are left out. Non-Effect diagnostics
 /// always count.
+/// Without Effect options it borrows `diags`, so projects without the plugin
+/// pay nothing.
 #[must_use]
-pub fn filter_diagnostics_for_exit_code(
+pub fn filter_diagnostics_for_exit_code<'a>(
     opts: Option<&etscore::EffectPluginOptions>,
-    diags: &[Diagnostic],
-) -> Vec<Diagnostic> {
+    diags: &'a [Diagnostic],
+) -> std::borrow::Cow<'a, [Diagnostic]> {
     let Some(opts) = opts else {
-        return diags.to_vec();
+        return std::borrow::Cow::Borrowed(diags);
     };
     diags
         .iter()
         .filter(|d| !(is_effect_code(d.code) && should_ignore_for_exit_code(opts, d.category)))
         .cloned()
-        .collect()
+        .collect::<Vec<_>>()
+        .into()
 }
 
 fn should_ignore_for_exit_code(
