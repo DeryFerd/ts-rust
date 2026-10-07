@@ -1422,7 +1422,7 @@ pub(crate) fn new_unknown_reference_processing_diagnostic(
 /// load: the parse threads of a program that is not large
 /// (`ThreadBudget::parse_threads`), less the loading thread.
 /// `GOPORT_PARSE_THREADS` sets it (0 turns prefetch off).
-fn prefetch_worker_count() -> usize {
+pub(crate) fn prefetch_worker_count() -> usize {
     if let Some(count) = parse_threads_from_env() {
         return count;
     }
@@ -3058,9 +3058,10 @@ impl WorkerResolver {
     }
 
     /// The project reference redirect of the file of `path`: the source
-    /// file and the redirect. Go resolves the references of the output
-    /// `.d.ts` file of a project reference with the reference's options,
-    /// from its source file (`getRedirectForResolution`).
+    /// file and the redirect. Go resolves the references of a source file
+    /// or an output `.d.ts` file of a project reference with the
+    /// reference's options, from its source file
+    /// (`getRedirectForResolution`).
     fn redirect_of<'c>(
         &self,
         config: &'c WorkerResolveConfig,
@@ -3131,9 +3132,10 @@ impl WorkerResolver {
     /// Resolves the type reference directives and imports of `refs` as
     /// `ParseTask::load` does (`resolve_type_reference_directives`,
     /// `resolve_imports_and_module_augmentations`), and adds to `names`
-    /// the files that the loader would add. The output `.d.ts` file of a
-    /// project reference resolves with the reference's options, from its
-    /// source file (`redirect_of`). Stops when the queue closes.
+    /// the files that the loader would add. A source file or an output
+    /// `.d.ts` file of a project reference resolves with the reference's
+    /// options, from its source file (`redirect_of`). Stops when the queue
+    /// closes.
     ///
     /// With `prep` (the file's metadata and synthetic imports), the
     /// synthetic imports resolve too, and the answers go to the loader

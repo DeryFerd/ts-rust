@@ -3365,11 +3365,16 @@ export const a: T | Dep | number = x + (h as never);
     // and resolves with the reference's redirect. When its worker panics
     // after it starts the job, the loader that waits for it still loads the
     // file and resolves its names with the redirect. Without the wake the
-    // test fails after 60 s.
+    // test fails after 60 s. The panic ends its worker, and the loader also
+    // waits for the jobs that no worker has started (`set_meta_wait`), so
+    // the test needs a second worker to run them: with one
+    // (`GOPORT_PARSE_THREADS=1`, two CPUs) it does not run.
     #[test]
     fn a_worker_panic_in_a_redirected_job_leaves_no_loader_waiting() {
-        use super::super::files_parser::{PANIC_IN_JOB, parse_workers_enabled};
-        if !parse_workers_enabled() {
+        use super::super::files_parser::{
+            PANIC_IN_JOB, parse_workers_enabled, prefetch_worker_count,
+        };
+        if !parse_workers_enabled() || prefetch_worker_count() < 2 {
             return;
         }
         let label = "worker_panic_redirect";
