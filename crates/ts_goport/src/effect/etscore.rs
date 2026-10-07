@@ -11,7 +11,7 @@ pub const EFFECT_PLUGIN_NAME: &str = "@effect/language-service";
 
 // Go: etscore/version_generated.go EffectVersion
 /// The `@effect/tsgo` release this port follows. Update it with the port.
-/// Build info written with the plugin on records it (`build_info_version`).
+/// Build info written with the rules on records it (`build_info_version`).
 pub const EFFECT_VERSION: &str = "0.46.1";
 
 // Go: etscore/severity.go

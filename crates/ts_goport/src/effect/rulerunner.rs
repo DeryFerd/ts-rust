@@ -53,11 +53,26 @@ pub fn set_api_process() {
     API_RULES_OFF.store(!*EFFECT_API, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// False in a standalone API process without `TSGO_EFFECT_API=1`
-/// (`set_api_process`); true in tsc and the language server.
+/// Test hook: undoes `set_api_process`, so this process runs the rules as
+/// tsc does.
+#[doc(hidden)]
+pub fn clear_api_process() {
+    API_RULES_OFF.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The Effect plugin options of `options` when this process runs the rules:
+/// none in a standalone API process without `TSGO_EFFECT_API=1`
+/// (`set_api_process`). The checker, the plugin option check and build info
+/// (its version suffix and `effect` options, written and checked) all read
+/// this. A standalone API build then writes and expects plain build info,
+/// so a later tsc build checks the project again and reports the Effect
+/// diagnostics.
 #[must_use]
-pub fn rules_enabled() -> bool {
-    !API_RULES_OFF.load(std::sync::atomic::Ordering::Relaxed)
+pub fn enabled_options(options: &CompilerOptions) -> Option<&EffectPluginOptions> {
+    options
+        .effect
+        .as_deref()
+        .filter(|_| !API_RULES_OFF.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 // Go: rulerunner.Run

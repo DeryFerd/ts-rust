@@ -265,9 +265,9 @@ impl Checker {
         // once, after the unused check, so that check reads only the TypeScript references.
         // A file with Effect rules always gets the unused check first. Without noUnusedLocals
         // and noUnusedParameters, that check only adds suggestions. A standalone API process
-        // runs no Effect rules (`rulerunner::rules_enabled`).
-        let run_effect = self.compiler_options.effect.is_some()
-            && crate::effect::rulerunner::rules_enabled()
+        // runs no Effect rules (`rulerunner::enabled_options`).
+        let run_effect = crate::effect::rulerunner::enabled_options(self.compiler_options)
+            .is_some()
             && !self.source_file_links.get(source_file).effect_checked;
         if (check_unused || run_effect) && !self.source_file_links.get(source_file).unused_checked {
             // The unused identifiers check relies on a full type check having first been performed

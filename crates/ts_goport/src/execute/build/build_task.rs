@@ -131,7 +131,7 @@ pub struct StatusCheckOptions {
     emit_declarations: bool,
     no_check: bool,
     no_emit: bool,
-    /// The Effect plugin is on (`BuildInfo::is_valid_version`).
+    /// The Effect rules run (`BuildInfo::is_valid_version`).
     effect: bool,
 }
 
@@ -142,7 +142,7 @@ impl StatusCheckOptions {
             emit_declarations: options.get_emit_declarations(),
             no_check: options.no_check.is_true(),
             no_emit: options.no_emit.is_true(),
-            effect: options.effect.is_some(),
+            effect: crate::effect::rulerunner::enabled_options(options).is_some(),
         }
     }
 
@@ -1385,7 +1385,9 @@ impl BuildTask {
         };
 
         // build info version
-        if !build_info.is_valid_version(resolved.compiler_options().effect.is_some()) {
+        if !build_info.is_valid_version(
+            crate::effect::rulerunner::enabled_options(resolved.compiler_options()).is_some(),
+        ) {
             return UpToDateStatus::with_data(
                 UpToDateStatusType::TsVersionOutputOfDate,
                 UpToDateStatusData::String(build_info.version.clone()),
@@ -1961,11 +1963,9 @@ impl BuildTask {
                 args![
                     config,
                     o.relative_file_name(status.data_string()),
-                    build_info_version(
-                        self.resolved
-                            .as_ref()
-                            .is_some_and(|r| r.compiler_options().effect.is_some())
-                    )
+                    build_info_version(self.resolved.as_ref().is_some_and(|r| {
+                        crate::effect::rulerunner::enabled_options(r.compiler_options()).is_some()
+                    }))
                 ],
             ),
             UpToDateStatusType::ForceBuild => new_compiler_diagnostic(

@@ -151,8 +151,9 @@ pub fn build_info_program(
     build_info: &BuildInfo,
     host: &dyn CompilerHost,
 ) -> Option<Program> {
-    if !build_info.is_valid_version(config.compiler_options().effect.is_some())
-        || !build_info.is_incremental()
+    if !build_info.is_valid_version(
+        crate::effect::rulerunner::enabled_options(config.compiler_options()).is_some(),
+    ) || !build_info.is_incremental()
     {
         return None;
     }

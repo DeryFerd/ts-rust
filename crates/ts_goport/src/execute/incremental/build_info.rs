@@ -1600,13 +1600,16 @@ pub fn content_mapper_identities(
 }
 
 // Go: core/version.go Version, with Effect-TS/tsgo patch 021
-/// The version that build info records, and must record to be reused, for a
-/// program whose Effect plugin is on (`effect`) or off. Effect-TS/tsgo adds
+/// The version that build info records, and must record to be reused.
+/// `effect` is whether the program runs the Effect rules
+/// (`rulerunner::enabled_options`). Effect-TS/tsgo adds
 /// "+effect-tsgo.<version>" to every version its binary reports. tsc-rs adds
-/// it only with the plugin on, so plain build info stays tsgo's. Plain tsgo
-/// and tsc-rs without the plugin then see Effect build info as from another
+/// it only when the rules run, so plain build info stays tsgo's. Plain tsgo
+/// and tsc-rs without the rules then see Effect build info as from another
 /// version and check again: they do not read Effect diagnostics that plain
-/// tsgo cannot print ("Unknown diagnostic message").
+/// tsgo cannot print ("Unknown diagnostic message"). In the same way, tsc-rs
+/// with the rules checks again after a build without them, for example a
+/// standalone API build.
 #[must_use]
 pub fn build_info_version(effect: bool) -> std::borrow::Cow<'static, str> {
     if effect {
@@ -1623,7 +1626,7 @@ pub fn build_info_version(effect: bool) -> std::borrow::Cow<'static, str> {
 
 impl BuildInfo {
     // Go: incremental/buildInfo.go:495 IsValidVersion
-    // PORT: `effect` is whether the reading program has the Effect plugin on
+    // PORT: `effect` is whether the reading program runs the Effect rules
     // (`build_info_version`).
     #[must_use]
     pub fn is_valid_version(&self, effect: bool) -> bool {
