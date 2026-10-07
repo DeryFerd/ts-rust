@@ -1792,6 +1792,88 @@ fn published_version(file: usize) -> Option<super::file_version::VersionPin> {
     super::file_version::pinned_file_version(file).filter(|version| version.published().is_some())
 }
 
+/// The node data of the nodes of one published store file, for a walk
+/// that reads every node of that file (the API encoder, `encode_tree`).
+/// Not in Go (perf, apiperf2): a read (`FileNodeReader::data`) is a few
+/// loads, with no file lookup and no pin per node (`with_scoped_store_node`
+/// makes both for a node of a freeable file version that is not hot).
+pub enum FileNodes {
+    /// The node column of a static publish (`FileBlock::node_column`).
+    Static(&'static [Option<&'static NodeData>]),
+    /// A freeable file version (lsshells M3c), pinned while this value
+    /// lives.
+    Pinned(super::file_version::VersionPin),
+}
+
+impl FileNodes {
+    /// The nodes of published store file `file`. `None` for a synthetic
+    /// id and for a store that is not published.
+    #[must_use]
+    pub fn of(file: usize) -> Option<Self> {
+        if let Some(nodes) = file_block(file).and_then(FileBlock::node_column) {
+            return Some(Self::Static(nodes));
+        }
+        published_version(file).map(Self::Pinned)
+    }
+
+    /// The reader of the nodes of file `file`, the file of `FileNodes::of`.
+    #[must_use]
+    pub fn reader(&self, file: usize) -> FileNodeReader<'_> {
+        // The records of a freeable version are in its node shell, which
+        // lives while the version is pinned.
+        let block = file_block(file).expect("a published store has a block");
+        check_block_owner(block, file);
+        let column = match self {
+            Self::Static(nodes) => NodeColumn::Static(nodes),
+            Self::Pinned(version) => NodeColumn::Store(
+                &version
+                    .published()
+                    .expect("a pinned file version is published")
+                    .store,
+            ),
+        };
+        FileNodeReader { block, column }
+    }
+}
+
+/// The node reads of a `FileNodes`.
+#[derive(Clone, Copy)]
+pub struct FileNodeReader<'a> {
+    block: &'a FileBlock,
+    column: NodeColumn<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum NodeColumn<'a> {
+    Static(&'static [Option<&'static NodeData>]),
+    Store(&'a FileStore),
+}
+
+impl<'a> FileNodeReader<'a> {
+    /// The node data of `n`, a node of this file (`Node::file_index`):
+    /// what `with_ast_data` reads for it.
+    #[inline]
+    #[must_use]
+    pub fn data(self, n: Node) -> &'a NodeData {
+        let index = slot_index(n);
+        match self.column {
+            NodeColumn::Static(nodes) => slot_node(nodes[index]),
+            NodeColumn::Store(store) => store.slot_ast_node(index),
+        }
+    }
+
+    /// Go `node.Kind`, `node.Loc` and `node.Flags` of `n`, a node of this
+    /// file: what `Node::kind`, `Node::loc` and `Node::flags` read, with one
+    /// record read.
+    #[inline]
+    #[must_use]
+    pub fn header(self, n: Node) -> (SyntaxKind, TextRange, NodeFlags) {
+        let index = slot_index(n);
+        let record = &self.block.records[index];
+        (self.block.kinds[index], record.loc(), record.flags())
+    }
+}
+
 /// The handle of slot `index` in store `file`. Does not resolve aliases.
 const fn handle(file: usize, index: u32) -> Node {
     Node(((file as u64) << 32) | (index as u64 + 1))
