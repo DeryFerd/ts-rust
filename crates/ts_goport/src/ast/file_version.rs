@@ -25,8 +25,9 @@
 //! inline (`ast::store::node_shell`); its foreign parents are leaked there,
 //! and the child link column is dropped. AST node records, step 4: the
 //! records and kids are in a pooled block that the version gives back when
-//! it dies; after two more program releases (`pin_epoch`) a later node
-//! shell can take it (`ast::store::BlockPool`).
+//! it dies; after two more pin releases (`pin_epoch`: program releases, and
+//! lease releases that free a parse) a later node shell can take it
+//! (`ast::store::BlockPool`).
 //! M3c (owned nodes; on by default in a language server or API process,
 //! see `owned_nodes_enabled`): its parse was a freeable parse
 //! (`ast::enter_freeable_parse`), so its store owns its astdata nodes (node
@@ -58,7 +59,7 @@
 //! +10.2% (+6.7% to +9.7% on the default threads), and the editor long
 //! sessions query-core +9.6%, hono +4.5%, effect +9.3%. A correct reader
 //! never sees a reuse: every holder of a node holds its version, and a
-//! given-back block waits two program releases (`BlockPool`). The
+//! given-back block waits two pin releases (`BlockPool`). The
 //! debug-assertion runs (the protected tests, the corpus, the editor and
 //! oracle runs) find a missed holder.
 //!
@@ -66,8 +67,11 @@
 //! a path that a publish on this thread published before, in a language
 //! server or API process (the parse cache, project/parsecache.rs) or a
 //! `tsc --watch` or `tsc -b --watch` process (each build,
-//! `program::mark_freeable_parses`; watchfree1). So the first publish, the
-//! first version of each file and every other CLI publish never get a
+//! `program::mark_freeable_parses`; watchfree1). An API source file lease
+//! notes its path before its parse (apimem1 fix C,
+//! `project::SnapshotHost::acquire_source_file`), so the first version of a
+//! leased path gets one. So the first publish, the first version of each
+//! file (but a leased one) and every other CLI publish never get a
 //! `FileVersion`.
 //! `GOPORT_FREE_FILE_VERSIONS=0` turns it off (the behavior before M3a);
 //! `=1` turns it on in any process, and then
@@ -164,6 +168,19 @@ impl FileVersion {
             .map_or(0, |store| store.go_file().parser_flags.len())
     }
 
+    /// Takes the data out of a version that dies (`PinRelease`): its store
+    /// and `GoFile`, name table, position map, declaration map and
+    /// identifier set. The version then drops with nothing to free.
+    fn take_data(&mut self) -> impl Send + use<> {
+        (
+            self.published.take(),
+            self.name_table.take(),
+            self.position_map.take(),
+            self.declaration_map.take(),
+            self.identifiers.take(),
+        )
+    }
+
     /// The `GoFile` of this version. Panics before the publish. A
     /// `FileRef::Pinned` getter starts here.
     #[inline]
@@ -178,7 +195,7 @@ impl FileVersion {
 
 impl Drop for FileVersion {
     // The store and `GoFile` (`published`) are freed after this, with the
-    // fields.
+    // fields, unless a `PinRelease` took them out (`take_data`).
     //
     // This runs after the strong count is 0, so a reader on another thread
     // can fail to upgrade the registry entry before the id is in
@@ -664,14 +681,14 @@ thread_local! {
     /// True while a `PinRelease` of this thread waits for its drop
     /// (`release_file_version_pins_later`).
     static PIN_RELEASE_QUEUED: Cell<bool> = const { Cell::new(false) };
-    /// `Some(min_nodes)` on a thread whose `PinRelease` frees a version of
-    /// `min_nodes` or more nodes on the free thread
+    /// `Some(min_nodes)` on a thread whose `PinRelease` frees the data of a
+    /// dying version of `min_nodes` or more nodes on the free thread
     /// (`free_released_versions_in_background`).
     static FREE_IN_BACKGROUND: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-/// The node count from which the free of a dying version goes to the free
-/// thread (`free_released_versions_in_background`): about a 60 KB file.
+/// The node count from which the free of a dying version's data goes to the
+/// free thread (`free_released_versions_in_background`): about a 60 KB file.
 // PERF: (apiperf1) mini-743d. The free of a version of a 260 KB file (about
 // 70,000 nodes) took about 1 ms of each releaseSourceFile. For small texts
 // (about 150 nodes) the free thread made a loop of 3,000 leases 3 to 6%
@@ -682,37 +699,68 @@ const BACKGROUND_FREE_MIN_NODES: usize = 10_000;
 struct PinRelease;
 
 impl Drop for PinRelease {
+    // Go has no counterpart: Go's GC frees the leased `*ast.SourceFile`
+    // after api/session.go:1906 `lease.Release()` (handleReleaseSourceFile,
+    // :1893; project/snapshothost.go:45 `cache.Deref`). The free thread
+    // and the free at the thread's end are Rust-only.
     fn drop(&mut self) {
         let _ = PIN_RELEASE_QUEUED.try_with(|queued| queued.set(false));
         let pins = take_file_version_pins();
-        let Some(min_nodes) = FREE_IN_BACKGROUND.try_with(Cell::get).ok().flatten() else {
-            drop(pins);
-            return;
+        // At the thread's end (the release waited in the garbage of
+        // `gostd::local`, and the thread ended before `drop_garbage`), the
+        // pins drop here, so the end does not start the free thread.
+        let min_nodes = match FREE_IN_BACKGROUND.try_with(Cell::get) {
+            Ok(Some(min_nodes)) if !crate::gostd::local::is_ending() => min_nodes,
+            _ => {
+                drop(pins);
+                return;
+            }
         };
-        // A pin that a `FileRef` guard of this thread shares drops here: the
-        // guard keeps the version.
-        let versions: Vec<Arc<FileVersion>> = pins
-            .into_iter()
-            .filter_map(|(_, pin)| Rc::try_unwrap(pin).ok())
-            .collect();
-        let big_dies = versions
-            .iter()
-            .any(|version| Arc::strong_count(version) == 1 && version.node_count() >= min_nodes);
-        if big_dies {
-            free_in_background(Box::new(versions));
+        let mut garbage = Vec::new();
+        for (_, pin) in pins {
+            // A pin that a `FileRef` guard of this thread shares drops here:
+            // the guard keeps the version.
+            let Ok(version) = Rc::try_unwrap(pin) else {
+                continue;
+            };
+            // `try_unwrap` takes the strong count from 1 to 0 in one step,
+            // so after it a registry upgrade fails on every thread.
+            let mut version = match Arc::try_unwrap(version) {
+                Ok(version) => version,
+                // Another holder keeps the version (a guard or the tables
+                // of a program on another thread): the `Arc` drops as usual.
+                Err(version) => {
+                    drop(version);
+                    continue;
+                }
+            };
+            // Before `take_data`, which takes the store that it reads.
+            let nodes = version.node_count();
+            let data = version.take_data();
+            // The version dies here, before the send: its `Drop` puts its
+            // id in `DEAD_FILES` and takes it out of the registry, so a read
+            // of it panics (`released`) from now on.
+            drop(version);
+            if nodes >= min_nodes {
+                garbage.push(data);
+            }
+            // Else its data drops here.
         }
-        // Else they drop here.
+        if !garbage.is_empty() {
+            free_in_background(Box::new(garbage));
+        }
     }
 }
 
 /// Not in Go (perf, apiperf1): on this thread, the pin release of a source
-/// file lease release (`release_file_version_pins_later`) gives the
-/// versions that it held to the free thread (`free_in_background`) when one
-/// of `BACKGROUND_FREE_MIN_NODES` or more nodes dies, so it is freed there,
+/// file lease release (`release_file_version_pins_later`) gives the data of
+/// each version that dies in it with `BACKGROUND_FREE_MIN_NODES` or more
+/// nodes to the free thread (`free_in_background`), so it is freed there,
 /// beside the next requests, as Go's GC frees the leased
-/// `*ast.SourceFile`. The stdio API server calls it with
-/// `gostd::local::keep_garbage`. Elsewhere the free runs in the release, so
-/// a test sees the version die at `drop_garbage`.
+/// `*ast.SourceFile`. The version itself dies in the release: its id is
+/// dead before the send, as with a free in the release. The stdio API
+/// server calls it with `gostd::local::keep_garbage`. Elsewhere the free
+/// runs in the release, so a test sees the data go at `drop_garbage`.
 pub fn free_released_versions_in_background() {
     FREE_IN_BACKGROUND.with(|min_nodes| min_nodes.set(Some(BACKGROUND_FREE_MIN_NODES)));
 }
@@ -721,7 +769,8 @@ pub fn free_released_versions_in_background() {
 /// values sent to it in order, or here when that thread cannot start
 /// (wasm32-wasip1 has no threads). A value still queued at exit is not
 /// dropped. `execute::build::build_task::drop_in_background` is the same
-/// thread for the data of a build.
+/// kind of thread (`goport-free`, a thread of its own) for the data of a
+/// build.
 fn free_in_background(garbage: Box<dyn Send>) {
     if cfg!(target_family = "wasm") {
         drop(garbage);
@@ -747,11 +796,11 @@ fn free_in_background(garbage: Box<dyn Send>) {
 /// (`gostd::local::drop_later`; at once on a thread that does not keep
 /// garbage). The release of a source file lease whose freeable parse has no
 /// other holder calls it (`project::drop_released_lease`), so the version
-/// dies with the lease, as Go's GC frees the leased `*ast.SourceFile`; on
-/// the free thread when this thread frees in the background
-/// (`free_released_versions_in_background`). One release waits at a time:
-/// the leases that one message releases (a session close) bump the pin
-/// epoch once.
+/// dies with the lease, as Go's GC frees the leased `*ast.SourceFile`; its
+/// data is freed on the free thread when this thread frees in the
+/// background (`free_released_versions_in_background`). One release waits
+/// at a time: the leases that one message releases (a session close) bump
+/// the pin epoch once.
 pub fn release_file_version_pins_later() {
     if PIN_RELEASE_QUEUED.replace(true) {
         return;
@@ -1130,47 +1179,152 @@ mod tests {
         assert_eq!(map.get(&node(OTHER)), Some(&2));
     }
 
-    // apiperf1: on a thread that frees in the background (the stdio API
-    // server), the pin release of a lease release gives the version to the
-    // free thread, which frees it after the values queued before it.
+    /// Holds the free thread until its sender sends or drops.
+    struct Blocker(std::sync::mpsc::Receiver<()>);
+
+    impl Drop for Blocker {
+        fn drop(&mut self) {
+            let _ = self.0.recv();
+        }
+    }
+
+    /// Starts the free thread when it has not started and blocks it: the
+    /// values sent to it after this wait until the returned sender sends or
+    /// drops.
+    fn block_free_thread() -> std::sync::mpsc::Sender<()> {
+        let (go, wait) = std::sync::mpsc::channel();
+        free_in_background(Box::new(Blocker(wait)));
+        go
+    }
+
+    /// Publishes on this thread a freeable version of a file of one
+    /// identifier per name and pins it. Gives the version (its other
+    /// holder) and a weak handle to its text, which goes with its data (its
+    /// store).
+    fn publish_pinned(name: &'static str, names: &[&str]) -> (Arc<FileVersion>, Weak<str>) {
+        let text = FileText::Shared(Arc::from(names.join(";")));
+        let weak = text.weak().expect("a shared text");
+        let file = super::super::store::new_file_store(name, text);
+        let factory = crate::ast::NodeFactory::for_file(file);
+        for identifier in names {
+            factory.new_identifier(*identifier);
+        }
+        super::super::store::freeze_file_store(file);
+        let version = FileVersion::new(file);
+        crate::program::publish_parsed_files("/");
+        assert!(version.node_count() > 0, "the version is published");
+        drop(pinned_file_version(file).expect("the version is live"));
+        (version, weak)
+    }
+
+    // apiperf1, followups30 item 3 (a): on a thread that frees in the
+    // background (the stdio API server), a version dies in the pin release
+    // of a lease release, also when the free thread is busy: its id is dead
+    // and a read of it panics. The data of a version of `min_nodes` or more
+    // nodes goes to the free thread, which frees it after the values queued
+    // before it. The data of a smaller version is freed in the release. A
+    // version with another holder lives until that holder lets go. It
+    // publishes, so no other test may build or publish stores while it runs
+    // (the runner uses one thread).
     #[test]
     fn background_pin_release_frees_on_the_free_thread() {
-        const DYING: usize = (1 << 22) - 7;
-        /// Holds the free thread until its sender sends or drops.
-        struct Blocker(std::sync::mpsc::Receiver<()>);
-        impl Drop for Blocker {
-            fn drop(&mut self) {
-                let _ = self.0.recv();
-            }
-        }
         // Its own thread, so the background mode stays there.
         std::thread::spawn(|| {
-            let version = FileVersion::new(DYING);
-            let probe = file_version_probe(node(DYING)).expect("the registry has the version");
-            drop(pinned_file_version(DYING).expect("the version is live"));
-            drop(version);
-            assert!(
-                !probe.is_freed(),
-                "the pin of this thread holds the version"
-            );
-            let (go, wait) = std::sync::mpsc::channel();
-            free_in_background(Box::new(Blocker(wait)));
-            // Every dying version, whatever its node count.
-            FREE_IN_BACKGROUND.with(|min_nodes| min_nodes.set(Some(0)));
+            let (small_version, small_text) = publish_pinned("/fv/small.ts", &["a"]);
+            let (big_version, big_text) = publish_pinned("/fv/big.ts", &["a", "b", "c", "d"]);
+            let (kept, kept_text) = publish_pinned("/fv/kept.ts", &["a", "b", "c", "d"]);
+            let big_nodes = big_version.node_count();
+            assert!(small_version.node_count() < big_nodes);
+            let [small, big] = [&small_version, &big_version].map(|version| version.file());
+            let probes = [small, big, kept.file()].map(|file| {
+                file_version_probe(node(file)).expect("the pin of this thread holds the version")
+            });
+            // Only the pins of this thread hold small and big.
+            drop((small_version, big_version));
+            let go = block_free_thread();
+            FREE_IN_BACKGROUND.with(|min_nodes| min_nodes.set(Some(big_nodes)));
+            let dead = dead_file_versions();
             release_file_version_pins_later();
-            assert!(!probe.is_freed(), "the release does not free the version");
+            assert!(
+                probes[..2].iter().all(FileVersionProbe::is_freed),
+                "the versions die in the release"
+            );
+            let (died, _) = dead_files_since(dead);
+            assert!(died.contains(&small) && died.contains(&big), "{died:?}");
+            assert!(!died.contains(&kept.file()), "{died:?}");
+            assert!(!probes[2].is_freed(), "its other holder keeps a version");
+            drop(kept);
+            assert!(probes[2].is_freed(), "the last holder frees the version");
+            assert!(
+                kept_text.upgrade().is_none(),
+                "the last holder frees the data"
+            );
+            let read = std::panic::catch_unwind(|| pinned_file_version(big).is_some());
+            let message = read.expect_err("a read of a dead version panics");
+            assert_eq!(
+                message.downcast_ref::<String>(),
+                Some(&format!("file version {big} is released"))
+            );
+            assert!(
+                small_text.upgrade().is_none(),
+                "the release frees the data of a small version"
+            );
+            assert!(
+                big_text.upgrade().is_some(),
+                "the data of a big version waits for the free thread"
+            );
             go.send(()).expect("the free thread waits");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while !probe.is_freed() {
+            while big_text.upgrade().is_some() {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "the free thread frees the version"
+                    "the free thread frees the data"
                 );
                 std::thread::yield_now();
             }
         })
         .join()
         .expect("the test thread ends");
+    }
+
+    // followups30 item 3 (b): a `PinRelease` that waits in the garbage of
+    // `gostd::local` when its thread ends drops its pins there, so the
+    // thread's end frees the data and does not send it to the free thread
+    // (a thread-local destructor must not start that thread). It publishes,
+    // so no other test may build or publish stores while it runs (the
+    // runner uses one thread).
+    #[test]
+    fn a_pin_release_at_the_thread_end_frees_in_place() {
+        // First, so the free thread exists and the end does not start it.
+        let go = block_free_thread();
+        let (probe, text) = std::thread::spawn(|| {
+            // `PINS` before `LOCAL` (`keep_garbage`): the thread-local
+            // destructors run in the reverse order of the first uses, so
+            // `LOCAL` drops the release while the pins are still there.
+            PINS.with(|_| ());
+            let (version, text) = publish_pinned("/fv/end.ts", &["a"]);
+            let file = version.file();
+            drop(version);
+            crate::gostd::local::keep_garbage();
+            FREE_IN_BACKGROUND.with(|min_nodes| min_nodes.set(Some(0)));
+            release_file_version_pins_later();
+            assert_eq!(
+                crate::gostd::local::garbage_len(),
+                1,
+                "the release waits for `drop_garbage`"
+            );
+            let probe = file_version_probe(node(file)).expect("the pin holds the version");
+            // The thread ends with no `drop_garbage`.
+            (probe, text)
+        })
+        .join()
+        .expect("the test thread ends");
+        assert!(probe.is_freed(), "the end of the thread frees the version");
+        assert!(
+            text.upgrade().is_none(),
+            "the end of the thread frees the data, not the free thread"
+        );
+        go.send(()).expect("the free thread waits");
     }
 
     // A node of a dead version whose id the map forgot gets no new id: the
