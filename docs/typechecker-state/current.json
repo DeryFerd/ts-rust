@@ -907,12 +907,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "a87206087842d1a07",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "a543371887aed7603",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R178 pipeline (candidate.sh side)."
