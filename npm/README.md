@@ -64,20 +64,22 @@ postinstall check.
 
 The release workflow (`.github/workflows/release.yml`) makes a release:
 
-1. Push a tag `v<version>`, for example `git tag v0.1.0-preview.1 && git push origin v0.1.0-preview.1`.
-   The npm version is the tag without the `v`.
+1. Push a tag `v<version>`, for example `git tag v0.1.0 && git push origin v0.1.0`. The npm
+   version is the tag without the `v`.
 2. It builds the tsc on Linux (static musl, non-PIE: it starts on any x86-64 Linux) and on a Mac
    (jemalloc does not cross-build for macOS with zig), from the same source.
 3. It packs the set with `npm-pack.sh --name tsc-rs --package-version <v> --also darwin-arm64=<tsc>`,
    makes one archive per platform (the tsc, the lib files, LICENSE and NOTICE.txt) and installs
    the packages in a fresh project on each platform.
-4. It publishes the platform packages, then `tsc-rs`, under the dist-tag `next`, and creates a
-   GitHub prerelease with the archives, the .tgz files and `SHA256SUMS`. The publish uses npm
+4. It publishes the platform packages, then `tsc-rs`, and creates a GitHub release with the
+   archives, the .tgz files and `SHA256SUMS`. A stable version goes to the dist-tag `latest` and a
+   normal release. A version with a prerelease part (`0.2.0-beta.1`) goes to `next` and a GitHub
+   prerelease. The publish uses npm
    trusted publishing (see below), so there is no npm token in the repo.
 
 Pull requests that change the release files run steps 2 and 3 with the version `0.0.0-ci.<run>`.
-After a check of `npx tsc-rs@next` on each platform, `npm dist-tag add tsc-rs@<v> latest` (and the
-same for each platform package) makes it the default.
+To make a prerelease the default after a check of `npx tsc-rs@next` on each platform, run
+`npm dist-tag add tsc-rs@<v> latest`, and the same for each platform package.
 
 The CI builds are the plain shipped profile (fat LTO). They have no PGO and BOLT, which give 14 to
 15% fewer cycles (build-release.sh header), because those need a host with BOLT and the project
