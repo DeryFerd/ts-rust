@@ -1034,16 +1034,17 @@ impl CompilerHost for BuildCompilerHost {
         let Some(project) = self.content_mapper_project() else {
             return Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone());
         };
-        let fs = CompilerHost::fs(self);
-        let (content, ok) = fs.read_file(&parse_options.file_name);
-        if !ok {
-            return Ok(SourceFiles::default());
-        }
-        let files = contentmapper::transform_and_parse(parse_options, &content, mapper, &*project)?;
-        contentmapper::check_supplemental_file_name_collisions(&files, &|name: &str| {
-            fs.file_exists(name)
-        })?;
-        Ok(files)
+        crate::frontend::compiler::content_mapped_source_files(
+            &*CompilerHost::fs(self),
+            &*project,
+            parse_options,
+            mapper,
+        )
+    }
+
+    // PORT: not in Go (see `CompilerHost::prefetch_content_mapped`).
+    fn prefetch_content_mapped(&self) -> bool {
+        true
     }
 
     // Go: build/compilerHost.go:56 (*compilerHost).ContentMapperProject (tsgo#4712)

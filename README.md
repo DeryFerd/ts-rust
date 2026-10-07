@@ -83,8 +83,12 @@ service (quick fixes, refactors, hover, completions) are not ported.
 
 ## Status
 
-The port is pinned to one upstream revision ([UPSTREAM.md](UPSTREAM.md)) and compared with Go at
-that revision:
+The port is pinned to one upstream revision, microsoft/TypeScript
+[`673a5f17d713`](https://github.com/microsoft/TypeScript/commit/673a5f17d713bdc8c7185f18a9c11e3c4ac5d781)
+(2026-09-29, TypeScript 7.1.0-dev; [UPSTREAM.md](UPSTREAM.md)), and compared with Go at that
+revision. To compare, use `typescript@7.1.0-dev.20260929.1`, not 7.0.x or
+`@typescript/native-preview`. A difference that this build also shows is upstream behavior, and it
+goes away when the port moves to a newer pin.
 
 - **Same results.** TanStack Query core and Hono check with diagnostics identical to Go's. All
   181,711 ported Go tests pass. The language server and API answers match Go on the oracle test

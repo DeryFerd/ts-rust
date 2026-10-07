@@ -6,8 +6,8 @@
 
 use super::files_parser::{TakenParse, count_prep, note_prep_taken};
 use crate::contentmapper::{
-    DiagnosticDirectiveError, DiagnosticDirectiveErrorKind, InitializeError, InitializeErrorKind,
-    InvalidVirtualExtensionError, Mapper, ProjectError, ProjectErrorKind,
+    ConcurrentTransform, DiagnosticDirectiveError, DiagnosticDirectiveErrorKind, InitializeError,
+    InitializeErrorKind, InvalidVirtualExtensionError, Mapper, ProjectError, ProjectErrorKind,
     SupplementalFileCollisionError, TransformError, TransformErrorKind,
 };
 use crate::frontend::prelude::*;
@@ -93,6 +93,18 @@ pub struct FileLoader {
     pub content_mapper_failures: RefCell<FxHashMap<*const Mapper, i32>>,
     pub content_mapper_init_failed: RefCell<FxHashSet<*const Mapper>>,
     pub content_mapper_diagnostics: RefCell<Vec<Diagnostic>>,
+    /// What the parse workers send the transforms of each mapper's files
+    /// with, from the loader's first transform of a file of the mapper on
+    /// (`note_content_mapper_transform`). Keyed as the maps above: two
+    /// mappers of one package and version have their own options, and so
+    /// their own project.
+    // PORT: not in Go, where the parse goroutines transform.
+    pub concurrent_transforms: RefCell<FxHashMap<*const Mapper, Arc<ConcurrentTransform>>>,
+    /// Set when `concurrent_transforms` gets a mapper, so that the files
+    /// parser queues the worker jobs of the files of that mapper that wait
+    /// in its queue (`FilesParser::queue_mapped_prefetch`).
+    // PORT: not in Go (see `concurrent_transforms`).
+    pub mapped_prefetch_ready: Cell<bool>,
     // ts#64299. PORT: Go `moduleResolutionErrorOnce` plus the error is an
     // `Option` that keeps the first error.
     pub module_resolution_error: RefCell<Option<GoError>>,
@@ -265,6 +277,8 @@ pub fn process_all_program_files(opts: ProgramOptions, single_threaded: bool) ->
         content_mapper_failures: RefCell::new(FxHashMap::default()),
         content_mapper_init_failed: RefCell::new(FxHashSet::default()),
         content_mapper_diagnostics: RefCell::new(Vec::new()),
+        concurrent_transforms: RefCell::new(FxHashMap::default()),
+        mapped_prefetch_ready: Cell::new(false),
         module_resolution_error: RefCell::new(None),
         opts,
     };
@@ -1104,8 +1118,11 @@ impl FileLoader {
     // subsequent files. Other failures produce per-file diagnostics and count toward a failure budget; after
     // maxContentMapperFailures, one program diagnostic reports that the mapper was disabled and subsequent
     // files are silently substituted with empty files. It returns nil only if the file cannot be read.
-    // PORT: the host transforms on this (the loading) thread; the content
-    // mapper host is dispatch-thread state (`contentmapper` module docs).
+    // PORT: the content mapper host is dispatch-thread state
+    // (`contentmapper` module docs), so the host transforms on this (the
+    // loading) thread. Once that opened the mapper project, the parse
+    // workers send the transforms of the later files, and the host takes
+    // their results (`note_content_mapper_transform`).
     pub fn parse_content_mapped_file(
         &self,
         opts: SourceFileParseOptions,
@@ -1127,11 +1144,12 @@ impl FileLoader {
                 &transform_identity,
             )));
         }
-        match self
+        let files = self
             .opts
             .host
-            .get_content_mapped_source_files(&opts, &mapper)
-        {
+            .get_content_mapped_source_files(&opts, &mapper);
+        self.note_content_mapper_transform(&mapper);
+        match files {
             Ok(files) => files.canonical,
             Err(err) => {
                 let mut source_file =
@@ -1214,6 +1232,66 @@ impl FileLoader {
         source_file
     }
 
+    /// What a parse worker sends the transform of the content-mapped file
+    /// `file_name` with (`FilesParser::prefetch_request`): `None` until
+    /// the loader's transform of a file of its mapper opened the mapper
+    /// project, and after the mapper is disabled.
+    // PORT: not in Go, where the parse goroutines transform (tsgo#4712).
+    pub(crate) fn concurrent_content_mapper_transform(
+        &self,
+        file_name: &str,
+    ) -> Option<Arc<ConcurrentTransform>> {
+        let transforms = self.concurrent_transforms.borrow();
+        if transforms.is_empty() {
+            return None;
+        }
+        let mapper = self
+            .opts
+            .config
+            .get_content_mapper_for_file_name(file_name)?;
+        if self.content_mapper_unavailable(Some(&mapper)) {
+            return None;
+        }
+        transforms.get(&Rc::as_ptr(&mapper)).cloned()
+    }
+
+    /// After the loader's transform of a file of `mapper`: when the host
+    /// lets the parse workers transform (`prefetch_content_mapped`) and the
+    /// transform opened the mapper project, keeps what the workers send
+    /// the later transforms with. Go opens the project on the first
+    /// transform too, so no request goes out that Go does not send.
+    /// `GOPORT_MAPPED_PREFETCH=0` turns it off (an A/B switch).
+    // PORT: not in Go (see `concurrent_transforms`).
+    fn note_content_mapper_transform(&self, mapper: &Rc<Mapper>) {
+        let key = Rc::as_ptr(mapper);
+        if self.concurrent_transforms.borrow().contains_key(&key)
+            || !self.opts.host.prefetch_content_mapped()
+            || std::env::var_os("GOPORT_MAPPED_PREFETCH").is_some_and(|value| value == "0")
+        {
+            return;
+        }
+        let Some(transform) = self
+            .opts
+            .host
+            .content_mapper_project()
+            .and_then(|project| project.concurrent_transform(mapper))
+        else {
+            return;
+        };
+        self.concurrent_transforms
+            .borrow_mut()
+            .insert(key, transform);
+        self.mapped_prefetch_ready.set(true);
+    }
+
+    /// Stops the worker transforms of a mapper that the loader disabled.
+    // PORT: not in Go (see `concurrent_transforms`).
+    fn disable_concurrent_transform(&self, mapper: &Rc<Mapper>) {
+        if let Some(transform) = self.concurrent_transforms.borrow().get(&Rc::as_ptr(mapper)) {
+            transform.disable();
+        }
+    }
+
     // Go: fileloader.go:638 (*fileLoader).contentMapperUnavailable (tsgo#4712)
     // contentMapperUnavailable reports whether mapper failed initialization or exceeded its failure budget.
     fn content_mapper_unavailable(&self, mapper: Option<&Rc<Mapper>>) -> bool {
@@ -1248,6 +1326,7 @@ impl FileLoader {
         self.content_mapper_diagnostics
             .borrow_mut()
             .push(content_mapper_initialization_diagnostic(label, err));
+        self.disable_concurrent_transform(mapper);
     }
 
     // Go: fileloader.go:660 (*fileLoader).recordContentMapperFailure (tsgo#4712)
@@ -1268,6 +1347,8 @@ impl FileLoader {
                     diag::The_content_mapper_0_failed_1_times_and_will_not_be_used,
                     args![label, MAX_CONTENT_MAPPER_FAILURES],
                 ));
+            drop(failures);
+            self.disable_concurrent_transform(mapper);
         }
         true
     }
@@ -3111,5 +3192,434 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
             }
         }
         set_load_prep(None);
+    }
+
+    /// A fake content mapper process over a socket pair (Go `net.Pipe` in
+    /// the Go host tests). It answers `initialize` and `openProject` at
+    /// once, and the transform requests newest first on another thread, so
+    /// the answers come out of order when requests overlap. The text of a
+    /// mapped file is TypeScript: `@diag` adds a mapper diagnostic, `@fail`
+    /// answers with an error, `@supp` adds a supplemental output. After
+    /// `exit_after` transform requests it closes the connection (a mapper
+    /// crash). `transforms` gets the file name of each transform request.
+    mod fake_mapper {
+        use crate::contentmapper::{
+            Diagnostic, InitializeResult, MappedOutput, OpenProjectResult, PositionEncoding,
+            ProcessExitState, SupplementalOutput, TransformParams, TransformResult,
+        };
+        use crate::frontend::json::json_unmarshal;
+        use crate::frontend::json_ext::{AnyValue, JsonValue};
+        use crate::gostd::GoError;
+        use crate::ipc::{self, Message, Protocol as _, ReadWriteCloser};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::sync::{Arc, Condvar, Mutex};
+
+        struct End(UnixStream);
+
+        impl ReadWriteCloser for End {
+            fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+                (&self.0).read(buf)
+            }
+
+            fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+                (&self.0).write(buf)
+            }
+
+            fn flush(&self) -> std::io::Result<()> {
+                (&self.0).flush()
+            }
+
+            fn close(&self) -> Result<(), GoError> {
+                let _ = self.0.shutdown(std::net::Shutdown::Both);
+                Ok(())
+            }
+        }
+
+        impl ProcessExitState for End {}
+
+        type Queue = Arc<(Mutex<(Vec<Message>, bool)>, Condvar)>;
+
+        pub(super) fn spawn(
+            transforms: Arc<Mutex<Vec<String>>>,
+            exit_after: Option<usize>,
+        ) -> Arc<dyn ProcessExitState> {
+            let (client, server) = UnixStream::pair().expect("socket pair");
+            let server: Arc<dyn ReadWriteCloser> = Arc::new(End(server));
+            let write = Arc::new(Mutex::new(()));
+            let queue: Queue = Arc::default();
+            let answer = {
+                let (server, write) = (server.clone(), write.clone());
+                move |msg: &Message, result: Option<Box<dyn AnyValue>>| {
+                    let _write = write.lock().unwrap();
+                    let _ = ipc::new_jsonrpc_protocol(server.clone())
+                        .write_response(msg.id.as_ref(), result);
+                }
+            };
+            {
+                let (server, write, queue) = (server.clone(), write.clone(), queue.clone());
+                std::thread::spawn(move || {
+                    loop {
+                        let msg = {
+                            let (lock, ready) = &*queue;
+                            let mut queue = lock.lock().unwrap();
+                            loop {
+                                if let Some(msg) = queue.0.pop() {
+                                    break msg;
+                                }
+                                if queue.1 {
+                                    return;
+                                }
+                                queue = ready.wait(queue).unwrap();
+                            }
+                        };
+                        let mut params = TransformParams::default();
+                        json_unmarshal(&msg.params.0, &mut params, &[]).unwrap();
+                        let _write = write.lock().unwrap();
+                        let mut protocol = ipc::new_jsonrpc_protocol(server.clone());
+                        if params.content.contains("@fail") {
+                            let _ = protocol.write_error(
+                                msg.id.as_ref(),
+                                &crate::jsonrpc::ResponseError {
+                                    code: crate::jsonrpc::CODE_INTERNAL_ERROR,
+                                    message: "fake failure".to_string(),
+                                    data: None,
+                                },
+                            );
+                            continue;
+                        }
+                        let _ = protocol.write_response(msg.id.as_ref(), Some(transform(&params)));
+                    }
+                });
+            }
+            std::thread::spawn(move || {
+                let mut protocol = ipc::new_jsonrpc_protocol(server.clone());
+                let mut count = 0;
+                while let Ok(msg) = protocol.read_message() {
+                    match msg.method.as_str() {
+                        "initialize" => answer(
+                            &msg,
+                            Some(Box::new(InitializeResult {
+                                position_encoding: PositionEncoding::UTF8,
+                                diagnostic_source: "fake".to_string(),
+                            })),
+                        ),
+                        "openProject" => {
+                            answer(&msg, Some(Box::new(OpenProjectResult::default())));
+                        }
+                        "closeProject" => answer(&msg, None),
+                        "transform" => {
+                            count += 1;
+                            if exit_after.is_some_and(|limit| count > limit) {
+                                let _ = server.close();
+                                break;
+                            }
+                            let mut params = TransformParams::default();
+                            json_unmarshal(&msg.params.0, &mut params, &[]).unwrap();
+                            transforms.lock().unwrap().push(params.file_name);
+                            let (lock, ready) = &*queue;
+                            lock.lock().unwrap().0.push(msg);
+                            ready.notify_one();
+                        }
+                        _ => {}
+                    }
+                }
+                let (lock, ready) = &*queue;
+                lock.lock().unwrap().1 = true;
+                ready.notify_one();
+            });
+            Arc::new(End(client))
+        }
+
+        fn verbatim(text: &str, extension: &str) -> MappedOutput {
+            let length = text.len() as i32;
+            let mappings = crate::spanmap::new(&[crate::spanmap::Segment {
+                virtual_end: length,
+                original_end: length,
+                kind: crate::spanmap::Kind::VERBATIM,
+                ..Default::default()
+            }])
+            .marshal()
+            .unwrap();
+            MappedOutput {
+                text: text.to_string(),
+                extension: extension.to_string(),
+                mappings: JsonValue(mappings),
+                diagnostic_directives: None,
+            }
+        }
+
+        fn transform(params: &TransformParams) -> Box<dyn AnyValue> {
+            let mut result = TransformResult {
+                mapped_output: verbatim(&params.content, ".ts"),
+                ..Default::default()
+            };
+            if params.content.contains("@diag") {
+                result.diagnostics.push(Diagnostic {
+                    message_text: "fake diagnostic".to_string(),
+                    start: 0,
+                    length: 1,
+                    code: 9001,
+                });
+            }
+            if params.content.contains("@supp") {
+                result.supplemental.push(SupplementalOutput {
+                    mapped_output: MappedOutput {
+                        text: "export const supplemental = 1;\n".to_string(),
+                        extension: ".ts".to_string(),
+                        mappings: JsonValue(b"[]".to_vec()),
+                        diagnostic_directives: None,
+                    },
+                });
+            }
+            Box::new(result)
+        }
+    }
+
+    /// Loads a program of `files` in a temp dir with the fake mapper for
+    /// `.vue` files. Returns each program file (name, text and parse
+    /// diagnostics) and the content mapper diagnostics, one per line, the
+    /// file name of each transform request, and the spawns.
+    fn load_mapped(
+        label: &str,
+        tsconfig: &str,
+        files: &[(String, String)],
+        single_threaded: bool,
+        exit_after: Option<usize>,
+    ) -> (Vec<String>, Vec<String>, usize) {
+        use crate::contentmapper::{self, HostOptions, ProjectSpec, SpawnerFunc};
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_file_loader_{label}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mapper_package = (
+            "node_modules/fake-mapper/package.json".to_string(),
+            r#"{ "name": "fake-mapper", "version": "1.0.0",
+                 "typescript": { "contentMapper": { "exec": ["fake"] } } }"#
+                .to_string(),
+        );
+        for (path, text) in files.iter().chain([&mapper_package]) {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        std::fs::write(dir.join("tsconfig.json"), tsconfig).unwrap();
+        let cwd = dir.to_string_lossy().replace('\\', "/");
+        let fs = bundled::wrap_fs(osvfs_fs());
+        let sys = System {
+            fs: fs.clone(),
+            current_directory: cwd.clone(),
+        };
+        // Go `tsc --runExternalCode`.
+        let options = CompilerOptions {
+            run_external_code: Tristate::True,
+            ..Default::default()
+        };
+        let (config, errors) = get_parsed_command_line_of_config_file(
+            &format!("{cwd}/tsconfig.json"),
+            Some(&options),
+            None,
+            &sys,
+            None,
+        );
+        assert!(errors.is_empty());
+        let config = Rc::new(config.unwrap());
+        assert_eq!(config.content_mappers().len(), 1);
+        let transforms = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let spawns = Rc::new(Cell::new(0));
+        let spawner = {
+            let (transforms, spawns) = (transforms.clone(), spawns.clone());
+            SpawnerFunc(Box::new(move |_, _, _| {
+                spawns.set(spawns.get() + 1);
+                Ok(fake_mapper::spawn(transforms.clone(), exit_after))
+            }))
+        };
+        let ctx = crate::gostd::context::background();
+        let host = contentmapper::new_host_with_options(
+            &ctx,
+            Rc::new(spawner),
+            crate::locale::DEFAULT,
+            HostOptions { logger: None },
+        );
+        let project = host.project(ProjectSpec {
+            config_file_name: config.config_name().to_string(),
+            mappers: config.content_mappers().to_vec(),
+            compiler_options: Some(config.compiler_options().clone()),
+        });
+        let compiler_host = new_cached_fs_compiler_host(
+            &cwd,
+            fs,
+            &bundled::lib_path(),
+            None,
+            None,
+            project.clone(),
+        );
+        let processed = process_all_program_files(
+            ProgramOptions {
+                host: compiler_host,
+                config,
+                use_source_of_project_reference: false,
+                single_threaded: if single_threaded {
+                    Tristate::True
+                } else {
+                    Tristate::False
+                },
+                typings_location: String::new(),
+                project_name: String::new(),
+                create_module_resolver: None,
+                skip_module_resolution: false,
+            },
+            single_threaded,
+        );
+        if let Some(project) = project {
+            let _ = project.close();
+        }
+        let _ = host.close();
+        let _ = std::fs::remove_dir_all(&dir);
+        let diagnostic = |d: &Diagnostic| {
+            format!(
+                "{:?}",
+                (
+                    d.pos,
+                    d.end,
+                    d.code,
+                    &d.source,
+                    &d.message_text,
+                    &d.message_args
+                )
+            )
+        };
+        let mut lines: Vec<String> = processed
+            .files
+            .iter()
+            .filter(|file| file.file_name().starts_with(&cwd))
+            .map(|file| {
+                let name = file.file_name().replace(&cwd, "");
+                let diagnostics: Vec<String> = file.diagnostics.iter().map(diagnostic).collect();
+                format!("{name} {:?} {diagnostics:?}", file.text())
+            })
+            .collect();
+        lines.extend(processed.content_mapper_diagnostics.iter().map(diagnostic));
+        let transforms = std::mem::take(&mut *transforms.lock().unwrap());
+        let transforms = transforms
+            .into_iter()
+            .map(|name| name.replace(&cwd, ""))
+            .collect();
+        (lines, transforms, spawns.get())
+    }
+
+    const MAPPED_TSCONFIG: &str = r#"{ "compilerOptions": { "module": "preserve",
+         "moduleResolution": "bundler", "types": [], "noEmit": true },
+         "include": ["src"],
+         "contentMappers": [{ "package": "fake-mapper", "extensions": [".vue"] }] }"#;
+
+    /// `count` mapped files that import the next one, with `marker` in
+    /// file `i` when `marker(i)` names one.
+    fn mapped_files(count: usize, marker: fn(usize) -> &'static str) -> Vec<(String, String)> {
+        let mut files: Vec<(String, String)> = (0..count)
+            .map(|i| {
+                let next = (i + 1) % count;
+                (
+                    format!("src/C{i}.vue"),
+                    format!(
+                        "// {}\nimport {{ v{next} }} from \"./C{next}.vue\";\nexport const v{i} = v{next};\n",
+                        marker(i)
+                    ),
+                )
+            })
+            .collect();
+        files.push((
+            "src/main.ts".to_string(),
+            "import { v0 } from \"./C0.vue\";\nexport const main = v0;\n".to_string(),
+        ));
+        files
+    }
+
+    // cmpar1: once the loader's transform of the first mapped file opened
+    // the mapper project, the parse workers send the transforms of the
+    // other mapped files and parse the virtual texts, and the loader takes
+    // their results. Each file gets one transform request, also with a
+    // mapper diagnostic, an error response or a supplemental output, and
+    // the program equals a load on one thread. The fake mapper answers the
+    // newest request first, so answers come out of order when requests
+    // overlap. Go sends the transforms from its parse goroutines
+    // (fileloader.go:438 parseContentMappedFile).
+    #[test]
+    fn workers_send_the_content_mapper_transforms() {
+        use super::super::files_parser::{MAPPED_TAKEN, parse_workers_enabled};
+        let files = mapped_files(40, |i| match i {
+            3 | 17 | 31 => "@diag",
+            9 | 26 => "@fail",
+            12 | 35 => "@supp",
+            _ => "",
+        });
+        let (serial, serial_transforms, _) =
+            load_mapped("mapped_serial", MAPPED_TSCONFIG, &files, true, None);
+        let taken = MAPPED_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
+        let (parallel, mut parallel_transforms, _) =
+            load_mapped("mapped_parallel", MAPPED_TSCONFIG, &files, false, None);
+        let taken = MAPPED_TAKEN.load(std::sync::atomic::Ordering::Relaxed) - taken;
+        assert_eq!(serial_transforms.len(), 40);
+        parallel_transforms.sort();
+        parallel_transforms.dedup();
+        assert_eq!(parallel_transforms.len(), 40, "a file got two transforms");
+        assert_eq!(parallel.join("\n"), serial.join("\n"));
+        if parse_workers_enabled() {
+            assert!(taken > 0, "the loader took no worker transform");
+        }
+    }
+
+    // A mapper that crashes during the load: the calls in flight and all
+    // later calls fail, the first 5 failures in load order are reported,
+    // then the mapper is disabled, and the load ends.
+    #[test]
+    fn a_mapper_crash_during_worker_transforms_ends_the_load() {
+        let files = mapped_files(40, |_| "");
+        for single_threaded in [true, false] {
+            let (lines, _, _) = load_mapped(
+                &format!("mapped_crash_{single_threaded}"),
+                MAPPED_TSCONFIG,
+                &files,
+                single_threaded,
+                Some(10),
+            );
+            let count = |code: u32| {
+                lines
+                    .iter()
+                    .filter(|line| line.contains(&format!(", {code}, ")))
+                    .count()
+            };
+            let failed = diag::The_content_mapper_0_failed_to_transform_this_file.code();
+            let disabled = diag::The_content_mapper_0_failed_1_times_and_will_not_be_used.code();
+            assert_eq!(
+                (count(failed), count(disabled)),
+                (5, 1),
+                "single threaded {single_threaded}:\n{}",
+                lines.join("\n")
+            );
+        }
+    }
+
+    // A mapped file that the program names but that does not exist sends
+    // no request: the mapper does not start, so the project does not open
+    // and reports no option diagnostics (Go program.go:828 reports them
+    // only for opened projects).
+    #[test]
+    fn a_missing_mapped_file_starts_no_mapper() {
+        let tsconfig = r#"{ "compilerOptions": { "types": [], "noEmit": true },
+             "files": ["missing.vue", "a.ts"],
+             "contentMappers": [{ "package": "fake-mapper", "extensions": [".vue"] }] }"#;
+        let files = [("a.ts".to_string(), "export const a = 1;\n".to_string())];
+        for single_threaded in [true, false] {
+            let (_, transforms, spawns) = load_mapped(
+                &format!("mapped_missing_{single_threaded}"),
+                tsconfig,
+                &files,
+                single_threaded,
+                None,
+            );
+            assert_eq!((transforms.len(), spawns), (0, 0));
+        }
     }
 }
