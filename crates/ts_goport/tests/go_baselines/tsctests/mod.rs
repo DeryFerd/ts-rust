@@ -6,6 +6,7 @@ mod explain_files_cache;
 mod file_delete;
 mod flag_bytes;
 mod jsdoc_cut;
+mod large_union_order;
 mod never_intersection_order;
 mod removed_reference_config;
 mod showconfig;
