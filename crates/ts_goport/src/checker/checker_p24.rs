@@ -498,6 +498,12 @@ impl Checker {
         // declarations is stored with no heap list (no malloc). A longer list
         // moves into one `Vec` for `Declarations::from`, as before.
         let mut declarations: SmallVec<[Node; 4]> = SmallVec::with_capacity(declaration_count);
+        // PERF: Go `core.AppendIfUnique` scans the list for each declaration,
+        // which is quadratic in a long list (blueprint: 43k calls with 181
+        // declarations, 178 of them distinct; the scans were about half of
+        // its check). A long list keeps a set of its nodes beside it
+        // (`DeclarationSet`); the list and its order stay Go's.
+        let mut declaration_set = DeclarationSet::default();
         let mut first_type = TypeId::NIL;
         let mut name_type = TypeId::NIL;
         let mut prop_types: SmallVec<[TypeId; 4]> =
@@ -517,9 +523,7 @@ impl Checker {
             }
             for &declaration in self.sym(prop).declarations.iter() {
                 // Go: core.AppendIfUnique
-                if !declarations.contains(&declaration) {
-                    declarations.push(declaration);
-                }
+                declaration_set.add(&mut declarations, declaration, declaration_count);
             }
             let t = self.get_type_of_symbol(prop);
             if first_type.is_nil() {
@@ -2267,6 +2271,62 @@ fn table_key_name(key: TableKey<'_>) -> Name {
     }
 }
 
+/// Go `core.AppendIfUnique` for the declarations list of
+/// `create_union_or_intersection_property`, which can grow long. While the
+/// list is short, an add scans it. From `SCAN` nodes on, an open-addressing
+/// table of the listed nodes answers instead. A node is pushed only when it
+/// is new, so the list keeps Go's order.
+#[derive(Default)]
+struct DeclarationSet {
+    /// Empty until the list reaches `SCAN` nodes, then a power-of-two table
+    /// at most half full. `Node::NIL` marks a free slot.
+    slots: Vec<Node>,
+}
+
+impl DeclarationSet {
+    /// The list length from which the table answers. Lists are mostly
+    /// shorter than 8 or longer than 32; blueprint runs fastest from 8 to 16.
+    const SCAN: usize = 16;
+
+    /// Pushes `node` to `list` unless the list has it. `max_len` is an
+    /// upper bound of the final list length (the table never fills).
+    fn add(&mut self, list: &mut SmallVec<[Node; 4]>, node: Node, max_len: usize) {
+        debug_assert!(node.is_some());
+        if list.len() < Self::SCAN {
+            if !list.contains(&node) {
+                list.push(node);
+                if list.len() == Self::SCAN {
+                    self.slots = vec![Node::NIL; (max_len * 2).next_power_of_two()];
+                    for &listed in list.iter() {
+                        self.insert(listed);
+                    }
+                }
+            }
+        } else if self.insert(node) {
+            list.push(node);
+        }
+    }
+
+    /// Puts `node` in the table. False when the table has it.
+    fn insert(&mut self, node: Node) -> bool {
+        let mask = self.slots.len() - 1;
+        // Fibonacci hashing: the top bits of the product pick the first slot.
+        let shift = 64 - self.slots.len().trailing_zeros();
+        let mut i = (node.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> shift) as usize;
+        loop {
+            let slot = self.slots[i];
+            if slot.is_nil() {
+                self.slots[i] = node;
+                return true;
+            }
+            if slot == node {
+                return false;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
 /// Go `orderedSet.Add` for a small symbol set kept as a list. Lookups scan the
 /// list while it is short; from `ORDERED_SYMBOL_SET_SCAN` symbols on, `index`
 /// holds every member and answers them instead.
@@ -2400,5 +2460,47 @@ type I = A & M;
             )
         );
         assert!(got.0.len() >= 4);
+    }
+
+    /// `DeclarationSet::add` gives the list of Go `core.AppendIfUnique`
+    /// (a scan per add), before and after the table takes over, for nodes
+    /// of several files.
+    #[test]
+    fn declaration_set_keeps_the_append_if_unique_list() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut cases: Vec<Vec<Node>> = Vec::new();
+        for (adds, distinct) in [
+            (10, 4),
+            (16, 16),
+            (40, 16),
+            (17, 17),
+            (700, 300),
+            (2000, 2000),
+        ] {
+            let nodes = (0..adds)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    let k = (seed >> 33) % distinct;
+                    Node(((k % 3 + 1) << 32) | (k * 7 + 1))
+                })
+                .collect();
+            cases.push(nodes);
+        }
+        // Every node distinct: the table is filled to its bound.
+        cases.push((1..=64).map(|k| Node((1 << 32) | k)).collect());
+        for nodes in cases {
+            let mut want: Vec<Node> = Vec::new();
+            for &node in &nodes {
+                if !want.contains(&node) {
+                    want.push(node);
+                }
+            }
+            let mut set = DeclarationSet::default();
+            let mut got: SmallVec<[Node; 4]> = SmallVec::new();
+            for &node in &nodes {
+                set.add(&mut got, node, nodes.len());
+            }
+            assert_eq!(got.as_slice(), want.as_slice());
+        }
     }
 }
