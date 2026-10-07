@@ -13,8 +13,9 @@ It [cost over $420,000](#how-did-this-go) in tokens to do it, but you could prob
 
 ## Warnings
 
-**This is an early release.** It is not yet a full replacement for `tsc` in every project. See
-[Known problems](#known-problems).
+**This is an early release.** It has 100% compatibility in every real world project we have
+tested. It should work as a drop in
+replacement for the vast majority of apps. See [Known problems](#known-problems).
 
 Also worth mentioning: I've never read a line of this code.
 
