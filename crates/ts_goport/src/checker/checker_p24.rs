@@ -2261,50 +2261,63 @@ mod tests {
     use super::*;
     use crate::checker::utilities_p1::union_sort_tests::with_alias_types;
 
-    /// The example of `some_property_reduces_to_never`. In `A<string> & T`,
-    /// where `T extends A<string> | A<number>`, the `m` of `A<string>` is a
-    /// public method, and the `m` of `T` is the union property of
-    /// `A<string> | A<number>`: a property with the same value declaration
+    /// The example of `some_property_reduces_to_never`. In
+    /// `A<string> & T & { kind: "b" }`, where
+    /// `T extends A<string> | A<number>`, the first `m` is the public method
+    /// of `A<string>`. The `m` of `T` comes next: the union property of
+    /// `A<string> | A<number>`, a property with the same value declaration
     /// (Go `createUnionOrIntersectionProperty`, checker.go:21821 and
-    /// :21988). `A<string> & (A<string> | B)` is a union: Go distributes an
-    /// intersection over a union (checker.go:26508).
+    /// :21988). So it is skipped, and `m` stays with the public methods:
+    /// `kind` (`"a" & "a" & "b"` is never, a discriminant, Go
+    /// `isDiscriminantWithNeverType`, checker.go:22273) is tested first,
+    /// though `m` is seen first, and the test returns there. The property
+    /// cache of the intersection then has no `m`. With no skip, `m` would
+    /// be tested first. Go keeps the order of an intersection
+    /// (`addTypeToIntersection`, checker.go:26723), and distributes an
+    /// intersection over a union (checker.go:26508), so
+    /// `A<string> & (A<string> | B)` is a union.
     #[test]
     fn a_skipped_property_can_be_a_union_property() {
         const SOURCE: &str = r#"
-interface A<X> { m(): X }
+interface A<X> { m(): X; kind: "a" }
 interface B { m: number }
 type D = A<string> & (A<string> | B);
-type I<T extends A<string> | A<number>> = A<string> & T;
+type I<T extends A<string> | A<number>> = A<string> & T & { kind: "b" };
 "#;
         let got = with_alias_types(SOURCE, |c, types| {
             let (d, i) = (types[0], types[1]);
-            let props: Vec<SymbolId> = c
-                .ty(i)
-                .types()
-                .to_vec()
-                .into_iter()
-                .map(|u| {
+            let constituents = c.ty(i).types().to_vec();
+            let props: Vec<SymbolId> = constituents[..2]
+                .iter()
+                .map(|&u| {
                     let props = c.get_properties_of_type(u);
                     props
                         .iter()
                         .copied()
                         .find(|&p| c.sym(p).name == "m")
-                        .expect("each constituent has m")
+                        .expect("A<string> and T have m")
                 })
                 .collect();
-            let mut public_methods: Vec<bool> =
-                props.iter().map(|&p| c.is_public_method(p)).collect();
-            public_methods.sort();
+            let public_methods: Vec<bool> = props.iter().map(|&p| c.is_public_method(p)).collect();
+            let reduces = c.some_property_reduces_to_never(i);
+            let cache = c
+                .ty(i)
+                .as_union_or_intersection_type()
+                .property_cache_without_function_property_augment;
             (
                 c.ty(d).flags.intersects(TypeFlags::UNION),
                 c.ty(i).flags.intersects(TypeFlags::INTERSECTION),
-                props.len(),
+                constituents.len(),
                 c.sym(props[0]).value_declaration.is_some()
                     && c.sym(props[0]).value_declaration == c.sym(props[1]).value_declaration,
                 public_methods,
+                reduces,
+                ["kind", "m"].map(|name| c.symbols.get(cache, name).is_some()),
             )
         });
-        // One public method and one union property, in either order.
-        assert_eq!(got, (true, true, 2, true, vec![false, true]));
+        assert_eq!(
+            got,
+            (true, true, 3, true, vec![true, false], true, [true, false])
+        );
     }
 }
