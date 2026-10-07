@@ -1778,6 +1778,22 @@ impl Checker {
         source: TypeId,
         target: TypeId,
     ) {
+        // Effect-TS/tsgo patch 004: collect the relation error for Effect diagnostics.
+        if self.compiler_options.effect.is_some() {
+            let error_node = r.borrow().error_node;
+            if error_node.is_some() {
+                let sf = get_source_file_of_node(error_node);
+                if sf.is_some() {
+                    self.effect_relation_errors.entry(sf).or_default().push(
+                        crate::effect::RelationError {
+                            source,
+                            target,
+                            error_node,
+                        },
+                    );
+                }
+            }
+        }
         let (source_type, target_type) = self.get_type_names_for_error_display(source, target);
         let mut generalized_source = source;
         let mut generalized_source_type = source_type.clone();

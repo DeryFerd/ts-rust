@@ -463,10 +463,12 @@ pub fn parse_config(
                 {
                     result.compile_on_save = *compile_on_save;
                 }
-                merge_compiler_options(
+                merge_compiler_options_with_paths(
                     &mut result.options,
                     extended_config.options.as_ref(),
                     raw_as_map(extends_raw),
+                    extended_config_path,
+                    &base_path,
                 );
             }
         }
@@ -514,10 +516,12 @@ pub fn parse_config(
             }
         }
         let own_options = own_config.options.take();
-        merge_compiler_options(
+        merge_compiler_options_with_paths(
             &mut result.options,
             own_options.as_ref(),
             raw_as_map(&own_config.raw),
+            config_file_name,
+            &base_path,
         );
         own_config.options = Some(result.options);
     }
@@ -714,7 +718,13 @@ pub fn parse_json_config_file_content_worker(
         extended_config_cache,
     );
     if let Some(options) = parsed_config.options.as_mut() {
-        merge_compiler_options(options, existing_options, existing_options_raw);
+        merge_compiler_options_with_paths(
+            options,
+            existing_options,
+            existing_options_raw,
+            config_file_name,
+            base_path,
+        );
     }
     handle_option_config_dir_template_substitution(
         parsed_config.options.as_mut(),
@@ -1053,6 +1063,11 @@ pub fn parse_json_config_file_content_worker(
             .iter()
             .flat_map(|mapper| mapper.definition.extensions.iter().cloned())
             .collect();
+    }
+
+    // Effect-TS/tsgo patch 030: validate the final Effect plugin options.
+    if let Some(options) = parsed_config.options.as_ref() {
+        errors.extend(crate::effect::configcheck::validate(options, tsconfig_node));
     }
 
     // Go: getFileNames(basePathForFileNames)

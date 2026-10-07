@@ -156,9 +156,15 @@ pub fn emit_and_report_statistics(input: &EmitInput) -> (CompileAndEmitResult, O
         statistics = Some(program_statistics);
     }
 
-    if result.emit_result.emit_skipped && !result.diagnostics.is_empty() {
+    // Effect-TS/tsgo patch 009: Effect diagnostics that the plugin options
+    // ignore for the exit code are still reported but do not count here.
+    let diagnostics_for_exit_code = crate::effect::filter_diagnostics_for_exit_code(
+        input.config_options().effect.as_deref(),
+        &result.diagnostics,
+    );
+    if result.emit_result.emit_skipped && !diagnostics_for_exit_code.is_empty() {
         result.status = ExitStatus::DiagnosticsPresentOutputsSkipped;
-    } else if !result.diagnostics.is_empty() {
+    } else if !diagnostics_for_exit_code.is_empty() {
         result.status = ExitStatus::DiagnosticsPresentOutputsGenerated;
     }
     (result, statistics)

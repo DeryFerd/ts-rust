@@ -5,17 +5,32 @@ A Rust port of the TypeScript 7 compiler (`tsc`).
 It is a direct port of Microsoft's native TypeScript compiler, which is written in Go. On the
 projects we test, it gives the same diagnostics and output as that compiler, and it is faster.
 
-This is a preview. Report problems at https://github.com/pingdotgg/ts-rust/issues.
+This is an early release. Report problems at https://github.com/pingdotgg/ts-rust/issues.
 
 ## Use
 
 ```sh
-npm install -D tsc-rs@next
+npm install -D tsc-rs
 npx tsc-rs -p tsconfig.json
 ```
 
 `tsc-rs` takes the same options as `tsc`. `tsc-rs --version` prints the TypeScript version that it
 ports (7.1.0-dev), not the npm version.
+
+## Effect diagnostics
+
+`tsc-rs` has the [Effect](https://effect.website) language service diagnostics built in (codes
+377xxx), so an Effect project needs no second compiler. They come from the same check as the
+TypeScript diagnostics, and the language server shows them too. They run only when the tsconfig has
+the plugin, as with `@effect/language-service`:
+
+```json
+{ "compilerOptions": { "plugins": [{ "name": "@effect/language-service" }] } }
+```
+
+The rules, options and `@effect-diagnostics` comments are a port of
+[Effect-TS/tsgo](https://github.com/Effect-TS/tsgo) 0.46.1. The editor features of the language
+service (quick fixes, refactors, hover, completions) are not ported.
 
 ## VS Code
 
