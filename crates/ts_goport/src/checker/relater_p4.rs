@@ -173,17 +173,24 @@ impl Checker {
     // `compare_types` reads do not change after a type is made, so Go's
     // repeat makes the same comparisons with the same results, and the one
     // effect of a comparison (a lazy symbol id) came with the first call.
+    // A long first call searches on entries (`contains_types_by_entries`).
     pub fn is_type_subset_of_union(&mut self, source: TypeId, target: TypeId) -> bool {
         if self.ty(source).flags.intersects(TypeFlags::UNION) {
             let n = self.ty(source).types().len();
             let m = self.ty(target).types().len();
             // About the number of comparisons (n searches of log2(m) steps).
-            let keep = n * (usize::BITS - m.leading_zeros()) as usize >= UNION_SUBSET_MEMO_MIN;
+            let work = n * (usize::BITS - m.leading_zeros()) as usize;
+            let keep = work >= UNION_SUBSET_MEMO_MIN;
             if keep && let Some(&answer) = self.union_subset_answers.get(&(source, target)) {
                 return answer;
             }
             let (sources, targets) = (self.ty(source).types(), self.ty(target).types());
-            let answer = sources.iter().all(|&t| self.contains_type(targets, t));
+            // The entries cost about one comparison per type.
+            let answer = if work >= 4 * (n + m) {
+                self.contains_types_by_entries(targets, sources)
+            } else {
+                sources.iter().all(|&t| self.contains_type(targets, t))
+            };
             if keep {
                 self.union_subset_answers.insert((source, target), answer);
             }
