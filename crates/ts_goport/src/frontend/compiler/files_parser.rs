@@ -2766,6 +2766,11 @@ impl Drop for RunningJob<'_> {
 #[cfg(test)]
 pub(crate) static PANIC_IN_JOB: Mutex<Option<String>> = Mutex::new(None);
 
+/// The worker transforms that loads took (`take_prefetched_mapped`), for
+/// the tests.
+#[cfg(test)]
+pub(crate) static MAPPED_TAKEN: AtomicUsize = AtomicUsize::new(0);
+
 /// A parse worker: parses queued files, newest first (the loader's queue
 /// is a stack too), until the queue closes. After each parse it queues the
 /// files that the parse references. The first free worker after the root
@@ -3821,6 +3826,8 @@ pub(crate) fn take_prefetched_mapped(
         shared.count(|c| c.taken += 1);
         Some(adopt_detached_parse(parse, &want))
     });
+    #[cfg(test)]
+    MAPPED_TAKEN.fetch_add(1, AtomicOrdering::Relaxed);
     Some(PrefetchedTransform { result, parse })
 }
 
