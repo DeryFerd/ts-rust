@@ -93,9 +93,16 @@ pub struct WatchSource {
 /// the detection kind, and with `auto` only, whether `jsx` is react-jsx or
 /// react-jsxdev and whether the module resolution is in Node16..NodeNext,
 /// which reads the package.json `type` (`loadSourceFileMetaData`,
-/// fileloader.go:384). `module` is not one: once the `type` is known,
-/// `GetImpliedNodeFormatForEmitWorker` (utilities.go:2622) gives ESNext to
-/// the same files with any module kind. Two configs with the same inputs
+/// fileloader.go:384). `module` has an effect only through the two
+/// default kinds here: with no `moduleDetection`, a module kind in
+/// Node16..NodeNext gives `force` (`GetEmitModuleDetectionKind`,
+/// compileroptions.go:243), and with no `moduleResolution` (or classic or
+/// node10) the module kind picks the resolution kind
+/// (`GetModuleResolutionKind`, compileroptions.go:227). The module kind
+/// that `isFileForcedToBeModuleByFormat` passes on is not an input: once
+/// the `type` is known, `GetImpliedNodeFormatForEmitWorker`
+/// (utilities.go:2622) gives ESNext to the same files with any module
+/// kind. Two configs with the same inputs
 /// give each file the same module indicator options. See
 /// `BuildHost::drop_kept_parses_whose_module_indicator_options_change`.
 #[derive(Clone, Copy, PartialEq, Eq)]
