@@ -460,6 +460,9 @@ fn parse_compiler_options_worker(
         "noResolve" => all_options.no_resolve = parse_tristate(value),
         "paths" => all_options.paths = parse_string_map(value),
         "plugins" => {
+            // Effect-TS/tsgo patch 013: parse @effect/language-service plugin configuration.
+            all_options.effect =
+                crate::effect::etscore::parse_from_plugins(value).map(std::sync::Arc::new);
             // Native TypeScript does not load plugins; retain them only so tools can report the incompatibility.
             // PORT: Go `core.Map` keeps a nil `[]any` (`NilList`) nil.
             if let CompilerOptionsValue::NilList = value {
@@ -664,6 +667,30 @@ pub fn parse_type_acquisition(
 
 // Go: tsoptions/parsinghelpers.go:626 ParseBuildOptions
 // PORT: ported in execute/build/command_line.rs.
+
+/// Effect-TS/tsgo patch 013 `mergeCompilerOptions` with the source config
+/// path and base path: the standard merge, then the Effect plugin options
+/// merge (`effect::configraw`). The standard merge leaves `effect` alone.
+pub fn merge_compiler_options_with_paths<'a>(
+    target_options: &'a mut CompilerOptions,
+    source_options: Option<&CompilerOptions>,
+    raw_source: Option<&IndexMap<String, CompilerOptionsValue>>,
+    source_config_path: &str,
+    base_path: &str,
+) -> &'a mut CompilerOptions {
+    let Some(source) = source_options else {
+        return target_options;
+    };
+    merge_compiler_options(target_options, Some(source), raw_source);
+    crate::effect::configraw::merge_effect_compiler_options(
+        target_options,
+        source,
+        raw_source,
+        source_config_path,
+        base_path,
+    );
+    target_options
+}
 
 // Go: tsoptions/parsinghelpers.go:658 mergeCompilerOptions
 // mergeCompilerOptions merges the source compiler options into the target compiler options

@@ -34,6 +34,8 @@ pub fn snapshot_to_build_info(
     let build_info = BuildInfo {
         version: version().to_string(),
         content_mapper_identities,
+        // Effect-TS/tsgo patch 028.
+        effect: snapshot.options.effect.as_ref().map(|e| e.to_value()),
         ..BuildInfo::default()
     };
     let mut to = ToBuildInfo {
