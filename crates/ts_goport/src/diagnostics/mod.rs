@@ -3,10 +3,12 @@
 //! `tools/ts_diagnostics_codegen`.
 
 mod catalog;
+mod effect_catalog;
 
 use std::{error::Error, fmt};
 
 pub use catalog::CATALOG;
+pub use effect_catalog::EFFECT_CATALOG;
 
 /// Go `diagnostics.Category`, an `int32`. The four named values are
 /// TypeScript's diagnostic severity categories. A bad `.tsbuildinfo` can
@@ -341,17 +343,29 @@ impl Error for FormatError {}
 /// Looks up a diagnostic message by its stable TypeScript code.
 #[must_use]
 pub fn message_by_code(code: u32) -> Option<&'static Message> {
-    CATALOG
+    let table = if code >= EFFECT_CODE_START {
+        EFFECT_CATALOG
+    } else {
+        CATALOG
+    };
+    table
         .binary_search_by_key(&code, |message| message.code())
         .ok()
-        .map(|index| &CATALOG[index])
+        .map(|index| &table[index])
 }
+
+/// The first Effect diagnostic code. Effect messages (377000 to 377999) are
+/// in `EFFECT_CATALOG`, not in the generated TypeScript catalog.
+pub const EFFECT_CODE_START: u32 = 377_000;
 
 /// Looks up a diagnostic message by its generated localization key.
 #[must_use]
 pub fn message_by_key(key: &str) -> Option<&'static Message> {
     #[cfg(not(target_family = "wasm"))]
-    return CATALOG.iter().find(|message| message.key() == key);
+    return CATALOG
+        .iter()
+        .chain(EFFECT_CATALOG)
+        .find(|message| message.key() == key);
     // wasm makes keys on demand, so it finds the message by the code that
     // ends every key.
     #[cfg(target_family = "wasm")]

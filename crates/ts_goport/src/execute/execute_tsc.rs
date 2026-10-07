@@ -186,6 +186,8 @@ pub fn command_line(
     command_line_args: &[String],
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
+    // Effect-TS/tsgo patch 009: Effect rules know they run under tsc.
+    let _effect_cli_mode = crate::effect::etscore::enter_command_line_mode();
     if let Some(first) = command_line_args.first() {
         match first.to_lowercase().as_str() {
             "-b" | "--b" | "-build" | "--build" => {

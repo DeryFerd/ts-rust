@@ -239,6 +239,8 @@ impl Checker {
                     true,
                 )
             });
+            // Effect-TS/tsgo patch 002: clear any stale relation errors before type checking.
+            self.effect_relation_errors.remove(&source_file);
             // Grammar checking
             self.check_grammar_source_file(source_file);
             self.renamed_binding_elements_in_types = Vec::new();
@@ -256,6 +258,9 @@ impl Checker {
             self.produce_deferred_diagnostics();
             self.reported_unreachable_nodes.clear();
             self.source_file_links.get(source_file).type_checked = true;
+
+            // Effect-TS/tsgo patch 002: run Effect diagnostics after type checking.
+            crate::effect::after_check_source_file(ctx, self, source_file);
         }
         if check_unused && !self.source_file_links.get(source_file).unused_checked {
             // The unused identifiers check relies on a full type check having first been performed

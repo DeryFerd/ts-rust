@@ -4574,6 +4574,11 @@ fn get_diagnostics_with_preceding_directives(
             }
             line -= 1;
         }
+        // Effect-TS/tsgo patch 006: never suppress Effect diagnostics (377xxx)
+        // with @ts-expect-error/@ts-ignore. Effect has its own directives.
+        if ignore_diagnostic && crate::effect::is_effect_code(diagnostic.code) {
+            ignore_diagnostic = false;
+        }
         if !ignore_diagnostic {
             filtered.push(diagnostic);
         }
@@ -4789,6 +4794,14 @@ pub fn get_diagnostics_of_any_program(
                 );
             }
         }
+    }
+    // Effect-TS/tsgo patch 009: Effect diagnostics ignored for the exit code
+    // do not block emit under noEmitOnError.
+    if skip_no_emit_check_for_dts_diagnostics {
+        all_diagnostics = crate::effect::filter_diagnostics_for_exit_code(
+            options.effect.as_deref(),
+            &all_diagnostics,
+        );
     }
     all_diagnostics
 }
