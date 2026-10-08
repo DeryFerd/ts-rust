@@ -2,6 +2,7 @@ mod build_info_corrupt;
 mod build_prefetch_rereads;
 mod checker_common_source_directory;
 mod contentmapper_watch;
+mod effect_build_info;
 mod explain_files_cache;
 mod file_delete;
 mod flag_bytes;
