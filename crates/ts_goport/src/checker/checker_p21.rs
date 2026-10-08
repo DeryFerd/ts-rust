@@ -523,11 +523,11 @@ impl Checker {
             // looks the name up in the function type and in Object
             // (checker.go:19259-19274, getPropertyOfObjectType at :21740).
             // When those types are resolved, each lookup is one map read,
-            // so a name in none of the 4 tables of `augment_filter` gives
-            // nil and changes no state. The filter returns that nil with no
-            // lookups. A text key takes the lookups.
+            // so a name that the filters of their member names reject
+            // gives nil and changes no state. The filters return that nil
+            // with no lookups. A text key takes the lookups.
             if let TableKey::Name(key) = name {
-                if !self.may_be_augment_member(key) {
+                if self.augment_lookups_miss(t, key) {
                     return SymbolId::NIL;
                 }
             }
@@ -578,76 +578,131 @@ impl Checker {
         SymbolId::NIL
     }
 
-    /// False when `name` is a member of none of the 4 types of the
-    /// `get_property_of_type_ex` fallback (Function, CallableFunction,
-    /// NewableFunction, Object). True until all 4 are resolved: asking must
-    /// not resolve them earlier than Go does. No Go counterpart.
+    /// True when Go's lookups of `name` in the function type of `t` and in
+    /// Object give nil, by the filters of their member names. False when a
+    /// filter keeps the name, and while a type that the lookups read is
+    /// not resolved: the lookups then run and resolve it, as in Go. No Go
+    /// counterpart.
     #[inline]
-    fn may_be_augment_member(&mut self, name: &Name) -> bool {
-        let filter = match self.augment_filter {
-            Some(filter) => filter,
-            None => match self.build_augment_filter() {
-                Some(filter) => filter,
-                None => return true,
-            },
-        };
-        let (a, b) = augment_filter_bits(name);
-        filter[a >> 6] & (1 << (a & 63)) != 0 && filter[b >> 6] & (1 << (b & 63)) != 0
+    fn augment_lookups_miss(&mut self, t: TypeId, name: &Name) -> bool {
+        let bits = augment_filter_bits(name);
+        match self.augment_filters.all {
+            Some(all) => !augment_filter_has(&all, bits),
+            None => self.augment_lookups_miss_partial(t, bits),
+        }
     }
 
-    /// Builds `augment_filter` from the members tables of the 4 types, or
-    /// gives None while one of them is not resolved. A type that is not an
-    /// object type has no table: Go `getPropertyOfObjectType` gives nil for
-    /// it.
-    #[cold]
+    /// `augment_lookups_miss` while not all 4 filters are built: tests the
+    /// filters of the two types that Go reads for `t`.
     #[inline(never)]
-    fn build_augment_filter(&mut self) -> Option<[u64; 4]> {
-        let mut filter = [0u64; 4];
-        for g in [
+    fn augment_lookups_miss_partial(&mut self, t: TypeId, bits: (usize, usize)) -> bool {
+        // The function type of checker.go:19262-19268.
+        let resolved = self.ty(t).as_structured_type();
+        let function_slot = if t == self.any_function_type {
+            Some(AUGMENT_FUNCTION)
+        } else if !resolved.call_signatures().is_empty() {
+            Some(AUGMENT_CALLABLE)
+        } else if !resolved.construct_signatures().is_empty() {
+            Some(AUGMENT_NEWABLE)
+        } else {
+            None
+        };
+        function_slot.is_none_or(|slot| self.augment_filter_rejects(slot, bits))
+            && self.augment_filter_rejects(AUGMENT_OBJECT, bits)
+    }
+
+    /// True when the filter of `slot` rejects the name with `bits`. Builds
+    /// the filter first when its type has members that `augment_members_set`
+    /// did not see: they were set before the checker set the global, or
+    /// the type has no table. False while the type is nil or not resolved.
+    #[inline]
+    fn augment_filter_rejects(&mut self, slot: usize, bits: (usize, usize)) -> bool {
+        let g = self.augment_globals()[slot];
+        if g.is_nil() {
+            return false;
+        }
+        if self.augment_filters.of[slot] != g {
+            let ty = self.ty(g);
+            if ty.flags.intersects(TypeFlags::OBJECT)
+                && !ty.object_flags.intersects(ObjectFlags::MEMBERS_RESOLVED)
+            {
+                return false;
+            }
+            self.build_augment_filter(slot, g);
+        }
+        !augment_filter_has(&self.augment_filters.bits[slot], bits)
+    }
+
+    /// The types of the slots of `augment_filters`, in slot order.
+    fn augment_globals(&self) -> [TypeId; 4] {
+        [
             self.global_function_type,
             self.global_callable_function_type,
             self.global_newable_function_type,
             self.global_object_type,
-        ] {
-            if g.is_nil() {
-                return None;
-            }
-            if !self.ty(g).flags.intersects(TypeFlags::OBJECT) {
-                continue;
-            }
-            if !self
-                .ty(g)
-                .object_flags
-                .intersects(ObjectFlags::MEMBERS_RESOLVED)
-            {
-                return None;
-            }
-            let members = self.ty(g).as_structured_type().members;
-            for (name, _) in self.symbols.entries(members) {
-                let (a, b) = augment_filter_bits(&name);
-                filter[a >> 6] |= 1 << (a & 63);
-                filter[b >> 6] |= 1 << (b & 63);
-            }
-        }
-        self.augment_filter = Some(filter);
-        Some(filter)
+        ]
     }
 
-    /// Drops `augment_filter` when `t` is one of its 4 types. Call it where
-    /// the members of `t` change: the `get_base_types` reset (the members
-    /// resolve again) and each `set_structured_type_members` of
-    /// `resolve_object_type_members`. A nested resolution of `t` (a late
-    /// bound name of `t` that needs `t`) sets members that the outer one
-    /// then replaces.
+    /// Builds the filters of `t` from the members that
+    /// `resolve_object_type_members` just set, when `t` is one of the 4
+    /// types. A nested resolution of `t` (a late bound name of `t` that
+    /// needs `t`) sets members that the outer one then replaces, so each
+    /// set builds again.
+    #[inline]
+    fn augment_members_set(&mut self, t: TypeId) {
+        let globals = self.augment_globals();
+        if globals.contains(&t) {
+            for (slot, g) in globals.into_iter().enumerate() {
+                if g == t {
+                    self.build_augment_filter(slot, t);
+                }
+            }
+        }
+    }
+
+    /// Builds the filter of `g` in `slot` from its members table, and the
+    /// union when all 4 are built. `g` is resolved, or not an object type:
+    /// then it has no table (Go `getPropertyOfObjectType` gives nil for
+    /// it), and its filter is empty.
+    #[cold]
+    #[inline(never)]
+    fn build_augment_filter(&mut self, slot: usize, g: TypeId) {
+        let mut bits = [0u64; 4];
+        let ty = self.ty(g);
+        if ty.flags.intersects(TypeFlags::OBJECT) {
+            for (name, _) in self.symbols.iter_names(ty.as_structured_type().members) {
+                let (a, b) = augment_filter_bits(&name);
+                bits[a >> 6] |= 1 << (a & 63);
+                bits[b >> 6] |= 1 << (b & 63);
+            }
+        }
+        let globals = self.augment_globals();
+        let filters = &mut self.augment_filters;
+        filters.of[slot] = g;
+        filters.bits[slot] = bits;
+        filters.all = None;
+        if filters.of == globals {
+            let mut all = [0u64; 4];
+            for slot_bits in &filters.bits {
+                for (word, slot_word) in all.iter_mut().zip(slot_bits) {
+                    *word |= slot_word;
+                }
+            }
+            filters.all = Some(all);
+        }
+    }
+
+    /// Drops the filters of `t` and the union at the `get_base_types`
+    /// reset: the members of `t` resolve again, and
+    /// `augment_members_set` builds them then.
     #[inline]
     fn drop_augment_filter_of(&mut self, t: TypeId) {
-        if self.augment_filter.is_some()
-            && (t == self.global_function_type
-                || t == self.global_callable_function_type
-                || t == self.global_newable_function_type
-                || t == self.global_object_type)
-        {
-            self.augment_filter = None;
+        let filters = &mut self.augment_filters;
+        for of in &mut filters.of {
+            if *of == t {
+                *of = TypeId::NIL;
+                filters.all = None;
+            }
         }
     }
 
@@ -1045,7 +1100,7 @@ impl Checker {
                 call_signature_count,
                 index_infos,
             );
-            self.drop_augment_filter_of(t);
+            self.augment_members_set(t);
             return;
         }
         let call_signature_count = call_signatures.len();
@@ -1057,7 +1112,7 @@ impl Checker {
             call_signature_count,
             index_infos,
         );
-        self.drop_augment_filter_of(t);
+        self.augment_members_set(t);
     }
 
     /// Go `instantiateList` on a shared list. When no element changes, the
@@ -1843,12 +1898,39 @@ impl Checker {
     }
 }
 
-/// The two bits of `name` in `Checker::augment_filter`, from its id. Equal
-/// texts have one id.
+/// PERF (propfilt1): 256-bit filters of the member names of the 4 types
+/// that `get_property_of_type_ex` falls back to, 2 bits for each name
+/// (`augment_filter_bits`). No Go counterpart.
+#[derive(Clone, Copy, Default)]
+pub struct AugmentFilters {
+    /// For each slot (`AUGMENT_FUNCTION` and the others), the type that
+    /// `bits` holds the names of. Nil while the slot has no filter.
+    pub of: [TypeId; 4],
+    pub bits: [[u64; 4]; 4],
+    /// The union of the 4 filters, once all 4 are built.
+    pub all: Option<[u64; 4]>,
+}
+
+/// The slots of `Checker::augment_filters`: Go `globalFunctionType`,
+/// `globalCallableFunctionType`, `globalNewableFunctionType` and
+/// `globalObjectType`.
+pub const AUGMENT_FUNCTION: usize = 0;
+pub const AUGMENT_CALLABLE: usize = 1;
+pub const AUGMENT_NEWABLE: usize = 2;
+pub const AUGMENT_OBJECT: usize = 3;
+
+/// The two bits of `name` in an `AugmentFilters` filter, from its id.
+/// Equal texts have one id.
 #[inline]
 fn augment_filter_bits(name: &Name) -> (usize, usize) {
     let mixed = name.id().wrapping_mul(0x9E37_79B9);
     ((mixed >> 24) as usize, ((mixed >> 16) & 255) as usize)
+}
+
+/// False when `filter` rejects the name with `bits`.
+#[inline]
+fn augment_filter_has(filter: &[u64; 4], (a, b): (usize, usize)) -> bool {
+    filter[a >> 6] & (1 << (a & 63)) != 0 && filter[b >> 6] & (1 << (b & 63)) != 0
 }
 
 #[cfg(test)]
@@ -2000,25 +2082,27 @@ type T9 = string;
         names
     }
 
+    /// True when each slot of `augment_filters` holds the filter of its
+    /// type, and the union is built.
+    fn all_filters_built(c: &Checker) -> bool {
+        c.augment_filters.of == c.augment_globals() && c.augment_filters.all.is_some()
+    }
+
     /// Resolves the 4 filter types by lookups that Go makes too, then
-    /// misses once, so the filter is built.
+    /// misses once on each kind of type, so the 4 filters are built.
     fn build_filter(c: &mut Checker, types: &[TypeId]) {
         let (plain, callable, newable) = (types[0], types[1], types[2]);
-        c.get_property_of_type(callable, "toString");
-        c.get_property_of_type(newable, "toString");
-        c.get_property_of_type(c.any_function_type, "toString");
-        c.get_property_of_type(plain, "toString");
         let miss = Name::from("noSuchMember0");
-        assert!(
-            c.get_property_of_type_ex(plain, &miss, false, false)
-                .is_nil()
-        );
-        assert!(c.augment_filter.is_some(), "the filter is not built");
+        for t in [callable, newable, c.any_function_type, plain] {
+            c.get_property_of_type(t, "toString");
+            assert!(c.get_property_of_type_ex(t, &miss, false, false).is_nil());
+        }
+        assert!(all_filters_built(c), "the filters are not built");
     }
 
     /// Every name on every alias type (and on Go's any function type) gives
-    /// Go's symbol. Returns how many names the filter rejects, so a test
-    /// can check that it skipped lookups.
+    /// Go's symbol. Returns how many names the filters reject on a
+    /// callable, so a test can check that it skipped lookups.
     fn assert_lookups_match_go(c: &mut Checker, types: &[TypeId], extra: &[&str]) -> usize {
         build_filter(c, types);
         let names = names_to_try(c, extra);
@@ -2033,10 +2117,10 @@ type T9 = string;
                 assert_eq!(got, want, "{:?} on type {t:?}", name.as_str());
             }
         }
-        assert!(c.augment_filter.is_some(), "the filter was dropped");
+        assert!(all_filters_built(c), "a filter was dropped");
         names
             .iter()
-            .filter(|name| !c.may_be_augment_member(name))
+            .filter(|name| c.augment_lookups_miss(types[1], name))
             .count()
     }
 
@@ -2224,10 +2308,10 @@ ctor.f1; ctor.n1;
 
     /// When the members of Function are set again (the outer resolution
     /// of a nested one, here with a member added to the declared table),
-    /// the filter is dropped, and the next lookup builds it from the new
-    /// table. The `get_base_types` reset drops it too.
+    /// its filter is built again from the new table. The `get_base_types`
+    /// reset drops the filter of its type.
     #[test]
-    fn filter_is_dropped_when_members_change() {
+    fn filter_follows_members_changes() {
         let a = format!(
             r#"export {{}};
 declare class K {{ static s: number }}
@@ -2236,11 +2320,12 @@ declare class K {{ static s: number }}
         let (added_found, reset_dropped) = with_checked_a(&[("a.ts", a)], STRICT, |c, _, types| {
             build_filter(c, &types);
             let function = c.global_function_type;
-            // A name that the filter rejects (ids, and so bits, depend on
+            // A name that the filters reject (ids, and so bits, depend on
             // intern order).
+            let any_function = c.any_function_type;
             let added = (0..)
                 .map(|i| Name::from(format!("addedLater{i}")))
-                .find(|name| !c.may_be_augment_member(name))
+                .find(|name| c.augment_lookups_miss(any_function, name))
                 .unwrap();
             let table = c
                 .symbols
@@ -2254,8 +2339,8 @@ declare class K {{ static s: number }}
                 .without(ObjectFlags::MEMBERS_RESOLVED);
             c.ty_mut(function).object_flags = flags;
             c.resolve_structured_type_members(function);
-            assert!(c.augment_filter.is_none());
-            let any_function = c.any_function_type;
+            assert!(all_filters_built(c));
+            assert!(!c.augment_lookups_miss(any_function, &added));
             let added_found =
                 c.get_property_of_type_ex(any_function, &added, false, false) == symbol;
 
@@ -2268,7 +2353,8 @@ declare class K {{ static s: number }}
                 .as_interface_type_mut()
                 .resolved_base_types = SharedList::default();
             c.get_base_types(callable);
-            let reset_dropped = c.augment_filter.is_none()
+            let reset_dropped = c.augment_filters.of[AUGMENT_CALLABLE].is_nil()
+                && c.augment_filters.all.is_none()
                 && !c
                     .ty(callable)
                     .object_flags
@@ -2278,5 +2364,65 @@ declare class K {{ static s: number }}
         });
         assert!(added_found);
         assert!(reset_dropped);
+    }
+
+    /// While NewableFunction is not resolved, misses on a callable and on
+    /// a plain object use the filters of the resolved types, with no union,
+    /// and build nothing again. A miss on a newable makes Go's lookups,
+    /// which resolve NewableFunction and so build only its filter, and the
+    /// union.
+    #[test]
+    fn filter_of_each_type_is_built_once() {
+        let a = r#"export {};
+type T0 = { a: number };
+type T1 = () => void;
+type T2 = new () => {};
+"#;
+        with_checked_a(&[("a.ts", a.to_string())], STRICT, |c, _, types| {
+            let (plain, callable, newable) = (types[0], types[1], types[2]);
+            let newable_function = c.global_newable_function_type;
+            let resolved = |c: &Checker| {
+                c.ty(newable_function)
+                    .object_flags
+                    .intersects(ObjectFlags::MEMBERS_RESOLVED)
+            };
+            assert!(!resolved(c), "NewableFunction is resolved too early");
+            let miss = Name::from("noSuchMember0");
+            for t in [callable, plain] {
+                c.get_property_of_type(t, "toString");
+                assert!(c.get_property_of_type_ex(t, &miss, false, false).is_nil());
+            }
+            let of = c.augment_filters.of;
+            assert_eq!(of[AUGMENT_CALLABLE], c.global_callable_function_type);
+            assert_eq!(of[AUGMENT_OBJECT], c.global_object_type);
+            assert!(of[AUGMENT_NEWABLE].is_nil());
+            assert!(c.augment_filters.all.is_none());
+            // A new build would write the real bits over these.
+            for slot in [AUGMENT_CALLABLE, AUGMENT_OBJECT] {
+                c.augment_filters.bits[slot] = [!0; 4];
+            }
+            for i in 0..64 {
+                let miss = Name::from(format!("noSuchMember{i}"));
+                for t in [plain, callable] {
+                    assert!(c.get_property_of_type_ex(t, &miss, false, false).is_nil());
+                }
+            }
+            assert!(!resolved(c));
+            assert!(
+                c.get_property_of_type_ex(newable, &miss, false, false)
+                    .is_nil()
+            );
+            assert!(
+                resolved(c),
+                "the newable miss did not resolve NewableFunction"
+            );
+            assert!(all_filters_built(c));
+            for slot in [AUGMENT_CALLABLE, AUGMENT_OBJECT] {
+                assert_eq!(
+                    c.augment_filters.bits[slot], [!0; 4],
+                    "slot {slot} was built again"
+                );
+            }
+        });
     }
 }
