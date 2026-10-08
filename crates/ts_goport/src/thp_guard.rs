@@ -12,9 +12,7 @@
 //! longer (perf12: 2,600 compaction stalls in one effect emit). With THP
 //! off (`prctl(PR_SET_THP_DISABLE)`), the faults take 4 KiB pages and do
 //! not wait, even where jemalloc asked for huge pages. Which faults may
-//! compact depends on `enabled` and `defrag` (`start_step`): in `always`
-//! mode with `defrag` other than `always`, none of ours, so the guard keeps
-//! THP there (thpfault1: 0 compaction stalls in 250 runs on cup2).
+//! compact depends on `enabled` and `defrag` (`start_step`).
 //!
 //! The guard has two parts:
 //! - The start check turns THP off at once when less than the limit is free
@@ -316,28 +314,30 @@ enum Start {
     Watch,
 }
 
-/// The start decision, from the texts of the sysfs files `enabled` and
-/// `defrag` (the mode in brackets). A huge page fault of our memory can
-/// wait in direct compaction only:
-/// - with `enabled` `madvise` and `defrag` `always`, `madvise` or
-///   `defer+madvise`: jemalloc marks its data `MADV_HUGEPAGE` in this mode;
-/// - with `enabled` `always` and `defrag` `always`: then every fault can.
+/// The start decision. A huge page fault of `MADV_HUGEPAGE` memory can
+/// wait in direct compaction when `enabled` is `always` or `madvise` and
+/// `defrag` is `always`, `madvise` or `defer+madvise` (the texts of the
+/// sysfs files, with the mode in brackets). With `defer` or `never`, it
+/// takes a 4 KiB page when no 2 MiB block is free, so THP can stay on. When
+/// a fault can wait: `Off` when `free` (the bytes free in blocks of 2 MiB
+/// or more) is less than `min_free`, else `Watch`.
 ///
-/// In `always` mode jemalloc marks nothing, so with `defrag` `madvise`,
-/// `defer+madvise`, `defer` or `never` a fault takes a free 2 MiB block or
-/// at once a 4 KiB page (`GFP_TRANSHUGE_LIGHT`), as with `defer` and
-/// `never` in `madvise` mode. There THP can stay on (`Keep`): turning it
-/// off would only take huge pages away. When a fault can wait: `Off` when
-/// `free` (the bytes free in blocks of 2 MiB or more) is less than
-/// `min_free`, else `Watch`.
+/// In `always` mode jemalloc marks nothing, so with `defrag` `madvise` or
+/// `defer+madvise` no fault of ours waits either (thpfault1: 0 compaction
+/// stalls in 250 runs on cup2). `Keep` there was slower all the same
+/// (thpguard2, release builds, 2 builds a side, 2 runs): cup2 wall +2.8%
+/// (geomean of 7 inputs as found and fragmented, query core +6%), and on
+/// zbook query core, hono and zod took 5% to 25% more page faults. The
+/// cause is the start of the watcher, not its reads: with the watcher's
+/// first allocations (the argument list, its 32 KiB buffer, the thread) and
+/// a thread that only sleeps, the faults were within 5% of the watcher's.
+/// So `always` mode counts as `madvise`.
 fn start_step(enabled: &str, defrag: &str, free: u64, min_free: u64) -> Start {
-    let can_wait = matches!(
-        (selected_mode(enabled), selected_mode(defrag)),
-        (
-            Some("madvise"),
+    let can_wait = matches!(selected_mode(enabled), Some("always" | "madvise"))
+        && matches!(
+            selected_mode(defrag),
             Some("always" | "madvise" | "defer+madvise")
-        ) | (Some("always"), Some("always"))
-    );
+        );
     match (can_wait, free < min_free) {
         (false, _) => Start::Keep,
         (true, true) => Start::Off,
@@ -356,11 +356,12 @@ fn start_step(enabled: &str, defrag: &str, free: u64, min_free: u64) -> Start {
 /// worker is a second process start: 2.0 to 2.4 ms per run (tsgo --version
 /// 3.3 against 5.3 ms). Query core check (32 ms, 58 MiB of huge pages) paid
 /// for it in every memory state: +0.1 to +4.8 ms (up to +13%) with its
-/// watcher set to fire after 8 to 32 MiB of huge pages, +6% to +12% at 0.6
-/// to 1.8 GiB free. T3 Code server was 2% to 12% faster where its watcher
-/// fired, and hono, T3 Code shared and zod 5% to 9% faster with the watcher
-/// set to fire after 8 to 64 MiB. A worker from a free-memory limit above
-/// `min_free` makes small runs pay, so there is none.
+/// watcher set to fire after 8 to 32 MiB of huge pages, +5% to +12% at 0.4
+/// to 1.8 GiB free. T3 Code server was 4% to 13% faster where its watcher
+/// fired, hono and T3 Code shared 5% to 9% with the watcher set to fire
+/// after 8 to 32 MiB, and zod 8% to 9% after 32 to 64 MiB. A worker from a
+/// free-memory limit above `min_free` makes small runs pay, so there is
+/// none.
 fn huge_pages(step: Start, enabled: &str, free: u64, min_free: u64) -> bool {
     step != Start::Off && selected_mode(enabled) != Some("never") && free >= min_free
 }
@@ -504,14 +505,13 @@ Node 0, zone   Normal 616681 607866 455781 337376 229283 129647  50350  16747   
         assert_eq!(start_step("madvise", defrag, 0, limit), Start::Keep);
     }
 
-    /// Every `enabled` and `defrag` mode: a fault can wait for compaction
-    /// only with `madvise` and `always`, `madvise` or `defer+madvise`
-    /// (jemalloc marks its data `MADV_HUGEPAGE`), or with `always` and
-    /// `always`. Else no watcher and THP stays on, also below the limit:
-    /// with `always` and `madvise` (cup2) or `defer+madvise` (zbook) no
-    /// fault of ours waits (thpfault1: 0 compaction stalls on cup2).
+    /// Every `enabled` and `defrag` mode: `Off` below the limit and else
+    /// `Watch` with `always` or `madvise` and `always`, `madvise` or
+    /// `defer+madvise`. Else no watcher and THP stays on. `always` with
+    /// `madvise` (cup2) or `defer+madvise` (zbook) counts as `madvise`
+    /// (thpguard2: no watcher there was slower).
     #[test]
-    fn start_step_watches_only_where_a_fault_can_wait() {
+    fn start_step_watches_where_a_fault_can_wait() {
         let limit = DEFAULT_MIN_FREE_MIB * MIB;
         let enabled_texts = [
             ("always", "[always] madvise never\n"),
@@ -533,6 +533,8 @@ Node 0, zone   Normal 616681 607866 455781 337376 229283 129647  50350  16747   
             ("madvise", "defer+madvise"),
             ("madvise", "madvise"),
             ("always", "always"),
+            ("always", "defer+madvise"),
+            ("always", "madvise"),
         ];
         for (e, enabled) in enabled_texts {
             for (d, defrag) in defrag_texts {
@@ -569,7 +571,7 @@ Node 0, zone   Normal 616681 607866 455781 337376 229283 129647  50350  16747   
             assert!(huge_pages(Start::Watch, madvise, free, limit));
             assert!(huge_pages(Start::Keep, always, free, limit));
         }
-        // cup2 with the hog (thpfault1): 10 to 22 MiB free, THP kept.
+        // Kept below the limit (`defrag` `defer` or `never`): a worker.
         assert!(!huge_pages(Start::Keep, always, 20 * MIB, limit));
         assert!(!huge_pages(Start::Keep, always, limit - 1, limit));
         // A text that does not parse keeps THP on.
