@@ -1002,8 +1002,12 @@ mod intern {
 /// nothing and a single declaration is stored inline. Longer lists share one
 /// `Vec` between clones; the first write copies it, so each symbol still owns
 /// its own list, like a Go slice that is copied before an append. Program
-/// symbols keep longer lists in a leaked slice (`make_static`), with the same
+/// symbols keep longer lists in a leaked `Vec` (`make_static`), with the same
 /// copy on the first write.
+// PERF (memper1): every list is behind a thin pointer, so a `Declarations`
+// is 16 bytes and a `Symbol` 56 (a leaked `&'static [Node]` made both 8
+// bytes larger). A static list reads through its `Vec` header, as a shared
+// list reads through its `Arc`.
 #[derive(Clone, Default)]
 pub struct Declarations(DeclarationList);
 
@@ -1013,7 +1017,7 @@ enum DeclarationList {
     Empty,
     One(Node),
     Many(Arc<Vec<Node>>),
-    Static(&'static [Node]),
+    Static(&'static Vec<Node>),
 }
 
 impl Declarations {
@@ -1034,7 +1038,7 @@ impl Declarations {
         }
     }
 
-    /// Moves a `Many` list into a leaked slice. Call it only for symbols
+    /// Moves a `Many` list into a leaked `Vec`. Call it only for symbols
     /// that live until exit (program symbols, like the AST).
     // PERF: a clone of a `Static` list copies a pointer. A clone of a `Many`
     // list changes a reference count that the checker threads share
@@ -1042,7 +1046,7 @@ impl Declarations {
     fn make_static(&mut self) {
         if matches!(self.0, DeclarationList::Many(_)) {
             if let DeclarationList::Many(list) = std::mem::take(&mut self.0) {
-                self.0 = DeclarationList::Static(Arc::unwrap_or_clone(list).leak());
+                self.0 = DeclarationList::Static(Box::leak(Box::new(Arc::unwrap_or_clone(list))));
             }
         }
     }
@@ -1159,6 +1163,11 @@ pub struct Symbol {
     pub parent: SymbolId,
     pub export_symbol: SymbolId,
 }
+
+// PERF (memper1): a checker makes millions of symbols, in chunks of
+// `COW_CHUNK_LEN` (14 KiB at 56 bytes, a jemalloc size class).
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Symbol>() == 56);
 
 /// A growable array split into fixed-size chunks that clones share. Index
 /// `i` is value `i % COW_CHUNK_LEN` of chunk `i / COW_CHUNK_LEN`. The values
