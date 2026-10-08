@@ -1582,7 +1582,9 @@ mod node_at_position_cursor_tests {
     }
 
     /// After the cursor has passed a position, a smaller one still gets the
-    /// node of a root descent (loadcrit1 follow-up: Go has no cursor).
+    /// node of a root descent (loadcrit1 follow-up: Go has no cursor). The
+    /// positions go up, down and up again, so a fallback that moves
+    /// `last_position` down fails (the followups33 skeptic's mutant CURS).
     #[test]
     fn a_smaller_position_gets_the_node_of_a_root_descent() {
         let mut wide = String::from("declare const _default: {\n");
@@ -1594,7 +1596,7 @@ mod node_at_position_cursor_tests {
         let end = source_file_text(file).len() as i32;
         for include_js_doc in [false, true] {
             let mut cursor = NodeAtPositionCursor::default();
-            for position in (0..=end).chain((0..=end).rev()) {
+            for position in (0..=end).chain((0..=end).rev()).chain(0..=end) {
                 assert_eq!(
                     cursor.node_at(file, position, include_js_doc),
                     get_node_at_position(file, position, include_js_doc),
