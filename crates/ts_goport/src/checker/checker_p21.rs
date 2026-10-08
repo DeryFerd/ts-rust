@@ -2444,7 +2444,7 @@ type T2 = new () => {};
         });
     }
 
-    /// The source of `n` names `{prefix}0` to `{prefix}{n-1}` that a module
+    /// The source of 40 names `{prefix}0` to `{prefix}39` that a module
     /// augmentation adds to `iface`, and of an assignment of `value` to a
     /// type with each name, which needs the name on the apparent type of
     /// `value`.
@@ -2459,8 +2459,8 @@ type T2 = new () => {};
     }
 
     /// Checks `a.ts` of `files` with `options` and the commonjs module.
-    /// Gives the codes of `a.ts`, the types that the 4 slots hold, and
-    /// whether the union is built.
+    /// Gives the codes of `a.ts`, the types that the 4 slots hold, the 4
+    /// types, and whether the union is built.
     fn check_augmentation(
         files: &[(&str, String)],
         options: &str,
