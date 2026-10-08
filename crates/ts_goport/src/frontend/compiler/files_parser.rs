@@ -2775,9 +2775,10 @@ impl Drop for RunningJob<'_> {
 pub(crate) static PANIC_IN_JOB: Mutex<Option<String>> = Mutex::new(None);
 
 /// The worker transforms that loads took (`take_prefetched_mapped`), for
-/// the tests.
+/// the tests: the file name, and whether a worker parse of the virtual text
+/// came with the transform.
 #[cfg(test)]
-pub(crate) static MAPPED_TAKEN: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static MAPPED_TAKEN: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
 
 /// A parse worker: parses queued files, newest first (the loader's queue
 /// is a stack too), until the queue closes. After each parse it queues the
@@ -3837,7 +3838,7 @@ pub(crate) fn take_prefetched_mapped(
         Some(adopt_detached_parse(parse, &want))
     });
     #[cfg(test)]
-    MAPPED_TAKEN.fetch_add(1, AtomicOrdering::Relaxed);
+    lock(&MAPPED_TAKEN).push((opts.file_name.clone(), parse.is_some()));
     Some(PrefetchedTransform { result, parse })
 }
 

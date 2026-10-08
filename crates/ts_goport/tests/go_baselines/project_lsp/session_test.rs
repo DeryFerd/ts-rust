@@ -2007,13 +2007,28 @@ child_test! {
     }
 }
 
+/// Ends the test process unless the returned flag is set within 60 s, for
+/// a `wait_for_background_tasks` that would not return.
+fn exit_unless_returned_in_60_s() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let returned = std::sync::Arc::new(AtomicBool::new(false));
+    let watched = returned.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(60));
+        if !watched.load(Ordering::SeqCst) {
+            eprintln!("wait_for_background_tasks did not return in 60 s");
+            std::process::exit(101);
+        }
+    });
+    returned
+}
+
 child_test! {
     // PORT: no Go counterpart (lswarm1). While a message waits for the
     // dispatch thread, a warm attempt does not start and queues itself
     // again. `wait_for_background_tasks` then returns, where it would run
     // that attempt forever (the message cannot run while it waits). Once no
-    // message waits, it runs the warm. A watchdog ends the test if the wait
-    // does not return.
+    // message waits, it runs the warm.
     fn wait_for_background_tasks_returns_while_a_message_waits() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2025,17 +2040,7 @@ child_test! {
                 .warm_auto_import_preempt
                 .set_busy(Box::new(move || busy.load(Ordering::SeqCst)));
         }
-        let returned = Arc::new(AtomicBool::new(false));
-        {
-            let returned = returned.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(60));
-                if !returned.load(Ordering::SeqCst) {
-                    eprintln!("wait_for_background_tasks did not return in 60 s");
-                    std::process::exit(101);
-                }
-            });
-        }
+        let returned = exit_unless_returned_in_60_s();
         let before = session.snapshot();
         session.wait_for_background_tasks();
         returned.store(true, Ordering::SeqCst);
@@ -2046,6 +2051,32 @@ child_test! {
         session.wait_for_background_tasks();
         assert_eq!(reads.get(), 1);
         assert!(!Rc::ptr_eq(&session.snapshot(), &before), "the clone was not adopted");
+        session.close();
+    }
+}
+
+child_test! {
+    // PORT: no Go counterpart (lswarm1). A message that comes while
+    // `wait_for_background_tasks` runs the idle work stops the wait too, so
+    // the wait reads the busy check before each run, not only once. Here
+    // the first read sees no message and every later read sees one: the warm
+    // attempt does not start and queues itself again, and the wait returns.
+    fn wait_for_background_tasks_returns_when_a_message_comes_during_the_wait() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (session, _, reads) = session_with_pending_warm();
+        let busy_reads = Arc::new(AtomicUsize::new(0));
+        {
+            let busy_reads = busy_reads.clone();
+            session
+                .warm_auto_import_preempt
+                .set_busy(Box::new(move || busy_reads.fetch_add(1, Ordering::SeqCst) > 0));
+        }
+        let returned = exit_unless_returned_in_60_s();
+        session.wait_for_background_tasks();
+        returned.store(true, Ordering::SeqCst);
+        assert_eq!(reads.get(), 0, "the warm cloned while a message waited");
+        assert!(session.warm_auto_import_pending.borrow().is_some(), "the warm ended");
         session.close();
     }
 }

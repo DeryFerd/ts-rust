@@ -708,6 +708,160 @@ mod tests {
         );
     }
 
+    /// The JSON-RPC protocol with error answers that fail: the first one
+    /// panics (`panic_once`), or each one returns an error (`refuse`).
+    struct FaultyErrorAnswers {
+        inner: Box<dyn ipc::Protocol>,
+        panic_once: Arc<std::sync::atomic::AtomicBool>,
+        refuse: bool,
+    }
+
+    impl ipc::Protocol for FaultyErrorAnswers {
+        fn read_message(&mut self) -> Result<Message, GoError> {
+            self.inner.read_message()
+        }
+
+        fn write_request(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.inner.write_request(id, method, params)
+        }
+
+        fn write_notification(
+            &mut self,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.inner.write_notification(method, params)
+        }
+
+        fn write_response(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            result: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.inner.write_response(id, result)
+        }
+
+        fn write_error(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            err: &jsonrpc::ResponseError,
+        ) -> Result<(), GoError> {
+            if self.refuse {
+                return Err(errors::new("write refused"));
+            }
+            if self.panic_once.swap(false, Ordering::SeqCst) {
+                panic!("write panic");
+            }
+            self.inner.write_error(id, err)
+        }
+    }
+
+    /// `connect_with` over `FaultyErrorAnswers`.
+    fn connect_faulty(
+        handler: Arc<dyn ipc::Handler + Send + Sync>,
+        panic_once: bool,
+        refuse: bool,
+    ) -> (Arc<MuxConn>, UnixStream) {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let client: Arc<dyn ReadWriteCloser> = Arc::new(End(client));
+        let panic_once = Arc::new(std::sync::atomic::AtomicBool::new(panic_once));
+        let conn = MuxConn::start(
+            Arc::new(move || {
+                Box::new(FaultyErrorAnswers {
+                    inner: Box::new(ipc::new_jsonrpc_protocol(client.clone())),
+                    panic_once: panic_once.clone(),
+                    refuse,
+                }) as Box<dyn ipc::Protocol>
+            }),
+            handler,
+        );
+        (conn, server)
+    }
+
+    // Go's recover also covers the write of the answer
+    // (ipc/conn_async.go:207-247). When that write panics, the request gets
+    // the panic as its answer, and the write lock that the panic poisoned
+    // still works for later calls.
+    #[test]
+    fn answer_write_panic_is_answered_with_an_error() {
+        let (conn, server) = connect_faulty(Arc::new(Reject), true, false);
+        server
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("read timeout");
+        let peer = std::thread::spawn(move || {
+            let call = read_framed(&server);
+            write_framed(
+                &server,
+                r#"{"jsonrpc":"2.0","id":"m1","method":"readFile"}"#,
+            );
+            let answer = read_framed(&server);
+            let id = string_field(&call, "id");
+            write_framed(
+                &server,
+                &format!(r#"{{"jsonrpc":"2.0","id":"{id}","result":true}}"#),
+            );
+            let call = read_framed(&server);
+            let id = string_field(&call, "id");
+            write_framed(
+                &server,
+                &format!(r#"{{"jsonrpc":"2.0","id":"{id}","result":false}}"#),
+            );
+            answer
+        });
+        let result = conn
+            .call(&context::background(), "transform", None)
+            .expect("the call returns");
+        assert_eq!(result.0, b"true");
+        let result = conn
+            .call(&context::background(), "transform", None)
+            .expect("a later call returns");
+        assert_eq!(result.0, b"false");
+        let answer = peer.join().expect("peer thread");
+        assert!(
+            answer.contains(r#""id":"m1""#)
+                && answer.contains(r#""code":-32603"#)
+                && answer.contains(r#""message":"panic: write panic\n"#),
+            "{answer}"
+        );
+    }
+
+    // When the panic answer cannot be written, Go's handleRequest returns
+    // "ipc: failed to write panic error response: ... (original panic: ...)"
+    // (ipc/conn_async.go:220), and the read loop ends the pending calls
+    // with it (recordRequestError, :123). A call that nothing ends fails at
+    // its 30 s deadline.
+    #[test]
+    fn a_failed_panic_answer_ends_the_calls() {
+        let (conn, server) = connect_faulty(Arc::new(Panics), false, true);
+        let peer = std::thread::spawn(move || {
+            read_framed(&server);
+            write_framed(
+                &server,
+                r#"{"jsonrpc":"2.0","id":"m1","method":"readFile"}"#,
+            );
+            server
+        });
+        let (ctx, _cancel) = context::with_timeout(&context::background(), Duration::from_secs(30));
+        let err = conn
+            .call(&ctx, "transform", None)
+            .expect_err("the call ends with the request error");
+        drop(peer.join().expect("peer thread"));
+        let text = err.error();
+        assert!(errors::is(&err, &ERR_CONN_CLOSED), "{text}");
+        assert!(
+            text.contains(
+                "ipc: failed to write panic error response: write refused \
+                 (original panic: handler panic)"
+            ),
+            "{text}"
+        );
+    }
+
     // Go answers the server timing request before the handler.
     #[test]
     fn server_timing_request_is_answered() {
