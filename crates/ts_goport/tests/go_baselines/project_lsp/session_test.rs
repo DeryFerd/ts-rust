@@ -1977,6 +1977,80 @@ child_test! {
 }
 
 child_test! {
+    // PORT: no Go counterpart (lswarm1, M10). A clone that ends within
+    // `WARM_AUTO_IMPORT_HOLD_CAP` clears the slow mark, so the next warm is
+    // eager again. The check holds by order, not by timing: it reads the mark
+    // only after an attempt that took less than the cap in all (a bound on
+    // its clone), and takes a new session until an attempt does.
+    fn a_short_auto_import_warm_clone_clears_the_slow_mark() {
+        use ts_goport::gostd::local;
+        let mut attempts = Vec::new();
+        for _ in 0..20 {
+            let (session, _, reads) = session_with_pending_warm();
+            session.warm_auto_import_slow.set(true);
+            local::run_pending();
+            let before = session.snapshot();
+            let start = Instant::now();
+            assert!(local::run_idle());
+            let attempt = start.elapsed();
+            assert_eq!(reads.get(), 1);
+            assert!(!Rc::ptr_eq(&session.snapshot(), &before), "the clone was not adopted");
+            let slow = session.warm_auto_import_slow.get();
+            session.close();
+            if attempt <= project::WARM_AUTO_IMPORT_HOLD_CAP {
+                assert!(!slow, "a clone within {attempt:?} kept the slow mark");
+                return;
+            }
+            attempts.push(attempt);
+        }
+        panic!("no attempt took less than the cap: {attempts:?}");
+    }
+}
+
+child_test! {
+    // PORT: no Go counterpart (lswarm1). While a message waits for the
+    // dispatch thread, a warm attempt does not start and queues itself
+    // again. `wait_for_background_tasks` then returns, where it would run
+    // that attempt forever (the message cannot run while it waits). Once no
+    // message waits, it runs the warm. A watchdog ends the test if the wait
+    // does not return.
+    fn wait_for_background_tasks_returns_while_a_message_waits() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (session, _, reads) = session_with_pending_warm();
+        let busy = Arc::new(AtomicBool::new(true));
+        {
+            let busy = busy.clone();
+            session
+                .warm_auto_import_preempt
+                .set_busy(Box::new(move || busy.load(Ordering::SeqCst)));
+        }
+        let returned = Arc::new(AtomicBool::new(false));
+        {
+            let returned = returned.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(60));
+                if !returned.load(Ordering::SeqCst) {
+                    eprintln!("wait_for_background_tasks did not return in 60 s");
+                    std::process::exit(101);
+                }
+            });
+        }
+        let before = session.snapshot();
+        session.wait_for_background_tasks();
+        returned.store(true, Ordering::SeqCst);
+        assert_eq!(reads.get(), 0, "the warm cloned while a message waited");
+        assert!(session.warm_auto_import_pending.borrow().is_some(), "the warm ended");
+
+        busy.store(false, Ordering::SeqCst);
+        session.wait_for_background_tasks();
+        assert_eq!(reads.get(), 1);
+        assert!(!Rc::ptr_eq(&session.snapshot(), &before), "the clone was not adopted");
+        session.close();
+    }
+}
+
+child_test! {
     // PORT: no Go counterpart (editfuzz2 P2-1). Only a released program
     // version loaded the node_modules entrypoint pk/node.d.ts; the parse
     // cache keeps its parse. The warm's auto-import extraction of package pk
