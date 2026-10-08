@@ -500,9 +500,10 @@ impl Checker {
     // PERF (cfcache1, not in Go): the answer depends only on the tree, so a
     // small table keeps recent answers (`control_flow_containers`). It
     // keeps only a walk that stayed in one published store: the parents of
-    // those nodes never change. About 93% of the calls come from
-    // `check_identifier` (the declaration, then the reference), and about
-    // half of all calls ask again for a node that was asked before.
+    // those nodes never change. In the cfcache1 counts (11 projects), 91.6%
+    // of the calls come from `check_identifier` (the declaration, then the
+    // reference; 99.8% with its loop), and 63% of all calls (44% to 77% per
+    // project) ask again for a node that was asked before.
     pub fn get_control_flow_container(&mut self, node: Node) -> Node {
         let slot = control_flow_container_slot(node);
         let (key, container) = self.control_flow_containers[slot];
