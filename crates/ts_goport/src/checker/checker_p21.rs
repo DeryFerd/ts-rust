@@ -519,6 +519,18 @@ impl Checker {
             if skip_object_function_property_augment {
                 return SymbolId::NIL;
             }
+            // PERF (propfilt1): Go next reads the signatures of `t` and
+            // looks the name up in the function type and in Object
+            // (checker.go:19259-19274, getPropertyOfObjectType at :21740).
+            // When those types are resolved, each lookup is one map read,
+            // so a name in none of the 4 tables of `augment_filter` gives
+            // nil and changes no state. The filter returns that nil with no
+            // lookups. A text key takes the lookups.
+            if let TableKey::Name(key) = name {
+                if !self.may_be_augment_member(key) {
+                    return SymbolId::NIL;
+                }
+            }
             let resolved = self.ty(t).as_structured_type();
             let call_count = resolved.call_signatures().len();
             let construct_count = resolved.construct_signatures().len();
@@ -564,6 +576,79 @@ impl Checker {
             );
         }
         SymbolId::NIL
+    }
+
+    /// False when `name` is a member of none of the 4 types of the
+    /// `get_property_of_type_ex` fallback (Function, CallableFunction,
+    /// NewableFunction, Object). True until all 4 are resolved: asking must
+    /// not resolve them earlier than Go does. No Go counterpart.
+    #[inline]
+    fn may_be_augment_member(&mut self, name: &Name) -> bool {
+        let filter = match self.augment_filter {
+            Some(filter) => filter,
+            None => match self.build_augment_filter() {
+                Some(filter) => filter,
+                None => return true,
+            },
+        };
+        let (a, b) = augment_filter_bits(name);
+        filter[a >> 6] & (1 << (a & 63)) != 0 && filter[b >> 6] & (1 << (b & 63)) != 0
+    }
+
+    /// Builds `augment_filter` from the members tables of the 4 types, or
+    /// gives None while one of them is not resolved. A type that is not an
+    /// object type has no table: Go `getPropertyOfObjectType` gives nil for
+    /// it.
+    #[cold]
+    #[inline(never)]
+    fn build_augment_filter(&mut self) -> Option<[u64; 4]> {
+        let mut filter = [0u64; 4];
+        for g in [
+            self.global_function_type,
+            self.global_callable_function_type,
+            self.global_newable_function_type,
+            self.global_object_type,
+        ] {
+            if g.is_nil() {
+                return None;
+            }
+            if !self.ty(g).flags.intersects(TypeFlags::OBJECT) {
+                continue;
+            }
+            if !self
+                .ty(g)
+                .object_flags
+                .intersects(ObjectFlags::MEMBERS_RESOLVED)
+            {
+                return None;
+            }
+            let members = self.ty(g).as_structured_type().members;
+            for (name, _) in self.symbols.entries(members) {
+                let (a, b) = augment_filter_bits(&name);
+                filter[a >> 6] |= 1 << (a & 63);
+                filter[b >> 6] |= 1 << (b & 63);
+            }
+        }
+        self.augment_filter = Some(filter);
+        Some(filter)
+    }
+
+    /// Drops `augment_filter` when `t` is one of its 4 types. Call it where
+    /// the members of `t` change: the `get_base_types` reset (the members
+    /// resolve again) and each `set_structured_type_members` of
+    /// `resolve_object_type_members`. A nested resolution of `t` (a late
+    /// bound name of `t` that needs `t`) sets members that the outer one
+    /// then replaces.
+    #[inline]
+    fn drop_augment_filter_of(&mut self, t: TypeId) {
+        if self.augment_filter.is_some()
+            && (t == self.global_function_type
+                || t == self.global_callable_function_type
+                || t == self.global_newable_function_type
+                || t == self.global_object_type)
+        {
+            self.augment_filter = None;
+        }
     }
 
     // Go: checker/checker.go:19291 getTypeOfPropertyOfType
@@ -960,6 +1045,7 @@ impl Checker {
                 call_signature_count,
                 index_infos,
             );
+            self.drop_augment_filter_of(t);
             return;
         }
         let call_signature_count = call_signatures.len();
@@ -971,6 +1057,7 @@ impl Checker {
             call_signature_count,
             index_infos,
         );
+        self.drop_augment_filter_of(t);
     }
 
     /// Go `instantiateList` on a shared list. When no element changes, the
@@ -1091,6 +1178,7 @@ impl Checker {
                     .without(ObjectFlags::MEMBERS_RESOLVED);
                 self.ty_mut(t).object_flags = object_flags;
             }
+            self.drop_augment_filter_of(t);
             self.ty_mut(t).as_interface_type_mut().base_types_resolved = true;
         }
         self.ty(t).as_interface_type().resolved_base_types.clone()
@@ -1752,5 +1840,443 @@ impl Checker {
             diag::Type_0_recursively_references_itself_as_a_base_type,
             args![type_string],
         );
+    }
+}
+
+/// The two bits of `name` in `Checker::augment_filter`, from its id. Equal
+/// texts have one id.
+#[inline]
+fn augment_filter_bits(name: &Name) -> (usize, usize) {
+    let mixed = name.id().wrapping_mul(0x9E37_79B9);
+    ((mixed >> 24) as usize, ((mixed >> 16) & 255) as usize)
+}
+
+#[cfg(test)]
+mod augment_filter_tests {
+    use super::*;
+
+    /// The types of the type aliases of `a.ts`, in source order. Each
+    /// scenario declares the same 10 aliases, so every lookup runs on a
+    /// plain object, a callable, a newable, a type with both signatures,
+    /// a class constructor, `Function`, `Object`, an array, `{}` and a
+    /// primitive (its apparent type).
+    const ALIASES: &str = r#"
+type T0 = { a: number };
+type T1 = () => void;
+type T2 = new () => {};
+type T3 = { (): void; new (): {} };
+type T4 = typeof K;
+type T5 = Function;
+type T6 = Object;
+type T7 = string[];
+type T8 = {};
+type T9 = string;
+"#;
+
+    /// Loads `files` with the `compilerOptions` body `options`, checks
+    /// `a.ts`, and calls `f` on its checker with the codes of its
+    /// diagnostics and the types of its type aliases. Each call writes its
+    /// files in a temp dir of its own.
+    fn with_checked_a<R: Send + 'static>(
+        files: &[(&str, String)],
+        options: &str,
+        f: impl FnOnce(&mut Checker, Vec<i32>, Vec<TypeId>) -> R + Send + 'static,
+    ) -> R {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ts_goport_augfilter_{}_{call}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        let list: Vec<String> = files.iter().map(|(name, _)| format!("{name:?}")).collect();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            format!(
+                r#"{{ "compilerOptions": {{ {options} }}, "files": [{}] }}"#,
+                list.join(", ")
+            ),
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = crate::program::try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scope = crate::core::enter_program(Some(program));
+        let file = program
+            .source_files()
+            .find(|file| file.info.file_name.ends_with("/a.ts"))
+            .expect("a.ts is not in the program")
+            .root;
+        let result = crate::program::with_type_checker_for_file(file, move |checker| {
+            let ctx = crate::gostd::context::background();
+            let codes = checker
+                .get_diagnostics_exported(&ctx, file)
+                .iter()
+                .map(|d| d.code)
+                .collect();
+            let types = file
+                .statements()
+                .iter()
+                .filter(|s| s.kind() == SyntaxKind::TypeAliasDeclaration)
+                .map(|alias| checker.get_type_from_type_node(alias.type_()))
+                .collect();
+            f(checker, codes, types)
+        });
+        drop(scope);
+        crate::program::release_program(program);
+        result
+    }
+
+    /// Go `getPropertyOfTypeEx(t, name, false, false)` for a type whose
+    /// apparent type is an object type, with the two lookups of
+    /// checker.go:19259-19274 always made.
+    fn go_property_of_type(c: &mut Checker, t: TypeId, name: &Name) -> SymbolId {
+        let own = c.get_property_of_type_ex(t, name, true, false);
+        if own.is_some() {
+            return own;
+        }
+        let t = c.get_reduced_apparent_type(t);
+        let resolved = c.resolve_structured_type_members(t);
+        let (calls, constructs) = (
+            resolved.call_signatures().len(),
+            resolved.construct_signatures().len(),
+        );
+        let function_type = if t == c.any_function_type {
+            c.global_function_type
+        } else if calls != 0 {
+            c.global_callable_function_type
+        } else if constructs != 0 {
+            c.global_newable_function_type
+        } else {
+            TypeId::NIL
+        };
+        if function_type.is_some() {
+            let symbol = c.get_property_of_object_type_key(function_type, TableKey::Name(name));
+            if symbol.is_some() {
+                return symbol;
+            }
+        }
+        let object = c.global_object_type;
+        c.get_property_of_object_type_key(object, TableKey::Name(name))
+    }
+
+    /// The names to look up: the members of the 4 filter types, every
+    /// global and the members and exports of each, `extra`, and 256 names
+    /// that no declaration has.
+    fn names_to_try(c: &Checker, extra: &[&str]) -> Vec<Name> {
+        let mut seen = FxHashSet::default();
+        let mut names = Vec::new();
+        let mut add = |name: Name| {
+            if seen.insert(name.id()) {
+                names.push(name);
+            }
+        };
+        for g in [
+            c.global_function_type,
+            c.global_callable_function_type,
+            c.global_newable_function_type,
+            c.global_object_type,
+        ] {
+            for (name, _) in c.symbols.entries(c.ty(g).as_structured_type().members) {
+                add(name);
+            }
+        }
+        for (name, symbol) in c.symbols.entries(c.globals) {
+            add(name);
+            for table in [c.sym(symbol).members, c.sym(symbol).exports] {
+                for (member, _) in c.symbols.entries(table) {
+                    add(member);
+                }
+            }
+        }
+        for &text in extra {
+            add(Name::from(text));
+        }
+        for i in 0..256 {
+            add(Name::from(format!("noSuchMember{i}")));
+        }
+        names
+    }
+
+    /// Resolves the 4 filter types by lookups that Go makes too, then
+    /// misses once, so the filter is built.
+    fn build_filter(c: &mut Checker, types: &[TypeId]) {
+        let (plain, callable, newable) = (types[0], types[1], types[2]);
+        c.get_property_of_type(callable, "toString");
+        c.get_property_of_type(newable, "toString");
+        c.get_property_of_type(c.any_function_type, "toString");
+        c.get_property_of_type(plain, "toString");
+        let miss = Name::from("noSuchMember0");
+        assert!(
+            c.get_property_of_type_ex(plain, &miss, false, false)
+                .is_nil()
+        );
+        assert!(c.augment_filter.is_some(), "the filter is not built");
+    }
+
+    /// Every name on every alias type (and on Go's any function type) gives
+    /// Go's symbol. Returns how many names the filter rejects, so a test
+    /// can check that it skipped lookups.
+    fn assert_lookups_match_go(c: &mut Checker, types: &[TypeId], extra: &[&str]) -> usize {
+        build_filter(c, types);
+        let names = names_to_try(c, extra);
+        let mut all = types.to_vec();
+        all.push(c.any_function_type);
+        for &t in &all {
+            let apparent = c.get_reduced_apparent_type(t);
+            assert!(c.ty(apparent).flags.intersects(TypeFlags::OBJECT));
+            for name in &names {
+                let want = go_property_of_type(c, t, name);
+                let got = c.get_property_of_type_ex(t, name, false, false);
+                assert_eq!(got, want, "{:?} on type {t:?}", name.as_str());
+            }
+        }
+        assert!(c.augment_filter.is_some(), "the filter was dropped");
+        names
+            .iter()
+            .filter(|name| !c.may_be_augment_member(name))
+            .count()
+    }
+
+    /// True when `name` on `t` is found and declared in `a.ts` or `b.ts`.
+    fn found_in_test_file(c: &mut Checker, t: TypeId, name: &str) -> bool {
+        let name = Name::from(name);
+        let symbol = c.get_property_of_type_ex(t, &name, false, false);
+        symbol.is_some()
+            && c.sym(symbol).declarations.iter().any(|d| {
+                let file_name = source_file_file_name(get_source_file_of_node(*d));
+                file_name.ends_with("/a.ts") || file_name.ends_with("/b.ts")
+            })
+    }
+
+    const STRICT: &str = r#""strict": true, "target": "es2020", "types": []"#;
+
+    /// `declare global` adds a member to each of the 4 types. The filter
+    /// holds them, so a plain object, a callable and a newable find them
+    /// through the fallback.
+    #[test]
+    fn filter_keeps_global_augmentations() {
+        let a = format!(
+            r#"export {{}};
+declare global {{
+    interface Object {{ objAug(): void }}
+    interface Function {{ fnAug: number }}
+    interface CallableFunction {{ callAug: string }}
+    interface NewableFunction {{ newAug: boolean }}
+}}
+declare const plain: {{ a: number }};
+declare const call: () => void;
+declare const ctor: new () => {{}};
+declare const both: {{ (): void; new (): {{}} }};
+declare class K {{ static s: number }}
+declare const u: {{ a: number }} | {{ b: number }};
+call.apply; ctor.bind; plain.toString;
+if ("a" in u) {{}}
+plain.objAug(); call.objAug(); call.fnAug; call.callAug;
+ctor.newAug; ctor.fnAug; ctor.objAug(); both.callAug; K.newAug; K.fnAug;
+plain.absentMember;
+{ALIASES}"#
+        );
+        let (codes, rejected, found) = with_checked_a(&[("a.ts", a)], STRICT, |c, codes, types| {
+            let found = [
+                (types[0], "objAug"),
+                (types[1], "objAug"),
+                (types[1], "fnAug"),
+                (types[1], "callAug"),
+                (types[2], "newAug"),
+                (types[2], "fnAug"),
+                (types[4], "newAug"),
+                (types[5], "objAug"),
+                (types[9], "objAug"),
+            ]
+            .map(|(t, name)| found_in_test_file(c, t, name));
+            let extra = ["objAug", "fnAug", "callAug", "newAug", "absentMember"];
+            (codes, assert_lookups_match_go(c, &types, &extra), found)
+        });
+        // Go N gives only TS2339 for `absentMember`.
+        assert_eq!(codes, [2339]);
+        assert_eq!(found, [true; 9]);
+        assert!(rejected > 128, "the filter rejected {rejected} names");
+    }
+
+    /// A script merges members into the global interfaces, also with late
+    /// bound names (`[fnKey]`, `[objKey]`). The filter holds the merged
+    /// tables.
+    #[test]
+    fn filter_keeps_merged_and_late_bound_members() {
+        let b = r#"interface Object { scriptObj: number }
+interface Function { scriptFn(): void }
+declare const fnKey: unique symbol;
+declare const objKey: unique symbol;
+interface Function { [fnKey]: number }
+interface Object { [objKey]: string }
+"#;
+        let a = format!(
+            r#"export {{}};
+declare const plain: {{ a: number }};
+declare const call: () => void;
+declare const ctor: new () => {{}};
+declare class K {{ static s: number }}
+call.apply; ctor.bind; plain.toString;
+const n: number = call[fnKey];
+const m: number = ctor[fnKey];
+const s: string = plain[objKey];
+const t: string = call[objKey];
+plain.scriptObj; call.scriptFn(); call.scriptObj; K.scriptFn();
+{ALIASES}"#
+        );
+        let (codes, rejected, found) = with_checked_a(
+            &[("a.ts", a), ("b.ts", b.to_string())],
+            STRICT,
+            |c, codes, types| {
+                let found = [
+                    (types[0], "scriptObj"),
+                    (types[1], "scriptFn"),
+                    (types[1], "scriptObj"),
+                    (types[2], "scriptFn"),
+                ]
+                .map(|(t, name)| found_in_test_file(c, t, name));
+                let extra = ["scriptObj", "scriptFn"];
+                (codes, assert_lookups_match_go(c, &types, &extra), found)
+            },
+        );
+        assert_eq!(codes, Vec::<i32>::new());
+        assert_eq!(found, [true; 4]);
+        assert!(rejected > 128, "the filter rejected {rejected} names");
+    }
+
+    /// With `strictBindCallApply` off, CallableFunction and NewableFunction
+    /// are the Function type, and the es5 lib has no `Symbol` members.
+    #[test]
+    fn filter_follows_lib_es5_without_strict_bind_call_apply() {
+        let a = format!(
+            r#"export {{}};
+declare global {{
+    interface Function {{ fnAug: number }}
+}}
+declare const plain: {{ a: number }};
+declare const call: () => void;
+declare const ctor: new () => {{}};
+declare class K {{ static s: number }}
+call.apply; ctor.bind; plain.toString;
+call.fnAug; ctor.fnAug; K.fnAug; plain.fnAug;
+{ALIASES}"#
+        );
+        let options = r#""strict": true, "strictBindCallApply": false, "target": "es2015", "lib": ["es5"], "types": []"#;
+        let (codes, rejected, same) = with_checked_a(&[("a.ts", a)], options, |c, codes, types| {
+            let same = c.global_callable_function_type == c.global_function_type
+                && c.global_newable_function_type == c.global_function_type;
+            (codes, assert_lookups_match_go(c, &types, &["fnAug"]), same)
+        });
+        // Go N gives only TS2339 for `plain.fnAug`.
+        assert_eq!(codes, [2339]);
+        assert!(same);
+        assert!(rejected > 128, "the filter rejected {rejected} names");
+    }
+
+    /// With `noLib`, the globals come from a file of the project. There
+    /// NewableFunction is a type alias, so Go `getGlobalType` gives the
+    /// empty object type, which has no members.
+    #[test]
+    fn filter_follows_no_lib_globals() {
+        let globals = r#"interface Object { o1: number }
+interface Function { f1: number }
+interface CallableFunction extends Function { c1: number }
+interface Array<T> { length: number }
+interface String {}
+interface Boolean {}
+interface Number {}
+interface RegExp {}
+interface IArguments {}
+type NewableFunction = { n1: number }
+"#;
+        let a = format!(
+            r#"export {{}};
+declare const plain: {{ a: number }};
+declare const call: () => void;
+declare const ctor: new () => {{}};
+declare class K {{ static s: number }}
+call.c1; call.f1; call.o1; ctor.o1; plain.o1;
+ctor.f1; ctor.n1;
+{ALIASES}"#
+        );
+        let options = r#""strict": true, "noLib": true, "target": "es2020", "types": []"#;
+        let (codes, rejected, empty) = with_checked_a(
+            &[("a.ts", a), ("globals.d.ts", globals.to_string())],
+            options,
+            |c, codes, types| {
+                let empty = c.global_newable_function_type == c.empty_object_type;
+                (
+                    codes,
+                    assert_lookups_match_go(c, &types, &["o1", "f1", "c1", "n1"]),
+                    empty,
+                )
+            },
+        );
+        // Go N gives TS2339 for `ctor.f1` and `ctor.n1` (and TS2316 in
+        // globals.d.ts).
+        assert_eq!(codes, [2339, 2339]);
+        assert!(empty);
+        assert!(rejected > 128, "the filter rejected {rejected} names");
+    }
+
+    /// When the members of Function are set again (the outer resolution
+    /// of a nested one, here with a member added to the declared table),
+    /// the filter is dropped, and the next lookup builds it from the new
+    /// table. The `get_base_types` reset drops it too.
+    #[test]
+    fn filter_is_dropped_when_members_change() {
+        let a = format!(
+            r#"export {{}};
+declare class K {{ static s: number }}
+{ALIASES}"#
+        );
+        let (added_found, reset_dropped) = with_checked_a(&[("a.ts", a)], STRICT, |c, _, types| {
+            build_filter(c, &types);
+            let function = c.global_function_type;
+            // A name that the filter rejects (ids, and so bits, depend on
+            // intern order).
+            let added = (0..)
+                .map(|i| Name::from(format!("addedLater{i}")))
+                .find(|name| !c.may_be_augment_member(name))
+                .unwrap();
+            let table = c
+                .symbols
+                .clone_table(c.ty(function).as_interface_type().declared_members);
+            let symbol = c.new_symbol(SymbolFlags::PROPERTY, &added);
+            c.symbols.set(table, &added, symbol);
+            c.ty_mut(function).as_interface_type_mut().declared_members = table;
+            let flags = c
+                .ty(function)
+                .object_flags
+                .without(ObjectFlags::MEMBERS_RESOLVED);
+            c.ty_mut(function).object_flags = flags;
+            c.resolve_structured_type_members(function);
+            assert!(c.augment_filter.is_none());
+            let any_function = c.any_function_type;
+            let added_found =
+                c.get_property_of_type_ex(any_function, &added, false, false) == symbol;
+
+            build_filter(c, &types);
+            let callable = c.global_callable_function_type;
+            c.ty_mut(callable)
+                .as_interface_type_mut()
+                .base_types_resolved = false;
+            c.ty_mut(callable)
+                .as_interface_type_mut()
+                .resolved_base_types = SharedList::default();
+            c.get_base_types(callable);
+            let reset_dropped = c.augment_filter.is_none()
+                && !c
+                    .ty(callable)
+                    .object_flags
+                    .intersects(ObjectFlags::MEMBERS_RESOLVED);
+            assert_lookups_match_go(c, &types, &[added.as_str()]);
+            (added_found, reset_dropped)
+        });
+        assert!(added_found);
+        assert!(reset_dropped);
     }
 }

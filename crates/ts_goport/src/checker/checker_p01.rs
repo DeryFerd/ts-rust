@@ -1001,6 +1001,11 @@ pub struct Checker {
     pub global_function_type: TypeId,
     pub global_callable_function_type: TypeId,
     pub global_newable_function_type: TypeId,
+    /// PERF (propfilt1): `get_property_of_type_ex`'s filter of the member
+    /// names of the 4 types above (`may_be_augment_member`). None until all
+    /// 4 are resolved, and again after the members of one of them change
+    /// (`drop_augment_filter_of`).
+    pub augment_filter: Option<[u64; 4]>,
     pub global_array_type: TypeId,
     pub global_readonly_array_type: TypeId,
     pub global_string_type: TypeId,
@@ -1507,6 +1512,7 @@ impl Checker {
             global_function_type: TypeId::NIL,
             global_callable_function_type: TypeId::NIL,
             global_newable_function_type: TypeId::NIL,
+            augment_filter: None,
             global_array_type: TypeId::NIL,
             global_readonly_array_type: TypeId::NIL,
             global_string_type: TypeId::NIL,
