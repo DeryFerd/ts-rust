@@ -3704,7 +3704,9 @@ fn prefetch_parse(
 
 /// A parse worker's transform of a content-mapped file: the transform
 /// request that `transform_locked` sends, and the parse of the virtual text
-/// that `contentmapper::parse_result` would make. The loader takes both
+/// that `contentmapper::parse_result` would make. As in Go, the parse runs
+/// only for a result whose mappings and virtual extension pass the checks
+/// before it (`contentmapper::parses_canonical_output`). The loader takes both
 /// (`take_prefetched_mapped`): it reports an error and attaches the other
 /// outputs, so each file gets one request, as in Go. `None` when the file
 /// cannot be read (Go sends no request then either), or when the loader
@@ -3721,12 +3723,7 @@ fn prefetch_mapped(
     }
     let result = transform.transform(&job.opts.file_name, &content)?;
     let parse = match &result {
-        Ok(result)
-            if result.mappings.is_some()
-                && crate::contentmapper::is_supported_virtual_extension(
-                    &result.virtual_extension,
-                ) =>
-        {
+        Ok(result) if crate::contentmapper::parses_canonical_output(result, &content) => {
             let mut opts = job.opts.clone();
             if crate::contentmapper::is_module_virtual_extension(&result.virtual_extension) {
                 opts.external_module_indicator_options.force = true;

@@ -3493,9 +3493,11 @@ export const a: T | Dep | number = x + (h as never);
     /// once, and the transform requests newest first on another thread, so
     /// the answers come out of order when requests overlap. The text of a
     /// mapped file is TypeScript: `@diag` adds a mapper diagnostic, `@fail`
-    /// answers with an error, `@supp` adds a supplemental output. After
+    /// answers with an error, `@badmap` gives a mapping that fails
+    /// `SpanMap::validate`, `@supp` adds a supplemental output. After
     /// `exit_after` transform requests it closes the connection (a mapper
     /// crash). `transforms` gets the file name of each transform request.
+    #[cfg(unix)]
     mod fake_mapper {
         use crate::contentmapper::{
             Diagnostic, InitializeResult, MappedOutput, OpenProjectResult, PositionEncoding,
@@ -3625,11 +3627,11 @@ export const a: T | Dep | number = x + (h as never);
             Arc::new(End(client))
         }
 
-        fn verbatim(text: &str, extension: &str) -> MappedOutput {
-            let length = text.len() as i32;
+        /// `text` mapped to itself, up to `end`.
+        fn verbatim(text: &str, extension: &str, end: usize) -> MappedOutput {
             let mappings = crate::spanmap::new(&[crate::spanmap::Segment {
-                virtual_end: length,
-                original_end: length,
+                virtual_end: end as i32,
+                original_end: text.len() as i32,
                 kind: crate::spanmap::Kind::VERBATIM,
                 ..Default::default()
             }])
@@ -3644,8 +3646,10 @@ export const a: T | Dep | number = x + (h as never);
         }
 
         fn transform(params: &TransformParams) -> Box<dyn AnyValue> {
+            // `@badmap`: the mapping ends one byte past the virtual text.
+            let end = params.content.len() + usize::from(params.content.contains("@badmap"));
             let mut result = TransformResult {
-                mapped_output: verbatim(&params.content, ".ts"),
+                mapped_output: verbatim(&params.content, ".ts", end),
                 ..Default::default()
             };
             if params.content.contains("@diag") {
@@ -3674,6 +3678,7 @@ export const a: T | Dep | number = x + (h as never);
     /// `.vue` files. Returns each program file (name, text and parse
     /// diagnostics) and the content mapper diagnostics, one per line, the
     /// file name of each transform request, and the spawns.
+    #[cfg(unix)]
     fn load_mapped(
         label: &str,
         tsconfig: &str,
@@ -3803,6 +3808,7 @@ export const a: T | Dep | number = x + (h as never);
         (lines, transforms, spawns.get())
     }
 
+    #[cfg(unix)]
     const MAPPED_TSCONFIG: &str = r#"{ "compilerOptions": { "module": "preserve",
          "moduleResolution": "bundler", "types": [], "noEmit": true },
          "include": ["src"],
@@ -3810,6 +3816,7 @@ export const a: T | Dep | number = x + (h as never);
 
     /// `count` mapped files that import the next one, with `marker` in
     /// file `i` when `marker(i)` names one.
+    #[cfg(unix)]
     fn mapped_files(count: usize, marker: fn(usize) -> &'static str) -> Vec<(String, String)> {
         let mut files: Vec<(String, String)> = (0..count)
             .map(|i| {
@@ -3834,17 +3841,20 @@ export const a: T | Dep | number = x + (h as never);
     // the mapper project, the parse workers send the transforms of the
     // other mapped files and parse the virtual texts, and the loader takes
     // their results. Each file gets one transform request, also with a
-    // mapper diagnostic, an error response or a supplemental output, and
+    // mapper diagnostic, an error response, a mapping that fails validation
+    // (the worker does not parse it) or a supplemental output, and
     // the program equals a load on one thread. The fake mapper answers the
     // newest request first, so answers come out of order when requests
     // overlap. Go sends the transforms from its parse goroutines
     // (fileloader.go:438 parseContentMappedFile).
+    #[cfg(unix)]
     #[test]
     fn workers_send_the_content_mapper_transforms() {
         use super::super::files_parser::{MAPPED_TAKEN, parse_workers_enabled};
         let files = mapped_files(40, |i| match i {
             3 | 17 | 31 => "@diag",
             9 | 26 => "@fail",
+            21 => "@badmap",
             12 | 35 => "@supp",
             _ => "",
         });
@@ -3871,6 +3881,7 @@ export const a: T | Dep | number = x + (h as never);
     // A mapper that crashes during the load: the calls in flight and all
     // later calls fail, the first 5 failures in load order are reported,
     // then the mapper is disabled, and the load ends.
+    #[cfg(unix)]
     #[test]
     fn a_mapper_crash_during_worker_transforms_ends_the_load() {
         let files = mapped_files(40, |_| "");
@@ -3903,6 +3914,7 @@ export const a: T | Dep | number = x + (h as never);
     // no request: the mapper does not start, so the project does not open
     // and reports no option diagnostics (Go program.go:828 reports them
     // only for opened projects).
+    #[cfg(unix)]
     #[test]
     fn a_missing_mapped_file_starts_no_mapper() {
         let tsconfig = r#"{ "compilerOptions": { "types": [], "noEmit": true },
