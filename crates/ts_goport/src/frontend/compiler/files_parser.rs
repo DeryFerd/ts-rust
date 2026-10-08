@@ -3031,10 +3031,13 @@ impl WorkerResolver {
         });
         // The worker keeps what it reads for each package.json entry (`fs`
         // keeps the texts, `WorkerFs::keep_package_jsons`), and the lookups
-        // of the package scope walk for a file's metadata carry it, so the
-        // loader puts those entries into its own cache when it takes the
-        // metadata, as the Go loader finds the metadata with the program's
-        // resolver (`Caches::adopt_worker_package_jsons`).
+        // of the package scope walk for a file's metadata carry it. When the
+        // loader takes the metadata, it keeps those reads in its own cache as
+        // texts that the cache parses on the first lookup (`InfoCache::get`),
+        // as the Go loader finds the metadata with the program's resolver
+        // (`Caches::adopt_worker_package_jsons`). The other reads of the load
+        // go into that cache at its end
+        // (`SharedResolutionCache::end_package_json_reads`).
         resolver.caches.worker_package_json_reads = Some(WorkerPackageJsonReads::default());
         set_worker_lookup_log(log_lookups);
         WorkerResolver {
