@@ -3848,16 +3848,20 @@ export const a: T | Dep | number = x + (h as never);
             12 | 35 => "@supp",
             _ => "",
         });
-        let (serial, serial_transforms, _) =
+        let (serial, mut serial_transforms, _) =
             load_mapped("mapped_serial", MAPPED_TSCONFIG, &files, true, None);
         let taken = MAPPED_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
         let (parallel, mut parallel_transforms, _) =
             load_mapped("mapped_parallel", MAPPED_TSCONFIG, &files, false, None);
         let taken = MAPPED_TAKEN.load(std::sync::atomic::Ordering::Relaxed) - taken;
-        assert_eq!(serial_transforms.len(), 40);
+        // One request per mapped file: a file with two requests, or with
+        // none, fails here.
+        let mut want: Vec<String> = (0..40).map(|i| format!("/src/C{i}.vue")).collect();
+        want.sort();
+        serial_transforms.sort();
         parallel_transforms.sort();
-        parallel_transforms.dedup();
-        assert_eq!(parallel_transforms.len(), 40, "a file got two transforms");
+        assert_eq!(serial_transforms, want);
+        assert_eq!(parallel_transforms, want, "one transform per file");
         assert_eq!(parallel.join("\n"), serial.join("\n"));
         if parse_workers_enabled() {
             assert!(taken > 0, "the loader took no worker transform");
