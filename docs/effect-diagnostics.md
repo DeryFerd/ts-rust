@@ -39,10 +39,13 @@ The code is `crates/ts_goport/src/effect`, a port of
   records the version `<version>+effect-tsgo.0.46.1`, as effect-tsgo does.
   Plain tsgo and tsc-rs without the plugin then check the project again
   instead of reading Effect diagnostics (plain tsgo panics on those:
-  "Unknown diagnostic message"). The language server shows the same
-  diagnostics. `tsc -v`, `tsc --help` and the language server's
-  `serverInfo` print the plain version; effect-tsgo prints
-  `<version>+effect-tsgo.0.46.1` there.
+  "Unknown diagnostic message"). tsc-rs from Theo PR #4, before this
+  suffix, wrote the plain version with Effect options and diagnostics.
+  tsc-rs checks that build info again too, as effect-tsgo does. Plain tsgo
+  still panics on it until one tsc-rs run writes it again. The language
+  server shows the same diagnostics. `tsc -v`, `tsc --help` and the
+  language server's `serverInfo` print the plain version; effect-tsgo
+  prints `<version>+effect-tsgo.0.46.1` there.
 - With no plugin entry, nothing runs. An entry with only a `name` runs every
   rule at its default severity. `"diagnostics": false` or
   `"diagnosticSeverity": null` turns the rules off.

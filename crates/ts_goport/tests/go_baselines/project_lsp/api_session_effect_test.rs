@@ -359,3 +359,31 @@ child_test! {
         session.close();
     }
 }
+
+// Theo PR #4 before effectfix2 wrote build info with the Effect options and
+// Effect diagnostics, but the plain version. effect-tsgo sees another
+// version there and builds again. The standalone API without the rules
+// does the same, and does not report the old Effect diagnostics.
+child_test! {
+    env &[("TSGO_EFFECT_API", "0")];
+    fn standalone_api_build_checks_build_info_of_an_older_effect_build_again() {
+        let (session, utils) = build_session();
+        rulerunner::clear_api_process();
+        assert_eq!(
+            build(&session),
+            (ExitStatus::DiagnosticsPresentOutputsGenerated, vec![GLOBAL_DATE])
+        );
+        let (text, ok) = utils.fs_from_file_map().fs().read_file(BUILD_INFO);
+        assert!(ok, "the build writes {BUILD_INFO}");
+        let version = |effect| format!(r#""version":"{}""#, build_info_version(effect));
+        assert_eq!(text.matches(&version(true)).count(), 1, "{text}");
+        let older = text.replace(&version(true), &version(false));
+        assert!(utils.fs().write_file(BUILD_INFO, &older).is_ok());
+        assert_eq!(build_info(&utils), (build_info_version(false).into_owned(), true));
+
+        rulerunner::set_api_process();
+        assert_eq!(build(&session), (ExitStatus::Success, vec![]));
+        assert_eq!(build_info(&utils), plain_build_info());
+        session.close();
+    }
+}
