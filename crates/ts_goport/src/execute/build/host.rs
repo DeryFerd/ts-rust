@@ -570,8 +570,10 @@ impl BuildHost {
     /// the dropped parses stayed until `end_config_change_cycle`: on 600
     /// script files with 12 `moduleDetection` edits, `tsc -b -w` held 24%
     /// more RSS than R173, which dropped every kept parse before a config
-    /// change build. The file versions are freed on the free thread, beside
-    /// the build, as Go's GC frees the files of the old program.
+    /// change build. A dropped version that no other holder keeps dies
+    /// here, and its data is freed on the free thread, beside the build, as
+    /// Go's GC frees the files of the old program
+    /// (`file_version::take_data_of_dying_versions`).
     pub fn drop_kept_parses_whose_module_indicator_options_change(
         &self,
         changed: &[(Option<ModuleIndicatorInputs>, Rc<ParsedCommandLine>)],
@@ -599,7 +601,10 @@ impl BuildHost {
                 }
                 !held
             });
-        crate::execute::build::build_task::drop_in_background(versions);
+        let data = crate::ast::file_version::take_data_of_dying_versions(versions);
+        if !data.is_empty() {
+            crate::execute::build::build_task::drop_in_background(data);
+        }
     }
 
     /// PORT: not in Go (`keep_watch_sources_for_config_change`). At the end
@@ -1034,16 +1039,17 @@ impl CompilerHost for BuildCompilerHost {
         let Some(project) = self.content_mapper_project() else {
             return Err(contentmapper::ERR_PROJECT_UNAVAILABLE.clone());
         };
-        let fs = CompilerHost::fs(self);
-        let (content, ok) = fs.read_file(&parse_options.file_name);
-        if !ok {
-            return Ok(SourceFiles::default());
-        }
-        let files = contentmapper::transform_and_parse(parse_options, &content, mapper, &*project)?;
-        contentmapper::check_supplemental_file_name_collisions(&files, &|name: &str| {
-            fs.file_exists(name)
-        })?;
-        Ok(files)
+        crate::frontend::compiler::content_mapped_source_files(
+            &*CompilerHost::fs(self),
+            &*project,
+            parse_options,
+            mapper,
+        )
+    }
+
+    // PORT: not in Go (see `CompilerHost::prefetch_content_mapped`).
+    fn prefetch_content_mapped(&self) -> bool {
+        true
     }
 
     // Go: build/compilerHost.go:56 (*compilerHost).ContentMapperProject (tsgo#4712)
