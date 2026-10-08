@@ -207,7 +207,7 @@ fn set_malloc_tunables(budget: &ThreadBudget) {
 /// memory. With 4 KiB pages that unmap takes about 50 ms for effect (1.3 GB);
 /// with huge pages it takes about 4 ms, less than a second process costs
 /// (about 1 ms on query check). So by default the worker runs only when
-/// `thp_guard` says the run can end on 4 KiB pages (`huge_pages` false).
+/// `thp_guard` says the run gets 4 KiB pages (`huge_pages` false).
 /// `GOPORT_LAUNCH=0` never starts a worker and `GOPORT_LAUNCH=1` always
 /// does. None when this process runs the work: it is a worker, no worker is
 /// wanted, `--lsp`, `--api` or watch mode (`long_running`: they end on

@@ -29,17 +29,13 @@
 //!   (dropin1 diag: 9 to 22 ms per edit window), and an LSP server builds
 //!   nothing until a request comes.
 //!
-//! The guard also tells `bin/tsgo.rs` `launch` whether the run can end on
-//! 4 KiB pages (`huge_pages`), so that it runs the work in a worker
-//! process and the caller does not wait for their unmap at exit. That is
-//! the case with less than `WORKER_HEADROOM` above the limit free in 2 MiB
-//! blocks, also when THP stays on: the run uses up the free 2 MiB blocks
-//! early and gets 4 KiB pages after that (the watcher turns THP off, or
-//! the faults fall back). With more free, a worker would cost small runs
-//! more than it saves (`WORKER_HEADROOM`), even where large runs end on
-//! 4 KiB pages. A launcher keeps the watcher that its start check started
-//! (it is needed when no worker starts, as with `GOPORT_LAUNCH=0`): there
-//! it only reads the free memory, until the launcher ends.
+//! The guard also tells `bin/tsgo.rs` `launch` whether the run ends on
+//! 4 KiB pages (`huge_pages`), so that it runs the work in a worker process
+//! and the caller does not wait for their unmap at exit: THP is off at the
+//! start, or `never`, or kept below the limit where no fault waits. A run
+//! whose watcher fires later also ends on 4 KiB pages, but it gets no
+//! worker: the start check cannot tell a small run from a large one, and
+//! for a small run a worker costs more than it saves (`huge_pages`).
 //!
 //! The limit is low (`DEFAULT_MIN_FREE_MIB`) because a run that finds
 //! enough free 2 MiB blocks is faster with THP. perf13 on dbook, with only
@@ -72,20 +68,6 @@ use std::time::Duration;
 /// blocks of 2 MiB or more. See the module comment for the perf13 and
 /// perf13b data.
 const DEFAULT_MIN_FREE_MIB: u64 = 64;
-
-/// `thp_guard` returns false (`launch` starts a worker) when less than the
-/// limit plus this many bytes are free in 2 MiB blocks at the start. Then
-/// the watcher fires before a run has faulted about this many huge pages
-/// (or, where THP stays on, the faults fall back), and the rest of the run
-/// gets 4 KiB pages, whose unmap at exit the worker hides. A worker costs a
-/// second process start: 2.0 to 2.4 ms per run on mini (thpguard2: tsgo
-/// --version 3.3 against 5.3 ms). thpguard2 on mini, with the watcher set
-/// to fire after H MiB of huge pages, a worker against none: query core
-/// check (32 ms, 58 MiB of huge pages) +0.1 ms at H 16, +1.5 to +4.8 ms at
-/// H 32, and +8% to +14% at H 64 to 256, where its watcher does not fire.
-/// hono check and T3 Code shared were 8% to 9% faster at H 16. So 16 MiB:
-/// a small run does not pay for the worker, and a larger one gains.
-const WORKER_HEADROOM: u64 = 16 << 20;
 
 /// The shortest wait between two reads of `/proc/buddyinfo`. A run faults
 /// huge pages fastest at its start: in perf13b, with reads every 5 ms, the
@@ -146,11 +128,12 @@ const PAGE_BYTES: u64 = 4096;
 /// A file that cannot be read keeps THP on and starts no watcher. The flag
 /// stays set for the whole process and its children.
 ///
-/// Returns false when the run can end on 4 KiB pages (`huge_pages`): THP
-/// is off (the start check turned it off, or it was off already), THP is
-/// `never`, or less than the limit plus `WORKER_HEADROOM` is free in 2 MiB
-/// blocks. `bin/tsgo.rs` then runs the work in a worker process (`launch`).
-/// True otherwise, also when a file cannot be read.
+/// Returns false when the run will get 4 KiB pages (`huge_pages`): THP is
+/// off (the start check turned it off, or it was off already), THP is
+/// `never`, or the check kept THP on (its faults cannot wait for
+/// compaction) with less than the limit free in 2 MiB blocks. `bin/tsgo.rs`
+/// then runs the work in a worker process (`launch`). True otherwise, also
+/// when a file cannot be read.
 pub fn thp_guard() -> bool {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
@@ -222,7 +205,7 @@ pub fn thp_guard() -> bool {
                 } else {
                     ""
                 },
-                if huge { "" } else { ", can end on 4 KiB pages" },
+                if huge { "" } else { ", 4 KiB pages" },
             ),
         );
         huge
@@ -364,15 +347,22 @@ fn start_step(enabled: &str, defrag: &str, free: u64, min_free: u64) -> Start {
 
 /// Whether a run with the start decision `step` ends with its memory on
 /// huge pages, so `bin/tsgo.rs` `launch` needs no worker: THP is on (not
-/// `Off`, not `never`), and `free` (the bytes free in 2 MiB blocks at the
-/// start) is at least `min_free` plus `WORKER_HEADROOM`. With less free,
-/// the run uses up the free blocks early and gets 4 KiB pages after that,
-/// with `Watch` (the watcher turns THP off) and with `Keep` (the faults
-/// fall back).
+/// `Off`, not `never`) and `free` (the bytes free in 2 MiB blocks at the
+/// start) is at least `min_free`. Below it only `Keep` gets here, and its
+/// faults soon fall back to 4 KiB pages.
+///
+/// A `Watch` run gets no worker, also when its watcher will fire soon.
+/// thpguard2 on mini timed a worker against none on the same binary. A
+/// worker is a second process start: 2.0 to 2.4 ms per run (tsgo --version
+/// 3.3 against 5.3 ms). Query core check (32 ms, 58 MiB of huge pages) paid
+/// for it in every memory state: +0.1 to +4.8 ms (up to +13%) with its
+/// watcher set to fire after 8 to 32 MiB of huge pages, +6% to +12% at 0.6
+/// to 1.8 GiB free. T3 Code server was 2% to 12% faster where its watcher
+/// fired, and hono, T3 Code shared and zod 5% to 9% faster with the watcher
+/// set to fire after 8 to 64 MiB. A worker from a free-memory limit above
+/// `min_free` makes small runs pay, so there is none.
 fn huge_pages(step: Start, enabled: &str, free: u64, min_free: u64) -> bool {
-    step != Start::Off
-        && selected_mode(enabled) != Some("never")
-        && free >= min_free.saturating_add(WORKER_HEADROOM)
+    step != Start::Off && selected_mode(enabled) != Some("never") && free >= min_free
 }
 
 /// What the watcher does after one read.
@@ -561,39 +551,27 @@ Node 0, zone   Normal 616681 607866 455781 337376 229283 129647  50350  16747   
         }
     }
 
-    /// The worker rule: the run gets a worker (false) when THP is off or
-    /// `never`, or when less than the limit plus `WORKER_HEADROOM` is free
-    /// in 2 MiB blocks, with the watcher and without it.
+    /// The worker rule: a worker (false) when THP is off or `never`, or
+    /// kept below the limit (`Keep`, where no fault waits). No worker while
+    /// the watcher runs, also just above the limit (thpguard2: small runs
+    /// pay for it there).
     #[test]
-    fn huge_pages_is_false_within_the_worker_headroom() {
+    fn huge_pages_is_false_only_where_the_run_starts_on_4_kib_pages() {
         let limit = DEFAULT_MIN_FREE_MIB * MIB;
         let madvise = "always [madvise] never\n";
         let always = "[always] madvise never\n";
         let never = "always madvise [never]\n";
-        // THP off at the start: always a worker.
-        assert!(!huge_pages(Start::Off, madvise, 0, limit));
-        assert!(!huge_pages(Start::Off, madvise, u64::MAX, limit));
-        for step in [Start::Watch, Start::Keep] {
-            for enabled in [madvise, always] {
-                // Up to 16 MiB above the limit: a worker. Below the limit
-                // only `Keep` gets here (THP stays on where no fault waits).
-                assert!(!huge_pages(step, enabled, 0, limit));
-                assert!(!huge_pages(step, enabled, limit, limit));
-                assert!(!huge_pages(step, enabled, 80 * MIB - 1, limit));
-                // More free: no worker. thpguard2: query core check paid
-                // up to 4.8 ms with 32 MiB of headroom, 8% to 14% with 64
-                // MiB or more.
-                assert!(huge_pages(step, enabled, 80 * MIB, limit));
-                assert!(huge_pages(step, enabled, 96 * MIB, limit));
-                assert!(huge_pages(step, enabled, 1018 * MIB, limit));
-                assert!(huge_pages(step, enabled, u64::MAX, limit));
-                // Another limit (`GOPORT_THP_GUARD_MIB=256`) moves it.
-                let other = 256 * MIB;
-                assert!(!huge_pages(step, enabled, 272 * MIB - 1, other));
-                assert!(huge_pages(step, enabled, 272 * MIB, other));
-            }
-            assert!(!huge_pages(step, never, u64::MAX, limit));
+        for free in [0, limit, u64::MAX] {
+            assert!(!huge_pages(Start::Off, madvise, free, limit));
+            assert!(!huge_pages(Start::Keep, never, free, limit));
         }
+        for free in [limit, limit + 10 * MIB, 1018 * MIB, u64::MAX] {
+            assert!(huge_pages(Start::Watch, madvise, free, limit));
+            assert!(huge_pages(Start::Keep, always, free, limit));
+        }
+        // cup2 with the hog (thpfault1): 10 to 22 MiB free, THP kept.
+        assert!(!huge_pages(Start::Keep, always, 20 * MIB, limit));
+        assert!(!huge_pages(Start::Keep, always, limit - 1, limit));
         // A text that does not parse keeps THP on.
         assert!(huge_pages(Start::Keep, "madvise", u64::MAX, limit));
     }
