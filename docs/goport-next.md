@@ -9,7 +9,9 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 - **Public issues first (Theo, 2026-10-07).** Check `scripts/goport/gh-inbox.py list` every 2 hours. A real incompatibility that a user reports goes before perf work. Upstream issues get the `upstream issue` label and wait for a pin bump.
 - **int53 (after the R181 accept).** Lanes with a passed skeptic: memper1 46f9546f4, followups34 727abf2e5; infmemo1, propfilt1 and cfcache1 when their skeptics pass; PGO training C (`pgotrain2/build-release-C.diff`, both timing sides on the same training). Its checks step also runs `scripts/goport/macos-like-test.sh`.
 - **extrabat181 and followups35** (the R181 reviewer and auditor items), after the R181 accept.
-- **rr.py side order.** Interleave or shuffle the sides: on cup2 sys time grows with the run position after Go (int52 skeptic problem 2). Tooling, light path.
+- **rr.py side order.** Interleave or shuffle the sides: on cup2 sys time grows with the run position after Go (int52 skeptic problem 2). The int53 prompt asks for interleaved sides; copy the fixed rr.py into `scripts/goport/` after int53.
+- **K2 node-redis check (compatsweep3).** Run `studies/compatsweep3/repros/redis-sig/run.sh` with the k2gaps1 head on a remote host after k2gaps1 ends.
+- **bwsig1 reviewer items (R181 item 2).** A test of the `.json` half (M5); drop the `watch_sources` entries of written paths when `build_all_tasks` ends. They are in `execute/build/*`, so they wait for k2gaps1.
 - **parsefast1 with the AST memory work (memast).** Waits for a design note.
 - **lschk1 redesign.** Parked.
 
