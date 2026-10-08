@@ -8,6 +8,8 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 - **Public issues first (Theo, 2026-10-07).** Check `scripts/goport/gh-inbox.py list` every 2 hours. A real incompatibility that a user reports goes before perf work. Upstream issues get the `upstream issue` label and wait for a pin bump.
 - **int53 (after the R181 accept).** Lanes with a passed skeptic: memper1 46f9546f4, followups34 727abf2e5; infmemo1, propfilt1 and cfcache1 when their skeptics pass; PGO training C (`pgotrain2/build-release-C.diff`, both timing sides on the same training). Its checks step also runs `scripts/goport/macos-like-test.sh`.
+- **bump D wave 0 fix 2 (before wave 3).** LSP answer set at N' (hono auto-import keys vary more than 13 recordings show: re-record full b1-hono and b2-hono batteries or a masked autoImport rule with a reviewer ruling); `check-typechecker-batch.mjs` accepts `"wire": 4` (protected, pin-bump batch); push the N' API goldens to the hosts; batch cites the new name map and golden shas (`upstream/bumpD/w0fix/wf-result.txt`). Start when int53 and int54 timing frees the hosts.
+- **bump D wave 1 (gen).** After int53 and int54 are in main (`upstream/bumpD/plan.md` section 6).
 - **extrabat181 and followups35** (the R181 reviewer and auditor items), after the R181 accept.
 - **rr.py side order.** Interleave or shuffle the sides: on cup2 sys time grows with the run position after Go (int52 skeptic problem 2). The int53 prompt asks for interleaved sides; copy the fixed rr.py into `scripts/goport/` after int53.
 - **K2 node-redis check (compatsweep3).** Run `studies/compatsweep3/repros/redis-sig/run.sh` with the k2gaps1 head on a remote host after k2gaps1 ends.
