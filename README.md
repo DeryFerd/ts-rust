@@ -199,12 +199,14 @@ The scripts are in [scripts/bench-apps](scripts/bench-apps): `setup.sh <dir>`, t
 
 - In some monorepos, the source files of a workspace package are reachable both through
   `node_modules` and through a direct import. There, `tsc-rs` can write output for more of those
-  files than `tsc` does.
+  files than `tsc` does, and report TS6059 (file is not under `rootDir`) for them. `tsc` decides
+  this by timing, so its own result changes between runs. `tsc-rs` gives the same result in every
+  run (the result of TypeScript 6).
 - In `tsc -b`, when one project imports the output of another project without a project reference,
-  `tsc-rs` can report TS2307 (cannot find module) where `tsc` happens to build the other project
-  first. Add the reference to fix it.
-- `tsc -b --watch` can stop with an internal error (exit code 70) after some edits.
-- In the editor, memory grows slowly during long edit sessions.
+  `tsc-rs` can read the old or missing output (TS2305 or TS2307) where `tsc` reads the new one.
+  This happens when the projects only need to write their outputs. Add the reference to fix it.
+- In the editor, memory grows slowly during long edit sessions (about 20 MiB per 1,000 edits). It
+  stays below `tsc`'s in the sessions we measured.
 - `tsc-rs --version` prints the TypeScript version that it ports (7.1.0-dev), not the npm
   version. The compiler matches `typesVersions` against it.
 
