@@ -22,10 +22,12 @@ use ts_goport::api::{
     GetDefaultProjectForFileParams, GetDiagnosticsParams, GetProjectDiagnosticsParams,
     SnapshotRequestChangesParams,
 };
+use ts_goport::diagnostics::Category;
 use ts_goport::effect::{diag, rulerunner};
 use ts_goport::execute::incremental::build_info::build_info_version;
 use ts_goport::execute::incremental::incremental::parse_build_info;
 use ts_goport::execute::tsc::ExitStatus;
+use ts_goport::ls::diagnostics::get_all_diagnostics;
 use ts_goport::program::ls_program;
 
 use super::api_util::{doc, nil_error};
@@ -147,6 +149,105 @@ child_test! {
         );
         session.close();
         project_session.close();
+    }
+}
+
+const UNUSED_CONFIG: &str = "/home/projects/u/tsconfig.json";
+const UNUSED_INDEX: &str = "/home/projects/u/index.ts";
+/// The plugin and no noUnusedLocals or noUnusedParameters: the unused check
+/// gives only suggestions.
+const UNUSED_CONFIG_TEXT: &str =
+    r#"{"compilerOptions":{"strict":true,"plugins":[{"name":"@effect/language-service"}]}}"#;
+/// Two type-predicate parameters that the code never reads.
+const UNUSED_INDEX_TEXT: &str = "export const isString = (value: string | number): value is string => true;\nexport function isNumber(input: unknown): input is number {\n    return true;\n}\n";
+
+const TS6133: i32 = 6133;
+
+/// The TS6133 suggestions for `value` and `input`: code, start and
+/// category.
+fn unused_parameter_suggestions() -> Vec<(i32, i32, Category)> {
+    ["value", "input"]
+        .iter()
+        .map(|name| {
+            let pos = UNUSED_INDEX_TEXT.find(name).expect("the parameter");
+            let pos = i32::try_from(pos).expect("an i32 position");
+            (TS6133, pos, Category::Suggestion)
+        })
+        .collect()
+}
+
+// effectfix1: the Effect rules run after the unused check. Their type
+// queries mark a type-predicate parameter referenced, so before the fix a
+// later suggestion request lost its TS6133 (the reference does too). The
+// language server asks for the semantic diagnostics first.
+child_test! {
+    fn language_server_reports_unused_type_predicate_parameters() {
+        let (project_session, _) = projecttestutil::setup(files(&[
+            (UNUSED_CONFIG, UNUSED_CONFIG_TEXT),
+            (UNUSED_INDEX, UNUSED_INDEX_TEXT),
+        ]));
+        open(&project_session, &format!("file://{UNUSED_INDEX}"), UNUSED_INDEX_TEXT);
+        let p = program(&project_session, &format!("file://{UNUSED_INDEX}"));
+        let file = p.get_source_file(UNUSED_INDEX).expect("index.ts");
+        // The document diagnostics of the language server (Go
+        // `getAllDiagnostics`): syntactic, semantic, then suggestion.
+        let mut diagnostics: Vec<(i32, i32, Category)> =
+            get_all_diagnostics(&projecttestutil::with_request_id(&bg()), &p, file.root)
+                .iter()
+                .map(|d| (d.code(), d.pos(), d.category()))
+                .collect();
+        diagnostics.sort_by_key(|&(_, pos, _)| pos);
+        assert_eq!(diagnostics, unused_parameter_suggestions());
+        project_session.close();
+    }
+}
+
+// The same through the API, with the rules (`TSGO_EFFECT_API=1`):
+// getSemanticDiagnostics, then getSuggestionDiagnostics.
+child_test! {
+    env &[("TSGO_EFFECT_API", "1")];
+    fn standalone_api_with_effect_api_reports_unused_type_predicate_parameters() {
+        let (init, _) = projecttestutil::get_session_init_options(
+            files(&[(UNUSED_CONFIG, UNUSED_CONFIG_TEXT), (UNUSED_INDEX, UNUSED_INDEX_TEXT)]),
+            None,
+            TypingsInstallerOptions::default(),
+        );
+        let session = api::new_standalone_session(&init, None);
+        let ctx = bg();
+        let snapshot = nil_error(session.handle_create_snapshot(
+            &ctx,
+            &CreateSnapshotParams {
+                snapshot_request_changes_params: SnapshotRequestChangesParams {
+                    open_projects: vec![doc(UNUSED_CONFIG)],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ))
+        .snapshot;
+        let project = nil_error(session.handle_get_default_project_for_file(
+            &ctx,
+            &GetDefaultProjectForFileParams {
+                snapshot,
+                file: doc(UNUSED_INDEX),
+            },
+        ))
+        .expect("a default project")
+        .id;
+        let params = GetDiagnosticsParams {
+            snapshot,
+            project,
+            files: Some(vec![doc(UNUSED_INDEX)]),
+        };
+        assert_eq!(nil_error(session.handle_get_semantic_diagnostics(&ctx, &params)), vec![]);
+        let mut suggestions: Vec<(i32, i32, Category)> =
+            nil_error(session.handle_get_suggestion_diagnostics(&ctx, &params))
+                .iter()
+                .map(|d| (d.code, d.pos, d.category))
+                .collect();
+        suggestions.sort_by_key(|&(_, pos, _)| pos);
+        assert_eq!(suggestions, unused_parameter_suggestions());
+        session.close();
     }
 }
 
