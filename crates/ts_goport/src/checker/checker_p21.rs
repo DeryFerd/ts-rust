@@ -628,7 +628,7 @@ impl Checker {
             {
                 return false;
             }
-            self.build_augment_filter(slot, g);
+            self.build_augment_filter(g);
         }
         !augment_filter_has(&self.augment_filters.bits[slot], bits)
     }
@@ -650,23 +650,37 @@ impl Checker {
     /// set builds again.
     #[inline]
     fn augment_members_set(&mut self, t: TypeId) {
-        let globals = self.augment_globals();
-        if globals.contains(&t) {
-            for (slot, g) in globals.into_iter().enumerate() {
-                if g == t {
-                    self.build_augment_filter(slot, t);
-                }
+        if self.augment_globals().contains(&t) {
+            self.build_augment_filter(t);
+        }
+    }
+
+    /// Builds again the filters that are built, from the current tables of
+    /// their types. Go `mergeModuleAugmentation` can add names in place to
+    /// the members map of Object or Function (`mergeSymbol`, checker.go:1484
+    /// and :14414), and a type with no late bound members has that map as
+    /// its members (`combineSymbolTables` returns it, :14331-14336).
+    /// `initialize_checker` calls this after each module augmentation
+    /// merge. No Go counterpart.
+    pub fn rebuild_augment_filters(&mut self) {
+        let of = self.augment_filters.of;
+        self.augment_filters = AugmentFilters::default();
+        for (slot, g) in of.into_iter().enumerate() {
+            if g.is_some() && self.augment_filters.of[slot] != g {
+                self.build_augment_filter(g);
             }
         }
     }
 
-    /// Builds the filter of `g` in `slot` from its members table, and the
-    /// union when all 4 are built. `g` is resolved, or not an object type:
-    /// then it has no table (Go `getPropertyOfObjectType` gives nil for
-    /// it), and its filter is empty.
+    /// Builds the filter of `g` from its members table, in each slot of
+    /// `g` (with `strictBindCallApply` off, the 3 function slots are all
+    /// Function), and the union when all 4 slots are built. `g` is
+    /// resolved, or not an object type: then it has no table (Go
+    /// `getPropertyOfObjectType` gives nil for it), and its filter is
+    /// empty.
     #[cold]
     #[inline(never)]
-    fn build_augment_filter(&mut self, slot: usize, g: TypeId) {
+    fn build_augment_filter(&mut self, g: TypeId) {
         let mut bits = [0u64; 4];
         let ty = self.ty(g);
         if ty.flags.intersects(TypeFlags::OBJECT) {
@@ -678,8 +692,12 @@ impl Checker {
         }
         let globals = self.augment_globals();
         let filters = &mut self.augment_filters;
-        filters.of[slot] = g;
-        filters.bits[slot] = bits;
+        for (slot, global) in globals.into_iter().enumerate() {
+            if global == g {
+                filters.of[slot] = g;
+                filters.bits[slot] = bits;
+            }
+        }
         filters.all = None;
         if filters.of == globals {
             let mut all = [0u64; 4];
@@ -2424,5 +2442,187 @@ type T2 = new () => {};
                 );
             }
         });
+    }
+
+    /// The source of `n` names `{prefix}0` to `{prefix}{n-1}` that a module
+    /// augmentation adds to `iface`, and of an assignment of `value` to a
+    /// type with each name, which needs the name on the apparent type of
+    /// `value`.
+    fn late_members(iface: &str, prefix: &str, value: &str) -> (String, String) {
+        let decls = (0..40)
+            .map(|i| format!("  interface {iface} {{ {prefix}{i}: number }}\n"))
+            .collect();
+        let uses = (0..40)
+            .map(|i| format!("const s{i}: {{ {prefix}{i}: number }} = {value};\n"))
+            .collect();
+        (decls, uses)
+    }
+
+    /// Checks `a.ts` of `files` with `options` and the commonjs module.
+    /// Gives the codes of `a.ts`, the types that the 4 slots hold, and
+    /// whether the union is built.
+    fn check_augmentation(
+        files: &[(&str, String)],
+        options: &str,
+    ) -> (Vec<i32>, [TypeId; 4], [TypeId; 4], bool) {
+        let options = format!(r#"{options}, "module": "commonjs""#);
+        with_checked_a(files, &options, |c, codes, _| {
+            let filters = c.augment_filters;
+            (
+                codes,
+                filters.of,
+                c.augment_globals(),
+                filters.all.is_some(),
+            )
+        })
+    }
+
+    /// `x.ts` with an `export=` whose check resolves Object (and with
+    /// `calls`, the function types), so their filters are built in the
+    /// module augmentation loop of `initialize_checker`.
+    fn x_ts(calls: bool) -> (&'static str, String) {
+        let text = if calls {
+            r#"declare function f(): void;
+declare class C {}
+declare const p: { a: number };
+const o = { r1: f.call, r2: C.apply, r3: p.toString, r4: p.missingX };
+export = o.r1;
+"#
+        } else {
+            r#"declare const p: { a: number };
+const o = { r3: p.toString };
+export = o.r3;
+"#
+        };
+        ("x.ts", text.to_string())
+    }
+
+    fn g_ts() -> (&'static str, String) {
+        ("g.ts", "export = globalThis;\n".to_string())
+    }
+
+    /// The augmentation of `./x` resolves Object, then the augmentation of
+    /// `./g` (`export = globalThis`) adds 3 names to the members of the
+    /// merged Object in place (Go `mergeSymbol`, checker.go:1484 and
+    /// :14414). The filter is built again with them.
+    #[test]
+    fn filter_follows_augmentation_merged_into_object() {
+        let a = r#"import "./x";
+import "./g";
+declare global { interface Object { a1: number } }
+declare module "./x" { interface Q {} }
+declare module "./g" { interface Object { late1: number; late2: number; late3: number } }
+declare const p2: { b: number };
+const s1: { late1: number } = p2;
+const s2 = p2["late2"];
+const s3: { late3: number } = p2;
+"#;
+        let files = [("a.ts", a.to_string()), x_ts(false), g_ts()];
+        let (codes, of, globals, _) = check_augmentation(&files, STRICT);
+        // Go N gives only TS2671 for `./x`.
+        assert_eq!(codes, [2671]);
+        assert_eq!(of[AUGMENT_OBJECT], globals[AUGMENT_OBJECT]);
+    }
+
+    /// As above with 40 names, after the check of `./x` resolved all 4
+    /// types, so lookups test the union.
+    #[test]
+    fn union_follows_augmentation_merged_into_object() {
+        let (decls, uses) = late_members("Object", "zq", "p2");
+        let reads: Vec<String> = (0..40).map(|i| format!("p2[\"zq{i}\"]")).collect();
+        let a = format!(
+            r#"import "./x";
+import "./g";
+declare global {{
+  interface Object {{ a1: number }}
+  interface Function {{ f1: number }}
+}}
+declare module "./x" {{ interface Q {{ q: number }} }}
+declare module "./g" {{
+{decls}}}
+declare const p2: {{ b: number }};
+export const r = [{}];
+{uses}"#,
+            reads.join(", ")
+        );
+        let files = [("a.ts", a), x_ts(true), g_ts()];
+        let (codes, of, globals, all) = check_augmentation(&files, STRICT);
+        // Go N gives only TS2671 for `./x` (and TS2339 in `x.ts`).
+        assert_eq!(codes, [2671]);
+        assert_eq!(of, globals);
+        assert!(all);
+    }
+
+    /// As above when only Object is resolved, so lookups test its filter
+    /// alone.
+    #[test]
+    fn object_filter_follows_augmentation_merged_into_object() {
+        let (decls, uses) = late_members("Object", "zq", "p2");
+        let a = format!(
+            r#"import "./x";
+import "./g";
+declare global {{ interface Object {{ a1: number }} }}
+declare module "./x" {{ interface Q {{ q: number }} }}
+declare module "./g" {{
+{decls}}}
+declare const p2: {{ b: number }};
+{uses}"#
+        );
+        let files = [("a.ts", a), x_ts(false), g_ts()];
+        let (codes, of, globals, all) = check_augmentation(&files, STRICT);
+        // Go N gives only TS2671 for `./x`.
+        assert_eq!(codes, [2671]);
+        assert_eq!(of[AUGMENT_OBJECT], globals[AUGMENT_OBJECT]);
+        assert!(!all);
+    }
+
+    /// The augmentation adds 40 names to Function. With the es5 lib and
+    /// `strictBindCallApply` off, the 3 function slots are all Function.
+    #[test]
+    fn function_filter_follows_augmentation_merged_into_function() {
+        let (decls, uses) = late_members("Function", "fq", "f2");
+        let a = format!(
+            r#"import "./x";
+import "./g";
+declare global {{ interface Function {{ f1: number }} }}
+declare module "./x" {{ interface Q {{ q: number }} }}
+declare module "./g" {{
+{decls}}}
+declare function f2(): void;
+{uses}"#
+        );
+        let (_, x) = x_ts(true);
+        let x = x.replace("export =", "const t1: { fx1: number } = f;\nexport =");
+        let files = [("a.ts", a), ("x.ts", x), g_ts()];
+        let options = r#""strict": true, "strictBindCallApply": false, "target": "es2015", "lib": ["es5"], "types": []"#;
+        let (codes, of, globals, _) = check_augmentation(&files, options);
+        // Go N gives only TS2671 for `./x` (and TS2322 and TS2339 in
+        // `x.ts`).
+        assert_eq!(codes, [2671]);
+        assert_eq!(globals[..3], [globals[AUGMENT_FUNCTION]; 3]);
+        assert_eq!(of[..3], globals[..3]);
+    }
+
+    /// The augmented module is ambient: `declare module "glob" { export =
+    /// globalThis; }`.
+    #[test]
+    fn filter_follows_augmentation_of_ambient_module() {
+        let (decls, uses) = late_members("Object", "zq", "p2");
+        let a = format!(
+            r#"import "./x";
+import "glob";
+declare global {{ interface Object {{ a1: number }} }}
+declare module "./x" {{ interface Q {{ q: number }} }}
+declare module "glob" {{
+{decls}}}
+declare const p2: {{ b: number }};
+{uses}"#
+        );
+        let ambient = r#"declare module "glob" { export = globalThis; }"#;
+        let files = [("amb.d.ts", ambient.to_string()), ("a.ts", a), x_ts(false)];
+        let (codes, of, globals, _) = check_augmentation(&files, STRICT);
+        // Go N gives only TS2671 for `./x`.
+        assert_eq!(codes, [2671]);
+        assert_eq!(of[AUGMENT_OBJECT], globals[AUGMENT_OBJECT]);
     }
 }

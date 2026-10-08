@@ -1003,8 +1003,9 @@ pub struct Checker {
     pub global_newable_function_type: TypeId,
     /// PERF (propfilt1): `get_property_of_type_ex`'s filters of the member
     /// names of the 4 types above (`augment_lookups_miss`). A type's filter
-    /// is built once it is resolved, and dropped when its members change
-    /// (`drop_augment_filter_of`).
+    /// is built when its members are set (`augment_members_set`), dropped
+    /// at the base types reset (`drop_augment_filter_of`), and built again
+    /// after each module augmentation merge (`rebuild_augment_filters`).
     pub augment_filters: AugmentFilters,
     pub global_array_type: TypeId,
     pub global_readonly_array_type: TypeId,
