@@ -529,6 +529,12 @@ The batch that adds it is not accepted until Theo approves.
   does not change, no watch event names it and no build of the cycle
   wrote it (`BuildHost::watch_source_file`, as Go `tsc --watch` keeps its
   files), so a cycle parses only the changed files, on the loading thread.
+  A `.d.ts` or `.json` file still comes through `source_files` (Go
+  `sourceFiles`) first, which keeps the first parse of a cycle until the
+  cycle ends, as in Go: a project that builds beside an upstream project
+  (no reference) can read the upstream `.d.ts` before that build writes
+  it, and a downstream project of the same cycle then gets the old parse
+  (bwsig1, `build_watch_keeps_the_first_dts_parse_of_a_cycle`).
   A config change keeps the parses too: their key holds the parse options,
   and a parse with other module indicator options that it did not read is
   kept as a copy, as in `tsc --watch`
