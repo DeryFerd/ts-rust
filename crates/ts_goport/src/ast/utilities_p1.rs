@@ -294,6 +294,13 @@ pub fn next_ids() -> (u64, u64) {
     )
 }
 
+/// Skips `count` symbol ids on this thread: the next id is `count` higher.
+/// A checker worker skips the ids that the other checkers of its pool gave
+/// as they were made (`program::new_pool_checker`).
+pub fn skip_symbol_ids(count: u64) {
+    NEXT_SYMBOL_ID.with(|next| next.set(next.get() + count));
+}
+
 /// Makes `seed` the id state of this thread.
 pub fn install_id_seed(seed: IdSeed) {
     NEXT_NODE_ID.with(|next| next.set(seed.next_node_id));
