@@ -14,6 +14,9 @@
 //! each check a project again after the other (int50b skeptic problem 1).
 //! The tests act as tsc in the same process with the flag reset
 //! (`rulerunner::clear_api_process`).
+//!
+//! A test of the standalone API without the rules sets `TSGO_EFFECT_API=0`
+//! in its child, so it also passes when the parent has `TSGO_EFFECT_API=1`.
 
 use std::rc::Rc;
 
@@ -104,6 +107,7 @@ fn standalone_codes() -> (Vec<i32>, Vec<i32>) {
 }
 
 child_test! {
+    env &[("TSGO_EFFECT_API", "0")];
     fn standalone_api_answers_without_effect_rules() {
         assert_eq!(standalone_codes(), (vec![TS2322], vec![]));
     }
@@ -318,6 +322,7 @@ fn effect_build_info() -> (String, bool) {
 }
 
 child_test! {
+    env &[("TSGO_EFFECT_API", "0")];
     fn standalone_api_build_writes_plain_build_info() {
         let (session, utils) = build_session();
         assert_eq!(build(&session), (ExitStatus::Success, vec![]));
@@ -336,6 +341,7 @@ child_test! {
 }
 
 child_test! {
+    env &[("TSGO_EFFECT_API", "0")];
     fn standalone_api_build_checks_tsc_build_info_again() {
         let (session, utils) = build_session();
         rulerunner::clear_api_process();
