@@ -1036,6 +1036,9 @@ pub struct Checker {
     pub flow_analysis_disabled: bool,
     pub flow_invocation_count: i32,
     pub flow_type_cache: FxHashMap<Node, TypeId>,
+    /// PERF (cfcache1, not in Go): `get_control_flow_container`'s memo, a
+    /// direct-mapped table of (node, container). A nil key is an empty slot.
+    pub control_flow_containers: Box<[(Node, Node); CONTROL_FLOW_CONTAINER_SLOTS]>,
     pub last_flow_node: FlowNodeId,
     pub last_flow_node_reachable: bool,
     pub flow_node_reachable: FxHashMap<FlowNodeId, bool>,
@@ -1541,6 +1544,9 @@ impl Checker {
             flow_analysis_disabled: false,
             flow_invocation_count: 0,
             flow_type_cache: FxHashMap::default(),
+            control_flow_containers: Box::new(
+                [(Node::NIL, Node::NIL); CONTROL_FLOW_CONTAINER_SLOTS],
+            ),
             last_flow_node: FlowNodeId::NIL,
             last_flow_node_reachable: false,
             flow_node_reachable: FxHashMap::default(),
