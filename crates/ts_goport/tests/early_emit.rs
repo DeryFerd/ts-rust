@@ -19,6 +19,10 @@
 //! `tsconfig.rules.json` (the same config with `"exclude": []`): without an
 //! `exclude`, the config excludes `outDir` and `declarationDir` from its
 //! files, so no program file would be inside them.
+//!
+//! The emit-only test makes its own `tsc -b` solution in a scratch dir: a
+//! task with nothing to check must emit on its checker threads too, so it
+//! finishes when its own emit ends, as a Go builder does.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -129,6 +133,97 @@ fn build_early_emit_writes_what_the_barrier_writes() {
         barrier.files.keys()
     );
     assert_eq!(early, barrier, "the early emit against the barrier");
+    fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
+}
+
+/// K2 (tscbemit1). `tsc -b --builders 2` on the solution p1 p2 p3, with no
+/// references. Only the emits of p1 and p2 are pending (`--noEmit` builds
+/// after an edit checked them): p1 is one root with a large emit, p2 a small
+/// writer whose new output adds `v2`, and p3 imports `v2` from p2's output.
+/// A Go builder writes its task's outputs when the task's emit ends, so p2
+/// ends first, its builder takes p3, and p3 loads after p2 wrote: exit 0,
+/// no output (Go N gives that). Before tscbemit1 a task with nothing to
+/// check emitted on the loading thread when it finished, so p1 and p2
+/// finished in build order and p3 loaded before p2 wrote (TS2305).
+#[test]
+fn build_emit_only_task_finishes_when_its_emit_ends() {
+    let root = scratch_dir();
+    let write = |path: &str, text: &str| {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().expect("a file in a project"))
+            .unwrap_or_else(|error| panic!("create the dir of {}: {error}", path.display()));
+        fs::write(&path, text).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+    };
+    let tsgo_b = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tsgo"))
+            .current_dir(&root)
+            .arg("-b")
+            .args(args)
+            .args(["--pretty", "false"])
+            .env("GOPORT_EARLY_EMIT", "1")
+            .output()
+            .expect("run tsgo -b")
+    };
+    // The code of 1,500 modules in one file: its emit takes far longer than
+    // the load and emit of p2.
+    let big = |tag: &str| {
+        use std::fmt::Write as _;
+        let mut text = String::new();
+        for i in 0..1500 {
+            write!(
+                text,
+                "export interface I{i} {{ a: number; b: string; c{i}: boolean }}\n\
+                 export function f{i}(x: I{i}): I{i} {{ return {{ ...x }}; }}\n\
+                 export class C{i} {{ constructor(public v: I{i}) {{}} get(): I{i} {{ return f{i}(this.v); }} }}\n\
+                 export const k{i}: number = {i}; // {tag}\n"
+            )
+            .expect("write to a String");
+        }
+        text
+    };
+    let config = r#"{"compilerOptions": {"composite": true, "strict": true, "target": "es2022",
+  "module": "esnext", "moduleResolution": "bundler", "outDir": "dist", "rootDir": "src",
+  "skipLibCheck": true}, "include": ["src"]}"#;
+    write(
+        "tsconfig.json",
+        r#"{"files": [], "references": [{"path": "./p1"}, {"path": "./p2"}, {"path": "./p3"}]}"#,
+    );
+    for project in ["p1", "p2", "p3"] {
+        write(&format!("{project}/tsconfig.json"), config);
+    }
+    write("p1/src/index.ts", &big("v1"));
+    write("p2/src/s0.ts", "export const s0 = 0;\n");
+    write("p2/src/s1.ts", "export const s1 = 1;\n");
+    write("p2/src/index.ts", "export const v1 = 1;\n");
+    write(
+        "p3/src/a.ts",
+        "import { v1, v2 } from \"../../p2/dist/index\";\nexport const a = v1 + v2;\n",
+    );
+    // The cold build: p3 cannot see `v2` yet.
+    tsgo_b(&["tsconfig.json"]);
+    write("p1/src/index.ts", &big("v2"));
+    write(
+        "p2/src/index.ts",
+        "export const v1 = 1;\nexport const v2 = 2;\n",
+    );
+    for project in ["p1", "p2"] {
+        let output = tsgo_b(&[project, "--noEmit"]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "tsc -b {project} --noEmit: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    let output = tsgo_b(&["tsconfig.json", "--builders", "2"]);
+    assert_eq!(
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        ),
+        (Some(0), String::new()),
+        "p2 finishes before p1, so p3 loads after p2 wrote v2"
+    );
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
 }
 

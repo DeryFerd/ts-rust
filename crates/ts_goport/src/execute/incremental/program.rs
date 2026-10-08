@@ -455,11 +455,11 @@ impl Program {
 
     /// PORT: not in Go (perf). After `start_check`: when the options allow
     /// an early emit (`early_emit_options_allow`), `start_check` sent a
-    /// check and the check cannot see the outputs
-    /// (`check_cannot_see_outputs`), sends the rest of the checker work of
-    /// `tsc.EmitFilesAndReportErrors` without a wait: the emit of the
-    /// affected files with `options` (`start_emit_files`; since ts#64452 Go
-    /// reads no global diagnostics after the check of an incremental
+    /// check or found nothing to check, and the check cannot see the
+    /// outputs (`check_cannot_see_outputs`), sends the rest of the checker
+    /// work of `tsc.EmitFilesAndReportErrors` without a wait: the emit of
+    /// the affected files with `options` (`start_emit_files`; since ts#64452
+    /// Go reads no global diagnostics after the check of an incremental
     /// program). Else it does nothing. `start_check_and_emit`
     /// (`tsc -p`) calls it. `tsc -b` calls it right after `start_check` in
     /// `BuildTask::compile_and_emit_start`, inside
@@ -467,15 +467,34 @@ impl Program {
     /// `compile_and_emit_finish`. In tests `tsc -b` calls it in
     /// `BuildTask::compile_and_emit_finish`, right before
     /// `EmitAndReportStatistics`.
+    ///
+    /// "Nothing to check": the global diagnostics are empty and every
+    /// program file has cached semantic diagnostics, so Go's
+    /// `collectSemanticDiagnosticsOfAffectedFiles` returns before a check
+    /// and only the emit is left. The emit is then the program's only
+    /// checker work, and `tsc -b` finishes the task when that emit ends
+    /// (`BuildTask::notify_when_compiled`), as Go's task goroutine writes
+    /// when its own emit ends (tscbemit1). Without it, the emit ran in
+    /// `compile_and_emit_finish` and such tasks finished in build order.
     pub fn start_emit(&self, options: EmitOptions) {
         debug_assert!(
             self.started.borrow().emit.is_none(),
             "start_emit: the emit already started"
         );
+        let check_started_or_nothing_to_check = {
+            let started = self.started.borrow();
+            started.check.is_some()
+                || (started
+                    .global_diagnostics
+                    .as_ref()
+                    .is_some_and(Vec::is_empty)
+                    && self.snapshot.borrow().semantic_diagnostics_per_file.len()
+                        == source_files().len())
+        };
         // The file rules read every program file: the checkers check
-        // meanwhile.
+        // meanwhile (when a check started).
         if !early_emit_options_allow()
-            || self.started.borrow().check.is_none()
+            || !check_started_or_nothing_to_check
             || !self.snapshot.borrow().can_use_incremental_state()
             || !check_cannot_see_outputs()
         {
