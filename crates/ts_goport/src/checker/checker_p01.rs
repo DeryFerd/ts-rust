@@ -1144,6 +1144,8 @@ pub struct Checker {
         FxHashMap<(SymbolTable, SymbolId), Option<crate::checker::checker_p24::NamedMembersOrder>>,
     /// PERF: not in Go. See `MatchingReferenceMemo`.
     pub(crate) matching_reference_memo: crate::checker::flow_p2::MatchingReferenceMemo,
+    /// flowskip1: the index and state of the flow walk skip (flow_skip.rs).
+    pub flow_skip: crate::checker::flow_skip::FlowSkip,
     /// PERF: not in Go. Counts the merges (`merge_symbol` and
     /// `record_merged_symbol`), so a memo of a merged symbol or of the flags
     /// a merge adds knows when to read them again (`MatchingReferenceMemo`,
@@ -1633,6 +1635,7 @@ impl Checker {
             named_members_orders: FxHashMap::default(),
             alternative_module_import_misses: FxHashSet::default(),
             matching_reference_memo: Default::default(),
+            flow_skip: Default::default(),
             merge_version: 0,
             symbols,
             types: ChunkedArena::with_nil(Type::default()),

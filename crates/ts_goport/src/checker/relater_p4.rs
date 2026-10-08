@@ -847,18 +847,15 @@ impl Checker {
     }
 
     // Go: checker/relater.go:3212 getErrorState
-    // PORT: perf. `related_info` is almost always empty; `Vec::new()` then
-    // skips the out-of-line `Vec::clone` call.
+    // PERF: both fields are shared (`RelatedInfo`), so the state and each
+    // copy of it copy two pointers, as Go copies a chain pointer and a slice
+    // header. Before, each state copied and dropped a `Vec<Diagnostic>`.
     #[inline]
     pub fn get_error_state(&self, r: &Rc<RefCell<Relater>>) -> ErrorState {
         let rb = r.borrow();
         ErrorState {
             error_chain: rb.error_chain.clone(),
-            related_info: if rb.related_info.is_empty() {
-                Vec::new()
-            } else {
-                rb.related_info.clone()
-            },
+            related_info: rb.related_info.clone(),
         }
     }
 
