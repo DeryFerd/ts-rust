@@ -24,6 +24,13 @@ The code is `crates/ts_goport/src/effect`, a port of
   (not declaration files and not files from `node_modules`). Rule
   severities come from `diagnosticSeverity`, matching `overrides`, and
   `@effect-diagnostics` / `@effect-diagnostics-next-line` comments.
+- The rules run once per file, after the unused-identifier check. The
+  reference runs them before it, inside `checkSourceFile`. Their type
+  queries can mark a name referenced (the parameter of an `x is T` type
+  predicate), so the reference loses that TS6133. With the plugin, the
+  unused check always runs first. Without `noUnusedLocals` and
+  `noUnusedParameters` it adds only suggestions: `tsc` does not print
+  them, and the editor and the API show them.
 - Effect errors and warnings fail `tsc`. Suggestions print and do not fail
   (`ignoreEffect{Errors,Warnings,Suggestions}InTscExitCode`).
   `@ts-ignore` does not hide Effect diagnostics.
@@ -33,7 +40,9 @@ The code is `crates/ts_goport/src/effect`, a port of
   Plain tsgo and tsc-rs without the plugin then check the project again
   instead of reading Effect diagnostics (plain tsgo panics on those:
   "Unknown diagnostic message"). The language server shows the same
-  diagnostics.
+  diagnostics. `tsc -v`, `tsc --help` and the language server's
+  `serverInfo` print the plain version; effect-tsgo prints
+  `<version>+effect-tsgo.0.46.1` there.
 - With no plugin entry, nothing runs. An entry with only a `name` runs every
   rule at its default severity. `"diagnostics": false` or
   `"diagnosticSeverity": null` turns the rules off.
@@ -41,7 +50,8 @@ The code is `crates/ts_goport/src/effect`, a port of
 ## Where it hooks in
 
 Each site names the reference patch it ports (`_patches/typescript/NNN-*`):
-`checker_p03.rs` (after `checkSourceFile`), `relater_p5.rs` (relation
+`checker_p03.rs` (in `checkSourceFile`, after the unused check, once per
+file), `relater_p5.rs` (relation
 errors), `program.rs` (`@ts-ignore` and `noEmitOnError`),
 `execute/tsc/emit.rs` (exit code), `execute_tsc.rs` (tsc mode),
 `frontend/tsoptions/*` (parse, merge, validate), and
