@@ -15,6 +15,8 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 - **rr.py side order.** Interleave or shuffle the sides: on cup2 sys time grows with the run position after Go (int52 skeptic problem 2). The int53 prompt asks for interleaved sides; copy the fixed rr.py into `scripts/goport/` after int53.
 - **K2 node-redis check (compatsweep3).** Run `studies/compatsweep3/repros/redis-sig/run.sh` with the k2gaps1 head on a remote host after k2gaps1 ends.
 - **bwsig1 reviewer items (R181 item 2).** A test of the `.json` half (M5); drop the `watch_sources` entries of written paths when `build_all_tasks` ends. They are in `execute/build/*`, so they wait for k2gaps1.
+- **jemlayout1 (study, from thpguard2).** On THP `always` hosts (cup2, alvin, zbook) the THP watcher thread's first allocations (argument list, 32 KiB buffer, the thread) give jemalloc a layout with 5 to 25% fewer page faults and about 3% less wall on cup2. The LSP, API, watch mode and `GOPORT_THP_GUARD=0` start no watcher and get the worse layout. Find the mechanism and make the good layout on purpose on every path. Also: hand off the exit unmap with `clone(CLONE_VM)` when the real RSS is known (bin/tsgo.rs). `thpguard2/summary.md`, follow-ups 1 and 2.
+- **thpguard2 (goport-thpguard2 52d2e83cb, skeptic PASS):** docs, refactor and 2 tests only; behavior equal to R181. Take it in a later integration.
 - **parsefast1 with the AST memory work (memast).** Waits for a design note.
 - **lschk1 redesign.** Parked.
 
