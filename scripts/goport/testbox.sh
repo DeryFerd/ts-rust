@@ -8,7 +8,14 @@
 #                                             (e.g. run scripts/run-cargo-capped.sh build --release -p ts_goport --bins).
 #                                             Arguments keep their boundaries; use run bash -c '...' for pipes and &&
 #        testbox.sh get <remote> [local]      copy a file or dir back (remote path relative to the repo root)
+#        testbox.sh push <path>...            copy zbook files or dirs to the same absolute paths (e.g. a bins dir)
+#        testbox.sh seed [inputs|pin]...      copy the files of testbox-data.txt (default both disks) to their
+#                                             sticky disks. They are kept when the testbox stops. Takes about
+#                                             20 minutes with no `run`: warm up with TESTBOX_IDLE=60 first
 #        testbox.sh status | stop | list      the saved testbox's status, stop it, list active testboxes
+# The gate and the oracles run as on zbook: the testbox env sets HOME=/home/theo and the workflow binds the
+# workspace on /home/theo/Code/sandbox/ts-rust (testbox-data.sh). Fetch a commit that the bins name before a
+# gate: run git fetch --depth=1 origin <sha>.
 # TESTBOX_ID overrides the saved ID. TESTBOX_IDLE: idle minutes before the testbox stops (default 15).
 # TESTBOX_REF: the ref the workflow runs from (default main: the workflow must be on the default branch).
 # Auth: `blacksmith auth login` once per host (`blacksmith auth status` shows it).
@@ -23,6 +30,24 @@ saved_id() {
   local id="${TESTBOX_ID:-$(cat "$id_file" 2>/dev/null || true)}"
   [[ -n "$id" ]] || { echo "no testbox: run 'testbox.sh warmup' or set TESTBOX_ID" >&2; exit 2; }
   echo "$id"
+}
+
+# push_paths <path>...: rsync each path to the same path on the testbox, over the CLI's own SSH route
+# (port 64000 and the key that warmup saves in ~/.blacksmith/testboxes/<id>; CLI 0.4.70, see `run --debug`).
+push_paths() {
+  local id host key p
+  id="$(saved_id)"
+  host="$(blacksmith testbox status --id "$id" | awk -v id="$id" '$1 == id {print $3}')"
+  key="$HOME/.blacksmith/testboxes/$id/id_ed25519"
+  [[ -n "$host" && -f "$key" ]] || { echo "no SSH route to $id (host '$host', key $key)" >&2; exit 1; }
+  local ssh="ssh -p 64000 -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o Compression=no"
+  for p in "$@"; do
+    p="$(realpath "$p")"
+    echo "push $p"
+    # A file of testbox-data.txt is a bind mount there: write it in place, not by rename.
+    if [[ -d "$p" ]]; then rsync -aH --mkpath --compress --compress-choice=zstd -e "$ssh" "$p/" "runner@$host:$p/"
+    else rsync -aH --mkpath --inplace --compress --compress-choice=zstd -e "$ssh" "$p" "runner@$host:$p"; fi
+  done
 }
 
 cmd="$1"
@@ -45,6 +70,14 @@ case "$cmd" in
     blacksmith testbox run --id "$(saved_id)" ". ~/testbox.env && $remote_cmd"
     ;;
   get) blacksmith testbox download --id "$(saved_id)" "$@" ;;
+  push)
+    (($#)) || { echo "usage: testbox.sh push <path>..." >&2; exit 2; }
+    push_paths "$@"
+    ;;
+  seed)
+    mapfile -t paths < <(scripts/goport/testbox-data.sh paths | awk -v want=" ${*:-inputs pin} " 'index(want, " " $1 " ") {print $2}')
+    push_paths "${paths[@]}"
+    ;;
   status) blacksmith testbox status --id "$(saved_id)" "$@" ;;
   stop)
     id="$(saved_id)"
