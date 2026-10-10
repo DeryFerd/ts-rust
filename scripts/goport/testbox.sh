@@ -7,7 +7,8 @@
 #        testbox.sh run <command...>          sync this worktree, then run the command with the testbox env
 #                                             (e.g. run scripts/run-cargo-capped.sh build --release -p ts_goport --bins).
 #                                             Arguments keep their boundaries; use run bash -c '...' for pipes and &&
-#        testbox.sh get <remote> [local]      copy a file or dir back (remote path relative to the repo root)
+#        testbox.sh get <remote> [local]      copy a file or dir back with rsync (remote path absolute or relative
+#                                             to the repo root; a trailing / copies a dir's contents)
 #        testbox.sh push <path>...            copy zbook files or dirs to the same absolute paths (e.g. a bins dir)
 #        testbox.sh seed [inputs|pin]...      copy the files of testbox-data.txt (default both disks) to their
 #                                             sticky disks. They are kept when the testbox stops. Takes about
@@ -32,15 +33,21 @@ saved_id() {
   echo "$id"
 }
 
-# push_paths <path>...: rsync each path to the same path on the testbox, over the CLI's own SSH route
-# (port 64000 and the key that warmup saves in ~/.blacksmith/testboxes/<id>; CLI 0.4.70, see `run --debug`).
-push_paths() {
-  local id host key p
+# ssh_route: sets host and ssh for rsync over the CLI's own SSH route (port 64000 and the key that warmup
+# saves in ~/.blacksmith/testboxes/<id>; CLI 0.4.70, see `run --debug`). The login dir is /home/runner.
+ssh_route() {
+  local id key
   id="$(saved_id)"
   host="$(blacksmith testbox status --id "$id" | awk -v id="$id" '$1 == id {print $3}')"
   key="$HOME/.blacksmith/testboxes/$id/id_ed25519"
   [[ -n "$host" && -f "$key" ]] || { echo "no SSH route to $id (host '$host', key $key)" >&2; exit 1; }
-  local ssh="ssh -p 64000 -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o Compression=no"
+  ssh="ssh -p 64000 -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o Compression=no"
+}
+
+# push_paths <path>...: rsync each path to the same path on the testbox.
+push_paths() {
+  local host ssh p
+  ssh_route
   for p in "$@"; do
     p="$(realpath "$p")"
     echo "push $p"
@@ -69,7 +76,14 @@ case "$cmd" in
     printf -v remote_cmd '%q ' "$@"
     blacksmith testbox run --id "$(saved_id)" ". ~/testbox.env && $remote_cmd"
     ;;
-  get) blacksmith testbox download --id "$(saved_id)" "$@" ;;
+  get)
+    # rsync, not `blacksmith testbox download`: that timed out after 5 minutes on a 124 MB results dir.
+    (($# == 1 || $# == 2)) || { echo "usage: testbox.sh get <remote> [local]" >&2; exit 2; }
+    ssh_route
+    src="$1"
+    [[ "$src" == /* ]] || src="_work/ts-rust/ts-rust/$src"
+    rsync -aH --compress --compress-choice=zstd -e "$ssh" "runner@$host:$src" "${2:-.}"
+    ;;
   push)
     (($#)) || { echo "usage: testbox.sh push <path>..." >&2; exit 2; }
     push_paths "$@"
