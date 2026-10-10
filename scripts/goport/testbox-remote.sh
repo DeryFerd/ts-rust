@@ -81,7 +81,7 @@ install_oracles() {
     [[ -n $(want_sha "$key") ]] || continue
     [[ $(sha256sum < "$f" | cut -d' ' -f1) == "$(want_sha "$key")" ]] || { echo "oracle $key: sha256 differs, skipped" >&2; continue; }
     path=$(pin path oracle "$key")
-    cmp -s "$f" "$path" 2> /dev/null || install -m 755 "$f" "$path"
+    cmp -s "$f" "$path" 2> /dev/null || install -D -m 755 "$f" "$path"
     echo "oracle $key: $path"
   done
   [[ -f $default ]] || printf '%s\n' '#!/bin/sh' \
