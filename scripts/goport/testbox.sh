@@ -9,9 +9,25 @@
 #                                             Arguments keep their boundaries; use run bash -c '...' for pipes and &&
 #        testbox.sh get <remote> [local]      copy a file or dir back (remote path relative to the repo root)
 #        testbox.sh status | stop | list      the saved testbox's status, stop it, list active testboxes
+#        testbox.sh pin [KEY...]              set up the zbook path mirror and each pin's Go checkout (default: the batch
+#                                             pin, which warmup sets up). KEY comes from this worktree's UPSTREAM.json
+#        testbox.sh oracles [KEY...]          seed the recorded oracle of each pin (default: the batch pin): upload the
+#                                             ones the testbox's sticky target/testbox-oracles lacks (sha256 checked
+#                                             against UPSTREAM.json on both sides), install them at their paths
+#        testbox.sh tests [--pin KEY] OUT BASE
+#                                             the protected test suite at HEAD: build-goport-tests.sh and
+#                                             goport-tests.sh on the testbox (seeds the oracle first), fetch results.json
+#                                             and the logs to OUT (must not exist), print compare-tests.py BASE OUT.
+#                                             HEAD must be pushed; crates/, Cargo.toml and Cargo.lock must be clean
+#        testbox.sh np-suite [--pin KEY] LABEL [BASE]
+#                                             a stable release tsgo and np-suite.sh run LABEL on the testbox, fetched to
+#                                             the main checkout's np-suite dir (LABEL must not exist), then
+#                                             np-suite.sh diff BASE LABEL
+# KEY defaults to the batch pin (docs/typechecker-state/current.json batch.upstreamPin.to).
 # TESTBOX_ID overrides the saved ID. TESTBOX_IDLE: idle minutes before the testbox stops (default 15).
 # TESTBOX_REF: the ref the workflow runs from (default main: the workflow must be on the default branch).
 # Auth: `blacksmith auth login` once per host (`blacksmith auth status` shows it).
+# scripts/goport/testbox-remote.sh holds the steps that run on the testbox.
 set -euo pipefail
 case "${1:-help}" in help | -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; esac
 
@@ -25,8 +41,55 @@ saved_id() {
   echo "$id"
 }
 
+# remote <command...>: sync this worktree, run the command in the testbox's repo root with the testbox env.
+remote() {
+  local remote_cmd
+  printf -v remote_cmd '%q ' "$@"
+  blacksmith testbox run --id "$(saved_id)" ". ~/testbox.env && $remote_cmd"
+}
+batch_pin() { jq -r '.batch.upstreamPin.to // empty' docs/typechecker-state/current.json; }
+
+# oracles KEY...: upload the oracles the testbox lacks through the sync (an untracked dir that is not
+# ignored, removed after), then install them.
+oracles() {
+  local k path out missing
+  for k in "$@"; do
+    path=$(python3 scripts/upstream/pin.py path oracle "$k") || exit 2
+    [[ $(sha256sum < "$path" | cut -d' ' -f1) == "$(python3 scripts/upstream/pin.py show "$k" | jq -r .oracle.sha256)" ]] ||
+      { echo "$path does not match the sha256 in UPSTREAM.json" >&2; exit 1; }
+  done
+  out=$(remote scripts/goport/testbox-remote.sh oracles-missing "$@") || { echo "$out"; exit 1; }
+  read -ra missing <<< "$(sed -n 's/^missing: *//p' <<< "$out" | tail -1)"
+  if ((${#missing[@]} == 0)); then
+    echo "oracles on the testbox: $*"
+    return
+  fi
+  echo "uploading oracles: ${missing[*]}"
+  trap 'rm -rf "$repo_root/testbox-upload"' EXIT
+  mkdir -p testbox-upload
+  for k in "${missing[@]}"; do cp --reflink=auto "$(python3 scripts/upstream/pin.py path oracle "$k")" "testbox-upload/$k"; done
+  remote scripts/goport/testbox-remote.sh oracles-install testbox-upload
+  rm -rf "$repo_root/testbox-upload"
+  trap - EXIT
+}
+
+# fetch RUN DEST: copy RUN/out.tar.gz back and unpack it in DEST.
+fetch() {
+  mkdir -p "$2"
+  blacksmith testbox download --id "$(saved_id)" "$1/out.tar.gz" "$2/out.tar.gz"
+  tar -xzf "$2/out.tar.gz" -C "$2"
+  rm "$2/out.tar.gz"
+}
+
 cmd="$1"
 shift
+pin_key=
+if [[ $cmd == tests || $cmd == np-suite ]] && [[ ${1:-} == --pin ]]; then
+  (($# >= 2)) || { echo "usage: testbox.sh $cmd --pin KEY ..." >&2; exit 2; }
+  pin_key=$2
+  shift 2
+fi
+pin_key=${pin_key:-$(batch_pin)}
 case "$cmd" in
   warmup)
     rc=0
@@ -41,8 +104,48 @@ case "$cmd" in
     ;;
   run)
     (($#)) || { echo "usage: testbox.sh run <command...>" >&2; exit 2; }
-    printf -v remote_cmd '%q ' "$@"
-    blacksmith testbox run --id "$(saved_id)" ". ~/testbox.env && $remote_cmd"
+    remote "$@"
+    ;;
+  pin) remote scripts/goport/testbox-remote.sh setup "$@" ;;
+  oracles)
+    (($#)) || set -- "$(batch_pin)"
+    oracles "$@"
+    ;;
+  tests)
+    (($# == 2)) || { echo "usage: testbox.sh tests [--pin KEY] OUT BASE" >&2; exit 2; }
+    out=$(realpath -m -- "$1") base=$(realpath -- "$2")
+    [[ ! -e $out ]] || { echo "$out exists (results are never replaced)" >&2; exit 2; }
+    [[ -z $(git status --porcelain --untracked-files=all -- crates Cargo.toml Cargo.lock) ]] ||
+      { echo "crates/, Cargo.toml or Cargo.lock has changes: commit them (build-goport-tests.sh builds HEAD)" >&2; exit 2; }
+    head=$(git rev-parse HEAD)
+    git branch -r --contains "$head" | grep -q . ||
+      echo "warning: no remote branch here has HEAD ${head:0:12}; the testbox fetches it from origin" >&2
+    oracles "$pin_key"
+    run=target/testbox-runs/tests-$(date -u +%Y%m%dT%H%M%S)-${head:0:9}
+    rc=0
+    remote scripts/goport/testbox-remote.sh tests "$pin_key" "$head" "$run" || rc=$?
+    fetch "$run" "$out"
+    [[ -f $out/tests-run/results.json ]] || { echo "no results.json (rc $rc): see $out/build.log and $out/tests.log" >&2; exit 1; }
+    python3 scripts/goport/compare-tests.py "$base" "$out/tests-run/results.json" --out "$out/compare.json" || rc=$?
+    echo "results $out/tests-run/results.json, compare $out/compare.json"
+    exit "$rc"
+    ;;
+  np-suite)
+    (($# == 1 || $# == 2)) || { echo "usage: testbox.sh np-suite [--pin KEY] LABEL [BASE]" >&2; exit 2; }
+    np=/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/compat-backlog/np-suite
+    [[ ! -e $np/$1 ]] || { echo "$np/$1 exists (results are never replaced)" >&2; exit 2; }
+    run=target/testbox-runs/np-$(date -u +%Y%m%dT%H%M%S)-$1
+    rc=0
+    remote scripts/goport/testbox-remote.sh np-suite "$pin_key" "$1" "$run" || rc=$?
+    mkdir -p "$np" target
+    tmp=$(mktemp -d "$repo_root/target/testbox-np.XXXXXX")
+    fetch "$run" "$tmp"
+    mv "$tmp/$1" "$np/$1"
+    mv "$tmp/build.log" "$np/$1/testbox-build.log"
+    rmdir "$tmp"
+    cat "$np/$1/summary.txt"
+    [[ -z ${2:-} ]] || scripts/goport/np-suite.sh diff "$2" "$1" | tail -20
+    exit "$rc"
     ;;
   get) blacksmith testbox download --id "$(saved_id)" "$@" ;;
   status) blacksmith testbox status --id "$(saved_id)" "$@" ;;

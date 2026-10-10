@@ -51,28 +51,24 @@ jobs:
         with:
           key: ts-rust-testbox-cargo
           path: ~/.cargo/registry
-      # main's Go pin is the saved state's batch.upstreamPin.to (AGENTS.md, "Pin"). The Go checkout sits
-      # outside the workspace, so a sync of the local tree does not touch it.
+      - name: Install bubblewrap
+        # goport-tests.sh and pin.py exec run tests in bwrap.
+        run: sudo apt-get install -y --no-install-recommends bubblewrap || { sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap; }
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      # main's Go pin is the saved state's batch.upstreamPin.to (AGENTS.md, "Pin").
       - name: Resolve the Go pin
         id: pin
         run: |
           key=$(jq -r '.batch.upstreamPin.to // empty' docs/typechecker-state/current.json)
           python3 scripts/upstream/pin.py show ${key:+"$key"} > "$RUNNER_TEMP/pin.json"
-          jq -r '"repo=\(.repo)", "commit=\(.commit)", "subdir=\(.subdir // "")", "go=\(.oracle.go | ltrimstr("go"))"' "$RUNNER_TEMP/pin.json" >> "$GITHUB_OUTPUT"
-      - name: Check out the pinned Go source
-        uses: actions/checkout@v5
-        with:
-          repository: ${{ steps.pin.outputs.repo }}
-          ref: ${{ steps.pin.outputs.commit }}
-          path: go-pin
-          sparse-checkout: ${{ steps.pin.outputs.subdir }}
-          persist-credentials: false
-      - name: Install the Go repo's typescript package
-        run: |
-          url=$(jq -r '.packages["node_modules/typescript"].resolved' go-pin/package-lock.json)
-          mkdir -p go-pin/node_modules/typescript
-          curl -sSfL "$url" | tar xz -C go-pin/node_modules/typescript --strip-components=1
-          mv go-pin "$HOME/go-pin"
+          jq -r --arg key "$key" '"key=\($key)", "goCheckout=\(.goCheckout)", "go=\(.oracle.go | ltrimstr("go"))"' "$RUNNER_TEMP/pin.json" >> "$GITHUB_OUTPUT"
+      # UPSTREAM.json and the protected scripts use zbook's absolute paths: /home/theo/Code/sandbox/ts-rust is the
+      # workspace, the whole pin checkout (with node_modules) sits at its zbook path, and the oracles that
+      # testbox.sh seeded on the sticky target/ (target/testbox-oracles) are installed at theirs.
+      - name: Mirror zbook's paths
+        run: scripts/goport/testbox-remote.sh setup ${{ steps.pin.outputs.key }}
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ steps.pin.outputs.go }}
@@ -87,12 +83,12 @@ jobs:
       # TS_CARGO_CGROUP_ACTIVE=1 skips the systemd user scope of run-cargo-capped.sh (no user session here).
       - name: Write the testbox env
         env:
-          SUBDIR: ${{ steps.pin.outputs.subdir }}
+          GO_CHECKOUT: ${{ steps.pin.outputs.goCheckout }}
         run: |
           cat > "$HOME/testbox.env" <<EOF
-          export PATH="$(dirname "$(command -v go)"):$HOME/.cargo/bin:\$PATH"
+          export PATH="$(dirname "$(command -v go)"):$(dirname "$(command -v node)"):$HOME/.cargo/bin:\$PATH"
           export CARGO_TERM_COLOR=always
-          export TS_GO_REPO="$HOME/go-pin${SUBDIR:+/$SUBDIR}"
+          export TS_GO_REPO="$GO_CHECKOUT"
           export TSCTEST_TMP="$RUNNER_TEMP/tsctest"
           export COMPILER_RUNNER_TMP="$RUNNER_TEMP/compiler-runner"
           export TS_CARGO_CGROUP_ACTIVE=1
