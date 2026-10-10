@@ -34,7 +34,9 @@
 //! make their own project there too: a read-only output, or a `writeFile`
 //! callback that gives an error, makes a write fail in `tsc -b`, `tsc -p`
 //! or the API build, and the output must be Go N''s. So do the noeediag1
-//! tests, for each case that turns the port's early emit off.
+//! tests, for each case that turns the port's early emit off, and the
+//! gopanicout1 tests, for Go's panic after a failed write in `tsc -p`,
+//! `tsc -b` and the API build (async and sync clients).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -508,43 +510,331 @@ fn build_reports_a_failed_write_as_go() {
 /// callback computes the signature of `a.ts` from `data.Diagnostics`, which
 /// holds the TS5033 of the failed JS write, and dereferences its nil file
 /// (incremental/snapshot.go:411): tsgo panics before it writes `a.d.ts`,
-/// with exit 2 and nothing on stdout (Go N', `tsc -b` and `tsc -p`). Go's
-/// runtime line ends with ` [recovered, repanicked]` in both modes. PORT:
-/// `tsc -p` prints the line without it (the emit jobs do not mark a Go
-/// panic as a work group's), so only `tsc -b` checks the whole line.
+/// with exit 2 and nothing on stdout (Go N', `tsc -b` and `tsc -p`).
+/// gopanicout1: stderr begins with Go's two runtime lines. The emit runs on
+/// a `sync.WaitGroup.Go` goroutine, so line 1 ends with
+/// ` [recovered, repanicked]`, except with `--singleThreaded`. Line 2 is the
+/// signal line (addr=0x68); Go's `pc` is an instruction of its binary
+/// (0xc5efe9 in tsgo-oracle-fed0bf24149f), the port's is 0x0. Go writes
+/// `b.js` and `b.d.ts` or not, by timing; both written is one of Go's
+/// results in each mode (gopanicout1 `w/go10-t2.jsonl`, 10 runs: 5, 3, 6
+/// and 4 runs).
 #[cfg(unix)]
 #[test]
 fn failed_write_before_a_dts_signature_panics_as_go() {
-    const LINE: &str = "panic: runtime error: invalid memory address or nil pointer dereference";
     if rustix::process::geteuid().is_root() {
         return; // root writes a read-only file
     }
-    for mode in ["-b", "-p"] {
+    for (args, suffix) in [
+        (&["-b"][..], " [recovered, repanicked]"),
+        (&["-p"][..], " [recovered, repanicked]"),
+        (&["-b", "--singleThreaded"][..], ""),
+        (&["-p", "--singleThreaded"][..], ""),
+    ] {
         let project = write_failure_project(r#""composite": true"#);
         let output = Command::new(env!("CARGO_BIN_EXE_tsgo"))
             .current_dir(&project.root)
-            .args([mode, "tsconfig.json", "--pretty", "false"])
+            .args([args[0], "tsconfig.json", "--pretty", "false"])
+            .args(&args[1..])
             .env("GOPORT_EARLY_EMIT", "1")
             .output()
             .expect("run tsgo");
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().next().unwrap_or_default();
         assert_eq!(
             (output.status.code(), output.stdout.is_empty()),
             (Some(2), true),
-            "tsc {mode}: Go N' exit code and stdout; stderr: {stderr}"
+            "tsc {args:?}: Go N' exit code and stdout; stderr: {stderr}"
         );
-        if mode == "-b" {
-            assert_eq!(first, format!("{LINE} [recovered, repanicked]"), "tsc -b");
-        } else {
-            assert!(first.starts_with(LINE), "tsc -p: {stderr}");
-        }
-        assert_eq!(project.read("out/a.js"), "old\n", "tsc {mode}: a.js");
+        assert_eq!(
+            stderr.lines().take(2).collect::<Vec<_>>(),
+            [&format!("{NIL_DEREFERENCE}{suffix}"), NIL_SIGNAL],
+            "tsc {args:?}: Go N' runtime lines"
+        );
+        assert_eq!(project.read("out/a.js"), "old\n", "tsc {args:?}: a.js");
         assert!(
             !project.root.join("out/a.d.ts").exists(),
-            "tsc {mode}: Go panics before it writes a.d.ts"
+            "tsc {args:?}: Go panics before it writes a.d.ts"
+        );
+        assert_eq!(project.read("out/b.js"), "export const b = 1;\n");
+        assert_eq!(
+            project.read("out/b.d.ts"),
+            "export declare const b: number;\n"
         );
         project.remove();
+    }
+}
+
+/// The first line of Go's stderr for the nil dereference of
+/// incremental/snapshot.go:411, without a suffix.
+#[cfg(unix)]
+const NIL_DEREFERENCE: &str =
+    "panic: runtime error: invalid memory address or nil pointer dereference";
+
+/// The signal line of that panic, with the port's `pc`.
+#[cfg(unix)]
+const NIL_SIGNAL: &str = "[signal SIGSEGV: segmentation violation code=0x1 addr=0x68 pc=0x0]";
+
+/// gopanicout1. The API build of a project with `sourceMap` and
+/// `declaration` (no incremental state is needed: the API orchestrator has
+/// no `build` option), with the `writeFile` callback: the client fails
+/// `b.js.map` and answers `useOS` for the others. The d.ts signature of
+/// `b.ts` reads the TS5033 and panics (snapshot.go:411) in a work group
+/// goroutine: Go N' gives no answer to `build`, prints the runtime lines
+/// and exits 2, async (JSON-RPC) and sync (msgpack). Its other emit
+/// goroutines make their calls until the process ends. Async, every JS and
+/// map was written and no d.ts in 48 of 50 runs; sync, the files were one
+/// of 8 sets, `{b.js}` in 11 of 50 (gopanicout1 `go-model.md` section 5).
+/// With `--singleThreaded` in `rootNames` Go emits on the request
+/// goroutine: the request's recover answers the panic, and the server goes
+/// on (exit 0 at the end of stdin). Go writes the files that its random
+/// emit order puts before `b.ts`; all of them is one of its results (1 and
+/// 3 of 10 runs).
+#[cfg(unix)]
+#[test]
+fn api_build_panics_as_go() {
+    let all_but_b_dts = "a.d.ts a.js a.js.map b.js c.d.ts c.js c.js.map";
+    for (sync, single_threaded, files) in [
+        (false, false, "a.js a.js.map b.js c.js c.js.map"),
+        (true, false, "b.js"),
+        (false, true, all_but_b_dts),
+        (true, true, all_but_b_dts),
+    ] {
+        let case = format!("sync {sync}, --singleThreaded {single_threaded}");
+        let project = Solution::new();
+        project.write(
+            "tsconfig.json",
+            r#"{"compilerOptions": {"strict": true, "outDir": "out", "rootDir": "src", "sourceMap": true, "declaration": true}, "include": ["src"]}"#,
+        );
+        project.write(
+            "src/a.ts",
+            "import { b } from \"./b\";\nimport { c } from \"./c\";\nexport const a: number = b + c;\n",
+        );
+        project.write(
+            "src/b.ts",
+            "export const b: number = 1;\nexport function fb(x: number): number { return x + b; }\n",
+        );
+        project.write("src/c.ts", "export const c: number = 2;\n");
+        let run = api_build_client(&project.root, sync, single_threaded, "b.js.map");
+        let mut written: Vec<String> = fs::read_dir(project.root.join("out"))
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.expect("an out entry").file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        written.sort();
+        assert_eq!(written.join(" "), files, "{case}: written files");
+        if single_threaded {
+            // A JSON-RPC message escapes the newline after the value.
+            let answer = run.answer.unwrap_or_default().replace("\\n", "\n");
+            assert!(
+                answer.contains(&format!("{NIL_DEREFERENCE}\n"))
+                    && (sync || answer.contains(r#""code":-32603"#)),
+                "{case}: the build answers the panic: {answer}"
+            );
+            assert_eq!((run.code, run.stderr.as_str()), (Some(0), ""), "{case}");
+        } else {
+            assert_eq!(run.answer, None, "{case}: no answer");
+            assert_eq!(run.code, Some(2), "{case}: exit code");
+            assert_eq!(
+                run.stderr.lines().take(2).collect::<Vec<_>>(),
+                [
+                    &format!("{NIL_DEREFERENCE} [recovered, repanicked]"),
+                    NIL_SIGNAL
+                ],
+                "{case}: Go N' runtime lines"
+            );
+        }
+        project.remove();
+    }
+}
+
+/// The next message of `tsgo --api` (`api_build_client`): whether it is a
+/// call of the server, its method (msgpack) or JSON-RPC id, and its
+/// payload (msgpack) or whole JSON-RPC message. None at the end.
+#[cfg(unix)]
+fn read_api_message(stdout: &mut impl std::io::Read, sync: bool) -> Option<(bool, String, String)> {
+    let mut read = |n: usize| {
+        let mut bytes = vec![0; n];
+        stdout.read_exact(&mut bytes).ok().map(|()| bytes)
+    };
+    if sync {
+        // 0x93, then the type: a fixint, or 0xcc and a byte.
+        let mut kind = read(2)?[1];
+        if kind == 0xcc {
+            kind = read(1)?[0];
+        }
+        let mut parts = Vec::new();
+        for _ in 0..2 {
+            let length = match read(1)?[0] {
+                0xc4 => usize::from(read(1)?[0]),
+                0xc5 => usize::from(u16::from_be_bytes(read(2)?.try_into().ok()?)),
+                _ => u32::from_be_bytes(read(4)?.try_into().ok()?) as usize,
+            };
+            parts.push(String::from_utf8_lossy(&read(length)?).into_owned());
+        }
+        let payload = parts.pop()?;
+        return Some((kind == 6, parts.pop()?, payload));
+    }
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        header.push(read(1)?[0]);
+    }
+    let length = String::from_utf8_lossy(&header)
+        .trim()
+        .strip_prefix("Content-Length: ")
+        .and_then(|value| value.parse().ok())
+        .expect("a Content-Length header");
+    let body = String::from_utf8_lossy(&read(length)?).into_owned();
+    let id = body
+        .split(r#""id":"#)
+        .nth(1)
+        .and_then(|rest| rest.split([',', '}']).next())
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_owned();
+    Some((body.contains(r#""method":"#), id, body))
+}
+
+/// What `api_build_client` saw: the build answer (None when the process
+/// ended without one), the exit code and stderr.
+#[cfg(unix)]
+struct ApiRun {
+    answer: Option<String>,
+    code: Option<i32>,
+    stderr: String,
+}
+
+/// Builds the project in `root` through `tsgo --api --callbacks writeFile`,
+/// async (JSON-RPC, `--async`) or sync (the msgpack tuples
+/// `[type, method, payload]` of Go api/protocol_msgpack.go), with
+/// `--singleThreaded` in `rootNames` when `single_threaded`. The client
+/// fails the `writeFile` call of the file named `fail` and answers
+/// `useOS` to the others. A JSON-RPC error answer is the whole message, a
+/// msgpack one its payload.
+#[cfg(unix)]
+fn api_build_client(root: &Path, sync: bool, single_threaded: bool, fail: &str) -> ApiRun {
+    use std::io::{BufReader, Read, Write};
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tsgo"))
+        .args(["--api", "--callbacks", "writeFile", "--cwd"])
+        .arg(norm(root))
+        .args(if sync { None } else { Some("--async") })
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run tsgo --api");
+    let mut stdin = child.stdin.take().expect("tsgo stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("tsgo stdout"));
+    let mut stderr = child.stderr.take().expect("tsgo stderr");
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    // (a call of the server, the method or the JSON-RPC id, the payload or
+    // the whole JSON-RPC message).
+    let (sender, messages) = std::sync::mpsc::channel::<(bool, String, String)>();
+    std::thread::spawn(move || {
+        while let Some(message) = read_api_message(&mut stdout, sync) {
+            if sender.send(message).is_err() {
+                return;
+            }
+        }
+    });
+    let mut send = |kind: u8, method: &str, payload: &str| {
+        let message = if sync {
+            let mut bytes = vec![0x93, kind];
+            for part in [method, payload] {
+                let length = u32::try_from(part.len()).expect("a short message");
+                bytes.push(0xc6);
+                bytes.extend(length.to_be_bytes());
+                bytes.extend(part.as_bytes());
+            }
+            bytes
+        } else {
+            format!("Content-Length: {}\r\n\r\n{payload}", payload.len()).into_bytes()
+        };
+        // The server can end before it reads this.
+        let _ = stdin.write_all(&message).and_then(|()| stdin.flush());
+    };
+    let root_names = if single_threaded {
+        format!(
+            r#"["--singleThreaded","{}"]"#,
+            norm(&root.join("tsconfig.json"))
+        )
+    } else {
+        format!(r#"["{}"]"#, norm(&root.join("tsconfig.json")))
+    };
+    let create = format!(r#"{{"rootNames":{root_names},"cwd":"{}"}}"#, norm(root));
+    if sync {
+        send(1, "createBuildOrchestrator", &create);
+    } else {
+        send(
+            0,
+            "",
+            &format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"createBuildOrchestrator","params":{create}}}"#
+            ),
+        );
+    }
+    let next = || messages.recv_timeout(Duration::from_secs(60)).ok();
+    let mut answer = None;
+    while let Some((call, method, payload)) = next() {
+        if !call && (method == "createBuildOrchestrator" || method == "1") {
+            let id = payload
+                .split(r#""buildOrchestratorID":"#)
+                .nth(1)
+                .and_then(|rest| rest.split(['}', ',']).next())
+                .unwrap_or_else(|| panic!("no orchestrator id in {payload}"))
+                .to_owned();
+            let params = format!(r#"{{"buildOrchestratorID":{id}}}"#);
+            if sync {
+                send(1, "build", &params);
+            } else {
+                send(
+                    0,
+                    "",
+                    &format!(r#"{{"jsonrpc":"2.0","id":7,"method":"build","params":{params}}}"#),
+                );
+            }
+        } else if !call && (method == "build" || method == "7") {
+            answer = Some(payload);
+            break;
+        } else {
+            // A writeFile call: sync kind 6, async a request with a string id.
+            let path = payload
+                .split(r#""path":""#)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_else(|| panic!("not a writeFile call: {payload}"));
+            let failed = path.ends_with(&format!("/{fail}"));
+            match (sync, failed) {
+                (true, true) => send(3, "writeFile", "client says no"),
+                (true, false) => send(2, "writeFile", r#"{"kind":"useOS"}"#),
+                (false, true) => send(
+                    0,
+                    "",
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","id":"{method}","error":{{"code":-32000,"message":"client says no"}}}}"#
+                    ),
+                ),
+                (false, false) => send(
+                    0,
+                    "",
+                    &format!(r#"{{"jsonrpc":"2.0","id":"{method}","result":{{"kind":"useOS"}}}}"#),
+                ),
+            }
+        }
+    }
+    drop(stdin);
+    let code = child.wait().expect("tsgo --api exits").code();
+    ApiRun {
+        answer,
+        code,
+        stderr: stderr.join().expect("the stderr reader"),
     }
 }
 
