@@ -78,14 +78,43 @@ oracles() {
   trap - EXIT
 }
 
-# fetch RUN DEST: copy RUN/out.tar.gz back and unpack it in DEST, then remove RUN on the testbox (its test
-# binaries would fill the sticky target/).
+# job RUN STEP ARGS...: start testbox-remote.sh STEP ARGS... detached on the testbox, print its log as it grows
+# and return its exit code. It polls with downloads, which do not sync this worktree.
+job() {
+  local run=$1 id t n=0 fails=0 rc
+  id=$(saved_id)
+  remote scripts/goport/testbox-remote.sh start "$@"
+  t=$(mktemp -d)
+  while :; do
+    rc=
+    blacksmith testbox download --id "$id" "$run.rc" "$t/rc" > /dev/null 2>&1 && rc=$(cat "$t/rc")
+    if blacksmith testbox download --id "$id" "$run.log" "$t/log" > /dev/null 2>&1; then
+      fails=0
+      tail -n "+$((n + 1))" "$t/log"
+      n=$(wc -l < "$t/log")
+    elif ((++fails >= 10)); then
+      echo "testbox $id: no $run.log after 10 tries" >&2
+      rm -rf "$t"
+      return 1
+    fi
+    [[ -z $rc ]] || break
+    sleep 15
+  done
+  rm -rf "$t"
+  return "$rc"
+}
+
+# fetch RUN DEST: copy RUN/out.tar.gz and RUN.log back, unpack them in DEST, then remove them on the testbox
+# (the test binaries would fill the sticky target/).
 fetch() {
+  local id
+  id=$(saved_id)
   mkdir -p "$2"
-  blacksmith testbox download --id "$(saved_id)" "$1/out.tar.gz" "$2/out.tar.gz"
+  blacksmith testbox download --id "$id" "$1/out.tar.gz" "$2/out.tar.gz" > /dev/null
+  blacksmith testbox download --id "$id" "$1.log" "$2/testbox.log" > /dev/null
   tar -xzf "$2/out.tar.gz" -C "$2"
   rm "$2/out.tar.gz"
-  remote rm -rf "$1" > /dev/null
+  remote rm -rf "$1" "$1.log" "$1.rc" > /dev/null
 }
 
 cmd="$1"
@@ -130,7 +159,7 @@ case "$cmd" in
     oracles "$pin_key"
     run=target/testbox-runs/tests-$(date -u +%Y%m%dT%H%M%S)-${head:0:9}
     rc=0
-    remote scripts/goport/testbox-remote.sh tests "$pin_key" "$head" "$run" || rc=$?
+    job "$run" tests "$pin_key" "$head" "$run" || rc=$?
     fetch "$run" "$out"
     [[ -f $out/tests-run/results.json ]] || { echo "no results.json (rc $rc): see $out/build.log and $out/tests.log" >&2; exit 1; }
     python3 scripts/goport/compare-tests.py "$base" "$out/tests-run/results.json" --out "$out/compare.json" || rc=$?
@@ -143,12 +172,13 @@ case "$cmd" in
     [[ ! -e $np/$1 ]] || { echo "$np/$1 exists (results are never replaced)" >&2; exit 2; }
     run=target/testbox-runs/np-$(date -u +%Y%m%dT%H%M%S)-$1
     rc=0
-    remote scripts/goport/testbox-remote.sh np-suite "$pin_key" "$1" "$run" || rc=$?
+    job "$run" np-suite "$pin_key" "$1" "$run" || rc=$?
     mkdir -p "$np" target
     tmp=$(mktemp -d "$repo_root/target/testbox-np.XXXXXX")
     fetch "$run" "$tmp"
     mv "$tmp/$1" "$np/$1"
     mv "$tmp/build.log" "$np/$1/testbox-build.log"
+    mv "$tmp/testbox.log" "$np/$1/testbox.log"
     rmdir "$tmp"
     cat "$np/$1/summary.txt"
     [[ -z ${2:-} ]] || scripts/goport/np-suite.sh diff "$2" "$1" | tail -20

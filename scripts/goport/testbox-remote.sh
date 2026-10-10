@@ -7,6 +7,9 @@
 #                                                  have another sha256 than UPSTREAM.json records)
 #        testbox-remote.sh oracles-install DIR     move each uploaded DIR/<key> (sha256 checked) to the sticky
 #                                                  target/testbox-oracles/<key>, then install the seeded oracles
+#        testbox-remote.sh start RUN STEP ARGS...  run `testbox-remote.sh STEP ARGS...` detached from the SSH session:
+#                                                  output in RUN.log, then its exit code in RUN.rc. The job counts as
+#                                                  testbox activity (the idle timer does not end the testbox under it)
 #        testbox-remote.sh tests KEY COMMIT RUN    build-goport-tests.sh at COMMIT, goport-tests.sh at pin KEY,
 #                                                  pack the results and logs in RUN/out.tar.gz
 #        testbox-remote.sh np-suite KEY LABEL RUN  a stable release tsgo, np-suite.sh run LABEL at pin KEY, pack
@@ -98,6 +101,25 @@ at_commit() {
 cmd=$1
 shift
 case $cmd in
+  start)
+    (($# >= 2)) || die "usage: start RUN STEP ARGS..."
+    [[ ! -e $1.log ]] || die "$1.log exists"
+    mkdir -p "$(dirname "$1")"
+    # A dropped SSH session must not stop a long job (one dropped after 170 s on 2026-10-10).
+    setsid nohup "$0" job "$@" > /dev/null 2>&1 < /dev/null &
+    echo "started $1"
+    ;;
+  job)
+    run=$1
+    shift
+    # run-testbox resets its idle timer when this file is newer than the last activity.
+    (while sleep 30; do touch ~/.testbox-last-activity; done) &
+    keep=$!
+    rc=0
+    "$0" "$@" > "$run.log" 2>&1 < /dev/null || rc=$?
+    kill "$keep"
+    echo "$rc" > "$run.rc"
+    ;;
   setup)
     mirror
     (($#)) || set -- "$(batch_pin)"
