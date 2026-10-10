@@ -6,6 +6,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
+- **Effect editor features (T3 Code drop-in blocker 2; note effectlsp0-2026-10-10; plan effectlsp0/summary.md).** Running: effectlsp1 (T0 T3 Code switch dry run, E0 effect-tsgo oracle at pin N, E1 baseline replay and Effect LSP battery tools). Next: E2 foundation (on the bump D head after it lands: it owns ls/* hook sites), then E3 auto-import style and E4 quick fixes (the 12 T3 Code hits), E6, E7, E8; later E5, E9. D1 (refactor.rewrite in initialize) needs Theo.
 - **Blacksmith testbox (Theo, 2026-10-10: move heavy builds, tests and benches off zbook and the SSH hosts; note blacksmith-testbox-2026-10-10).** PR #36 merged. Running: tbxflow1 (setup, oracle seeding, `testbox.sh tests` and `np-suite`, one PR). Next: the gate, the LSP and API batteries, candidate.sh side and timing on testboxes; then new lanes build and test on testboxes by default (update the agent brief).
 - **T3 Code drop-in (Theo, 2026-10-09: "asap"; t3code PR #16704). Running: workflow t3dropin1.** t3sat1: the `satisfies` TS2322 (diagnose against Go N, fix if a port bug, list other T3 Code gaps). plat2: darwin-x64 and win32-arm64 release binaries (PR stacked on win1). Then a release; Theo runs `npm/trust-setup.sh` for the new packages first. Later items from the T3 report: Effect editor features in `--lsp` (quick fixes, refactors), and T3 Code launcher passthrough of `-w` and `-b`.
 
