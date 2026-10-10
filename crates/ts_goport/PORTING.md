@@ -636,7 +636,13 @@ The batch that adds it is not accepted until Theo approves.
   writes, and that thread flushes them when the emit ends, with the same
   replay (`EmitFilesHandler::emit_with_writes_here`). So a TS5033 is in
   its file's result, sorted and in `emitDiagnosticsPerFile`, as in Go.
-  `tsc -b` and `tsc -p` write at once there. A task finishes
+  `tsc -b` and `tsc -p` write at once there. When each API write is a
+  client `writeFile` call (`System::client_writes`), and the build is not
+  single-threaded, the flush writes in rounds (each file's outputs before
+  its declarations first), and after a failed write whose file's d.ts
+  signature then panics it makes only the writes that Go's race mostly
+  makes before that panic (`emit_files::flush_client_writes`, see Exit
+  codes). A task finishes
   when its check and its early emit (when it has one) have ended (the
   barrier jobs behind them also
   wait for the d.ts twins and the emit pool,
@@ -758,13 +764,42 @@ runs `f` under `core::go_wait_group_task`. Where the port runs it inline
 inside work that a Go `recover()` guards (the auto-import registry build
 under a request), it runs `f` under `core::go_wait_group_goroutine`: a Go
 panic ends the process there, because Go's recover sees only its own
-goroutine. Not done for the emit jobs: Go's `Program.Emit` emits each file
-on a work group goroutine, so a Go panic in an emit (an `es_decorator`
-nil dereference, or the d.ts signature of a file after a failed write,
-incremental/snapshot.go:411) ends with the suffix in Go. `tsc -b` adds it
-for its builder goroutine (`BuildTask::keep_go_panic`); `tsc -p` and the
-API build print the line without it, and the API build answers the request
-with the panic where Go's process ends.
+goroutine. Go's `Program.Emit` emits each file on a work group goroutine
+unless the program is single-threaded. The port waits for its emit jobs
+under `core::go_work_group_task` (`program_emit::wait_emit_jobs`), so a Go
+panic in an emit (an `es_decorator` nil dereference, or the d.ts signature
+of a file after a failed write, incremental/snapshot.go:411) gets the
+suffix in `tsc -p`, `tsc -w`, `tsc -b` (also with `--builders 1`) and the
+API build, and in the API build it ends the process with no answer and
+exit 2, as Go does. With `--singleThreaded` Go emits on the caller's
+goroutine: no suffix, and the API answers the request with the panic.
+`tsc -b` also adds the suffix for its builder goroutine
+(`BuildTask::keep_go_panic`).
+
+A Go nil dereference is a SIGSEGV that the runtime turns into a panic,
+so Go prints a second line, `[signal SIGSEGV: segmentation violation
+code=0x1 addr=<fault address> pc=<pc>]` (runtime `dopanic_m`), before the
+goroutine trace. A site that knows Go's fault address uses
+`core::go_nil_dereference_at(address)`, and the port prints the line with
+`pc=0x0`: Go's `pc` is an instruction of its own binary (0xc5efe9 in
+tsgo-oracle-fed0bf24149f). The d.ts signature site
+(`diagnostic_to_string_builder`) has it (0x68). The other
+`go_nil_dereference()` sites still print no signal line: each needs its
+fault address from the pinned Go. The signal stays with the goroutine
+until a recovery completes, so a panic in the deferred function that
+recovered a nil dereference keeps the line (`core::go_after_recover`).
+
+In that panic case Go's other emit goroutines go on until the process
+ends, so which of their outputs exist varies by timing (a file can also be
+cut to 0 bytes). The port's written files are one of the sets that Go N'
+gave in repeated runs (gopanicout1 `go-model.md`): in the CLI modes, and
+in the API build without the `writeFile` callback or single-threaded,
+every other file in full (the flush leaves out only the panicking d.ts).
+In the API build with the callback each write waits for a client answer,
+so the panic mostly wins: after the failed write, `flush_client_writes`
+makes the other outputs before the declarations and no other file's
+declaration (`--async`), or only the panicking file's own outputs before
+its d.ts (sync msgpack, whose calls go one at a time).
 
 ## Process start
 
