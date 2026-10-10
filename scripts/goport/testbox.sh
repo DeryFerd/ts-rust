@@ -11,9 +11,10 @@
 #                                             to the repo root; a trailing / copies a dir's contents)
 #        testbox.sh push <path>...            copy zbook files or dirs to the same absolute paths (e.g. a bins dir)
 #        testbox.sh seed [inputs|pin]...      copy the files of testbox-data.txt (default both disks) to their
-#                                             sticky disks. They are kept when the testbox stops. Takes about
-#                                             20 minutes with no `run`: warm up with TESTBOX_IDLE=60 first
-#        testbox.sh status | stop | list      the saved testbox's status, stop it, list active testboxes
+#                                             sticky disks (about 30 minutes). Then let the testbox end on its
+#                                             idle timeout: a stopped job is cancelled, and a cancelled job does
+#                                             not commit its sticky disks
+#        testbox.sh status | stop | list      the saved testbox's status, stop it (no sticky disk commit), list
 # The gate and the oracles run as on zbook: the testbox env sets HOME=/home/theo and the workflow binds the
 # workspace on /home/theo/Code/sandbox/ts-rust (testbox-data.sh). Fetch a commit that the bins name before a
 # gate: run git fetch --depth=1 origin <sha>.
