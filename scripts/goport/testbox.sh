@@ -8,7 +8,12 @@
 #                                             (e.g. run scripts/run-cargo-capped.sh build --release -p ts_goport --bins).
 #                                             Arguments keep their boundaries; use run bash -c '...' for pipes and &&
 #        testbox.sh get <remote> [local]      copy a file or dir back (remote path relative to the repo root)
-#        testbox.sh status | stop | list      the saved testbox's status, stop it, list active testboxes
+#        testbox.sh status | list             the saved testbox's status, list active testboxes
+#        testbox.sh stop                      end the saved testbox now. stop cancels the job, and the sticky disks
+#                                             do not commit after a cancelled step: the writes to target/ are lost
+#        testbox.sh release                   forget the saved testbox: it ends at its idle timeout (TESTBOX_IDLE
+#                                             minutes after the last command), and that end commits the sticky disks.
+#                                             Use it after a cold build or new oracles; the idle minutes cost the same
 #        testbox.sh pin [KEY...]              set up the zbook path mirror and each pin's Go checkout (default: the batch
 #                                             pin, which warmup sets up). KEY comes from this worktree's UPSTREAM.json
 #        testbox.sh oracles [KEY...]          seed the recorded oracle of each pin (default: the batch pin): upload the
@@ -73,12 +78,14 @@ oracles() {
   trap - EXIT
 }
 
-# fetch RUN DEST: copy RUN/out.tar.gz back and unpack it in DEST.
+# fetch RUN DEST: copy RUN/out.tar.gz back and unpack it in DEST, then remove RUN on the testbox (its test
+# binaries would fill the sticky target/).
 fetch() {
   mkdir -p "$2"
   blacksmith testbox download --id "$(saved_id)" "$1/out.tar.gz" "$2/out.tar.gz"
   tar -xzf "$2/out.tar.gz" -C "$2"
   rm "$2/out.tar.gz"
+  remote rm -rf "$1" > /dev/null
 }
 
 cmd="$1"
@@ -149,10 +156,14 @@ case "$cmd" in
     ;;
   get) blacksmith testbox download --id "$(saved_id)" "$@" ;;
   status) blacksmith testbox status --id "$(saved_id)" "$@" ;;
-  stop)
+  stop | release)
     id="$(saved_id)"
-    blacksmith testbox stop --id "$id"
-    # Keep the saved ID when TESTBOX_ID stopped another testbox.
+    if [[ $cmd == stop ]]; then
+      blacksmith testbox stop --id "$id"
+    else
+      echo "testbox $id: released; it ends and commits its sticky disks after its idle timeout"
+    fi
+    # Keep the saved ID when TESTBOX_ID named another testbox.
     [[ "$(cat "$id_file" 2>/dev/null || true)" != "$id" ]] || rm -f "$id_file"
     ;;
   list) blacksmith testbox list "$@" ;;

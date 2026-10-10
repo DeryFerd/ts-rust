@@ -288,3 +288,38 @@ revision evidence (`remote.sh help`, "Reserved"): timing that needs zbook-class 
 - mini-abf9 is Theo's own machine again since 2026-10-04. `remote.sh` refuses every command on it.
 - dbook-lan and mini-743d: `sudo -n`, perf_event_paranoid 4 (use `sudo perf`), THP madvise, and
   perf, bpftrace and strace installed.
+
+## Blacksmith testboxes
+
+`testbox.sh` runs builds and protected suites on a warm Blacksmith runner (32 vCPU, 124 GB RAM),
+not on zbook or the SSH hosts. `.github/workflows/testbox.yml` sets up the testbox. `testbox-remote.sh`
+holds the steps that run on it. `testbox.sh help` gives the usage.
+
+```sh
+scripts/goport/testbox.sh warmup                                # about 35 s; TESTBOX_REF=<branch> for a workflow change
+scripts/goport/testbox.sh tests <out-dir> <base results.json>   # build-goport-tests.sh, goport-tests.sh, compare-tests.py
+scripts/goport/testbox.sh np-suite <label> [<base label>]       # np-suite.sh run, then np-suite.sh diff
+scripts/goport/testbox.sh stop                                  # or release (see "Sticky disks")
+```
+
+- Warmup: bubblewrap, Node 24, Go, Rust 1.93.0 and the nightly, and zbook's paths:
+  `/home/theo/Code/sandbox/ts-rust` is a symlink to the workspace, the whole checkout of the batch pin (with
+  `npm ci` node_modules) is at its zbook path, the default goCheckout is an empty dir and the default
+  oracle is a stub that exits 2. `pin.py exec` binds the pin over both.
+- Oracles: `pin.py` checks the sha256 of the pin oracle, and a build on the runner has another sha256 (Go
+  puts absolute paths in the binary). `testbox.sh oracles [KEY...]` uploads zbook's recorded binary to
+  `target/testbox-oracles/<key>` and installs it at its path. It uploads only what the testbox lacks.
+  `tests` runs it first.
+- Git: the sync sends files, not git state. `tests` needs HEAD on origin: the testbox fetches it and resets
+  its index to it, so `build-goport-tests.sh` sees a clean tree at HEAD.
+- Other pins: `testbox.sh pin KEY` sets up a pin of this worktree's UPSTREAM.json (microsoft/TypeScript
+  pins only), for example bump D fed0bf24149f from a bump D worktree. Then `tests --pin KEY`.
+- Output: `tests` writes `<out-dir>/tests-run` (results.json, logs, tsv, track), `<out-dir>/testbin` (the
+  metadata, no binaries) and `<out-dir>/compare.json`. `np-suite` writes the label dir in the main
+  checkout's np-suite dir. Neither replaces an existing dir.
+- Sticky disks: `target/` and the cargo registry. A sticky disk commits only when the job ends with no
+  failed or cancelled step. `stop` cancels the job, so its writes are lost. `release` forgets the testbox,
+  which ends at its idle timeout (`TESTBOX_IDLE`, default 15 minutes) and commits. The last commit wins.
+- Times (2026-10-10, cold target): `tests` 502 s (test bins 3.6 min, suite 4.7 min), `np-suite` 112 s.
+- Not on testboxes yet: the gate, the LSP and API oracle batteries, `candidate.sh side` and `perf.sh`.
+  Revision evidence stays on dbook-lan and timing on mini-743d.
