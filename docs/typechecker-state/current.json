@@ -957,12 +957,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "ae7bafd79d4aa1d07",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "af1db1be7204bba88",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R189 pipeline (candidate.sh side)."
