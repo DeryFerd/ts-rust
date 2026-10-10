@@ -107,13 +107,15 @@ job() {
 # fetch RUN DEST: copy RUN/out.tar.gz and RUN.log back, unpack them in DEST, then remove them on the testbox
 # (the test binaries would fill the sticky target/).
 fetch() {
-  local id
+  local id t
   id=$(saved_id)
+  t=$(mktemp -d)
+  blacksmith testbox download --id "$id" "$1/out.tar.gz" "$t/out.tar.gz" > /dev/null
+  blacksmith testbox download --id "$id" "$1.log" "$t/testbox.log" > /dev/null
   mkdir -p "$2"
-  blacksmith testbox download --id "$id" "$1/out.tar.gz" "$2/out.tar.gz" > /dev/null
-  blacksmith testbox download --id "$id" "$1.log" "$2/testbox.log" > /dev/null
-  tar -xzf "$2/out.tar.gz" -C "$2"
-  rm "$2/out.tar.gz"
+  tar -xzf "$t/out.tar.gz" -C "$2"
+  mv "$t/testbox.log" "$2/"
+  rm -rf "$t"
   remote rm -rf "$1" "$1.log" "$1.rc" > /dev/null
 }
 
