@@ -708,14 +708,14 @@ struct ApiRun {
 
 /// Builds the project in `root` through `tsgo --api --callbacks writeFile`,
 /// async (JSON-RPC, `--async`) or sync (the msgpack tuples
-/// `[type, method, payload]` of Go api/protocol_msgpack.go), with
+/// `[type, method, payload]` of Go `api/protocol_msgpack.go`), with
 /// `--singleThreaded` in `rootNames` when `single_threaded`. The client
 /// fails the `writeFile` call of the file named `fail` and answers
 /// `useOS` to the others. A JSON-RPC error answer is the whole message, a
 /// msgpack one its payload.
 #[cfg(unix)]
 fn api_build_client(root: &Path, sync: bool, single_threaded: bool, fail: &str) -> ApiRun {
-    use std::io::{BufReader, Read, Write};
+    use std::io::{BufReader, Read};
     use std::process::Stdio;
     let mut child = Command::new(env!("CARGO_BIN_EXE_tsgo"))
         .args(["--api", "--callbacks", "writeFile", "--cwd"])
@@ -726,7 +726,10 @@ fn api_build_client(root: &Path, sync: bool, single_threaded: bool, fail: &str) 
         .stderr(Stdio::piped())
         .spawn()
         .expect("run tsgo --api");
-    let mut stdin = child.stdin.take().expect("tsgo stdin");
+    let mut client = ApiClient {
+        stdin: child.stdin.take().expect("tsgo stdin"),
+        sync,
+    };
     let mut stdout = BufReader::new(child.stdout.take().expect("tsgo stdout"));
     let mut stderr = child.stderr.take().expect("tsgo stderr");
     let stderr = std::thread::spawn(move || {
@@ -734,9 +737,7 @@ fn api_build_client(root: &Path, sync: bool, single_threaded: bool, fail: &str) 
         let _ = stderr.read_to_string(&mut text);
         text
     });
-    // (a call of the server, the method or the JSON-RPC id, the payload or
-    // the whole JSON-RPC message).
-    let (sender, messages) = std::sync::mpsc::channel::<(bool, String, String)>();
+    let (sender, messages) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         while let Some(message) = read_api_message(&mut stdout, sync) {
             if sender.send(message).is_err() {
@@ -744,8 +745,59 @@ fn api_build_client(root: &Path, sync: bool, single_threaded: bool, fail: &str) 
             }
         }
     });
-    let mut send = |kind: u8, method: &str, payload: &str| {
-        let message = if sync {
+    let config = norm(&root.join("tsconfig.json"));
+    let root_names = if single_threaded {
+        format!(r#"["--singleThreaded","{config}"]"#)
+    } else {
+        format!(r#"["{config}"]"#)
+    };
+    let create = format!(r#"{{"rootNames":{root_names},"cwd":"{}"}}"#, norm(root));
+    client.request(1, "createBuildOrchestrator", &create);
+    let mut answer = None;
+    while let Ok((call, method, payload)) = messages.recv_timeout(Duration::from_secs(60)) {
+        if !call && (method == "createBuildOrchestrator" || method == "1") {
+            let id = payload
+                .split(r#""buildOrchestratorID":"#)
+                .nth(1)
+                .and_then(|rest| rest.split(['}', ',']).next())
+                .unwrap_or_else(|| panic!("no orchestrator id in {payload}"));
+            client.request(7, "build", &format!(r#"{{"buildOrchestratorID":{id}}}"#));
+        } else if !call && (method == "build" || method == "7") {
+            answer = Some(payload);
+            break;
+        } else {
+            let path = payload
+                .split(r#""path":""#)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_else(|| panic!("not a writeFile call: {payload}"));
+            let failed = path.ends_with(&format!("/{fail}"));
+            client.answer_write_file(&method, !failed);
+        }
+    }
+    drop(client);
+    let code = child.wait().expect("tsgo --api exits").code();
+    ApiRun {
+        answer,
+        code,
+        stderr: stderr.join().expect("the stderr reader"),
+    }
+}
+
+/// The client side of `api_build_client`.
+#[cfg(unix)]
+struct ApiClient {
+    stdin: std::process::ChildStdin,
+    sync: bool,
+}
+
+#[cfg(unix)]
+impl ApiClient {
+    /// Sends a msgpack tuple, or with `kind` 0 the JSON-RPC message
+    /// `payload`. The server can end before it reads it.
+    fn send(&mut self, kind: u8, method: &str, payload: &str) {
+        use std::io::Write;
+        let message = if self.sync {
             let mut bytes = vec![0x93, kind];
             for part in [method, payload] {
                 let length = u32::try_from(part.len()).expect("a short message");
@@ -757,84 +809,42 @@ fn api_build_client(root: &Path, sync: bool, single_threaded: bool, fail: &str) 
         } else {
             format!("Content-Length: {}\r\n\r\n{payload}", payload.len()).into_bytes()
         };
-        // The server can end before it reads this.
-        let _ = stdin.write_all(&message).and_then(|()| stdin.flush());
-    };
-    let root_names = if single_threaded {
-        format!(
-            r#"["--singleThreaded","{}"]"#,
-            norm(&root.join("tsconfig.json"))
-        )
-    } else {
-        format!(r#"["{}"]"#, norm(&root.join("tsconfig.json")))
-    };
-    let create = format!(r#"{{"rootNames":{root_names},"cwd":"{}"}}"#, norm(root));
-    if sync {
-        send(1, "createBuildOrchestrator", &create);
-    } else {
-        send(
-            0,
-            "",
-            &format!(
-                r#"{{"jsonrpc":"2.0","id":1,"method":"createBuildOrchestrator","params":{create}}}"#
-            ),
-        );
+        let _ = self
+            .stdin
+            .write_all(&message)
+            .and_then(|()| self.stdin.flush());
     }
-    let next = || messages.recv_timeout(Duration::from_secs(60)).ok();
-    let mut answer = None;
-    while let Some((call, method, payload)) = next() {
-        if !call && (method == "createBuildOrchestrator" || method == "1") {
-            let id = payload
-                .split(r#""buildOrchestratorID":"#)
-                .nth(1)
-                .and_then(|rest| rest.split(['}', ',']).next())
-                .unwrap_or_else(|| panic!("no orchestrator id in {payload}"))
-                .to_owned();
-            let params = format!(r#"{{"buildOrchestratorID":{id}}}"#);
-            if sync {
-                send(1, "build", &params);
-            } else {
-                send(
-                    0,
-                    "",
-                    &format!(r#"{{"jsonrpc":"2.0","id":7,"method":"build","params":{params}}}"#),
-                );
-            }
-        } else if !call && (method == "build" || method == "7") {
-            answer = Some(payload);
-            break;
+
+    /// A request: msgpack type 1, or JSON-RPC with `id`.
+    fn request(&mut self, id: u32, method: &str, params: &str) {
+        if self.sync {
+            self.send(1, method, params);
         } else {
-            // A writeFile call: sync kind 6, async a request with a string id.
-            let path = payload
-                .split(r#""path":""#)
-                .nth(1)
-                .and_then(|rest| rest.split('"').next())
-                .unwrap_or_else(|| panic!("not a writeFile call: {payload}"));
-            let failed = path.ends_with(&format!("/{fail}"));
-            match (sync, failed) {
-                (true, true) => send(3, "writeFile", "client says no"),
-                (true, false) => send(2, "writeFile", r#"{"kind":"useOS"}"#),
-                (false, true) => send(
-                    0,
-                    "",
-                    &format!(
-                        r#"{{"jsonrpc":"2.0","id":"{method}","error":{{"code":-32000,"message":"client says no"}}}}"#
-                    ),
-                ),
-                (false, false) => send(
-                    0,
-                    "",
-                    &format!(r#"{{"jsonrpc":"2.0","id":"{method}","result":{{"kind":"useOS"}}}}"#),
-                ),
-            }
+            let message =
+                format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#);
+            self.send(0, "", &message);
         }
     }
-    drop(stdin);
-    let code = child.wait().expect("tsgo --api exits").code();
-    ApiRun {
-        answer,
-        code,
-        stderr: stderr.join().expect("the stderr reader"),
+
+    /// The answer to the `writeFile` call `id` (JSON-RPC; msgpack answers
+    /// by method): `useOS` when `ok`, else an error.
+    fn answer_write_file(&mut self, id: &str, ok: bool) {
+        match (self.sync, ok) {
+            (true, true) => self.send(2, "writeFile", r#"{"kind":"useOS"}"#),
+            (true, false) => self.send(3, "writeFile", "client says no"),
+            (false, true) => self.send(
+                0,
+                "",
+                &format!(r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"kind":"useOS"}}}}"#),
+            ),
+            (false, false) => self.send(
+                0,
+                "",
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":"{id}","error":{{"code":-32000,"message":"client says no"}}}}"#
+                ),
+            ),
+        }
     }
 }
 
