@@ -529,9 +529,11 @@ The batch that adds it is not accepted until Theo approves.
   (`Orchestrator::start`) does the same for the program of each task. Go
   parses every file of each project that it builds again in each cycle
   (`resetCaches`); here a file keeps its parse while its modification time
-  does not change, no watch event names it and no build of the cycle
-  wrote it (`BuildHost::watch_source_file`, as Go `tsc --watch` keeps its
-  files), so a cycle parses only the changed files, on the loading thread.
+  does not change, no watch event names it and no build wrote it since the
+  parse (`BuildHost::watch_source_file`, as Go `tsc --watch` keeps its
+  files; the end of each build drops the kept parses of the files that it
+  wrote, `BuildHost::drop_written_watch_sources`), so a cycle parses only
+  the changed files, on the loading thread.
   A `.d.ts` or `.json` file still comes through `source_files` (Go
   `sourceFiles`) first, which keeps the first parse of a cycle until the
   cycle ends, as in Go: a project that builds beside an upstream project
@@ -640,8 +642,11 @@ The batch that adds it is not accepted until Theo approves.
   thread. So a project that imports another project's output without a
   reference can read it before or after Go's reader does:
   - G1: the reader references a project that builds before the writer.
-  - G2 (the rest): several large emit-only projects with the default
-    builders. Their affected-file walks wait for the loading thread.
+  - G2 (the rest): several large projects with the default builders.
+    Their affected-file walks wait for the loading thread: for an
+    emit-only task, and for a checked task too
+    (`incremental::Program::start_check`; Go runs `collectAllAffectedFiles`
+    on the task's goroutine). k2redis1 repro: 3 checked projects.
   - G3: a `noEmitOnError` project has no early emit. It finishes when its
     check ends, then emits and writes; Go's builder writes when that emit
     ends. Starting its emit when its check ends (k2gaps1 round 1) broke
@@ -687,6 +692,13 @@ The batch that adds it is not accepted until Theo approves.
     answer stays in Go's set, and quiet hosts gave one answer. Cause: in
     the full build the port's k finishes late (350 to 460 ms against Go's
     140 to 180 ms), so k and w almost tie, and C1 moves k a little later.
+  - G6, partial writes: Go writes each output when the emit of its file
+    ends, so a task that loads during that emit reads some files old and
+    some new. The port keeps an early emit's writes until the task
+    finishes (`buffer_early_emit_writes`), so it reads all old or all new.
+    node-redis step 2: Go reads `commands/index.d.ts` old and
+    `AGGREGATE.d.ts` and `CREATE.d.ts` new in 6 of 6 runs; the port reads
+    all old (k2redis1). A Go clock for G1 alone does not fix this.
 
 `program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
 `Program` methods as free functions with Go snake names (`get_resolved_module(file, name, mode)` ->
@@ -926,21 +938,43 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   while they check, which race in Go. Go also gives each class with private
   names an id at bind time; the port does not
   (`get_symbol_name_for_private_identifier`), so such a class gets its id
-  later, at its first id site. The 4 check-time private name sites give the
-  class its id, as Go does (`Checker::private_identifier_symbol_name`).
+  later, at its first id site. The 4 check-time private name sites give an
+  id to the symbol that they look in, as Go does: the class, or the symbol
+  of the type that the site looks in
+  (`Checker::private_identifier_symbol_name`).
 - Several programs in one process: Go's one counter runs on from one
-  program to the next, and a bound file keeps the ids of its symbols. With
-  `--singleThreaded` (one checker) the port hands the ids of a program's
-  checker to its loading thread, so the next program's checker starts from
-  them (`program::CheckerPool::carry_symbol_ids`): when the next pool is made
-  (watch makes the next program before it releases the last) or when the
-  program is released (`tsc -b`). So `tsc -b --singleThreaded` and the
-  watch cycles of `--singleThreaded` give Go's ids. Other cases do not
-  carry ids, and each program's checkers count from the loading thread's
-  ids: with more checkers (the default pool, `tsc -b` projects built at once)
-  Go's ids race, and per-thread counters cannot give Go's process count
-  without one shared counter. The language server's programs and its search
-  threads do not carry ids either. Go's ids are also fixed with
+  program to the next, and a bound file keeps the ids of its symbols. The
+  one-checker pool of a program with `singleThreaded` (on the command line
+  or in the project tsconfig, `program::single_threaded`) hands the ids of
+  its checker to its loading thread, so the next program's checker starts
+  from them (`program::CheckerPool::carry_symbol_ids`): when the next such
+  pool is made (watch makes the next program before it releases the last)
+  or when the program is released (`tsc -b`). The loading thread takes them
+  only when it gave no ids after the pool was made. So `tsc -b
+  --singleThreaded` and the watch cycles of `--singleThreaded` give Go's
+  ids. Two more cases carry ids:
+  - `tsc -b` with more builders, for the projects whose tsconfig has
+    `"singleThreaded": true`. The pool of each such project first waits for
+    the check and emit of the last one (`symbol_id_carry_start`), so their
+    checks run one after the other, where Go's builders run them at once.
+    This is a speed cost only. A project that waits for its upstream
+    project gets Go's ids. When Go builds 2 such projects at once, its ids
+    race, and the port gives the ids of one order.
+  - The API `emitProgram` of a project whose tsconfig has
+    `"singleThreaded": true`. Its one-checker compile pool is on the
+    dispatch thread. When the pool stops or the next such pool is made, and
+    the dispatch thread gave no ids after the pool was made, the dispatch
+    thread counts on from the ids of the emit. So the API symbol handles
+    (symbol ids) that come after are larger. The handles that the client
+    already has do not change. Go emits with the project's checkers, which
+    share the one counter with the other requests, so its later handles
+    also count on after an emit, but not by the same number.
+
+  Other cases do not carry ids, and each program's checkers count from the
+  loading thread's ids: with more checkers (the default pool, `--checkers`
+  above 1) Go's ids race, and per-thread counters cannot give Go's process
+  count without one shared counter. The language server's programs and its
+  search threads do not carry ids either. Go's ids are also fixed with
   `--checkers 1` when the programs run one at a time (`tsc -b --builders 1
   --checkers 1`, watch with `--checkers 1`), but the port does not carry
   them there: `program.rs` cannot tell that the programs run one at a time,
