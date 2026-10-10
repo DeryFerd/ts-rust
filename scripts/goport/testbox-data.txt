@@ -17,6 +17,8 @@ inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/corpus-int
 inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/emit-corpus/
 inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/errcopies/
 inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/typesyms/compare-int.py
+# A mount target of the pin dumper: pin.py binds a file cache only over a file that exists.
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/typesyms/typesymdump-go
 inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/battery/traces/
 inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/battery/counts.json
 pin /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/pins/@PIN@/
