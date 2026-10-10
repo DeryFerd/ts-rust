@@ -1160,7 +1160,7 @@ impl BuildTask {
             // and this thread makes them (`flush_writes_on_this_thread`), so
             // a failed write is in its file's result, as in Go.
             let emitted = if deferred_writes.is_some() {
-                flush_writes_on_this_thread(emit)
+                flush_writes_on_this_thread(sys.client_writes(), emit)
             } else {
                 emit()
             };

@@ -770,14 +770,31 @@ struct BufferedWrite {
 
 /// What `flush_writes` did not write, by file name: the error text of each
 /// failed write, and `None` for each write that it left out. Every other
-/// write succeeded.
+/// write succeeded, or was not made because the replay panics first
+/// (`flush_client_writes`).
 type FlushFailures = FxHashMap<String, Option<String>>;
+
+/// PORT: not in Go. How the writes of the API build reach the client when
+/// each one is a `writeFile` call (`--callbacks writeFile`). Go's emit
+/// goroutines make the calls, so which outputs exist when a d.ts signature
+/// panics (`diagnostic_to_string_builder`) depends on the calls
+/// (`flush_client_writes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientWrites {
+    /// The calls run at the same time (`--async`, Go `AsyncConn.Call`).
+    Concurrent,
+    /// One call at a time: Go `SyncConn.Call` (msgpack) holds a mutex for
+    /// each call (ipc/conn_sync.go:170).
+    Serialized,
+}
 
 thread_local! {
     /// True while `buffer_early_emit_writes` runs its `start`.
     static BUFFER_EARLY_EMIT_WRITES: Cell<bool> = const { Cell::new(false) };
     /// True while `flush_writes_on_this_thread` runs its `f`.
     static FLUSH_ON_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+    /// The `client_writes` of `flush_writes_on_this_thread` while it runs.
+    static CLIENT_WRITES: Cell<Option<ClientWrites>> = const { Cell::new(None) };
 }
 
 /// PORT: not in Go (perf). Runs `start`, a `Program::start_emit` call, so
@@ -808,16 +825,24 @@ pub(crate) fn buffer_early_emit_writes(start: impl FnOnce()) {
 /// API build runs a task's emit under it: only its orchestrator thread
 /// reaches the file system (`System::emit_writes_through_osvfs`), so a
 /// write on another thread would wait (build_task.rs `DeferredWrites`), and
-/// the emit would not get its result.
-pub(crate) fn flush_writes_on_this_thread<R>(f: impl FnOnce() -> R) -> R {
-    /// Puts back the flag of the caller when `f` ends, also on a panic.
-    struct Reset(bool);
+/// the emit would not get its result. `client_writes` is
+/// `System::client_writes`.
+pub(crate) fn flush_writes_on_this_thread<R>(
+    client_writes: Option<ClientWrites>,
+    f: impl FnOnce() -> R,
+) -> R {
+    /// Puts back the values of the caller when `f` ends, also on a panic.
+    struct Reset(bool, Option<ClientWrites>);
     impl Drop for Reset {
         fn drop(&mut self) {
             FLUSH_ON_THIS_THREAD.set(self.0);
+            CLIENT_WRITES.set(self.1);
         }
     }
-    let _reset = Reset(FLUSH_ON_THIS_THREAD.replace(true));
+    let _reset = Reset(
+        FLUSH_ON_THIS_THREAD.replace(true),
+        CLIENT_WRITES.replace(client_writes),
+    );
     f()
 }
 
@@ -837,7 +862,8 @@ const MAX_FLUSH_THREADS: usize = 8;
 /// `data.Diagnostics`. When the callback computes the signature from them
 /// (`signature_read_diagnostics`), Go panics there
 /// (`diagnostic_to_string_builder`) before the write, so this leaves the
-/// write out.
+/// write out. In the API build with client calls the writes go as
+/// `flush_client_writes` says.
 fn flush_writes(
     mut writes: Vec<BufferedWrite>,
     order: &[Path],
@@ -850,11 +876,17 @@ fn flush_writes(
         .collect();
     // A file's JS and declaration can emit on two threads, each in order.
     let key = |write: &BufferedWrite| {
-        let output = write.file_name.as_str();
-        let declaration = is_declaration_file_name(output.strip_suffix(".map").unwrap_or(output));
-        (order.get(&write.source).copied(), declaration)
+        (
+            order.get(&write.source).copied(),
+            is_declaration_output(write),
+        )
     };
     crate::gostd::slices::stable_sort_by(&mut writes, |a, b| key(a).cmp(&key(b)));
+    if let Some(calls) = CLIENT_WRITES.get()
+        && !crate::program::single_threaded()
+    {
+        return flush_client_writes(writes, calls, write_file);
+    }
     let files: Vec<&mut [BufferedWrite]> =
         writes.chunk_by_mut(|a, b| a.source == b.source).collect();
     let threads = if FLUSH_ON_THIS_THREAD.get() {
@@ -914,6 +946,105 @@ fn flush_writes(
     let failures = failures
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
+    (!failures.is_empty()).then_some(failures)
+}
+
+/// True for a declaration output or its map.
+fn is_declaration_output(write: &BufferedWrite) -> bool {
+    let output = write.file_name.as_str();
+    is_declaration_file_name(output.strip_suffix(".map").unwrap_or(output))
+}
+
+/// `flush_writes` in the API build when each write is a client `writeFile`
+/// call (`calls`), without `--singleThreaded`. `writes` are in file order,
+/// each file's outputs in Go's order. Go's emit goroutines make the calls
+/// in parallel. A d.ts signature that reads the TS5033 of an earlier
+/// failed write of its file (`signature_read_diagnostics`) panics and ends
+/// the process during the other goroutines' calls, so Go writes some of
+/// their outputs, by timing. This makes the writes that Go N' mostly
+/// makes (gopanicout1 `go-model.md` section 5, 50 runs per shape):
+/// - The outputs go in rounds: the first output of each file that comes
+///   before its declarations, then the second..., then the declaration
+///   outputs in rounds. A file's goroutine writes its JS and maps before
+///   its declarations.
+/// - After a failed write of a file whose d.ts then panics (doomed), with
+///   `Concurrent` calls: the other outputs before the declarations, then
+///   the doomed file's declaration map. Go's panic needs no more answers,
+///   and another file's d.ts needs one more.
+/// - With `Serialized` calls: only the doomed file's outputs before its
+///   d.ts. The goroutine that got its answer takes the call mutex again.
+/// - No other write is made: the replay panics at the doomed d.ts, and the
+///   process ends (`program_emit::wait_emit_jobs`).
+///
+/// Without a doomed file every write is made, in rounds.
+fn flush_client_writes(
+    writes: Vec<BufferedWrite>,
+    calls: ClientWrites,
+    write_file: Option<&WriteFile>,
+) -> Option<FlushFailures> {
+    // (declaration, the output's place among its file's outputs of that
+    // kind, the file), and the write.
+    let mut rounds = Vec::with_capacity(writes.len());
+    let mut file = 0;
+    let mut place = [0; 2];
+    let mut previous: Option<Path> = None;
+    for write in writes {
+        if previous.as_ref() != Some(&write.source) {
+            if previous.is_some() {
+                file += 1;
+            }
+            place = [0; 2];
+            previous = Some(write.source.clone());
+        }
+        let declaration = is_declaration_output(&write);
+        rounds.push(((declaration, place[usize::from(declaration)], file), write));
+        place[usize::from(declaration)] += 1;
+    }
+    crate::gostd::slices::stable_sort_by(&mut rounds, |a, b| a.0.cmp(&b.0));
+    // The files whose d.ts signature reads `data.diagnostics`.
+    let reads_diagnostics: FxHashSet<usize> = rounds
+        .iter()
+        .filter(|(_, write)| write.signature_read_diagnostics)
+        .map(|&((.., file), _)| file)
+        .collect();
+    let mut failed = FxHashSet::default();
+    let mut doomed = None;
+    let mut failures = FlushFailures::default();
+    for ((declaration, _, file), mut write) in rounds {
+        let made = match (doomed, calls) {
+            (None, _) => true,
+            (Some(doomed), ClientWrites::Concurrent) => !declaration || file == doomed,
+            (Some(doomed), ClientWrites::Serialized) => file == doomed,
+        };
+        if !made {
+            continue;
+        }
+        let result = if failed.contains(&file) && write.signature_read_diagnostics {
+            None
+        } else {
+            match write_output(
+                write_file,
+                &write.file_name,
+                &write.text,
+                &mut write.data,
+                write.differs_only_in_map,
+            ) {
+                Ok(()) => continue,
+                Err(err) => Some(err),
+            }
+        };
+        // A failed output before the file's d.ts (not the d.ts itself,
+        // whose signature comes before its write).
+        if doomed.is_none()
+            && result.is_some()
+            && !write.signature_read_diagnostics
+            && reads_diagnostics.contains(&file)
+        {
+            doomed = Some(file);
+        }
+        failed.insert(file);
+        failures.insert(write.file_name, result);
+    }
     (!failures.is_empty()).then_some(failures)
 }
 
