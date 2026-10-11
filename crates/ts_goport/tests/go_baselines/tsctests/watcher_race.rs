@@ -328,7 +328,7 @@ fn watcher_alternating_modify_and_do_cycle() {
     );
 }
 
-// Go: watcher_race_test.go:268 TestBuildWatchStopsWhenContextIsCancelled
+// Go: watcher_race_test.go:271 TestBuildWatchStopsWhenContextIsCancelled
 ///
 /// PORT: Go builds `sys` on the test goroutine and runs CommandLine on
 /// another goroutine. `TestSys` is not `Send`, so the thread builds the same
@@ -357,7 +357,8 @@ fn build_watch_stops_when_context_is_cancelled() {
             cancel();
 
             let (result_tx, result_rx) = mpsc::sync_channel::<(ExitStatus, bool)>(1);
-            // ts#64457 removed --watchInterval from these arguments.
+            // ts#64457 removed --watchInterval from these arguments (Go N'
+            // fed0bf24149f watcher_race_test.go:285).
             const ARGS: [&str; 2] = ["--build", "--watch"];
             thread::Builder::new()
                 .stack_size(STACK_SIZE)
