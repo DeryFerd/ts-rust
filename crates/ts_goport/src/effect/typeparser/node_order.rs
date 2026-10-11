@@ -33,6 +33,7 @@ pub enum Walk {
 
 impl NodeOrder {
     /// The order of `root` and its subtree, from one `for_each_child` walk.
+    /// A nil child is not in the order.
     #[must_use]
     pub fn build(root: Node) -> Self {
         fn visit(n: Node, nodes: &mut Vec<Node>, end: &mut Vec<u32>) {
@@ -40,7 +41,15 @@ impl NodeOrder {
             nodes.push(n);
             end.push(0);
             n.for_each_child(|child| {
-                visit(child, nodes, end);
+                // Go `visit` (ast.go:31) skips a nil child field, but
+                // `visitNodes` (ast.go:38) passes a nil list entry, and each
+                // Go rule walk skips it (`if node == nil`, for example
+                // schema_number.go:46 and promise_in_effect_success.go:39).
+                // A parsed file has no nil list entry, so this changes no
+                // output.
+                if child.is_some() {
+                    visit(child, nodes, end);
+                }
                 false
             });
             end[i] = u32::try_from(nodes.len()).expect("node count fits u32");
@@ -151,6 +160,21 @@ mod tests {
             let want: Vec<Node> = n.iter_children().collect();
             assert_eq!(kids, want);
         }
+    }
+
+    // PORT: no Go test; Go `visitNodes` (ast.go:38) and the rule walks
+    // (schema_number.go:46). A nil list entry (a factory list) is not in
+    // the order, as the Go walks skip it.
+    #[test]
+    fn order_skips_a_nil_list_entry() {
+        let f = NodeFactory::new();
+        let a = f.new_identifier("a");
+        let b = f.new_identifier("b");
+        let array = f.new_array_literal_expression(f.new_node_list(&[a, Node::NIL, b]), false);
+        let order = NodeOrder::build(array);
+        assert_eq!(order.nodes(), &[array, a, b]);
+        let kids: Vec<Node> = order.children(0).map(|c| order.node(c)).collect();
+        assert_eq!(kids, [a, b]);
     }
 
     #[test]
