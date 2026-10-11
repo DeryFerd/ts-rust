@@ -49,65 +49,17 @@ pub fn new_package_source_file_descriptor(
     }
 }
 
-/// A `reference_symbol` cache entry.
-// PORT: Go caches only `reference`. The port also keeps `at_location`, so the
-// stability rules need no second `GetSymbolAtLocation` call.
-#[derive(Clone, Copy, Debug)]
-pub struct ReferenceSymbols {
-    /// The first `get_symbol_at_location(node)` result. For an Identifier it
-    /// is the checker's `GetSymbolAtLocation(node)`. A later call can give a
-    /// new transient symbol (a for-of binding element's property name does)
-    /// with the same declarations and flags; the stability walk reads only
-    /// those, so the first result gives the same answers.
-    pub at_location: SymbolId,
-    /// Go `ReferenceSymbolAtNode(node)`.
-    pub reference: SymbolId,
-}
-
-/// A `reference_symbol` slot in a node link page: the `ReferenceSymbols`
-/// of a node, with `at_location` kept like `CachedId`, so that
-/// `Option<CachedReferenceSymbols>` is 8 bytes (a page of 64 nodes 512
-/// bytes). The default is nil.
-// PERF: the cache stays on node link pages (effcache1) and keeps both
-// symbols (effperf1).
-#[derive(Clone, Copy, Default)]
-pub struct CachedReferenceSymbols {
-    at_location: CachedId,
-    reference: SymbolId,
-}
-
-const _: () = assert!(size_of::<Option<CachedReferenceSymbols>>() == 8);
-
 impl TypeParser<'_> {
     pub fn reference_symbol_at_node(&mut self, node: Node) -> SymbolId {
-        self.reference_symbols_at_node(node).reference
-    }
-
-    /// `reference_symbol_at_node(node)`, with the symbol at `node` that it
-    /// starts from.
-    // PORT: not in Go. Go `runStabilityApiUsage` calls `GetSymbolAtLocation`
-    // and then `ReferenceSymbolAtNode`, which calls it again on a cache miss.
-    // A later call on an Identifier gives a symbol with the same declarations
-    // and flags (sometimes a new transient one), and the walk reads only those,
-    // so the port keeps the first result and saves one call per identifier per
-    // rule.
-    pub fn reference_symbols_at_node(&mut self, node: Node) -> ReferenceSymbols {
         if node.is_nil() {
-            return ReferenceSymbols {
-                at_location: SymbolId::NIL,
-                reference: SymbolId::NIL,
-            };
+            return SymbolId::NIL;
         }
 
         // Go `Cached(&tp.links.ReferenceSymbol, node, ..)`.
         if let Some(cached) = self.links().reference_symbol.try_get(node) {
-            return ReferenceSymbols {
-                at_location: SymbolId(cached.at_location.get()),
-                reference: cached.reference,
-            };
+            return SymbolId(cached.get());
         }
-        let at_location = self.get_symbol_at_location(node);
-        let mut sym = at_location;
+        let mut sym = self.get_symbol_at_location(node);
         if sym.is_nil() && node.kind() == SyntaxKind::PropertyAccessExpression {
             let prop = node;
             if prop.name().is_some() {
@@ -116,19 +68,11 @@ impl TypeParser<'_> {
         }
 
         sym = self.resolve_aliased_symbol(sym);
-        let reference = if node.kind() == SyntaxKind::Identifier && !is_declaration_name(node) {
-            self.resolve_constant_alias_symbol(sym)
-        } else {
-            sym
-        };
-        *self.links().reference_symbol.get(node) = CachedReferenceSymbols {
-            at_location: CachedId::new(at_location.0),
-            reference,
-        };
-        ReferenceSymbols {
-            at_location,
-            reference,
+        if node.kind() == SyntaxKind::Identifier && !is_declaration_name(node) {
+            sym = self.resolve_constant_alias_symbol(sym);
         }
+        *self.links().reference_symbol.get(node) = CachedId::new(sym.0);
+        sym
     }
 
     pub fn resolve_constant_alias_symbol(&mut self, sym: SymbolId) -> SymbolId {
