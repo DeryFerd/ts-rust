@@ -46,8 +46,6 @@ fn run_async_await_to_fn(ctx: &mut RefactorContext<'_, '_>) -> Vec<CodeAction> {
             if async_fn.kind() == SyntaxKind::FunctionDeclaration {
                 tracker.replace_node(sf, async_fn, new_decl, None);
             } else {
-                // PORT: false (Go panics) comes before any edit, so the
-                // action has no edits and is dropped.
                 replace_expression_via_statement(tracker, sf, async_fn, new_decl);
             }
         }

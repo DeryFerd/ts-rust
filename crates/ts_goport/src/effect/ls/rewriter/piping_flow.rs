@@ -2,8 +2,6 @@
 //! replace or collapse the steps of a piping flow while keeping how each
 //! step's input is applied in source.
 
-use std::cell::Cell;
-
 use rustc_hash::FxHashMap;
 
 use crate::ast::visitor::{NodeVisitorHooks, new_node_visitor};
@@ -135,9 +133,13 @@ impl Tracker {
             return false;
         }
         let access = call_node.expression();
-        // PORT: Go `AsPropertyAccessExpression()` is a type assertion that
-        // panics on another kind. The port returns false (no edit) there.
-        if access.kind() != SyntaxKind::PropertyAccessExpression || access.name().is_nil() {
+        // Go: rewriter/piping_flow.go:83 `call.Expression.AsPropertyAccessExpression()`
+        // panics on another kind (`ParsePipeCall` makes a pipeable step only
+        // from a property access).
+        if access.kind() != SyntaxKind::PropertyAccessExpression {
+            go_node_as_panic(access, "PropertyAccessExpression");
+        }
+        if access.name().is_nil() {
             return false;
         }
 
@@ -233,10 +235,12 @@ impl Tracker {
             | TransformationKind::EffectFnUntraced => piping_flow_operator(f, replacement),
 
             TransformationKind::DataFirst | TransformationKind::DataLast => {
-                // PORT: Go `AsCallExpression()` panics when the node is not a
-                // call (the callee fallback). The port returns false there.
-                if !is_call_expression(transformation_node)
-                    || transformation_node.argument_list().is_nil()
+                // Go: rewriter/piping_flow.go:200 `transformationNode.AsCallExpression()`
+                // panics when the node is not a call (the callee fallback).
+                if !is_call_expression(transformation_node) {
+                    go_node_as_panic(transformation_node, "CallExpression");
+                }
+                if transformation_node.argument_list().is_nil()
                     || transformation_node.arguments().is_empty()
                 {
                     return false;
@@ -264,10 +268,12 @@ impl Tracker {
             }
 
             TransformationKind::Call => {
-                // PORT: Go `AsCallExpression()` panics when the node is not a
-                // call (the callee fallback). The port returns false there.
-                if !is_call_expression(transformation_node)
-                    || transformation_node.argument_list().is_nil()
+                // Go: rewriter/piping_flow.go:227 `transformationNode.AsCallExpression()`
+                // panics when the node is not a call (the callee fallback).
+                if !is_call_expression(transformation_node) {
+                    go_node_as_panic(transformation_node, "CallExpression");
+                }
+                if transformation_node.argument_list().is_nil()
                     || transformation_node.arguments().len() != 1
                 {
                     return false;
@@ -385,10 +391,6 @@ impl Tracker {
         if target.is_nil() {
             return false;
         }
-        // PORT: Go panics in the visitor when an emptied pipe call is not a
-        // call, or a pipeable call's expression is not a property access. The
-        // port sets this flag there and makes no edit.
-        let go_panics = Cell::new(false);
         let result = {
             let f = self.node_factory();
             let mut visitor = new_node_visitor(
@@ -396,18 +398,19 @@ impl Tracker {
                     let Some(&index) = steps.get(&node) else {
                         let updated = v.visit_each_child(node);
                         if let Some(&kind) = emptied_pipes.get(&node) {
+                            // Go: rewriter/piping_flow.go:335 `updated.AsCallExpression()`
                             if !is_call_expression(updated) {
-                                go_panics.set(true);
-                                return updated;
+                                go_node_as_panic(updated, "CallExpression");
                             }
                             let arguments = updated.argument_list();
                             if kind == TransformationKind::Pipeable
                                 && (arguments.is_nil() || arguments.nodes().is_empty())
                             {
+                                // Go: rewriter/piping_flow.go:337
+                                // `call.Expression.AsPropertyAccessExpression()`
                                 let access = updated.expression();
                                 if access.kind() != SyntaxKind::PropertyAccessExpression {
-                                    go_panics.set(true);
-                                    return updated;
+                                    go_node_as_panic(access, "PropertyAccessExpression");
                                 }
                                 return access.expression();
                             }
@@ -465,9 +468,6 @@ impl Tracker {
             let visited = visitor.visit_node(target);
             f.deep_clone_node(visited)
         };
-        if go_panics.get() {
-            return false;
-        }
         set_parent_in_children(result);
         self.replace_node(source_file, target, result, None);
         true

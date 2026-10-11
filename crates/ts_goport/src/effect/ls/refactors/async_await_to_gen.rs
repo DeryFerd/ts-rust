@@ -47,8 +47,6 @@ fn run_async_await_to_gen(ctx: &mut RefactorContext<'_, '_>) -> Vec<CodeAction> 
             if async_fn.kind() == SyntaxKind::FunctionDeclaration {
                 tracker.replace_node(sf, async_fn, new_decl, None);
             } else {
-                // PORT: false (Go panics) comes before any edit, so the
-                // action has no edits and is dropped.
                 replace_expression_via_statement(tracker, sf, async_fn, new_decl);
             }
         }
@@ -62,29 +60,29 @@ fn run_async_await_to_gen(ctx: &mut RefactorContext<'_, '_>) -> Vec<CodeAction> 
 /// initializer, and replacing the entire statement. This avoids a printer
 /// assertion failure that occurs when replacing non-statement nodes with
 /// complex synthetic trees.
-// PORT: returns false where Go panics (`varDecl.Parent` is not a
-// VariableDeclarationList, for example a catch clause variable), with no
-// edit. Callers that queued other edits drop the action, as E4's fixables
-// make no edit for a Go panic.
+// A catch clause variable with an initializer (`catch (e = async () =>
+// ...)`, a grammar error that parses) under a variable statement has a
+// CatchClause parent: Go `AsVariableDeclarationList` panics there
+// (`go_node_as_panic`), and the LSP request answers an internal error.
 pub(crate) fn replace_expression_via_statement(
     tracker: &mut Tracker,
     sf: Node,
     old_expr: Node,
     new_expr: Node,
-) -> bool {
+) {
     // Walk up to find containing VariableDeclaration
     let var_decl = find_parent_of_kind(old_expr, SyntaxKind::VariableDeclaration);
     if var_decl.is_nil() {
         // Fallback: replace directly
         tracker.replace_node(sf, old_expr, new_expr, None);
-        return true;
+        return;
     }
 
     // Walk up to find containing VariableStatement
     let var_stmt = find_parent_of_kind(var_decl, SyntaxKind::VariableStatement);
     if var_stmt.is_nil() {
         tracker.replace_node(sf, old_expr, new_expr, None);
-        return true;
+        return;
     }
 
     let new_var_stmt = {
@@ -102,9 +100,10 @@ pub(crate) fn replace_expression_via_statement(
         let new_var_decl = f.new_variable_declaration(name, Node::NIL, type_node, new_expr);
 
         // Rebuild the VariableDeclarationList
+        // Go: refactors/async_await_to_gen.go:93 `varDecl.Parent.AsVariableDeclarationList()`
         let vdl = var_decl.parent();
         if vdl.kind() != SyntaxKind::VariableDeclarationList {
-            return false;
+            go_node_as_panic(vdl, "VariableDeclarationList");
         }
         let new_var_decl_list = f.new_variable_declaration_list(
             f.new_node_list(&[new_var_decl]),
@@ -118,7 +117,6 @@ pub(crate) fn replace_expression_via_statement(
 
     set_parent_in_children(new_var_stmt);
     tracker.replace_node(sf, var_stmt, new_var_stmt, None);
-    true
 }
 
 /// The modifiers of `mods` as new modifier tokens, or nil when there are
@@ -433,4 +431,49 @@ pub(super) fn get_modifiers_without_async(tracker: &Tracker, node: Node) -> Modi
         return ModifierList::NIL;
     }
     f.new_modifier_list(&mod_nodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+    use crate::ls::{change, lsconv, lsutil};
+    use crate::lsp::lsproto;
+
+    // A catch clause variable with an initializer parses (TS1197 is a
+    // checker error), and its VariableDeclaration has a CatchClause parent.
+    // Go `varDecl.Parent.AsVariableDeclarationList()` (async_await_to_gen.go:93)
+    // panics there, so the codeAction request answers an internal error
+    // with this text instead of any action.
+    #[test]
+    fn replace_expression_via_statement_panics_as_go_on_a_catch_variable() {
+        let text = "export const handler = () => {\n  try {\n    return 1\n  } catch (e = async () => 1) {\n    return 2\n  }\n}\n";
+        let opts = SourceFileParseOptions {
+            file_name: "/catch.ts".to_string(),
+            ..Default::default()
+        };
+        let sf = parse_source_file(&opts, text, ScriptKind::TS).root;
+        let pos = text.find("async").expect("the async arrow") as i32;
+        let async_fn = find_async_function(astnav::get_token_at_position(sf, pos));
+        assert_eq!(async_fn.kind(), SyntaxKind::ArrowFunction);
+        let mut tracker = Tracker::new(change::new_tracker(
+            &crate::gostd::context::background(),
+            &crate::options::CompilerOptions::default(),
+            lsutil::FormatCodeSettings::default(),
+            lsconv::new_converters(lsproto::PositionEncodingKind::UTF16, |_| None),
+        ));
+        let new_expr = tracker.node_factory().new_identifier("replacement");
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            replace_expression_via_statement(&mut tracker, sf, async_fn, new_expr);
+        }))
+        .expect_err("Go panics");
+        assert_eq!(
+            payload
+                .downcast_ref::<crate::core::GoPanic>()
+                .map(|p| p.message.as_str()),
+            Some(
+                "interface conversion: ast.nodeData is *ast.CatchClause, not *ast.VariableDeclarationList"
+            )
+        );
+    }
 }
