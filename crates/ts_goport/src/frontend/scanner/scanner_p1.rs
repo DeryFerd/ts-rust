@@ -642,7 +642,9 @@ impl<'a> Scanner<'a> {
     }
 
     // Go: scanner/scanner.go:276 TokenText
-    pub fn token_text(&self) -> &str {
+    // PORT: a slice of the text (`'a`), like the Go substring, so a caller
+    // can keep it after the next scan.
+    pub fn token_text(&self) -> &'a str {
         &self.text[self.scanner_state.token_start as usize..self.scanner_state.pos as usize]
     }
 
