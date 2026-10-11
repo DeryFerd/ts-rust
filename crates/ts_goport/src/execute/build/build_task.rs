@@ -2235,7 +2235,8 @@ impl BuildTask {
         // upstream task whose config file is gone or cannot be read, so its
         // check never loaded a build info).
         let Some(entry) = self.build_info_entry.as_mut() else {
-            crate::core::go_nil_dereference()
+            // Go N' loads `buildInfoEntry.dtsTime` (offset 0x40): addr=0x40 (buildtask.go:895).
+            crate::core::go_nil_dereference_at(0x40)
         };
         if let Some(dts_time) = entry.dts_time {
             return dts_time;
@@ -2244,7 +2245,9 @@ impl BuildTask {
         // panics on a nil build info (an upstream build info that cannot be
         // read).
         let Some(build_info) = entry.build_info.as_ref() else {
-            crate::core::go_nil_dereference()
+            // Go N' loads `buildInfo.LatestChangedDtsFile` (offset 0x140): addr=0x140
+            // (buildtask.go:900).
+            crate::core::go_nil_dereference_at(0x140)
         };
         // ts#64159: `incremental.ResolveBuildInfoFileName` against the build
         // info file's directory, not its path key's (buildtask.go:898-904).

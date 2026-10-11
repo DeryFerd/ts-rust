@@ -2343,7 +2343,8 @@ impl Node {
         }
         // Go reads the kind of a nil node.
         if self.is_nil() {
-            crate::core::go_nil_dereference();
+            // Go N' loads `node.Kind` (offset 0): addr=0x0.
+            crate::core::go_nil_dereference_at(0x0);
         }
         unreachable!("node {self:?} is not synthetic and has no store")
     }

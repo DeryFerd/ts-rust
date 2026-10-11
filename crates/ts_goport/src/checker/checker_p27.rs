@@ -1387,7 +1387,9 @@ impl Checker {
         // the nil parent of the SourceFile, and `IsParameterDeclaration(nil)`
         // dereferences it. The shortcuts below skip that walk.
         if matches!(node.kind(), SyntaxKind::SourceFile | SyntaxKind::EndOfFile) {
-            crate::core::go_nil_dereference();
+            // Go N' loads `node.Kind` of the nil parent (offset 0): addr=0x0
+            // (ast_generated.go:1888).
+            crate::core::go_nil_dereference_at(0x0);
         }
         if let Some(facts) = frozen_node_store_facts(node) {
             // PERF: hono P7-C7. The loop adds a constraint only under a
