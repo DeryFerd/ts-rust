@@ -60,6 +60,49 @@ impl FlatKey for InferenceKey {
     }
 }
 
+/// PORT: perf. Not in Go. `InferenceState::definitely_unrelated`: a
+/// direct-mapped cache of `types_definitely_unrelated` for the source and
+/// target pairs of `infer_from_object_types` in one inference. A slot holds
+/// the pair as one word and `(generation << 1) | answer`; a slot of an
+/// earlier inference on this pooled state has another generation, so
+/// nothing is cleared between inferences.
+pub struct DefinitelyUnrelatedCache {
+    slots: Box<[(u64, u64); Self::SLOTS]>,
+}
+
+impl DefinitelyUnrelatedCache {
+    const SLOTS: usize = 1024;
+
+    #[inline]
+    fn slot(pair: u64) -> usize {
+        // The murmur3 finalizer, as for `RecursionKey`.
+        let mut x = pair;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        (x ^ (x >> 33)) as usize & (Self::SLOTS - 1)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn get(&self, pair: u64, generation: u64) -> Option<bool> {
+        let (p, g) = self.slots[Self::slot(pair)];
+        (p == pair && g >> 1 == generation).then_some(g & 1 != 0)
+    }
+
+    #[inline]
+    pub fn put(&mut self, pair: u64, generation: u64, unrelated: bool) {
+        self.slots[Self::slot(pair)] = (pair, (generation << 1) | u64::from(unrelated));
+    }
+}
+
+impl Default for DefinitelyUnrelatedCache {
+    fn default() -> Self {
+        Self {
+            slots: Box::new([(0, 0); Self::SLOTS]),
+        }
+    }
+}
+
 /// The map type of `InferenceState::visited`. For an A/B run against
 /// hashbrown, change it to `FxHashMap<InferenceKey, InferencePriority>`.
 pub type InferenceVisitedMap = FlatMap<InferenceKey, InferencePriority>;
@@ -316,6 +359,12 @@ pub struct InferenceState {
     // of each entry (see `InferenceStack`).
     pub source_stack: InferenceStack,
     pub target_stack: InferenceStack,
+    // PORT: perf. Not in Go. `types_definitely_unrelated` of the source and
+    // target pairs of `infer_from_object_types` in this inference (see
+    // there), made at the first use. `generation` counts the inferences on
+    // this pooled state. An empty slot holds pair 0, which no real pair is.
+    pub definitely_unrelated: Option<DefinitelyUnrelatedCache>,
+    pub generation: u64,
     pub next: Option<Rc<RefCell<InferenceState>>>,
 }
 
@@ -353,6 +402,8 @@ impl Checker {
                 max_visited_len,
                 source_stack,
                 target_stack,
+                definitely_unrelated: _,
+                generation,
                 next,
             } = &mut *guard;
             *max_visited_len =
@@ -368,6 +419,8 @@ impl Checker {
             }
             source_stack.clear();
             target_stack.clear();
+            // The cache slots of this inference are stale from here on.
+            *generation += 1;
             // PORT: Go `inferences: n.inferences[:0]` keeps only the slice
             // capacity; the context id has none, so it becomes nil.
             *inferences = InferenceContextId::NIL;
@@ -1808,7 +1861,31 @@ impl Checker {
             }
         }
         // Infer from the members of source and target only if the two types are possibly related
-        if self.types_definitely_unrelated(source, target) {
+        // PORT: perf. Go N' (ts#64553) keys `invokeOnce` by the priority and
+        // the variance too, so one inference can run this action again for a
+        // pair it has seen. The first `types_definitely_unrelated` of a pair
+        // runs here as in Go; a later one in the same inference can take the
+        // kept answer. Go's later call gives the same answer and makes
+        // nothing: the properties, the property types and the union and
+        // intersection properties that it reads were made and cached by the
+        // first call, and the type resolutions under way are the same at
+        // every call of one inference (a nested inference has its own
+        // state).
+        let pair = (u64::from(source.0) << 32) | u64::from(target.0);
+        let generation = n.generation;
+        let cache = n.definitely_unrelated.get_or_insert_with(Default::default);
+        let unrelated = match cache.get(pair, generation) {
+            Some(unrelated) => unrelated,
+            None => {
+                let unrelated = self.types_definitely_unrelated(source, target);
+                n.definitely_unrelated
+                    .as_mut()
+                    .unwrap()
+                    .put(pair, generation, unrelated);
+                unrelated
+            }
+        };
+        if unrelated {
             return;
         }
         if self.is_array_or_tuple_type(source) {
@@ -2503,6 +2580,21 @@ mod tests {
             }
         }
         assert!(fast_answers > 1000);
+    }
+
+    #[test]
+    fn definitely_unrelated_cache_keeps_answers_of_one_generation() {
+        let mut cache = DefinitelyUnrelatedCache::default();
+        assert_eq!(cache.get(0, 0), Some(false));
+        let pair = (5 << 32) | 7;
+        assert_eq!(cache.get(pair, 3), None);
+        cache.put(pair, 3, true);
+        assert_eq!(cache.get(pair, 3), Some(true));
+        assert_eq!(cache.get(pair, 4), None);
+        assert_eq!(cache.get((7 << 32) | 5, 3), None);
+        cache.put(pair, 4, false);
+        assert_eq!(cache.get(pair, 4), Some(false));
+        assert_eq!(cache.get(pair, 3), None);
     }
 
     #[test]
