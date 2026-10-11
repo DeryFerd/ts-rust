@@ -12,7 +12,11 @@ use crate::prelude::*;
 /// EffectDisable provides "disable for line/file" actions for all Effect diagnostics.
 /// This fixable handles all Effect diagnostic codes and provides two actions:
 /// 1. "Disable {ruleName} for this line" - inserts @effect-diagnostics-next-line directive
-/// 2. "Disable {ruleName} for entire file" - inserts @effect-diagnostics skip-file directive
+/// 2. "Disable {ruleName} for entire file" - inserts `/** @effect-diagnostics {ruleName}:off */`
+///    at the top of the file
+// PORT: Go's comment (disable.go:16) says the file action inserts a
+// `skip-file` directive; its code (`createDisableFileAction`) inserts the
+// `{ruleName}:off` directive above, which this port does.
 // PORT: a `LazyLock` because its codes are `rule.AllCodes(rules.All)`. The
 // list is made once and lives for the process.
 pub static EFFECT_DISABLE: LazyLock<Fixable> = LazyLock::new(|| Fixable {
