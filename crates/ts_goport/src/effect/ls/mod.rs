@@ -13,6 +13,7 @@
 //! | 015 | `ls/inlay_hints.rs` `provide_inlay_hint` | [`inlay_hints::after_inlay_hints`] |
 //! | 022 | `ls/completions_p1.rs` `provide_completion` | [`after_completion`] |
 //! | 024 | `ls/symbols.rs` `get_document_symbols_for_children` | [`after_document_symbols`] |
+//! | 018, 027 | `ls/autoimport/view.rs` `new_view`, `ls/autoimport/fix.rs` `get_fixes` and `edits` | [`autoimportstyle::new_view_fix_transformer`] |
 //!
 //! Every hook returns its input at once when the program has no Effect
 //! plugin, as in Go. A standalone API process (`tsgo --api`) has the hooks
@@ -20,11 +21,10 @@
 //! the rules.
 //!
 //! Not ported here: patch 017 (`refactor.rewrite` in the server's code
-//! action kinds; root decision D1 keeps the plain list), and the auto-import
-//! transformer of `init()` (lane E3). The lists that later lanes fill:
-//! fixables (E4 ported the disable actions and 12 fixes; E5 the other 43),
-//! refactors (E9), completions (E6), document symbols (E8) and the Layer
-//! hover (E7).
+//! action kinds; root decision D1 keeps the plain list). The lists that
+//! later lanes fill: fixables (E4 ported the disable actions and 12 fixes;
+//! E5 the other 43), refactors (E9), completions (E6), document symbols (E8)
+//! and the Layer hover (E7).
 
 use std::sync::LazyLock;
 
@@ -33,6 +33,7 @@ use crate::effect::rulerunner::enabled_options;
 use crate::effect::typeparser::TypeParser;
 use crate::ls::prelude::*;
 
+pub mod autoimportstyle;
 pub mod fixable;
 pub mod fixables;
 pub mod hover;
