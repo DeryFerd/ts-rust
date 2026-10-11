@@ -1206,8 +1206,13 @@ impl ResolutionState<'_> {
         crate::gostd::slices::stable_sort_by(&mut names, |a, b| compare_go_bytes(a, b));
         let mut builder = String::new();
         for name in &names {
+            // Go N': `nodeModules.ResolveDirectory(pathForDynamicResolution(nodeModules, name,
+            // true))`. A Go `RootedDirectoryPath` has no trailing separator, so the
+            // `DirectoryExists` callback gets the path without one.
             let peer_package_json =
-                self.get_package_json_info(&resolve_path_for_module(&node_modules, name, true));
+                self.get_package_json_info(remove_trailing_directory_separator(
+                    &resolve_path_for_module(&node_modules, name, true),
+                ));
             if let Some(peer_package_json) = peer_package_json.filter(|p| p.exists()) {
                 let version = peer_package_json
                     .contents
