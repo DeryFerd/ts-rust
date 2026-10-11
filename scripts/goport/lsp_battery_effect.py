@@ -64,15 +64,25 @@ check sends every e1 method except initialize. lsp_oracle.py always sends
 and compares the initialize request: effect-tsgo adds "refactor.rewrite" to
 codeActionKinds (decision D1), so check prints initialize apart from the
 other methods.
+
+check then compares each hover that lsp_oracle.py classes diff again, with
+the "pako:" payload of each Mermaid link (the Layer hover's "Show full
+graph" and "Show outline") inflated on both sides: decision D3, tsc-rs
+deflates with other bytes than Go's compress/zlib. Nothing else is
+normalized, and lsp_oracle.py's results stay as they are. It prints the
+hover diffs that remain and writes results/<label>/mermaid-inflate.json.
 """
 
 import argparse
+import base64
 import gzip
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -452,6 +462,55 @@ def cmd_selfcheck(args) -> int:
     return rc
 
 
+MERMAID_PAKO = re.compile(r"pako:([A-Za-z0-9_-]+)")
+
+
+def canon(v) -> str:
+    """lsp_oracle.py canon: the JSON text that its compare uses."""
+    return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def inflate_mermaid(v):
+    """v with the "pako:<base64url>" payload of each Mermaid link in its strings inflated (decision D3)."""
+    if isinstance(v, str):
+        def one(m):
+            raw = base64.urlsafe_b64decode(m.group(1) + "=" * (-len(m.group(1)) % 4))
+            return "pako:<" + zlib.decompress(raw).decode("utf-8") + ">"
+        return MERMAID_PAKO.sub(one, v)
+    if isinstance(v, list):
+        return [inflate_mermaid(x) for x in v]
+    if isinstance(v, dict):
+        return {k: inflate_mermaid(x) for k, x in v.items()}
+    return v
+
+
+def mermaid_recheck(out_root: Path, label: str) -> tuple[int, list[dict]]:
+    """Compares each hover diff of the label again with the Mermaid payloads inflated on both sides.
+    Returns the number of hover diffs and the rows of those that still differ; writes all rows to
+    results/<label>/mermaid-inflate.json."""
+    rdir = out_root / "results" / label
+    rows = []
+    for tpath in sorted((rdir / "traces").glob("**/*.json")):
+        tr = json.loads(tpath.read_text())
+        diffs = [ev for ev in tr["events"] if ev["method"] == "textDocument/hover" and ev["class"] == "diff"]
+        if not diffs:
+            continue
+        with gzip.open(tr["golden"], "rt", encoding="utf-8") as f:
+            next(f)
+            golden = {r["i"]: r for r in map(json.loads, f) if r.get("kind") == "request"}
+        with gzip.open(tr["responses"], "rt", encoding="utf-8") as f:
+            responses = {r["i"]: r for r in map(json.loads, f)}
+        for ev in diffs:
+            g = golden[ev["i"]]["response"].get("result")
+            r = responses[ev["i"]]["response"].get("result")
+            same = canon(inflate_mermaid(g)) == canon(inflate_mermaid(r))
+            rows.append({"battery": tr["battery"], "trace": tr["trace"], "i": ev["i"],
+                         "mermaid": "pako:" in canon(g) or "pako:" in canon(r),
+                         "class": "same" if same else "diff"})
+    (rdir / "mermaid-inflate.json").write_text(json.dumps({"label": label, "rows": rows}, indent=1) + "\n")
+    return len(rows), [row for row in rows if row["class"] == "diff"]
+
+
 def cmd_check(args) -> int:
     methods = trace_methods(Path(args.out_root))
     rc = oracle("check", args, ["--goport", args.server, "--label", args.label, "--methods", ",".join(methods)])
@@ -469,6 +528,12 @@ def cmd_check(args) -> int:
             total[k] = total.get(k, 0) + v
     print(f"{'all but initialize':40s} {json.dumps(total, sort_keys=True)}")
     print(f"summary: {summary}")
+    hover_diffs, still = mermaid_recheck(Path(args.out_root), args.label)
+    print(f"\nhover diffs: {hover_diffs}; after Mermaid inflate (D3): {hover_diffs - len(still)} same, "
+          f"{len(still)} diff")
+    for row in still:
+        print(f"  {row['battery']}/{row['trace']} event {row['i']}")
+    print(f"rows: {Path(args.out_root) / 'results' / args.label / 'mermaid-inflate.json'}")
     return rc
 
 

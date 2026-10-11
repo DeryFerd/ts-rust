@@ -5,7 +5,9 @@
 // project made as the Go harness makes it, sends the requests the Go runner sends, formats the
 // answers as the Go baseline writers do, and compares the text with the committed baseline.
 // Hover cases have no baseline file: the expected text is the VerifyQuickInfoAt arguments of
-// internal/effecttest/hover_test.go (one case per Go test, one block per marker).
+// internal/effecttest/hover_test.go (one case per Go test, one block per marker). Hover compares
+// inflate the `pako:` payload of each Mermaid link on both sides (root decision D3: tsc-rs deflates
+// with other bytes than Go's compress/zlib); nothing else is normalized.
 //
 // usage: node scripts/effect/ls-cases.mjs --server <tsc> [--effect-repo DIR] [--kinds K,...]
 //          [--versions effect-v4,effect-v3] [--filter SUBSTR] [--out DIR] [--jobs N] [--timeout S]
@@ -43,6 +45,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+import zlib from "node:zlib";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 if (["help", "-h", "--help"].includes(process.argv[2])) {
@@ -954,6 +957,10 @@ async function runHover(c) {
   }
 }
 
+// Root decision D3: each Mermaid link's `pako:<base64url>` becomes `pako:<inflated payload>`.
+const inflateMermaid = (text) =>
+  text.replace(/pako:([A-Za-z0-9_-]+)/g, (_, b64) => `pako:<${zlib.inflateSync(Buffer.from(b64, "base64url")).toString("utf8")}>`);
+
 // Go fourslash verifyHoverMarkdown: the markdown each VerifyQuickInfoAt expects.
 const hoverExpected = (c) => c.checks.map((check) => `=== marker ${check.marker} ===\n\`\`\`typescript\n${check.text}\n\`\`\`\n${check.doc}\n`).join("\n");
 
@@ -1007,11 +1014,12 @@ async function runCase(c) {
     if (c.expected === undefined && !fs.existsSync(c.baseline)) throw new Error(`no baseline ${path.relative(EFFECT_REPO, c.baseline)}`);
     const actual = await c.run(c);
     const expected = c.expected ?? fs.readFileSync(c.baseline, "utf8");
-    status = actual === expected ? "same" : "diff";
+    const norm = c.kind === "hover" ? inflateMermaid : (text) => text;
+    status = norm(actual) === norm(expected) ? "same" : "diff";
     if (status === "diff") {
       fs.mkdirSync(resultDir, { recursive: true });
       fs.writeFileSync(path.join(resultDir, c.name + ".actual"), actual);
-      fs.writeFileSync(path.join(resultDir, c.name + ".diff"), lineDiff(expected, actual));
+      fs.writeFileSync(path.join(resultDir, c.name + ".diff"), lineDiff(norm(expected), norm(actual)));
     }
   } catch (e) {
     status = "error";
