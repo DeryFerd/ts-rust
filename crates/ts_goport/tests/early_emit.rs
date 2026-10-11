@@ -583,8 +583,8 @@ const NIL_SIGNAL: &str = "[signal SIGSEGV: segmentation violation code=0x1 addr=
 /// and exits 2, async (JSON-RPC) and sync (msgpack). Its other emit
 /// goroutines make their calls until the process ends. Async, every JS and
 /// map was written and no d.ts in 48 of 50 runs; sync, the files vary
-/// (10 sets in 160 runs): `{b.js, c.js.map}`, with the calls of every
-/// file's first output and of `b.js`, in 37 (gopanicout2 `go-model.md`;
+/// by run: `{b.js, c.js.map}`, with the calls of every file's first output
+/// and of `b.js`, in 48 of 190 (gopanicout2 `go-model.md` section 5;
 /// `api_build_calls_after_a_failed_write_are_one_of_gos` checks the calls).
 /// With `--singleThreaded` in `rootNames` Go emits on the request
 /// goroutine: the request's recover answers the panic, and the server goes
@@ -661,8 +661,8 @@ fn api_build_panics_as_go() {
 ///   in flight (12 of 50 runs).
 /// - Sync (one call at a time): in the round of the failure the next file
 ///   (in emit order) writes its output too. In the first round every
-///   file's output is called (`b.js.map`: 37 of 160 runs, `a.js.map`: 6
-///   of 30); in a later round the next file's output is the last call,
+///   file's output is called (`b.js.map`: 48 of 190 runs, `a.js.map`: 7
+///   of 60); in a later round the next file's output is the last call,
 ///   and the round's earlier writes are lost (`c.js`: 4 of 60,
 ///   `b.d.ts.map`: 6 of 66).
 #[cfg(unix)]
