@@ -34,6 +34,12 @@
 //!   parse worker; jemlayout1 measured the same faults there as with the
 //!   watcher. Before this, only the watcher kept the fourth arena, by
 //!   chance.
+//! - At most the first 4 arenas (`MAX_ARENAS`, the `narenas` of
+//!   `JEMALLOC_CONF`). A run without that conf has 4 arenas per CPU: a
+//!   `_RJEM_MALLOC_CONF` of the user without `narenas`, or a failed exec in
+//!   `set_malloc_tunables` of a build without the conf built in. To make
+//!   every arena on main would then cost some ms. The holder keeps arena 3,
+//!   and the later arenas grow as they did before the layout.
 //!
 //! jemlayout1, query check: 5.0k to 6.2k minor faults became 1.2k to 1.6k on
 //! alvin, cup2 (THP `always`) and mini-743d (THP `madvise`). Max RSS within
@@ -65,13 +71,18 @@ use tikv_jemalloc_ctl::{Access, AsName};
 /// tests/jemalloc_layout.rs looks for it.
 pub const HOLDER_NAME: &str = "arena-hold";
 
+/// The most arenas that `jemalloc_layout` lays out: `narenas:4` of
+/// `JEMALLOC_CONF` (see the module comment).
+const MAX_ARENAS: u32 = 4;
+
 /// The free allocation that makes an arena skip to its 8 MiB step (B).
 #[repr(C, align(4194304))]
 struct Grow([u8; 4 << 20]);
 
 /// Lays out the jemalloc arenas (see the module comment). Call once in
 /// `main`, after `set_malloc_tunables` (it can exec the binary again) and
-/// before the work threads start. It does not wait for the holder thread.
+/// before the work threads start (tsgo: also before `go_runtime_start`,
+/// see the comment at the call). It does not wait for the holder thread.
 pub fn jemalloc_layout() {
     if std::env::var_os("GOPORT_JEMALLOC_LAYOUT").is_some_and(|v| v == "0")
         || crate::gostd::stack::memory_limit().is_some()
@@ -81,6 +92,7 @@ pub fn jemalloc_layout() {
     let Ok(arenas) = Access::<u32>::read(b"opt.narenas\0".name()) else {
         return;
     };
+    let arenas = arenas.min(MAX_ARENAS);
     let Ok(own) = Access::<u32>::read(b"thread.arena\0".name()) else {
         return;
     };
