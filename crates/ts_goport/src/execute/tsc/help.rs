@@ -584,6 +584,7 @@ pub(super) fn format_value_v(value: &CompilerOptionsValue) -> String {
         CompilerOptionsValue::StringList(list) => format!("[{}]", list.join(" ")),
         CompilerOptionsValue::NilList => "[]".to_string(),
         CompilerOptionsValue::Map(_) => unported!("fmt %v of *collections.OrderedMap"),
+        CompilerOptionsValue::GoMap(_) => unported!("fmt %v of map[string]any"),
         CompilerOptionsValue::Paths(None) | CompilerOptionsValue::IntPtr(None) => {
             "<nil>".to_string()
         }

@@ -627,7 +627,7 @@ fn float_or_int32_to_flag<T>(
         CompilerOptionsValue::Bool(_) => "bool",
         CompilerOptionsValue::String(_) => "string",
         CompilerOptionsValue::List(_) | CompilerOptionsValue::NilList => "[]interface {}",
-        CompilerOptionsValue::Map(_) => "map[string]interface {}",
+        CompilerOptionsValue::Map(_) | CompilerOptionsValue::GoMap(_) => "map[string]interface {}",
         _ => panic!("interface conversion: option value is not float64"),
     };
     go_panic(format!(

@@ -1125,10 +1125,9 @@ impl<V: MarshalerTo> MarshalerTo for SortedMapJSON<'_, V> {
 // directory and constructs a CompilerOptions with typed path guarantees.
 // PORT: Go keeps it in tsoptions; the port keeps it with the API protocol, its
 // only user. Go `Finalize` is `tsoptions::finalize_raw_compiler_options` on
-// `values`. A value is the Go `any` of its JSON (`json_value_to_any`). Go
-// decodes an object under any key but "paths" as a `map[string]any`, which
-// `ParseCompilerOptions` does not read as an object (a raw "plugins" entry
-// gets no name). The port keeps every object as a `Map`.
+// `values`. A value is the Go `any` of its JSON (`json_value_to_go_any`): an
+// object is a Go `map[string]any` (`GoMap`), except a "paths" object, which
+// is an ordered map (`Map`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RawCompilerOptions {
     pub values: IndexMap<String, tsoptions::CompilerOptionsValue>,
@@ -1183,12 +1182,43 @@ impl UnmarshalerFrom for RawCompilerOptions {
         while dec.peek_kind() != b'}' {
             let mut key = String::new();
             json_unmarshal_decode(dec, &mut key)?;
+            let paths = key == "paths" && dec.peek_kind() == b'{';
             let mut value = LspAny::Null;
             json_unmarshal_decode(dec, &mut value)?;
-            self.values.insert(key, json_value_to_any(&value));
+            let value = match value {
+                // Go :52-57: `*collections.OrderedMap[string, any]`, whose
+                // values are Go `any` (collections/ordered_map.go:291-300).
+                LspAny::Object(paths_map) if paths => tsoptions::CompilerOptionsValue::Map(
+                    paths_map
+                        .iter()
+                        .map(|(key, value)| (key.clone(), json_value_to_go_any(value)))
+                        .collect(),
+                ),
+                value => json_value_to_go_any(&value),
+            };
+            self.values.insert(key, value);
         }
         dec.read_token()?;
         Ok(())
+    }
+}
+
+// Go json v2 decode into `any` (go1.27.1 encoding/json/v2 arshal_any.go:64
+// unmarshalValueAny): null, bool, float64, string, `[]any` and
+// `map[string]any` (`GoMap`).
+fn json_value_to_go_any(value: &LspAny) -> tsoptions::CompilerOptionsValue {
+    use crate::frontend::tsoptions::CompilerOptionsValue;
+    match value {
+        LspAny::Array(array) => {
+            CompilerOptionsValue::List(array.iter().map(json_value_to_go_any).collect())
+        }
+        LspAny::Object(object) => CompilerOptionsValue::GoMap(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), json_value_to_go_any(value)))
+                .collect(),
+        ),
+        value => json_value_to_any(value),
     }
 }
 
@@ -5642,5 +5672,66 @@ mod unmarshal_error_tests {
             crate::frontend::json::json_marshal(&CompilerOptionsJSON(&compiler_options), &[])
                 .expect("marshal");
         assert_eq!(written, options);
+    }
+
+    // ts#64159: a raw value is the Go `any` of its JSON, so an object is a
+    // `map[string]any` (`GoMap`), but a "paths" object is an ordered map (Go
+    // N' tsoptions/rawcompileroptions.go:51-61). Go `ParseCompilerOptions`
+    // reads a "plugins" entry name only from an ordered map
+    // (tsoptions/options_generated.go:154-161), so each raw entry gets an
+    // empty name. Expected values are from a Go N' probe (`json.Unmarshal`,
+    // `%T` of each value, `json.Marshal`, `Finalize("/project")`).
+    #[test]
+    fn raw_compiler_options_decode_objects_as_go_maps() {
+        use crate::options::PluginImport;
+        use tsoptions::CompilerOptionsValue as V;
+        let decode = |text: &str| {
+            let mut raw = RawCompilerOptions::default();
+            crate::frontend::json::json_unmarshal(text.as_bytes(), &mut raw, &[])
+                .unwrap_or_else(|err| panic!("decode: {err:?}"));
+            assert_eq!(
+                crate::frontend::json::json_marshal(&raw, &[]).expect("marshal"),
+                text
+            );
+            raw
+        };
+
+        let text = r#"{"plugins":[{"name":"x"},{"name":"@effect/language-service","diagnostics":false}],"paths":{"a":["b",{"k":1}],"c":{"d":["e"]}},"module":1}"#;
+        let raw = decode(text);
+        // Go: plugins []interface {} [map[string]interface {}] (twice); paths
+        // *collections.OrderedMap; paths.a []interface {} [string]
+        // [map[string]interface {}]; paths.c map[string]interface {}.
+        let Some(V::List(plugins)) = raw.values.get("plugins") else {
+            panic!("plugins: {:?}", raw.values.get("plugins"));
+        };
+        assert!(plugins.iter().all(|plugin| matches!(plugin, V::GoMap(_))));
+        let Some(V::Map(paths)) = raw.values.get("paths") else {
+            panic!("paths: {:?}", raw.values.get("paths"));
+        };
+        assert!(matches!(&paths["a"], V::List(a) if matches!(a[1], V::GoMap(_))));
+        assert!(matches!(paths["c"], V::GoMap(_)));
+        let options = tsoptions::finalize_raw_compiler_options(&raw.values, "/project");
+        assert_eq!(options.plugins, Some(vec![PluginImport::default(); 2]));
+        // Effect-TS/tsgo reads its plugin from a `map[string]any` too
+        // (`@effect/tsgo@0.46.1` etscore/options_parser.go:23).
+        assert!(options.effect.is_some());
+
+        let raw = decode(r#"{"plugins":[{"name":"x"},"y",5,null,[]]}"#);
+        let options = tsoptions::finalize_raw_compiler_options(&raw.values, "/project");
+        assert_eq!(
+            crate::frontend::json::json_marshal(&CompilerOptionsJSON(&options), &[])
+                .expect("marshal"),
+            r#"{"plugins":[{"name":""},{"name":""},{"name":""},{"name":""},{"name":""}]}"#
+        );
+
+        // Go `floatOrInt32ToFlag` (tsoptions/parsinghelpers.go:325) panics
+        // with the dynamic type of the raw object.
+        let raw = decode(r#"{"module":{"a":1}}"#);
+        assert_eq!(
+            crate::core::go_panic_text(|| {
+                tsoptions::finalize_raw_compiler_options(&raw.values, "/project");
+            }),
+            "interface conversion: interface {} is map[string]interface {}, not float64"
+        );
     }
 }

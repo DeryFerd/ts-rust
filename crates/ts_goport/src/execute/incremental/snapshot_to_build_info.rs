@@ -672,6 +672,8 @@ pub fn is_zero_compiler_option_value(
         V::List(v) => v.is_empty(),
         V::NilList => true,
         V::Map(v) => v.is_empty(),
+        // A Go map from a JSON decode is never nil.
+        V::GoMap(_) => false,
         V::StringList(v) => v.is_empty(),
         V::Paths(v) => v.is_none(),
         V::IntPtr(v) => v.is_none(),

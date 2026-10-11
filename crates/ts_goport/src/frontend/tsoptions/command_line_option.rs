@@ -63,6 +63,13 @@ pub enum CompilerOptionsValue {
     /// nothing.
     NilList,
     Map(IndexMap<String, CompilerOptionsValue>),
+    /// Go `map[string]any`: what a Go JSON decode into an `any` makes for an
+    /// object (the values of the API's `RawCompilerOptions`, ts#64159). Go
+    /// code that asserts `*collections.OrderedMap[string, any]` (`Map`) does
+    /// not match it, so a raw API "plugins" entry gets no name (Go N'
+    /// tsoptions/options_generated.go:154-161).
+    /// PORT: the Rust map keeps the input order; a Go map has no order.
+    GoMap(IndexMap<String, CompilerOptionsValue>),
     StringList(Vec<String>),
     Paths(Option<IndexMap<String, Option<Vec<String>>>>),
     IntPtr(Option<i64>),

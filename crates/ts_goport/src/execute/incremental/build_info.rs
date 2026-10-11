@@ -343,7 +343,11 @@ pub fn marshal_any(enc: &mut String, v: &CompilerOptionsValue) -> Result<(), Jso
             }
             enc.push(']');
         }
-        CompilerOptionsValue::Map(map) => {
+        // PORT: Go writes a `map[string]any` (`GoMap`) in map order, which is
+        // random without `Deterministic` (go1.27.1 encoding/json/v2
+        // arshal_any.go:142 marshalObjectAny); the port writes the input
+        // order.
+        CompilerOptionsValue::Map(map) | CompilerOptionsValue::GoMap(map) => {
             enc.push('{');
             for (i, (k, item)) in map.iter().enumerate() {
                 if i > 0 {

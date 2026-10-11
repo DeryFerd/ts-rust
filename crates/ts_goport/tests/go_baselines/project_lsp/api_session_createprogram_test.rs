@@ -515,6 +515,38 @@ child_test! {
     }
 }
 
+// PORT: no Go test. ts#64159: a raw "plugins" entry is a Go
+// `map[string]any` (Go N' tsoptions/rawcompileroptions.go:51-61), which
+// `ParseCompilerOptions` does not read as an entry
+// (tsoptions/options_generated.go:154-161), so the plugins of a created
+// program have no names. The expected project text is from a Go N' probe
+// (`handleCreateSnapshot`, then `json.Marshal` of `Projects[0]`).
+child_test! {
+    fn create_snapshot_drops_raw_plugin_names() {
+        let (project_session, _) = projecttestutil::setup(files(&[(
+            "/home/projects/p/a.ts",
+            "export const a = 1;",
+        )]));
+        let session = api::new_lsp_session(project_session.clone(), None);
+
+        let response = nil_error(session.handle_create_snapshot(
+            &bg(),
+            &CreateSnapshotParams {
+                snapshot_request_changes_params: unmarshal_changes(
+                    r#"{"createPrograms":[{"rootFiles":["/home/projects/p/a.ts"],"compilerOptions":{"noLib":true,"plugins":[{"name":"x"},{"name":"y","k":1}]}}]}"#,
+                ),
+                ..Default::default()
+            },
+        ));
+        assert_eq!(
+            json_marshal(&response.projects[0], &[]).expect("marshal"),
+            r#"{"id":"/dev/null/synthetic/1","currentDirectory":"/","dirty":false,"parsedCommandLine":{"fileNames":["/home/projects/p/a.ts"],"options":{"noLib":true,"plugins":[{"name":""},{"name":""}]},"errors":[]},"rootFiles":["/home/projects/p/a.ts"],"compilerOptions":{"noLib":true,"plugins":[{"name":""},{"name":""}]}}"#
+        );
+        session.close();
+        project_session.close();
+    }
+}
+
 // PORT: no Go test. ts#64159 (Go N' api/session.go:1610-1614): the JSON
 // `compilerOptions` of a reconfigured program are finalized as for a created
 // one.

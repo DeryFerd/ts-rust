@@ -303,9 +303,12 @@ pub fn normalize_package_list(packages: &[String]) -> Vec<String> {
 
 type Getter<'a> = &'a IndexMap<String, CompilerOptionsValue>;
 
+// Go (`@effect/tsgo@0.46.1` options_parser.go, the type switches at :20,
+// :283, :413 and :429): each map read takes both
+// `*collections.OrderedMap[string, any]` and `map[string]any`.
 fn as_map(value: &CompilerOptionsValue) -> Option<Getter<'_>> {
     match value {
-        CompilerOptionsValue::Map(m) => Some(m),
+        CompilerOptionsValue::Map(m) | CompilerOptionsValue::GoMap(m) => Some(m),
         _ => None,
     }
 }
