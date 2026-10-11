@@ -369,9 +369,11 @@ impl NewProgram {
                             let mut name = resolved_module.package_id.name.clone();
                             if name.is_empty() {
                                 // 2. GetPackageScopeForPath - get name from package.json in the package directory
-                                if let Some(package_scope) = resolver
-                                    .get_package_scope_for_path(&resolved_module.resolved_file_name)
-                                    && package_scope.exists()
+                                // ts#64159: Go N' passes `ResolvedFileName.Directory()` (N: the
+                                // file name, so the walk began with a `DirectoryExists` of it).
+                                if let Some(package_scope) = resolver.get_package_scope_for_path(
+                                    &get_directory_path(&resolved_module.resolved_file_name),
+                                ) && package_scope.exists()
                                 {
                                     let (scope_name, ok) = package_scope
                                         .get_contents()
@@ -399,7 +401,7 @@ impl NewProgram {
                                 let (_, rest) = parse_package_name(imp.text());
                                 if !rest.is_empty()
                                     && let Some(scope) = resolver.get_package_scope_for_path(
-                                        &resolved_module.resolved_file_name,
+                                        &get_directory_path(&resolved_module.resolved_file_name),
                                     )
                                     && scope.exists()
                                     && !scope
