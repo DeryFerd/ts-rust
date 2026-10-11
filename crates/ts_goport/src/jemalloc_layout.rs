@@ -64,6 +64,11 @@
 //! When jemalloc no longer does A or B, remove that part. In the worst case
 //! the code costs one 4 MiB allocation and free per arena and one parked
 //! thread.
+//!
+//! `ArenaClaims` (arenabind1) keeps two checkers of one pool out of one
+//! arena: program.rs `start_checkers`.
+
+use std::sync::{Mutex, PoisonError};
 
 use tikv_jemalloc_ctl::{Access, AsName};
 
@@ -121,4 +126,67 @@ pub fn jemalloc_layout() {
                 }
             }
         });
+}
+
+/// The auto arenas that the checkers of one pool hold. Not a Go port
+/// (arenabind0, arenabind1).
+///
+/// jemalloc gives a new thread the auto arena (`< opt.narenas`) with the
+/// fewest threads, the lowest index on a tie. With `narenas:4` the threads
+/// that hold arenas when the checkers start (main, the THP watcher, the
+/// work and signal threads, the holder, a `tsc -b` free thread) can tie so
+/// that two checkers get one arena while another arena has no checker:
+/// after the THP watcher ends in every run, in the third project of
+/// `tsc -b`, and in 1 run of 16 to 70 with the watcher alive. Two checkers
+/// in one arena cost 17% more page allocations on zod (both fault the same
+/// new 2 MiB ranges) and 0.65% wall.
+///
+/// With many arenas (a user `_RJEM_MALLOC_CONF` without `narenas`) or one
+/// thread per arena (no watcher), jemalloc already gives each checker an
+/// arena of its own, and `claim` moves none.
+pub struct ArenaClaims {
+    /// Bit i: arena i is an auto arena below 64.
+    auto: u64,
+    /// Bit i: a checker of the pool is in arena i. The lock also keeps one
+    /// claim, with its move, from running between the steps of another.
+    held: Mutex<u64>,
+}
+
+impl Default for ArenaClaims {
+    /// No arena held. Reads `opt.narenas`; when it cannot, `claim` does
+    /// nothing.
+    fn default() -> Self {
+        let arenas = Access::<u32>::read(b"opt.narenas\0".name()).map_or(0, |n| n.min(64));
+        ArenaClaims {
+            auto: u64::MAX.checked_shr(64 - arenas).unwrap_or(0),
+            held: Mutex::new(0),
+        }
+    }
+}
+
+impl ArenaClaims {
+    /// Call first on each checker thread of the pool. Keeps this thread's
+    /// arena when no other checker of the pool is in it. Else moves the
+    /// thread to the lowest auto arena that has no checker of the pool.
+    /// The arena it leaves keeps that other checker, so a claim never
+    /// empties an arena (jemalloc purges every free page of an arena that
+    /// loses its last thread). Keeps jemalloc's choice when every auto arena
+    /// has a checker, when the arena is not an auto arena below 64, and when
+    /// jemalloc refuses the move (`percpu_arena`).
+    pub fn claim(&self) {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let Ok(own) = Access::<u32>::read(b"thread.arena\0".name()) else {
+            return;
+        };
+        let own = 1u64.checked_shl(own).unwrap_or(0) & self.auto;
+        if *held & own == 0 {
+            *held |= own;
+            return;
+        }
+        let free = self.auto & !*held;
+        let arena = free.trailing_zeros();
+        if free != 0 && b"thread.arena\0".name().write(arena).is_ok() {
+            *held |= 1 << arena;
+        }
+    }
 }

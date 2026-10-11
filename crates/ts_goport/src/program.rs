@@ -3553,17 +3553,29 @@ fn start_checkers(count: usize) -> CheckerPool {
     } else {
         None
     };
+    // PERF (arenabind1): with more checkers, no two of them share an arena
+    // (`ArenaClaims`).
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    let claims = arena
+        .is_none()
+        .then(Arc::<crate::jemalloc_layout::ArenaClaims>::default);
     let carry_from = symbol_id_carry_start(count);
     let (workers, threads): (Vec<_>, Vec<_>) = (0..count)
         .map(|index| {
             let (sender, receiver) = std::sync::mpsc::channel::<Job>();
             let seed = WorkerSeed::take();
+            #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+            let claims = claims.clone();
             let thread = crate::core::GoThread::new()
                 .name(format!("checker-{index}"))
                 .stack_size(crate::gostd::stack::max_stack_size())
                 .spawn(move || {
                     if let Some(arena) = arena {
                         set_jemalloc_thread_arena(arena);
+                    }
+                    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+                    if let Some(claims) = claims {
+                        claims.claim();
                     }
                     seed.install();
                     let checker = new_pool_checker(index, count);
