@@ -59,7 +59,7 @@ pub fn analyze_timeout_catch_tag_to_timeout_or_else(
         while i + 1 < flow.transformations.len() {
             let timeout = &flow.transformations[i];
             if timeout.args.len() != 1
-                || !tp.is_node_reference_to_effect_module_api(timeout.callee, "timeout")
+                || !tp.is_node_reference_to_effect_module_api(timeout.callee, member!("timeout"))
             {
                 i += 1;
                 continue;
@@ -75,7 +75,7 @@ pub fn analyze_timeout_catch_tag_to_timeout_or_else(
             }
             let catch = &flow.transformations[end];
             if catch.args.len() != 2
-                || !tp.is_node_reference_to_effect_module_api(catch.callee, "catchTag")
+                || !tp.is_node_reference_to_effect_module_api(catch.callee, member!("catchTag"))
             {
                 i += 1;
                 continue;
@@ -141,10 +141,11 @@ pub fn analyze_timeout_catch_tag_to_timeout_or_else(
 
 // Go: rules/timeout_catch_tag_to_timeout_or_else.go timeoutAsSome
 fn timeout_as_some(tp: &mut TypeParser<'_>, step: &PipingFlowTransformation) -> bool {
-    step.args.is_empty() && tp.is_node_reference_to_effect_module_api(step.callee, "asSome")
+    step.args.is_empty()
+        && tp.is_node_reference_to_effect_module_api(step.callee, member!("asSome"))
         || step.args.len() == 1
-            && tp.is_node_reference_to_effect_module_api(step.callee, "map")
-            && tp.is_node_reference_to_effect_option_module_api(step.args[0], "some")
+            && tp.is_node_reference_to_effect_module_api(step.callee, member!("map"))
+            && tp.is_node_reference_to_effect_option_module_api(step.args[0], member!("some"))
 }
 
 // Go: rules/timeout_catch_tag_to_timeout_or_else.go timeoutReturnsNone
@@ -160,7 +161,7 @@ fn timeout_returns_none(tp: &mut TypeParser<'_>, handler: Node) -> bool {
     flow.matches_exactly(
         tp,
         &mut |tp: &mut TypeParser<'_>, subject: &PipingFlowSubject| {
-            tp.is_node_reference_to_effect_module_api(subject.node, "succeedNone")
+            tp.is_node_reference_to_effect_module_api(subject.node, member!("succeedNone"))
         },
         &mut [],
     ) || flow.matches_exactly(
@@ -172,7 +173,7 @@ fn timeout_returns_none(tp: &mut TypeParser<'_>, handler: Node) -> bool {
             &mut |tp: &mut TypeParser<'_>, step: &PipingFlowTransformation| {
                 step.args.is_empty()
                     && (step.type_arguments.is_nil() || step.type_arguments.nodes().is_empty())
-                    && tp.is_node_reference_to_effect_module_api(step.callee, "succeed")
+                    && tp.is_node_reference_to_effect_module_api(step.callee, member!("succeed"))
             },
         ],
     )

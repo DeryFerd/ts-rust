@@ -94,10 +94,10 @@ pub fn analyze_catch_all_tag_dispatch_to_catch_tag(
 }
 
 fn catch_all_tag_dispatch_method(tp: &mut TypeParser<'_>, callee: Node) -> (String, bool) {
-    if tp.is_node_reference_to_effect_module_api(callee, "catch") {
+    if tp.is_node_reference_to_effect_module_api(callee, member!("catch")) {
         return ("catch".to_string(), true);
     }
-    if tp.is_node_reference_to_effect_module_api(callee, "catchAll") {
+    if tp.is_node_reference_to_effect_module_api(callee, member!("catchAll")) {
         return ("catchAll".to_string(), true);
     }
     (String::new(), false)

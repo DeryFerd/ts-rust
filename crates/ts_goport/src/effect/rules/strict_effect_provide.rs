@@ -64,7 +64,7 @@ fn check_effect_provide_with_layer(
     // Check if the expression references Effect.provide
     if !ctx
         .tp
-        .is_node_reference_to_effect_module_api(call.expression(), "provide")
+        .is_node_reference_to_effect_module_api(call.expression(), member!("provide"))
     {
         return None;
     }

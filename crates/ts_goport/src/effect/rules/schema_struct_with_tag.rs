@@ -99,7 +99,7 @@ fn analyze_schema_struct_with_tag_node(
     let call = node;
 
     // Check if this is Schema.Struct
-    if !tp.is_node_reference_to_effect_schema_module_api(call.expression(), "Struct") {
+    if !tp.is_node_reference_to_effect_schema_module_api(call.expression(), member!("Struct")) {
         return (SchemaStructWithTagMatch::default(), false);
     }
 
@@ -138,7 +138,10 @@ fn analyze_schema_struct_with_tag_node(
         }
 
         let literal_call = init;
-        if !tp.is_node_reference_to_effect_schema_module_api(literal_call.expression(), "Literal") {
+        if !tp.is_node_reference_to_effect_schema_module_api(
+            literal_call.expression(),
+            member!("Literal"),
+        ) {
             return (SchemaStructWithTagMatch::default(), false);
         }
 

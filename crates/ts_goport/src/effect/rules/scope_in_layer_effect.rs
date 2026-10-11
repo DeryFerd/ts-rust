@@ -112,9 +112,13 @@ fn match_layer_effect_call(
     // "effect" package. Symbol resolution also recognizes named imports and
     // stable local aliases whose source spelling does not reveal the API name.
     let mut method_name = "";
-    for candidate in ["effect", "effectDiscard", "effectContext"] {
+    for candidate in [
+        member!("effect"),
+        member!("effectDiscard"),
+        member!("effectContext"),
+    ] {
         if tp.is_node_reference_to_effect_layer_module_api(call.expression(), candidate) {
-            method_name = candidate;
+            method_name = candidate.name;
             break;
         }
     }

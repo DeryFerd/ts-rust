@@ -28,7 +28,7 @@ fn run_lazy_promise_in_effect_sync(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnos
             let call = node;
             if ctx
                 .tp
-                .is_node_reference_to_effect_module_api(call.expression(), "sync")
+                .is_node_reference_to_effect_module_api(call.expression(), member!("sync"))
                 && call.argument_list().is_some()
                 && !call.arguments().is_empty()
             {

@@ -84,7 +84,7 @@ impl TypeParser<'_> {
                     }
                     if !self.is_node_reference_to_effect_sql_model_module_api(
                         inner_call.expression(),
-                        "Class",
+                        member!("Class"),
                     ) {
                         continue;
                     }

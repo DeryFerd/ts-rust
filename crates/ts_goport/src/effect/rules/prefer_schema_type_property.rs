@@ -98,7 +98,7 @@ fn analyze_prefer_schema_type_property_node(
     }
     let schema_export = middle_name.right();
     if schema_export.is_nil()
-        || !tp.is_node_reference_to_effect_schema_module_api(schema_export, "Schema")
+        || !tp.is_node_reference_to_effect_schema_module_api(schema_export, member!("Schema"))
     {
         return None;
     }

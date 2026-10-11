@@ -18,15 +18,15 @@ pub static SCHEMA_SYNC: Rule = Rule {
 };
 
 fn run_schema_sync(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
-    let mut methods = super::schema_sync_in_effect::SYNC_TO_EFFECT_METHOD_V3;
+    let mut methods = &super::schema_sync_in_effect::SYNC_TO_EFFECT_METHOD_V3;
     if ctx.tp.supported_effect_version() == EffectMajorVersion::V4 {
-        methods = super::schema_sync_in_effect::SYNC_TO_EFFECT_METHOD_V4;
+        methods = &super::schema_sync_in_effect::SYNC_TO_EFFECT_METHOD_V4;
     }
 
     fn walk(
         ctx: &mut RuleContext<'_, '_>,
         diags: &mut Vec<Diagnostic>,
-        methods: &[(&str, &str)],
+        methods: &[(ExportMember, &str)],
         node: Node,
     ) -> bool {
         if node.is_nil() {
@@ -41,7 +41,7 @@ fn run_schema_sync(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
             // PORT: Go ranges over a map (random order). A reference names one
             // member, so at most one entry matches and the order does not
             // change the result.
-            for &(sync_name, effect_name) in methods {
+            for (sync_name, effect_name) in methods {
                 if ctx
                     .tp
                     .is_node_reference_to_effect_schema_module_api(reference, sync_name)

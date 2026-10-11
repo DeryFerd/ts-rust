@@ -167,8 +167,6 @@ pub struct EffectLinks {
     pub is_yieldable_error_type: FxHashMap<TypeId, bool>,
     pub reference_symbol: LinkStore<Node, CachedReferenceSymbols>,
     pub module_export_reference: FxHashMap<ModuleExportReferenceCacheKey, bool>,
-    /// The member names of `module_export_reference` keys, by id.
-    pub module_export_members: FxHashMap<Box<str>, u32>,
     pub pipeable_signature_shape: FxHashMap<PipeableSignatureShapeCacheKey, bool>,
     // API-stability caches. Declared lookups persist per checker: the declared
     // stability of a symbol, of a raw signature overload and of one

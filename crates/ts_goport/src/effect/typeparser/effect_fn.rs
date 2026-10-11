@@ -274,17 +274,19 @@ impl TypeParser<'_> {
                 break 'compute None;
             }
 
-            if self.is_node_reference_to_effect_module_api(expression_to_check, "fn") {
+            if self.is_node_reference_to_effect_module_api(expression_to_check, member!("fn")) {
                 variant = EffectFnVariant::Fn;
-            } else if self.is_node_reference_to_effect_module_api(expression_to_check, "fnUntraced")
+            } else if self
+                .is_node_reference_to_effect_module_api(expression_to_check, member!("fnUntraced"))
             {
                 if trace_expression.is_some() {
                     break 'compute None;
                 }
                 variant = EffectFnVariant::FnUntraced;
-            } else if self
-                .is_node_reference_to_effect_module_api(expression_to_check, "fnUntracedEager")
-            {
+            } else if self.is_node_reference_to_effect_module_api(
+                expression_to_check,
+                member!("fnUntracedEager"),
+            ) {
                 if trace_expression.is_some() {
                     break 'compute None;
                 }

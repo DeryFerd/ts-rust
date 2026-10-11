@@ -73,7 +73,10 @@ pub fn analyze_prefer_succeed_some_or_none(
                     && transformation.args.is_empty()
                     && (transformation.type_arguments.is_nil()
                         || transformation.type_arguments.nodes().is_empty())
-                    && tp.is_node_reference_to_effect_module_api(transformation.callee, "succeed")
+                    && tp.is_node_reference_to_effect_module_api(
+                        transformation.callee,
+                        member!("succeed"),
+                    )
             };
         let mut is_none_subject = |tp: &mut TypeParser<'_>, subject: &PipingFlowSubject| -> bool {
             is_option_none_call(tp, subject.node)
@@ -91,13 +94,15 @@ pub fn analyze_prefer_succeed_some_or_none(
             ));
         }
 
-        let mut is_some = |tp: &mut TypeParser<'_>,
-                           transformation: &PipingFlowTransformation|
-         -> bool {
-            transformation.callee.is_some()
-                && transformation.args.is_empty()
-                && tp.is_node_reference_to_effect_option_module_api(transformation.callee, "some")
-        };
+        let mut is_some =
+            |tp: &mut TypeParser<'_>, transformation: &PipingFlowTransformation| -> bool {
+                transformation.callee.is_some()
+                    && transformation.args.is_empty()
+                    && tp.is_node_reference_to_effect_option_module_api(
+                        transformation.callee,
+                        member!("some"),
+                    )
+            };
         let sequences =
             flow.find_transformation_sequences(tp, &mut [&mut is_some, &mut is_succeed]);
         for sequence in &sequences {
@@ -158,5 +163,5 @@ pub fn is_option_none_call(tp: &mut TypeParser<'_>, node: Node) -> bool {
     // the list, and `arguments()` gives an empty slice for a nil one.
     call.arguments().is_empty()
         && call.type_arguments().is_empty()
-        && tp.is_node_reference_to_effect_option_module_api(call.expression(), "none")
+        && tp.is_node_reference_to_effect_option_module_api(call.expression(), member!("none"))
 }

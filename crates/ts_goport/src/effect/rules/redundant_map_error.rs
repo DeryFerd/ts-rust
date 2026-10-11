@@ -124,7 +124,7 @@ fn analyze_redundant_map_error_flow_candidate(
     if last_transform.callee.is_nil() || last_transform.args.is_empty() {
         return fail();
     }
-    if !tp.is_node_reference_to_effect_module_api(last_transform.callee, "mapError") {
+    if !tp.is_node_reference_to_effect_module_api(last_transform.callee, member!("mapError")) {
         return fail();
     }
 

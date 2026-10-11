@@ -67,7 +67,7 @@ pub fn analyze_sync_to_succeed(tp: &mut TypeParser<'_>, sf: Node) -> Vec<SyncToS
         if node.kind() == SyntaxKind::CallExpression {
             let call = node;
             if call.expression().is_some()
-                && tp.is_node_reference_to_effect_module_api(call.expression(), "sync")
+                && tp.is_node_reference_to_effect_module_api(call.expression(), member!("sync"))
                 && call.argument_list().is_some()
                 && call.arguments().len() == 1
             {
