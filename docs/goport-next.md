@@ -26,6 +26,8 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 - **Running: sweepgap1 (compat study: LSP sweep battery diffs against Go N prime, svelte 289 and effect 14, mostly completions; Go selfcheck first).**
 
+- **invokeonce1 75866d18c: skeptic PASS (T3 server st -5.1 percent, T3 web -1.5 to -2; output and counts equal). Into int61. chk4split: the 4-checker split is Go's (lib updates moved it); hono 4-checker wall is a named Go-parity cost (note invokeonce1-result-2026-10-11).**
+
 - **int61 (R194) = goport-effint1 b38ba8de8 (all Effect editor features of effect-tsgo 0.51.1; note effint3-result-2026-10-11).** After bump D and int60: merge the accepted head, then a revision. D1 (refactor.rewrite in initialize codeActionKinds) needs Theo.
 
 - **Running 2026-10-11 (after the R190 accept; all heavy work on testboxes):** bumpD-int4b2 (merge main into goport-bumpD-int4 through the a41381218 temp branch, N prime references, Effect gate files at N prime, tests, np-suite and the full gate at N prime); effectE3 717704745 and effectE4 673ccdf5e done (skeptic PASS; note effectE3E4-result-2026-10-11); running E5a, E5b, E5c (on E4), E6, E7, E8 (on E2b); noderef1 (W1 to W3, then G1 with intern1 fixes, G2, G4); arenabind1 (per-pool arena claims, on main plus jemarena1); effperf1 (F1 message map, F3 symbol reuse); tbxside1 (candidate.sh side on testboxes, protected); tbxperf0 (timing on testboxes). Bump D freeze: no other revision until bump D is accepted; these lanes go into int60 or the integration after it.
