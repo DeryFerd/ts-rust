@@ -1002,7 +1002,9 @@ impl Inbox {
     /// - The message read after the `ctx` of `run` was done
     ///   (`after_cancel`), when the call's `ctx` is not done: Go's `Run`
     ///   dispatched it (:94-110) before it returned and its deferred
-    ///   `closePendingCalls` ran, so the call gets its response.
+    ///   `closePendingCalls` ran. It can be any message: a response goes to
+    ///   its call (:96), and a request or a notification runs nested in the
+    ///   call's wait, where Go started its goroutine (:98, :108).
     /// - The end of a loop that ended before `ctx` was done (EOF, a read
     ///   error): Go's `closePendingCalls` runs before `cancelHandlers`.
     /// - `ctx` done. After a signal the loop ends only at its next read (1
