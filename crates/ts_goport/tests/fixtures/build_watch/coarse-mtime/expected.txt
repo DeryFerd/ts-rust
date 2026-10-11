@@ -15,3 +15,8 @@
 side/index.ts(2,14): error TS2322: Type 'string' is not assignable to type 'number'.
 <time> - Found 1 error. Watching for file changes.
 
+<time> - File change detected. Starting incremental compilation...
+
+side/index.ts(2,14): error TS2322: Type 'string' is not assignable to type 'number'.
+<time> - Found 1 error. Watching for file changes.
+

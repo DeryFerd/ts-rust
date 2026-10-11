@@ -46,8 +46,10 @@ const COARSE_MTIME_FIXTURE: &str = concat!(
 #[test]
 fn build_watch_keeps_the_first_json_parse_of_a_cycle() {
     let root = scratch_dir("stale-json");
-    // Go `CanWatchDirectory` does not watch `/tmp/<dir>/project`, so the
-    // project is one level deeper.
+    // The project is one level deeper, as in the Go runs of `expected.txt`.
+    // Go 673a5f17d713 did not watch `/tmp/<dir>/project` (`CanWatchDirectory`
+    // watched no directory 3 or fewer levels below `/`). Since #64366 Go
+    // watches the directory of a config or program file at any depth.
     let project = root.join("work").join("project");
     copy_dir(Path::new(STALE_JSON_FIXTURE), &project);
     // The first build builds `side` and `app` with no `lib/dist/data.json`
@@ -104,40 +106,49 @@ fn build_watch_keeps_the_first_json_parse_of_a_cycle() {
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
 }
 
-/// The bwsig2 skeptic case: a written `.d.ts` whose modification time goes
-/// back, in an output directory that no watch covers (as on a coarse
-/// clock). `lib` writes `a.d.ts` to `out`, beside the project. `side`
-/// imports `out/a.d.ts` and has no reference to `lib`. The steps, with the
-/// OS watcher:
+/// The bwsig2 skeptic case, at Go fed0bf24149f. `lib` writes `a.d.ts` to
+/// `out`, beside the project. `side` imports `out/a.d.ts` and has no
+/// reference to `lib`. The steps, with the OS watcher, and the number of
+/// builds that ended after each:
 ///
-/// 1. A `side` edit: `side` builds and parses `out/a.d.ts` (`a: number`).
-/// 2. A `lib` edit (`a: string`): `lib` writes `out/a.d.ts`. `side` does
-///    not build: no watch covers `out`.
-/// 3. The test sets the time of each `out/*.d.ts` back to the time that
-///    step 1 saw (it set it before the watch started too), then edits
-///    `side` again. `side` builds, and Go reads the new `a.d.ts`, because
-///    `resetCaches` drops every parse at the end of a cycle: TS2322.
+/// 1. The start: 1.
+/// 2. A `side` edit: `side` builds and parses `out/a.d.ts` (`a: number`): 2.
+/// 3. A `lib` edit (`a: string`): `lib` builds and writes `out/a.d.ts`: 3.
+///    The write gives a watch event, so `side` builds in the next cycle
+///    with the new `a.d.ts`: TS2322, 4.
+/// 4. The test sets both times of each `out/*.d.ts` back to the time that
+///    step 2 saw (it set them before the watch started too): no build, 4.
+/// 5. A `side` edit: `side` builds: TS2322, 5.
 ///
-/// The end of `build_all_tasks` drops the kept parse of each written file
-/// (`BuildHost::drop_written_watch_sources`). Without that call the port
-/// keeps the parse of step 1 and reports no error. `expected.txt` is the
-/// output of `tsgo-oracle-673a5f17d713` for the same steps (7 of 7 runs).
+/// Go watches `out` since #64366: `addProgramFileWatchDir` watches the
+/// directory of a program file at any depth, with no `CanWatchDirectory`
+/// check (execute/build/orchestrator.go:775-781), for each root file
+/// (:712) and each file name of the build info (:752), here `out/a.d.ts`
+/// of `side`. `ResolveDesiredDirs` checks the depth only for an ancestor
+/// fallback (execute/watchmanager/watchmanager.go:219-222). The watch masks
+/// have create and modify but not attrib (fswatch/inotify_linux.go:77-86,
+/// fswatch/fanotify_linux.go:118-120). So the write starts a build, and a
+/// change of both times does not: Linux reports it as `IN_ATTRIB`. A change
+/// of the modification time alone is `IN_MODIFY`, and `side` builds again.
+///
+/// At Go 673a5f17d713 no watch covered `/tmp/<dir>/out`: `side` did not
+/// build in step 3, no build started after step 4, and step 5 checked that
+/// the next cycle parses a written `.d.ts` again although no event named
+/// it and its time did not change (a coarse clock). That case does not
+/// occur here. It still occurs when `side` is not incremental: its build
+/// info has no file names (execute/incremental/snapshottobuildinfo.go:37,
+/// :51), so no watch covers `out`. For that case the end of
+/// `build_all_tasks` drops the kept parse of each written file
+/// (`BuildHost::drop_written_watch_sources`); its test is
+/// `execute::build::host::tests::a_written_file_is_parsed_again_in_the_next_cycle`.
+/// `expected.txt` and the counts are from `tsgo-oracle-fed0bf24149f` in
+/// place of `tsgo` for this test (3 of 3 runs).
 // PORT: no Go counterpart; the output is Go's.
 #[cfg(target_os = "linux")]
 #[test]
 fn build_watch_parses_a_written_dts_again_in_the_next_cycle() {
     use std::time::Duration;
-    // Go `CanWatchDirectory` watches no directory 3 or fewer levels below
-    // `/`, so no watch covers `/tmp/<dir>/out`. A TMPDIR can be deeper (the
-    // macOS-like runner's is `/private/var/folders/x/T`), so the test uses
-    // `/tmp`, and it is skipped where `/tmp` is not a directory one level
-    // below `/`.
-    let tmp = Path::new("/tmp");
-    if fs::canonicalize(tmp).ok().as_deref() != Some(tmp) {
-        eprintln!("skipped: the case needs /tmp, one level below /");
-        return;
-    }
-    let root = scratch_dir_in(tmp, "coarse-mtime");
+    let root = scratch_dir("coarse-mtime");
     // As in the first test, the project is one level deeper. `lib` writes
     // to `<root>/out`, outside the project.
     let project = root.join("work").join("project");
@@ -151,7 +162,9 @@ fn build_watch_parses_a_written_dts_again_in_the_next_cycle() {
                 fs::File::options()
                     .write(true)
                     .open(&path)
-                    .and_then(|file| file.set_modified(old))
+                    .and_then(|file| {
+                        file.set_times(fs::FileTimes::new().set_accessed(old).set_modified(old))
+                    })
                     .unwrap_or_else(|error| panic!("set the time of {}: {error}", path.display()));
             }
         }
@@ -171,22 +184,17 @@ fn build_watch_parses_a_written_dts_again_in_the_next_cycle() {
     }
     set_dts_times_back();
     let watch = os_watch::Run::start(&project);
-    watch.settle(1, &root);
+    watch.expect_builds(1, "the start", &root);
     let edit = |target: &str, source: &str| os_watch::replace(&root, &project, target, source);
     edit("side/index.ts", "edits/side-index-1.ts");
-    watch.settle(2, &root);
+    watch.expect_builds(2, "the first side edit", &root);
     edit("lib/a.ts", "edits/lib-a.ts");
-    watch.settle(3, &root);
+    watch.expect_builds(4, "the lib edit", &root);
     set_dts_times_back();
     std::thread::sleep(os_watch::QUIET);
-    assert_eq!(
-        watch.builds(),
-        3,
-        "a build started after the time change ({})",
-        root.display()
-    );
+    watch.expect_builds(4, "the time change", &root);
     edit("side/index.ts", "edits/side-index-2.ts");
-    watch.settle(4, &root);
+    watch.expect_builds(5, "the second side edit", &root);
     let (stdout, stderr) = watch.stop();
     assert_eq!(
         normalize_watch_output(&stdout),
@@ -254,11 +262,6 @@ mod os_watch {
             }
         }
 
-        /// The number of builds that ended.
-        pub fn builds(&self) -> usize {
-            self.stdout.lock().unwrap().0.matches(BUILD_END).count()
-        }
-
         /// Waits until `builds` builds ended, the output ends with the end
         /// of a build, and nothing more came for `QUIET`.
         pub fn settle(&self, builds: usize, root: &Path) {
@@ -282,6 +285,19 @@ mod os_watch {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
+        }
+
+        /// `settle(builds)`, then checks that no more builds ended.
+        pub fn expect_builds(&self, builds: usize, step: &str, root: &Path) {
+            self.settle(builds, root);
+            let output = self.stdout.lock().unwrap();
+            assert_eq!(
+                output.0.matches(BUILD_END).count(),
+                builds,
+                "builds after {step} ({}):\n{}",
+                root.display(),
+                output.0
+            );
         }
 
         /// Kills the run and gives its whole stdout and stderr.
@@ -355,16 +371,11 @@ fn normalize_watch_output(output: &str) -> String {
 /// for paths under it. A Windows real path is verbatim (`\\?\C:\...`),
 /// which a program does not take as a cwd, so it stays as made there.
 fn scratch_dir(test: &str) -> PathBuf {
-    scratch_dir_in(&std::env::temp_dir(), test)
-}
-
-/// `scratch_dir` under `base`.
-fn scratch_dir_in(base: &Path, test: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after 1970")
         .as_nanos();
-    let dir = base.join(format!(
+    let dir = std::env::temp_dir().join(format!(
         "goport-build-watch-{test}-{}-{nanos}",
         std::process::id()
     ));
