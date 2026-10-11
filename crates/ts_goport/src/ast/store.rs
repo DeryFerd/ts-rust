@@ -4654,6 +4654,55 @@ pub fn frozen_store_ast_node(n: Node) -> Option<&'static NodeData> {
         .map(|nodes| nodes[slot_index(n)].expect("store handle does not name a node slot"))
 }
 
+/// A published store node with its registry block, read once: the node
+/// shell of a freeable file version included (`frozen_store_kind`). Its
+/// reads are plain loads from the block's columns, so a caller that reads
+/// several fields of one node does one registry lookup, not one per field.
+/// Lives no longer than a node read: the block of a freeable file version
+/// is valid only while the version is.
+// PERF: noderef1 (getsym1 report, W1). Go reads `n.Kind` and `n.data` from
+// one struct. Each `Node` read here goes through `file_block`, whose
+// `OnceLock` acquire load stops LLVM from merging repeated lookups.
+#[derive(Clone, Copy)]
+pub struct FrozenNode {
+    block: &'static FileBlock,
+    index: usize,
+}
+
+impl FrozenNode {
+    /// Go `node.Kind` (`frozen_store_kind`).
+    #[inline]
+    #[must_use]
+    pub fn kind(self) -> SyntaxKind {
+        self.block.kinds[self.index]
+    }
+
+    /// The node data (`frozen_store_ast_node`). `None` in the node shell of
+    /// a freeable file version whose store owns its astdata nodes
+    /// (lsshells M3c): read those with `with_scoped_ast_node`.
+    #[inline]
+    #[must_use]
+    pub fn data(self) -> Option<&'static NodeData> {
+        self.block
+            .node_column()
+            .map(|nodes| slot_node(nodes[self.index]))
+    }
+}
+
+/// The `FrozenNode` of `n`. `None` as for `frozen_store_kind`: nil,
+/// synthetic and unpublished store nodes.
+#[inline]
+#[must_use]
+pub fn frozen_store_node(n: Node) -> Option<FrozenNode> {
+    if n.is_nil() {
+        return None;
+    }
+    Some(FrozenNode {
+        block: file_block(n.file_index())?,
+        index: slot_index(n),
+    })
+}
+
 /// `store_ast_node(n)` when `n` is a store node, in one lookup (see
 /// `try_store_header`). `None` for nil and synthetic nodes, and for a node
 /// with no `'static` data (a node that a freeable parse owns, lsshells M3c;
