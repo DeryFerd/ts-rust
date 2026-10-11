@@ -18,6 +18,7 @@
 use crate::gostd::Context;
 use crate::prelude::*;
 
+pub mod codegens;
 pub mod configcheck;
 pub mod configraw;
 pub mod diag;

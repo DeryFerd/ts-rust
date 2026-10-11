@@ -228,13 +228,14 @@ child_test! {
 }
 
 child_test! {
-    // Patches 011, 022 and 024: on this file the code action, completion and
-    // document symbol answers with the plugin are the answers without it. The
-    // range has no Effect diagnostic, so the fixables (E4, E5) add no action.
-    // The file has no Layer, service, error or schema, and flows need the
-    // `debug` option, so the document symbols (E8) add no `Effect` symbol.
-    // The refactors (E9) and completions (E6) are not ported yet.
-    fn code_actions_completions_and_symbols_are_unchanged() {
+    // Patches 011 and 024: on this file the code action and document symbol
+    // answers with the plugin are the answers without it. The range has no
+    // Effect diagnostic, so the fixables (E4, E5) add no action. The file has
+    // no Layer, service, error or schema, and flows need the `debug` option,
+    // so the document symbols (E8) add no `Effect` symbol. The refactors (E9)
+    // are not ported yet. The completions (patch 022, E6) are in
+    // `effect_ls_completions_test.rs`.
+    fn code_actions_and_symbols_are_unchanged() {
         let answers = |service: &LanguageService| {
             let ctx = projecttestutil::with_request_id(&bg());
             let actions = service
@@ -251,19 +252,14 @@ child_test! {
                     },
                 )
                 .unwrap_or_else(|err| panic!("{}", err.error()));
-            let completion = service
-                .provide_completion(&ctx, &uri(MAIN_URI), position(4, 26), None)
-                .unwrap_or_else(|err| panic!("{}", err.error()));
             let symbols = service
                 .provide_document_symbols(&ctx, &uri(MAIN_URI))
                 .unwrap_or_else(|err| panic!("{}", err.error()));
-            format!("{actions:?}\n{completion:?}\n{symbols:?}")
+            format!("{actions:?}\n{symbols:?}")
         };
         let (_session, on) = service(PLUGIN, None);
         let (_session, off) = service("", None);
-        let on = answers(&on);
-        assert!(on.contains("succeed"), "completion after Effect. has succeed: {on}");
-        assert_eq!(on, answers(&off));
+        assert_eq!(answers(&on), answers(&off));
     }
 }
 

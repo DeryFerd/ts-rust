@@ -36,6 +36,8 @@ use crate::effect::typeparser::TypeParser;
 use crate::ls::prelude::*;
 
 pub mod autoimportstyle;
+pub mod completion;
+pub mod completions;
 pub mod document_symbols;
 pub mod fixable;
 pub mod fixables;
@@ -124,15 +126,18 @@ fn get_effect_refactor_actions(
 // Go: etslshooks/init.go:155 afterCompletion
 /// Called by `ls/completions_p1.rs` after the completion list is built
 /// (Effect-TS/tsgo patch 022). Returns the items with the Effect completions
-/// appended.
-// PORT: Go returns the items when `completions.All` is empty. Lane E6 ports
-// `internal/completion` and `internal/completions`; until then the list is
-// empty, so the items come back unchanged.
+/// of [`completions::ALL`] appended, in that order.
+// PORT: Go builds the completion context over `items` and appends each
+// provider's results to `items` in the loop; the context keeps the original
+// slice as `ExistingItems`. Here the context borrows the items, so the
+// results go to a second list, which is appended after the loop (the same
+// items in the same order). Go also passes the language service to the
+// context, which no provider reads.
 pub fn after_completion(
-    _ctx: &Context,
-    _sf: Node,
-    _position: i32,
-    items: Vec<lsproto::CompletionItem>,
+    ctx: &Context,
+    sf: Node,
+    position: i32,
+    mut items: Vec<lsproto::CompletionItem>,
     program: &compiler::NewProgram,
     _lang_service: &LanguageService,
 ) -> Vec<lsproto::CompletionItem> {
@@ -142,6 +147,29 @@ pub fn after_completion(
     if !effect_config.get_completions_enabled() {
         return items;
     }
+
+    if completions::ALL.is_empty() {
+        return items;
+    }
+
+    let (ch, done) = ls_program::get_type_checker_for_file(program, ctx, sf);
+    let mut added = Vec::new();
+    {
+        let mut ch = ch.borrow_mut();
+        let tp_program = ch.program;
+        let mut tp = TypeParser::new(tp_program, &mut ch);
+
+        let mut completion_ctx =
+            completion::new_context(ctx, sf, position, &items, program, &mut tp);
+
+        for c in completions::ALL {
+            let results = (c.run)(&mut completion_ctx);
+            added.extend(results);
+        }
+    }
+    done.call();
+
+    items.extend(added);
     items
 }
 
