@@ -193,16 +193,38 @@ fn json_value_len(text: &str) -> usize {
     panic!("no JSON value end in {text}")
 }
 
-/// `tsgo --lsp --stdio` in a project with `a.ts` open: sends `messages`
-/// after `initialize`, `initialized` and `didOpen`, answers the server's
-/// requests, and returns the exit code and the first two stderr lines when
-/// the server exits (at most 60 s).
+/// The text of `a.ts` in the LSP project (`lsp_session`).
+const A_TS: &str = "const x = 1;\nexport function f(a: number) { return a + x; }\n";
+
+/// The `initialized` notification.
+const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#;
+
+/// `lsp_session` with `a.ts` open: sends `messages` after `initialize`,
+/// `initialized` and `didOpen`.
 fn lsp_run(messages: &[String]) -> (Option<i32>, Vec<String>) {
+    lsp_session(|root| {
+        let text = A_TS.replace('\n', "\\n");
+        let mut all = vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"processId":null,"rootUri":"{root}","capabilities":{{}},"workspaceFolders":[{{"uri":"{root}","name":"p"}}]}}}}"#
+            ),
+            INITIALIZED.to_string(),
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{root}/a.ts","languageId":"typescript","version":1,"text":"{text}"}}}}}}"#
+            ),
+        ];
+        all.extend_from_slice(messages);
+        all
+    })
+}
+
+/// `tsgo --lsp --stdio` in a project with `a.ts` (`A_TS`): sends the
+/// messages that `messages` makes from the project's root URI, answers the
+/// server's requests, and returns the exit code and the first two stderr
+/// lines when the server exits (at most 60 s).
+fn lsp_session(messages: impl FnOnce(&str) -> Vec<String>) -> (Option<i32>, Vec<String>) {
     let project = Project::new();
-    project.write(
-        "a.ts",
-        "const x = 1;\nexport function f(a: number) { return a + x; }\n",
-    );
+    project.write("a.ts", A_TS);
     project.write("tsconfig.json", r#"{"compilerOptions":{"strict":true}}"#);
     let root = format!("file://{}", project.0.display());
     let mut child = Command::new(env!("CARGO_BIN_EXE_tsgo"))
@@ -245,25 +267,8 @@ fn lsp_run(messages: &[String]) -> (Option<i32>, Vec<String>) {
         let _ = stderr.read_to_end(&mut bytes);
         bytes
     });
-    let text = project.read("a.ts").replace('\n', "\\n");
-    send(
-        &stdin,
-        &format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"processId":null,"rootUri":"{root}","capabilities":{{}},"workspaceFolders":[{{"uri":"{root}","name":"p"}}]}}}}"#
-        ),
-    );
-    send(
-        &stdin,
-        r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
-    );
-    send(
-        &stdin,
-        &format!(
-            r#"{{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{{"textDocument":{{"uri":"{root}/a.ts","languageId":"typescript","version":1,"text":"{text}"}}}}}}"#
-        ),
-    );
-    for message in messages {
-        send(&stdin, message);
+    for message in messages(&root) {
+        send(&stdin, &message);
     }
     let start = Instant::now();
     let status = loop {
@@ -352,4 +357,28 @@ fn lsp_messages_with_a_nil_element() {
             "{message}"
         );
     }
+}
+
+/// gopanicout3. The handler of `initialized` (no `recover`) reads what
+/// `initialize` sets: `s.initializationOptions`, nil before `initialize`
+/// (lsp/server.go:1716, offset 0), and, when the client has the workspace
+/// folders capability, the only folder of `workspaceFolders: [null]`
+/// (lsp/server.go:1752, offset 0x8: the length word of `Uri`).
+#[test]
+fn lsp_initialized_reads_a_nil_initialize_state() {
+    assert_eq!(
+        lsp_session(|_| vec![INITIALIZED.to_string()]),
+        (Some(2), vec![NIL_DEREFERENCE.to_string(), signal(0x0)]),
+        "initialized before initialize"
+    );
+    assert_eq!(
+        lsp_session(|root| vec![
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"processId":null,"rootUri":"{root}","capabilities":{{"workspace":{{"workspaceFolders":true}}}},"workspaceFolders":[null]}}}}"#
+            ),
+            INITIALIZED.to_string(),
+        ]),
+        (Some(2), vec![NIL_DEREFERENCE.to_string(), signal(0x8)]),
+        "workspaceFolders [null]"
+    );
 }

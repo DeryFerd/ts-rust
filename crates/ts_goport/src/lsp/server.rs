@@ -1743,23 +1743,6 @@ pub fn go_crash(payload: Box<dyn Any + Send>) -> ! {
     std::process::exit(crate::execute::tsc::EXIT_UNPORTED);
 }
 
-/// The port's text for Go `debug.Stack()` after a `recover()` of `r`: the
-/// port site of a Go panic, which takes the place of the goroutine trace as
-/// in `core::print_go_panic` (`\t<file>:<line>` and a newline). For any
-/// other payload, the Rust backtrace when `RUST_BACKTRACE` enables it,
-/// else "".
-pub fn recovered_stack(r: &(dyn Any + Send)) -> String {
-    if let Some(panic) = r.downcast_ref::<crate::core::GoPanic>() {
-        return format!("\t{}:{}\n", panic.location.file(), panic.location.line());
-    }
-    let backtrace = std::backtrace::Backtrace::capture();
-    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
-        backtrace.to_string()
-    } else {
-        String::new()
-    }
-}
-
 /// The text of a panic value (Go `%v` of the recovered value).
 pub fn panic_value_string(r: &(dyn Any + Send)) -> String {
     if let Some(panic) = r.downcast_ref::<crate::core::GoPanic>() {
@@ -3329,10 +3312,11 @@ impl Server {
     // PORT: Go `defer s.recover(req)`; `recover_guard` runs the guarded code
     // in `core::go_recover` and calls this with the panic value.
     // PORT: Go `debug.Stack()` is the goroutine trace of the panic; the
-    // port logs `recovered_stack` in its place. `sanitize_stack_trace`
-    // finds no Go frames in it and gives "" (log and telemetry text only).
+    // port logs `core::go_recovered_stack` in its place.
+    // `sanitize_stack_trace` finds no Go frames in it and gives "" (log and
+    // telemetry text only).
     pub fn recover(&self, req: &lsproto::RequestMessage, r: Box<dyn Any + Send>) {
-        let stack = recovered_stack(r.as_ref());
+        let stack = crate::core::go_recovered_stack(r.as_ref());
         let r = panic_value_string(r.as_ref());
         self.logger.errorf(&format!(
             "panic handling request {}: {}\n{}",
@@ -3689,7 +3673,13 @@ impl Server {
     ) -> Result<(), GoError> {
         let mut disable_push_diagnostics = false;
         let mut enable_telemetry = false;
-        let initialization_options = self.shared.initialization_options();
+        // Before `initialize` the options are nil: Go faults at its read of
+        // `DisablePushDiagnostics`, offset 0 (server.go:1716).
+        let initialization_options = self
+            .shared
+            .initialization_options
+            .get()
+            .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x0));
         if let Some(v) = initialization_options.disable_push_diagnostics {
             disable_push_diagnostics = v;
         }
@@ -3753,10 +3743,12 @@ impl Server {
         // names, and a root path counts only when it is absolute; each is
         // normalized (server.go:1752-1762).
         if client_capabilities.workspace.workspace_folders && single_workspace_folder.is_some() {
+            // A null folder: Go faults at its read of the length word of
+            // `Uri`, offset 0x8 (server.go:1752).
             let folder = single_workspace_folder
                 .expect("checked above")
                 .as_ref()
-                .unwrap_or_else(|| crate::core::go_nil_dereference());
+                .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x8));
             let file_name = lsproto::DocumentUri(folder.uri.0.clone()).file_name();
             if !file_name.is_empty() {
                 cwd = file_name;
@@ -5046,7 +5038,7 @@ impl Server {
             }
         });
         if let Err(r) = result {
-            let stack = recovered_stack(r.as_ref());
+            let stack = crate::core::go_recovered_stack(r.as_ref());
             self.logger.errorf(&format!(
                 "API session {}: panic: {}\n{}",
                 api_session.id(),

@@ -512,6 +512,22 @@ pub fn print_go_panic(payload: &(dyn std::any::Any + Send)) -> bool {
     true
 }
 
+/// The port's text for Go `debug.Stack()` after a `recover()` of `r`: the
+/// port site of a Go panic, which takes the place of the goroutine trace as
+/// in `print_go_panic` (`\t<file>:<line>` and a newline). For any other
+/// payload, the Rust backtrace when `RUST_BACKTRACE` enables it, else "".
+pub fn go_recovered_stack(r: &(dyn std::any::Any + Send)) -> String {
+    if let Some(panic) = r.downcast_ref::<GoPanic>() {
+        return format!("\t{}:{}\n", panic.location.file(), panic.location.line());
+    }
+    let backtrace = std::backtrace::Backtrace::capture();
+    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+        backtrace.to_string()
+    } else {
+        String::new()
+    }
+}
+
 // Go: runtime/panic.go:1581 dopanic_m (go1.27.1), Linux: the line for a
 // panic of a SIGSEGV (`gp.sig`), with its newline. `code=0x1` is
 // SEGV_MAPERR, the code of a nil page access.
