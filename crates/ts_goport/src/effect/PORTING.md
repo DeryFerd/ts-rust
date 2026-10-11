@@ -209,3 +209,35 @@ default tsconfig turns the 3 rules off, as Go `effecttest.DefaultTsConfig`),
 the 3 rules on, `--pretty false` and `--pretty true`), and the fixtures
 `unstable-api-usage`, `allowed-unstable-apis`, `experimental-api-usage` and
 `api-stability-leak`.
+
+### TS2790 with the stability rules
+
+With `unstableApiUsage` or `experimentalApiUsage` on (the default), a
+`delete` of a property that an index signature gives, under
+`exactOptionalPropertyTypes`, gets TS2790 ("The operand of a 'delete'
+operator must be optional"). effect-tsgo 0.51.1 prints it too, and plain
+TypeScript-Go does not. On T3 Code `apps/server` these are the 14 TS2790
+lines (`delete process.env.X`). The cause, in rule order:
+
+1. The two usage rules come before `floatingEffect` in Go `rules.All`
+   (`internal/rules/rules.go:11-14`). They call `GetSymbolAtLocation` on each
+   identifier (`stability_api_usage.go:91`).
+2. On the name of `env.X`, TypeScript-Go
+   `getSymbolOfNameOrPropertyAccessExpression` (pinned
+   `internal/checker/checker.go:32357-32366`) stores the synthetic index
+   symbol of `getApplicableIndexSymbol` (`checker.go:32574`: flags
+   `Property`, not `Optional`) as the access's `resolvedSymbol`.
+3. `floatingEffect` calls `GetTypeAtLocation` on the expression of each
+   expression statement (`floating_effect.go:109`). For `delete env.X` this
+   runs `checkExpression` again (`getTypeOfExpression`, `checker.go:7509`).
+   `checkDeleteExpression` (`checker.go:11004`) now finds the index symbol,
+   and `checkDeleteExpressionMustBeOptional` (`checker.go:11025`) reports
+   TS2790: with `exactOptionalPropertyTypes` only the `Optional` flag counts.
+
+The first check of the file found no symbol there, so plain TypeScript-Go and
+a run with the two rules off report nothing. The port makes the same calls in
+the same order (`rules/stability_api_usage.rs`, `rules/floating_effect.rs`),
+so it prints the same lines. A small case: `declare const env: { [key:
+string]: string | undefined }; delete env.FOO;` with `strict`,
+`exactOptionalPropertyTypes` and the plugin. `scripts/effect/t3-rules-off.sh`
+runs T3 Code with the rules on and off against effect-tsgo 0.51.1.
