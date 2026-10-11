@@ -48,8 +48,9 @@
 //! - a new node, a factory list and a list copy go to the current program
 //!   version when it is an owner on this thread and no base scope
 //!   (`enter_base_synthetic_owner`) is open, else to the base owner;
-//! - a data write (`replace_node_data`, `set_node_kind`) goes to the owner
-//!   of the node, so a base node never points into a program version;
+//! - a data write (`replace_node_data`, `set_node_kind`, and
+//!   `set_node_modifiers` with its new list) goes to the owner of the node,
+//!   so a base node never points into a program version;
 //! - an alias slot goes to the file version of its parsed node when that is
 //!   a freeable version (`ast/file_version.rs`), else to the base owner. An
 //!   alias lives as long as the node it names: after the version dies, the
@@ -500,17 +501,7 @@ impl SyntheticArena {
             return;
         }
         for &file in &dead {
-            if let Some(chunks) = self.alias_files.remove(&(file as u32)) {
-                for c in chunks.slots {
-                    self.slots[c as usize] = None;
-                }
-                for c in chunks.datas {
-                    self.datas[c as usize] = None;
-                }
-                for c in chunks.lists {
-                    self.lists[c as usize] = None;
-                }
-            }
+            self.free_file_owner(file as u32);
         }
         // PERF: emitast2. An editor edit kills one version: compare its id,
         // with no set lookup per alias.
@@ -519,6 +510,21 @@ impl SyntheticArena {
         } else {
             let dead: FxHashSet<usize> = dead.into_iter().collect();
             self.aliases.retain(|n, _| !dead.contains(&n.file_index()));
+        }
+    }
+
+    /// Frees the entries of the file version `file` (`OwnerKey::File`).
+    fn free_file_owner(&mut self, file: u32) {
+        if let Some(chunks) = self.alias_files.remove(&file) {
+            for c in chunks.slots {
+                self.slots[c as usize] = None;
+            }
+            for c in chunks.datas {
+                self.datas[c as usize] = None;
+            }
+            for c in chunks.lists {
+                self.lists[c as usize] = None;
+            }
         }
     }
 
@@ -2304,7 +2310,7 @@ pub fn set_node_modifiers(n: Node, modifiers: ModifierList) {
     let mods = if is_store_node(n) {
         crate::ast::store::store_modifiers_value(n.file_index(), modifiers)
     } else {
-        synthetic_modifiers_value(false, modifiers)
+        node_modifiers_value(n, modifiers)
     };
     let mut data = with_ast_data(n, Clone::clone);
     match &mut data {
@@ -2677,10 +2683,34 @@ pub fn synthetic_modifiers_value(
     print: bool,
     modifiers: ModifierList,
 ) -> Option<crate::astdata::ModifierList> {
+    let copy = modifiers_copy(modifiers)?;
+    Some(crate::astdata::ModifierList {
+        list: own_list_field(print, copy),
+    })
+}
+
+/// `synthetic_modifiers_value` for a data write on synthetic node `n`
+/// (`set_node_modifiers`). The list goes to the owner of `n`, as the new
+/// data does (`replace_synthetic_ast_node`), so it lives as long as the
+/// data that names it.
+fn node_modifiers_value(n: Node, modifiers: ModifierList) -> Option<crate::astdata::ModifierList> {
+    let copy = modifiers_copy(modifiers)?;
+    let index = ARENA.with(|a| {
+        let mut a = a.borrow_mut();
+        let owner = a.slot_owner[slot_index(n) / SLOT_CHUNK];
+        a.push_list(owner, OwnList::List(copy))
+    });
+    Some(crate::astdata::ModifierList {
+        list: crate::astdata::NodeList::new(index),
+    })
+}
+
+/// The list that a modifier list value copies, or `None` for Go `nil`.
+fn modifiers_copy(modifiers: ModifierList) -> Option<SyntheticListData> {
     if modifiers.is_nil() {
         return None;
     }
-    let copy = match modifiers.synthetic_list() {
+    Some(match modifiers.synthetic_list() {
         Some(m) => with_synthetic_list(m, SyntheticListData::clone),
         None => {
             let nodes = modifiers.nodes().to_vec();
@@ -2691,9 +2721,6 @@ pub fn synthetic_modifiers_value(
                 crate::astdata::ModifierFlags(modifiers_to_flags(&nodes).0 as u32),
             )
         }
-    };
-    Some(crate::astdata::ModifierList {
-        list: own_list_field(print, copy),
     })
 }
 
@@ -2883,6 +2910,60 @@ mod tests {
             assert_eq!(local::garbage_len(), 1, "the chunks do not wait");
             local::drop_garbage(|| false);
             assert_eq!(local::garbage_len(), 0);
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    // `set_node_modifiers` on a synthetic node puts the new list in the
+    // owner of the node, with its new data, not in the current owner. A
+    // base node or a program node changed in a file scope, and a base node
+    // changed while a program version is current, keep their modifiers
+    // after that file version or program version is freed.
+    #[test]
+    fn set_node_modifiers_puts_the_list_in_the_node_owner() {
+        std::thread::spawn(|| {
+            let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
+                id: next_program_id(),
+                options: Box::leak(Box::default()),
+                state: std::sync::OnceLock::new(),
+            }));
+            let f = NodeFactory::new();
+            let export = f.new_modifier(SyntaxKind::ExportKeyword);
+            let mods = f.new_modifier_list(&[export]);
+            let member = |name: &str| f.new_enum_member(f.new_identifier(name), Node::NIL);
+            let (in_program, in_file) = (member("a"), member("b"));
+
+            open_synthetic_owner(program.id);
+            let program_node = {
+                let _program = enter_program(Some(program));
+                set_node_modifiers(in_program, mods);
+                let program_node = member("c");
+                // A file scope of a freeable file version (`alias_owner`).
+                let file = u32::MAX;
+                ARENA.with(|a| {
+                    let mut a = a.borrow_mut();
+                    a.alias_files.insert(file, OwnerChunks::default());
+                });
+                {
+                    let _file = enter_owner_scope(OwnerKey::File(file));
+                    set_node_modifiers(in_file, mods);
+                    set_node_modifiers(program_node, mods);
+                }
+                // The file version dies (`free_dead_aliases`).
+                ARENA.with(|a| a.borrow_mut().free_file_owner(file));
+                program_node
+            };
+            let read = |n: Node| read_panic(|| n.modifiers().nodes().to_vec());
+            assert_eq!(read(in_file), None);
+            assert_eq!(in_file.modifiers().nodes().to_vec(), vec![export]);
+            assert_eq!(read(program_node), None);
+            assert_eq!(program_node.modifiers().nodes().to_vec(), vec![export]);
+
+            free_synthetic_owner(program.id);
+            assert_eq!(read(in_program), None);
+            assert_eq!(in_program.modifiers().nodes().to_vec(), vec![export]);
             free_synthetic_nodes();
         })
         .join()
