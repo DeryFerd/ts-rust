@@ -11,7 +11,8 @@
 #                                             to the repo root; a trailing / copies a dir's contents)
 #        testbox.sh push <path>...            copy zbook files or dirs to the same absolute paths (e.g. a bins dir)
 #        testbox.sh seed [inputs|pin]...      copy the files of testbox-data.txt (default both disks) to their
-#                                             sticky disks (about 30 minutes). Then let the testbox end on its
+#                                             sticky disks (30 to 35 minutes; a rerun copies only what is
+#                                             missing). Then let the testbox end on its
 #                                             idle timeout: a stopped job is cancelled, and a cancelled job does
 #                                             not commit its sticky disks
 #        testbox.sh status | stop | list      the saved testbox's status, stop it (no sticky disk commit), list
@@ -47,8 +48,12 @@ ssh_route() {
 
 # push_paths <path>...: rsync each path to the same path on the testbox.
 push_paths() {
-  local host ssh p
+  local host ssh p keep
   ssh_route
+  # The idle loop of run-testbox does not see this SSH route: touch its activity marker while we copy.
+  while :; do $ssh "runner@$host" touch .testbox-last-activity || true; sleep 60; done &
+  keep=$!
+  trap 'kill "$keep" 2>/dev/null' EXIT
   for p in "$@"; do
     p="$(realpath "$p")"
     echo "push $p"
