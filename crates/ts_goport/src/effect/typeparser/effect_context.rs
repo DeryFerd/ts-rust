@@ -105,17 +105,12 @@ impl TypeParser<'_> {
                 | EffectContextFlags::IN_EFFECT_CONSTRUCTOR_THUNK
                 | pending_flags_mask,
         };
-        // PERF: Go walks the tree; the node order has the same nodes in the
-        // same order (effperf4).
-        let order = self.node_order(sf);
-        for i in 0..order.nodes().len() as u32 {
-            effect_context_visit(self, &mut state, &order, i);
-        }
+        effect_context_walk(self, &mut state, sf);
     }
 }
 
 /// The locals of Go `analyzeEffectContextForSourceFile` that its closures
-/// share. PORT: Go's `walk` closure is `effect_context_visit`, and the
+/// share. PORT: Go's `walk` closure is `effect_context_walk`, and the
 /// closures that only touch the pending stores are methods here.
 pub struct EffectContextWalk {
     pub pending_enable_flags: FxHashMap<Node, EffectContextFlags>,
@@ -142,15 +137,17 @@ impl EffectContextWalk {
     }
 
     // Go: resetChildFunctionScopeFlags
-    pub fn reset_child_function_scope_flags(&mut self, node: Node) {
+    pub fn reset_child_function_scope_flags(&mut self, node: Node) -> bool {
         let flags = self.function_scope_reset_flags;
         self.set_pending_disable_flags(node, flags);
+        false
     }
 
     // Go: resetPendingFlags
-    pub fn reset_pending_flags(&mut self, child: Node) {
+    pub fn reset_pending_flags(&mut self, child: Node) -> bool {
         let flags = self.pending_flags_mask;
         self.set_pending_disable_flags(child, flags);
+        false
     }
 }
 
@@ -170,16 +167,10 @@ pub fn transparent_pending_expression(node: Node) -> Node {
 }
 
 // Go: the `walk` closure of analyzeEffectContextForSourceFile
-/// The walk's work for node `i` of `order`. PORT: the caller visits the
-/// nodes in order, so the walk's last line (`ForEachChild(walk)`) is not
-/// here, and the children of the node are its node order children.
-pub fn effect_context_visit(
-    tp: &mut TypeParser<'_>,
-    w: &mut EffectContextWalk,
-    order: &NodeOrder,
-    i: u32,
-) {
-    let node = order.node(i);
+pub fn effect_context_walk(tp: &mut TypeParser<'_>, w: &mut EffectContextWalk, node: Node) -> bool {
+    if node.is_nil() {
+        return false;
+    }
 
     {
         let links = tp.links();
@@ -229,9 +220,7 @@ pub fn effect_context_visit(
         .intersects(EffectContextFlags::PENDING_NEXT_OBJECT_TRY_PROPERTY_IS_EFFECT_THUNK)
         && node.kind() == SyntaxKind::ObjectLiteralExpression
     {
-        for child in order.children(i) {
-            w.reset_pending_flags(order.node(child));
-        }
+        node.for_each_child(|child| w.reset_pending_flags(child));
 
         let obj = node;
         for prop in obj.properties().iter() {
@@ -260,9 +249,7 @@ pub fn effect_context_visit(
         .get(node)
         .intersects(w.pending_flags_mask)
     {
-        for child in order.children(i) {
-            w.reset_pending_flags(order.node(child));
-        }
+        node.for_each_child(|child| w.reset_pending_flags(child));
     }
 
     // logic for this node
@@ -314,9 +301,7 @@ pub fn effect_context_visit(
     // yieldability from an outer Effect scope. Matching Effect helpers re-enable the
     // flag on the specific body node below.
     if is_function_like(node) {
-        for child in order.children(i) {
-            w.reset_child_function_scope_flags(order.node(child));
-        }
+        node.for_each_child(|child| w.reset_child_function_scope_flags(child));
     }
 
     // reset stores correlated to a flag set here.
@@ -328,4 +313,7 @@ pub fn effect_context_visit(
     {
         *tp.links().effect_yield_generator_function.get(node) = CachedNode::default();
     }
+
+    node.for_each_child(|child| effect_context_walk(tp, w, child));
+    false
 }

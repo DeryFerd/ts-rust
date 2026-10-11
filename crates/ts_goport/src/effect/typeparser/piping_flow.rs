@@ -716,19 +716,17 @@ impl TypeParser<'_> {
 #[derive(Clone)]
 pub struct WorkItem {
     pub node: Node,
-    /// PORT: the node order index of `node`, or `NO_INDEX` (effperf4).
-    pub index: u32,
     /// non-nil when traversing subject chain for flattening
     pub parent_flow: Option<Rc<RefCell<PipingFlow>>>,
 }
 
 /// Go `enqueueChild` closure of `PipingFlows`.
-fn enqueue_child(queue: &mut Vec<WorkItem>, child: Node, index: u32) {
+fn enqueue_child(queue: &mut Vec<WorkItem>, child: Node) -> bool {
     queue.push(WorkItem {
         node: child,
-        index,
         parent_flow: None,
     });
+    false
 }
 
 impl TypeParser<'_> {
@@ -765,13 +763,8 @@ impl TypeParser<'_> {
         let mut result: Vec<Rc<RefCell<PipingFlow>>> = Vec::new();
 
         // Initialize work queue with all children of the source file
-        // PERF: Go walks the tree with a stack of nodes; each work item also
-        // holds its node order index, and the children of an indexed node
-        // come from the node order: the same nodes in the same order
-        // (effperf4).
-        let order = self.node_order(sf);
         let mut queue: Vec<WorkItem> = Vec::new();
-        order.for_each_child_of(0, sf, |c, ci| enqueue_child(&mut queue, c, ci));
+        sf.for_each_child(|child| enqueue_child(&mut queue, child));
 
         while let Some(item) = queue.pop() {
             // Pop from end (stack behavior for depth-first)
@@ -779,12 +772,10 @@ impl TypeParser<'_> {
             if node.is_nil() {
                 continue;
             }
-            let i = item.index;
             let unwrapped = skip_parentheses(node);
             if unwrapped != node {
                 queue.push(WorkItem {
                     node: unwrapped,
-                    index: order.index_under(i, unwrapped),
                     parent_flow: item.parent_flow.clone(),
                 });
                 continue;
@@ -817,18 +808,14 @@ impl TypeParser<'_> {
 
                     // Queue function body argument children for independent inner flow traversal
                     if efn_result.body_node.is_some() {
-                        order.for_each_child_of(
-                            order.index_under(i, efn_result.body_node),
-                            efn_result.body_node,
-                            |c, ci| enqueue_child(&mut queue, c, ci),
-                        );
+                        efn_result
+                            .body_node
+                            .for_each_child(|child| enqueue_child(&mut queue, child));
                     }
                     // Queue trailing arg children for independent inner flow traversal
                     for &arg in &efn_result.trailing_args {
                         if arg.is_some() {
-                            order.for_each_child_of(order.index_under(i, arg), arg, |c, ci| {
-                                enqueue_child(&mut queue, c, ci)
-                            });
+                            arg.for_each_child(|child| enqueue_child(&mut queue, child));
                         }
                     }
                     continue;
@@ -850,7 +837,6 @@ impl TypeParser<'_> {
                         // Continue traversing the subject for further flattening
                         queue.push(WorkItem {
                             node: pipe_result.subject,
-                            index: order.index_under(i, pipe_result.subject),
                             parent_flow: Some(parent_flow.clone()),
                         });
                     } else {
@@ -864,7 +850,6 @@ impl TypeParser<'_> {
                         };
                         queue.push(WorkItem {
                             node: pipe_result.subject,
-                            index: order.index_under(i, pipe_result.subject),
                             parent_flow: Some(Rc::new(RefCell::new(new_flow))),
                         });
                     }
@@ -872,9 +857,7 @@ impl TypeParser<'_> {
                     // Queue transformation argument children for independent inner flow traversal
                     for &arg in &pipe_result.args {
                         if arg.is_some() {
-                            order.for_each_child_of(order.index_under(i, arg), arg, |c, ci| {
-                                enqueue_child(&mut queue, c, ci)
-                            });
+                            arg.for_each_child(|child| enqueue_child(&mut queue, child));
                         }
                     }
                     continue;
@@ -903,7 +886,6 @@ impl TypeParser<'_> {
                             .insert(0, transformation);
                         queue.push(WorkItem {
                             node: data_first_result.subject,
-                            index: order.index_under(i, data_first_result.subject),
                             parent_flow: Some(parent_flow.clone()),
                         });
                     } else {
@@ -916,21 +898,16 @@ impl TypeParser<'_> {
                         };
                         queue.push(WorkItem {
                             node: data_first_result.subject,
-                            index: order.index_under(i, data_first_result.subject),
                             parent_flow: Some(Rc::new(RefCell::new(new_flow))),
                         });
                     }
 
-                    order.for_each_child_of(
-                        order.index_under(i, data_first_result.callee),
-                        data_first_result.callee,
-                        |c, ci| enqueue_child(&mut queue, c, ci),
-                    );
+                    data_first_result
+                        .callee
+                        .for_each_child(|child| enqueue_child(&mut queue, child));
                     for &arg in &data_first_result.args {
                         if arg.is_some() {
-                            order.for_each_child_of(order.index_under(i, arg), arg, |c, ci| {
-                                enqueue_child(&mut queue, c, ci)
-                            });
+                            arg.for_each_child(|child| enqueue_child(&mut queue, child));
                         }
                     }
                     continue;
@@ -965,7 +942,6 @@ impl TypeParser<'_> {
                         // Continue traversing the subject
                         queue.push(WorkItem {
                             node: single_result.subject,
-                            index: order.index_under(i, single_result.subject),
                             parent_flow: Some(parent_flow.clone()),
                         });
                     } else {
@@ -979,7 +955,6 @@ impl TypeParser<'_> {
                         };
                         queue.push(WorkItem {
                             node: single_result.subject,
-                            index: order.index_under(i, single_result.subject),
                             parent_flow: Some(Rc::new(RefCell::new(new_flow))),
                         });
                     }
@@ -988,22 +963,16 @@ impl TypeParser<'_> {
                     if !single_result.args.is_empty() {
                         // Curried factory: the applied function and the factory
                         // arguments belong to this transformation's subtree.
-                        enqueue_child(
-                            &mut queue,
-                            single_result.callee,
-                            order.index_under(i, single_result.callee),
-                        );
+                        enqueue_child(&mut queue, single_result.callee);
                         for &arg in &single_result.args {
                             if arg.is_some() {
-                                enqueue_child(&mut queue, arg, order.index_under(i, arg));
+                                enqueue_child(&mut queue, arg);
                             }
                         }
                     } else {
-                        order.for_each_child_of(
-                            order.index_under(i, single_result.callee),
-                            single_result.callee,
-                            |c, ci| enqueue_child(&mut queue, c, ci),
-                        );
+                        single_result
+                            .callee
+                            .for_each_child(|child| enqueue_child(&mut queue, child));
                     }
                     continue;
                 }
@@ -1018,7 +987,7 @@ impl TypeParser<'_> {
                 result.push(parent_flow.clone());
             }
             // Queue children for further traversal (independent inner flows)
-            order.for_each_child_of(i, node, |c, ci| enqueue_child(&mut queue, c, ci));
+            node.for_each_child(|child| enqueue_child(&mut queue, child));
         }
 
         // Sort by source position

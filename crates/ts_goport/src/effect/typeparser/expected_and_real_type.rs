@@ -100,17 +100,12 @@ impl TypeParser<'_> {
         cached!(self, expected_and_real_types, sf, {
             let mut result: Vec<ExpectedAndRealType> = Vec::new();
 
-            // PERF: each queued node also holds its node order index, and the
-            // children of an indexed node come from the node order: the same
-            // nodes in the same order (effperf4).
-            let order = self.node_order(sf);
-
             // Initialize BFS queue with the source file node
-            let mut queue: VecDeque<(Node, u32)> = VecDeque::new();
-            queue.push_back((sf, 0));
+            let mut queue: VecDeque<Node> = VecDeque::new();
+            queue.push_back(sf);
 
             // Dequeue from front (FIFO/breadth-first) to match TypeScript's shift() behavior
-            while let Some((node, i)) = queue.pop_front() {
+            while let Some(node) = queue.pop_front() {
                 if node.is_nil() {
                     continue;
                 }
@@ -130,7 +125,7 @@ impl TypeParser<'_> {
                                 real_type,
                             });
                         }
-                        queue.push_back((initializer, order.index_under(i, initializer)));
+                        queue.push_back(initializer);
                         continue;
                     }
                 }
@@ -163,7 +158,10 @@ impl TypeParser<'_> {
                             });
                         }
                     }
-                    order.for_each_child_of(i, node, |c, ci| queue.push_back((c, ci)));
+                    node.for_each_child(|child| {
+                        queue.push_back(child);
+                        false
+                    });
                     continue;
                 }
 
@@ -208,7 +206,10 @@ impl TypeParser<'_> {
                             }
                         }
                     }
-                    order.for_each_child_of(i, node, |c, ci| queue.push_back((c, ci)));
+                    node.for_each_child(|child| {
+                        queue.push_back(child);
+                        false
+                    });
                     continue;
                 }
 
@@ -230,7 +231,7 @@ impl TypeParser<'_> {
                             });
                         }
                         if right.is_some() {
-                            queue.push_back((right, order.index_under(i, right)));
+                            queue.push_back(right);
                         }
                         continue;
                     }
@@ -254,7 +255,10 @@ impl TypeParser<'_> {
                             }
                         }
                     }
-                    order.for_each_child_of(i, node, |c, ci| queue.push_back((c, ci)));
+                    node.for_each_child(|child| {
+                        queue.push_back(child);
+                        false
+                    });
                     continue;
                 }
 
@@ -291,8 +295,9 @@ impl TypeParser<'_> {
                                 });
                             }
                         }
-                        order.for_each_child_of(order.index_under(i, body), body, |c, ci| {
-                            queue.push_back((c, ci))
+                        body.for_each_child(|child| {
+                            queue.push_back(child);
+                            false
                         });
                         continue;
                     }
@@ -311,13 +316,16 @@ impl TypeParser<'_> {
                             value_node: sat_expression,
                             real_type,
                         });
-                        queue.push_back((sat_expression, order.index_under(i, sat_expression)));
+                        queue.push_back(sat_expression);
                         continue;
                     }
                 }
 
                 // No pattern matched — queue all children for traversal
-                order.for_each_child_of(i, node, |c, ci| queue.push_back((c, ci)));
+                node.for_each_child(|child| {
+                    queue.push_back(child);
+                    false
+                });
             }
 
             Rc::new(result)
