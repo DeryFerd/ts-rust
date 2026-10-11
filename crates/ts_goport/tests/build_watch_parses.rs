@@ -124,25 +124,31 @@ fn build_watch_keeps_the_first_json_parse_of_a_cycle() {
 ///    (execute/build/orchestrator.go:506-513, called at :862): TS2322, 4.
 ///
 /// A non-incremental build info has no file names
-/// (execute/incremental/snapshottobuildinfo.go:37, :51). So Go watches no
-/// directory for `out/a.d.ts` (execute/build/orchestrator.go:746-753), and
-/// an event there names no file of `side` (:586-615). Lines are at Go
-/// fed0bf24149f. Go 673a5f17d713 does the same, so no directory depth
-/// matters.
+/// (execute/incremental/snapshottobuildinfo.go:37, :51), so no event in
+/// `out` builds `side` (execute/build/orchestrator.go:586-615). `out` gets
+/// a watch only from the package.json lookups of `side` (:761), and
+/// `CanWatchDirectory` refuses a directory 3 or fewer levels below `/`
+/// (:769-773, execute/watchmanager/watchbackend.go:84-92). Lines are at Go
+/// fed0bf24149f. Go 673a5f17d713 does the same.
 ///
 /// The port keeps a `.d.ts` parse from one cycle to the next and checks it
 /// by its modification time. The end of `build_all_tasks` drops the kept
 /// parse of each written file (`BuildHost::drop_written_watch_sources`).
 /// Without that call the port keeps the parse of step 2 and finds no
-/// error: this test checks that call. `expected.txt` and the counts are
-/// from `tsgo-oracle-fed0bf24149f` and `tsgo-oracle-673a5f17d713` in place
-/// of `tsgo` for this test (3 of 3 runs each).
+/// error: this test checks that call. A watch event drops a kept parse too
+/// (`BuildHost::evict_watch_sources`), so the check needs an `out` with no
+/// watch: the test works in `/tmp/<dir>`, not in the system temp dir. Go
+/// gives the same output at any depth, so where `/tmp` is deeper the test
+/// still runs. `expected.txt` and the counts are from
+/// `tsgo-oracle-fed0bf24149f` and `tsgo-oracle-673a5f17d713` in place of
+/// `tsgo` for this test (3 of 3 runs each).
 // PORT: no Go counterpart; the output is Go's.
 #[cfg(target_os = "linux")]
 #[test]
 fn build_watch_parses_a_written_dts_again_in_the_next_cycle() {
     use std::time::Duration;
-    let root = scratch_dir("coarse-mtime");
+    // `out` must be 3 or fewer levels below `/` (see above).
+    let root = scratch_dir_in(Path::new("/tmp"), "coarse-mtime");
     // As in the first test, the project is one level deeper. `lib` writes
     // to `<root>/out`, outside the project.
     let project = root.join("work").join("project");
@@ -365,11 +371,16 @@ fn normalize_watch_output(output: &str) -> String {
 /// for paths under it. A Windows real path is verbatim (`\\?\C:\...`),
 /// which a program does not take as a cwd, so it stays as made there.
 fn scratch_dir(test: &str) -> PathBuf {
+    scratch_dir_in(&std::env::temp_dir(), test)
+}
+
+/// `scratch_dir` under `base`.
+fn scratch_dir_in(base: &Path, test: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after 1970")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
+    let dir = base.join(format!(
         "goport-build-watch-{test}-{}-{nanos}",
         std::process::id()
     ));
