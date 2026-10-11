@@ -11,6 +11,7 @@ use crate::effect::layergraph::{
     extract_layer_graph, extract_outline_graph,
 };
 use crate::effect::ls::refactor::{Refactor, RefactorContext};
+use crate::effect::ls::refactors::async_await_to_gen::replace_expression_via_statement;
 use crate::effect::ls::refactors::with_kind;
 use crate::effect::ls::rewriter::Tracker;
 use crate::effect::typeparser::find_module_identifier;
@@ -278,6 +279,8 @@ fn build_layer_magic_build(
 
     // If the old node is an expression inside a variable declaration, use replaceExpressionViaStatement
     if old_node.parent().is_some() && old_node.parent().kind() == SyntaxKind::VariableDeclaration {
+        // PORT: false (Go panics) comes before any edit, so the action has no
+        // edits and is dropped.
         replace_expression_via_statement(tracker, sf, old_node, new_declaration);
     } else {
         tracker.replace_node(sf, old_node, new_declaration, None);
@@ -487,6 +490,8 @@ fn build_layer_magic_prepare(
 
     // If the old node is an expression inside a variable declaration, use replaceExpressionViaStatement
     if old_node.parent().is_some() && old_node.parent().kind() == SyntaxKind::VariableDeclaration {
+        // PORT: false (Go panics) comes before any edit, so the action has no
+        // edits and is dropped.
         replace_expression_via_statement(tracker, sf, old_node, outer_as);
     } else {
         tracker.replace_node(sf, old_node, outer_as, None);
@@ -522,89 +527,4 @@ fn sorted_type_slice(c: &mut Checker, types: IndexSet<TypeId>) -> Vec<TypeId> {
             < c.type_to_string_ex(*b, Node::NIL, TypeFormatFlags::NO_TRUNCATION, None)
     });
     result
-}
-
-// Go: refactors/async_await_to_gen.go:64 replaceExpressionViaStatement
-// replaceExpressionViaStatement replaces an expression node by finding its
-// containing VariableStatement, rebuilding it with the new expression as
-// initializer, and replacing the entire statement. This avoids a printer
-// assertion failure that occurs when replacing non-statement nodes with
-// complex synthetic trees.
-// PORT: Go has it in a group b file (asyncAwaitToGen, lane E9b), which this
-// lane does not own. E9b ports the same function in its file; one copy can
-// go after both lanes merge.
-fn replace_expression_via_statement(
-    tracker: &mut Tracker,
-    sf: Node,
-    old_expr: Node,
-    new_expr: Node,
-) {
-    // Walk up to find containing VariableDeclaration
-    let var_decl = find_parent_of_kind(old_expr, SyntaxKind::VariableDeclaration);
-    if var_decl.is_nil() {
-        // Fallback: replace directly
-        tracker.replace_node(sf, old_expr, new_expr, None);
-        return;
-    }
-
-    // Walk up to find containing VariableStatement
-    let var_stmt = find_parent_of_kind(var_decl, SyntaxKind::VariableStatement);
-    if var_stmt.is_nil() {
-        tracker.replace_node(sf, old_expr, new_expr, None);
-        return;
-    }
-
-    let new_var_stmt = {
-        let f = tracker.node_factory();
-
-        // Rebuild the VariableDeclaration with new initializer
-        let mut name = Node::NIL;
-        if var_decl.name().is_some() {
-            name = f.deep_clone_node(var_decl.name());
-        }
-        let mut type_node = Node::NIL;
-        if var_decl.type_().is_some() {
-            type_node = f.deep_clone_node(var_decl.type_());
-        }
-        let new_var_decl = f.new_variable_declaration(name, Node::NIL, type_node, new_expr);
-
-        // Rebuild the VariableDeclarationList
-        let vdl = var_decl.parent();
-        let new_var_decl_list = f.new_variable_declaration_list(
-            f.new_node_list(&[new_var_decl]),
-            vdl.flags() & NodeFlags::BLOCK_SCOPED,
-        );
-
-        // Rebuild the VariableStatement with cloned modifiers
-        let mut mods = ModifierList::NIL;
-        let old_mods = var_stmt.modifiers();
-        if old_mods.is_some() {
-            let mod_nodes: Vec<Node> = old_mods
-                .nodes()
-                .iter()
-                .map(|m| f.new_modifier(m.kind()))
-                .collect();
-            if !mod_nodes.is_empty() {
-                mods = f.new_modifier_list(&mod_nodes);
-            }
-        }
-        f.new_variable_statement(mods, new_var_decl_list)
-    };
-
-    set_parent_in_children(new_var_stmt);
-    tracker.replace_node(sf, var_stmt, new_var_stmt, None);
-}
-
-// Go: refactors/async_await_to_gen.go:115 findParentOfKind
-// findParentOfKind walks up the parent chain to find a node of the given kind.
-// PORT: Go has it in the same group b file as replaceExpressionViaStatement.
-fn find_parent_of_kind(node: Node, kind: SyntaxKind) -> Node {
-    let mut n = node.parent();
-    while n.is_some() {
-        if n.kind() == kind {
-            return n;
-        }
-        n = n.parent();
-    }
-    Node::NIL
 }

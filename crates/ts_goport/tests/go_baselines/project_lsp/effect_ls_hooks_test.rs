@@ -232,12 +232,13 @@ child_test! {
 child_test! {
     // Patches 011 and 024: on this file the code action and document symbol
     // answers with the plugin are the answers without it, except for the
-    // Effect refactors (E9a), which come after the other code actions. Their
-    // edits are in `effect_refactors_test.rs`. The range has no Effect
-    // diagnostic, so the fixables (E4, E5) add no action. The file has no
-    // Layer, service, error or schema, and flows need the `debug` option, so
-    // the document symbols (E8) add no `Effect` symbol. The completion answer
-    // is not the same: at `Effect.` the plugin appends `gen` and `fn` items
+    // Effect refactors, which come after the other code actions. On
+    // `program` 3 of the 21 refactors apply, in Go order (their edits are in
+    // `effect_refactors_test.rs`). The range has no Effect diagnostic, so the
+    // fixables (E4, E5) add no action. The file has no Layer, service, error
+    // or schema, and flows need the `debug` option, so the document symbols
+    // (E8) add no `Effect` symbol. The completion answer is not the same: at
+    // `Effect.` the plugin appends `gen` and `fn` items
     // (`effect_ls_completions_test.rs`).
     fn code_actions_and_symbols_are_unchanged() {
         let answers = |service: &LanguageService| {

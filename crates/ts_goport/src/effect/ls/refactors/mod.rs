@@ -2,10 +2,10 @@
 //! `47cb1ed7`): all refactor implementations and the registry. One Go file
 //! per Rust file.
 //!
-//! Lane E9a ports the 9 refactors of group a (pipe, toggle, arrow and gen
-//! wrappers) and lane E9b the 5 of group b (async/await and effectGenToFn).
-//! The other 7 are comments in [`ALL`] at their Go place: E9c (the Schema
-//! refactors) and E9d (layerMagic, writeTagClassAccessors).
+//! All 21 refactors are ported, and [`ALL`] has them in Go order: lane E9a
+//! the 9 of group a (pipe, toggle, arrow and gen wrappers), E9b the 5 of
+//! group b (async/await and effectGenToFn), E9c the 5 Schema refactors and
+//! E9d layerMagic and writeTagClassAccessors.
 
 use std::borrow::Cow;
 

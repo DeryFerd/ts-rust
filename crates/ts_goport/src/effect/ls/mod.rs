@@ -20,13 +20,15 @@
 //! off unless `TSGO_EFFECT_API=1` (`rulerunner::enabled_options`), as for
 //! the rules.
 //!
-//! Ported: the Effect hover and the inlay filter (lane E2), the auto-import
-//! style (E3), the fixable framework with the disable actions and all 55
-//! fixes (E4, E5a, E5b, E5c), the completions (E6), the Layer hover (E7),
-//! the document symbols (E8) and the refactor framework with 9 refactors
-//! (E9a; E9b to E9d the other 12). Not ported here: patch 017
-//! (`refactor.rewrite` in the server's code action kinds; root decision D1
-//! keeps the plain list).
+//! All the editor features of effect-tsgo 0.51.1 are ported: the Effect
+//! hover and the inlay filter (lane E2), the auto-import style (E3), the
+//! fixable framework with the disable actions and all 55 fixes (E4, E5a,
+//! E5b, E5c), the completions (E6), the Layer hover (E7), the document
+//! symbols (E8) and the refactor framework with all 21 refactors (E9a to
+//! E9d). Not ported here: patch 017 (`refactor.rewrite` in the server's code
+//! action kinds). Root decision D1 keeps the plain list until Theo decides,
+//! so the editor "Refactor..." menu does not ask the server; the lightbulb
+//! and the quick fix menu (no `only` filter) show the Effect refactors.
 
 use std::sync::LazyLock;
 

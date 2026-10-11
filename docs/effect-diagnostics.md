@@ -136,10 +136,29 @@ The language server (`--lsp`) has these editor features of effect-tsgo
   items, the `@effect-diagnostics`, `@effect-codegens` and
   `@effect-identifier` comment directives, Duration units and the v3
   Schema `brand`. They come after the plain items.
+- Refactors (`refactors`): all 21, after the other code actions, each with
+  the kind `refactor.rewrite.effect.<name>`. Pipe: `wrapWithPipe`,
+  `togglePipeStyle`, `pipeableToDatafirst`. `Effect.gen` and `Effect.fn`:
+  `wrapWithEffectGen`, `removeUnnecessaryEffectGen`, `asyncAwaitToGen`,
+  `asyncAwaitToGenTryPromise`, `asyncAwaitToFn`,
+  `asyncAwaitToFnTryPromise`, `effectGenToFn`. Types and functions:
+  `toggleTypeAnnotation`, `toggleReturnTypeAnnotation`, `toggleLazyConst`,
+  `functionToArrow`. Layers and services: `layerMagic` (build and
+  prepare), `writeTagClassAccessors`. Schema: `typeToEffectSchema`,
+  `typeToEffectSchemaClass`, `makeSchemaOpaque`, `makeSchemaOpaqueWithNs`,
+  `structuralTypeToSchema`. When more than one Schema in scope matches a
+  type, `structuralTypeToSchema` in effect-tsgo picks one in Go map order
+  (it can change from run to run). tsc-rs picks the first in scope order.
 
 tsc mode never runs them.
 
 ## Not ported
 
-Editor features: the refactors. The `goto` and `renames` options are read,
-but effect-tsgo does not use them either.
+Editor features: none. One server change is not ported: effect-tsgo adds
+`refactor.rewrite` to the code action kinds of the `initialize` answer
+(patch 017). Without it, the lightbulb and the quick fix menu show the
+Effect refactors, because they ask for all code actions. The editor
+"Refactor..." menu asks only servers that list a `refactor` kind, so it
+does not show them. This waits for a decision (D1), because it changes the
+`initialize` answer that the LSP oracle compares. The `goto` and `renames`
+options are read, but effect-tsgo does not use them either.
