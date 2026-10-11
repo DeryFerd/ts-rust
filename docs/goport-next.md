@@ -6,6 +6,8 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
+- **Now (2026-10-11):** R191 = bump D (batch 73) side run on dbook-lan; pre-verdict items running (bumpD-w6: per-class table, release timing with the mongodb cost); np-suite at N prime on the side bins on a testbox after the side run. Then R192 = goport-int60p f0d8c2df8 (note int60p-r2-2026-10-11) plus the accepted bump D head plus perfP2 d620bef7d (item 2). Then R193 = int61 goport-effint1 b38ba8de8 (all Effect editor features). Studies running: astchunks0 (typed node chunks), effperf2 (Effect plugin per rule).
+
 - **int61 = goport-effint1 b38ba8de8 (all Effect editor features of effect-tsgo 0.51.1; note effint3-result-2026-10-11).** After bump D and int60: merge the accepted head, then a revision. D1 (refactor.rewrite in initialize codeActionKinds) needs Theo.
 
 - **Running 2026-10-11 (after the R190 accept; all heavy work on testboxes):** bumpD-int4b2 (merge main into goport-bumpD-int4 through the a41381218 temp branch, N prime references, Effect gate files at N prime, tests, np-suite and the full gate at N prime); effectE3 717704745 and effectE4 673ccdf5e done (skeptic PASS; note effectE3E4-result-2026-10-11); running E5a, E5b, E5c (on E4), E6, E7, E8 (on E2b); noderef1 (W1 to W3, then G1 with intern1 fixes, G2, G4); arenabind1 (per-pool arena claims, on main plus jemarena1); effperf1 (F1 message map, F3 symbol reuse); tbxside1 (candidate.sh side on testboxes, protected); tbxperf0 (timing on testboxes). Bump D freeze: no other revision until bump D is accepted; these lanes go into int60 or the integration after it.
