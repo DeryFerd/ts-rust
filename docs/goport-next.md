@@ -6,7 +6,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
-- **Now (2026-10-11):** R194 accepted (int61: Effect editor features, effperf3, invokeonce1, jsdocstr1, astshrink1, apicbfu1, #49, #50; main 31897dfd5; notes r194-side, timing-r194). #50 and PR #54 closed (realpath_case passes on macOS CI). Running after the accept: extrabatR194 and int62 = R195 (effperf4 b553fc3d5, followups42 5df09027d; workflow after-r194). Next integration (int63): followups43 (Effect LS Go panics and the R194 reviewer latent items), jemtune1, portonly1 when their skeptics pass; then a parse lane on main (perfscan3 items 1 and 7, astchunks step 2).
+- **Now (2026-10-11):** R195 accepted (int62: effperf4 Effect rule walks, followups42; main 9a59c0259). Theo approved tbxside1 and moving all compute-heavy work to Blacksmith (note theo-blacksmith-approval-2026-10-11). Running: blacksmith-move (tbxside2: candidate.sh side --host testbox with fixes, validation on R195, PR; tbxrel1: PGO+BOLT release builds on a testbox with BOLT instrumentation), followups45, astchunks2 design and e0gold1. Next: extrabatR195 and int63 (followups43 98333a1f8, followups44 62f56d2bd, portonly1 up to 17d03b190, parsefast1 a9d5cb913; followups45 if ready); R196 lists the tbxside2 protected paths and uses --host testbox when tbxside2 has landed.
 
 - **Public issues 2026-10-11 (note issues52-result-2026-10-11):** #52 replied (effect-tsgo 0.51.1 parity, workaround, upstream Effect-TS/tsgo#820, labeled; port the upstream fix when it lands). #49: PR #53 merged (ef82c3e59, light path). #50: PR #54 (loader: into int61; macOS CI runs realpath_case.rs).
 
