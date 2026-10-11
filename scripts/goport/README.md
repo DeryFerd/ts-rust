@@ -155,7 +155,8 @@ with the pinned `nightly-2026-06-17` and `-Zthreads=8` (the job count, at most 8
 - `TS_CARGO_NIGHTLY=0` uses the default toolchain. `TS_CARGO_INCREMENTAL=0` turns incremental off;
   `1` turns it on for every workspace crate. After an internal compiler error, build again with both
   set to 0 and report the error.
-- A host without the toolchain uses the default one and prints a note. Install it with
+- On a host without the toolchain, edit-loop builds stop with the install command (a quiet fallback
+  to the default toolchain made them slower with no error). Install it with
   `rustup toolchain install nightly-2026-06-17 --profile minimal`.
 - The first build in each target dir after the switch rebuilds every crate once. The incremental
   cache of ts_goport takes about 1.7 GB per target dir. sccache does not cache an incremental crate, so only
