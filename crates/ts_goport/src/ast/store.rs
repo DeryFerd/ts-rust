@@ -6351,9 +6351,8 @@ pub(crate) fn leak_in_ast_arena<T>(value: T) -> &'static T {
 
 /// S1: the one node data that every store Identifier (or
 /// PrivateIdentifier, by `kind`) made by `alloc_store_shared_name_node`
-/// points at. Its data is the Go factory payload with the default fields:
-/// no flow node (the binder keeps flow nodes in its tables) and an empty
-/// text (the name column holds the text).
+/// points at. Its data is the Go factory payload with an empty text (the
+/// name column holds the text).
 fn shared_name_node(kind: SyntaxKind) -> &'static NodeData {
     static IDENTIFIER: OnceLock<&'static NodeData> = OnceLock::new();
     static PRIVATE_IDENTIFIER: OnceLock<&'static NodeData> = OnceLock::new();
@@ -6362,7 +6361,6 @@ fn shared_name_node(kind: SyntaxKind) -> &'static NodeData {
         SyntaxKind::Identifier => *IDENTIFIER.get_or_init(|| {
             leak(NodeData::Identifier(Box::new(
                 crate::astdata::IdentifierData {
-                    flow_node: None,
                     text: String::new(),
                 },
             )))
@@ -6386,8 +6384,8 @@ fn shared_name_node(kind: SyntaxKind) -> &'static NodeData {
 pub fn debug_assert_shared_name_data(kind: SyntaxKind, data: &NodeData) {
     let same = match (data, shared_name_node(kind)) {
         (NodeData::Identifier(a), NodeData::Identifier(b)) => {
-            let crate::astdata::IdentifierData { flow_node, text } = &**a;
-            *flow_node == b.flow_node && *text == b.text
+            let crate::astdata::IdentifierData { text } = &**a;
+            *text == b.text
         }
         (NodeData::PrivateIdentifier(a), NodeData::PrivateIdentifier(b)) => {
             let crate::astdata::PrivateIdentifierData { text } = &**a;
@@ -6420,7 +6418,7 @@ pub fn alloc_store_name_node(file: usize, kind: SyntaxKind, data: NodeData, text
 }
 
 /// S1: `alloc_store_name_node` for the Go factory payload of a name node
-/// (no flow node, empty data text), without a new data box or leaked data:
+/// (empty data text), without a new data box or leaked data:
 /// the slot points at the process-wide data of `kind` (`shared_name_node`).
 /// The name column holds `text`. The factory checks its payload against the
 /// shared one in debug builds (`debug_assert_shared_name_data`).

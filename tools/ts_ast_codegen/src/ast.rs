@@ -308,7 +308,14 @@ impl<'a> AstGenerator<'a> {
             }
         }
         fields.remove("Flags");
-        Ok(fields.into_values().filter(|field| !field.no_go).collect())
+        // astshrink1: the `goOnly` fields are the binder fields (`Symbol`,
+        // `LocalSymbol`, `Locals`, `NextContainer`, the flow nodes and
+        // `facts`). The port keeps that data in the store records, the bind
+        // extras and `subtree_facts`, so the node data has no room for it.
+        Ok(fields
+            .into_values()
+            .filter(|field| !field.no_go && !field.go_only)
+            .collect())
     }
 
     fn apply_inherited_member(
@@ -345,7 +352,7 @@ impl<'a> AstGenerator<'a> {
                 continue;
             }
             let Some(field) = fields.iter().find(|field| field.schema_name == member.name) else {
-                if member.no_go {
+                if member.no_go || member.go_only {
                     continue;
                 }
                 return Err(format!(
@@ -1184,7 +1191,7 @@ mod tests {
         assert!(output.contains("pub else_statement: Option<NodeId>"));
         assert!(output.contains("pub statements: NodeList"));
         assert!(output.contains("pub modifiers: Option<ModifierList>"));
-        assert!(output.contains("pub flow_node: Option<FlowNodeId>"));
+        assert!(!output.contains("pub flow_node:"));
         let export_assignment = output
             .split("pub struct ExportAssignmentData")
             .nth(1)

@@ -261,7 +261,6 @@ impl NodeArena {
 pub struct ArrayLiteralExpressionData {
     pub elements: NodeList,
     pub multi_line: bool,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -273,17 +272,11 @@ pub struct ArrayTypeNodeData {
 pub struct ArrowFunctionData {
     pub asterisk_token: Option<NodeId>,
     pub body: NodeId,
-    pub end_flow_node: Option<FlowNodeId>,
     pub equals_greater_than_token: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
@@ -309,43 +302,31 @@ pub struct BinaryExpressionData {
     pub left: NodeId,
     pub operator_token: NodeId,
     pub right: NodeId,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BindingElementData {
     pub dot_dot_dot_token: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub initializer: Option<NodeId>,
-    pub local_symbol: Option<SymbolId>,
     pub property_name: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BindingPatternData {
     pub elements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct BlockData {
-    pub flow_node: Option<FlowNodeId>,
-    pub locals: SymbolTable,
     pub multi_line: bool,
-    pub next_container: Option<NodeId>,
     pub statements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct BreakStatementData {
-    pub flow_node: Option<FlowNodeId>,
     pub label: Option<NodeId>,
 }
 
@@ -354,18 +335,13 @@ pub struct CallExpressionData {
     pub arguments: NodeList,
     pub expression: NodeId,
     pub question_dot_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct CallSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
 }
@@ -373,39 +349,25 @@ pub struct CallSignatureDeclarationData {
 #[derive(Clone, Debug)]
 pub struct CaseBlockData {
     pub clauses: NodeList,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct CaseOrDefaultClauseData {
     pub expression: NodeId,
-    pub fallthrough_flow_node: Option<FlowNodeId>,
     pub statements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct CatchClauseData {
     pub block: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub variable_declaration: Option<NodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ClassDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
     pub heritage_clauses: Option<NodeList>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
     pub members: NodeList,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -413,13 +375,8 @@ pub struct ClassDeclarationData {
 #[derive(Clone, Debug)]
 pub struct ClassExpressionData {
     pub heritage_clauses: Option<NodeList>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
     pub members: NodeList,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -427,18 +384,12 @@ pub struct ClassExpressionData {
 #[derive(Clone, Debug)]
 pub struct ClassStaticBlockDeclarationData {
     pub body: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ComputedPropertyNameData {
     pub expression: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -448,7 +399,6 @@ pub struct ConditionalExpressionData {
     pub question_token: NodeId,
     pub when_false: NodeId,
     pub when_true: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -456,18 +406,13 @@ pub struct ConditionalTypeNodeData {
     pub check_type: NodeId,
     pub extends_type: NodeId,
     pub false_type: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub true_type: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct ConstructSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
 }
@@ -476,26 +421,17 @@ pub struct ConstructSignatureDeclarationData {
 pub struct ConstructorDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ConstructorTypeNodeData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -503,19 +439,15 @@ pub struct ConstructorTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct ContinueStatementData {
-    pub flow_node: Option<FlowNodeId>,
     pub label: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
-pub struct DebuggerStatementData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct DebuggerStatementData;
 
 #[derive(Clone, Debug)]
 pub struct DecoratorData {
     pub expression: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -526,32 +458,22 @@ pub struct DeleteExpressionData {
 #[derive(Clone, Debug)]
 pub struct DoStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ElementAccessExpressionData {
     pub argument_expression: NodeId,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub question_dot_token: Option<NodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
-pub struct EmptyStatementData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct EmptyStatementData;
 
 #[derive(Clone, Debug)]
 pub struct EnumDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub local_symbol: Option<SymbolId>,
     pub members: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -560,8 +482,6 @@ pub struct EnumDeclarationData {
 pub struct EnumMemberData {
     pub initializer: Option<NodeId>,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -569,11 +489,8 @@ pub struct EnumMemberData {
 #[derive(Clone, Debug)]
 pub struct ExportAssignmentData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub is_export_equals: bool,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
@@ -581,35 +498,27 @@ pub struct ExportAssignmentData {
 pub struct ExportDeclarationData {
     pub attributes: Option<NodeId>,
     pub export_clause: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub is_type_only: bool,
     pub module_specifier: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExportSpecifierData {
     pub is_type_only: bool,
-    pub local_symbol: Option<SymbolId>,
     pub property_name: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExpressionStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExpressionWithTypeArgumentsData {
     pub expression: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -621,42 +530,26 @@ pub struct ExternalModuleReferenceData {
 pub struct ForInOrOfStatementData {
     pub await_modifier: Option<NodeId>,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub initializer: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ForStatementData {
     pub condition: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub incrementor: Option<NodeId>,
     pub initializer: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct FunctionDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -665,17 +558,10 @@ pub struct FunctionDeclarationData {
 pub struct FunctionExpressionData {
     pub asterisk_token: Option<NodeId>,
     pub body: NodeId,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -683,10 +569,7 @@ pub struct FunctionExpressionData {
 #[derive(Clone, Debug)]
 pub struct FunctionTypeNodeData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -696,17 +579,11 @@ pub struct FunctionTypeNodeData {
 pub struct GetAccessorDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -715,12 +592,10 @@ pub struct GetAccessorDeclarationData {
 pub struct HeritageClauseData {
     pub token: SyntaxKind,
     pub types: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct IdentifierData {
-    pub flow_node: Option<FlowNodeId>,
     pub text: String,
 }
 
@@ -728,15 +603,12 @@ pub struct IdentifierData {
 pub struct IfStatementData {
     pub else_statement: Option<NodeId>,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub then_statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportAttributeData {
     pub value: NodeId,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -745,38 +617,27 @@ pub struct ImportAttributesData {
     pub attributes: NodeList,
     pub multi_line: bool,
     pub token: SyntaxKind,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportClauseData {
-    pub local_symbol: Option<SymbolId>,
     pub named_bindings: Option<NodeId>,
     pub phase_modifier: Option<SyntaxKind>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportDeclarationData {
     pub attributes: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub import_clause: Option<NodeId>,
     pub module_specifier: NodeId,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportEqualsDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
     pub is_type_only: bool,
-    pub local_symbol: Option<SymbolId>,
     pub module_reference: NodeId,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -784,10 +645,7 @@ pub struct ImportEqualsDeclarationData {
 #[derive(Clone, Debug)]
 pub struct ImportSpecifierData {
     pub is_type_only: bool,
-    pub local_symbol: Option<SymbolId>,
     pub property_name: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -803,10 +661,7 @@ pub struct ImportTypeNodeData {
 #[derive(Clone, Debug)]
 pub struct IndexSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -825,11 +680,8 @@ pub struct InferTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct InterfaceDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
     pub heritage_clauses: Option<NodeList>,
-    pub local_symbol: Option<SymbolId>,
     pub members: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
@@ -995,10 +847,7 @@ pub struct JsDocSeeTagData {
 #[derive(Clone, Debug)]
 pub struct JsDocSignatureData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
 }
@@ -1039,7 +888,6 @@ pub struct JsDocTypeExpressionData {
 pub struct JsDocTypeLiteralData {
     pub is_array_type: bool,
     pub js_doc_property_tags: Option<Vec<NodeId>>,
-    pub symbol: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1071,16 +919,12 @@ pub struct JsDocVariadicTypeData {
 #[derive(Clone, Debug)]
 pub struct JsxAttributeData {
     pub initializer: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct JsxAttributesData {
     pub properties: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1096,7 +940,6 @@ pub struct JsxElementData {
     pub children: NodeList,
     pub closing_element: NodeId,
     pub opening_element: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1110,13 +953,11 @@ pub struct JsxFragmentData {
     pub children: NodeList,
     pub closing_fragment: NodeId,
     pub opening_fragment: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct JsxNamespacedNameData {
     pub namespace: NodeId,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -1125,7 +966,6 @@ pub struct JsxOpeningElementData {
     pub attributes: NodeId,
     pub tag_name: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1136,7 +976,6 @@ pub struct JsxSelfClosingElementData {
     pub attributes: NodeId,
     pub tag_name: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1152,16 +991,13 @@ pub struct JsxTextData {
 }
 
 #[derive(Clone, Debug)]
-pub struct KeywordExpressionData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct KeywordExpressionData;
 
 #[derive(Clone, Debug)]
 pub struct KeywordTypeNodeData;
 
 #[derive(Clone, Debug)]
 pub struct LabeledStatementData {
-    pub flow_node: Option<FlowNodeId>,
     pub label: NodeId,
     pub statement: NodeId,
 }
@@ -1173,22 +1009,17 @@ pub struct LiteralTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct MappedTypeNodeData {
-    pub locals: SymbolTable,
     pub members: Option<NodeList>,
     pub name_type: Option<NodeId>,
-    pub next_container: Option<NodeId>,
     pub question_token: Option<NodeId>,
     pub readonly_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameter: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct MetaPropertyData {
-    pub flow_node: Option<FlowNodeId>,
     pub keyword_token: SyntaxKind,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -1196,17 +1027,11 @@ pub struct MetaPropertyData {
 pub struct MethodDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1214,11 +1039,8 @@ pub struct MethodDeclarationData {
 #[derive(Clone, Debug)]
 pub struct MethodSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -1227,16 +1049,12 @@ pub struct MethodSignatureDeclarationData {
 
 #[derive(Clone, Debug)]
 pub struct MissingDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ModuleBlockData {
-    pub flow_node: Option<FlowNodeId>,
     pub statements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1244,14 +1062,7 @@ pub struct ModuleDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub attributes: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub keyword: SyntaxKind,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1259,42 +1070,34 @@ pub struct ModuleDeclarationData {
 #[derive(Clone, Debug)]
 pub struct NamedExportsData {
     pub elements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamedImportsData {
     pub elements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamedTupleMemberData {
     pub dot_dot_dot_token: Option<NodeId>,
     pub question_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamespaceExportData {
-    pub symbol: Option<SymbolId>,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamespaceExportDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamespaceImportData {
-    pub local_symbol: Option<SymbolId>,
-    pub symbol: Option<SymbolId>,
     pub name: NodeId,
 }
 
@@ -1303,13 +1106,11 @@ pub struct NewExpressionData {
     pub arguments: Option<NodeList>,
     pub expression: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct NoSubstitutionTemplateLiteralData {
     pub raw_text: String,
-    pub symbol: Option<SymbolId>,
     pub template_flags: TokenFlags,
     pub text: String,
     pub token_flags: TokenFlags,
@@ -1321,9 +1122,7 @@ pub struct NonNullExpressionData {
 }
 
 #[derive(Clone, Debug)]
-pub struct NotEmittedStatementData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct NotEmittedStatementData;
 
 #[derive(Clone, Debug)]
 pub struct NotEmittedTypeElementData;
@@ -1338,8 +1137,6 @@ pub struct NumericLiteralData {
 pub struct ObjectLiteralExpressionData {
     pub multi_line: bool,
     pub properties: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1355,9 +1152,7 @@ pub struct ParameterDeclarationData {
     pub dot_dot_dot_token: Option<NodeId>,
     pub initializer: Option<NodeId>,
     pub question_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1397,9 +1192,7 @@ pub struct PrivateIdentifierData {
 #[derive(Clone, Debug)]
 pub struct PropertyAccessExpressionData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub question_dot_token: Option<NodeId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -1407,9 +1200,7 @@ pub struct PropertyAccessExpressionData {
 pub struct PropertyAssignmentData {
     pub initializer: NodeId,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1418,9 +1209,7 @@ pub struct PropertyAssignmentData {
 pub struct PropertyDeclarationData {
     pub initializer: Option<NodeId>,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1429,7 +1218,6 @@ pub struct PropertyDeclarationData {
 pub struct PropertySignatureDeclarationData {
     pub initializer: NodeId,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
@@ -1437,10 +1225,8 @@ pub struct PropertySignatureDeclarationData {
 
 #[derive(Clone, Debug)]
 pub struct QualifiedNameData {
-    pub flow_node: Option<FlowNodeId>,
     pub left: NodeId,
     pub right: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1457,8 +1243,6 @@ pub struct RestTypeNodeData {
 #[derive(Clone, Debug)]
 pub struct ReturnStatementData {
     pub expression: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1468,25 +1252,17 @@ pub struct SatisfiesExpressionData {
 }
 
 #[derive(Clone, Debug)]
-pub struct SemicolonClassElementData {
-    pub symbol: Option<SymbolId>,
-}
+pub struct SemicolonClassElementData;
 
 #[derive(Clone, Debug)]
 pub struct SetAccessorDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1496,9 +1272,7 @@ pub struct ShorthandPropertyAssignmentData {
     pub equals_token: Option<NodeId>,
     pub object_assignment_initializer: Option<NodeId>,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1506,17 +1280,12 @@ pub struct ShorthandPropertyAssignmentData {
 #[derive(Clone, Debug)]
 pub struct SourceFileData {
     pub end_of_file_token: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub statements: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct SpreadAssignmentData {
     pub expression: NodeId,
-    pub symbol: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1534,8 +1303,6 @@ pub struct StringLiteralData {
 pub struct SwitchStatementData {
     pub case_block: NodeId,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1562,14 +1329,12 @@ pub struct TaggedTemplateExpressionData {
     pub tag: NodeId,
     pub template: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct TemplateExpressionData {
     pub head: NodeId,
     pub template_spans: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1620,8 +1385,6 @@ pub struct ThisTypeNodeData;
 #[derive(Clone, Debug)]
 pub struct ThrowStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1631,9 +1394,7 @@ pub struct TokenData;
 pub struct TryStatementData {
     pub catch_clause: Option<NodeId>,
     pub finally_block: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub try_block: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1643,11 +1404,6 @@ pub struct TupleTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct TypeAliasDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -1663,7 +1419,6 @@ pub struct TypeAssertionData {
 #[derive(Clone, Debug)]
 pub struct TypeLiteralNodeData {
     pub members: NodeList,
-    pub symbol: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1682,7 +1437,6 @@ pub struct TypeParameterDeclarationData {
     pub constraint: Option<NodeId>,
     pub default_type: Option<NodeId>,
     pub expression: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1715,24 +1469,18 @@ pub struct UnionTypeNodeData {
 pub struct VariableDeclarationData {
     pub exclamation_token: Option<NodeId>,
     pub initializer: Option<NodeId>,
-    pub local_symbol: Option<SymbolId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct VariableDeclarationListData {
     pub declarations: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct VariableStatementData {
     pub declaration_list: NodeId,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
@@ -1744,17 +1492,13 @@ pub struct VoidExpressionData {
 #[derive(Clone, Debug)]
 pub struct WhileStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct WithStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]

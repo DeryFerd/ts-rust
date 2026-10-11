@@ -6975,12 +6975,9 @@ mod tests {
         let (s, f) = (String::new, a::TokenFlags(0));
         let leaves = [
             NodeData::Token(Box::new(a::TokenData)),
-            NodeData::Identifier(Box::new(a::IdentifierData {
-                flow_node: None,
-                text: s(),
-            })),
+            NodeData::Identifier(Box::new(a::IdentifierData { text: s() })),
             NodeData::PrivateIdentifier(Box::new(a::PrivateIdentifierData { text: s() })),
-            NodeData::KeywordExpression(Box::new(a::KeywordExpressionData { flow_node: None })),
+            NodeData::KeywordExpression(Box::new(a::KeywordExpressionData)),
             NodeData::KeywordTypeNode(Box::new(a::KeywordTypeNodeData)),
             NodeData::NumericLiteral(Box::new(a::NumericLiteralData {
                 text: s(),
@@ -7001,7 +6998,6 @@ mod tests {
             NodeData::NoSubstitutionTemplateLiteral(Box::new(
                 a::NoSubstitutionTemplateLiteralData {
                     raw_text: s(),
-                    symbol: None,
                     template_flags: f,
                     text: s(),
                     token_flags: f,
@@ -7032,16 +7028,14 @@ mod tests {
             })),
             NodeData::ThisTypeNode(Box::new(a::ThisTypeNodeData)),
             NodeData::OmittedExpression(Box::new(a::OmittedExpressionData)),
-            NodeData::SemicolonClassElement(Box::new(a::SemicolonClassElementData {
-                symbol: None,
-            })),
-            NodeData::EmptyStatement(Box::new(a::EmptyStatementData { flow_node: None })),
-            NodeData::DebuggerStatement(Box::new(a::DebuggerStatementData { flow_node: None })),
+            NodeData::SemicolonClassElement(Box::new(a::SemicolonClassElementData)),
+            NodeData::EmptyStatement(Box::new(a::EmptyStatementData)),
+            NodeData::DebuggerStatement(Box::new(a::DebuggerStatementData)),
             NodeData::JsxOpeningFragment(Box::new(a::JsxOpeningFragmentData)),
             NodeData::JsxClosingFragment(Box::new(a::JsxClosingFragmentData)),
             NodeData::JsDocAllType(Box::new(a::JsDocAllTypeData)),
             NodeData::JsDocText(Box::new(a::JsDocTextData { text: Vec::new() })),
-            NodeData::NotEmittedStatement(Box::new(a::NotEmittedStatementData { flow_node: None })),
+            NodeData::NotEmittedStatement(Box::new(a::NotEmittedStatementData)),
             NodeData::NotEmittedTypeElement(Box::new(a::NotEmittedTypeElementData)),
         ];
         let fields = |kind: SyntaxKind, d: &NodeData| {

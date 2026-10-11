@@ -253,8 +253,8 @@ mod tests {
     use super::{
         ConditionalExpressionData, DoStatementData, FileId, ImportDeclarationData,
         JsDocParameterOrPropertyTagData, ModifierFlags, ModifierList, Node, NodeArena, NodeData,
-        NodeFlags, NodeId, NodeList, NodeRef, SourceFileData, SymbolTable, SyntaxKind,
-        SyntaxListData, TokenData,
+        NodeFlags, NodeId, NodeList, NodeRef, SourceFileData, SyntaxKind, SyntaxListData,
+        TokenData,
     };
 
     fn node_list(nodes: &[u32]) -> NodeList {
@@ -463,9 +463,7 @@ mod tests {
                 "do statement visits its body before its condition",
                 NodeData::DoStatement(Box::new(DoStatementData {
                     expression: NodeId::new(2),
-                    flow_node: None,
                     statement: NodeId::new(1),
-                    facts: 0,
                 })),
                 node_ids(&[1, 2]),
             ),
@@ -477,7 +475,6 @@ mod tests {
                     question_token: NodeId::new(2),
                     when_false: NodeId::new(5),
                     when_true: NodeId::new(3),
-                    facts: 0,
                 })),
                 node_ids(&[1, 2, 3, 4, 5]),
             ),
@@ -485,11 +482,8 @@ mod tests {
                 "modifier and node lists flatten in place",
                 NodeData::ImportDeclaration(Box::new(ImportDeclarationData {
                     attributes: Some(NodeId::new(6)),
-                    flow_node: None,
                     import_clause: Some(NodeId::new(3)),
                     module_specifier: NodeId::new(5),
-                    symbol: None,
-                    facts: 0,
                     modifiers: Some(modifier_list(&[1, 2])),
                 })),
                 node_ids(&[1, 2, 3, 5, 6]),
@@ -498,11 +492,7 @@ mod tests {
                 "source-file statements precede end-of-file",
                 NodeData::SourceFile(Box::new(SourceFileData {
                     end_of_file_token: NodeId::new(4),
-                    locals: SymbolTable,
-                    next_container: None,
                     statements: node_list(&[1, 2, 3]),
-                    symbol: None,
-                    facts: 0,
                 })),
                 node_ids(&[1, 2, 3, 4]),
             ),
@@ -548,11 +538,7 @@ mod tests {
             parent: None,
             data: NodeData::SourceFile(Box::new(SourceFileData {
                 end_of_file_token: NodeId::new(4),
-                locals: SymbolTable,
-                next_container: None,
                 statements: node_list(&[1, 2, 3]),
-                symbol: None,
-                facts: 0,
             })),
         };
         let mut visited = Vec::new();
