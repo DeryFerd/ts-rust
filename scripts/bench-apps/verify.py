@@ -13,9 +13,10 @@ def records(text: str, effect_only: bool = False) -> list[tuple[str, ...]]:
     diagnostics = []
     current = None
     for line in text.splitlines():
-        header = re.search(r'(?:error|warning|message|suggestion) TS(\d+):', line)
+        header = re.search(r'(?:error|warning|message|suggestion) (?:TS(-?\d+)|effect\([^)]+\)):', line)
         if header:
-            current = [line] if not effect_only or header[1].startswith('377') else None
+            is_effect = header[1] is None or header[1].startswith('377')
+            current = [line] if not effect_only or is_effect else None
             if current is not None:
                 diagnostics.append(current)
         elif current is not None and line.startswith((' ', '\t')):

@@ -27,7 +27,7 @@ bench_measure() {
     bash -c "${cmds[$i]}" >"$out.${names[$i]}.stdout" 2>"$out.${names[$i]}.stderr" || rc=$?
     ((rc <= 2)) || { echo "${names[$i]} failed: exit $rc" >&2; exit 1; }
     cat "$out.${names[$i]}.stdout" "$out.${names[$i]}.stderr" |
-      LC_ALL=C grep -E '(error|warning|message|suggestion) TS[0-9]+' |
+      LC_ALL=C grep -E '(error|warning|message|suggestion) (TS-?[0-9]+|effect\()' |
       LC_ALL=C sort >"$out.${names[$i]}.diag" || true
     echo "${names[$i]} rc=$rc errors=$(wc -l <"$out.${names[$i]}.diag" | tr -d ' ')" >>"$out.errors"
     args+=(-n "${names[$i]}" "${cmds[$i]}")
