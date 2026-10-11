@@ -367,10 +367,26 @@ fn scratch_dir_in(base: &Path, test: &str) -> PathBuf {
         std::process::id()
     ));
     fs::create_dir(&dir).unwrap_or_else(|error| panic!("create {}: {error}", dir.display()));
-    if cfg!(windows) {
-        return dir;
+    // tsc names the watched directories by the real path, so the test must
+    // too: on Windows the temp dir can be a short name (`RUNNER~1`), and an
+    // edit under it then reaches no watch.
+    let real = fs::canonicalize(&dir).expect("canonical scratch dir");
+    // On Windows the real path is verbatim (`\\?\C:\...`), which tsc does not
+    // take as a cwd.
+    #[cfg(windows)]
+    let real = PathBuf::from(unverbatim(&real.to_string_lossy()));
+    real
+}
+
+/// `text` without the Windows verbatim prefix: `\\?\C:\x` is `C:\x`, and
+/// `\\?\UNC\server\share\x` is `\\server\share\x` (the root stays).
+#[cfg(windows)]
+fn unverbatim(text: &str) -> String {
+    if let Some(unc) = text.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{unc}")
+    } else {
+        text.strip_prefix("\\\\?\\").unwrap_or(text).to_owned()
     }
-    fs::canonicalize(&dir).expect("canonical scratch dir")
 }
 
 fn copy_dir(from: &Path, to: &Path) {
