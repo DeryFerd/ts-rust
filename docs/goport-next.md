@@ -6,7 +6,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
-- **Now (2026-10-11):** R193 accepted (int60 without effperf1 F3; main 3323eeb9f; notes r193-side, timing-r193). Running after the accept: extrabatR193 and followups42 (workflow after-r193). Next: int61 = R194 on main: effint1 b38ba8de8 (Effect editor features, D1 stays out), effperf3 bc6cd8b72, invokeonce1 75866d18c, jsdocstr1 e9c2aff12, astshrink1 b5611fa68, apicbfu1 1b7532c48, i50 (PR #54); then main's light-path PRs #55 (CI fix) and #53 (#49).
+- **Now (2026-10-11):** R194 accepted (int61: Effect editor features, effperf3, invokeonce1, jsdocstr1, astshrink1, apicbfu1, #49, #50; main 31897dfd5; notes r194-side, timing-r194). #50 and PR #54 closed (realpath_case passes on macOS CI). Running after the accept: extrabatR194 and int62 = R195 (effperf4 b553fc3d5, followups42 5df09027d; workflow after-r194). Next integration (int63): followups43 (Effect LS Go panics and the R194 reviewer latent items), jemtune1, portonly1 when their skeptics pass; then a parse lane on main (perfscan3 items 1 and 7, astchunks step 2).
 
 - **Public issues 2026-10-11 (note issues52-result-2026-10-11):** #52 replied (effect-tsgo 0.51.1 parity, workaround, upstream Effect-TS/tsgo#820, labeled; port the upstream fix when it lands). #49: PR #53 merged (ef82c3e59, light path). #50: PR #54 (loader: into int61; macOS CI runs realpath_case.rs).
 
