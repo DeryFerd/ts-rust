@@ -276,8 +276,11 @@ impl Checker {
 
     // Returns the effective arguments for an expression that works like a function invocation.
     // Go: checker/checker.go:30591 getEffectiveCallArguments
+    // PERF: portonly1 item 5. Go tests the kind with `ast.IsX(node)`, a field
+    // read each. Here each test was a store read, so the kind is read once.
     pub fn get_effective_call_arguments(&mut self, node: Node) -> EffectiveArgs {
-        if is_jsx_opening_fragment(node) {
+        let kind = node.kind();
+        if kind == SyntaxKind::JsxOpeningFragment {
             // This attributes Type does not include a children property yet, the same way a fragment created with <React.Fragment> does not at this stage
             let empty_fresh_jsx_object_type = self.empty_fresh_jsx_object_type;
             return EffectiveArgs::Owned(vec![self.create_synthetic_expression(
@@ -286,7 +289,7 @@ impl Checker {
                 false,
                 Node::NIL,
             )]);
-        } else if is_tagged_template_expression(node) {
+        } else if kind == SyntaxKind::TaggedTemplateExpression {
             let template = node.template();
             let get_global_template_strings_array_type =
                 self.get_global_template_strings_array_type.clone();
@@ -307,14 +310,18 @@ impl Checker {
                 args.push(span.expression());
             }
             return EffectiveArgs::Owned(args);
-        } else if is_decorator(node) {
+        } else if kind == SyntaxKind::Decorator {
             return EffectiveArgs::Owned(self.get_effective_decorator_arguments(node));
-        } else if is_binary_expression(node) {
+        } else if kind == SyntaxKind::BinaryExpression {
             // Handles instanceof operator
             return EffectiveArgs::Owned(vec![node.left()]);
-        } else if is_jsx_opening_like_element(node) {
+        } else if matches!(
+            kind,
+            SyntaxKind::JsxOpeningElement | SyntaxKind::JsxSelfClosingElement
+        ) {
             if node.attributes().properties().len() != 0
-                || (is_jsx_opening_element(node) && node.parent().children().nodes().len() != 0)
+                || (kind == SyntaxKind::JsxOpeningElement
+                    && node.parent().children().nodes().len() != 0)
             {
                 return EffectiveArgs::Owned(vec![node.attributes()]);
             }
@@ -376,8 +383,14 @@ impl Checker {
 }
 
 // Go: checker/checker.go:30661 isSpreadArgument
+// PERF: portonly1 item 5. Go reads `arg.Kind` twice as a field; here the
+// kind is one store read.
 pub fn is_spread_argument(arg: Node) -> bool {
-    is_spread_element(arg) || is_synthetic_expression(arg) && arg.is_spread()
+    match arg.kind() {
+        SyntaxKind::SpreadElement => true,
+        SyntaxKind::SyntheticExpression => arg.is_spread(),
+        _ => false,
+    }
 }
 
 impl Checker {
