@@ -98,6 +98,30 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+/// A map keyed by a `Name::text_hash` value, which is already a hash: the
+/// key is the map hash as is (`TextHashKey`). No code iterates it.
+type TextHashMap<V> = std::collections::HashMap<u64, V, std::hash::BuildHasherDefault<TextHashKey>>;
+
+/// The hasher of `TextHashMap`: the `u64` key is the hash.
+#[derive(Default)]
+struct TextHashKey(u64);
+
+impl std::hash::Hasher for TextHashKey {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write_u64(&mut self, hash: u64) {
+        self.0 = hash;
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("TextHashKey takes only u64 keys");
+    }
+}
+
 /// Slot 0: Go `nil` stored in a astdata field that has no `Option`.
 const NIL_SLOT: u32 = 0;
 
@@ -243,12 +267,14 @@ struct FileStore {
     /// (`SlotLinks::NONE`) when the slot is made and written by
     /// `StoreChildLinks` and `replace_store_node_data`.
     build_links: Vec<SlotLinks>,
-    /// The name and keyword bit of each identifier text of this file, keyed
-    /// by the interned text. Port only: Go stopped interning parser texts
-    /// (`internIdentifier`) in tsgo#4731. Dropped by the freeze.
+    /// The interned text, name and keyword bit of each identifier text of
+    /// this file, keyed by the `Name::text_hash` of the text. Port only: Go
+    /// stopped interning parser texts (`internIdentifier`) in tsgo#4731.
+    /// Dropped by the freeze.
     // PERF: one text hash per identifier node; the process-wide intern (a
-    // shard `Mutex`) runs once per distinct text of the file.
-    identifier_names: FxHashMap<&'static str, (Name, bool)>,
+    // shard `Mutex`) runs once per distinct text of the file, with the same
+    // hash (parsefast1 item 1).
+    identifier_names: TextHashMap<(&'static str, Name, bool)>,
     /// U1 (e): binder capacity hints, made with `facts`.
     bind_estimate: BindEstimate,
 }
@@ -2077,7 +2103,8 @@ impl FileStore {
         lists.push(nil_static_list());
         // PERF: U1 (a). About one distinct identifier text per 16 slots, so
         // the map of a large file does not rehash while it grows.
-        let identifier_names = FxHashMap::with_capacity_and_hasher(slots / 16, Default::default());
+        let identifier_names =
+            TextHashMap::with_capacity_and_hasher(slots / 16, Default::default());
         Self {
             file_name,
             text,
@@ -2127,18 +2154,29 @@ impl FileStore {
             return (Name::default(), false);
         }
         let text = text.unwrap_or_else(|| identifier_text(data));
-        if let Some(entry) = self.identifier_names.get(text) {
-            return entry.clone();
+        // PERF: parsefast1 item 1. One hash of the text: the map probe and,
+        // on a miss, the process-wide intern use it.
+        let hash = Name::text_hash(text);
+        match self.identifier_names.entry(hash) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let (stored, name, text_is_keyword) = entry.get();
+                if *stored == text {
+                    return (name.clone(), *text_is_keyword);
+                }
+                // Another text of this file has the same 64-bit hash: no
+                // entry for this one.
+                (
+                    Name::intern_hashed(text, hash).0,
+                    get_identifier_token(text) != SyntaxKind::Identifier,
+                )
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let (name, stored) = Name::intern_hashed(text, hash);
+                let text_is_keyword = get_identifier_token(text) != SyntaxKind::Identifier;
+                entry.insert((stored, name.clone(), text_is_keyword));
+                (name, text_is_keyword)
+            }
         }
-        // U1 (d): the key is the interned text, which lives as long as the
-        // map. The data of a store identifier has no text to borrow.
-        let entry = (
-            Name::from(text),
-            get_identifier_token(text) != SyntaxKind::Identifier,
-        );
-        self.identifier_names
-            .insert(entry.0.as_str(), entry.clone());
-        entry
     }
 
     /// The record, kind, kids and link vectors have one entry per slot.
@@ -3874,7 +3912,7 @@ impl FileStore {
         self.facts = facts;
         self.facts_made = true;
         self.bind_estimate = counts.estimate();
-        self.identifier_names = FxHashMap::default();
+        self.identifier_names = TextHashMap::default();
         #[cfg(debug_assertions)]
         self.debug_check_kids();
         // R2-5: a link written after the slot was made must have gone
