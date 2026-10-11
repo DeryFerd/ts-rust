@@ -2488,12 +2488,8 @@ impl RegistryBuilder {
         // PORT: `None` only for a stopped build (`should_stop_build`).
         let (ch, _alias_program) = alias_resolver.new_checker(ctx, &[])?;
         let mut ch_ref = ch.borrow_mut();
-        let mut extractor = self.new_export_extractor(
-            package_name,
-            &mut ch_ref,
-            resolver.clone(),
-            Some(to_realpath),
-        );
+        let mut extractor =
+            self.new_export_extractor(package_name, &mut ch_ref, resolver, Some(to_realpath));
 
         let mut non_module_files: FxHashSet<tspath::Path> = FxHashSet::default();
         for entrypoint in alias_resolver.root_files.clone() {
