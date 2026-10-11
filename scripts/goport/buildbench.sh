@@ -29,9 +29,11 @@ OUT=$1 LABEL=$2 TC=$3 PROFILE=$4 ACTION=$5 FLAGS=${6:-}
 WT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$WT" || exit 2
 mkdir -p "$OUT/logs"
-# A results.tsv from before the cmd and peak_kib columns would get rows with 2 more fields.
-if [[ -s $OUT/results.tsv ]] && ! head -1 "$OUT/results.tsv" | grep -q $'\tpeak_kib$'; then
-  echo "$OUT/results.tsv has no cmd and peak_kib columns (an older buildbench.sh): use a new out-dir" >&2
+# A results.tsv with another header (an older buildbench.sh, before the cmd and peak_kib columns)
+# would get rows that do not match it.
+HEADER=$'label\thost\ttoolchain\tprofile\trustflags\tincr\taction\trc\twall_s\tuser_s\tsys_s\tmaxrss_kib\tcpu\tts_goport_lib_s\tload_before\trustc\tcmd\tpeak_kib'
+if [[ -s $OUT/results.tsv && $(head -1 "$OUT/results.tsv") != "$HEADER" ]]; then
+  echo "$OUT/results.tsv has another header (an older buildbench.sh): use a new out-dir" >&2
   exit 2
 fi
 INCR=${BENCH_INCREMENTAL:-0}
@@ -98,7 +100,7 @@ except Exception:
     print("-")
 EOF
 )
-[[ -s $OUT/results.tsv ]] || printf 'label\thost\ttoolchain\tprofile\trustflags\tincr\taction\trc\twall_s\tuser_s\tsys_s\tmaxrss_kib\tcpu\tts_goport_lib_s\tload_before\trustc\tcmd\tpeak_kib\n' > "$OUT/results.tsv"
+[[ -s $OUT/results.tsv ]] || printf '%s\n' "$HEADER" > "$OUT/results.tsv"
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$LABEL" "$(hostname)" "$TC" "$PROFILE" "${FLAGS:--}" "$INCR" \
   "$ACTION" "$rc" "$wall" "$user" "$sys" "$rss" "$cpu" "$lib" "$load_before" "$ver" "$CMD" "$peak_kib" >> "$OUT/results.tsv"
 echo "$LABEL rc=$rc wall=${wall}s user=${user}s sys=${sys}s maxrss=${rss}KiB peak=${peak_kib}KiB cpu=$cpu lib=${lib}s"
