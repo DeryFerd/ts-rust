@@ -1116,6 +1116,13 @@ enum DeclarationList {
 }
 
 impl Declarations {
+    /// Go `[]*ast.Node{node}` (`newSingleDeclaration`): a list of one node.
+    #[inline]
+    #[must_use]
+    pub fn one(node: Node) -> Self {
+        Self(DeclarationList::One(node))
+    }
+
     /// Go `append(declarations, node)`.
     pub fn push(&mut self, node: Node) {
         match &mut self.0 {
