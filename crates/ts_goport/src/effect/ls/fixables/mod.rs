@@ -3,8 +3,8 @@
 //! per Rust file.
 //!
 //! Lane E4 ports the disable actions and the 12 fixes that T3 Code hits,
-//! lanes E5a and E5b 29 more. The 14 fixes of lane E5c are still comments
-//! (`// E5:`) in [`ALL`] at their Go place.
+//! lanes E5a, E5b and E5c the other 43. [`ALL`] has all 56 entries in the
+//! Go order.
 
 use std::sync::LazyLock;
 

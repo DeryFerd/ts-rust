@@ -126,14 +126,20 @@ The language server (`--lsp`) has these editor features of effect-tsgo
   its Mermaid links.
 - The inlay hint filter (`inlays`).
 - The auto-import style (`namespaceImportPackages`,
-  `barrelImportPackages`).
-- Quick fixes: the 2 disable actions and 41 of the 55 fixes.
+  `barrelImportPackages`, `importAliases`, `topLevelNamedReexports`).
+- Quick fixes: the 2 disable actions and all 55 fixes.
 - Document symbols: the `Effect` symbol with Layers, Services, Errors and
-  Schemas.
+  Schemas, and Flows with the `debug` option.
+- Completions (`completions`): the 13 providers. They add class snippets
+  after `extends` (Schema, Model, Data, Context, v3 Effect, `@effect/sql`
+  Model, `@effect/rpc`), `gen(function*(){})`, `fn` and `fnUntraced`
+  items, the `@effect-diagnostics`, `@effect-codegens` and
+  `@effect-identifier` comment directives, Duration units and the v3
+  Schema `brand`. They come after the plain items.
 
 tsc mode never runs them.
 
 ## Not ported
 
-Editor features: completions, refactors and 14 quick fixes. The `goto`
-and `renames` options are read, but effect-tsgo does not use them either.
+Editor features: the refactors. The `goto` and `renames` options are read,
+but effect-tsgo does not use them either.

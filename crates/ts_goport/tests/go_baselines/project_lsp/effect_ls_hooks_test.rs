@@ -1,8 +1,10 @@
 //! Port-only tests of the Effect language service hooks (`effect::ls`,
-//! Effect-TS/tsgo patches 011, 012, 015, 022 and 024; lane effectE2). Each
-//! hook runs with the Effect plugin on and off. Without the plugin every hook
+//! Effect-TS/tsgo patches 011, 012, 015 and 024; lane effectE2). Each hook
+//! runs with the Effect plugin on and off. Without the plugin every hook
 //! gives back its input. A standalone API process has the hooks off unless
-//! `TSGO_EFFECT_API=1`.
+//! `TSGO_EFFECT_API=1`. With completions on, the completion hook (patch 022)
+//! adds Effect items, so its on and off checks are in
+//! `effect_ls_completions_test.rs`.
 //!
 //! The project has a small stand-in for the `effect` package: an `Effect`
 //! interface with the v3 variance struct, `succeed` and `gen`. That is enough
@@ -233,8 +235,9 @@ child_test! {
     // Effect diagnostic, so the fixables (E4, E5) add no action. The file has
     // no Layer, service, error or schema, and flows need the `debug` option,
     // so the document symbols (E8) add no `Effect` symbol. The refactors (E9)
-    // are not ported yet. The completions (patch 022, E6) are in
-    // `effect_ls_completions_test.rs`.
+    // are not ported yet. The completion answer is not the same: at
+    // `Effect.` the plugin appends `gen` and `fn` items
+    // (`effect_ls_completions_test.rs`).
     fn code_actions_and_symbols_are_unchanged() {
         let answers = |service: &LanguageService| {
             let ctx = projecttestutil::with_request_id(&bg());

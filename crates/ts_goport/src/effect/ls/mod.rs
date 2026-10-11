@@ -21,12 +21,12 @@
 //! the rules.
 //!
 //! Ported: the Effect hover and the inlay filter (lane E2), the auto-import
-//! style (E3), the fixable framework with the disable actions and 41 of the
-//! 55 fixes (E4, E5a, E5b), the Layer hover (E7) and the document symbols
-//! (E8). Not ported here: patch 017 (`refactor.rewrite` in the server's code
-//! action kinds; root decision D1 keeps the plain list). The lists that
-//! later lanes fill: the other 14 fixes (E5c), completions (E6) and
-//! refactors (E9).
+//! style (E3), the fixable framework with the disable actions and all 55
+//! fixes (E4, E5a, E5b, E5c), the completions (E6), the Layer hover (E7)
+//! and the document symbols (E8). Not ported here: patch 017
+//! (`refactor.rewrite` in the server's code action kinds; root decision D1
+//! keeps the plain list). The refactors (E9) are still to come:
+//! [`EFFECT_REFACTOR_PROVIDER`] gives no action.
 
 use std::sync::LazyLock;
 

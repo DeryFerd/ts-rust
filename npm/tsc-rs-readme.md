@@ -30,8 +30,8 @@ the plugin, as with `@effect/language-service`:
 
 The rules, options and `@effect-diagnostics` comments are a port of
 [Effect-TS/tsgo](https://github.com/Effect-TS/tsgo) 0.51.1. The language server also has its editor
-features: the Effect hover (with the Layer summary), inlay hints, the auto-import style, quick fixes
-and document symbols. Completions, refactors and 14 of the 55 quick fixes are not ported yet.
+features: the Effect hover (with the Layer summary), inlay hints, the auto-import style, quick fixes,
+document symbols and completions. Only the refactors are not ported yet.
 
 The API stability rules of 0.51.1 read the `@stability` JSDoc tags of Effect 4.
 `unstableApiUsage` (TS377136) and `experimentalApiUsage` (TS377135) report each use of an
