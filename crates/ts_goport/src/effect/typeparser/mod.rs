@@ -165,7 +165,7 @@ pub struct EffectLinks {
     pub promise_type: FxHashMap<TypeId, TypeId>,
     pub is_global_error_type: FxHashMap<TypeId, bool>,
     pub is_yieldable_error_type: FxHashMap<TypeId, bool>,
-    pub reference_symbol: LinkStore<Node, CachedId>,
+    pub reference_symbol: LinkStore<Node, CachedReferenceSymbols>,
     pub module_export_reference: FxHashMap<ModuleExportReferenceCacheKey, bool>,
     /// The member names of `module_export_reference` keys, by id.
     pub module_export_members: FxHashMap<Box<str>, u32>,
