@@ -4698,6 +4698,23 @@ impl FrozenNode {
     pub fn ids(self) -> FrozenIds {
         block_ids(self.block, self.file)
     }
+
+    /// `frozen_store_children` of this node: its children in Go
+    /// `ForEachChild` order from the link column of its block, or `None`
+    /// when its chain is not known or the block has no link column (a
+    /// node shell).
+    // PERF: perfP1 item 1. No second registry lookup.
+    #[inline]
+    #[must_use]
+    pub fn children(self) -> Option<StoreChildren<'static>> {
+        let links = self.block.file.links;
+        let first = links.get(self.index)?.first_child;
+        (first != LINK_NONE).then_some(StoreChildren {
+            file: self.file,
+            links,
+            next: first,
+        })
+    }
 }
 
 /// The `FrozenNode` of `n`. `None` as for `frozen_store_kind`: nil,
@@ -4818,7 +4835,7 @@ impl NodeRef {
             let kind = b.kinds[index];
             // Go `ForEachChild` has no case for these kinds (`for_each_child_dyn`).
             if super::node::has_no_child_fields(kind) {
-                debug_assert!(self.node.iter_children().next().is_none());
+                debug_assert!(super::node::children_by_data(self.node).next().is_none());
                 return false;
             }
             let links = b.file.links;
@@ -4832,8 +4849,8 @@ impl NodeRef {
                         links,
                         next: first,
                     }
-                    .eq(self.node.iter_children()),
-                    "child links differ from for_each_child"
+                    .eq(super::node::children_by_data(self.node)),
+                    "child links differ from the data walk"
                 );
                 let mut next = first;
                 while next != LINK_END {

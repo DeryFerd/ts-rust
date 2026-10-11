@@ -3755,6 +3755,22 @@ fn for_each_child_dyn(n: Node, v: &mut dyn FnMut(Node) -> bool) -> bool {
             );
             return false;
         }
+        // PERF: perfP1 item 1 (perfscan2). A node whose child chain is
+        // known (R2-5 `SlotLinks`, Go `ForEachChild` order; the binder walks
+        // it) walks the chain: two loads per child from one column, no
+        // node data match. Debug builds compare it with the data walk.
+        if let Some(children) = f.children() {
+            debug_assert!(
+                children.eq(children_by_data(n)),
+                "child links differ from the data walk of {kind:?}"
+            );
+            for child in children {
+                if v(child) {
+                    return true;
+                }
+            }
+            return false;
+        }
         if let Some(data) = f.data() {
             let mut visit = FrozenChildVisit {
                 kind,
@@ -3766,6 +3782,21 @@ fn for_each_child_dyn(n: Node, v: &mut dyn FnMut(Node) -> bool) -> bool {
         }
     }
     for_each_child_impl(n, v, None)
+}
+
+/// The children of `n` from its node data (`for_each_child_impl`), not
+/// from its child chain: the debug checks of the chain walks.
+pub(crate) fn children_by_data(n: Node) -> std::vec::IntoIter<Node> {
+    let mut out = Vec::new();
+    for_each_child_impl(
+        n,
+        &mut |c| {
+            out.push(c);
+            false
+        },
+        None,
+    );
+    out.into_iter()
 }
 
 /// A list slot seen by `for_each_child_and_lists`: the list and whether it
