@@ -9,7 +9,9 @@
 //          [--versions effect-v4,effect-v3] [--filter SUBSTR] [--out DIR] [--jobs N] [--timeout S]
 //   --kinds      quickfixes,refactors,symbols,inlay (default: all)
 //   --effect-repo  effect-tsgo checkout with `pnpm install` done in testdata/tests/effect-v4 and
-//                effect-v3 (default target/continuation-r97-goport/effect051/effect-tsgo-0511)
+//                effect-v3 (default target/continuation-r97-goport/effect051/effect-tsgo-0511 in the
+//                main checkout: the parent of the git common dir, or /home/theo/Code/sandbox/ts-rust
+//                from an independent clone)
 // Writes <out>/summary.json (per case: same, diff or error) and, for each case that is not same,
 // <out>/<kind>/<version>/<case>.actual and .diff. Exit 0 when every case is same, 1 otherwise.
 //
@@ -32,7 +34,7 @@
 //   binary become bundled:///libs/<name>.
 // - Edits are applied to the client copy only. Go also sends them to the server and then undoes them;
 //   both leave the server with the original text.
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -63,9 +65,23 @@ if (!args.server) {
 }
 const SERVER = fs.realpathSync(args.server);
 const SERVER_DIR = path.dirname(SERVER);
-// Work data lives in the main checkout's target dir, also when this runs from a worktree.
-const mainRoot = root.includes("/target/worktrees/") ? root.slice(0, root.indexOf("/target/worktrees/")) : root;
-const EFFECT_REPO = fs.realpathSync(args["effect-repo"] ?? path.join(mainRoot, "target/continuation-r97-goport/effect051/effect-tsgo-0511"));
+// Work data lives in the main checkout's target dir: the parent of the git common dir from the main
+// checkout or any worktree. An independent clone has no work data, so it uses the main checkout path
+// (the remote hosts mirror it at the same path).
+function mainCheckout() {
+  let main = root;
+  try {
+    const gitArgs = ["-C", root, "rev-parse", "--path-format=absolute", "--git-common-dir"];
+    main = path.dirname(execFileSync("git", gitArgs, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim());
+  } catch {}
+  return fs.existsSync(path.join(main, "target/continuation-r97-goport")) ? main : "/home/theo/Code/sandbox/ts-rust";
+}
+const effectRepo = args["effect-repo"] ?? path.join(mainCheckout(), "target/continuation-r97-goport/effect051/effect-tsgo-0511");
+if (!fs.existsSync(path.join(effectRepo, "testdata/baselines/reference"))) {
+  console.error(`no effect-tsgo checkout at ${effectRepo}; pass --effect-repo DIR`);
+  process.exit(2);
+}
+const EFFECT_REPO = fs.realpathSync(effectRepo);
 const REFERENCE = path.join(EFFECT_REPO, "testdata/baselines/reference");
 const TIMEOUT_MS = Number(args.timeout) * 1000;
 fs.mkdirSync(args.out, { recursive: true });

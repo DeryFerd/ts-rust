@@ -38,9 +38,23 @@ Requests per file:
 Usage:
   lsp_battery_effect.py build [--out-root R] [--parts e1-effect,e1-t3code] [--t3code DIR]
   lsp_battery_effect.py record [--out-root R] [--oracle E0] [--jobs N] [--only S] [--force]
-  lsp_battery_effect.py selfcheck [--out-root R] [--oracle E0] [--jobs N] [--runs N]
+  lsp_battery_effect.py selfcheck [--out-root R] [--oracle E0] [--jobs N] [--runs N (16)]
   lsp_battery_effect.py check --server BIN --label L [--out-root R] [--oracle E0] [--jobs N] [--only S]
   lsp_battery_effect.py list
+
+Defaults are in the main checkout's target/continuation-r97-goport: the parent
+of the git common dir from the main checkout or any worktree, or the main
+checkout of lsp_battery_edits.py from an independent clone. A default that is
+not there stops the command with the name of its flag.
+
+selfcheck runs E0 16 times by default and then checks the codeAction answers
+that hold two actions with one title. effect-tsgo returns these in a random
+order (the namespace auto-import fix "Add import from "effect/X"" with and
+without the qualified name: 63 requests in e1-t3code). A run that sees the
+other order marks the answer multiset, so each run marks each one with chance
+1/2: 16 runs leave one of the 63 unmarked in about 1 selfcheck of 1,000, 8 runs
+in about 1 of 5. If one is still not marked, selfcheck exits 1: run it again
+(runs add up).
 
 check sends every e1 method except initialize. lsp_oracle.py always sends
 and compares the initialize request: effect-tsgo adds "refactor.rewrite" to
@@ -49,6 +63,7 @@ other methods.
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -62,14 +77,26 @@ import lsp_battery_edits as be  # noqa: E402
 lb = be.lb
 BATTERY = "e1"
 REPO = Path(__file__).resolve().parents[2]
-# Work data lives in the main checkout's target dir, also when this runs from a worktree.
-MAIN = Path(str(REPO).split("/target/worktrees/")[0])
-LANES = MAIN / "target/continuation-r97-goport"
-DEFAULT_OUT_ROOT = LANES / "ls-oracle/effect"
-DEFAULT_ORACLE = LANES / "effectlsp1/e0/oracle/bin/tsc"
+
+
+def main_checkout() -> Path:
+    """The checkout whose target dir holds the work data: the parent of the git common dir from the
+    main checkout or any worktree. An independent clone has no work data, so it uses the main checkout
+    that lsp_battery_edits.py reads the project inputs from."""
+    git = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                         capture_output=True, text=True)
+    main = Path(git.stdout.strip()).parent if git.returncode == 0 else REPO
+    return main if (main / "target/continuation-r97-goport").is_dir() else be.REPO
+
+
+LANES = main_checkout() / "target/continuation-r97-goport"
+DEFAULT_OUT_ROOT = LANES / "effectls0b/ls-oracle/effect"
+# E0 from scripts/effect/build-oracle.sh; its sha256 is the KNOWN_SHA there and keys the goldens.
+DEFAULT_ORACLE = LANES / "effectls0b/e0/a/bin/tsc"
 DEFAULT_T3CODE = LANES / "effectlsp1/t3code"
 T3CODE_COMMIT = "e95b57dc"
 LSP_ORACLE = REPO / "scripts/goport/lsp_oracle.py"
+SELFCHECK_RUNS = 16
 
 CAPS = {"hover": 8, "yield": 3, "diags": 8, "refactor": 6, "members": 3}
 
@@ -305,6 +332,8 @@ def effect_files(_args) -> tuple[Path, list[str]]:
 
 def t3code_files(args) -> tuple[Path, list[str]]:
     root = Path(args.t3code).resolve()
+    if not root.is_dir():
+        raise SystemExit(f"e1-t3code: no T3 Code copy at {root}; pass --t3code DIR (T3 Code at {T3CODE_COMMIT})")
     head = subprocess.run(["git", "-C", str(root), "rev-parse", "--short=8", "HEAD"], capture_output=True, text=True)
     if head.stdout.strip() != T3CODE_COMMIT:
         raise SystemExit(f"e1-t3code: {root} is at {head.stdout.strip() or '?'}, expected {T3CODE_COMMIT}")
@@ -367,11 +396,55 @@ def trace_methods(out_root: Path) -> list[str]:
 
 
 def oracle(cmd: str, args, extra: list[str]) -> int:
+    if not Path(args.oracle).is_file():
+        raise SystemExit(f"no E0 oracle at {args.oracle}; build it with scripts/effect/build-oracle.sh "
+                         "and pass --oracle BIN")
+    if not (Path(args.out_root) / "traces" / f"{BATTERY}.index.json").is_file():
+        raise SystemExit(f"no e1 traces in {args.out_root}/traces; run build, or pass --out-root R")
     argv = [sys.executable, str(LSP_ORACLE), cmd, "--out-root", str(args.out_root), "--battery", BATTERY,
             "--oracle", str(args.oracle), "--jobs", str(args.jobs)]
     if args.only:
         argv += ["--only", args.only]
     return subprocess.run(argv + extra).returncode
+
+
+def same_title_unmarked(args) -> tuple[int, list[str]]:
+    """Counts the codeAction answers in the goldens with two actions of one title, and lists the ones
+    that selfcheck has not marked multiset at the top array (pattern "") or unstable."""
+    groot = Path(args.out_root) / "golden" / lb.file_sha(Path(args.oracle))[:12]
+    total, unmarked = 0, []
+    for gpath in sorted(groot.glob(f"{BATTERY}-*/**/*.golden.jsonl.gz")):
+        name = str(gpath.relative_to(groot)).removesuffix(".golden.jsonl.gz")
+        if args.only and args.only not in name.split("/", 1)[1]:
+            continue
+        fpath = gpath.with_name(gpath.name.removesuffix(".golden.jsonl.gz") + ".flaky.json")
+        flaky = json.loads(fpath.read_text()) if fpath.is_file() else {}
+        events = flaky.get("events", {}) if flaky.get("goldenSha256") == lb.file_sha(gpath) else {}
+        with gzip.open(gpath, "rt", encoding="utf-8") as f:
+            next(f)
+            for line in f:
+                rec = json.loads(line)
+                if rec.get("kind") != "request" or rec.get("method") != "textDocument/codeAction" or rec.get("status") != "ok":
+                    continue
+                titles = [a.get("title") for a in rec["response"].get("result") or []]
+                if len(titles) == len(set(titles)):
+                    continue
+                total += 1
+                ev = events.get(str(rec["i"]), {})
+                if "" not in ev.get("multiset", []) and not ev.get("unstable"):
+                    unmarked.append(f"{name} event {rec['i']}")
+    return total, unmarked
+
+
+def cmd_selfcheck(args) -> int:
+    rc = oracle("selfcheck", args, ["--runs", str(args.runs)])
+    total, unmarked = same_title_unmarked(args)
+    print(f"\ncodeAction answers with two actions of one title: {total}, not marked multiset: {len(unmarked)}")
+    if unmarked:
+        print("\n".join(f"  {u}" for u in unmarked))
+        print("run selfcheck again (runs add up). If Go keeps one order for a request, check it by hand.")
+        return rc or 1
+    return rc
 
 
 def cmd_check(args) -> int:
@@ -417,7 +490,7 @@ def main() -> int:
     r.add_argument("--force", action="store_true")
     sc = sub.add_parser("selfcheck", help="lsp_oracle.py selfcheck with the E0 oracle")
     common(sc)
-    sc.add_argument("--runs", type=int, default=1)
+    sc.add_argument("--runs", type=int, default=SELFCHECK_RUNS, help=f"default {SELFCHECK_RUNS}")
     c = sub.add_parser("check", help="lsp_oracle.py check of a server against the E0 goldens")
     common(c)
     c.add_argument("--server", required=True, help="server under test (tsc-rs tsgo)")
@@ -432,7 +505,7 @@ def main() -> int:
     if args.cmd == "record":
         return oracle("record", args, ["--force"] if args.force else [])
     if args.cmd == "selfcheck":
-        return oracle("selfcheck", args, ["--runs", str(args.runs)])
+        return cmd_selfcheck(args)
     return cmd_check(args)
 
 
