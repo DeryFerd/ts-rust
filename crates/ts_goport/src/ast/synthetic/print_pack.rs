@@ -20,6 +20,9 @@ pub struct PrintPack {
     slots: Vec<(u32, Slot)>,
     /// The current astdata node of each node slot, by data index.
     datas: Vec<(u32, crate::astdata::Node)>,
+    /// The list fields of those nodes, by list index (astshrink1: node data
+    /// names its lists in the list table).
+    lists: Vec<(u32, SyntheticListData)>,
 }
 
 impl PrintPack {
@@ -40,6 +43,7 @@ pub fn export_print_pack(roots: &[Node], mut more: impl FnMut(Node, &mut Vec<Nod
     let mut pack = PrintPack {
         slots: Vec::new(),
         datas: Vec::new(),
+        lists: Vec::new(),
     };
     let mut seen = SEEN.take();
     let mut stack: Vec<u32> = Vec::new();
@@ -69,7 +73,15 @@ pub fn export_print_pack(roots: &[Node], mut more: impl FnMut(Node, &mut Vec<Nod
                     pack.slots.push((index, Slot::Node(node.clone())));
                     let data = a.data(node.data);
                     pack.datas.push((node.data, data.clone()));
-                    data.for_each_child(|child| stack.push(child.index() as u32));
+                    data.for_each_child(|child| match child {
+                        crate::astdata::Child::Node(id) => stack.push(id.index() as u32),
+                        crate::astdata::Child::List(l) => {
+                            let index = l.index() as u32;
+                            let list = a.own_list(index).get();
+                            stack.extend(list.nodes.iter().map(|id| id.index() as u32));
+                            pack.lists.push((index, list.clone()));
+                        }
+                    });
                     push(&mut stack, node.parent);
                     if let Some(file) = &node.source_file {
                         for &n in file.imports.iter().chain(&file.module_augmentations) {
@@ -102,9 +114,9 @@ thread_local! {
     /// is kept between walks, with every bit clear.
     // PERF: a hash set cost about a third of the walk on effect.
     static SEEN: Cell<Vec<u64>> = const { Cell::new(Vec::new()) };
-    /// The slot and data chunks that `install_print_pack` made on this
-    /// thread since the last `release_print_packs`.
-    static INSTALLED: RefCell<(Vec<u32>, Vec<u32>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    /// The slot, data and list chunks that `install_print_pack` made on
+    /// this thread since the last `release_print_packs`.
+    static INSTALLED: RefCell<(Vec<u32>, Vec<u32>, Vec<u32>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
 }
 
 /// Puts the entries of `pack` in this thread's arena, each at its index:
@@ -113,7 +125,7 @@ thread_local! {
 /// be the d.ts twin of the pack's thread (`install_twin_synthetic_arena`):
 /// the chunks of the pack's entries are then never chunks of its own.
 pub fn install_print_pack(pack: PrintPack) {
-    INSTALLED.with_borrow_mut(|(slot_chunks, data_chunks)| {
+    INSTALLED.with_borrow_mut(|(slot_chunks, data_chunks, list_chunks)| {
         ARENA.with(|a| {
             let mut a = a.borrow_mut();
             debug_assert!(a.shared.is_some(), "a print pack goes to a d.ts twin");
@@ -140,6 +152,14 @@ pub fn install_print_pack(pack: PrintPack) {
                 // A filled cell holds this same node.
                 let _ = a.datas[c].as_ref().expect(FREED)[i].set(node);
             }
+            for (index, list) in pack.lists {
+                let (c, i) = (index as usize / LIST_CHUNK, index as usize % LIST_CHUNK);
+                if a.lists.get(c).is_none_or(Option::is_none) {
+                    set_chunk(&mut a.lists, c as u32, vec![OwnList::Absent; LIST_CHUNK]);
+                    list_chunks.push(c as u32);
+                }
+                a.lists[c].as_mut().expect(FREED)[i] = OwnList::List(list);
+            }
         });
     });
 }
@@ -149,10 +169,11 @@ pub fn install_print_pack(pack: PrintPack) {
 /// brings it back. The d.ts twin calls it after each print, so it keeps the
 /// nodes of one print at a time. The entries that this thread made stay.
 pub fn release_print_packs() {
-    let (slot_chunks, data_chunks) = INSTALLED.take();
+    let (slot_chunks, data_chunks, list_chunks) = INSTALLED.take();
     // Dropped after the arena borrow ends.
     let mut freed = Vec::with_capacity(slot_chunks.len());
     let mut freed_data = Vec::with_capacity(data_chunks.len());
+    let mut freed_lists = Vec::with_capacity(list_chunks.len());
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
         for c in slot_chunks {
@@ -167,6 +188,9 @@ pub fn release_print_packs() {
         }
         for c in data_chunks {
             freed_data.push(a.datas[c as usize].take());
+        }
+        for c in list_chunks {
+            freed_lists.push(a.lists[c as usize].take());
         }
     });
 }

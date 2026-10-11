@@ -121,7 +121,7 @@ impl NodeFactory {
     /// A required list field.
     pub(crate) fn req_list(&self, l: NodeList) -> crate::astdata::NodeList {
         match self.target {
-            NodeFactoryTarget::Synthetic => synthetic_req_list_value(l),
+            NodeFactoryTarget::Synthetic => synthetic_req_list_value(self.print_owned.get(), l),
             NodeFactoryTarget::File(store) => store_req_list_value(store, l),
         }
     }
@@ -129,7 +129,7 @@ impl NodeFactory {
     /// An optional list field.
     pub(crate) fn opt_list(&self, l: NodeList) -> Option<crate::astdata::NodeList> {
         match self.target {
-            NodeFactoryTarget::Synthetic => synthetic_list_value(l),
+            NodeFactoryTarget::Synthetic => synthetic_list_value(self.print_owned.get(), l),
             NodeFactoryTarget::File(store) => store_list_value(store, l),
         }
     }
@@ -137,7 +137,7 @@ impl NodeFactory {
     /// A modifiers field.
     pub(crate) fn mods(&self, m: ModifierList) -> Option<crate::astdata::ModifierList> {
         match self.target {
-            NodeFactoryTarget::Synthetic => synthetic_modifiers_value(m),
+            NodeFactoryTarget::Synthetic => synthetic_modifiers_value(self.print_owned.get(), m),
             NodeFactoryTarget::File(store) => store_modifiers_value(store, m),
         }
     }

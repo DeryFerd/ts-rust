@@ -56,7 +56,7 @@
 //! - the `ParsedSourceFile` fields in declaration order, with node handles
 //!   as slot indexes (0 is nil), and the import specifiers.
 
-use crate::ast::store::{LibParseSlot, load_lib_parse_slots, reset_file_store};
+use crate::ast::store::{LibListTable, LibParseSlot, load_lib_parse_slots, reset_file_store};
 #[cfg(test)]
 use crate::ast::store::{lib_parse_slot_views, lib_parse_store_dump};
 use crate::astdata::NodeData;
@@ -351,6 +351,7 @@ fn decode(
         total: 1,
         index: 0,
         pos: 0,
+        ids: Vec::new(),
     };
     let count = d.count()?;
     d.total = u32::try_from(count).ok()?.checked_add(1)?;
@@ -374,7 +375,7 @@ fn decode(
         let text_is_keyword = get_identifier_token(name.as_str()) != SyntaxKind::Identifier;
         names.push((name, text_is_keyword));
     }
-    if !load_lib_parse_slots(store, count, || d.slot(&palette, &names)) {
+    if !load_lib_parse_slots(store, count, |lists| d.slot(&palette, &names, lists)) {
         return None;
     }
     let file = d.parsed_file(opts, text)?;
@@ -421,6 +422,59 @@ struct Decoder<'a> {
     /// `loc.pos()` of the slot being read (of the one before, until its
     /// position is read); list ranges are relative to it.
     pos: i64,
+    /// The ids of the list being read (`list_parts`), kept between lists.
+    ids: Vec<crate::astdata::NodeId>,
+}
+
+/// The `Decoder` of one node data, with the list table of the store, which
+/// the list readers add to (astshrink1). The other field readers are the
+/// `Decoder` methods (`Deref`).
+struct PayloadDecoder<'d, 'a, 't, 'l> {
+    dec: &'d mut Decoder<'a>,
+    lists: &'t mut LibListTable<'l>,
+}
+
+impl<'a> std::ops::Deref for PayloadDecoder<'_, 'a, '_, '_> {
+    type Target = Decoder<'a>;
+
+    fn deref(&self) -> &Decoder<'a> {
+        self.dec
+    }
+}
+
+impl std::ops::DerefMut for PayloadDecoder<'_, '_, '_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.dec
+    }
+}
+
+impl PayloadDecoder<'_, '_, '_, '_> {
+    fn list(&mut self) -> Option<crate::astdata::NodeList> {
+        let (range, comma) = self.dec.list_parts()?;
+        Some(
+            self.lists
+                .push(range, &self.dec.ids, comma, Default::default()),
+        )
+    }
+
+    fn olist(&mut self) -> Option<Option<crate::astdata::NodeList>> {
+        Some(if self.flag()? {
+            Some(self.list()?)
+        } else {
+            None
+        })
+    }
+
+    fn mods(&mut self) -> Option<Option<crate::astdata::ModifierList>> {
+        if !self.flag()? {
+            return Some(None);
+        }
+        let (range, comma) = self.dec.list_parts()?;
+        let flags = crate::astdata::ModifierFlags(self.num()?);
+        Some(Some(crate::astdata::ModifierList {
+            list: self.lists.push(range, &self.dec.ids, comma, flags),
+        }))
+    }
 }
 
 impl<'a> Decoder<'a> {
@@ -488,6 +542,7 @@ impl<'a> Decoder<'a> {
         &mut self,
         palette: &[(SyntaxKind, NodeFlags)],
         names: &[(Name, bool)],
+        lists: &mut LibListTable<'_>,
     ) -> Option<LibParseSlot> {
         self.index += 1;
         let (kind, flags) = *palette.get(usize::try_from(self.var()?).ok()?)?;
@@ -512,7 +567,7 @@ impl<'a> Decoder<'a> {
             }
             None
         } else {
-            let data = decode_payload(self, variant)?;
+            let data = decode_payload(&mut PayloadDecoder { dec: self, lists }, variant)?;
             if !data.matches_syntax_kind(kind) {
                 return None;
             }
@@ -548,7 +603,8 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn list(&mut self) -> Option<crate::astdata::NodeList> {
+    /// The range and the missing-list bit of a list; its ids go to `ids`.
+    fn list_parts(&mut self) -> Option<(crate::astdata::text::TextRange, bool)> {
         let start_delta = self.zz()?;
         let start = u32::try_from(self.pos + start_delta).ok()?;
         let end = u32::try_from(i64::from(start) + self.zz()?).ok()?;
@@ -557,37 +613,18 @@ impl<'a> Decoder<'a> {
         if len > self.r.remaining() {
             return None;
         }
-        let mut nodes = Vec::with_capacity(len);
+        self.ids.clear();
         for _ in 0..len {
-            nodes.push(self.id()?);
+            let id = self.id()?;
+            self.ids.push(id);
         }
-        Some(crate::astdata::NodeList {
-            range: crate::astdata::text::TextRange::new(
+        Some((
+            crate::astdata::text::TextRange::new(
                 crate::astdata::text::TextPos::new(start),
                 crate::astdata::text::TextPos::new(end),
             ),
-            nodes,
-            has_trailing_comma: head & 1 != 0,
-        })
-    }
-
-    fn olist(&mut self) -> Option<Option<crate::astdata::NodeList>> {
-        Some(if self.flag()? {
-            Some(self.list()?)
-        } else {
-            None
-        })
-    }
-
-    fn mods(&mut self) -> Option<Option<crate::astdata::ModifierList>> {
-        if !self.flag()? {
-            return Some(None);
-        }
-        let list = self.list()?;
-        Some(Some(crate::astdata::ModifierList {
-            list,
-            flags: crate::astdata::ModifierFlags(self.num()?),
-        }))
+            head & 1 != 0,
+        ))
     }
 
     fn opaque(&mut self) -> Option<crate::astdata::OpaqueValue> {
@@ -879,7 +916,7 @@ macro_rules! payload_codec {
         $($field:ident: $codec:ident),* $(,)?
     })*) => {
         /// The node data with variant tag `variant_tag`, from `dec`.
-        fn decode_payload(dec: &mut Decoder<'_>, variant_tag: u8) -> Option<NodeData> {
+        fn decode_payload(dec: &mut PayloadDecoder<'_, '_, '_, '_>, variant_tag: u8) -> Option<NodeData> {
             Some(match variant_tag {
                 $($variant_tag => NodeData::$variant(Box::new(crate::astdata::$data {
                     $($field: dec.$codec()?,)*
@@ -1250,6 +1287,9 @@ struct Encoder {
     index: u32,
     /// See `Decoder::pos`.
     pos: i64,
+    /// The list table of the store (astshrink1), which the list fields
+    /// of its node data name.
+    lists: Vec<&'static crate::ast::store::StaticList>,
 }
 
 #[cfg(test)]
@@ -1315,12 +1355,13 @@ impl Encoder {
     }
 
     fn list(&mut self, l: &crate::astdata::NodeList) -> Result<(), String> {
+        let l = self.lists[l.index()];
         let start = i64::from(l.range.start.get());
         let end = i64::from(l.range.end.get());
         self.zz(start - self.pos);
         self.zz(end - start);
-        self.var(((l.nodes.len() as u64) << 1) | u64::from(l.has_trailing_comma));
-        for id in &l.nodes {
+        self.var(((l.nodes.len() as u64) << 1) | u64::from(l.has_trailing_comma()));
+        for id in l.nodes {
             self.id(id)?;
         }
         Ok(())
@@ -1343,7 +1384,8 @@ impl Encoder {
             Some(m) => {
                 self.u8(1);
                 self.list(&m.list)?;
-                self.var(u64::from(m.flags.0));
+                let flags = self.lists[m.list.index()].modifier_flags();
+                self.var(u64::from(flags.0));
             }
         }
         Ok(())
@@ -1603,6 +1645,7 @@ fn encode_section(
         store: file.store,
         index: 0,
         pos: 0,
+        lists: crate::ast::store::lib_parse_list_table(file.store),
     };
     let mut palette: Vec<(SyntaxKind, NodeFlags)> = Vec::new();
     let mut palette_index: FxHashMap<(SyntaxKind, NodeFlags), u64> = FxHashMap::default();
@@ -1655,6 +1698,7 @@ fn encode_section(
         store: file.store,
         index: 0,
         pos: 0,
+        lists: Vec::new(),
     };
     e.count(views.len());
     e.count(palette.len());

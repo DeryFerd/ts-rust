@@ -487,7 +487,7 @@ impl<'a> AstGenerator<'a> {
         writeln!(output, "    where").unwrap();
         writeln!(
             output,
-            "        F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,"
+            "        F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,"
         )
         .unwrap();
         writeln!(output, "    {{").unwrap();
@@ -542,9 +542,17 @@ impl<'a> AstGenerator<'a> {
             return Err(format!("unsupported handwritten visitor for {schema_name}"));
         }
         writeln!(output, "            Self::{rust_name}(node) => {{").unwrap();
-        writeln!(output, "                visitor(node.tag_name)?;").unwrap();
+        writeln!(
+            output,
+            "                visitor(Child::Node(node.tag_name))?;"
+        )
+        .unwrap();
         writeln!(output, "                if node.is_name_first {{").unwrap();
-        writeln!(output, "                    visitor(node.name)?;").unwrap();
+        writeln!(
+            output,
+            "                    visitor(Child::Node(node.name))?;"
+        )
+        .unwrap();
         writeln!(
             output,
             "                    visit_optional_child(visitor, node.type_expression)?;"
@@ -556,11 +564,15 @@ impl<'a> AstGenerator<'a> {
             "                    visit_optional_child(visitor, node.type_expression)?;"
         )
         .unwrap();
-        writeln!(output, "                    visitor(node.name)?;").unwrap();
+        writeln!(
+            output,
+            "                    visitor(Child::Node(node.name))?;"
+        )
+        .unwrap();
         writeln!(output, "                }}").unwrap();
         writeln!(
             output,
-            "                visit_optional_node_list(visitor, node.comment.as_ref())"
+            "                visit_optional_node_list(visitor, node.comment)"
         )
         .unwrap();
         writeln!(output, "            }}").unwrap();
@@ -573,19 +585,19 @@ impl<'a> AstGenerator<'a> {
             .child_storage(field)?
             .ok_or_else(|| format!("{} is not an AST child", field.schema_name))?
         {
-            ChildStorage::Node => format!("visitor(node.{field_name})"),
+            ChildStorage::Node => format!("visitor(Child::Node(node.{field_name}))"),
             ChildStorage::OptionalNode => {
                 format!("visit_optional_child(visitor, node.{field_name})")
             }
-            ChildStorage::NodeList => format!("visit_node_list(visitor, &node.{field_name})"),
+            ChildStorage::NodeList => format!("visitor(Child::List(node.{field_name}))"),
             ChildStorage::OptionalNodeList => {
-                format!("visit_optional_node_list(visitor, node.{field_name}.as_ref())")
+                format!("visit_optional_node_list(visitor, node.{field_name})")
             }
             ChildStorage::ModifierList => {
-                format!("visit_modifier_list(visitor, &node.{field_name})")
+                format!("visitor(Child::List(node.{field_name}.list))")
             }
             ChildStorage::OptionalModifierList => {
-                format!("visit_optional_modifier_list(visitor, node.{field_name}.as_ref())")
+                format!("visit_optional_modifier_list(visitor, node.{field_name})")
             }
             ChildStorage::RawNodes => format!("visit_children(visitor, &node.{field_name})"),
             ChildStorage::OptionalRawNodes => {
@@ -722,20 +734,20 @@ fn write_child_traversal_helpers(output: &mut String) {
     child: Option<NodeId>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match child {
-        Some(child) => visitor(child),
+        Some(child) => visitor(Child::Node(child)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
 fn visit_children<B, F>(visitor: &mut F, children: &[NodeId]) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     for &child in children {
-        visitor(child)?;
+        visitor(Child::Node(child))?;
     }
     std::ops::ControlFlow::Continue(())
 }
@@ -745,7 +757,7 @@ fn visit_optional_children<B, F>(
     children: Option<&[NodeId]>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match children {
         Some(children) => visit_children(visitor, children),
@@ -753,49 +765,35 @@ where
     }
 }
 
-fn visit_node_list<B, F>(visitor: &mut F, list: &NodeList) -> std::ops::ControlFlow<B>
-where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
-{
-    visit_children(visitor, &list.nodes)
-}
-
 fn visit_optional_node_list<B, F>(
     visitor: &mut F,
-    list: Option<&NodeList>,
+    list: Option<NodeList>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match list {
-        Some(list) => visit_node_list(visitor, list),
+        Some(list) => visitor(Child::List(list)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
-fn visit_modifier_list<B, F>(visitor: &mut F, list: &ModifierList) -> std::ops::ControlFlow<B>
-where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
-{
-    visit_node_list(visitor, &list.list)
-}
-
 fn visit_optional_modifier_list<B, F>(
     visitor: &mut F,
-    list: Option<&ModifierList>,
+    list: Option<ModifierList>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match list {
-        Some(list) => visit_modifier_list(visitor, list),
+        Some(list) => visitor(Child::List(list.list)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
 impl Node {
     /// Visits every direct AST child in TypeScript-Go `ForEachChild` order.
-    pub fn for_each_child(&self, mut visitor: impl FnMut(NodeId)) {
+    pub fn for_each_child(&self, mut visitor: impl FnMut(Child)) {
         let _ = self.data.try_for_each_child(&mut |child| {
             visitor(child);
             std::ops::ControlFlow::<()>::Continue(())
@@ -807,7 +805,7 @@ impl Node {
     /// Returning [`std::ops::ControlFlow::Break`] stops traversal immediately.
     pub fn try_for_each_child<B>(
         &self,
-        mut visitor: impl FnMut(NodeId) -> std::ops::ControlFlow<B>,
+        mut visitor: impl FnMut(Child) -> std::ops::ControlFlow<B>,
     ) -> std::ops::ControlFlow<B> {
         self.data.try_for_each_child(&mut visitor)
     }
@@ -994,17 +992,43 @@ pub struct SymbolTable;
 #[derive(Clone, Debug, Default)]
 pub struct OpaqueValue;
 
-#[derive(Clone, Debug, Default)]
-pub struct NodeList {
-    pub range: TextRange,
-    pub nodes: Vec<NodeId>,
-    pub has_trailing_comma: bool,
+/// A list field of node data: entry `index()` of the list table of the owner
+/// of the data (a file store, or the synthetic arena of a thread). The entry
+/// holds the Go `Loc`, the node ids, the missing-list bit and, for a modifier
+/// list, Go `ModifiersToFlags`. Go stores a `*NodeList`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NodeList(std::num::NonZeroU32);
+
+impl NodeList {
+    /// The list field of table entry `index`.
+    #[must_use]
+    pub const fn new(index: u32) -> Self {
+        match std::num::NonZeroU32::new(index.wrapping_add(1)) {
+            Some(n) => Self(n),
+            None => panic!("list table index out of range"),
+        }
+    }
+
+    /// The table entry.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        (self.0.get() - 1) as usize
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+/// A modifier list field: the list of its table entry (Go `ModifierList`
+/// embeds its `NodeList`).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ModifierList {
     pub list: NodeList,
-    pub flags: ModifierFlags,
+}
+
+/// A direct child that `NodeData::try_for_each_child` visits: a child node
+/// id, or a list field (whose ids are in the list table of the data's owner).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Child {
+    Node(NodeId),
+    List(NodeList),
 }
 
 #[derive(Clone, Debug)]

@@ -192,23 +192,39 @@ pub struct SyntheticSourceFileData {
     pub content_mapper_info: Option<&'static ContentMapperFileInfo>,
 }
 
-/// A list that the factory made (`new_synthetic_node_list`,
-/// `new_synthetic_modifier_list`) or that a read copied
-/// (`copy_synthetic_list`).
+/// A list of the synthetic arena of a thread: a factory list
+/// (`new_synthetic_node_list`, `new_synthetic_modifier_list`), or a list
+/// field of synthetic node data, which names it by index (astshrink1,
+/// `synthetic_list_value`).
+#[derive(Clone, Debug)]
+pub struct SyntheticListData {
+    /// Go `list.Loc` in astdata form.
+    pub range: crate::astdata::text::TextRange,
+    /// The synthetic-space ids of the nodes (`synthetic_child_id`).
+    pub nodes: Vec<crate::astdata::NodeId>,
+    /// The astdata missing-list bit (`NodeList::stored_trailing_comma`).
+    pub has_trailing_comma: bool,
+    /// Go `ModifiersToFlags(nodes)` of a modifier list, 0 for a node list.
+    pub flags: crate::astdata::ModifierFlags,
+}
+
+/// An entry of the list table of the synthetic arena.
 #[derive(Clone)]
 enum OwnList {
-    Nodes(crate::astdata::NodeList),
-    Modifiers(crate::astdata::ModifierList),
+    List(SyntheticListData),
     /// A list of a to-string call that ended. A read panics.
     Freed,
+    /// A list that no print pack brought to this d.ts twin. A read panics
+    /// (`ABSENT`).
+    Absent,
 }
 
 impl OwnList {
-    fn get(&self) -> AnyList<'_> {
+    fn get(&self) -> &SyntheticListData {
         match self {
-            Self::Nodes(l) => AnyList::Nodes(l),
-            Self::Modifiers(m) => AnyList::Modifiers(m),
+            Self::List(l) => l,
             Self::Freed => panic!("{PRINT_FREED}"),
+            Self::Absent => panic!("{ABSENT}"),
         }
     }
 }
@@ -662,11 +678,8 @@ impl SyntheticArena {
     }
 
     /// The list that `list` names. Panics on a node slice.
-    fn list(&self, list: SyntheticList) -> AnyList<'_> {
+    fn list(&self, list: SyntheticList) -> &SyntheticListData {
         match list {
-            SyntheticList::Field { data, sel } => sel(&self.data(data).data)
-                .flatten()
-                .expect("synthetic list field is not in its node data"),
             SyntheticList::Own { index } => self.own_list(index).get(),
             SyntheticList::Slice { .. } => panic!("a node slice is not a NodeList"),
         }
@@ -1626,6 +1639,46 @@ pub fn read_scoped_ast_node<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
     crate::ast::store::with_scoped_store_node(n, f)
 }
 
+/// `static_tier_ast_node` with the list table of the data (the `list_of!`
+/// read).
+#[inline]
+#[must_use]
+pub fn static_tier_ast_node_lists(
+    n: Node,
+) -> Option<(
+    &'static NodeData,
+    &'static [&'static crate::ast::store::StaticList],
+)> {
+    assert!(n.is_some(), "nil node dereference");
+    crate::ast::store::frozen_store_ast_node_lists(n)
+}
+
+/// The `NodeList` handle of list field `l` of the node data of node `n`,
+/// parsed or synthetic (astshrink1: node data names a list by its index in
+/// the list table of its owner).
+#[must_use]
+pub fn data_list(n: Node, l: crate::astdata::NodeList) -> NodeList {
+    if n.file_index() == SYNTHETIC_NODE_FILE {
+        return NodeList::synthetic(SyntheticList::Own {
+            index: l.index() as u32,
+        });
+    }
+    crate::ast::store::store_data_list(n, l)
+}
+
+/// `data_list` for a modifier list field.
+#[must_use]
+pub fn data_modifiers(n: Node, m: crate::astdata::ModifierList) -> ModifierList {
+    let list = data_list(n, m.list);
+    if let Some(l) = list.static_list() {
+        return ModifierList::from_static(list.file(), l);
+    }
+    if let Some(l) = list.store_list() {
+        return ModifierList::store(l);
+    }
+    ModifierList::synthetic(list.synthetic_list().expect("a synthetic list"))
+}
+
 /// The inline part of `static_ast_node`: the node data of a published
 /// store node of a static tier, or `None` for any other node (`with_data!`
 /// then reads it with `read_ast_node_miss`). Go dereferences the pointer,
@@ -1736,13 +1789,14 @@ pub(crate) use with_data;
 macro_rules! list_of {
     ($n:expr, |$d:ident| $body:expr) => {{
         let n__: $crate::core::Node = $n;
-        match $crate::ast::synthetic::static_tier_ast_node(n__) {
-            Some(data__) => {
+        match $crate::ast::synthetic::static_tier_ast_node_lists(n__) {
+            Some((data__, lists__)) => {
                 let $d: &'static crate::astdata::NodeData = data__;
                 let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
                 found.map(|l| {
-                    $crate::ast::NodeList::from_ts(
+                    $crate::ast::NodeList::from_table(
                         n__.file_index(),
+                        lists__,
                         l.map($crate::ast::synthetic::AnyList::nodes),
                     )
                 })
@@ -1761,13 +1815,14 @@ pub(crate) use list_of;
 macro_rules! modifiers_of {
     ($n:expr, |$d:ident| $body:expr) => {{
         let n__: $crate::core::Node = $n;
-        match $crate::ast::synthetic::static_tier_ast_node(n__) {
-            Some(data__) => {
+        match $crate::ast::synthetic::static_tier_ast_node_lists(n__) {
+            Some((data__, lists__)) => {
                 let $d: &'static crate::astdata::NodeData = data__;
                 let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
                 found.map(|m| {
-                    $crate::ast::ModifierList::from_ts(
+                    $crate::ast::ModifierList::from_table(
                         n__.file_index(),
+                        lists__,
                         m.map($crate::ast::synthetic::AnyList::modifiers),
                     )
                 })
@@ -1808,9 +1863,10 @@ impl<'a> AnyList<'a> {
         }
     }
 
-    /// The address of the node list, for Go pointer equality.
-    fn ptr(self) -> *const () {
-        std::ptr::from_ref(self.nodes()).cast()
+    /// The list table index of the list.
+    #[must_use]
+    pub fn index(self) -> usize {
+        self.nodes().index()
     }
 }
 
@@ -1907,7 +1963,7 @@ pub fn scoped_node_list_of(n: Node, site: &SelectorSite, sel: ListSel) -> Option
     let file = n.file_index();
     scoped_store_list_of(n, site.id(sel), sel).map(|found| match found {
         None => NodeList::NIL,
-        Some(ScopedList::Static(l)) => NodeList::from_ts(file, Some(l.nodes())),
+        Some(ScopedList::Static(l)) => NodeList::from_static(file, l),
         Some(ScopedList::Store(l)) => NodeList::store(l),
     })
 }
@@ -1924,7 +1980,7 @@ pub fn scoped_modifiers_of(n: Node, site: &SelectorSite, sel: ListSel) -> Option
     let file = n.file_index();
     scoped_store_list_of(n, site.id(sel), sel).map(|found| match found {
         None => ModifierList::NIL,
-        Some(ScopedList::Static(m)) => ModifierList::from_ts(file, Some(m.modifiers())),
+        Some(ScopedList::Static(m)) => ModifierList::from_static(file, m),
         Some(ScopedList::Store(m)) => ModifierList::store(m),
     })
 }
@@ -2035,25 +2091,13 @@ pub fn synthetic_expression_type(n: Node) -> TypeId {
 /// A list of synthetic data: the `NodeList`, `ModifierList` and `NodeSlice`
 /// form of a list that this thread's arena owns. It is an index, so it is
 /// only valid on the thread that made it (like a synthetic `Node`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum SyntheticList {
-    /// The list field that `sel` finds in node data `data`
-    /// (`SyntheticNode::data`).
-    Field { data: u32, sel: ListSel },
-    /// A factory list.
+    /// An entry of the list table: a factory list, or a list field of node
+    /// data (astshrink1).
     Own { index: u32 },
     /// A node slice that a read made (`NodeSlice` only).
     Slice { index: u32 },
-}
-
-impl std::fmt::Debug for SyntheticList {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Field { data, .. } => write!(f, "Field({data})"),
-            Self::Own { index } => write!(f, "Own({index})"),
-            Self::Slice { index } => write!(f, "Slice({index})"),
-        }
-    }
 }
 
 /// The list field that `sel` finds in the data of synthetic node `n`. `None`
@@ -2063,14 +2107,18 @@ pub fn synthetic_list_of(n: Node, sel: ListSel) -> Option<Option<SyntheticList>>
     ARENA.with(|a| {
         let a = a.borrow();
         let data = a.node(n).data;
-        sel(&a.data(data).data).map(|l| l.map(|_| SyntheticList::Field { data, sel }))
+        sel(&a.data(data).data).map(|l| {
+            l.map(|l| SyntheticList::Own {
+                index: l.index() as u32,
+            })
+        })
     })
 }
 
 /// Calls `f` with the list that `list` names. Panics on a node slice. The
 /// arena stays borrowed while `f` runs, so `f` must not make or change
 /// synthetic nodes.
-pub fn with_synthetic_list<R>(list: SyntheticList, f: impl FnOnce(AnyList<'_>) -> R) -> R {
+pub fn with_synthetic_list<R>(list: SyntheticList, f: impl FnOnce(&SyntheticListData) -> R) -> R {
     ARENA.with(|a| f(a.borrow().list(list)))
 }
 
@@ -2081,7 +2129,7 @@ pub fn synthetic_list_len(list: SyntheticList) -> usize {
         let a = a.borrow();
         match list {
             SyntheticList::Slice { index } => a.slices[index as usize].len(),
-            _ => a.list(list).nodes().nodes.len(),
+            SyntheticList::Own { .. } => a.list(list).nodes.len(),
         }
     })
 }
@@ -2093,7 +2141,7 @@ pub fn synthetic_list_node(list: SyntheticList, i: usize) -> Node {
         let a = a.borrow();
         match list {
             SyntheticList::Slice { index } => a.slices[index as usize][i],
-            _ => a.resolve(a.list(list).nodes().nodes[i].index()),
+            SyntheticList::Own { .. } => a.resolve(a.list(list).nodes[i].index()),
         }
     })
 }
@@ -2104,23 +2152,16 @@ pub fn synthetic_list_eq(x: SyntheticList, y: SyntheticList) -> bool {
     match (x, y) {
         (SyntheticList::Own { index: i }, SyntheticList::Own { index: j })
         | (SyntheticList::Slice { index: i }, SyntheticList::Slice { index: j }) => i == j,
-        (SyntheticList::Field { data: d, .. }, SyntheticList::Field { data: e, .. }) => {
-            d == e
-                && ARENA.with(|a| {
-                    let a = a.borrow();
-                    a.list(x).ptr() == a.list(y).ptr()
-                })
-        }
         _ => false,
     }
 }
 
 /// The address of the node list that `list` names, for Go pointer keys
 /// (`NodeList::list_ptr`). It stays the same while the owner of the list
-/// lives: node data and factory lists are in chunks that do not move.
+/// lives: list chunks do not move.
 #[must_use]
 pub fn synthetic_list_ptr(list: SyntheticList) -> *const () {
-    ARENA.with(|a| a.borrow().list(list).ptr())
+    ARENA.with(|a| std::ptr::from_ref(a.borrow().list(list)).cast())
 }
 
 /// A new node slice of this thread (Go allocates one on each call, for
@@ -2137,24 +2178,17 @@ pub fn new_synthetic_slice(nodes: Vec<Node>) -> SyntheticList {
     })
 }
 
-/// A factory list with a copy of `list`, a list of synthetic node data that
-/// a read has in place (the `Node::for_each_child_and_lists` hook). The
-/// thread's arena owns the copy.
-#[must_use]
-pub fn copy_synthetic_list(list: &crate::astdata::NodeList) -> NodeList {
-    NodeList::synthetic(push_own_list(OwnList::Nodes(list.clone())))
-}
-
 /// Parser `createMissingList` for synthetic `list` (see
 /// `NodeList::with_missing_marker`): a new empty factory list at the `Loc`
 /// of `list`, with the astdata `has_trailing_comma` bit set.
 #[must_use]
 pub fn synthetic_missing_list(list: SyntheticList) -> SyntheticList {
-    let range = with_synthetic_list(list, |l| l.nodes().range);
-    push_own_list(OwnList::Nodes(crate::astdata::NodeList {
+    let range = with_synthetic_list(list, |l| l.range);
+    push_own_list(OwnList::List(SyntheticListData {
         range,
         nodes: Vec::new(),
         has_trailing_comma: true,
+        flags: crate::astdata::ModifierFlags::default(),
     }))
 }
 
@@ -2293,7 +2327,12 @@ fn new_ts_node(kind: SyntaxKind, data: NodeData) -> crate::astdata::Node {
 // `modifiers` field set it (ModifiersBase, NamedMemberBase,
 // BinaryExpression); other kinds do nothing, like Go `NodeDefault`.
 pub fn set_node_modifiers(n: Node, modifiers: ModifierList) {
-    let mods = synthetic_modifiers_value(modifiers);
+    // astshrink1: the list goes into the list table of the node's owner.
+    let mods = if is_store_node(n) {
+        crate::ast::store::store_modifiers_value(n.file_index(), modifiers)
+    } else {
+        synthetic_modifiers_value(false, modifiers)
+    };
     let mut data = with_ast_data(n, Clone::clone);
     match &mut data {
         NodeData::ArrowFunction(d) => d.modifiers = mods,
@@ -2572,12 +2611,18 @@ fn ts_range(loc: TextRange) -> crate::astdata::text::TextRange {
     }
 }
 
-/// The astdata list for a synthetic node's list field.
-fn ts_list(nodes: &[Node], loc: TextRange, has_trailing_comma: bool) -> crate::astdata::NodeList {
-    crate::astdata::NodeList {
+/// The synthetic list over `nodes` at `loc`.
+fn ts_list(
+    nodes: &[Node],
+    loc: TextRange,
+    has_trailing_comma: bool,
+    flags: crate::astdata::ModifierFlags,
+) -> SyntheticListData {
+    SyntheticListData {
         range: ts_range(loc),
         nodes: nodes.iter().map(|&n| synthetic_child_id(n)).collect(),
         has_trailing_comma,
+        flags,
     }
 }
 
@@ -2594,8 +2639,8 @@ pub fn new_synthetic_node_list(nodes: &[Node], loc: TextRange) -> NodeList {
 /// (`alloc_synthetic_print_node`).
 #[must_use]
 pub fn new_synthetic_node_list_in(print: bool, nodes: &[Node], loc: TextRange) -> NodeList {
-    let list = ts_list(nodes, loc, false);
-    NodeList::synthetic(push_own_list_in(print, OwnList::Nodes(list)))
+    let list = ts_list(nodes, loc, false, crate::astdata::ModifierFlags::default());
+    NodeList::synthetic(push_own_list_in(print, OwnList::List(list)))
 }
 
 /// Go `f.NewModifierList(nodes)` with a given `Loc`. `modifier_flags()` in
@@ -2608,57 +2653,83 @@ pub fn new_synthetic_modifier_list(nodes: &[Node], loc: TextRange) -> ModifierLi
 /// `new_synthetic_modifier_list` (`print`: see `new_synthetic_node_list_in`).
 #[must_use]
 pub fn new_synthetic_modifier_list_in(print: bool, nodes: &[Node], loc: TextRange) -> ModifierList {
-    let list = crate::astdata::ModifierList {
-        list: ts_list(nodes, loc, false),
-        flags: crate::astdata::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
-    };
-    ModifierList::synthetic(push_own_list_in(print, OwnList::Modifiers(list)))
+    let flags = crate::astdata::ModifierFlags(modifiers_to_flags(nodes).0 as u32);
+    let list = ts_list(nodes, loc, false, flags);
+    ModifierList::synthetic(push_own_list_in(print, OwnList::List(list)))
 }
 
-/// A list value to store inside new synthetic `NodeData`. Go stores the
-/// `*NodeList` pointer; a list that already is synthetic is copied as is, and
-/// a parsed list is rebuilt over alias ids with its own `Loc`.
-// PORT: astdata stores lists by value, so a synthetic node that takes a
-// parsed (or another synthetic) list gets a copy. `NodeList` equality on the
-// copy is false where Go compares equal pointers.
+/// A list value to store inside new synthetic `NodeData`: the index of a
+/// new list of the arena, which the node's owner owns (`print`: see
+/// `new_synthetic_node_list_in`). Go stores the `*NodeList` pointer; a list
+/// that already is synthetic is copied as is, and a parsed list is rebuilt
+/// over alias ids with its own `Loc`.
+// PORT: a synthetic node that takes a list gets a copy, so the list has the
+// lifetime of the node. `NodeList` equality on the copy is false where Go
+// compares equal pointers.
 #[must_use]
-pub fn synthetic_list_value(list: NodeList) -> Option<crate::astdata::NodeList> {
+pub fn synthetic_list_value(print: bool, list: NodeList) -> Option<crate::astdata::NodeList> {
     if list.is_nil() {
         return None;
     }
-    if let Some(l) = list.synthetic_list() {
-        return Some(with_synthetic_list(l, |l| l.nodes().clone()));
-    }
-    let nodes = list.nodes().to_vec();
-    Some(ts_list(&nodes, list.loc(), list.stored_trailing_comma()))
+    let copy = match list.synthetic_list() {
+        Some(l) => with_synthetic_list(l, SyntheticListData::clone),
+        None => {
+            let nodes = list.nodes().to_vec();
+            ts_list(
+                &nodes,
+                list.loc(),
+                list.stored_trailing_comma(),
+                crate::astdata::ModifierFlags::default(),
+            )
+        }
+    };
+    Some(own_list_field(print, copy))
 }
 
 /// Like `synthetic_list_value` for a list field that astdata requires. Go
 /// `nil` becomes an empty list with an undefined `Loc`.
 // PORT: Go keeps `nil`; `NodeList::is_nil` on that field is false here.
 #[must_use]
-pub fn synthetic_req_list_value(list: NodeList) -> crate::astdata::NodeList {
-    synthetic_list_value(list).unwrap_or_else(|| ts_list(&[], TextRange::undefined(), false))
+pub fn synthetic_req_list_value(print: bool, list: NodeList) -> crate::astdata::NodeList {
+    synthetic_list_value(print, list).unwrap_or_else(|| {
+        let empty = ts_list(&[], TextRange::undefined(), false, Default::default());
+        own_list_field(print, empty)
+    })
 }
 
-/// A modifier list value to store inside new synthetic `NodeData`.
+/// A modifier list value to store inside new synthetic `NodeData` (see
+/// `synthetic_list_value`).
 #[must_use]
-pub fn synthetic_modifiers_value(modifiers: ModifierList) -> Option<crate::astdata::ModifierList> {
+pub fn synthetic_modifiers_value(
+    print: bool,
+    modifiers: ModifierList,
+) -> Option<crate::astdata::ModifierList> {
     if modifiers.is_nil() {
         return None;
     }
-    if let Some(m) = modifiers.synthetic_list() {
-        return Some(with_synthetic_list(m, |m| m.modifiers().clone()));
-    }
-    let nodes = modifiers.nodes().to_vec();
+    let copy = match modifiers.synthetic_list() {
+        Some(m) => with_synthetic_list(m, SyntheticListData::clone),
+        None => {
+            let nodes = modifiers.nodes().to_vec();
+            ts_list(
+                &nodes,
+                modifiers.loc(),
+                modifiers.node_list().stored_trailing_comma(),
+                crate::astdata::ModifierFlags(modifiers_to_flags(&nodes).0 as u32),
+            )
+        }
+    };
     Some(crate::astdata::ModifierList {
-        list: ts_list(
-            &nodes,
-            modifiers.loc(),
-            modifiers.node_list().stored_trailing_comma(),
-        ),
-        flags: crate::astdata::ModifierFlags(modifiers_to_flags(&nodes).0 as u32),
+        list: own_list_field(print, copy),
     })
+}
+
+/// Adds `list` to the arena for a list field of new node data.
+fn own_list_field(print: bool, list: SyntheticListData) -> crate::astdata::NodeList {
+    match push_own_list_in(print, OwnList::List(list)) {
+        SyntheticList::Own { index } => crate::astdata::NodeList::new(index),
+        SyntheticList::Slice { .. } => unreachable!("a factory list is not a slice"),
+    }
 }
 
 #[cfg(test)]
