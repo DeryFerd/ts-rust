@@ -74,9 +74,11 @@ remote() {
 ssh_route() {
   local id key
   id="$(saved_id)"
-  host="$(blacksmith testbox status --id "$id" | awk -v id="$id" '$1 == id {print $3}')"
+  # --wait: a testbox that is not ready yet has no IP, and its row has the workflow path in that column.
+  host="$(blacksmith testbox status --id "$id" --wait --wait-timeout 15m | awk -v id="$id" '$1 == id && $2 == "ready" {print $3}')"
   key="$HOME/.blacksmith/testboxes/$id/id_ed25519"
-  [[ -n "$host" && -f "$key" ]] || { echo "no SSH route to $id (host '$host', key $key)" >&2; exit 1; }
+  # A host with a / would make rsync copy to a local path.
+  [[ -n "$host" && $host != */* && -f "$key" ]] || { echo "no SSH route to $id (host '$host', key $key)" >&2; exit 1; }
   ssh="ssh -p 64000 -i $key -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o Compression=no -o ConnectTimeout=20"
 }
 
