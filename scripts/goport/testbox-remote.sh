@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# The testbox side of testbox.sh. Each command runs on a Blacksmith testbox in the synced repo root:
-# testbox.yml runs `setup` at warmup, testbox.sh runs the others through `blacksmith testbox run`.
-# usage: testbox-remote.sh setup [KEY...]          the zbook path mirror and the Go checkout of each pin
-#                                                  (default: the batch pin), then install the seeded oracles
-#        testbox-remote.sh oracles-missing KEY...  print "missing: <keys>" (the seeded oracles that are absent or
-#                                                  have another sha256 than UPSTREAM.json records)
-#        testbox-remote.sh oracles-install DIR     move each uploaded DIR/<key> (sha256 checked) to the sticky
-#                                                  target/testbox-oracles/<key>, then install the seeded oracles
+# The testbox side of testbox.sh. Each command runs on a Blacksmith testbox in the synced repo root, through
+# `blacksmith testbox run`. The workflow has set up zbook's paths (testbox-data.sh mount): the workspace is
+# bound on /home/theo/Code/sandbox/ts-rust, the batch pin's Go checkout (with node_modules) on its zbook path,
+# the pin oracle and the other files of testbox-data.txt on theirs, and the testbox env sets HOME=/home/theo.
+# usage: testbox-remote.sh pin [KEY...]            the Go checkout of each pin at its zbook path, at the pin commit,
+#                                                  with npm ci node_modules (default: the batch pin, which the
+#                                                  workflow checks out)
 #        testbox-remote.sh start RUN STEP ARGS...  run `testbox-remote.sh STEP ARGS...` detached from the SSH session:
 #                                                  output in RUN.log, then its exit code in RUN.rc. The job counts as
 #                                                  testbox activity (the idle timer does not end the testbox under it)
@@ -16,13 +15,7 @@
 #        testbox-remote.sh np-suite KEY LABEL RUN  a stable release tsgo, np-suite.sh run LABEL at pin KEY, pack
 #                                                  the label dir in RUN/out.tar.gz, then remove the label dir
 #                                                  (after a failed build, only its build.log)
-# The zbook path mirror (UPSTREAM.json, pin.py and the protected scripts use zbook's absolute paths):
-#   /home/theo/Code/sandbox/ts-rust                the workspace (a symlink)
-#   <pin goCheckout>/..                            the whole pin checkout (depth 1) with npm ci node_modules
-#   the default goCheckout                         an empty real dir (pin.py exec binds the pin checkout over it)
-#   each pin oracle path                           a real copy of target/testbox-oracles/<key> (sha256 checked)
-#   the default oracle                             the current pin's seeded oracle, else a stub that exits 2
-#   ~/.explore                                     /home/theo/.explore (a symlink), for ~/.explore paths
+# pin.py exec binds a pin's oracle and Go checkout over the default ones; bwrap makes those bind targets.
 # Only microsoft/TypeScript pins (layout typescript) are set up: the older layout needs the TypeScript submodule.
 set -euo pipefail
 case "${1:-help}" in help | -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; esac
@@ -34,17 +27,11 @@ cd "$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
 pin() { python3 scripts/upstream/pin.py "$@"; }
 batch_pin() { jq -r '.batch.upstreamPin.to // empty' docs/typechecker-state/current.json; }
 
-mirror() {
-  local d
-  [[ -d /home/theo ]] || sudo install -d -o "$(id -u)" -g "$(id -g)" /home/theo
-  mkdir -p "$(dirname "$ZBOOK_REPO")"
-  [[ -L $ZBOOK_REPO || ! -e $ZBOOK_REPO ]] || die "$ZBOOK_REPO exists and is not a symlink"
-  ln -sfn "$PWD" "$ZBOOK_REPO"
-  mkdir -p "$(jq -r .defaults.goCheckout UPSTREAM.json)" "$(dirname "$(jq -r .defaults.oracle UPSTREAM.json)")"
-  [[ -e $HOME/.explore ]] || ln -s /home/theo/.explore "$HOME/.explore"
-  for d in "$ZBOOK_REPO/target" /home/theo/.explore/repos "$(dirname "$(jq -r .defaults.oracle UPSTREAM.json)")"; do
-    touch "$d/.testbox-write-check" && rm "$d/.testbox-write-check" || die "$(id -un) cannot write to $d"
-  done
+# on_testbox: the workspace must be bound on $ZBOOK_REPO (testbox-data.sh mount). On zbook $ZBOOK_REPO is the
+# main checkout itself, and `tests` must not move its HEAD (at_commit).
+on_testbox() {
+  [[ $PWD != "$ZBOOK_REPO" && $ZBOOK_REPO -ef $PWD ]] ||
+    die "not on a testbox: $ZBOOK_REPO is not a bind of $PWD (testbox-data.sh mount)"
 }
 
 # checkout KEY: the whole pin checkout at its zbook path, at the pin commit, with the root node_modules
@@ -60,6 +47,8 @@ checkout() {
     echo "pin $1: $dir ready"
     return
   fi
+  # The workflow binds its checkout of the batch pin here: never empty it.
+  ! mountpoint -q "$dir" || die "pin $1: the workflow's checkout at $dir is not at ${commit:0:12} with node_modules"
   rm -rf "$dir"
   git init -q "$dir"
   git -C "$dir" fetch -q --depth=1 "https://github.com/$repo" "$commit"
@@ -67,29 +56,6 @@ checkout() {
   (cd "$dir" && npm ci --ignore-scripts --no-audit --no-fund --loglevel=error)
   [[ -d $go/testdata/baselines/reference ]] || die "pin $1: no $go/testdata/baselines/reference"
   echo "pin $1: $dir at ${commit:0:12}, $(ls "$dir/node_modules" | wc -l) node_modules"
-}
-
-# The recorded sha256 of a pin's oracle; empty when the synced UPSTREAM.json lacks the pin.
-want_sha() { pin show "$1" 2> /dev/null | jq -r .oracle.sha256 || true; }
-
-# install_oracles: a real copy of each seeded oracle at its path; the default oracle path gets the current
-# pin's oracle, else a stub (pin.py exec binds over a real file; a run without GOPORT_PIN fails loudly).
-install_oracles() {
-  local f key path default
-  default=$(jq -r .defaults.oracle UPSTREAM.json)
-  for f in target/testbox-oracles/*; do
-    [[ -f $f ]] || continue
-    key=${f##*/}
-    [[ -n $(want_sha "$key") ]] || continue
-    [[ $(sha256sum < "$f" | cut -d' ' -f1) == "$(want_sha "$key")" ]] || { echo "oracle $key: sha256 differs, skipped" >&2; continue; }
-    path=$(pin path oracle "$key")
-    cmp -s "$f" "$path" 2> /dev/null || install -D -m 755 "$f" "$path"
-    echo "oracle $key: $path"
-  done
-  [[ -f $default ]] || printf '%s\n' '#!/bin/sh' \
-    "echo \"tsgo-oracle: no oracle of the current pin on this testbox (set GOPORT_PIN, or testbox.sh oracles $(jq -r .current UPSTREAM.json))\" >&2" \
-    'exit 2' > "$default"
-  chmod 755 "$default"
 }
 
 # at_commit COMMIT: HEAD and the index at COMMIT, the synced files kept (the sync sends files, not git state).
@@ -114,51 +80,31 @@ case $cmd in
   job)
     run=$1
     shift
-    # run-testbox resets its idle timer when this file is newer than the last activity. The keepalive ends
-    # with this shell, so a killed job lets the testbox end at its idle timeout and the local poll stop.
-    (while sleep 30 && kill -0 "$$" 2> /dev/null; do touch ~/.testbox-last-activity; done) &
+    # run-testbox resets its idle timer when this file is newer than the last activity. It is in the login
+    # home (/home/runner), not in ~: the testbox env sets HOME=/home/theo. The keepalive ends with this
+    # shell, so a killed job lets the testbox end at its idle timeout and the local poll stop.
+    marker=$(getent passwd "$(id -u)" | cut -d: -f6)/.testbox-last-activity
+    (while sleep 30 && kill -0 "$$" 2> /dev/null; do touch "$marker"; done) &
     keep=$!
     # RUN.rc is written on every exit. It stays 1 when the job shell itself is killed.
     rc=1
     trap 'kill "$keep" 2> /dev/null || true; echo "$rc" > "$run.rc"' EXIT
     if "$0" "$@" > "$run.log" 2>&1 < /dev/null; then rc=0; else rc=$?; fi
     ;;
-  setup)
-    mirror
+  pin)
+    on_testbox
     (($#)) || { k=$(batch_pin); [[ -z $k ]] || set -- "$k"; }
     (($#)) || echo "no batch pin in docs/typechecker-state/current.json: no pin checkout (testbox.sh pin KEY sets one up)"
     for k in "$@"; do checkout "$k"; done
-    install_oracles
-    ;;
-  oracles-missing)
-    missing=()
-    for k in "$@"; do
-      [[ -f target/testbox-oracles/$k && $(sha256sum < "target/testbox-oracles/$k" | cut -d' ' -f1) == "$(want_sha "$k")" ]] ||
-        missing+=("$k")
-    done
-    echo "missing: ${missing[*]}"
-    ;;
-  oracles-install)
-    (($# == 1)) && [[ -d $1 ]] || die "usage: oracles-install DIR"
-    mkdir -p target/testbox-oracles
-    for f in "$1"/*; do
-      k=${f##*/}
-      [[ $(sha256sum < "$f" | cut -d' ' -f1) == "$(want_sha "$k")" ]] || die "upload $k: sha256 differs from UPSTREAM.json"
-      mv -f "$f" "target/testbox-oracles/$k"
-    done
-    rm -rf "$1"
-    mirror
-    install_oracles
     ;;
   tests)
     (($# == 3)) || die "usage: tests KEY COMMIT RUN"
     key=$1 commit=$2 run=$3
     [[ ! -e $run ]] || die "$run exists"
-    # mirror first: it refuses to run on zbook (a real dir at $ZBOOK_REPO) before at_commit moves HEAD.
-    mirror
+    # First: it refuses to run on zbook before at_commit moves HEAD.
+    on_testbox
     at_commit "$commit"
     checkout "$key"
-    install_oracles
     mkdir -p "$run"
     rc=0
     echo "build-goport-tests.sh at ${commit:0:12} ($(date -u +%T))"
@@ -184,7 +130,7 @@ case $cmd in
     (($# == 3)) || die "usage: np-suite KEY LABEL RUN"
     key=$1 label=$2 run=$3
     [[ ! -e $run ]] || die "$run exists"
-    mirror
+    on_testbox
     checkout "$key"
     mkdir -p "$run"
     # Stable and not incremental, as candidate.sh builds release bins.

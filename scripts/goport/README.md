@@ -291,46 +291,64 @@ revision evidence (`remote.sh help`, "Reserved"): timing that needs zbook-class 
 
 ## Blacksmith testboxes
 
-`testbox.sh` runs builds and protected suites on a warm Blacksmith runner (32 vCPU, 124 GB RAM),
-not on zbook or the SSH hosts. `.github/workflows/testbox.yml` sets up the testbox. `testbox-remote.sh`
-holds the steps that run on it. `testbox.sh help` gives the usage.
+`testbox.sh` runs builds, the protected suites, the gate and the oracle batteries on a warm Blacksmith
+runner (32 vCPU, 124 GB RAM), not on zbook or the SSH hosts. `.github/workflows/testbox.yml` sets up the
+testbox, `testbox-data.sh` makes zbook's paths there, and `testbox-remote.sh` holds the steps of `tests`,
+`np-suite` and `pin`. `testbox.sh help` gives the usage.
 
 ```sh
-scripts/goport/testbox.sh warmup                                # about 35 s; TESTBOX_REF=<branch> for a workflow change
+scripts/goport/testbox.sh warmup                                # about 1 min; TESTBOX_REF=<branch> for a workflow change
 scripts/goport/testbox.sh tests <out-dir> <base results.json>   # build-goport-tests.sh, goport-tests.sh, compare-tests.py
 scripts/goport/testbox.sh np-suite <label> [<base label>]       # np-suite.sh run, then np-suite.sh diff
+scripts/goport/testbox.sh push <bins dir>                       # then run gate.sh, lsp_oracle.py or api_oracle.py as on zbook
+scripts/goport/testbox.sh get <remote> [<local>]                # rsync a result back
 scripts/goport/testbox.sh stop                                  # or release (see "Sticky disks")
 ```
 
-- Warmup: bubblewrap, Node 24, Go, Rust 1.93.0 and the nightly, and zbook's paths:
-  `/home/theo/Code/sandbox/ts-rust` is a symlink to the workspace, the whole checkout of the batch pin (with
-  `npm ci` node_modules) is at its zbook path, the default goCheckout is an empty dir and the default
-  oracle is a stub that exits 2. `pin.py exec` binds the pin over both.
+- Warmup: bubblewrap, psutil, Node 24, Go, Rust 1.93.0 and the nightly, and zbook's paths
+  (`testbox-data.sh mount`):
+  - The workspace is bound on `/home/theo/Code/sandbox/ts-rust`, and the testbox env sets
+    `HOME=/home/theo`.
+  - The whole checkout of the batch pin, with `npm ci` node_modules, is bound on its zbook path.
+  - Each path of `testbox-data.txt` is bound from its sticky disk.
+  - `pin.py exec` binds the pin over the default oracle and goCheckout paths. bwrap makes those bind targets.
+- Data: `testbox-data.txt` lists the zbook files that the gate and the LSP and API oracles read and git does
+  not hold. Disk `ts-rust-testbox-inputs` holds the files that are the same for every pin: the project inputs,
+  the runner trees and the corpus. Disk `ts-rust-testbox-pin-<key>` holds the pin cache, the LSP and API
+  goldens and the pin oracle. `testbox.sh seed [inputs|pin]` copies them from zbook (30 to 35 minutes; a
+  rerun copies only what is missing). Then `release`.
 - Oracles: `pin.py` checks the sha256 of the pin oracle, and a build on the runner has another sha256 (Go
-  puts absolute paths in the binary). `testbox.sh oracles [KEY...]` uploads zbook's recorded binary to
-  `target/testbox-oracles/<key>` and installs it at its path. It uploads only what the testbox lacks.
-  `tests` runs it first.
+  puts absolute paths in the binary). So the testbox uses zbook's recorded binary from the pin disk.
+  `tests` compares the testbox's copy with UPSTREAM.json and pushes zbook's binary when they differ.
 - Git: the sync sends files, not git state. `tests` needs HEAD on origin: the testbox fetches it and resets
-  its index to it, so `build-goport-tests.sh` sees a clean tree at HEAD.
-- Other pins: `testbox.sh pin KEY` sets up a pin of this worktree's UPSTREAM.json (microsoft/TypeScript
+  its index to it, so `build-goport-tests.sh` sees a clean tree at HEAD. Before a gate, fetch the commit
+  that the bins name (`run git fetch --depth=1 origin <sha>`).
+- Other pins: `testbox.sh pin KEY` checks out a pin of this worktree's UPSTREAM.json (microsoft/TypeScript
   pins only), for example bump D fed0bf24149f from a bump D worktree. Then
   `testbox.sh tests --pin KEY <out-dir> <base results.json>` or `testbox.sh np-suite --pin KEY <label>`.
+  The pin disk holds only the batch pin's files. `tests --pin` pushes the other pin's oracle to that
+  testbox only.
 - Output: `tests` writes `<out-dir>/tests-run` (results.json, logs, tsv, track), `<out-dir>/testbin` (the
   metadata, no binaries) and `<out-dir>/compare.json`. After a failed build it writes the cargo logs to
   `<out-dir>/testbin.new/logs` and prints the compiler errors. `np-suite` writes the label dir in the main
   checkout's np-suite dir. Neither replaces an existing dir.
-- Sticky disks: `target/` and the cargo registry. A sticky disk commits only when the job ends with no
-  failed or cancelled step. `stop` cancels the job, so its writes are lost. `release` forgets the testbox,
-  which ends at its idle timeout (`TESTBOX_IDLE`, default 15 minutes) and requests a commit.
+- Activity: the idle timer does not see the SSH route of `push`, `get` and the `tests` poll. `push` and
+  `seed` touch the activity marker every minute, and the `tests` and `np-suite` jobs every 30 s.
+- Sticky disks: `target/` and the cargo registry, and the inputs and pin disks. The inputs and pin disks
+  commit only when a file changed (`commit: on-change`), so a testbox that only reads them does not commit an
+  older copy. A sticky disk commits only when the job ends with no failed or cancelled step. `stop` cancels the
+  job, so its writes are lost. `release` forgets the testbox, which ends at its idle timeout
+  (`TESTBOX_IDLE`, default 15 minutes) and requests a commit.
   - Not every requested commit lands. On 2026-10-10, five testboxes that lived 2 to 13 minutes committed,
     up to 2.1 GiB (a warm target after `tests` and `np-suite`). One that lived 27 minutes (10 to 15 idle
     minutes at the end, no `stop`) requested a 2 GiB commit that never landed. The cause is not known: a
     39-minute testbox of another session probably did commit.
-  - `TESTBOX_IDLE=1` with a release right after the last command gave commits that landed. Only `tests`
-    and `np-suite` keep a testbox alive: with a short idle timeout, a `run` or `pin` command longer than
-    about 6 minutes is cut off (the VM waits at most 290 s for SSH sessions, then shuts down).
+  - `TESTBOX_IDLE=1` with a release right after the last command gave commits that landed. Only `tests`,
+    `np-suite`, `push` and `seed` keep a testbox alive: with a short idle timeout, a `run` or `pin` command
+    longer than about 6 minutes is cut off (the VM waits at most 290 s for SSH sessions, then shuts down).
     `TESTBOX_ID=<id> testbox.sh status` shows the end.
   - The last commit wins, across branches too: every branch uses the same disk keys.
-- Times (2026-10-10, cold target): `tests` 502 s (test bins 3.6 min, suite 4.7 min), `np-suite` 112 s.
-- Not on testboxes yet: the gate, the LSP and API oracle batteries, `candidate.sh side` and `perf.sh`.
-  Revision evidence stays on dbook-lan and timing on mini-743d.
+- Times (2026-10-10, cold target): `tests` 502 s (test bins 3.6 min, suite 4.7 min), `np-suite` 112 s. With
+  the R189 bins: the full gate 8.4 min, the LSP batteries 3 min, the API batteries 1 min.
+- Not on testboxes yet: `candidate.sh side` and `perf.sh`. Revision evidence stays on dbook-lan and timing on
+  mini-743d.
