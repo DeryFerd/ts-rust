@@ -175,7 +175,7 @@ impl Checker {
     // effect of a comparison (a lazy symbol id) came with the first call.
     // A long first call searches on entries (`contains_types_by_entries`).
     // Go's only caller is `isTypeSubsetOf` (from flow.go and relater.go:2753);
-    // `removeSubtypes` (checker.go:26399) does not call it.
+    // `removeSubtypes` (checker.go:26468) does not call it.
     pub fn is_type_subset_of_union(&mut self, source: TypeId, target: TypeId) -> bool {
         if self.ty(source).flags.intersects(TypeFlags::UNION) {
             let n = self.ty(source).types().len();

@@ -194,7 +194,7 @@ impl Checker {
         let _verbosity = VerbosityRestore::install(&node_builder, vc);
         self.serialization_level += 1;
         // PORT: Go does not restore serializationLevel when TypeToTypeNode
-        // panics. Go recovers a panic per LSP request (`lsp/server.go:1477`
+        // panics. Go recovers a panic per LSP request (`lsp/server.go:1513`
         // `recover`) and keeps the checker, so after two such panics a Go
         // checker stays at maxSerializationLevel and every later type prints
         // as "?". The port also catches port-only `unported!` panics per

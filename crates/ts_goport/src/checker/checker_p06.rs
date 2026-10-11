@@ -5,129 +5,11 @@
 use crate::diagnostics::Message;
 use crate::prelude::*;
 
-// PORT: Go `tspath.IsExternalModuleNameRelative`, `tspath.FileExtensionIsOneOf`
-// and their helpers. tspath has no port in this crate, so these private
-// copies follow the Go code exactly.
-
-// Go: tspath/path.go:954 PathIsRelative
-fn path_is_relative_p06(path: &str) -> bool {
-    // True if path is ".", "..", or starts with "./", "../", ".\\", or "..\\".
-    if path == "." || path == ".." {
-        return true;
-    }
-    let b = path.as_bytes();
-    if b.len() >= 2 && b[0] == b'.' && (b[1] == b'/' || b[1] == b'\\') {
-        return true;
-    }
-    if b.len() >= 3 && b[0] == b'.' && b[1] == b'.' && (b[2] == b'/' || b[2] == b'\\') {
-        return true;
-    }
-    false
-}
-
-// Go: tspath/path.go IsVolumeCharacter
-fn is_volume_character_p06(ch: u8) -> bool {
-    (b'a'..=b'z').contains(&ch) || (b'A'..=b'Z').contains(&ch)
-}
-
-// Go: tspath/path.go:152 getFileUrlVolumeSeparatorEnd
-fn get_file_url_volume_separator_end_p06(url: &[u8], start: usize) -> i32 {
-    if url.len() <= start {
-        return -1;
-    }
-    let ch0 = url[start];
-    if ch0 == b':' {
-        return (start + 1) as i32;
-    }
-    if ch0 == b'%' && url.len() > start + 2 && url[start + 1] == b'3' {
-        let ch2 = url[start + 2];
-        if ch2 == b'a' || ch2 == b'A' {
-            return (start + 3) as i32;
-        }
-    }
-    -1
-}
-
-// Go: tspath/path.go:169 GetEncodedRootLength
-fn get_encoded_root_length_p06(path: &str) -> i32 {
-    let b = path.as_bytes();
-    let ln = b.len();
-    if ln == 0 {
-        return 0;
-    }
-    let ch0 = b[0];
-
-    // POSIX or UNC
-    if ch0 == b'/' || ch0 == b'\\' {
-        if ln == 1 || b[1] != ch0 {
-            return 1; // POSIX: "/" (or non-normalized "\")
-        }
-        let offset = 2;
-        return match b[offset..].iter().position(|&c| c == ch0) {
-            None => ln as i32,                    // UNC: "//server" or "\\server"
-            Some(p1) => (p1 + offset + 1) as i32, // UNC: "//server/" or "\\server\"
-        };
-    }
-
-    // DOS
-    if is_volume_character_p06(ch0) && ln > 1 && b[1] == b':' {
-        if ln == 2 {
-            return 2; // DOS: "c:" (but not "c:d")
-        }
-        let ch2 = b[2];
-        if ch2 == b'/' || ch2 == b'\\' {
-            return 3; // DOS: "c:/" or "c:\"
-        }
-    }
-
-    // Untitled paths (e.g., "^/untitled/ts-nul-authority/Untitled-1")
-    if ch0 == b'^' && ln > 1 && b[1] == b'/' {
-        return 2; // Untitled: "^/"
-    }
-
-    // URL
-    const URL_SCHEME_SEPARATOR: &str = "://";
-    if let Some(scheme_end) = path.find(URL_SCHEME_SEPARATOR) {
-        let authority_start = scheme_end + URL_SCHEME_SEPARATOR.len();
-        if let Some(authority_length) = path[authority_start..].find('/') {
-            // URL: "file:///", "file://server/", "file://server/path"
-            let authority_end = authority_start + authority_length;
-
-            // For local "file" URLs, include the leading DOS volume (if present).
-            let scheme = &path[..scheme_end];
-            let authority = &path[authority_start..authority_end];
-            if scheme == "file"
-                && (authority.is_empty() || authority == "localhost")
-                && (ln > authority_end + 2)
-                && is_volume_character_p06(b[authority_end + 1])
-            {
-                let volume_separator_end =
-                    get_file_url_volume_separator_end_p06(b, authority_end + 2);
-                if volume_separator_end != -1 {
-                    if volume_separator_end as usize == ln {
-                        return !volume_separator_end;
-                    }
-                    if b[volume_separator_end as usize] == b'/' {
-                        return !(volume_separator_end + 1);
-                    }
-                }
-            }
-            return !((authority_end + 1) as i32); // URL: "file://server/", "http://server/"
-        }
-        return !(ln as i32); // URL: "file://server", "http://server"
-    }
-
-    // relative
-    0
-}
-
-// Go: tspath/path.go:981 IsExternalModuleNameRelative
-fn is_external_module_name_relative_p06(module_name: &str) -> bool {
-    // TypeScript 1.0 spec (April 2014): 11.2.1
-    // An external module name is "relative" if the first term is "." or "..".
-    // Update: We also consider a path like `C:\foo.ts` "relative" because we do not search for it in `node_modules` or treat it as an ambient module.
-    path_is_relative_p06(module_name) || get_encoded_root_length_p06(module_name) > 0
-}
+// PORT: Go `tspath.FileExtensionIsOneOf` as a private copy. ts#64544 and
+// ts#64159 changed the root rules of `tspath.IsExternalModuleNameRelative`
+// (dynamic file names, file URLs without case), so that one is the tspath
+// port.
+use crate::frontend::tspath::is_external_module_name_relative;
 
 // Go: tspath/extension.go:79 FileExtensionIsOneOf
 fn file_extension_is_one_of_p06(path: &str, extensions: &[&str]) -> bool {
@@ -160,7 +42,7 @@ pub struct InheritanceInfo {
 }
 
 impl Checker {
-    // Go: checker/checker.go:4904 checkIndexConstraintForProperty
+    // Go: checker/checker.go:4920 checkIndexConstraintForProperty
     pub fn check_index_constraint_for_property(
         &mut self,
         t: TypeId,
@@ -250,7 +132,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4950 checkIndexConstraintForIndexSignature
+    // Go: checker/checker.go:4966 checkIndexConstraintForIndexSignature
     pub fn check_index_constraint_for_index_signature(
         &mut self,
         t: TypeId,
@@ -328,7 +210,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4987 checkClassOrInterfaceForDuplicateIndexSignatures
+    // Go: checker/checker.go:5003 checkClassOrInterfaceForDuplicateIndexSignatures
     pub fn check_class_or_interface_for_duplicate_index_signatures(&mut self, node: Node) {
         // Only check the type once
         let symbol = self.get_symbol_of_declaration(node);
@@ -344,7 +226,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:4995 checkTypeForDuplicateIndexSignatures
+    // Go: checker/checker.go:5011 checkTypeForDuplicateIndexSignatures
     pub fn check_type_for_duplicate_index_signatures(&mut self, node: Node) {
         // TypeScript 1.0 spec (April 2014)
         // 3.7.4: An object type can contain at most one string index signature and one numeric index signature.
@@ -383,7 +265,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5024 checkPropertyInitialization
+    // Go: checker/checker.go:5040 checkPropertyInitialization
     pub fn check_property_initialization(&mut self, node: Node) {
         if !self.strict_null_checks
             || !self.strict_property_initialization
@@ -426,7 +308,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5047 isPropertyWithoutInitializer
+    // Go: checker/checker.go:5063 isPropertyWithoutInitializer
     pub fn is_property_without_initializer(&self, node: Node) -> bool {
         is_property_declaration(node)
             && !has_abstract_modifier(node)
@@ -434,7 +316,7 @@ impl Checker {
             && node.initializer().is_nil()
     }
 
-    // Go: checker/checker.go:5051 isPropertyInitializedInStaticBlocks
+    // Go: checker/checker.go:5067 isPropertyInitializedInStaticBlocks
     pub fn is_property_initialized_in_static_blocks(
         &mut self,
         prop_name: Node,
@@ -472,7 +354,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:5068 isPropertyInitializedInConstructor
+    // Go: checker/checker.go:5084 isPropertyInitializedInConstructor
     pub fn is_property_initialized_in_constructor(
         &mut self,
         prop_name: Node,
@@ -510,7 +392,7 @@ impl Checker {
         !self.contains_undefined_type(flow_type)
     }
 
-    // Go: checker/checker.go:5082 checkInterfaceDeclaration
+    // Go: checker/checker.go:5098 checkInterfaceDeclaration
     pub fn check_interface_declaration(&mut self, node: Node) {
         if !self.check_grammar_modifiers(node) {
             self.check_grammar_interface_declaration(node);
@@ -527,13 +409,18 @@ impl Checker {
         self.check_exports_on_merged_declarations(node);
         let symbol = self.get_symbol_of_declaration(node);
         self.check_type_parameter_lists_identical(symbol);
-        // Only check this symbol once
+        // Check once per checker, but report on the first interface declaration,
+        // independently of which declaration is checked first.
+        // (ts#64566, Go N' checker.go:5110)
         if !self.declared_type_links.get(symbol).interface_checked {
             self.declared_type_links.get(symbol).interface_checked = true;
+            let first_interface_declaration =
+                get_declaration_of_kind(&self.symbols, symbol, SyntaxKind::InterfaceDeclaration);
             let t = self.get_declared_type_of_symbol(symbol);
             let type_with_this = self.get_type_with_this_argument(t, TypeId::NIL, false);
             // run subsequent checks only if first set succeeded
-            if self.check_inherited_properties_are_identical(t, node.name()) {
+            if self.check_inherited_properties_are_identical(t, first_interface_declaration.name())
+            {
                 for base_type in self.get_base_types(t) {
                     let this_type = self.ty(t).as_interface_type().this_type;
                     let base_with_this =
@@ -541,7 +428,7 @@ impl Checker {
                     self.check_type_assignable_to(
                         type_with_this,
                         base_with_this,
-                        node.name(),
+                        first_interface_declaration.name(),
                         Some(diag::Interface_0_incorrectly_extends_interface_1),
                     );
                 }
@@ -563,7 +450,7 @@ impl Checker {
         self.register_for_unused_identifiers_check(node);
     }
 
-    // Go: checker/checker.go:5127 checkInheritedPropertiesAreIdentical
+    // Go: checker/checker.go:5145 checkInheritedPropertiesAreIdentical
     pub fn check_inherited_properties_are_identical(&mut self, t: TypeId, type_node: Node) -> bool {
         let base_types = self.get_base_types(t);
         if base_types.len() < 2 {
@@ -630,7 +517,7 @@ impl Checker {
         identical
     }
 
-    // Go: checker/checker.go:5159 isPropertyIdenticalTo
+    // Go: checker/checker.go:5177 isPropertyIdenticalTo
     pub fn is_property_identical_to(
         &mut self,
         source_prop: SymbolId,
@@ -643,7 +530,7 @@ impl Checker {
         ) != Ternary::FALSE
     }
 
-    // Go: checker/checker.go:5163 checkEnumDeclaration
+    // Go: checker/checker.go:5181 checkEnumDeclaration
     pub fn check_enum_declaration(&mut self, node: Node) {
         self.check_grammar_modifiers(node);
         self.check_collisions_for_declaration_name(node, node.name());
@@ -670,7 +557,13 @@ impl Checker {
             self.declared_type_links.get(enum_symbol).enum_checked = true;
             let declarations = self.sym(enum_symbol).declarations.clone();
             if declarations.len() > 1 {
-                let enum_is_const = is_enum_const(node);
+                // ts#64566 (Go N' checker.go:5202): the const test of the first enum declaration.
+                let first_enum_declaration = get_declaration_of_kind(
+                    &self.symbols,
+                    enum_symbol,
+                    SyntaxKind::EnumDeclaration,
+                );
+                let enum_is_const = is_enum_const(first_enum_declaration);
                 // check that const is placed\omitted on all enum declarations
                 for &decl in &declarations {
                     if is_enum_declaration(decl) && is_enum_const(decl) != enum_is_const {
@@ -708,7 +601,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5214 checkEnumMember
+    // Go: checker/checker.go:5233 checkEnumMember
     pub fn check_enum_member(&mut self, node: Node) {
         if is_private_identifier(node.name()) {
             self.error(
@@ -717,12 +610,17 @@ impl Checker {
                 args![],
             );
         }
+        // ts#64674, Go N' checker.go:5237: a computed name is checked even
+        // though it is a grammar error.
+        if is_computed_property_name(node.name()) {
+            self.check_expression(node.name().expression());
+        }
         if node.initializer().is_some() {
             self.check_expression(node.initializer());
         }
     }
 
-    // Go: checker/checker.go:5223 checkModuleDeclaration
+    // Go: checker/checker.go:5245 checkModuleDeclaration
     pub fn check_module_declaration(&mut self, node: Node) {
         let body = node.body();
         if body.is_some() {
@@ -871,7 +769,7 @@ impl Checker {
                         diag::Augmentations_for_the_global_scope_can_only_be_directly_nested_in_external_modules_or_ambient_module_declarations,
                         args![],
                     );
-                } else if is_external_module_name_relative_p06(node.name().text()) {
+                } else if is_external_module_name_relative(node.name().text()) {
                     self.error(
                         node.name(),
                         diag::Ambient_module_declaration_cannot_specify_relative_module_name,
@@ -898,7 +796,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5320 checkImportAttributesType
+    // Go: checker/checker.go:5342 checkImportAttributesType
     pub fn check_import_attributes_type(&mut self, attributes: Node) {
         self.check_grammar_import_attributes_type(attributes);
         self.check_source_element(attributes);
@@ -915,7 +813,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5330 getTypeOfModuleDeclarationImportAttributes
+    // Go: checker/checker.go:5352 getTypeOfModuleDeclarationImportAttributes
     pub fn get_type_of_module_declaration_import_attributes(&mut self, attributes: Node) -> TypeId {
         if attributes.is_nil() {
             return self.empty_object_type;
@@ -923,7 +821,7 @@ impl Checker {
         self.get_type_from_type_node(attributes)
     }
 
-    // Go: checker/checker.go:5337 getTypeOfModuleImportAttributes
+    // Go: checker/checker.go:5359 getTypeOfModuleImportAttributes
     pub fn get_type_of_module_import_attributes(&mut self, symbol: SymbolId) -> TypeId {
         if let Some(&t) = self.module_import_attributes_types.get(&symbol) {
             return t;
@@ -948,7 +846,7 @@ impl Checker {
 }
 
 impl Checker {
-    // Go: checker/checker.go:5357 getFirstNonAmbientClassOrFunctionDeclaration
+    // Go: checker/checker.go:5379 getFirstNonAmbientClassOrFunctionDeclaration
     // PORT: package-level Go function that reads symbol data, so it is a
     // `Checker` method per the contract.
     pub fn get_first_non_ambient_class_or_function_declaration(&self, symbol: SymbolId) -> Node {
@@ -963,7 +861,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:5366 getIsolatedModulesLikeFlagName
+    // Go: checker/checker.go:5388 getIsolatedModulesLikeFlagName
     pub fn get_isolated_modules_like_flag_name(&self) -> String {
         if self.compiler_options.verbatim_module_syntax.is_true() {
             "verbatimModuleSyntax".to_string()
@@ -972,7 +870,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5370 checkModuleAugmentationElement
+    // Go: checker/checker.go:5392 checkModuleAugmentationElement
     pub fn check_module_augmentation_element(&mut self, node: Node) {
         match node.kind() {
             SyntaxKind::VariableStatement => {
@@ -1017,7 +915,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5398 checkImportDeclaration
+    // Go: checker/checker.go:5420 checkImportDeclaration
     pub fn check_import_declaration(&mut self, node: Node) {
         // Grammar checking
         let diagnostic = if is_in_js_file(node) {
@@ -1134,7 +1032,7 @@ impl Checker {
         self.check_import_attributes(node);
     }
 
-    // Go: checker/checker.go:5467 checkExternalImportOrExportDeclaration
+    // Go: checker/checker.go:5489 checkExternalImportOrExportDeclaration
     pub fn check_external_import_or_export_declaration(&mut self, node: Node) -> bool {
         let module_name = get_external_module_name(node);
         if module_name.is_nil() || node_is_missing(module_name) {
@@ -1159,7 +1057,7 @@ impl Checker {
             );
             return false;
         }
-        if in_ambient_external_module && is_external_module_name_relative_p06(module_name.text()) {
+        if in_ambient_external_module && is_external_module_name_relative(module_name.text()) {
             // we have already reported errors on top level imports/exports in external module augmentations in checkModuleDeclaration
             // no need to do this again.
             if !is_top_level_in_external_module_augmentation(node) {
@@ -1186,7 +1084,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:5505 checkImportBinding
+    // Go: checker/checker.go:5527 checkImportBinding
     pub fn check_import_binding(&mut self, node: Node) {
         self.check_collisions_for_declaration_name(node, node.name());
         self.check_alias_symbol(node);
@@ -1201,7 +1099,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5517 checkModuleExportName
+    // Go: checker/checker.go:5539 checkModuleExportName
     pub fn check_module_export_name(&mut self, name: Node, allow_string_literal: bool) {
         if name.is_nil() || name.kind() != SyntaxKind::StringLiteral {
             return;
@@ -1222,7 +1120,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:5530 hasTypeJsonImportAttribute
+// Go: checker/checker.go:5552 hasTypeJsonImportAttribute
 pub fn has_type_json_import_attribute(node: Node) -> bool {
     // PORT: Go reads `node.AsImportDeclaration().Attributes`; for the
     // ImportDeclaration kinds this is exactly `ast.GetImportAttributes(node)`.
@@ -1238,7 +1136,7 @@ pub fn has_type_json_import_attribute(node: Node) -> bool {
 }
 
 impl Checker {
-    // Go: checker/checker.go:5537 checkImportAttributes
+    // Go: checker/checker.go:5559 checkImportAttributes
     pub fn check_import_attributes(&mut self, declaration: Node) {
         let node = get_import_attributes(declaration);
         if node.is_nil() {
@@ -1289,7 +1187,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5569 getTypeFromImportAttributes
+    // Go: checker/checker.go:5591 getTypeFromImportAttributes
     pub fn get_type_from_import_attributes(&mut self, node: Node) -> TypeId {
         if node.is_nil() {
             return TypeId::NIL;
@@ -1300,7 +1198,7 @@ impl Checker {
         self.check_expression_cached(node)
     }
 
-    // Go: checker/checker.go:5579 checkImportAttributesExpression
+    // Go: checker/checker.go:5601 checkImportAttributesExpression
     pub fn check_import_attributes_expression(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let symbol = self.new_symbol(
@@ -1328,7 +1226,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:5596 getImportAttributesTypeForModuleSpecifier
+    // Go: checker/checker.go:5618 getImportAttributesTypeForModuleSpecifier
     pub fn get_import_attributes_type_for_module_specifier(
         &mut self,
         module_specifier: Node,
@@ -1348,7 +1246,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:5610 checkImportEqualsDeclaration
+    // Go: checker/checker.go:5632 checkImportEqualsDeclaration
     pub fn check_import_equals_declaration(&mut self, node: Node) {
         let diagnostic = if is_in_js_file(node) {
             diag::An_import_declaration_can_only_be_used_at_the_top_level_of_a_module
@@ -1432,7 +1330,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5653 checkExportDeclaration
+    // Go: checker/checker.go:5675 checkExportDeclaration
     pub fn check_export_declaration(&mut self, node: Node) {
         let diagnostic = if is_in_js_file(node) {
             diag::An_export_declaration_can_only_be_used_at_the_top_level_of_a_module
@@ -1517,7 +1415,7 @@ impl Checker {
         self.check_import_attributes(node);
     }
 
-    // Go: checker/checker.go:5702 checkExternalModuleNameInGlobalScope
+    // Go: checker/checker.go:5724 checkExternalModuleNameInGlobalScope
     pub fn check_external_module_name_in_global_scope(&mut self, node: Node) {
         if get_enclosing_container(node).kind() != SyntaxKind::SourceFile
             || (is_import_declaration_or_js_import_declaration(node)
@@ -1536,7 +1434,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:5716 checkExportSpecifier
+    // Go: checker/checker.go:5738 checkExportSpecifier
     pub fn check_export_specifier(&mut self, node: Node) {
         self.check_alias_symbol(node);
         let has_module_specifier = node.parent().parent().module_specifier().is_some();
@@ -1590,7 +1488,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:5740 isContainedByNamespace
+// Go: checker/checker.go:5762 isContainedByNamespace
 pub fn is_contained_by_namespace(node: Node) -> bool {
     let mut container = node.parent();
     if !is_source_file(container) {
@@ -1600,7 +1498,7 @@ pub fn is_contained_by_namespace(node: Node) -> bool {
 }
 
 impl Checker {
-    // Go: checker/checker.go:5748 checkExportAssignment
+    // Go: checker/checker.go:5770 checkExportAssignment
     pub fn check_export_assignment(&mut self, node: Node) {
         let is_export_equals = node.is_export_equals();
         // Always check the exported expression so its identifiers are resolved even when the
@@ -1819,7 +1717,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:5846 getVerbatimModuleSyntaxErrorMessage
+// Go: checker/checker.go:5868 getVerbatimModuleSyntaxErrorMessage
 pub fn get_verbatim_module_syntax_error_message(node: Node) -> &'static Message {
     let source_file = get_source_file_of_node(node);
     let file_name = source_file_file_name(source_file);
@@ -1833,7 +1731,7 @@ pub fn get_verbatim_module_syntax_error_message(node: Node) -> &'static Message 
 }
 
 impl Checker {
-    // Go: checker/checker.go:5858 checkExternalModuleExports
+    // Go: checker/checker.go:5880 checkExternalModuleExports
     pub fn check_external_module_exports(&mut self, node: Node) {
         let module_symbol = self.get_symbol_of_declaration(node);
         if !self.module_symbol_links.get(module_symbol).exports_checked {

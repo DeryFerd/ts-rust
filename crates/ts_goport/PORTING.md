@@ -679,7 +679,7 @@ The batch that adds it is not accepted until Theo approves.
     other `early_emit_options_allow` cases: `preserveSymlinks` (F4),
     `outFile`, `--generateTrace`, and every project with
     `GOPORT_EARLY_EMIT=0`. `--singleThreaded` is not a gap: Go's build
-    then runs one task at a time (execute/build/orchestrator.go:925
+    then runs one task at a time (execute/build/orchestrator.go:919
     `rangeTasks`).
   - C1 rate shift (int56; state note `int56-decision-2026-10-09`). C1
     makes a task with early emit finish when its emit pool jobs and d.ts
@@ -1019,7 +1019,11 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   cannot change an output. The binder reference resolver reads the
   program's binder symbols (`transformers::reference_resolver::BinderSymbols`),
   on every thread. A d.ts part waits for its file's JS part before it
-  writes, so a file's outputs are written in Go's order. The pool is off
+  writes, so a file's outputs are written in Go's order. It also waits for
+  the JS transforms before its own transforms, and imports what they wrote
+  on parse-tree nodes (ts#64649: Go runs both parts of a file in one emit
+  context; `printer::emit_context::ParseEmitNodes`). A file whose two
+  parts run on its checker (the twins below) does the same. The pool is off
   with `--singleThreaded`, `--generateTrace`, an emit called on a checker
   thread and `GOPORT_EMIT_THREADS=0` (the variable sets the thread count,
   also when no core is spare).
@@ -1570,11 +1574,11 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 - The end of a run: when SIGINT, SIGTERM, the parent watchdog or the end
   of stdin ends the context while the dispatch thread runs work that Go
   runs on a goroutine (the async part of a request, an API session), Go's
-  `Run` (`lsp/server.go:859`) returns without that work and the process
+  `Run` (`lsp/server.go:895`) returns without that work and the process
   ends at once. The port waits until that work ends, then ends with Go's
   exit code and message. A request that the end cancels can also log
   "error handling method" on stderr. Go and the port both wait for the
-  sync part of a handler (`server.go:1013`).
+  sync part of a handler (`lsp/server.go:1049`).
   - A fix ends the run from a watcher thread while the dispatch thread is
     in Go's goroutine work. So it tracks the phase of Go's dispatch
     goroutine: in `requestQueue.Get`, in the sync part of a handler, or in

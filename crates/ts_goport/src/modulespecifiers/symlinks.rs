@@ -8,6 +8,12 @@ use super::tspath::Path;
 // Go: symlinks/knownsymlinks.go:13 KnownDirectoryLink
 #[derive(Clone, Debug, Default)]
 pub struct KnownDirectoryLink {
+    /// Matches the spelling used to reach the symlink. Used to preserve the
+    /// spelling of child paths when substituting the real directory.
+    // Go N' (ts#64159, symlinks/knownsymlinks.go:16): a
+    // `tspath.RootedDirectoryPath`, stored as `SetDirectory` gets it, with no
+    // trailing directory separator (ts#64544 added one).
+    pub symlink: String,
     /// Matches the casing returned by `realpath`. Used to compute the `realpath` of children.
     /// Always has trailing directory separator
     pub real: String,
@@ -16,7 +22,7 @@ pub struct KnownDirectoryLink {
     pub real_path: Path,
 }
 
-// Go: symlinks/knownsymlinks.go:22 KnownSymlinks
+// Go: symlinks/knownsymlinks.go:23 KnownSymlinks
 // PORT: Go uses SyncMap and SyncSet, whose iteration order is random. The
 // cache is filled once and then only read, so plain ordered maps are used.
 #[derive(Clone, Debug, Default)]
@@ -32,8 +38,34 @@ pub struct KnownSymlinks {
 // PORT: `Path` needs `Hash` and `Eq` as a map key. The frontend `Path` type
 // derives them.
 
+impl KnownDirectoryLink {
+    // Go: symlinks/knownsymlinks.go:68 KnownDirectoryLink.ResolveFilePath (ts#64544 adds it as
+    // ResolveFileName; ts#64159 renames it)
+    // The real path of `file_name`, a path under the symlink, or `None` when
+    // `file_name` is not under the symlink.
+    // Go N': `RelativeFilePathFromDirectory(link.Symlink, fileName)` (tspath
+    // rooted_path.go:563, `trimContainedPath` :575) takes the rest of
+    // `file_name` after a separator below `symlink`, then
+    // `link.Real.ResolveRelativeFile` (:746) joins it to `real`.
+    // PORT: `real` keeps the trailing separator of the 673a5f17d713 port, so
+    // the join is a plain append (Go `appendPathToDirectory`, :853).
+    pub fn resolve_file_name(
+        &self,
+        file_name: &str,
+        use_case_sensitive_file_names: bool,
+    ) -> Option<String> {
+        let relative = tspath::relative_path_within_directory(
+            &self.symlink,
+            file_name,
+            use_case_sensitive_file_names,
+        )?;
+        Some(format!("{}{relative}", self.real))
+    }
+}
+
 impl KnownSymlinks {
-    // Go: symlinks/knownsymlinks.go:74 NewKnownSymlink
+    // Go: symlinks/knownsymlinks.go:74 NewKnownSymlink (at 673a5f17d713;
+    // ts#64159 renames it NewKnownSymlinks, symlinks/knownsymlinks.go:85)
     pub fn new(current_directory: &str, use_case_sensitive_file_names: bool) -> KnownSymlinks {
         KnownSymlinks {
             cwd: current_directory.to_string(),
@@ -72,12 +104,18 @@ impl KnownSymlinks {
     }
 
     // Go: symlinks/knownsymlinks.go:55 SetDirectory
+    // ts#64544: the stored link keeps the spelling of `symlink`. Go N'
+    // (ts#64159, :58 `link.Symlink = symlink`) stores it unchanged.
     pub fn set_directory(
         &mut self,
         symlink: &str,
         symlink_path: Path,
         real_directory: Option<KnownDirectoryLink>,
     ) {
+        let real_directory = real_directory.map(|mut link| {
+            link.symlink = symlink.to_string();
+            link
+        });
         if let Some(real_directory) = &real_directory {
             if !self.directories.contains_key(&symlink_path) {
                 self.directories_by_realpath
@@ -89,7 +127,7 @@ impl KnownSymlinks {
         self.directories.insert(symlink_path, real_directory);
     }
 
-    // Go: symlinks/knownsymlinks.go:65 SetFile
+    // Go: symlinks/knownsymlinks.go:76 SetFile
     pub fn set_file(&mut self, symlink: &str, symlink_path: Path, realpath: &str) {
         if !self.files.contains_key(&symlink_path) {
             let realpath_path =
@@ -102,7 +140,7 @@ impl KnownSymlinks {
         self.files.insert(symlink_path, realpath.to_string());
     }
 
-    // Go: symlinks/knownsymlinks.go:93 ProcessResolution
+    // Go: symlinks/knownsymlinks.go:103 ProcessResolution
     pub fn process_resolution(&mut self, original_path: &str, resolved_file_name: &str) {
         if original_path.is_empty() || resolved_file_name.is_empty() {
             return;
@@ -123,6 +161,8 @@ impl KnownSymlinks {
                     &common_original,
                     symlink_path.ensure_trailing_directory_separator(),
                     Some(KnownDirectoryLink {
+                        // `set_directory` sets the symlink spelling.
+                        symlink: String::new(),
                         real: tspath::ensure_trailing_directory_separator(&common_resolved),
                         real_path: tspath::to_path(&common_resolved, &cwd, case)
                             .ensure_trailing_directory_separator(),
@@ -132,7 +172,8 @@ impl KnownSymlinks {
         }
     }
 
-    // Go: symlinks/knownsymlinks.go:114 guessDirectorySymlink
+    // Go: symlinks/knownsymlinks.go:114 guessDirectorySymlink (at 673a5f17d713;
+    // ts#64159 makes it guessDirectorySymlinkFromFilePaths, symlinks/knownsymlinks.go:124)
     fn guess_directory_symlink(&self, a: &str, b: &str, cwd: &str) -> (String, String) {
         let mut a_parts =
             tspath::get_path_components(&tspath::get_normalized_absolute_path(a, cwd), "");
@@ -164,7 +205,7 @@ impl KnownSymlinks {
         (String::new(), String::new())
     }
 
-    // Go: symlinks/knownsymlinks.go:132 isNodeModulesOrScopedPackageDirectory
+    // Go: symlinks/knownsymlinks.go:145 isNodeModulesOrScopedPackageDirectory
     fn is_node_modules_or_scoped_package_directory(&self, s: &str) -> bool {
         !s.is_empty()
             && (tspath::get_canonical_file_name(s, self.use_case_sensitive_file_names)
