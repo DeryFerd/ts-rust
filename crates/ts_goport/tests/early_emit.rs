@@ -656,9 +656,9 @@ fn api_build_panics_as_go() {
 /// write whose file's d.ts then panics: the client's calls and the written
 /// files are one of Go N''s results (the answer-set rule: Go's goroutines
 /// race, so its calls and files vary by run; gopanicout2 `go-model.md`
-/// section 3, with the Go runs per case). The emit order is b, c, a.
+/// section 5, with the Go runs per case). The emit order is b, c, a.
 /// - Async, `declarationMap`, `b.d.ts.map` fails: the other d.ts maps are
-///   in flight (12 of 50 runs).
+///   in flight (19 of 70 runs).
 /// - Sync (one call at a time): in the round of the failure the next file
 ///   (in emit order) writes its output too. In the first round every
 ///   file's output is called (`b.js.map`: 48 of 190 runs, `a.js.map`: 7
@@ -708,34 +708,10 @@ fn api_build_calls_after_a_failed_write_are_one_of_gos() {
         ),
     ] {
         let case = format!("{options}, sync {sync}, {fail} fails");
-        let project = Solution::new();
-        project.write(
-            "tsconfig.json",
-            &format!(
-                r#"{{"compilerOptions": {{"strict": true, "outDir": "out", "rootDir": "src", {options}}}, "include": ["src"]}}"#
-            ),
-        );
-        project.write(
-            "src/a.ts",
-            "import { b } from \"./b\";\nimport { c } from \"./c\";\nexport const a: number = b + c;\n",
-        );
-        project.write(
-            "src/b.ts",
-            "export const b: number = 1;\nexport function fb(x: number): number { return x + b; }\n",
-        );
-        project.write("src/c.ts", "export const c: number = 2;\n");
+        let project = answer_set_project(options);
         let run = api_build_client(&project.root, sync, false, fail);
-        let mut written: Vec<String> = fs::read_dir(project.root.join("out"))
-            .map(|entries| {
-                entries
-                    .map(|entry| entry.expect("an out entry").file_name())
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
-        written.sort();
         assert_eq!(run.calls.join(" "), calls, "{case}: calls");
-        assert_eq!(written.join(" "), files, "{case}: written files");
+        assert_eq!(out_names(&project), files, "{case}: written files");
         assert_eq!(
             (run.answer, run.code),
             (None, Some(2)),
@@ -743,6 +719,108 @@ fn api_build_calls_after_a_failed_write_are_one_of_gos() {
         );
         project.remove();
     }
+}
+
+/// gopanicout3. As `api_build_calls_after_a_failed_write_are_one_of_gos`,
+/// sync, but the client answers `useOS` to every call, and the OS write of
+/// the read-only output `fail` fails. Go tries that write again after it
+/// makes the directory (vfs/osvfs/os.go:161), so the failure comes later
+/// than a failed call: the round's other writes are made, and in the next
+/// round the failed file's output is called and written, and the next
+/// file's output is called without its write (gopanicout3 `go-model.md`).
+/// Each case is one of Go N''s results: `b.js.map` in 15 of 90 runs, `a.js`
+/// 9 of 90, `c.js.map` 6 of 60, `b.d.ts.map` 5 of 60. Before gopanicout3
+/// the port made every call and write of the other files (1 to 3 of 90).
+#[cfg(unix)]
+#[test]
+fn api_build_calls_after_a_failed_os_write_are_one_of_gos() {
+    if rustix::process::geteuid().is_root() {
+        return; // root writes a read-only file
+    }
+    let maps = r#""sourceMap": true, "declaration": true"#;
+    let dmaps = r#""declaration": true, "declarationMap": true"#;
+    for (options, fail, calls, files) in [
+        (
+            maps,
+            "b.js.map",
+            "a.js.map b.js b.js.map c.js c.js.map",
+            "a.js.map b.js b.js.map c.js.map",
+        ),
+        (
+            maps,
+            "a.js",
+            "a.js a.js.map b.d.ts b.js b.js.map c.js c.js.map",
+            "a.js a.js.map b.js b.js.map c.js c.js.map",
+        ),
+        (
+            maps,
+            "c.js.map",
+            "a.js a.js.map b.js.map c.js c.js.map",
+            "a.js.map b.js.map c.js c.js.map",
+        ),
+        (
+            dmaps,
+            "b.d.ts.map",
+            "a.d.ts.map a.js b.d.ts.map b.js c.d.ts c.d.ts.map c.js",
+            "a.d.ts.map a.js b.d.ts.map b.js c.d.ts.map c.js",
+        ),
+    ] {
+        let case = format!("{options}, the OS write of {fail} fails");
+        let project = answer_set_project(options);
+        let read_only = format!("out/{fail}");
+        project.write(&read_only, "old\n");
+        let path = project.root.join(&read_only);
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o444))
+            .unwrap_or_else(|error| panic!("chmod {}: {error}", path.display()));
+        let run = api_build_client(&project.root, true, false, "");
+        assert_eq!(run.calls.join(" "), calls, "{case}: calls");
+        assert_eq!(out_names(&project), files, "{case}: out files");
+        assert_eq!(project.read(&read_only), "old\n", "{case}: not written");
+        assert_eq!(
+            (run.answer, run.code),
+            (None, Some(2)),
+            "{case}: Go's panic"
+        );
+        project.remove();
+    }
+}
+
+/// The 3-file project of the API answer-set tests (emit order b, c, a),
+/// with `options` added to its compiler options.
+#[cfg(unix)]
+fn answer_set_project(options: &str) -> Solution {
+    let project = Solution::new();
+    project.write(
+        "tsconfig.json",
+        &format!(
+            r#"{{"compilerOptions": {{"strict": true, "outDir": "out", "rootDir": "src", {options}}}, "include": ["src"]}}"#
+        ),
+    );
+    project.write(
+        "src/a.ts",
+        "import { b } from \"./b\";\nimport { c } from \"./c\";\nexport const a: number = b + c;\n",
+    );
+    project.write(
+        "src/b.ts",
+        "export const b: number = 1;\nexport function fb(x: number): number { return x + b; }\n",
+    );
+    project.write("src/c.ts", "export const c: number = 2;\n");
+    project
+}
+
+/// The names in the project's `out` directory, sorted, with spaces.
+#[cfg(unix)]
+fn out_names(project: &Solution) -> String {
+    let mut names: Vec<String> = fs::read_dir(project.root.join("out"))
+        .map(|entries| {
+            entries
+                .map(|entry| entry.expect("an out entry").file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names.join(" ")
 }
 
 /// The next message of `tsgo --api` (`api_build_client`): whether it is a
@@ -807,8 +885,8 @@ struct ApiRun {
 /// async (JSON-RPC, `--async`) or sync (the msgpack tuples
 /// `[type, method, payload]` of Go `api/protocol_msgpack.go`), with
 /// `--singleThreaded` in `rootNames` when `single_threaded`. The client
-/// fails the `writeFile` call of the file named `fail` and answers
-/// `useOS` to the others. A JSON-RPC error answer is the whole message, a
+/// fails the `writeFile` call of the file named `fail` (none when it is
+/// empty) and answers `useOS` to the others. A JSON-RPC error answer is the whole message, a
 /// msgpack one its payload.
 #[cfg(unix)]
 fn api_build_client(root: &Path, sync: bool, single_threaded: bool, fail: &str) -> ApiRun {
@@ -869,7 +947,7 @@ fn api_build_client(root: &Path, sync: bool, single_threaded: bool, fail: &str) 
                 .nth(1)
                 .and_then(|rest| rest.split('"').next())
                 .unwrap_or_else(|| panic!("not a writeFile call: {payload}"));
-            let failed = path.ends_with(&format!("/{fail}"));
+            let failed = !fail.is_empty() && path.ends_with(&format!("/{fail}"));
             calls.push(path.rsplit('/').next().unwrap_or(path).to_string());
             client.answer_write_file(&method, !failed);
         }

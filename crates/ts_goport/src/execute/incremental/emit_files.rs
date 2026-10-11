@@ -962,9 +962,9 @@ fn is_declaration_output(write: &BufferedWrite) -> bool {
 /// failed write of its file (`signature_read_diagnostics`) panics and ends
 /// the process during the other goroutines' calls, so Go makes some of
 /// their calls and writes some of their outputs, by timing. This makes
-/// calls and writes that Go N' often makes (gopanicout1 and gopanicout2
-/// `go-model.md`, the client's call set and the written files are one of
-/// Go's results in 30 to 160 runs per shape):
+/// calls and writes that Go N' often makes (gopanicout1, gopanicout2 and
+/// gopanicout3 `go-model.md`, the client's call set and the written files
+/// are one of Go's results in 30 to 190 runs per shape):
 /// - The outputs go in rounds: the first output of each file that comes
 ///   before its declarations, then the second..., then the declaration
 ///   outputs in rounds. A file's goroutine writes its JS and maps before
@@ -978,7 +978,8 @@ fn is_declaration_output(write: &BufferedWrite) -> bool {
 /// - With `Serialized` calls (`flush_serialized_client_writes`): in the
 ///   round of the failure the next file's output is written too, and in
 ///   the first round every file's output is called; then the doomed
-///   file's own outputs.
+///   file's own outputs. A failed OS write after a `useOS` answer dooms
+///   its file one round later.
 /// - No other write is made: the replay panics at the doomed d.ts, and the
 ///   process ends (`program_emit::wait_emit_jobs`).
 ///
@@ -1051,9 +1052,8 @@ struct ClientFlush<'a> {
 }
 
 impl ClientFlush<'_> {
-    /// Makes the write of an output of `file` and records a failure. True
-    /// when this failure dooms the file: a failed output before the file's
-    /// d.ts (not the d.ts itself, whose signature comes before its write).
+    /// Makes the write of an output of `file` and records a failure (`fail`).
+    /// True when this failure dooms the file.
     fn write(&mut self, file: usize, mut write: BufferedWrite) -> bool {
         let result = if self.failed.contains(&file) && write.signature_read_diagnostics {
             None
@@ -1069,15 +1069,34 @@ impl ClientFlush<'_> {
                 Err(err) => Some(err),
             }
         };
+        self.fail(
+            file,
+            write.file_name,
+            result,
+            write.signature_read_diagnostics,
+        )
+    }
+
+    /// Records a write of an output of `file` that failed with `result`, or
+    /// that was left out (`None`). True when this failure dooms the file: a
+    /// failed output before the file's d.ts (not the d.ts itself, whose
+    /// signature comes before its write, `signature_read_diagnostics`).
+    fn fail(
+        &mut self,
+        file: usize,
+        file_name: String,
+        result: Option<String>,
+        signature_read_diagnostics: bool,
+    ) -> bool {
         let dooms = self.doomed.is_none()
             && result.is_some()
-            && !write.signature_read_diagnostics
+            && !signature_read_diagnostics
             && self.reads_diagnostics.contains(&file);
         if dooms {
             self.doomed = Some(file);
         }
         self.failed.insert(file);
-        self.failures.insert(write.file_name, result);
+        self.failures.insert(file_name, result);
         dooms
     }
 }
@@ -1094,6 +1113,13 @@ impl ClientFlush<'_> {
 ///   failure, and the earlier writes of the round are lost.
 ///
 /// Then only the doomed file's own outputs are made.
+///
+/// A failed OS write after a `useOS` answer (gopanicout3 `go-model.md`) is
+/// slower than a failed call: Go tries the write again after it makes the
+/// directory (vfs/osvfs/os.go:161 `writeFileEnsuringDir`). So it dooms its
+/// file after the round's OS writes, and in the next round the doomed
+/// file's output is called and written, and the next file's output is
+/// called without its write. Then only the doomed file's own outputs.
 fn flush_serialized_client_writes(
     rounds: Vec<((bool, usize, usize), BufferedWrite)>,
     flush: &mut ClientFlush<'_>,
@@ -1105,6 +1131,8 @@ fn flush_serialized_client_writes(
         .unwrap_or(0);
     let mut rounds = rounds.into_iter().peekable();
     let mut first_round = true;
+    // A failed OS write of the last round doomed its file.
+    let mut doomed_by_os_write = false;
     while let Some(&((declaration, place, _), _)) = rounds.peek() {
         let mut round = Vec::new();
         while let Some(((_, _, file), write)) =
@@ -1116,8 +1144,12 @@ fn flush_serialized_client_writes(
             for (file, write) in round {
                 if file == doomed {
                     flush.write(file, write);
+                } else if doomed_by_os_write && file == (doomed + 1) % files {
+                    // The process ends before this OS write.
+                    drop(defer_os_writes(|| flush.write(file, write)));
                 }
             }
+            doomed_by_os_write = false;
             continue;
         }
         let mut held = Vec::new();
@@ -1128,22 +1160,27 @@ fn flush_serialized_client_writes(
             };
             if called {
                 let name = write.file_name.clone();
-                held.push((file, name, defer_os_writes(|| flush.write(file, write))));
+                let signature_read_diagnostics = write.signature_read_diagnostics;
+                let os_writes = defer_os_writes(|| flush.write(file, write));
+                held.push((file, name, signature_read_diagnostics, os_writes));
             }
         }
-        for (file, name, os_writes) in held {
-            let written = flush
-                .doomed
-                .is_none_or(|doomed| file == doomed || file == (doomed + 1) % files);
+        // The doom of a failed call of the round.
+        let doomed_by_call = flush.doomed;
+        for (file, name, signature_read_diagnostics, os_writes) in held {
+            let written =
+                doomed_by_call.is_none_or(|doomed| file == doomed || file == (doomed + 1) % files);
             if !written {
                 continue;
             }
             for os_write in os_writes {
                 if let Err(err) = os_write() {
-                    flush.failed.insert(file);
-                    flush
-                        .failures
-                        .insert(name.clone(), Some(fs_error_text(&err)));
+                    doomed_by_os_write |= flush.fail(
+                        file,
+                        name.clone(),
+                        Some(fs_error_text(&err)),
+                        signature_read_diagnostics,
+                    );
                 }
             }
         }
