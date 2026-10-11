@@ -67,8 +67,10 @@ use std::time::{Duration, Instant};
 
 /// Go `chan *Message` with capacity 1 for one pending server-to-client call.
 /// PORT: with the instant at which the reader thread read the response
-/// (`read_on_thread`; `None` without it), for the Go clock.
-type ResponseChan = Rc<RefCell<Option<(Message, Option<Instant>)>>>;
+/// (`read_on_thread`; `None` without it), for the Go clock, and whether it
+/// read it after the `ctx` of `run` was done (the late reply of
+/// `end_read_loop`).
+type ResponseChan = Rc<RefCell<Option<(Message, Option<Instant>, bool)>>>;
 
 // Go: ipc/conn_async.go:20 AsyncConn
 // AsyncConn manages bidirectional JSON-RPC communication with async request handling.
@@ -284,11 +286,15 @@ impl AsyncConn {
     /// Go's `Run` gave each response to its call when it read it
     /// (`handleResponse`, :96), before it returned. So the responses that
     /// the thread read before the end and that no wait took yet go to their
-    /// calls first: a call that a nested request held keeps its reply. The
-    /// message read after a signal stays: Go's call returned `ctx.Err()` at
-    /// the signal, before that read.
+    /// calls first: a call that a nested request held keeps its reply. This
+    /// holds also for a response read after a signal (the 1 read after it,
+    /// the late reply): Go's `Run` gave it at :96, then returned at :84.
+    /// The `select` of its call (:289) took `ctx.Done()` first when its
+    /// `ctx` was done at the signal, so that call returns `ctx.Err()`
+    /// (`wait_on_reader`). A request or a notification read after a signal
+    /// stays for `run`.
     fn end_read_loop(&self, reader: &RunReader) {
-        let (end, ended_at, responses) = {
+        let (end, ended_at, responses, late) = {
             let mut state = lock(&reader.inbox.state);
             let Some((end, ended_at)) = state.end.take() else {
                 return;
@@ -297,10 +303,14 @@ impl AsyncConn {
                 .into_iter()
                 .partition(|(msg, _)| msg.is_response());
             state.messages = rest;
-            (end, ended_at, responses)
+            let late = state.after_cancel.take_if(|(msg, _)| msg.is_response());
+            (end, ended_at, responses, late)
         };
         for (msg, read_at) in responses {
-            self.handle_response(msg, Some(read_at));
+            self.handle_response(msg, Some(read_at), false);
+        }
+        if let Some((msg, read_at)) = late {
+            self.handle_response(msg, Some(read_at), true);
         }
         match end {
             ReadEnd::Returned(result) => {
@@ -327,7 +337,7 @@ impl AsyncConn {
     /// message (`read_on_thread`).
     fn dispatch(&self, ctx: &Context, msg: Message, read_at: Option<Instant>) {
         if msg.is_response() {
-            self.handle_response(msg, read_at);
+            self.handle_response(msg, read_at, false);
         } else if msg.is_request() {
             if let Err(request_err) = self.handle_request(ctx, msg)
                 && self.record_request_error(request_err)
@@ -358,7 +368,7 @@ impl AsyncConn {
         entered: Instant,
     ) -> bool {
         if msg.is_response() {
-            self.handle_response(msg, Some(read_at));
+            self.handle_response(msg, Some(read_at), false);
             return false;
         }
         let _frame = Frame::push(self, entered.saturating_duration_since(read_at));
@@ -422,7 +432,8 @@ impl AsyncConn {
 
     // Go: ipc/conn_async.go:158 handleResponse
     // handleResponse matches a response to a pending request.
-    fn handle_response(&self, msg: Message, read_at: Option<Instant>) {
+    // PORT: `read_at` and `late` go with the response (`ResponseChan`).
+    fn handle_response(&self, msg: Message, read_at: Option<Instant>, late: bool) {
         let Some(id) = msg.id.clone() else {
             // Go dereferences the nil ID and panics; responses always have one.
             panic!("runtime error: invalid memory address or nil pointer dereference");
@@ -430,7 +441,7 @@ impl AsyncConn {
         let ch = self.pending.borrow_mut().remove(&id);
 
         if let Some(ch) = ch {
-            *ch.borrow_mut() = Some((msg, read_at));
+            *ch.borrow_mut() = Some((msg, read_at, late));
         }
     }
 
@@ -622,7 +633,7 @@ impl AsyncConn {
             }
 
             let resp = response_chan.borrow_mut().take();
-            if let Some((resp, _)) = resp {
+            if let Some((resp, _, _)) = resp {
                 return response_result(resp);
             }
 
@@ -672,9 +683,10 @@ impl AsyncConn {
     /// the call waits until its response comes, its channel closes or
     /// `ctx` is done, and dispatches the messages that come meanwhile (file
     /// header). It returns what wakes Go's `select` first
-    /// (`Inbox::next_for_call`). A call made when `ctx` is already done
-    /// returns `ctx.Err()` right after its write. `wrote`: when the call
-    /// wrote its request.
+    /// (`Inbox::next_for_call`; a late reply loses to a done `ctx`,
+    /// `end_read_loop`). A call made when `ctx` is already done returns
+    /// `ctx.Err()` right after its write. `wrote`: when the call wrote its
+    /// request.
     fn wait_on_reader(
         &self,
         ctx: &Context,
@@ -689,7 +701,12 @@ impl AsyncConn {
         let mut held_until = None;
         let (result, woke) = loop {
             let resp = response_chan.borrow_mut().take();
-            if let Some((resp, read_at)) = resp {
+            if let Some((resp, read_at, late)) = resp {
+                // Go :290: `ctx.Done()` came at the signal, before `Run`
+                // read the late reply.
+                if late && let Some(err) = ctx.err() {
+                    break (Err(err), Some(Woke::Canceled(reader.inbox.canceled_at())));
+                }
                 break (response_result(resp), read_at.map(Woke::Reply));
             }
             if !self.pending.borrow().contains_key(id) {
@@ -2138,7 +2155,11 @@ pub(crate) mod tests {
     /// context, as the API's module resolver) and notes the result. `lags`
     /// makes 2 calls and notes its frame's lag after each. `hold` waits
     /// `HOLD` and does not look at its context; `holdcall` then makes a
-    /// call and notes its result. Other requests answer `true`.
+    /// call and notes its result. `bgcall` makes a call with a context that
+    /// is never done and notes the result. `endnotify` and `endcall` note
+    /// `start`, wait until the read loop ended, then notify, or call with a
+    /// context that is never done, and note the result. Other requests
+    /// answer `true`.
     struct CallbackHandler {
         conn: std::cell::OnceCell<std::rc::Weak<AsyncConn>>,
         call_ctx: Context,
@@ -2164,6 +2185,18 @@ pub(crate) mod tests {
             let text = |result: Result<JsonValue, GoError>| match result {
                 Ok(_) => "ok".to_string(),
                 Err(err) => err.error(),
+            };
+            // Waits up to 5 s until the reader thread ended the read loop.
+            let wait_for_the_end = |conn: &AsyncConn| {
+                let reader = conn
+                    .reader
+                    .borrow()
+                    .clone()
+                    .expect("run reads on its thread");
+                let end = Instant::now() + Duration::from_secs(5);
+                while !lock(&reader.inbox.state).ended && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             };
             match method {
                 "outer" | "late" => {}
@@ -2207,6 +2240,30 @@ pub(crate) mod tests {
                     self.notes.send(format!("hcall | {result}")).expect("notes");
                     return Ok(None);
                 }
+                "bgcall" => {
+                    let result = text(conn().call(&context::background(), "callback", None));
+                    self.notes
+                        .send(format!("bgcall | {result}"))
+                        .expect("notes");
+                    return Ok(None);
+                }
+                "endnotify" | "endcall" => {
+                    self.notes.send(format!("{method} | start")).expect("notes");
+                    let conn = conn();
+                    wait_for_the_end(&conn);
+                    let result = if method == "endnotify" {
+                        match conn.notify(ctx, "note", None) {
+                            Ok(()) => "ok".to_string(),
+                            Err(err) => err.error(),
+                        }
+                    } else {
+                        text(conn.call(&context::background(), "callback", None))
+                    };
+                    self.notes
+                        .send(format!("{method} | {result}"))
+                        .expect("notes");
+                    return Ok(None);
+                }
                 "inner" => {
                     self.inner.borrow_mut().push(ctx.clone());
                     return Ok(None);
@@ -2221,15 +2278,7 @@ pub(crate) mod tests {
             let conn = conn();
             if method == "late" {
                 let first = conn.call(&self.call_ctx, "callback", None).err();
-                let reader = conn
-                    .reader
-                    .borrow()
-                    .clone()
-                    .expect("run reads on its thread");
-                let end = Instant::now() + Duration::from_secs(5);
-                while !lock(&reader.inbox.state).ended && Instant::now() < end {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                wait_for_the_end(&conn);
                 let second = conn.call(&self.call_ctx, "callback", None).err();
                 let texts = [&first, &second].map(|err| err.as_ref().map(GoError::error));
                 self.notes.send(format!("late | {texts:?}")).expect("notes");
@@ -2494,6 +2543,57 @@ pub(crate) mod tests {
             .expect("run returned");
         assert_eq!(result, Err("context canceled".to_string()));
         runner.join().expect("run thread");
+    }
+
+    /// Runs `first` (id 1), which calls the client back (api1), and in its
+    /// wait `nested` (id 2), which waits until the read loop ended. Then
+    /// cancels the `ctx` of `run` and answers api1: the 1 message read after
+    /// the signal, which ends the read loop. Returns the notes of `nested`
+    /// and `first`.
+    fn late_reply(first: &str, nested: &str) -> [String; 2] {
+        let (ctx, cancel) = context::with_cancel(&context::background());
+        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{first}"}}"#);
+        write_framed(&client, &body);
+        let call = read_framed(&client);
+        assert!(call.contains(r#""id":"api1""#), "{call}");
+        let body = format!(r#"{{"jsonrpc":"2.0","id":2,"method":"{nested}"}}"#);
+        write_framed(&client, &body);
+        let note = |what: &str| notes.recv_timeout(Duration::from_secs(5)).expect(what);
+        assert_eq!(note("nested ran"), format!("{nested} | start"));
+        // The reader thread waits in its next read.
+        std::thread::sleep(Duration::from_millis(50));
+        cancel();
+        write_framed(&client, r#"{"jsonrpc":"2.0","id":"api1","result":true}"#);
+        let both = [note("nested returned"), note("first returned")];
+        let result = run_done
+            .recv_timeout(Duration::from_secs(5))
+            .expect("run returned");
+        assert_eq!(result, Err("context canceled".to_string()));
+        runner.join().expect("run thread");
+        both
+    }
+
+    // PORT: no Go test; Go `Run` and `Call` (ipc/conn_async.go:87-96,
+    // :289-303). A nested request makes a call or a notify after the read
+    // loop ended at a reply read after the signal. Go's `Run` gave that
+    // reply to its call (:96) before it returned and closed the pending
+    // calls. So a call whose `ctx` is not done returns the reply, and a
+    // call whose `ctx` was done at the signal returns `context canceled`.
+    #[test]
+    fn test_async_conn_reader_end_gives_the_late_reply_to_its_call() {
+        let closed = "ipc: connection closed\ncontext canceled";
+        for nested in ["endnotify", "endcall"] {
+            let after = format!("{nested} | {closed}");
+            assert_eq!(
+                late_reply("bgcall", nested),
+                [after.clone(), "bgcall | ok".to_string()]
+            );
+            assert_eq!(
+                late_reply("hcall", nested),
+                [after, "hcall | context canceled".to_string()]
+            );
+        }
     }
 
     // PORT: no Go test; Go `Run` (ipc/conn_async.go:73, :89-90). EOF while
