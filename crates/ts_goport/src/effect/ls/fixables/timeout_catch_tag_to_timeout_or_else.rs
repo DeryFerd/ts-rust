@@ -18,9 +18,6 @@ pub static TIMEOUT_CATCH_TAG_TO_TIMEOUT_OR_ELSE_FIX: Fixable = Fixable {
 };
 
 // Go: fixables/timeout_catch_tag_to_timeout_or_else.go:18 TimeoutCatchTagToTimeoutOrElseFix.Run
-// PORT: Go `SkipParentheses(Handler).AsArrowFunction()` panics when the
-// handler is not an arrow function. The port makes no edit there (the
-// analyzer only matches arrow function handlers).
 fn run_timeout_catch_tag_to_timeout_or_else_fix(
     ctx: &mut FixableContext<'_, '_>,
 ) -> Vec<CodeAction> {
@@ -46,9 +43,12 @@ fn run_timeout_catch_tag_to_timeout_or_else_fix(
                 let mut argument = f.deep_clone_node(m.duration);
                 if m.replacement_name == "timeoutOrElse" {
                     let mut handler = f.deep_clone_node(m.handler);
+                    // Go: fixables/timeout_catch_tag_to_timeout_or_else.go:36
+                    // `SkipParentheses(Handler).AsArrowFunction()` panics on
+                    // another kind; the analyzer only matches arrow handlers.
                     let arrow = skip_parentheses(m.handler);
                     if arrow.kind() != SyntaxKind::ArrowFunction {
-                        return;
+                        go_node_as_panic(arrow, "ArrowFunction");
                     }
                     if arrow.parameter_list().is_some() && !arrow.parameters().is_empty() {
                         handler = f.new_arrow_function(

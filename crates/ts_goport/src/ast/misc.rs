@@ -1856,6 +1856,28 @@ impl PositionMap {
 }
 
 // ---------------------------------------------------------------------------
+// ast_generated.go As* type assertions
+// ---------------------------------------------------------------------------
+
+/// Go `node.AsX()` on a node whose data is not an `X`: the type assertion
+/// `n.data.(*X)` panics with the Go runtime text, for example
+/// `interface conversion: ast.nodeData is *ast.CatchClause, not
+/// *ast.VariableDeclarationList`. `go_type` is the Go struct name `X`. A
+/// nil node is a nil dereference in Go.
+#[cold]
+#[inline(never)]
+#[track_caller]
+pub fn go_node_as_panic(node: Node, go_type: &str) -> ! {
+    if node.is_nil() {
+        crate::core::go_nil_dereference();
+    }
+    let have = crate::ast::synthetic::with_ast_data(node, |d| d.schema_name());
+    crate::core::go_panic(format!(
+        "interface conversion: ast.nodeData is *ast.{have}, not *ast.{go_type}"
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // ids.go
 // ---------------------------------------------------------------------------
 
@@ -1867,6 +1889,27 @@ impl PositionMap {
 mod tests {
     use super::*;
     use std::panic::AssertUnwindSafe;
+
+    // Go `n.data.(*X)` (ast_generated.go `AsX`) on other data panics with
+    // the runtime's type assertion text, which a Go LSP request recover
+    // sends back in its internal error.
+    #[test]
+    fn go_node_as_panic_names_both_go_types() {
+        let f = NodeFactory::new();
+        let block = f.new_block(f.new_node_list(&[]), false);
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            go_node_as_panic(block, "VariableDeclarationList")
+        }))
+        .expect_err("no panic");
+        assert_eq!(
+            payload
+                .downcast_ref::<crate::core::GoPanic>()
+                .map(|p| p.message.as_str()),
+            Some(
+                "interface conversion: ast.nodeData is *ast.Block, not *ast.VariableDeclarationList"
+            )
+        );
+    }
 
     // Go prints `%v` of the Kind in this panic (ast/precedence.go:715
     // `panic(fmt.Sprintf("unhandled TypeNode: %v", n.Kind))`), which is

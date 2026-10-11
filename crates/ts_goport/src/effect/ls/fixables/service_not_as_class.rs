@@ -27,11 +27,12 @@ fn run_service_not_as_class_fix(ctx: &mut FixableContext<'_, '_>) -> Vec<CodeAct
 
         if let Some(action) =
             ctx.new_fix_action("Convert to class declaration".to_string(), |tracker| {
-                // PORT: Go `CallExprNode.AsCallExpression()` panics on another
-                // kind; the analyzer only keeps call expressions.
+                // Go: fixables/service_not_as_class.go:34
+                // `CallExprNode.AsCallExpression()` panics on another kind;
+                // the analyzer only keeps call expressions.
                 let call_expr = m.call_expr_node;
                 if call_expr.kind() != SyntaxKind::CallExpression {
-                    return;
+                    go_node_as_panic(call_expr, "CallExpression");
                 }
                 let f = tracker.node_factory();
 

@@ -40,9 +40,8 @@ fn run_async_await_to_gen_try_promise(ctx: &mut RefactorContext<'_, '_>) -> Vec<
     let data_module_name = find_module_identifier(ctx.source_file, "Data");
 
     let sf = ctx.source_file;
-    let mut go_panics = false;
     let action = ctx.new_refactor_action("Rewrite to Effect.gen with failures", |tracker| {
-        go_panics = !transform_async_to_effect_gen_try_promise(
+        transform_async_to_effect_gen_try_promise(
             tracker,
             sf,
             async_fn,
@@ -50,26 +49,20 @@ fn run_async_await_to_gen_try_promise(ctx: &mut RefactorContext<'_, '_>) -> Vec<
             &data_module_name,
         );
     });
-    // PORT: see `replace_expression_via_statement`: Go panics after the
-    // error classes are queued; the port gives no action.
-    if go_panics {
-        return Vec::new();
-    }
     with_kind(action, "refactor.rewrite.effect.asyncAwaitToGenTryPromise")
 }
 
 // Go: refactors/async_await_to_gen_try_promise.go:50 transformAsyncToEffectGenTryPromise
-// PORT: returns false where Go panics (in `replace_expression_via_statement`).
 fn transform_async_to_effect_gen_try_promise(
     tracker: &mut Tracker,
     sf: Node,
     node: Node,
     effect_module_name: &str,
     data_module_name: &str,
-) -> bool {
+) {
     let body = get_function_like_body(node);
     if body.is_nil() {
-        return true;
+        return;
     }
 
     // Track error classes to generate
@@ -97,12 +90,12 @@ fn transform_async_to_effect_gen_try_promise(
     // Build non-async declaration wrapping the gen call
     let new_decl = build_non_async_declaration(tracker, node, effect_gen_call);
     if new_decl.is_nil() {
-        return true;
+        return;
     }
 
     set_parent_in_children(new_decl);
 
-    insert_error_classes_and_replace(tracker, sf, node, new_decl, error_classes)
+    insert_error_classes_and_replace(tracker, sf, node, new_decl, error_classes);
 }
 
 /// Go: `isExported` in transformAsyncToEffectGenTryPromise: the function's
@@ -123,7 +116,6 @@ pub(super) fn is_exported_for_error_classes(node: Node) -> bool {
 
 /// Go: the tail of transformAsyncToEffectGenTryPromise: insert the error
 /// classes before the top-level statement, then replace the function.
-/// False where Go panics.
 // PORT: Go repeats these lines in async_await_to_fn_try_promise.go:275.
 pub(super) fn insert_error_classes_and_replace(
     tracker: &mut Tracker,
@@ -131,7 +123,7 @@ pub(super) fn insert_error_classes_and_replace(
     node: Node,
     new_decl: Node,
     error_classes: Vec<Node>,
-) -> bool {
+) {
     // Find the top-level statement containing the function (for inserting error classes before it)
     let top_level_stmt = find_top_level_statement(node);
 
@@ -150,9 +142,8 @@ pub(super) fn insert_error_classes_and_replace(
     // Replace the function
     if node.kind() == SyntaxKind::FunctionDeclaration {
         tracker.replace_node(sf, node, new_decl, None);
-        true
     } else {
-        replace_expression_via_statement(tracker, sf, node, new_decl)
+        replace_expression_via_statement(tracker, sf, node, new_decl);
     }
 }
 

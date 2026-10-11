@@ -65,8 +65,6 @@ fn run_effect_gen_to_fn(ctx: &mut RefactorContext<'_, '_>) -> Vec<CodeAction> {
                 tracker.replace_node(sf, parsed.func_node, new_node, None);
             }
             _ => {
-                // PORT: false (Go panics) comes before any edit, so the
-                // action has no edits and is dropped.
                 replace_expression_via_statement(tracker, sf, parsed.func_node, new_node);
             }
         }
@@ -216,11 +214,13 @@ fn build_effect_gen_to_fn_replacement(
 
     // Build Effect.fn or Effect.fn("name")
     // PORT: `EffectModule` is nil for a named import (`gen(function* ...)`).
-    // Go then builds a property access with a nil expression and panics in
-    // the printer (the request answers an internal error). The port makes no
-    // edit, so there is no action.
+    // Go then builds a property access with a nil expression, and the
+    // printer dereferences it when `NewRefactorAction` gets the changes. The
+    // codeAction request answers Go's internal error for that nil
+    // dereference; the port panics here with the same value. Go prints no
+    // signal line in an answer, so no fault address is needed.
     if gen_call.effect_module.is_nil() {
-        return Node::NIL;
+        crate::core::go_nil_dereference();
     }
     let effect_id = f.deep_clone_node(gen_call.effect_module);
     let fn_access = f.new_property_access_expression(

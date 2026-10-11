@@ -12,6 +12,8 @@
 // internal/effecttest/completion_test.go or of the 10 unit test files of internal/completions,
 // ported by hand (source, cursor, the label filter of the fourslash_test.go helper, the Go
 // assertions). The answer is "ok" when every assertion holds.
+// Port refactor cases (`refactors/<profile>-port`, PORT_REFACTOR_CASES) have no Go baseline either:
+// each holds its source and the answer of effect-tsgo 0.51.1, which can be an error answer.
 //
 // usage: node scripts/effect/ls-cases.mjs --server <tsc> [--effect-repo DIR] [--kinds K,...]
 //          [--versions effect-v4,effect-v3] [--filter SUBSTR] [--out DIR] [--jobs N] [--timeout S]
@@ -472,8 +474,9 @@ function openAll(server, project, files) {
 // ---------------------------------------------------------------------------
 
 // The fourslash text that RunEffectQuickFixTest and RunEffectRefactorTest build, and its files.
-function fourslashCase(file) {
-  const units = parseTestUnits(fs.readFileSync(file, "utf8"), path.basename(file));
+// `content` is the case text (a port case has no file).
+function fourslashCase(file, content = fs.readFileSync(file, "utf8")) {
+  const units = parseTestUnits(content, path.basename(file));
   let text = "";
   if (!units.some((u) => isConfig(absName(u.name)))) text += `// @filename: /.src/tsconfig.json\n${DEFAULT_TSCONFIG}\n`;
   const testFiles = [];
@@ -602,8 +605,9 @@ function parseRefactorComment(content) {
 }
 
 async function runRefactors(c) {
-  const { files, testFiles } = fourslashCase(c.file);
-  const ranges = parseRefactorComment(fs.readFileSync(c.file, "utf8"));
+  const content = c.content ?? fs.readFileSync(c.file, "utf8");
+  const { files, testFiles } = fourslashCase(c.file, content);
+  const ranges = parseRefactorComment(content);
   setupFourslash(c.dir, files);
   const project = new Project(c.dir);
   const texts = new Map(files.map((f) => [f.name, f.content]));
@@ -618,9 +622,17 @@ async function runRefactors(c) {
       const uri = project.uri(testFiles[0]);
       for (const range of ranges) {
         const params = { textDocument: { uri }, range, context: { diagnostics: [], only: ["refactor"] } };
-        const actions = refactors(await server.request("textDocument/codeAction", params));
         const id = `R${++n}`;
         const desc = `${range.start.line + 1}:${range.start.character + 1}-${range.end.line + 1}:${range.end.character + 1}`;
+        let actions;
+        try {
+          actions = refactors(await server.request("textDocument/codeAction", params));
+        } catch (e) {
+          // A port case records the error answer of the request (a Go panic answers an internal error).
+          if (!c.recordErrors) throw e;
+          inventory.push({ id, desc, actions: [], error: e.message });
+          continue;
+        }
         inventory.push({ id, desc, actions: actions.map((a) => ({ title: a.title, kind: a.kind })) });
         for (let i = 0; i < actions.length; i++) {
           const again = refactors(await server.request("textDocument/codeAction", params));
@@ -635,7 +647,8 @@ async function runRefactors(c) {
     if (!inventory.length) out.push("(no selections)\n");
     for (const e of inventory) {
       out.push(`\n[${e.id}] selection: ${goQuote(e.desc)}\n`);
-      if (!e.actions.length) out.push("  (no refactors)\n");
+      if (e.error !== undefined) out.push(`  (error) ${e.error}\n`);
+      else if (!e.actions.length) out.push("  (no refactors)\n");
       e.actions.forEach((a, i) => out.push(`  Refactor ${i}: ${goQuote(a.title)} (${a.kind})\n`));
     }
     out.push("\n=== Refactor Application Results ===\n");
@@ -1296,6 +1309,75 @@ async function runCompletion(c) {
 // Driver
 // ---------------------------------------------------------------------------
 
+// Refactor cases that the Go harness does not have ("port cases", version `<profile>-port`). In
+// each, a Go panic inside an Effect refactor reaches the LSP request recover, which answers the whole
+// codeAction request with an internal error (root decision effect-ls-go-panics-decision-2026-10-11);
+// the inventory line `(error) <code>: <message>` records it. Each `expected` text is the answer of
+// effect-tsgo 0.51.1 (`--server` its tsc, `--kinds refactors --filter <name>`), the second selection
+// shows that the server goes on after the panic.
+const PORT_REFACTOR_CASES = [
+  {
+    // effectGenToFn with a named import of gen: EffectModule is nil, and the printer dereferences
+    // the nil receiver of the new `.fn` access (effect_gen_to_fn.go:216).
+    name: "effectGenToFn_namedGenImport",
+    profile: "effect-v4",
+    content: `// refactor: 5:3, 2:10
+import { gen, succeed } from "effect/Effect"
+
+export const program = () =>
+  gen(function*() {
+    const a = yield* succeed(1)
+    return a
+  })
+`,
+    expected: `=== Refactor Inventory ===
+
+[R1] selection: "5:3-5:3"
+  (error) -32603: InternalError: panic handling request textDocument/codeAction: runtime error: invalid memory address or nil pointer dereference
+
+[R2] selection: "2:10-2:10"
+  (no refactors)
+
+[R3] selection: "empty (0:0-0:0)"
+  (no refactors)
+
+=== Refactor Application Results ===
+(no refactors to apply)
+`,
+  },
+  {
+    // asyncAwaitToGen on an async arrow in a catch clause variable initializer under a variable
+    // statement: varDecl.Parent is the CatchClause (async_await_to_gen.go:93).
+    name: "asyncAwaitToGen_catchVariable",
+    profile: "effect-v4",
+    content: `// refactor: 7:18, 2:10
+import { Effect } from "effect"
+
+export const handler = () => {
+  try {
+    return Effect.void
+  } catch (e = async () => 1) {
+    return Effect.void
+  }
+}
+`,
+    expected: `=== Refactor Inventory ===
+
+[R1] selection: "7:18-7:18"
+  (error) -32603: InternalError: panic handling request textDocument/codeAction: interface conversion: ast.nodeData is *ast.CatchClause, not *ast.VariableDeclarationList
+
+[R2] selection: "2:10-2:10"
+  (no refactors)
+
+[R3] selection: "empty (0:0-0:0)"
+  (no refactors)
+
+=== Refactor Application Results ===
+(no refactors to apply)
+`,
+  },
+];
+
 function listTs(dir) {
   return fs.existsSync(dir) ? fs.readdirSync(dir).filter((n) => n.endsWith(".ts")).sort().map((n) => path.join(dir, n)) : [];
 }
@@ -1313,6 +1395,12 @@ function collectCases() {
     if (kinds.includes("quickfixes")) for (const f of listTs(path.join(tests, v))) add("quickfixes", v, path.basename(f, ".ts"), { file: f, baseline: path.join(REFERENCE, v, path.basename(f, ".ts") + ".quickfixes.txt"), run: runQuickFixes });
     if (kinds.includes("refactors")) for (const f of listTs(path.join(tests, v + "-refactors"))) add("refactors", v, path.basename(f, ".ts"), { file: f, baseline: path.join(REFERENCE, v, path.basename(f, ".ts") + ".refactors.txt"), run: runRefactors });
     if (kinds.includes("symbols")) for (const f of listTs(path.join(tests, v + "-document-symbols"))) add("symbols", v, path.basename(f, ".ts"), { file: f, baseline: path.join(REFERENCE, v, path.basename(f, ".ts") + ".symbols.txt"), run: runSymbols });
+  }
+  if (kinds.includes("refactors")) {
+    for (const c of PORT_REFACTOR_CASES) {
+      if (!versions.includes(c.profile)) continue;
+      add("refactors", c.profile + "-port", c.name, { file: c.name + ".ts", content: c.content, expected: c.expected, recordErrors: true, run: runRefactors });
+    }
   }
   if (kinds.includes("inlay")) for (const c of inlayCases()) add("inlay", "inlayHints", c.name, { content: c.content, baseline: path.join(REFERENCE, "inlayHints", c.name + ".baseline"), run: runInlay });
   if (kinds.includes("hover")) for (const c of hoverCases()) add("hover", "hover_test", c.name, { content: c.content, checks: c.checks, expected: hoverExpected(c), run: runHover });
