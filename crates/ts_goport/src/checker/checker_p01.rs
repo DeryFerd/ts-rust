@@ -878,6 +878,13 @@ pub struct Checker {
     pub symbol_table_alias_cache: FxHashMap<SymbolTableID, Vec<SymbolId>>,
     pub class_expression_name_tables: FxHashMap<Node, SymbolTable>,
     pub resolve_name: ResolveNameFn,
+    /// The resolver that `resolve_name` calls, for the callers that hold
+    /// the `Name` (`resolve_name_key`). `None` while flow skip verify mode
+    /// wraps `resolve_name` (`flow_skip_verify`), so every call goes
+    /// through the wrapper.
+    // PERF: noderef1 G4. Go calls the bound method `c.resolveName` with the
+    // string the node holds. The field is an `Rc<dyn Fn>` that takes text.
+    pub name_resolver: Option<Rc<NameResolver>>,
     pub resolve_name_for_symbol_suggestion: ResolveNameFn,
     /// PORT: port-only memo of the spelling suggestion from the globals
     /// table, by name id and meaning (`get_suggestion_for_symbol_name_lookup`),
@@ -1401,6 +1408,7 @@ impl Checker {
             symbol_table_alias_cache: FxHashMap::default(),
             class_expression_name_tables: FxHashMap::default(),
             resolve_name: nil_resolve_name_fn(),
+            name_resolver: None,
             resolve_name_for_symbol_suggestion: nil_resolve_name_fn(),
             global_spelling_suggestions: FxHashMap::default(),
             globals_complete: false,
@@ -1702,8 +1710,10 @@ impl Checker {
         let global_this_name = c.sym(global_this_symbol).name.clone();
         c.symbols.set(globals, global_this_name, global_this_symbol);
         // PORT: Go stores the bound method `resolver.Resolve`. The resolver is
-        // moved into the closure, which forwards the checker.
-        let resolver = c.create_name_resolver();
+        // moved into the closure, which forwards the checker. noderef1 G4:
+        // `name_resolver` holds it too.
+        let resolver = Rc::new(c.create_name_resolver());
+        c.name_resolver = Some(Rc::clone(&resolver));
         c.resolve_name = Rc::new(
             move |c: &mut Checker,
                   location: Node,

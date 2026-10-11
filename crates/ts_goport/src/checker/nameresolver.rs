@@ -147,6 +147,52 @@ pub fn resolver_name_text(name: Name) -> &'static str {
     text
 }
 
+impl Checker {
+    /// Go `c.resolveName(location, name.Text(), ...)` for a caller that has
+    /// the interned `name`: the checker's resolver (`name_resolver`) with
+    /// the name, else the `resolve_name` field with its text.
+    // PERF: noderef1 G4. No `Rc<dyn Fn>` clone and call, no text read and no
+    // `NAME_HINT` note: getsym1 measured 303 instructions per
+    // `resolve_entity_name` call around the resolve, Go 37.
+    #[inline]
+    pub fn resolve_name_key(
+        &mut self,
+        location: Node,
+        name: &Name,
+        meaning: SymbolFlags,
+        name_not_found_message: Option<NameNotFound>,
+        is_use: bool,
+        exclude_globals: bool,
+    ) -> SymbolId {
+        match &self.name_resolver {
+            Some(resolver) => {
+                let resolver = Rc::clone(resolver);
+                resolver.resolve_name(
+                    self,
+                    location,
+                    name,
+                    meaning,
+                    name_not_found_message,
+                    is_use,
+                    exclude_globals,
+                )
+            }
+            None => {
+                let resolve_name = self.resolve_name.clone();
+                resolve_name(
+                    self,
+                    location,
+                    resolver_name_text(name.clone()),
+                    meaning,
+                    name_not_found_message,
+                    is_use,
+                    exclude_globals,
+                )
+            }
+        }
+    }
+}
+
 impl NameResolver {
     // Go: binder/nameresolver.go:25 Resolve
     // PORT: Go `nameNotFoundMessage *diagnostics.Message` may be nil, so it is
