@@ -503,7 +503,10 @@ pub(crate) fn text_to_token(text: &str) -> Option<SyntaxKind> {
 // PORT: `commentDirectives` is a Go slice header. Go `Rewind` restores its
 // length, and later appends overwrite the shared backing array after that
 // length. Here the backing array is `Scanner.comment_directives` and the
-// state keeps only the length (`comment_directives_len`). `tokenValue` is a
+// state keeps only the length (`comment_directives_len`). Go `SetText` starts
+// a nil slice, which shares no array with a state saved before it; `set_text`
+// keeps the `Vec`, so a caller that rewinds to such a state saves the `Vec`
+// too (`parse_js_doc_comment`, issue #49). `tokenValue` is a
 // slice of the scanned text or an interned `&'static str` (see
 // `intern_token_value`), so the state is `Copy`.
 #[derive(Clone, Copy, Debug)]
