@@ -160,9 +160,11 @@ with the pinned `nightly-2026-06-17` and `-Zthreads=8` (the job count, at most 8
 - The first build in each target dir after the switch rebuilds every crate once. The incremental
   cache of ts_goport takes about 1.7 GB per target dir. sccache does not cache an incremental crate, so only
   `ts_goport` is incremental: sccache still caches every other crate.
-- To measure a build change, run the `buildbench-plan.sh` session `defaults` before and after it on
-  one host: `buildbench-remote.sh dbook-lan defaults` from the worktree under test (the `setup`
-  session copies its source to the host first). `buildbench-report.py <runs-dir>...` makes the table.
+- To measure a build change, run the `buildbench-plan.sh` sessions `defaults` (release) and `devloop`
+  (dev: `check`, `--bin tsgo`, `--bins`, `test --no-run`) before and after it on one host:
+  `buildbench-remote.sh dbook-lan defaults` from the worktree under test (the `setup` session copies
+  its source to the host first), or `buildbench-plan.sh <session> <out-dir>` on the host you are on.
+  `buildbench-report.py <runs-dir>...` makes the table, with the peak memory of each build.
 
 Revision evidence is the exception: `candidate.sh side` builds its release bins and its test bins with `TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0`, so the goport tests, gate, bound runs and oracles test bins from the shipped toolchain with no incremental cache (the evidence key records the toolchain).
 
