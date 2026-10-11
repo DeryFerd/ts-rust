@@ -68,6 +68,15 @@ and "Types" sections and follow them. This file adds the Effect rules.
   version (one server serves projects with and without the plugin). Only
   build info records `<version>+effect-tsgo.0.51.1`
   (`etscore::EFFECT_VERSION`).
+- Build info `effect` text: without `extends`, Go writes a root `effectFn`,
+  `namespaceImportPackages`, `barrelImportPackages` or `overrides` that the
+  config sets to `[]`, a root `importAliases: {}`, and an override `include`
+  or `exclude` set to `[]`. The port leaves them out, as Go does for the same
+  lists through `extends` (`cloneEffectOptions` makes them nil). Go reads them
+  back as empty, so neither checks a file again: only the text differs. Where
+  nil and `[]` change the compare after a round trip (the override lists and
+  `skipLeadingPath`), the port keeps them apart as Go
+  (`configraw::clone_effect_options`, `etscore::SlicePtr`).
 
 ## Go shim -> Rust
 
