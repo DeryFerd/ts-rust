@@ -1576,3 +1576,170 @@ child_test! {
         assert_eq!(exports[0].module_file_name, format!("{aug}/index.ts"));
     }
 }
+
+child_test! {
+    // R191 reviewer item 7: no program imports dep-pkg, so its other.d.ts
+    // is in no program. The checker asks for it when it resolves the alias
+    // `y`, and the alias resolver reads and binds it then
+    // (aliasresolver.go:83-91), after the checker copied the binder
+    // lineage. The checker must add the new lineage chunks before it reads
+    // the file's symbols (`program::catch_up_alias_resolver_checker`, at
+    // the checker.go:15531 site). The tests above do not show this: their
+    // alias targets are program files, which the program bound before the
+    // checker was made.
+    fn alias_target_in_no_program_is_bound_after_the_checker() {
+        let root = "/home/src/alias-catch-up";
+        let pkg = format!("{root}/node_modules/dep-pkg");
+        let index_text = "export const app = 1;\n";
+        let mut files = FileMap::new();
+        let mut add = |path: String, text: &str| {
+            files.insert(path, text.into());
+        };
+        add(
+            format!("{root}/tsconfig.json"),
+            r#"{"compilerOptions":{"module":"esnext","moduleResolution":"bundler"}}"#,
+        );
+        add(
+            format!("{root}/package.json"),
+            r#"{"name":"alias-catch-up","dependencies":{"dep-pkg":"*"}}"#,
+        );
+        add(format!("{root}/index.ts"), index_text);
+        add(
+            format!("{pkg}/package.json"),
+            r#"{"name":"dep-pkg","version":"1.0.0","types":"index.d.ts"}"#,
+        );
+        add(format!("{pkg}/index.d.ts"), "import { y } from \"./other\";\nexport { y };\n");
+        add(format!("{pkg}/other.d.ts"), "export declare const y: number;\n");
+        let (session, _) = projecttestutil::setup(files);
+        let index_uri = uri(&format!("file://{root}/index.ts"));
+        open_uri(&session, &index_uri, index_text, lsproto::LanguageKind::TYPE_SCRIPT);
+
+        with_auto_imports(&session, &index_uri);
+
+        let snapshot = session.snapshot();
+        let project = snapshot.get_default_project(&index_uri).expect("default project");
+        let program = project.borrow().get_program().expect("project has a program");
+        assert!(program.get_source_file(&format!("{pkg}/other.d.ts")).is_none());
+        let registry = snapshot
+            .auto_import_registry()
+            .expect("auto import registry not initialized");
+        assert_eq!(registry.node_modules.len(), 1);
+        let bucket = registry.node_modules.values().next().unwrap();
+        let index = bucket.index.as_ref().expect("an indexed bucket").borrow();
+        let exports = index.find("y", true);
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert_eq!(exports[0].module_file_name, format!("{pkg}/index.d.ts"));
+        assert_eq!(
+            exports[0].target.module_id.as_string(),
+            format!("{pkg}/other.d.ts")
+        );
+        assert_eq!(exports[0].target.export_name, "y");
+    }
+}
+
+child_test! {
+    // R191 reviewer item 7: a second-pass root file of an ancestor bucket
+    // that a later clone does not build. reexporter's `export *` names the
+    // ambient module "virtual-mod", which only the ancestor bucket's
+    // ambient-decl declares, so the second pass extracts reexporter with
+    // ambient-decl as a root file (registry.go:1088-1131, :1844). The edits
+    // rebuild only the app bucket. Its export count is Go N' fed0bf24149f's
+    // in each clone (2, 3, 4: `virtualValue` stays). In Go a later clone
+    // gets a new parse of ambient-decl, and the parse cache binds it
+    // (project/parsecache.go:80). The port's session keeps one parse per
+    // path (`kept_files`, project/autoimport.rs `dispose`), so a later clone
+    // reuses the parse that clone 1 bound: this test pins Go's counts, but it
+    // does not reach the root-file bind of `AliasResolver::new_checker`.
+    fn second_pass_reads_a_root_file_of_an_ancestor_bucket_in_a_later_clone() {
+        let root = "/home/src/second-pass-ancestor";
+        let app = format!("{root}/apps/web");
+        let app_index = format!("{app}/src/index.ts");
+        let reexporter = format!("{app}/node_modules/reexporter/index.d.ts");
+        let mut files = FileMap::new();
+        let mut add = |path: String, text: &str| {
+            files.insert(path, text.into());
+        };
+        add(
+            format!("{root}/package.json"),
+            r#"{"name":"repo-root","private":true,"dependencies":{"ambient-decl":"*"}}"#,
+        );
+        add(
+            format!("{root}/node_modules/ambient-decl/package.json"),
+            r#"{"name":"ambient-decl","version":"1.0.0","types":"index.d.ts"}"#,
+        );
+        add(
+            format!("{root}/node_modules/ambient-decl/index.d.ts"),
+            "declare module \"virtual-mod\" {\n  export const virtualValue: number;\n}\n",
+        );
+        add(
+            format!("{app}/package.json"),
+            r#"{"name":"web","private":true,"dependencies":{"reexporter":"*"}}"#,
+        );
+        add(
+            format!("{app}/tsconfig.json"),
+            r#"{"compilerOptions":{"module":"esnext","target":"esnext","strict":true},"include":["src"]}"#,
+        );
+        add(app_index.clone(), "export const app = 1;\n");
+        add(
+            format!("{app}/node_modules/reexporter/package.json"),
+            r#"{"name":"reexporter","version":"1.0.0","types":"index.d.ts"}"#,
+        );
+        let own = "export * from \"virtual-mod\";\nexport declare const ownValue: number;\n";
+        add(reexporter.clone(), own);
+        let (session, utils) = projecttestutil::setup(files);
+        let app_uri = lsconv::file_name_to_document_uri(&app_index);
+        open_uri(&session, &app_uri, "export const app = 1;\n", lsproto::LanguageKind::TYPE_SCRIPT);
+
+        let export_counts = || -> Vec<(String, i32)> {
+            let mut counts: Vec<(String, i32)> = auto_import_stats(&session)
+                .node_modules_buckets
+                .iter()
+                .map(|bucket| (bucket.name.clone(), bucket.export_count))
+                .collect();
+            counts.sort();
+            counts
+        };
+        let expect = |app_exports: i32| vec![(root.to_string(), 1), (app.clone(), app_exports)];
+        with_auto_imports(&session, &app_uri);
+        assert_eq!(export_counts(), expect(2), "the first clone");
+
+        // An event in the app's node_modules makes only the app bucket dirty
+        // (registry.go:749-755).
+        for (text, app_exports) in [
+            "export declare const ownValue2: number;\n",
+            "export declare const ownValue2: number;\nexport declare const ownValue3: number;\n",
+        ]
+        .into_iter()
+        .zip([3, 4])
+        {
+            utils.fs().write_file(&reexporter, &format!("{own}{text}")).unwrap();
+            session.did_change_watched_files(
+                &bg(),
+                &[Some(lsproto::FileEvent {
+                    type_: CHANGED,
+                    uri: lsconv::file_name_to_document_uri(&reexporter),
+                })],
+            );
+            with_auto_imports(&session, &app_uri);
+            assert_eq!(export_counts(), expect(app_exports), "a later clone");
+        }
+        let snapshot = session.snapshot();
+        let registry = snapshot
+            .auto_import_registry()
+            .expect("auto import registry not initialized");
+        let bucket = registry
+            .node_modules
+            .values()
+            .find(|bucket| {
+                bucket
+                    .package_files
+                    .as_ref()
+                    .is_some_and(|files| files.contains_key("reexporter"))
+            })
+            .expect("the app bucket");
+        let index = bucket.index.as_ref().expect("an indexed bucket").borrow();
+        let exports = index.find("virtualValue", true);
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert_eq!(exports[0].module_file_name, reexporter);
+    }
+}
