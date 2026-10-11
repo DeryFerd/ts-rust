@@ -16,7 +16,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 - **effperf3 bc6cd8b72 (not the head 91ad83a5e): skeptic PASS, into int61 (note effperf3-result-2026-10-11).** Effect st instructions -2.0%, tests -2.0%, T3 server -1.4%; output equal. Items 9 and 10 dropped as below the bar. Base is int60p f0d8c2df8 + perfP2: merge after R192.
 
-- **Running: effperf4 (effperf2 item 1: one pre-order node list per file for the Effect rule walks; study estimate effect -4.5%, T3 -4.5%), on effperf3 bc6cd8b72, goport-effperf4.**
+- **effperf4 b553fc3d5: skeptic PASS, g4 reverted (note effperf4-result-2026-10-11): effect st -6.4 percent, T3 server -6.8, output equal. Into int62.**
 
 - **astshrink1 f56430d3b skeptic PASS (note astshrink1-result-2026-10-11): default peak RSS -2.2 to -6.7 percent, output equal. Running: astshrink2 (round 2: the 2 latent list-owner and print-pack defects). Then into int61 with its 2 protected expectation changes for the reviewer.**
 
