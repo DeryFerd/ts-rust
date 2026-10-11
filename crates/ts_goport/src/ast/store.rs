@@ -3383,8 +3383,10 @@ impl FileStore {
             return;
         }
         // The lists of a store that owns its nodes are all in its owned
-        // table (`new_store_list`).
-        debug_assert_eq!(
+        // table (`new_store_list`). The table below replaces the static
+        // table, so a static list would be lost: check it in every build
+        // (one compare per publish).
+        assert_eq!(
             self.lists.len(),
             1,
             "static lists in a store with owned nodes"
@@ -6015,33 +6017,39 @@ impl FileStore {
             return set_parent_in_owned_store_children(self, index);
         }
         let kind = self.kinds[index];
-        // `NodeHeader::stored_parent` of a child in the store of `parent`.
-        let stored = handle(LOCAL_STORE, index as u32);
+        // The `ParentCode` of `parent` in a child of its store
+        // (`set_slot_parent` of a `LOCAL_STORE` parent).
+        let code = local_parent_code(handle(LOCAL_STORE, index as u32));
         // `StoreChildLinks::new`.
         self.unlink_children(index);
         self.build_links[index].first_child = LINK_END;
         let mut last = LINK_END;
         let mut linking = true;
-        // The list table is moved out for the walk, so the parent writes can
-        // borrow the store.
-        let lists = std::mem::take(&mut self.lists);
+        // The fields are borrowed apart, so the walk reads the list table
+        // while the records and the links change. A panic in the walk (a
+        // Go panic that an LSP request recovers) leaves the table in place.
+        let FileStore {
+            lists,
+            records,
+            build_links,
+            ..
+        } = self;
         let stopped =
-            super::node::for_each_store_child_id(kind, node, ListIds::Static(&lists), |child| {
+            super::node::for_each_store_child_id(kind, node, ListIds::Static(lists), |child| {
                 let child = child as usize;
                 // PERF: perfP2 item 2. The record bit, not the node column: the
                 // parent write below reads and writes the same record.
-                if !self.records[child].is_node() {
+                if !records[child].is_node() {
                     return true;
                 }
                 // `StoreChildLinks::set_parent`.
-                self.set_slot_parent(child, stored);
-                if linking && !self.link_child(index, &mut last, child) {
+                records[child].set_parent_code(code);
+                if linking && !link_child(build_links, index, &mut last, child) {
                     linking = false;
-                    self.unlink_children(index);
+                    unlink_children(build_links, index);
                 }
                 false
             });
-        self.lists = lists;
         !stopped
     }
 }
@@ -7391,6 +7399,63 @@ mod tests {
             }
             false
         });
+    }
+
+    // A panic in the child walk of `set_parent_in_store_children` (a Go
+    // panic that an LSP request recovers) leaves the list table of the store
+    // in place: the walk borrows the table, it does not move it out. Here
+    // the walk panics on a list field that names no list.
+    #[test]
+    fn set_parent_in_store_children_keeps_the_lists_after_a_panic() {
+        let file = new_file_store("/walk-panic.ts", "a;");
+        let f = NodeFactory::for_file(file);
+        let a = f.new_identifier("a");
+        let statement = f.new_expression_statement(a);
+        let block = f.new_block(f.new_node_list(&[statement]), false);
+        let other = f.new_block(f.new_node_list(&[statement]), false);
+        let lists = with_store(file, |s| s.lists.len());
+        assert!(lists > 1, "the blocks have static lists");
+
+        let mut data = with_ast_data(block, Clone::clone);
+        if let NodeData::Block(d) = &mut data {
+            d.statements = crate::astdata::NodeList::new(u32::MAX - 1);
+        }
+        replace_store_node_data(block, data);
+        let walk = std::panic::catch_unwind(|| set_parent_in_store_children(block));
+        assert!(walk.is_err(), "the walk reads a list that is not there");
+
+        assert_eq!(with_store(file, |s| s.lists.len()), lists);
+        assert_eq!(other.statements().to_vec(), vec![statement]);
+        assert!(set_parent_in_store_children(other));
+        assert_eq!(statement.parent(), other);
+    }
+
+    // A store that owns its nodes keeps all its lists in its owned table,
+    // and the static publish (`leak_owned_nodes`) replaces the static table:
+    // a static list there would be lost. The check runs in every build.
+    #[test]
+    fn leak_owned_nodes_with_a_static_list_panics_in_every_build() {
+        let file = {
+            let _scope = enter_owned_parse();
+            let file = new_file_store("/owned-static-list.ts", "");
+            let f = NodeFactory::for_file(file);
+            let _block = f.new_block(f.new_node_list(&[]), false);
+            freeze_file_store(file);
+            file
+        };
+        let leak = std::panic::catch_unwind(|| {
+            with_store_mut(file, |s| {
+                let nil_list = s.lists[0];
+                s.lists.push(nil_list);
+                s.leak_owned_nodes();
+            });
+        });
+        let payload = leak.expect_err("a static list in a store with owned nodes");
+        let message = payload.downcast_ref::<String>().map_or("", String::as_str);
+        assert!(
+            message.contains("static lists in a store with owned nodes"),
+            "{message}"
+        );
     }
 
     #[test]
