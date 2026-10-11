@@ -170,6 +170,9 @@ etscore.SeverityError` becomes `Severity::Error`.
   (`children(i)`). Each rule still runs alone and visits the same nodes in
   the same order, so its checker queries keep Go's order. Walks of a
   subtree (a callback body, a heritage clause) keep `for_each_child`.
+  The type parser's own file walks (the effect context, piping flows,
+  expected and real types) keep `for_each_child`: the order saved less than
+  0.3 percent there.
 
 ## API stability rules (0.51.1)
 
