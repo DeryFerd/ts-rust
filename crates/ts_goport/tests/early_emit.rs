@@ -582,8 +582,10 @@ const NIL_SIGNAL: &str = "[signal SIGSEGV: segmentation violation code=0x1 addr=
 /// goroutine: Go N' gives no answer to `build`, prints the runtime lines
 /// and exits 2, async (JSON-RPC) and sync (msgpack). Its other emit
 /// goroutines make their calls until the process ends. Async, every JS and
-/// map was written and no d.ts in 48 of 50 runs; sync, the files were one
-/// of 8 sets, `{b.js}` in 11 of 50 (gopanicout1 `go-model.md` section 5).
+/// map was written and no d.ts in 48 of 50 runs; sync, the files vary
+/// (10 sets in 160 runs): `{b.js, c.js.map}`, with the calls of every
+/// file's first output and of `b.js`, in 37 (gopanicout2 `go-model.md`;
+/// `api_build_calls_after_a_failed_write_are_one_of_gos` checks the calls).
 /// With `--singleThreaded` in `rootNames` Go emits on the request
 /// goroutine: the request's recover answers the panic, and the server goes
 /// on (exit 0 at the end of stdin). Go writes the files that its random
@@ -595,7 +597,7 @@ fn api_build_panics_as_go() {
     let all_but_b_dts = "a.d.ts a.js a.js.map b.js c.d.ts c.js c.js.map";
     for (sync, single_threaded, files) in [
         (false, false, "a.js a.js.map b.js c.js c.js.map"),
-        (true, false, "b.js"),
+        (true, false, "b.js c.js.map"),
         (false, true, all_but_b_dts),
         (true, true, all_but_b_dts),
     ] {
@@ -646,6 +648,98 @@ fn api_build_panics_as_go() {
                 "{case}: Go N' runtime lines"
             );
         }
+        project.remove();
+    }
+}
+
+/// gopanicout2. The API build with the `writeFile` callback after a failed
+/// write whose file's d.ts then panics: the client's calls and the written
+/// files are one of Go N''s results (the answer-set rule: Go's goroutines
+/// race, so its calls and files vary by run; gopanicout2 `go-model.md`
+/// section 3, with the Go runs per case). The emit order is b, c, a.
+/// - Async, `declarationMap`, `b.d.ts.map` fails: the other d.ts maps are
+///   in flight (12 of 50 runs).
+/// - Sync (one call at a time): every file's first output is called. A
+///   failure there writes the failed file's outputs and the next file's
+///   first output (`b.js.map`: 37 of 160, `a.js.map`: 6 of 30). A later
+///   failure calls the next file's output of its round, without its write
+///   (`c.js`: 4 of 30, `b.d.ts.map`: 3 of 36).
+#[cfg(unix)]
+#[test]
+fn api_build_calls_after_a_failed_write_are_one_of_gos() {
+    let maps = r#""sourceMap": true, "declaration": true"#;
+    let dmaps = r#""declaration": true, "declarationMap": true"#;
+    for (options, sync, fail, calls, files) in [
+        (
+            dmaps,
+            false,
+            "b.d.ts.map",
+            "a.d.ts.map a.js b.d.ts.map b.js c.d.ts.map c.js",
+            "a.d.ts.map a.js b.js c.d.ts.map c.js",
+        ),
+        (
+            maps,
+            true,
+            "b.js.map",
+            "a.js.map b.js b.js.map c.js.map",
+            "b.js c.js.map",
+        ),
+        (
+            maps,
+            true,
+            "a.js.map",
+            "a.js a.js.map b.js.map c.js.map",
+            "a.js b.js.map",
+        ),
+        (
+            maps,
+            true,
+            "c.js",
+            "a.js a.js.map b.js b.js.map c.js c.js.map",
+            "a.js.map b.js b.js.map c.js.map",
+        ),
+        (
+            dmaps,
+            true,
+            "b.d.ts.map",
+            "a.js b.d.ts.map b.js c.d.ts.map c.js",
+            "a.js b.js c.js",
+        ),
+    ] {
+        let case = format!("{options}, sync {sync}, {fail} fails");
+        let project = Solution::new();
+        project.write(
+            "tsconfig.json",
+            &format!(
+                r#"{{"compilerOptions": {{"strict": true, "outDir": "out", "rootDir": "src", {options}}}, "include": ["src"]}}"#
+            ),
+        );
+        project.write(
+            "src/a.ts",
+            "import { b } from \"./b\";\nimport { c } from \"./c\";\nexport const a: number = b + c;\n",
+        );
+        project.write(
+            "src/b.ts",
+            "export const b: number = 1;\nexport function fb(x: number): number { return x + b; }\n",
+        );
+        project.write("src/c.ts", "export const c: number = 2;\n");
+        let run = api_build_client(&project.root, sync, false, fail);
+        let mut written: Vec<String> = fs::read_dir(project.root.join("out"))
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.expect("an out entry").file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        written.sort();
+        assert_eq!(run.calls.join(" "), calls, "{case}: calls");
+        assert_eq!(written.join(" "), files, "{case}: written files");
+        assert_eq!(
+            (run.answer, run.code),
+            (None, Some(2)),
+            "{case}: Go's panic"
+        );
         project.remove();
     }
 }
@@ -704,6 +798,8 @@ struct ApiRun {
     answer: Option<String>,
     code: Option<i32>,
     stderr: String,
+    /// The file names of the `writeFile` calls, sorted.
+    calls: Vec<String>,
 }
 
 /// Builds the project in `root` through `tsgo --api --callbacks writeFile`,
@@ -754,6 +850,7 @@ fn api_build_client(root: &Path, sync: bool, single_threaded: bool, fail: &str) 
     let create = format!(r#"{{"rootNames":{root_names},"cwd":"{}"}}"#, norm(root));
     client.request(1, "createBuildOrchestrator", &create);
     let mut answer = None;
+    let mut calls = Vec::new();
     while let Ok((call, method, payload)) = messages.recv_timeout(Duration::from_secs(60)) {
         if !call && (method == "createBuildOrchestrator" || method == "1") {
             let id = payload
@@ -772,15 +869,18 @@ fn api_build_client(root: &Path, sync: bool, single_threaded: bool, fail: &str) 
                 .and_then(|rest| rest.split('"').next())
                 .unwrap_or_else(|| panic!("not a writeFile call: {payload}"));
             let failed = path.ends_with(&format!("/{fail}"));
+            calls.push(path.rsplit('/').next().unwrap_or(path).to_string());
             client.answer_write_file(&method, !failed);
         }
     }
     drop(client);
     let code = child.wait().expect("tsgo --api exits").code();
+    calls.sort();
     ApiRun {
         answer,
         code,
         stderr: stderr.join().expect("the stderr reader"),
+        calls,
     }
 }
 
