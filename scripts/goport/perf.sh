@@ -2,6 +2,7 @@
 # usage: perf.sh [--mode default|st|both] [--rounds N] <label> <bin>... [-- <tsgo arg>...]
 #        perf.sh compare <base label or dir> <new label or dir>
 #        perf.sh host                     print this host's line
+#        perf.sh env                      print the caller's variables that pass on to tsgo
 # Runs each binary on query, hono, zod and effect (`<bin> -p <tsconfig> [tsgo args]`) under perf stat
 # (instructions:u, cycles:u, task-clock) and /usr/bin/time (max RSS), and prints the median per binary with the
 # delta to bin0. Without `-- --noEmit` the emit runs too (the read-only inputs refuse the writes): it is about
@@ -12,17 +13,22 @@
 # on each project comes first (page cache). Runs are interleaved (run 1 of every binary, then run 2, ...) and
 # the binary order turns each round, so drift hits every side the same way.
 # Wall is perf's own elapsed time (microseconds, without the sudo and perf start). Compare wall only within
-# one perf.sh run, on mini-743d (or alvin under load 1.5). On a Blacksmith testbox wall is not valid (A/A up to
-# 7.5 percent at median of 3, tbxperf0) and the summary leaves it out: use `testbox.sh perf` there for
-# instructions:u (both sides on one testbox) and peak RSS. cycles:u is in runs.tsv only: it is not a 1 percent
-# metric on any host (tbxperf0).
+# one perf.sh run, on mini-743d. cup2 is not a wall host (A/A at median of 5: zod 3.0, query 11.5 percent),
+# and alvin has no perf. On a Blacksmith testbox wall is not valid (A/A up to 7.5 percent at median of 3,
+# tbxperf0) and the summary leaves it out: use `testbox.sh perf` there for instructions:u (both sides on one
+# testbox) and peak RSS. cycles:u is in runs.tsv only: it is not a 1 percent metric on any host (tbxperf0).
 # A/A (tbxperf1, testbox and mini-743d): st instructions:u within 0.005 percent on every project. At 4 checkers
-# the counts include waits that depend on timing: query up to 0.21, hono 0.09, zod and effect 0.02 percent, so
-# use st for an instruction claim. RSS at median of 3: query (100 MiB) up to 2 percent, the others 0.6. Wall on
-# mini-743d at median of 5: zod and effect 0.35, hono 0.4, query (45 ms) up to 6.4 percent.
+# the counts include waits that depend on timing: query up to 0.42 percent (median of 3 on a testbox), hono
+# 0.09, zod and effect 0.03, so use st for an instruction claim. RSS at median of 3: query (100 MiB) up to
+# 2 percent, the others 0.6. Wall on mini-743d at median of 5: zod and effect up to 1.1 percent (tbxperf0: 1.5
+# to 1.8 at the 95th percentile), hono 0.4, query (45 ms) up to 6.4 percent.
+# Env: tsgo runs under `env -i` on every host, so it sees the same variables with or without sudo: HOME,
+# PATH=/usr/local/bin:/usr/bin:/bin, LC_ALL=C, GOPORT_LAUNCH=0, and the caller's GOPORT_* (not GOPORT_PIN*),
+# _RJEM_MALLOC_CONF, MALLOC_*, GLIBC_TUNABLES, GOMAXPROCS, GOGC, GOMEMLIMIT and GODEBUG (`perf.sh env`).
+# host.txt records them (the env line), and `compare` refuses two runs with a different env.
 # Host line: CPU family/model and name, microcode, kernel, perf version, THP and the virtio balloon free page
 # reporting state. `compare` (bin0 of BASE against each bin of NEW, instructions:u and RSS only) refuses two
-# runs with different host lines or tsgo args. Instruction counts and RSS differ a little between host types.
+# runs with different host lines, tsgo args or env. Counts and RSS differ a little between host types.
 # perf: the first of PERF_BIN, `perf`, /usr/lib/linux-tools/*/perf that runs (Ubuntu's /usr/bin/perf fails on
 # a testbox kernel). perf_event_paranoid 3 or more (mini-743d: 4): perf runs under `sudo -n` and the binary
 # under setpriv as this user.
@@ -37,6 +43,17 @@ PERF_DIR=$ROOT/target/continuation-r97-goport/perf
 # tsgo on 4 KiB pages hands the work to a worker (R137), so wait4 RSS and CPU would show only the
 # launcher. Measure the process that does the work.
 export GOPORT_LAUNCH=0
+# The caller's variables that change what tsgo does. They pass on to tsgo on every host (env -i drops the
+# rest) and go into host.txt. GOPORT_PIN* are for pin.py, not tsgo; GOPORT_LAUNCH is always 0 here.
+PASS_RE='^(GOPORT_[A-Z0-9_]+|_RJEM_MALLOC_CONF|MALLOC_[A-Z0-9_]+|GLIBC_TUNABLES|GOMAXPROCS|GOGC|GOMEMLIMIT|GODEBUG)$'
+# tsgo_env: the caller's variables that pass, as sorted NAME=VALUE lines.
+tsgo_env() {
+  local k
+  for k in $(compgen -e | sort); do
+    [[ $k =~ $PASS_RE && $k != GOPORT_LAUNCH && $k != GOPORT_PIN* ]] && printf '%s=%s\n' "$k" "${!k}"
+  done
+  return 0
+}
 usage() { sed -n '2,/^set -uo/p' "$0" | sed '$d'; }
 die() { echo "perf.sh: $*" >&2; exit 2; }
 
@@ -77,6 +94,7 @@ import csv, os, statistics, sys
 def load(d):
     info = dict(l.rstrip("\n").split(" ", 1) for l in open(os.path.join(d, "host.txt")) if " " in l)
     info.setdefault("args", "none")
+    info.setdefault("env", "none")
     cells = {}
     for r in csv.DictReader(open(os.path.join(d, "runs.tsv")), delimiter="\t"):
         cells.setdefault((r["mode"], r["project"], r["bin"]), []).append(r)
@@ -87,7 +105,7 @@ base_dir, new_dir = sys.argv[1:3]
 one = os.path.realpath(base_dir) == os.path.realpath(new_dir)
 bi, bcells, bbins = load(base_dir)
 ni, cells, nbins = load(new_dir)
-for key, what in ("line", "host lines"), ("args", "tsgo args"):
+for key, what in ("line", "host lines"), ("args", "tsgo args"), ("env", "tsgo env"):
     if bi[key] != ni[key]:
         print(f"different {what}: counts do not compare\n  {base_dir}: {bi[key]}\n  {new_dir}: {ni[key]}")
         sys.exit(3)
@@ -104,6 +122,7 @@ nm = {m: med(cells, m) for m, *_ in metrics}
 print(f"host {ni['name']} ({'testbox' if ni['testbox'] == 'yes' else 'host'}), mode {ni['mode']}, rounds {ni['rounds']}, medians")
 print(f"host-line {ni['line']}")
 print(f"tsgo args {ni['args']}")
+print(f"tsgo env {ni['env']}")
 if one:
     print("wall: valid (compare only within this run)" if wall else "wall: not valid on a testbox (time on mini-743d)")
 else:
@@ -145,6 +164,10 @@ case ${1:-} in
   host)
     P=$(find_perf) || die "no perf that runs"
     host_line "$P"
+    exit 0
+    ;;
+  env)
+    tsgo_env
     exit 0
     ;;
   compare)
@@ -198,13 +221,17 @@ O=$PERF_DIR/$L
 [[ ! -e $O ]] || die "$O exists (results are never replaced)"
 
 P=$(find_perf) || die "no perf that runs (perf --version fails; no /usr/lib/linux-tools/*/perf)"
+mapfile -t PASS < <(tsgo_env)
+# The same env for tsgo on every host: sudo's env_reset would drop the caller's variables, the plain path keeps
+# all of them.
+TENV=(env -i HOME="$HOME" PATH=/usr/local/bin:/usr/bin:/bin LC_ALL=C GOPORT_LAUNCH=0 "${PASS[@]}")
 # C locale: no thousands separators and a decimal point in perf's output.
-PREFIX=(env LC_ALL=C) INNER=()
+PREFIX=(env LC_ALL=C) INNER=("${TENV[@]}")
 if (($(cat /proc/sys/kernel/perf_event_paranoid) > 2)); then
   # paranoid 3+ blocks user counters: perf runs as root and setpriv drops back to this user for the binary.
   sudo -n true 2> /dev/null || die "perf_event_paranoid is over 2 and sudo -n does not work"
   PREFIX=(sudo -n env LC_ALL=C)
-  INNER=(setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups env HOME="$HOME" GOPORT_LAUNCH=0)
+  INNER=(setpriv --reuid="$(id -u)" --regid="$(id -g)" --clear-groups "${TENV[@]}")
 fi
 PAIRS=("query:target/project-inputs/query/source/packages/query-core/tsconfig.prod.json"
   "hono:target/project-inputs/hono/source/tsconfig.build.json"
@@ -236,7 +263,8 @@ mkdir -p "$O/raw"
   echo "mode $mode"
   echo "rounds $rounds"
   echo "args ${TARGS[*]:-none}"
-  echo "perf $P${INNER[*]:+ (sudo -n, setpriv)}"
+  echo "env ${PASS[*]:-none}"
+  echo "perf $P$([[ ${PREFIX[0]} == sudo ]] && echo " (sudo -n, setpriv)")"
   echo "start $(date -u +%FT%TZ) load $(load)"
 } > "$O/host.txt"
 for k in "${!BINS[@]}"; do echo "$k $(sha256sum < "${BINS[k]}" | cut -d' ' -f1) ${BINS[k]}"; done > "$O/bins.txt"
@@ -245,7 +273,7 @@ cd "$ROOT" || die "no $ROOT"
 nb=${#BINS[@]}
 # One untimed run of each binary on each project: the first run reads the binary and the inputs from disk.
 for pair in "${PAIRS[@]}"; do
-  for b in "${BINS[@]}"; do "$b" -p "${pair#*:}" "${TARGS[@]}" > /dev/null 2>&1; done
+  for b in "${BINS[@]}"; do "${TENV[@]}" "$b" -p "${pair#*:}" "${TARGS[@]}" > /dev/null 2>&1; done
 done
 for ((r = 1; r <= rounds; r++)); do
   for m in "${MODES[@]}"; do

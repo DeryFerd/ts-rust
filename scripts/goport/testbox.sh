@@ -41,7 +41,8 @@
 #                                             perf.sh on the testbox (default --mode both, 3 rounds): pushes the
 #                                             bins, fetches the result to the main checkout's perf dir (LABEL must
 #                                             not exist). Without a saved testbox it warms one up (TESTBOX_IDLE 30)
-#                                             and stops it at the end. Read instructions:u and RSS; wall is not valid
+#                                             and stops it at the end. Read instructions:u and RSS; wall is not valid.
+#                                             The variables of `perf.sh env` pass on to perf.sh there
 # The gate and the oracles run as on zbook: the testbox env sets HOME=/home/theo and the workflow binds the
 # workspace on /home/theo/Code/sandbox/ts-rust (testbox-data.sh). Fetch a commit that the bins name before a
 # gate: run git fetch --depth=1 origin <sha>.
@@ -281,8 +282,10 @@ case "$cmd" in
     # The same absolute paths there, so bins.txt names the zbook files.
     push_paths "${bins[@]}"
     run=target/testbox-runs/perf-$(date -u +%Y%m%dT%H%M%S)-$label
+    # The caller's GOPORT_* and allocator variables: perf.sh there passes them on to tsgo.
+    mapfile -t envs < <(scripts/goport/perf.sh env)
     rc=0
-    job "$run" perf "$run" "$label" "${opts[@]}" "$label" "${bins[@]}" "${targs[@]}" || rc=$?
+    job "$run" perf "$run" "$label" "${envs[@]}" "${opts[@]}" "$label" "${bins[@]}" "${targs[@]}" || rc=$?
     mkdir -p "$pd" target
     tmp=$(mktemp -d "$repo_root/target/testbox-perf.XXXXXX")
     fetch "$run" "$tmp" || exit 1
