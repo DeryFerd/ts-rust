@@ -127,12 +127,14 @@ fn walk(
                 }
             }
         }
-        // PORT: Go calls `GetSymbolAtLocation(node)` before
-        // `ReferenceSymbolAtNode(node)`. The port takes the symbol that the
-        // reference cache kept from its own first call (same result, one
-        // checker call less).
-        let resolved_symbol = ctx.tp.reference_symbol_at_node(node);
-        let symbol = ctx.tp.raw_symbol_at_identifier(node);
+        // PORT: Go calls `GetSymbolAtLocation(node)`, then
+        // `ReferenceSymbolAtNode(node)`. The port takes both from the
+        // reference cache (`reference_symbols_at_node`): the same symbols, one
+        // checker call less.
+        let ReferenceSymbols {
+            at_location: symbol,
+            reference: resolved_symbol,
+        } = ctx.tp.reference_symbols_at_node(node);
         let use_symbol = selected_declaration.is_nil()
             || !symbol_has_declaration(ctx.tp.checker, symbol, selected_declaration)
                 && !symbol_has_declaration(ctx.tp.checker, resolved_symbol, selected_declaration);

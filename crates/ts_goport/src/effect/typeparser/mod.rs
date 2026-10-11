@@ -160,12 +160,7 @@ pub struct EffectLinks {
     pub promise_type: FxHashMap<TypeId, TypeId>,
     pub is_global_error_type: FxHashMap<TypeId, bool>,
     pub is_yieldable_error_type: FxHashMap<TypeId, bool>,
-    pub reference_symbol: FxHashMap<Node, SymbolId>,
-    // PORT: not in Go. The first `get_symbol_at_location` result of an
-    // Identifier, kept by `reference_symbol_at_node` when it fills
-    // `reference_symbol`. The stability rules read it in place of a second
-    // checker call (`raw_symbol_at_identifier`).
-    pub raw_symbol_at_identifier: FxHashMap<Node, SymbolId>,
+    pub reference_symbol: FxHashMap<Node, ReferenceSymbols>,
     pub module_export_reference: FxHashMap<ModuleExportReferenceCacheKey, bool>,
     pub pipeable_signature_shape: FxHashMap<PipeableSignatureShapeCacheKey, bool>,
     // API-stability caches. Declared lookups persist per checker: the declared

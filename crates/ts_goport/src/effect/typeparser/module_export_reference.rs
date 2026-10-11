@@ -45,17 +45,40 @@ pub fn new_package_source_file_descriptor(
     }
 }
 
+/// A `reference_symbol` cache entry.
+// PORT: Go caches only `reference`. The port also keeps `at_location`, so the
+// stability rules need no second `GetSymbolAtLocation` call.
+#[derive(Clone, Copy, Debug)]
+pub struct ReferenceSymbols {
+    /// The first `get_symbol_at_location(node)` result. For an Identifier it
+    /// is the checker's `GetSymbolAtLocation(node)`.
+    pub at_location: SymbolId,
+    /// Go `ReferenceSymbolAtNode(node)`.
+    pub reference: SymbolId,
+}
+
 impl TypeParser<'_> {
     pub fn reference_symbol_at_node(&mut self, node: Node) -> SymbolId {
+        self.reference_symbols_at_node(node).reference
+    }
+
+    /// `reference_symbol_at_node(node)`, with the symbol at `node` that it
+    /// starts from.
+    // PORT: not in Go. Go `runStabilityApiUsage` calls `GetSymbolAtLocation`
+    // and then `ReferenceSymbolAtNode`, which calls it again on a cache miss.
+    // The checker gives an Identifier the same symbol on every call, so the
+    // port keeps the first result and saves one call per identifier per rule.
+    pub fn reference_symbols_at_node(&mut self, node: Node) -> ReferenceSymbols {
         if node.is_nil() {
-            return SymbolId::NIL;
+            return ReferenceSymbols {
+                at_location: SymbolId::NIL,
+                reference: SymbolId::NIL,
+            };
         }
 
         cached!(self, reference_symbol, node, {
-            let mut sym = self.get_symbol_at_location(node);
-            if node.kind() == SyntaxKind::Identifier {
-                self.links().raw_symbol_at_identifier.insert(node, sym);
-            }
+            let at_location = self.get_symbol_at_location(node);
+            let mut sym = at_location;
             if sym.is_nil() && node.kind() == SyntaxKind::PropertyAccessExpression {
                 let prop = node;
                 if prop.name().is_some() {
@@ -64,26 +87,16 @@ impl TypeParser<'_> {
             }
 
             sym = self.resolve_aliased_symbol(sym);
-            if node.kind() == SyntaxKind::Identifier && !is_declaration_name(node) {
+            let reference = if node.kind() == SyntaxKind::Identifier && !is_declaration_name(node) {
                 self.resolve_constant_alias_symbol(sym)
             } else {
                 sym
+            };
+            ReferenceSymbols {
+                at_location,
+                reference,
             }
         })
-    }
-
-    /// The checker's `GetSymbolAtLocation(node)` for an Identifier: the
-    /// result that `reference_symbol_at_node` kept when it computed `node`,
-    /// or a new checker call. Call `reference_symbol_at_node(node)` first.
-    // PORT: not in Go. Go `runStabilityApiUsage` calls `GetSymbolAtLocation`
-    // and then `ReferenceSymbolAtNode`, which calls it again on a cache miss.
-    // The checker gives an Identifier the same symbol on every call, so the
-    // port keeps the first result and saves one call per identifier per rule.
-    pub fn raw_symbol_at_identifier(&mut self, node: Node) -> SymbolId {
-        if let Some(&symbol) = self.links().raw_symbol_at_identifier.get(&node) {
-            return symbol;
-        }
-        self.checker.get_symbol_at_location_exported(node)
     }
 
     pub fn resolve_constant_alias_symbol(&mut self, sym: SymbolId) -> SymbolId {
