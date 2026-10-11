@@ -194,7 +194,7 @@ of the same names. `checker_integration.rs` is the Effect-owned Go shim
   (`_tools/gen_shims/providers/typescript/checker/integration.go:340`). The
   other link reads of the shim (`typeNodeLinks`, `declaredTypeLinks`,
   `typeAliasLinks`, `sourceFileLinks`, `aliasSymbolLinks`) are `core.LinkStore`
-  maps in Go (TypeScript-Go `internal/checker/checker.go:677-700`), which give
+  maps in Go (TypeScript-Go `internal/checker/checker.go:678-702`), which give
   no ids. The port gives none there either, as Go.
 - A surface clones its findings map where Go copies a struct that shares
   the map. Go never writes a shared map, so results are the same.
@@ -236,14 +236,14 @@ lines (`delete process.env.X`). The cause, in rule order:
    identifier (`stability_api_usage.go:91`).
 2. On the name of `env.X`, TypeScript-Go
    `getSymbolOfNameOrPropertyAccessExpression` (pinned
-   `internal/checker/checker.go:32357-32366`) stores the synthetic index
-   symbol of `getApplicableIndexSymbol` (`checker.go:32574`: flags
+   `internal/checker/checker.go:32422-32431`) stores the synthetic index
+   symbol of `getApplicableIndexSymbol` (`checker.go:32639`: flags
    `Property`, not `Optional`) as the access's `resolvedSymbol`.
 3. `floatingEffect` calls `GetTypeAtLocation` on the expression of each
    expression statement (`floating_effect.go:109`). For `delete env.X` this
-   runs `checkExpression` again (`getTypeOfExpression`, `checker.go:7509`).
-   `checkDeleteExpression` (`checker.go:11004`) now finds the index symbol,
-   and `checkDeleteExpressionMustBeOptional` (`checker.go:11025`) reports
+   runs `checkExpression` again (`getTypeOfExpression`, `checker.go:7539`).
+   `checkDeleteExpression` (`checker.go:11040`) now finds the index symbol,
+   and `checkDeleteExpressionMustBeOptional` (`checker.go:11061`) reports
    TS2790: with `exactOptionalPropertyTypes` only the `Optional` flag counts.
 
 The first check of the file found no symbol there, so plain TypeScript-Go and

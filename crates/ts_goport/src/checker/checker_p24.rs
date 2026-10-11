@@ -1046,14 +1046,14 @@ impl Checker {
         // it). It can be another symbol: a union or intersection property of
         // two or more properties is a property, not a method, with their
         // value declaration when they have one and the same (Go
-        // `createUnionOrIntersectionProperty`, checker.go:21821 and :21988).
+        // `createUnionOrIntersectionProperty`, checker.go:21888 and :22055).
         // So in `A<string> & T`, where `T extends A<string> | A<number>` and
         // `A.m` is a public method, the `m` of `T` (a property of its
-        // apparent type `A<string> | A<number>`, checker.go:19187) is
+        // apparent type `A<string> | A<number>`, checker.go:19254) is
         // skipped, and `m` stays with the public methods
         // (`tests::fast_never_order_can_skip_a_union_property`). An
         // intersection has no union constituent: Go distributes
-        // `A & (A | B)` over the union (checker.go:26508), so that type is
+        // `A & (A | B)` over the union (checker.go:26577), so that type is
         // the union `A | (A & B)`. That changes only the order of the tests
         // below, not the answer: both groups are tested. The tuples of an
         // intersection share the lib declarations of their array methods,
@@ -2557,13 +2557,13 @@ type KM = C & D;
     /// where `T extends A<string> | A<number>`, the first `m` is the public
     /// method of `A<string>`. The `m` of `T` comes next: the union property
     /// of `A<string> | A<number>`, a property with the same value
-    /// declaration (Go `createUnionOrIntersectionProperty`, checker.go:21821
-    /// and :21988). So it is skipped, and `m` stays with the public methods:
+    /// declaration (Go `createUnionOrIntersectionProperty`, checker.go:21888
+    /// and :22055). So it is skipped, and `m` stays with the public methods:
     /// `kind` (`"a" & "a" & "b"` is never) is tested first, though `m` is
     /// seen first, and the test returns there. The property cache of the
     /// intersection then has no `m`. Go keeps the order of an intersection
-    /// (`addTypeToIntersection`, checker.go:26723), and distributes an
-    /// intersection over a union (checker.go:26508), so
+    /// (`addTypeToIntersection`, checker.go:26792), and distributes an
+    /// intersection over a union (checker.go:26577), so
     /// `A<string> & (A<string> | B)` is a union.
     #[test]
     fn fast_never_order_can_skip_a_union_property() {

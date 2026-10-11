@@ -1,6 +1,6 @@
 //! How `tsgo -b -w` ends on SIGINT and SIGTERM, and how `-w` and `-b -w`
 //! end on a signal during a rebuild cycle, as Go's tsgo ends them. Go's
-//! watch loop (execute/watchmanager/watchmanager.go:354 `RunLoop`) selects
+//! watch loop (execute/watchmanager/watchmanager.go:382 `RunLoop`) selects
 //! on `ctx.Done()` and the cycle channel:
 //!
 //! - A signal while the loop waits ends the run at once with exit code 0.

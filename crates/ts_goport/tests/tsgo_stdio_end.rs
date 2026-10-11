@@ -24,7 +24,7 @@
 //!     `Call` returns it and writes nothing (`:262-267`). This is a Go
 //!     race that the deferred function wins in practice, also for the
 //!     request read after the signal.
-//!   - The end code is 0 (`api/server.go:134-139`).
+//!   - The end code is 0 (`api/server.go:137-142`).
 //!   - The port runs the requests one at a time, so it holds a request
 //!     that waits in a callback while a nested request runs, or that waits
 //!     behind a running request. Go's goroutine went on at once, so the

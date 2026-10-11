@@ -1005,7 +1005,7 @@ impl Checker {
     /// Copy of `augment_lookups_miss` (checker_p21.rs) for a type whose
     /// members may not be resolved: the signature counts come through the
     /// accessors (Go `len(getSignaturesOfStructuredType(t, kind))` with
-    /// #64475, checker.go:19262-19268).
+    /// #64475, checker.go:19329-19335).
     fn augment_lookups_miss_lazy(&mut self, t: TypeId, name: &Name) -> bool {
         let bits = augment_filter_bits(name);
         if let Some(all) = self.augment_filters.all {
@@ -1044,7 +1044,7 @@ impl Checker {
                 .every_property_of_structured_type(t, |p| p.flags.intersects(SymbolFlags::OPTIONAL))
     }
 
-    // Go: getSingleSignature (checker.go:19690 with #64475), the object
+    // Go: getSingleSignature (checker.go:19757 with #64475), the object
     // type case
     #[cold]
     #[inline(never)]
@@ -1077,7 +1077,7 @@ impl Checker {
         SignatureId::NIL
     }
 
-    // Go: isFunctionObjectType (checker.go:31624 with #64475), after the
+    // Go: isFunctionObjectType (checker.go:31689 with #64475), after the
     // evolving array test
     #[cold]
     #[inline(never)]
@@ -1099,7 +1099,7 @@ impl Checker {
             && self.is_type_subtype_of(t, global_function_type)
     }
 
-    // Go: isStringIndexSignatureOnlyTypeWorker (checker.go:27830 with
+    // Go: isStringIndexSignatureOnlyTypeWorker (checker.go:27899 with
     // #64475), the object type case
     #[cold]
     #[inline(never)]
