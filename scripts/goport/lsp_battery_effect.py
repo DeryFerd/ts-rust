@@ -68,8 +68,9 @@ other methods.
 check then compares each hover that lsp_oracle.py classes diff again, with
 the "pako:" payload of each Mermaid link (the Layer hover's "Show full
 graph" and "Show outline") inflated on both sides: decision D3, tsc-rs
-deflates with other bytes than Go's compress/zlib. Nothing else is
-normalized, and lsp_oracle.py's results stay as they are. It prints the
+deflates with other bytes than Go's compress/zlib. Only two results can
+count as the same; an error or a missing result stays a diff. Nothing else
+is normalized, and lsp_oracle.py's results stay as they are. It prints the
 hover diffs that remain and writes results/<label>/mermaid-inflate.json.
 """
 
@@ -501,9 +502,12 @@ def mermaid_recheck(out_root: Path, label: str) -> tuple[int, list[dict]]:
         with gzip.open(tr["responses"], "rt", encoding="utf-8") as f:
             responses = {r["i"]: r for r in map(json.loads, f)}
         for ev in diffs:
-            g = golden[ev["i"]]["response"].get("result")
-            r = responses[ev["i"]]["response"].get("result")
-            same = canon(inflate_mermaid(g)) == canon(inflate_mermaid(r))
+            g = golden[ev["i"]]["response"]
+            r = responses[ev["i"]]["response"]
+            # Only two results can be the same: an error or a missing result on either side stays a diff
+            # (both would read as None).
+            same = ("result" in g and "result" in r
+                    and canon(inflate_mermaid(g["result"])) == canon(inflate_mermaid(r["result"])))
             rows.append({"battery": tr["battery"], "trace": tr["trace"], "i": ev["i"],
                          "mermaid": "pako:" in canon(g) or "pako:" in canon(r),
                          "class": "same" if same else "diff"})

@@ -228,10 +228,12 @@ child_test! {
 }
 
 child_test! {
-    // Patches 011, 022 and 024: until the fixables (E4), refactors (E9),
-    // completions (E6) and document symbols (E8) are ported, the code
-    // action, completion and document symbol answers with the plugin are the
-    // answers without it.
+    // Patches 011, 022 and 024: on this file the code action, completion and
+    // document symbol answers with the plugin are the answers without it. The
+    // range has no Effect diagnostic, so the fixables (E4, E5) add no action.
+    // The file has no Layer, service, error or schema, and flows need the
+    // `debug` option, so the document symbols (E8) add no `Effect` symbol.
+    // The refactors (E9) and completions (E6) are not ported yet.
     fn code_actions_completions_and_symbols_are_unchanged() {
         let answers = |service: &LanguageService| {
             let ctx = projecttestutil::with_request_id(&bg());

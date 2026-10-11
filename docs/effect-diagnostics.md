@@ -117,8 +117,23 @@ All take the reference Effect-patched `tsc` as `--ref`:
 - `scripts/effect/t3-parity.mjs` and `scripts/effect/bench-t3.mjs`: T3 Code
   parity and timing.
 
+## Editor features
+
+The language server (`--lsp`) has these editor features of effect-tsgo
+0.51.1, each only with the plugin (`crates/ts_goport/src/effect/ls`):
+
+- Hover: the Effect type parameters, `yield*`, and the Layer summary with
+  its Mermaid links.
+- The inlay hint filter (`inlays`).
+- The auto-import style (`namespaceImportPackages`,
+  `barrelImportPackages`).
+- Quick fixes: the 2 disable actions and 41 of the 55 fixes.
+- Document symbols: the `Effect` symbol with Layers, Services, Errors and
+  Schemas.
+
+tsc mode never runs them.
+
 ## Not ported
 
-Editor features of the language service: quick fixes, refactors, hover,
-completions, inlay hints, document symbols and goto. tsc mode never runs
-them.
+Editor features: completions, refactors and 14 quick fixes. The `goto`
+and `renames` options are read, but effect-tsgo does not use them either.

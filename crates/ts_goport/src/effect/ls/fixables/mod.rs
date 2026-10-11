@@ -2,8 +2,9 @@
 //! `47cb1ed7`): all code fix implementations and the registry. One Go file
 //! per Rust file.
 //!
-//! Lane E4 ports the disable actions and the 12 fixes that T3 Code hits.
-//! The other 43 fixes (lane E5) are comments in [`ALL`] at their Go place.
+//! Lane E4 ports the disable actions and the 12 fixes that T3 Code hits,
+//! lanes E5a and E5b 29 more. The 14 fixes of lane E5c are still comments
+//! (`// E5:`) in [`ALL`] at their Go place.
 
 use std::sync::LazyLock;
 

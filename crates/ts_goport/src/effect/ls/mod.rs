@@ -20,11 +20,13 @@
 //! off unless `TSGO_EFFECT_API=1` (`rulerunner::enabled_options`), as for
 //! the rules.
 //!
-//! Not ported here: patch 017 (`refactor.rewrite` in the server's code
+//! Ported: the Effect hover and the inlay filter (lane E2), the auto-import
+//! style (E3), the fixable framework with the disable actions and 41 of the
+//! 55 fixes (E4, E5a, E5b), the Layer hover (E7) and the document symbols
+//! (E8). Not ported here: patch 017 (`refactor.rewrite` in the server's code
 //! action kinds; root decision D1 keeps the plain list). The lists that
-//! later lanes fill: fixables (E4 ported the disable actions and 12 fixes;
-//! E5 the other 43), refactors (E9), completions (E6), document symbols (E8)
-//! and the Layer hover (E7).
+//! later lanes fill: the other 14 fixes (E5c), completions (E6) and
+//! refactors (E9).
 
 use std::sync::LazyLock;
 
