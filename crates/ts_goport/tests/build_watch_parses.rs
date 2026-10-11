@@ -38,8 +38,10 @@ const COARSE_MTIME_FIXTURE: &str = concat!(
 /// imports the same file, builds after `lib` and gets the parse that `side`
 /// made: its build info keeps the LF version of `data.json`. `expected.txt`
 /// (the output up to the end of the second build) and
-/// `expected-app.tsbuildinfo.json` are from `tsgo-oracle-673a5f17d713` for
-/// the same steps (16 of 16 runs).
+/// `expected-app.tsbuildinfo.json` are from `tsgo-oracle-fed0bf24149f` for
+/// the same steps (3 of 3 runs). At that pin only the `lib.dom.d.ts` and
+/// `lib.es2022.array.d.ts` versions differ from `tsgo-oracle-673a5f17d713`
+/// (16 of 16 runs): Go changed those two libs (#64604, #64536).
 // PORT: no Go counterpart; the output is Go's.
 #[test]
 fn build_watch_keeps_the_first_json_parse_of_a_cycle() {
