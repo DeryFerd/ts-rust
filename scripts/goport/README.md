@@ -363,9 +363,20 @@ scripts/goport/testbox.sh stop                                  # or release (se
   - `pin.py exec` binds the pin over the default oracle and goCheckout paths. bwrap makes those bind targets.
 - Data: `testbox-data.txt` lists the zbook files that the gate and the LSP and API oracles read and git does
   not hold. Disk `ts-rust-testbox-inputs` holds the files that are the same for every pin: the project inputs,
-  the runner trees and the corpus. Disk `ts-rust-testbox-pin-<key>` holds the pin cache, the LSP and API
-  goldens and the pin oracle. `testbox.sh seed [inputs|pin]` copies them from zbook (30 to 35 minutes; a
-  rerun copies only what is missing). Then `release`.
+  the runner trees, the corpus and the Effect e1 data (below). Disk `ts-rust-testbox-pin-<key>` holds the pin
+  cache, the LSP and API goldens and the pin oracle. `testbox.sh seed [inputs|pin]` copies them from zbook (30
+  to 35 minutes; a rerun copies only what is missing). Then `release`. A testbox reads the list of the ref
+  that it warmed up from: to seed a new path, warm up with `TESTBOX_REF=<your pushed branch>`. With main's
+  list, the copy goes to the target disk, not the inputs disk.
+- Effect e1 (`lsp_battery_effect.py`): the inputs disk holds its traces, the E0 goldens and flaky files, the
+  E0 copies, the T3 Code copy of e1-t3code and the effect-tsgo 0.51.1 repo (3.4 GiB). A lane pushes only its
+  bins: `push <bins dir>`, then
+  `run bash -c 'cd /home/theo/Code/sandbox/ts-rust && GOPORT_LAUNCH=0 python3 scripts/goport/lsp_battery_effect.py check --server <bins>/tsgo --label <label> --jobs 16'`
+  and `get` `ls-oracle/effect/results/<label>/` (the results are on the target disk). New e1 goldens (a new
+  part or a new E0) reach the disk with another `seed inputs` and a release. `--parts` limits a run to some
+  parts: e1-effect and e1-t3code, and e1-effect-ce and e1-t3code-ce (completion at `// @` and after
+  `extends Data.`). On a fresh testbox (2026-10-11) the R190 check took 20 s for the first two parts and
+  33 s for all four; the push of tsgo took 4 s.
 - Oracles: `pin.py` checks the sha256 of the pin oracle, and a build on the runner has another sha256 (Go
   puts absolute paths in the binary). So the testbox uses zbook's recorded binary from the pin disk.
   `tests` compares the testbox's copy with UPSTREAM.json and pushes zbook's binary when they differ.
@@ -403,6 +414,14 @@ scripts/goport/testbox.sh stop                                  # or release (se
     longer than about 6 minutes is cut off (the VM waits at most 290 s for SSH sessions, then shuts down).
     `TESTBOX_ID=<id> testbox.sh status` shows the end.
   - The last commit wins, across branches too: every branch uses the same disk keys.
+  - `on-change` compares the disk usage, not the files: a change of 4096 bytes or less (for example a file
+    written again at the same size) does not commit.
+  - The idle loop keeps the time of the last activity in memory and only moves it forward, so an older
+    marker time does not end a testbox sooner. A released testbox with `TESTBOX_IDLE=60` lives 60 more
+    minutes. `seed` keeps the testbox alive itself, so a short `TESTBOX_IDLE` is safe for a seed. On
+    2026-10-11 both seed commits landed: `TESTBOX_IDLE=60` (78 minutes, 3.4 GiB) and `TESTBOX_IDLE=5`
+    (21 minutes, 2.6 MB). The first took 18 minutes; the second 15, almost all of it the scan of the files
+    that were there.
 - Times (2026-10-10, cold target): `tests` 502 s (test bins 3.6 min, suite 4.7 min), `np-suite` 112 s. With
   the R189 bins: the full gate 8.4 min, the LSP batteries 3 min, the API batteries 1 min. `perf` with two bins
   (2026-10-11): 2 minutes with the warmup (perf.sh itself 47 s at 3 rounds, 76 s at 5).
