@@ -304,6 +304,8 @@ scripts/goport/testbox.sh push <bins dir>                       # then run gate.
                                                                  # from the zbook path, so the manifest names the same scripts:
                                                                  # run bash -c 'cd /home/theo/Code/sandbox/ts-rust && GOPORT_PIN=<pin> bash scripts/goport/gate.sh ...'
 scripts/goport/testbox.sh get <remote> [<local>]                # rsync a result back
+scripts/goport/testbox.sh job <command...>                     # as run, detached: survives a dropped SSH session
+scripts/goport/testbox.sh source <checkout>                     # the checkout at its own zbook path there (fp.py checked)
 scripts/goport/testbox.sh stop                                  # or release (see "Sticky disks")
 ```
 
@@ -355,5 +357,10 @@ scripts/goport/testbox.sh stop                                  # or release (se
   - The last commit wins, across branches too: every branch uses the same disk keys.
 - Times (2026-10-10, cold target): `tests` 502 s (test bins 3.6 min, suite 4.7 min), `np-suite` 112 s. With
   the R189 bins: the full gate 8.4 min, the LSP batteries 3 min, the API batteries 1 min.
-- Not on testboxes yet: `candidate.sh side` and `perf.sh`. Revision evidence stays on dbook-lan and timing on
-  mini-743d.
+- `candidate.sh side --host testbox` runs the release bins, test bins, goport tests, bound runs, gate, LSP and
+  API oracles and clippy on one testbox (`TESTBOX_ID_FILE` keeps its ID out of `target/testbox-id`). The results
+  come back to the same zbook paths; the compares and records stay on zbook, and the evidence key and cache are
+  the same. The default host stays dbook-lan until a batch lists the change; it is also the fallback after a
+  testbox failure (finished steps stay cached). R190 source, 2026-10-11: 27.9 min against 29.1 min for zbook and
+  dbook-lan, with the same results (target/continuation-r97-goport/tbxside1/summary.md).
+- Not on testboxes yet: `perf.sh`. Timing stays on mini-743d.
