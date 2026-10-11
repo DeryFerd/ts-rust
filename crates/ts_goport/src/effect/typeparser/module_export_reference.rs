@@ -23,11 +23,15 @@ pub struct PackageSourceFileDescriptorCacheKey(pub u32);
 /// The next `PackageSourceFileDescriptorCacheKey` (Go `new`).
 static NEXT_PACKAGE_SOURCE_FILE_DESCRIPTOR_CACHE_KEY: AtomicU32 = AtomicU32::new(1);
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Go `moduleExportReferenceCacheKey`.
+/// PORT: Go keys by the member name. Here `member` is the descriptor id
+/// (low 8 bits) and the id of the member name in
+/// `EffectLinks::module_export_members` (high 24 bits), so an entry with
+/// its value is 12 bytes and no key holds a string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ModuleExportReferenceCacheKey {
     pub symbol: SymbolId,
-    pub descriptor: PackageSourceFileDescriptorCacheKey,
-    pub member_name: String,
+    pub member: u32,
 }
 
 // Go: newPackageSourceFileDescriptor
@@ -45,28 +49,86 @@ pub fn new_package_source_file_descriptor(
     }
 }
 
+/// A `reference_symbol` cache entry.
+// PORT: Go caches only `reference`. The port also keeps `at_location`, so the
+// stability rules need no second `GetSymbolAtLocation` call.
+#[derive(Clone, Copy, Debug)]
+pub struct ReferenceSymbols {
+    /// The first `get_symbol_at_location(node)` result. For an Identifier it
+    /// is the checker's `GetSymbolAtLocation(node)`. A later call can give a
+    /// new transient symbol (a for-of binding element's property name does)
+    /// with the same declarations and flags; the stability walk reads only
+    /// those, so the first result gives the same answers.
+    pub at_location: SymbolId,
+    /// Go `ReferenceSymbolAtNode(node)`.
+    pub reference: SymbolId,
+}
+
+/// A `reference_symbol` slot in a node link page: the `ReferenceSymbols`
+/// of a node, with `at_location` kept like `CachedId`, so that
+/// `Option<CachedReferenceSymbols>` is 8 bytes (a page of 64 nodes 512
+/// bytes). The default is nil.
+// PERF: the cache stays on node link pages (effcache1) and keeps both
+// symbols (effperf1).
+#[derive(Clone, Copy, Default)]
+pub struct CachedReferenceSymbols {
+    at_location: CachedId,
+    reference: SymbolId,
+}
+
+const _: () = assert!(size_of::<Option<CachedReferenceSymbols>>() == 8);
+
 impl TypeParser<'_> {
     pub fn reference_symbol_at_node(&mut self, node: Node) -> SymbolId {
+        self.reference_symbols_at_node(node).reference
+    }
+
+    /// `reference_symbol_at_node(node)`, with the symbol at `node` that it
+    /// starts from.
+    // PORT: not in Go. Go `runStabilityApiUsage` calls `GetSymbolAtLocation`
+    // and then `ReferenceSymbolAtNode`, which calls it again on a cache miss.
+    // A later call on an Identifier gives a symbol with the same declarations
+    // and flags (sometimes a new transient one), and the walk reads only those,
+    // so the port keeps the first result and saves one call per identifier per
+    // rule.
+    pub fn reference_symbols_at_node(&mut self, node: Node) -> ReferenceSymbols {
         if node.is_nil() {
-            return SymbolId::NIL;
+            return ReferenceSymbols {
+                at_location: SymbolId::NIL,
+                reference: SymbolId::NIL,
+            };
         }
 
-        cached!(self, reference_symbol, node, {
-            let mut sym = self.get_symbol_at_location(node);
-            if sym.is_nil() && node.kind() == SyntaxKind::PropertyAccessExpression {
-                let prop = node;
-                if prop.name().is_some() {
-                    sym = self.get_symbol_at_location(prop.name());
-                }
+        // Go `Cached(&tp.links.ReferenceSymbol, node, ..)`.
+        if let Some(cached) = self.links().reference_symbol.try_get(node) {
+            return ReferenceSymbols {
+                at_location: SymbolId(cached.at_location.get()),
+                reference: cached.reference,
+            };
+        }
+        let at_location = self.get_symbol_at_location(node);
+        let mut sym = at_location;
+        if sym.is_nil() && node.kind() == SyntaxKind::PropertyAccessExpression {
+            let prop = node;
+            if prop.name().is_some() {
+                sym = self.get_symbol_at_location(prop.name());
             }
+        }
 
-            sym = self.resolve_aliased_symbol(sym);
-            if node.kind() == SyntaxKind::Identifier && !is_declaration_name(node) {
-                self.resolve_constant_alias_symbol(sym)
-            } else {
-                sym
-            }
-        })
+        sym = self.resolve_aliased_symbol(sym);
+        let reference = if node.kind() == SyntaxKind::Identifier && !is_declaration_name(node) {
+            self.resolve_constant_alias_symbol(sym)
+        } else {
+            sym
+        };
+        *self.links().reference_symbol.get(node) = CachedReferenceSymbols {
+            at_location: CachedId::new(at_location.0),
+            reference,
+        };
+        ReferenceSymbols {
+            at_location,
+            reference,
+        }
     }
 
     pub fn resolve_constant_alias_symbol(&mut self, sym: SymbolId) -> SymbolId {
@@ -130,14 +192,37 @@ impl TypeParser<'_> {
             return self.is_symbol_reference_to_module_export(sym, desc, member_name);
         };
 
+        let Some(member) = self.module_export_member_key(cache_key, member_name) else {
+            return self.is_symbol_reference_to_module_export(sym, desc, member_name);
+        };
         let key = ModuleExportReferenceCacheKey {
             symbol: sym,
-            descriptor: cache_key,
-            member_name: member_name.to_string(),
+            member,
         };
         cached!(self, module_export_reference, key, {
             self.is_symbol_reference_to_module_export(sym, desc, member_name)
         })
+    }
+
+    /// The `member` of a `ModuleExportReferenceCacheKey`, or `None` when the
+    /// descriptor id or the member name id does not fit (then the caller
+    /// does not cache, as for a descriptor with no cache key).
+    fn module_export_member_key(
+        &mut self,
+        descriptor: PackageSourceFileDescriptorCacheKey,
+        member_name: &str,
+    ) -> Option<u32> {
+        let descriptor = u8::try_from(descriptor.0).ok()?;
+        let members = &mut self.links().module_export_members;
+        let id = match members.get(member_name) {
+            Some(&id) => id,
+            None => {
+                let id = u32::try_from(members.len()).ok()?;
+                members.insert(member_name.into(), id);
+                id
+            }
+        };
+        (id < 1 << 24).then_some((id << 8) | u32::from(descriptor))
     }
 
     pub fn is_symbol_reference_to_module_export(
