@@ -234,11 +234,13 @@ impl TypeParser<'_> {
         if sf.is_nil() {
             return false;
         }
-        let Some(pkg) = self.package_json_for_source_file(sf) else {
-            return false;
-        };
-        let (name, ok) = pkg.fields.name.get_value();
-        ok && crate::frontend::vfs::vfsmatch::equal_fold(name.as_bytes(), package_name.as_bytes())
+        // PERF: a cached entry is read in place. `package_json_for_source_file`
+        // would clone its `Arc`, and `get_value` the name (effperf3 item 5).
+        if let Some(pkg) = self.links().package_json_for_source_file.get(&sf) {
+            return package_name_is(pkg.as_deref(), package_name);
+        }
+        let pkg = self.package_json_for_source_file(sf);
+        package_name_is(pkg.as_deref(), package_name)
     }
 
     pub fn is_node_reference_to_module_export(
@@ -351,4 +353,20 @@ fn module_export_member_key(
     let descriptor = u8::try_from(descriptor.0).ok()?;
     let id = member.id();
     (id < 1 << 24).then_some((id << 8) | u32::from(descriptor))
+}
+
+/// Go `name, ok := pkg.Fields.Name.GetValue(); ok && strings.EqualFold(name, packageName)`
+/// for a nil-able package.json.
+fn package_name_is(
+    pkg: Option<&crate::modulespecifiers::packagejson::PackageJson>,
+    package_name: &str,
+) -> bool {
+    pkg.is_some_and(|pkg| {
+        let name = &pkg.fields.name;
+        name.valid
+            && crate::frontend::vfs::vfsmatch::equal_fold(
+                name.value.as_bytes(),
+                package_name.as_bytes(),
+            )
+    })
 }
