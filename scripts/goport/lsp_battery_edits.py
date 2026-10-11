@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Edit-flow battery for the LSP parity oracle (goport tests2, sub-track S6 b2).
 
-lsp_battery.py (int7) sends one open file and read-only requests. This script
+lsp_battery.py (from int7, now beside this script) sends one open file and read-only requests. This script
 writes goport-lsp-trace/1 traces for the flows it does not send:
 
   triggers   completion with trigger characters other than "." (quotes, "/",
@@ -38,7 +38,7 @@ build writes <TRACES>/<part>/<file>.jsonl and <TRACES>/b4.index.json. Run
 them with the unchanged int7 lsp_oracle.py (`--battery b4`).
 
 The lexer, the lsconv position math, Trace and the capabilities come from the
-int7 lsp_battery.py, imported by path (LSP_BATTERY_PY overrides the path).
+lsp_battery.py beside this script, imported by path (LSP_BATTERY_PY overrides the path).
 """
 
 import argparse
@@ -53,7 +53,7 @@ from pathlib import Path
 REPO = Path("/home/theo/Code/sandbox/ts-rust")
 INPUTS = REPO / "target/project-inputs"
 LSP_BATTERY_PY = Path(os.environ.get(
-    "LSP_BATTERY_PY", REPO / "target/worktrees/goport-int7/scripts/goport/lsp_battery.py"))
+    "LSP_BATTERY_PY", Path(__file__).resolve().parent / "lsp_battery.py"))
 
 
 def load_lsp_battery(path: Path):
