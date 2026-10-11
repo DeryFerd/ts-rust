@@ -4167,10 +4167,14 @@ impl<V: Default> LinkPage<V> for SparseLinkPage<V> {
 
     #[inline(always)]
     fn insert_record(&mut self, index: usize, value: V) -> &mut V {
-        debug_assert_eq!(
-            self.places[index % LINK_PAGE_SIZE],
-            0,
-            "insert_record on a key that has a record"
+        // A real check: a second record of a key would stay in `records`
+        // with no place, and a later `remove_record` could not find the
+        // place of the last record. A `DenseLinkPage` and the map replace
+        // the record, which breaks nothing. The check reads the place that
+        // `push` writes.
+        assert!(
+            self.places[index % LINK_PAGE_SIZE] == 0,
+            "insert_record on a key with a record"
         );
         self.push(index, value)
     }
@@ -4547,6 +4551,17 @@ mod link_store_tests {
         assert_eq!(symbols.try_get(SymbolId(70)).map(|v| v[1]), Some(2));
         assert_eq!(symbols.try_get(SymbolId(1)).map(|v| v[7]), Some(1));
         assert!(!symbols.has(SymbolId(71)) && !symbols.has(SymbolId(64 * 50)));
+    }
+
+    // `insert_new` on a key that has a record is a caller bug. A sparse
+    // page checks it in a release build too: the second record would have
+    // no place (`SparseLinkPage::insert_record`).
+    #[test]
+    #[should_panic(expected = "on a key with a record")]
+    fn sparse_link_store_insert_new_on_a_key_with_a_record_panics() {
+        let mut symbols = SparseLinkStore::<SymbolId, u64>::default();
+        symbols.insert_new(SymbolId(1), 1);
+        symbols.insert_new(SymbolId(1), 2);
     }
 
     // Symbol keys from `LINK_FLAT_IDS` on keep their records in pages by
