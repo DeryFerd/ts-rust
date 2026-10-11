@@ -100,6 +100,14 @@ class Tree(unittest.TestCase):
         self.assertIn("dry run: 2 dirs.", out)
         self.assertTrue(os.path.exists(os.path.join(self.release, "tsgo")))
 
+    def test_go_cache_inside_cargo_dir_is_listed_once(self):
+        make_tree(os.path.join(self.release, "gocache"), {"trim.txt": "x", "README": GO_README})
+        os.utime(self.release, (OLD, OLD))
+        rc, out, _ = self.run_main()
+        self.assertEqual(rc, 0)
+        self.assertNotIn(os.path.join(self.release, "gocache"), out)
+        self.assertIn("dry run: 2 dirs.", out)
+
     def test_failed_remove_is_counted_and_exits_1(self):
         with mock.patch.object(cb.shutil, "rmtree", side_effect=OSError("denied")) as rmtree:
             rc, out, err = self.run_main("--apply")

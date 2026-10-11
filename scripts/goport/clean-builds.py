@@ -201,7 +201,9 @@ def main(argv):
             continue
         if any(c == wt or c.startswith(wt + '/') for c in busy):
             continue
-        dirs = build_dirs(wt) + go_cache_dirs(wt)
+        cargo = build_dirs(wt)
+        # A Go cache inside a Cargo dir goes with it.
+        dirs = cargo + [g for g in go_cache_dirs(wt) if not any(g.startswith(c + os.sep) for c in cargo)]
         if not dirs or git_files_mtime(wt) > cutoff or changed_since(dirs, cutoff):
             continue
         for d in dirs:
