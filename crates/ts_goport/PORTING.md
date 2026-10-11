@@ -1707,35 +1707,91 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   - `--api --async` and the API sessions run requests one at a time
     (`ipc/conn_async.rs`). A pipelined request sees the result of the one
     before it. Go runs them at the same time.
-  - The async connection reads its next message only after the running
+  - The API sessions read their next message only after the running
     request. So the end of the input during a request does not cancel the
     request's context: Go's read loop sees the end at once and returns
     (`ipc/conn_async.go:89-91`), and its deferred `cancelHandlers` (`:73`)
     cancels it, so a long check answers early with what it has. The port
-    answers in full and then ends, with Go's exit code.
-  - The end on SIGINT or SIGTERM in `--api --async` is an open Go
-    difference (state note `r187-repair-withdraw-2026-10-09`, lane
-    apisig4). Go's read loop checks the context at the top of each turn
-    (`ipc/conn_async.go:83`) and then waits in the read while a request
-    runs on its own goroutine (`:98`). The port runs the request inline
-    and checks the context after it (`run_loop`). The cases:
-    - A signal during a request: Go answers it, then ends after the next
-      message (it answers that message too) or at the end of the input.
-      The port ends right after the answer and reads no more.
-    - Pipelined requests: a signal during request 1 while request 2 is
-      already sent. Go answers both (2 first) and then waits for the next
-      message. The port answers request 1 and ends: request 2 gets no
-      answer.
-    - A signal while a request waits for a client callback: Go's `Call`
-      returns the context error at once (`:290`), so request 1 is answered
-      at the signal. The port's `call` waits in its read, so it answers
-      request 1 after the next message. Both end after that message.
-  - apisig2 (R187) moved the run's check before an inline request to
-    match the first case. The run then read until the end of the input in
-    the callback case. Its repair apisig3 closed the pending calls at the
-    signal, so the callbacks that a handler makes after the signal
-    (writeFile, removeFile) lost their requests. Both are withdrawn, and
-    `ipc/conn_async.rs` is R186's code.
+    answers in full and then ends, with Go's exit code. `--api --async`
+    reads on a thread of its own (`read_on_thread`) and cancels it as Go.
+  - SIGINT and SIGTERM in `--api --async` end the run as in Go (lane
+    apisig4, tests in `tests/tsgo_stdio_end.rs`). The read thread checks
+    the context before each read (`ipc/conn_async.go:83`), and a `call`
+    waits on the inbox and the context, as Go's `select` (`:289-303`).
+    Equal to Go:
+    - Phase A, until the next client message: a callback that waits
+      returns `context canceled` at once, and a later one writes its
+      request and returns it too. So a request answers at the signal
+      (readFile, fileExists, getAccessibleEntries, realpath,
+      resolveModuleName, writeFile, removeFile), and a callback that
+      panics on a worker goroutine (directoryExists, readFile of a source
+      file) ends the process with exit code 2 at the signal.
+    - Exactly 1 message is read after the signal, also after a request
+      that makes no callback.
+    - Phase B: that message runs after Go's deferred `closePendingCalls`
+      (a Go race that the deferred function wins in practice), so its
+      callbacks write nothing and fail with `ipc: connection closed` and
+      `context canceled`. The run ends with exit code 0.
+    - The end of the input after the signal; a second signal does
+      nothing.
+    - A request that the port holds keeps Go's phase for each callback,
+      except in the window under "Still different". The port holds a
+      request that waits in a callback while a nested request runs
+      (until that one returns), and a request read while another one
+      runs (until that one returns). Go's goroutines go on at once. So
+      each request has a Go clock: the port time less the time that the
+      port held it (`ipc/conn_async.rs`, file header). A callback that
+      Go made before the read loop ended writes its request and returns
+      Go's error (`context canceled` after a signal, else
+      `ipc: connection closed`), also when the port makes it after the
+      end. A callback that Go made after the end writes nothing (Phase
+      B). A reply that the port read before the end goes to its call,
+      also when a nested request holds that call at the end (Go's `Run`
+      gives each reply to its call when it reads it).
+  - Still different in `--api --async` (the requests run one at a time):
+    - A held request answers, writes its later callback requests and
+      crashes (a worker callback) only after the request that held it
+      answers. Go does it at once: at the signal, or at the reply to its
+      callback. So:
+      - The answers come in another order (Go answers request 2 of a
+        pipelined pair first, and a held request before the nested one).
+      - When Go's held worker callback panics (at the signal, or at the
+        end of the read loop), Go ends at once with exit code 2, and the
+        nested request never goes on. The port runs the nested request to
+        its answer (with its callbacks), then the worker panics and the
+        port ends with exit code 2.
+      - A callback request that the port writes after the end of the
+        read loop gets no reply (the read loop has ended). Go wrote it
+        earlier, and its client could answer it before the end.
+    - Go's races give more outcomes than the port: a reply that comes
+      just before the signal, and a signal less than about 0.5 ms before
+      the end of the read loop. There the port gives one of Go's
+      outcomes.
+    - A held build in a window of about 0.5 to 1 ms gives an outcome
+      that Go and R188 do not give. The build waits in its first
+      writeFile, a nested request holds it, and SIGINT and then the end
+      of the input come 0.5 to 1 ms apart. Go and R188 fail both writes
+      with `context canceled`. The port fails them with
+      `ipc: connection closed`: Go wrote the later writeFile requests
+      before the signal, from concurrent emit workers, but the port's
+      held worker hands over its writes one at a time after the hold, and
+      the Go clock adds that work, so the later writes come after the
+      end (Phase B). Runs with `ipc: connection closed` of 10 per cell
+      (the apisig4 skeptic's `heldbuild.py`; Go and R188: 0 in each
+      cell): 0.5 ms: 10 on alvin, 5 on mini-743d; 0.75 ms: 10 and 0;
+      1 ms: 2 and 0; 1.5 ms and 2 ms: 0. At 0.25 ms Go gives both
+      outcomes and the port only `ipc: connection closed`.
+    - A worker makes one callback at a time, so fewer directoryExists or
+      writeFile requests are out at the signal (Go: 2 or more). The
+      answers are the same, except for a build after a write error: the
+      port's build writes its outputs again after a failed write, so its
+      write errors can differ from Go's, and it orders the diagnostics in
+      another way. With no signal, b.js written and a.js failed gives 2
+      write errors (Go: 1), and b.js failed then written gives 0 (Go:
+      1). It is not a signal effect; R188 does the same.
+    - On wasm, which has no threads, the reads stay on the dispatch
+      thread: a waiting callback wakes only at the next message, and
+      there is no Phase B.
 - Go runtime profiles (pprof) have no samples: the port writes Go's file
   names, errors and log lines and valid empty profiles. `runtime.GC` is a
   no-op. `runtime/metrics` reads as `KindBad`, so the Go runtime fields of
