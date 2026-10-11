@@ -240,6 +240,21 @@ impl Name {
         intern::stable(id)
     }
 
+    /// The `hash_str` hash of `text`, for `Name::intern_hashed`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn text_hash(text: &str) -> u64 {
+        intern::hash_str(text)
+    }
+
+    /// `Name::from(text)` with `hash`, the `Name::text_hash` of `text`, and
+    /// the interned text, which lives until the process ends.
+    #[inline]
+    #[must_use]
+    pub(crate) fn intern_hashed(text: &str, hash: u64) -> (Name, &'static str) {
+        intern::intern_hashed(text, hash)
+    }
+
     /// The 4-byte id, for a packed node column (`ast::store::NodeKids`).
     /// It is valid only in this process.
     #[inline]
@@ -857,7 +872,19 @@ mod intern {
         if s.is_empty() {
             return Name(0);
         }
-        let hash = hash_str(s);
+        intern_hashed(s, hash_str(s)).0
+    }
+
+    /// `intern` of `s` with its `hash_str` hash `hash`, which the caller
+    /// already has. Also returns the stored text, which lives as long as
+    /// the process.
+    // PERF: parsefast1 item 1. The parse hashes an identifier once for its
+    // per-file name map and passes that hash here (`Name::intern_hashed`).
+    pub(super) fn intern_hashed(s: &str, hash: u64) -> (Name, &'static str) {
+        debug_assert_eq!(hash, hash_str(s), "intern_hashed of {s:?}");
+        if s.is_empty() {
+            return (Name(0), "");
+        }
         let set = (hash as usize) & (CACHE_SETS - 1);
         // After the thread-local destructors ran (`try_with` fails), a
         // name goes to the shared map without the cache.
@@ -865,7 +892,7 @@ mod intern {
             let [first, second] = &cache.get_or_init(new_cache)[set].0;
             let (h, id, stored) = first.get();
             if id != 0 && h == hash && stored == s {
-                return Some(id);
+                return Some((id, stored));
             }
             let entry = second.get();
             let (h, id, stored) = entry;
@@ -873,12 +900,12 @@ mod intern {
                 // Least recently used goes second.
                 second.set(first.get());
                 first.set(entry);
-                return Some(id);
+                return Some((id, stored));
             }
             None
         });
-        if let Ok(Some(id)) = cached {
-            return Name(id);
+        if let Ok(Some((id, stored))) = cached {
+            return (Name(id), stored);
         }
         // PERF: bind B2. A lib name (lib.dom alone brings about 7k names
         // that no file interned before) gets its id from the static table,
@@ -897,7 +924,7 @@ mod intern {
                 first.set((hash, id, stored));
             }
         });
-        Name(id)
+        (Name(id), stored)
     }
 
     /// The id and stored text of `s`, from the shared map.
@@ -1089,6 +1116,13 @@ enum DeclarationList {
 }
 
 impl Declarations {
+    /// Go `[]*ast.Node{node}` (`newSingleDeclaration`): a list of one node.
+    #[inline]
+    #[must_use]
+    pub fn one(node: Node) -> Self {
+        Self(DeclarationList::One(node))
+    }
+
     /// Go `append(declarations, node)`.
     pub fn push(&mut self, node: Node) {
         match &mut self.0 {
