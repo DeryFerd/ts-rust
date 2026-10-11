@@ -1135,11 +1135,12 @@
       "batchId": "recovery-continuation-go-checker-port-72",
       "standing": true,
       "approvedBy": "Theo",
-      "date": "2026-10-10",
-      "approvalNote": "theo-effect051-approval-2026-10-10",
-      "instruction": "Theo 2026-10-10: \"There's a good issue around missing effect diagnostics stuff. Would like to get that addressed.\" (issue #28; root reads it as approval of the Effect gate rule that the effect051 lane waited for; the reviewer judges that reading).",
+      "date": "2026-10-11",
+      "approvalNote": "theo-effect-gate-approval-2026-10-11",
+      "instruction": "Theo 2026-10-11, in reply to root's request that named the rule: \"Why does the reviewer need my words? I'm confused. Obviously I approve it.\" (Earlier, 2026-10-10: \"There's a good issue around missing effect diagnostics stuff. Would like to get that addressed.\"; the R190 reviewer did not count that as approval.)",
       "scope": "Gate items of configs whose tsconfig lists @effect/language-service: the expected output is the plain Go N oracle lines plus the TS377xxx lines of effect-tsgo at the Effect pin (0.51.1), one oracle/<label>.effect.txt per config made with scripts/goport/effect-oracle.py; the reference TS6133 bug stays excluded. Names: the 13 sweep-wide/effect-ts-effect:* items other than opentelemetry. Paths: scripts/goport/sweep-wide.sh (protected; batch 72 lists it), scripts/goport/effect-oracle.py.",
-      "goEvidence": "effect-tsgo 0.51.1 output equal to the port on these configs (target/continuation-r97-goport/effect051/summary.md, int60e/open.md); not pinned TypeScript-Go, so Theo's approval is the basis."
+      "goEvidence": "effect-tsgo 0.51.1 output equal to the port on these configs (target/continuation-r97-goport/effect051/summary.md, int60e/open.md); not pinned TypeScript-Go, so Theo's approval is the basis.",
+      "earlierNote": "theo-effect051-approval-2026-10-10"
     }
   ]
 }
