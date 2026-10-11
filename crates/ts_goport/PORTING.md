@@ -786,7 +786,9 @@ tsgo-oracle-fed0bf24149f). The d.ts signature site
 (`diagnostic_to_string_builder`) has it (0x68). gopanicout2 gave 39 more
 sites their address: the CLI, build, checker, transformer, API and IPC
 sites, and the LSP sites that a client message reaches (a nil element in
-`changes` or `files`, a code lens without `data`). Each address is the
+`changes` or `files`, a code lens without `data`). gopanicout3 gave the 2
+sites of `initialized` theirs: before `initialize`, and a null workspace
+folder (server.go:1716 and 1752). Each address is the
 first load through the nil pointer in Go's compiled code, read from
 `go tool objdump` of the pinned oracle; 6 of them are checked against
 Go's own output (tests/go_nil_signal.rs). The other `go_nil_dereference()`
@@ -811,15 +813,21 @@ write, `flush_client_writes` makes the other outputs before the
 declarations and, for a failed declaration output, the rest of its round,
 and no other declaration (`--async`). With sync msgpack, whose calls go
 one at a time, every file's first output is called; a failure there
-writes the next file's first output too, and a later failure calls the
-next file's output of its round without its write
-(`flush_serialized_client_writes`).
+writes the next file's first output too, and a later failure calls and
+writes the next file's output of its round, and the round's earlier
+writes are lost (`flush_serialized_client_writes`). A failed OS write
+after a `useOS` answer dooms its file one round later, because Go tries
+that write again after it makes the directory: in the next round the
+file's output is called and written, and the next file's output is called
+without its write (gopanicout3 `go-model.md`).
 
 The LSP request recover (`Server::recover_guard`) and the API session
 recover are `core::go_recover`: a Go `recover()` sees only its own
 goroutine, so a Go panic in a work group task under a request ends the
 process. The recover logs the port site of a Go panic in place of Go's
-`debug.Stack()` text.
+`debug.Stack()` text (`core::go_recovered_stack`), and so does the
+recover of a cross-project queued function
+(`ls::crossproject::panic_occured_text`).
 
 ## Process start
 
