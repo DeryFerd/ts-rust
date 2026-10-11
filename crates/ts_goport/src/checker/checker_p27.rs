@@ -176,7 +176,7 @@ impl Checker {
     pub fn get_type_from_mapped_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let t = self.new_object_type(ObjectFlags::MAPPED, node.symbol());
-            self.ty_mut(t).as_mapped_type_mut().declaration = node;
+            self.ty_mut(t).as_mapped_type_mut().set_declaration(node);
             let alias = self.get_alias_for_type_node(node);
             self.ty_mut(t).alias = alias;
             self.type_node_links.get(node).resolved_type = t;
@@ -1306,23 +1306,31 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25442 isGenericMappedType
+    // PERF: the `MAPPED` test is inline and the rest out of line, so a type
+    // that is not mapped (most calls) makes no call.
+    #[inline]
     pub fn is_generic_mapped_type(&mut self, t: TypeId) -> bool {
-        if self.ty(t).object_flags.intersects(ObjectFlags::MAPPED) {
-            let constraint = self.get_constraint_type_from_mapped_type(t);
-            if self.is_generic_index_type(constraint) {
+        self.ty(t).object_flags.intersects(ObjectFlags::MAPPED)
+            && self.is_generic_mapped_type_worker(t)
+    }
+
+    /// The body of `is_generic_mapped_type` for a mapped type.
+    #[inline(never)]
+    fn is_generic_mapped_type_worker(&mut self, t: TypeId) -> bool {
+        let constraint = self.get_constraint_type_from_mapped_type(t);
+        if self.is_generic_index_type(constraint) {
+            return true;
+        }
+        // A mapped type is generic if the 'as' clause references generic types other than the iteration type.
+        // To determine this, we substitute the constraint type (that we now know isn't generic) for the iteration
+        // type and check whether the resulting type is generic.
+        let name_type = self.get_name_type_from_mapped_type(t);
+        if name_type.is_some() {
+            let type_parameter = self.get_type_parameter_from_mapped_type(t);
+            let mapper = self.new_simple_type_mapper(type_parameter, constraint);
+            let instantiated = self.instantiate_type(name_type, mapper);
+            if self.is_generic_index_type(instantiated) {
                 return true;
-            }
-            // A mapped type is generic if the 'as' clause references generic types other than the iteration type.
-            // To determine this, we substitute the constraint type (that we now know isn't generic) for the iteration
-            // type and check whether the resulting type is generic.
-            let name_type = self.get_name_type_from_mapped_type(t);
-            if name_type.is_some() {
-                let type_parameter = self.get_type_parameter_from_mapped_type(t);
-                let mapper = self.new_simple_type_mapper(type_parameter, constraint);
-                let instantiated = self.instantiate_type(name_type, mapper);
-                if self.is_generic_index_type(instantiated) {
-                    return true;
-                }
             }
         }
         false
