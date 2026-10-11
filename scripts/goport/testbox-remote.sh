@@ -15,6 +15,7 @@
 #                                                  its cargo logs in testbin.new/logs)
 #        testbox-remote.sh np-suite KEY LABEL RUN  a stable release tsgo, np-suite.sh run LABEL at pin KEY, pack
 #                                                  the label dir in RUN/out.tar.gz, then remove the label dir
+#                                                  (after a failed build, only its build.log)
 # The zbook path mirror (UPSTREAM.json, pin.py and the protected scripts use zbook's absolute paths):
 #   /home/theo/Code/sandbox/ts-rust                the workspace (a symlink)
 #   <pin goCheckout>/..                            the whole pin checkout (depth 1) with npm ci node_modules
@@ -113,8 +114,9 @@ case $cmd in
   job)
     run=$1
     shift
-    # run-testbox resets its idle timer when this file is newer than the last activity.
-    (while sleep 30; do touch ~/.testbox-last-activity; done) &
+    # run-testbox resets its idle timer when this file is newer than the last activity. The keepalive ends
+    # with this shell, so a killed job lets the testbox end at its idle timeout and the local poll stop.
+    (while sleep 30 && kill -0 "$$" 2> /dev/null; do touch ~/.testbox-last-activity; done) &
     keep=$!
     # RUN.rc is written on every exit. It stays 1 when the job shell itself is killed.
     rc=1
@@ -187,7 +189,11 @@ case $cmd in
     mkdir -p "$run"
     # Stable and not incremental, as candidate.sh builds release bins.
     TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 scripts/run-cargo-capped.sh build --release --locked -p ts_goport --bin tsgo \
-      > "$run/build.log" 2>&1 || { tail -20 "$run/build.log"; die "tsgo build failed"; }
+      > "$run/build.log" 2>&1 || {
+      tail -20 "$run/build.log"
+      tar -czf "$run/out.tar.gz" -C "$run" build.log
+      die "tsgo build failed"
+    }
     np=target/continuation-r97-goport/compat-backlog/np-suite
     rc=0
     NP_GO_DIR=$(pin path goCheckout "$key") scripts/goport/np-suite.sh run "$label" "$PWD/target/release/tsgo" || rc=$?

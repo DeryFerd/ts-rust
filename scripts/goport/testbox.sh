@@ -88,7 +88,9 @@ oracles() {
 job() {
   local run=$1 id t n=0 fails=0 rc
   id=$(saved_id)
-  remote scripts/goport/testbox-remote.sh start "$@"
+  # exit, not return: callers run job in a || list (no set -e there), and then fetch RUN, which must not
+  # take another job's run.
+  remote scripts/goport/testbox-remote.sh start "$@" || exit
   t=$(mktemp -d)
   while :; do
     rc=
@@ -193,6 +195,7 @@ case "$cmd" in
     mkdir -p "$np" target
     tmp=$(mktemp -d "$repo_root/target/testbox-np.XXXXXX")
     fetch "$run" "$tmp"
+    [[ -d $tmp/$1 ]] || { echo "no np-suite result (rc $rc): the tsgo build log is $tmp/build.log" >&2; exit 1; }
     mv "$tmp/$1" "$np/$1"
     mv "$tmp/build.log" "$np/$1/testbox-build.log"
     mv "$tmp/testbox.log" "$np/$1/testbox.log"
