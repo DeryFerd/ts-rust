@@ -10,10 +10,13 @@ use crate::prelude::*;
 
 // Go: ast/utilities.go:911 FindAncestor
 /// Walks up the parents of a node to find the ancestor that matches the callback.
-pub fn find_ancestor(mut node: Node, mut callback: impl FnMut(Node) -> bool) -> Node {
+// PERF: perfP1 item 5. The parent steps read through one view of the file
+// (`NodeRef::parent` keeps the block).
+pub fn find_ancestor(node: Node, mut callback: impl FnMut(Node) -> bool) -> Node {
+    let mut node = NodeRef::new(node);
     while node.is_some() {
-        if callback(node) {
-            return node;
+        if callback(node.node()) {
+            return node.node();
         }
         node = node.parent();
     }
@@ -95,16 +98,18 @@ pub fn to_find_ancestor_result(b: bool) -> FindAncestorResult {
 
 // Go: ast/utilities.go:967 FindAncestorOrQuit
 /// Walks up the parents of a node to find the ancestor that matches the callback.
+// PERF: perfP1 item 5, as `find_ancestor`.
 pub fn find_ancestor_or_quit(
-    mut node: Node,
+    node: Node,
     mut callback: impl FnMut(Node) -> FindAncestorResult,
 ) -> Node {
+    let mut node = NodeRef::new(node);
     while node.is_some() {
-        let result = callback(node);
+        let result = callback(node.node());
         if result == FindAncestorResult::FIND_ANCESTOR_QUIT {
             return Node::NIL;
         } else if result == FindAncestorResult::FIND_ANCESTOR_TRUE {
-            return node;
+            return node.node();
         }
         node = node.parent();
     }

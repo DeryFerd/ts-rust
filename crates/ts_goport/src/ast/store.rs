@@ -4780,6 +4780,35 @@ impl NodeRef {
         self.node.is_some()
     }
 
+    /// The view of node `n`, read from this view (a child or an ancestor):
+    /// a node of the same file keeps this block, any other node makes its
+    /// own lookup.
+    // PERF: perfP1 item 5. A store id names its file, and the block of a
+    // file id never changes while a node read lives.
+    #[inline]
+    #[must_use]
+    pub fn view(self, n: Node) -> NodeRef {
+        if self.block.is_some() && n.is_some() && n.file_index() == self.node.file_index() {
+            debug_assert!(std::ptr::eq(
+                self.block.expect("a block"),
+                file_block(n.file_index()).expect("the same block")
+            ));
+            return NodeRef {
+                node: n,
+                block: self.block,
+            };
+        }
+        NodeRef::new(n)
+    }
+
+    /// True for a published store node: its reads are plain loads from
+    /// the block of its file.
+    #[inline]
+    #[must_use]
+    pub fn has_block(self) -> bool {
+        self.block.is_some()
+    }
+
     /// Go `node.Kind` (`Node::kind`).
     #[inline]
     #[must_use]

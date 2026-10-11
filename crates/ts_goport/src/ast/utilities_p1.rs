@@ -789,17 +789,15 @@ pub fn is_assignment_target(node: Node) -> bool {
 // Go: ast/utilities.go:184 GetAssignmentTarget
 // PERF: U4 (CH7). A step inside a published store reads the parent and its
 // kind with one store lookup (`frozen_store_parent_kind`).
+// PERF: perfP1 item 5. The walk reads through one view of the file
+// (`NodeRef`): each parent step and kind read is a load from the block.
 pub fn get_assignment_target(node: Node) -> Node {
-    let mut node = node;
+    let mut view = NodeRef::new(node);
     loop {
-        let (parent, parent_kind) = match frozen_store_parent_kind(node) {
-            Some(parent_and_kind) => parent_and_kind,
-            None => {
-                let parent = node.parent();
-                (parent, parent.kind())
-            }
-        };
-        match parent_kind {
+        let node = view.node();
+        let parent_view = view.parent();
+        let parent = parent_view.node();
+        match parent_view.kind_or_unknown() {
             SyntaxKind::BinaryExpression => {
                 if is_assignment_operator(parent.operator_token().kind()) && parent.left() == node {
                     return parent;
@@ -832,22 +830,22 @@ pub fn get_assignment_target(node: Node) -> Node {
             | SyntaxKind::ArrayLiteralExpression
             | SyntaxKind::SpreadElement
             | SyntaxKind::NonNullExpression => {
-                node = parent;
+                view = parent_view;
             }
             SyntaxKind::SpreadAssignment => {
-                node = parent.parent();
+                view = parent_view.parent();
             }
             SyntaxKind::ShorthandPropertyAssignment => {
                 if parent.name() != node {
                     return Node::NIL;
                 }
-                node = parent.parent();
+                view = parent_view.parent();
             }
             SyntaxKind::PropertyAssignment => {
                 if parent.name() == node {
                     return Node::NIL;
                 }
-                node = parent.parent();
+                view = parent_view.parent();
             }
             _ => return Node::NIL,
         }
@@ -1656,11 +1654,19 @@ impl OuterExpressionKinds {
 // Determines whether node is an "outer expression" of the provided kinds
 // Go: ast/utilities.go:791 IsOuterExpression
 pub fn is_outer_expression(node: Node, kinds: OuterExpressionKinds) -> bool {
+    is_outer_expression_ref(NodeRef::new(node), kinds)
+}
+
+/// `is_outer_expression` on the view of the node.
+// PERF: perfP1 item 5 (perfscan2). Go switches on `node.Kind`; the view
+// reads the kind and the operator token with one registry lookup.
+#[inline]
+pub fn is_outer_expression_ref(node: NodeRef, kinds: OuterExpressionKinds) -> bool {
     match node.kind() {
         SyntaxKind::ParenthesizedExpression => {
             return kinds.intersects(OuterExpressionKinds::OEK_PARENTHESES)
                 && !(kinds.intersects(OuterExpressionKinds::OEK_EXCLUDE_JS_DOC_TYPE_ASSERTION)
-                    && is_js_doc_type_assertion(node));
+                    && is_js_doc_type_assertion(node.node()));
         }
         SyntaxKind::TypeAssertionExpression | SyntaxKind::AsExpression => {
             return kinds.intersects(OuterExpressionKinds::OEK_TYPE_ASSERTIONS);
@@ -1688,7 +1694,7 @@ pub fn is_outer_expression(node: Node, kinds: OuterExpressionKinds) -> bool {
                 OuterExpressionKinds::OEK_ASSIGNMENTS | OuterExpressionKinds::OEK_COMMA,
             ) =>
         {
-            match node.operator_token().kind() {
+            match node.node().operator_token().kind() {
                 SyntaxKind::EqualsToken => {
                     return kinds.intersects(OuterExpressionKinds::OEK_ASSIGNMENTS);
                 }
@@ -1705,16 +1711,18 @@ pub fn is_outer_expression(node: Node, kinds: OuterExpressionKinds) -> bool {
 
 // Descends into an expression, skipping past "outer expressions" of the provided kinds
 // Go: ast/utilities.go:817 SkipOuterExpressions
+// PERF: perfP1 item 5. The steps read through one view of the file.
 pub fn skip_outer_expressions(node: Node, kinds: OuterExpressionKinds) -> Node {
-    let mut node = node;
-    while is_outer_expression(node, kinds) {
-        if is_binary_expression(node) {
-            node = node.right();
+    let mut node = NodeRef::new(node);
+    while is_outer_expression_ref(node, kinds) {
+        let next = if node.kind() == SyntaxKind::BinaryExpression {
+            node.node().right()
         } else {
-            node = node.expression();
-        }
+            node.expression()
+        };
+        node = node.view(next);
     }
-    node
+    node.node()
 }
 
 // Skips past the parentheses of an expression
