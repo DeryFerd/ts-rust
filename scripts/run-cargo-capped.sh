@@ -5,7 +5,7 @@
 #        scripts/run-cargo-capped.sh help                       this text
 # - Target: <worktree>/target, with sccache when installed. Do not set CARGO_TARGET_DIR (TS_CARGO_SEPARATE_TARGET=1
 #   with its own CARGO_TARGET_DIR only for a deliberate fresh-target reproduction).
-# - TS_CARGO_JOBS: build jobs (16 on zbook, 1 elsewhere). TS_CARGO_MEMORY_LIMIT_KIB: the memory cap of the run.
+# - TS_CARGO_JOBS: build jobs (the core count, at most 16). TS_CARGO_MEMORY_LIMIT_KIB: the memory cap of the run.
 # - TS_CARGO_SLOTS: Cargo runs at a time (2 on zbook, 1 elsewhere). A run takes the first free slot lock
 #   (/tmp/ts-rust-cargo-<id>.lock, then <id>-1.lock, ...); slot 0 keeps the old single-lock name.
 # - Edit-loop builds (build, check, test, run, bench without --profile goport) use nightly -Zthreads=8 and
@@ -21,12 +21,11 @@ case "${1:-}" in help | -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; ex
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
-# Build jobs. TS_CARGO_JOBS overrides the per-host default: 16 on zbook (32
-# cores, 94 GB), 1 elsewhere. Tests keep one thread either way.
-case "$(hostname)" in
-  zbook) default_jobs=16 ;;
-  *) default_jobs=1 ;;
-esac
+# Build jobs. TS_CARGO_JOBS overrides the default: the core count, at most 16
+# (16 on zbook's 32 cores and alvin's 24). Until 2026-10-10 every host but zbook
+# got 1 job. Tests keep one thread either way.
+cores="$(nproc 2>/dev/null || echo 1)"
+default_jobs=$((cores < 16 ? cores : 16))
 jobs="${TS_CARGO_JOBS:-$default_jobs}"
 if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
   echo "TS_CARGO_JOBS must be a positive integer" >&2
@@ -81,8 +80,8 @@ fi
 
 # A virtual-memory limit applies per process. The slot locks below keep separate
 # rustc and test processes from multiplying that limit beyond TS_CARGO_SLOTS runs.
-# Allow 8 GiB for one job and 4 GiB per job above that, capped at three quarters
-# of available memory.
+# Allow 8 GiB for one job and 4 GiB per job for more jobs, capped at three
+# quarters of available memory.
 default_memory_limit_kib=$((jobs == 1 ? 8388608 : jobs * 4194304))
 if [[ -r /proc/meminfo ]]; then
   available_memory_kib="$(awk '$1 == "MemAvailable:" { print $2; exit }' /proc/meminfo)"
