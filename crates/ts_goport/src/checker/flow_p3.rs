@@ -1291,7 +1291,16 @@ impl Checker {
     // `c.markNodeAssignments` is always this worker (`checker_p02`), so the
     // `Rc` closure clone and call per node are not needed.
     pub fn mark_node_assignments_worker(&mut self, node: Node) -> bool {
-        let kind = node.kind();
+        self.mark_node_assignments_ref(NodeRef::new(node))
+    }
+
+    /// `mark_node_assignments_worker` on the view of the node.
+    // PERF: perfP1 item 9 (perfscan2). The walk reads each kind and child
+    // through one view of the file (`NodeRef::for_each_child`): no registry
+    // lookup and no node data load per node.
+    fn mark_node_assignments_ref(&mut self, view: NodeRef) -> bool {
+        let node = view.node();
+        let kind = view.kind();
         match kind {
             SyntaxKind::Identifier => {
                 let assignment_kind = get_assignment_target_kind(node);
@@ -1360,7 +1369,7 @@ impl Checker {
         if is_type_node_kind(kind) {
             return false;
         }
-        node.for_each_child(&mut |child: Node| -> bool { self.mark_node_assignments_worker(child) })
+        view.for_each_child(|child| self.mark_node_assignments_ref(child))
     }
 
     // Extend the position of the given assignment target node to the end of any intervening variable statement,
