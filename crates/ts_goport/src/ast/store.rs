@@ -4698,6 +4698,23 @@ impl FrozenNode {
     pub fn ids(self) -> FrozenIds {
         block_ids(self.block, self.file)
     }
+
+    /// `frozen_store_children` of this node: its children in Go
+    /// `ForEachChild` order from the link column of its block, or `None`
+    /// when its chain is not known or the block has no link column (a
+    /// node shell).
+    // PERF: perfP1 item 1. No second registry lookup.
+    #[inline]
+    #[must_use]
+    pub fn children(self) -> Option<StoreChildren<'static>> {
+        let links = self.block.file.links;
+        let first = links.get(self.index)?.first_child;
+        (first != LINK_NONE).then_some(StoreChildren {
+            file: self.file,
+            links,
+            next: first,
+        })
+    }
 }
 
 /// The `FrozenNode` of `n`. `None` as for `frozen_store_kind`: nil,
