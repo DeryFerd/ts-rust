@@ -287,8 +287,28 @@ fn parse_integer_literal(text: &str) -> Option<Number> {
     }
     let digits = digits.trim_start_matches('0');
     let digits = if digits.is_empty() { "0" } else { digits };
+    if let Some(value) = parse_safe_integer(digits, radix) {
+        return Some(Number(value as f64));
+    }
     let integer = BigInt::parse_bytes(digits.as_bytes(), radix)?;
     Some(Number(integer.to_f64()?))
+}
+
+/// The value of `digits` (valid digits of `radix`) when it is at most
+/// 2^53, so that the `f64` is exact and equals the `BigInt` path's.
+// PERF: Go `jsnum.FromString` tries `strconv.ParseInt` first too; most
+// literals are small. The Effect plugin's re-checks parse each literal again
+// (effperf3 item 8).
+fn parse_safe_integer(digits: &str, radix: u32) -> Option<u64> {
+    let mut value: u64 = 0;
+    for byte in digits.bytes() {
+        // `value` is at most 2^53 here, so this does not overflow.
+        value = value * u64::from(radix) + u64::from(char::from(byte).to_digit(radix)?);
+        if value > 1 << 53 {
+            return None;
+        }
+    }
+    Some(value)
 }
 
 fn parse_decimal_float(text: &str) -> Option<f64> {
@@ -444,7 +464,46 @@ pub fn parse_pseudo_big_int(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, Number, PseudoBigInt, parse_pseudo_big_int};
+    use super::{
+        BigInt, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, Number, PseudoBigInt, parse_pseudo_big_int,
+    };
+    use num_traits::ToPrimitive;
+
+    #[test]
+    fn small_integer_literals_parse_like_bigint() {
+        for text in [
+            "0",
+            "00",
+            "7",
+            "0012",
+            "9007199254740991",
+            "9007199254740992",
+            "9007199254740993",
+            "18446744073709551616",
+            "0x1F",
+            "0X0000ff",
+            "0b101",
+            "0o777",
+            "0x20000000000000",
+            "0x20000000000001",
+            "0xFFFFFFFFFFFFFFFFFF",
+        ] {
+            let (radix, digits) = match text.get(0..2).unwrap_or_default() {
+                "0b" | "0B" => (2, &text[2..]),
+                "0o" | "0O" => (8, &text[2..]),
+                "0x" | "0X" => (16, &text[2..]),
+                _ => (10, text),
+            };
+            let expected = BigInt::parse_bytes(digits.as_bytes(), radix)
+                .and_then(|integer| integer.to_f64())
+                .unwrap();
+            assert_eq!(
+                Number::from_string(text).0.to_bits(),
+                expected.to_bits(),
+                "{text}"
+            );
+        }
+    }
 
     fn assert_number(actual: Number, expected: Number) {
         if expected.is_nan() {

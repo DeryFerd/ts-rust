@@ -112,7 +112,7 @@ fn analyze_prefer_unsafe_constructor_node(
     if call.argument_list().is_nil() || call.arguments().len() != 1 {
         return None;
     }
-    if !tp.is_node_reference_to_effect_module_api(call.expression(), "runSync") {
+    if !tp.is_node_reference_to_effect_module_api(call.expression(), member!("runSync")) {
         return None;
     }
 

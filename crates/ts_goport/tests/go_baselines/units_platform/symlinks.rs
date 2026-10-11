@@ -117,7 +117,7 @@ fn test_known_directory_link_preserves_child_spelling() {
     );
 }
 
-// Go: knownsymlinks_test.go:56 TestSetFile
+// Go: knownsymlinks_test.go:86 TestSetFile
 #[test]
 fn test_set_file() {
     let mut cache = KnownSymlinks::new("/test/dir", true);
@@ -134,7 +134,7 @@ fn test_set_file() {
     assert_eq!(stored, realpath);
 }
 
-// Go: knownsymlinks_test.go:74 TestProcessResolution
+// Go: knownsymlinks_test.go:104 TestProcessResolution
 #[test]
 fn test_process_resolution() {
     let mut cache = KnownSymlinks::new("/test/dir", true);
@@ -157,7 +157,7 @@ fn test_process_resolution() {
     assert_eq!(stored, resolved_path);
 }
 
-// Go: knownsymlinks_test.go:193 TestSetSymlinksFromResolutions
+// Go: knownsymlinks_test.go:223 TestSetSymlinksFromResolutions
 #[test]
 fn test_set_symlinks_from_resolutions() {
     let mut cache = KnownSymlinks::new("/test/dir", true);
@@ -213,7 +213,7 @@ fn test_set_symlinks_from_resolutions() {
     }
 }
 
-// Go: knownsymlinks_test.go:258 TestKnownSymlinksThreadSafety
+// Go: knownsymlinks_test.go:282 TestKnownSymlinksThreadSafety
 #[test]
 fn test_known_symlinks_thread_safety() {
     let mut cache = KnownSymlinks::new("/test/dir", true);

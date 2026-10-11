@@ -88,7 +88,7 @@ pub fn analyze_effect_succeed_with_void(
         if n.kind() == SyntaxKind::CallExpression {
             let call = n;
             if call.expression().is_some()
-                && tp.is_node_reference_to_effect_module_api(call.expression(), "succeed")
+                && tp.is_node_reference_to_effect_module_api(call.expression(), member!("succeed"))
             {
                 if call.argument_list().is_some() && !call.arguments().is_empty() {
                     let arg = call.arguments().get(0);

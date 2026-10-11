@@ -435,7 +435,9 @@ impl TypeParser<'_> {
                 }
 
                 // Check if this is Function.pipe from "effect" package
-                if self.is_node_reference_to_effect_package_export(call.expression(), "pipe") {
+                if self
+                    .is_node_reference_to_effect_package_export(call.expression(), member!("pipe"))
+                {
                     // This is pipe(subject, f1, f2, ...) via namespace access (e.g., Function.pipe)
                     if call.argument_list().is_nil() || call.arguments().is_empty() {
                         break 'compute None;
@@ -469,7 +471,9 @@ impl TypeParser<'_> {
 
             // Case 2: Identifier — bare pipe(subject, f1, f2, ...)
             if call.expression().kind() == SyntaxKind::Identifier {
-                if !self.is_node_reference_to_effect_package_export(call.expression(), "pipe") {
+                if !self
+                    .is_node_reference_to_effect_package_export(call.expression(), member!("pipe"))
+                {
                     break 'compute None;
                 }
 

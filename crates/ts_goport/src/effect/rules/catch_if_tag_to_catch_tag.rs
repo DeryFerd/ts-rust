@@ -58,7 +58,10 @@ pub fn analyze_catch_if_tag_to_catch_tag(
     for flow in flows.iter() {
         for transformation in &flow.transformations {
             if transformation.callee.is_nil()
-                || !tp.is_node_reference_to_effect_module_api(transformation.callee, "catchIf")
+                || !tp.is_node_reference_to_effect_module_api(
+                    transformation.callee,
+                    member!("catchIf"),
+                )
                 || transformation.args.len() != 2
             {
                 continue;

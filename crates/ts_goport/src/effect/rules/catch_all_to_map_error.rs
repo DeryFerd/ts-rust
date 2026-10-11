@@ -66,8 +66,11 @@ pub fn analyze_catch_all_to_map_error(
     let flows = tp.piping_flows(sf, true);
     for flow in flows.iter() {
         for transformation in &flow.transformations {
-            if !tp.is_node_reference_to_effect_module_api(transformation.callee, "catch")
-                && !tp.is_node_reference_to_effect_module_api(transformation.callee, "catchAll")
+            if !tp.is_node_reference_to_effect_module_api(transformation.callee, member!("catch"))
+                && !tp.is_node_reference_to_effect_module_api(
+                    transformation.callee,
+                    member!("catchAll"),
+                )
             {
                 continue;
             }
@@ -93,7 +96,7 @@ pub fn analyze_catch_all_to_map_error(
                 continue;
             }
 
-            if !tp.is_node_reference_to_effect_module_api(call.expression(), "fail") {
+            if !tp.is_node_reference_to_effect_module_api(call.expression(), member!("fail")) {
                 continue;
             }
 

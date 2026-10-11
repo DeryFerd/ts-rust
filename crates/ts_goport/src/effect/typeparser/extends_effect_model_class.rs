@@ -80,9 +80,10 @@ impl TypeParser<'_> {
                 if inner_call.expression().is_nil() {
                     continue;
                 }
-                if !self
-                    .is_node_reference_to_effect_model_module_api(inner_call.expression(), "Class")
-                {
+                if !self.is_node_reference_to_effect_model_module_api(
+                    inner_call.expression(),
+                    member!("Class"),
+                ) {
                     continue;
                 }
 

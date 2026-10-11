@@ -208,7 +208,12 @@ fn type_contains_promise(tp: &mut TypeParser<'_>, t: TypeId) -> bool {
 
 /// explicitPromiseSuccessApis lists the Effect APIs whose explicit type
 /// arguments annotate the success channel directly.
-static EXPLICIT_PROMISE_SUCCESS_APIS: &[&str] = &["succeed", "as", "map", "zipWith"];
+static EXPLICIT_PROMISE_SUCCESS_APIS: [ExportMember; 4] = [
+    ExportMember::new("succeed"),
+    ExportMember::new("as"),
+    ExportMember::new("map"),
+    ExportMember::new("zipWith"),
+];
 
 /// hasExplicitPromiseSuccessTypeArguments reports whether the promise in the
 /// success channel was written explicitly through type arguments on the node
@@ -266,7 +271,7 @@ fn is_explicit_promise_success_transformation(
 
 // Go: rules/promise_in_effect_success.go isExplicitPromiseSuccessApi
 fn is_explicit_promise_success_api(tp: &mut TypeParser<'_>, node: Node) -> bool {
-    for name in EXPLICIT_PROMISE_SUCCESS_APIS {
+    for name in &EXPLICIT_PROMISE_SUCCESS_APIS {
         if tp.is_node_reference_to_effect_module_api(node, name) {
             return true;
         }
@@ -279,5 +284,5 @@ fn is_effect_sync_call(tp: &mut TypeParser<'_>, node: Node) -> bool {
     if node.is_nil() || node.kind() != SyntaxKind::CallExpression {
         return false;
     }
-    tp.is_node_reference_to_effect_module_api(node.expression(), "sync")
+    tp.is_node_reference_to_effect_module_api(node.expression(), member!("sync"))
 }

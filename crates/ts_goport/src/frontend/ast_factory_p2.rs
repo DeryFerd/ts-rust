@@ -33,11 +33,7 @@ impl NodeFactory {
             SyntaxKind::SourceFile,
             D::SourceFile(Box::new(crate::astdata::SourceFileData {
                 end_of_file_token: self.id(end_of_file_token),
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
                 statements: self.req_list(statements),
-                symbol: None,
-                facts: 0,
             })),
         )
     }

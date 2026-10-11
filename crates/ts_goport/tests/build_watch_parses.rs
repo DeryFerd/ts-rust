@@ -8,8 +8,10 @@
 //! that parse. The `.d.ts` case is
 //! `multi_program::build_watch_keeps_the_first_dts_parse_of_a_cycle`.
 //!
-//! Each test copies its fixture to a new directory under the system temp
-//! dir and runs `tsgo` there, and `goport_watch` or `tsgo -b --watch`. A
+//! Each test copies its fixture to a new directory and runs `tsgo` there,
+//! and `goport_watch` or `tsgo -b --watch`. The directory is under the
+//! system temp dir, or under `/tmp` for
+//! `build_watch_parses_a_written_dts_again_in_the_next_cycle` (see there). A
 //! passing test deletes the directory. A failing test keeps it and names it
 //! in the message.
 
@@ -123,13 +125,21 @@ fn build_watch_keeps_the_first_json_parse_of_a_cycle() {
 ///    `resetCaches` drops every parse at the end of a cycle
 ///    (execute/build/orchestrator.go:506-513, called at :862): TS2322, 4.
 ///
-/// A non-incremental build info has no file names
-/// (execute/incremental/snapshottobuildinfo.go:37, :51), so no event in
-/// `out` builds `side` (execute/build/orchestrator.go:586-615). `out` gets
-/// a watch only from the package.json lookups of `side` (:761), and
+/// Why `side` is not composite: a non-incremental build info has no file
+/// names (execute/incremental/snapshottobuildinfo.go:37, :51). A composite
+/// `side` would list `out/a.d.ts` there. Then Go watches `out` at any depth
+/// (`addProgramFileWatchDir`, execute/build/orchestrator.go:746-752,
+/// :775-781; #64366), and the event for `out/a.d.ts` builds `side` in step
+/// 3 (:606-614). So step 5 would not show the drop below.
+///
+/// With no file names, an event for `out/a.d.ts` builds no task: it is no
+/// root file, build info file name or package.json lookup of a task
+/// (:586-638). An event for a directory under a watch would build every
+/// task (:653-666), but every event here is for a file. `out` gets a watch
+/// only from the package.json lookups of `side` (:761, `addWatchDir`), and
 /// `CanWatchDirectory` refuses a directory 3 or fewer levels below `/`
 /// (:769-773, execute/watchmanager/watchbackend.go:84-92). Lines are at Go
-/// fed0bf24149f. Go 673a5f17d713 does the same.
+/// fed0bf24149f. Go 673a5f17d713 does the same for a non-composite `side`.
 ///
 /// The port keeps a `.d.ts` parse from one cycle to the next and checks it
 /// by its modification time. The end of `build_all_tasks` drops the kept
@@ -137,9 +147,11 @@ fn build_watch_keeps_the_first_json_parse_of_a_cycle() {
 /// Without that call the port keeps the parse of step 2 and finds no
 /// error: this test checks that call. A watch event drops a kept parse too
 /// (`BuildHost::evict_watch_sources`), so the check needs an `out` with no
-/// watch: the test works in `/tmp/<dir>`, not in the system temp dir. Go
-/// gives the same output at any depth, so where `/tmp` is deeper the test
-/// still runs. `expected.txt` and the counts are from
+/// watch. Why the root is `/tmp/<dir>`: there `out` is 3 levels below `/`,
+/// and it gets no watch. Under the system temp dir it can be deeper and get
+/// a watch. Go gives the same output at any depth, so where `/tmp` is
+/// deeper the test still runs and passes, but it does not check the drop.
+/// `expected.txt` and the counts are from
 /// `tsgo-oracle-fed0bf24149f` and `tsgo-oracle-673a5f17d713` in place of
 /// `tsgo` for this test (3 of 3 runs each).
 // PORT: no Go counterpart; the output is Go's.

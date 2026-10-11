@@ -284,6 +284,7 @@ fn try_code_action(
             &locale::from_context(ctx),
             &args![],
         ),
+        ..Default::default()
     })
 }
 

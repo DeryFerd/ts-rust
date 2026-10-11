@@ -29,21 +29,21 @@ fn run_schema_literal_non_finite(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnosti
             let call = node;
             if call.is_some() && call.argument_list().is_some() && !call.arguments().is_empty() {
                 let mut values: Vec<Node> = Vec::new();
-                if ctx
-                    .tp
-                    .is_node_reference_to_effect_schema_module_api(call.expression(), "Literals")
-                {
+                if ctx.tp.is_node_reference_to_effect_schema_module_api(
+                    call.expression(),
+                    member!("Literals"),
+                ) {
                     let arg = call.arguments().get(0);
                     if arg.is_some() && arg.kind() == SyntaxKind::ArrayLiteralExpression {
                         values = arg.elements().to_vec();
                     }
-                } else if ctx
-                    .tp
-                    .is_node_reference_to_effect_schema_module_api(call.expression(), "Literal")
-                    || ctx
-                        .tp
-                        .is_node_reference_to_effect_schema_module_api(call.expression(), "tag")
-                {
+                } else if ctx.tp.is_node_reference_to_effect_schema_module_api(
+                    call.expression(),
+                    member!("Literal"),
+                ) || ctx.tp.is_node_reference_to_effect_schema_module_api(
+                    call.expression(),
+                    member!("tag"),
+                ) {
                     values = vec![call.arguments().get(0)];
                 }
 

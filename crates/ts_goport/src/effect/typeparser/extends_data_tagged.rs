@@ -69,9 +69,10 @@ impl TypeParser<'_> {
                 if call.expression().is_nil() {
                     continue;
                 }
-                if !self
-                    .is_node_reference_to_effect_data_module_api(call.expression(), "TaggedError")
-                {
+                if !self.is_node_reference_to_effect_data_module_api(
+                    call.expression(),
+                    member!("TaggedError"),
+                ) {
                     continue;
                 }
 
