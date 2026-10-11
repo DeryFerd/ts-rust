@@ -300,7 +300,9 @@ testbox, `testbox-data.sh` makes zbook's paths there, and `testbox-remote.sh` ho
 scripts/goport/testbox.sh warmup                                # about 1 min; TESTBOX_REF=<branch> for a workflow change
 scripts/goport/testbox.sh tests <out-dir> <base results.json>   # build-goport-tests.sh, goport-tests.sh, compare-tests.py
 scripts/goport/testbox.sh np-suite <label> [<base label>]       # np-suite.sh run, then np-suite.sh diff
-scripts/goport/testbox.sh push <bins dir>                       # then run gate.sh, lsp_oracle.py or api_oracle.py as on zbook
+scripts/goport/testbox.sh push <bins dir>                       # then run gate.sh, lsp_oracle.py or api_oracle.py as on zbook,
+                                                                 # from the zbook path, so the manifest names the same scripts:
+                                                                 # run bash -c 'cd /home/theo/Code/sandbox/ts-rust && GOPORT_PIN=<pin> bash scripts/goport/gate.sh ...'
 scripts/goport/testbox.sh get <remote> [<local>]                # rsync a result back
 scripts/goport/testbox.sh stop                                  # or release (see "Sticky disks")
 ```

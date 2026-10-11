@@ -109,7 +109,8 @@ case $cmd in
     rc=0
     echo "build-goport-tests.sh at ${commit:0:12} ($(date -u +%T))"
     scripts/goport/build-goport-tests.sh "$PWD" "$run/testbin" > "$run/build.log" 2>&1 || rc=$?
-    tail -2 "$run/build.log"
+    # Not the bare DONE line: a driver log that ends in DONE or FAIL must not match it early.
+    tail -2 "$run/build.log" | grep -vx DONE || true
     if ((rc == 0)); then
       echo "goport-tests.sh at pin $key ($(date -u +%T))"
       GOPORT_PIN=$key scripts/goport/goport-tests.sh "$run/testbin" "$run/tests-run" > "$run/tests.log" 2>&1 || rc=$?
