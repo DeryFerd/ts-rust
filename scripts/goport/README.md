@@ -63,12 +63,13 @@ retired. R132 is the last legacy revision.
    applies the branch to the checkout in one commit and records the revision (`open_revision.py`,
    the only state write). Leave out `--new-batch` for a later revision of an open batch. Then commit
    the state.
-3. `candidate.sh side <rev> [--gate-host HOST] [--name-map TSV]`: in a systemd unit, the release
+3. `candidate.sh side <rev> [--gate-host HOST | --host testbox] [--name-map TSV]`: in a systemd unit, the release
    bins, the goport tests (`build-goport-tests.sh`, `goport-tests.sh`, then `compare-tests.py`
    against the base results), two bound runs, the full gate and `gate-compare.py` against the base
    gate manifest, the LSP oracle (`lsp_oracle.py`) and the API oracle (`api_oracle.py`, 10
    batteries) each compared per request with the base results (`oracle-compare.py`), and rustfmt
-   and clippy on `ts_goport` and the kept crates. Wait for `SIDE DONE`. A pin bump that
+   and clippy on `ts_goport` and the kept crates (in the checkout's own `target/candidate-clippy`; the
+   quality record is reused only for the same `fp.py` fingerprint). Wait for `SIDE DONE`. A pin bump that
    renames Go tests, or a moved test, needs `--name-map` (old suite, old name, new suite, new name,
    then the evidence). A gate run that fails its compare stays in the evidence cache for good, as
    `gate-fail-<gate label>.json` and `gate-compare-fail-<gate label>.json`, and the next `side` runs a
@@ -436,4 +437,14 @@ scripts/goport/testbox.sh stop                                  # or release (se
   the same. The default host stays dbook-lan until a batch lists the change; it is also the fallback after a
   testbox failure (finished steps stay cached). R190 source, 2026-10-11: 27.9 min against 29.1 min for zbook and
   dbook-lan, with the same results (target/continuation-r97-goport/tbxside1/summary.md).
+  - Test bins of another checkout (an integration's side run) also run there: the testbox gets their commit
+    (from origin, or from the checkout's bundle) and their two bind paths.
+  - Host kinds: testbox, or ssh (zbook and the SSH hosts). With `batch.oracleRebase`, the rebase runs and the
+    candidate's oracle runs must be one kind (ruling 10 "the same host setup"); `oracle-rebase.sh` runs on the
+    SSH hosts, so a pin bump runs `side` without `--host testbox`. Each oracle run records its host in
+    `<kind>-run.host`.
+  - Editor items: the gate judges each one against Go in the same run, and no rule judges peak RSS (2 to 4
+    percent higher on a testbox). `gate-compare.py` compares only the Rust growth of `editor/<project>/long`
+    with its cap across runs, and that growth was the same on both kinds. `side` fails when the base and the
+    candidate gates are of two kinds and a long growth is within 0.15 MiB/edit of its cap.
 - Not on testboxes yet: wall timing and PGO and BOLT builds. Wall stays on mini-743d.
