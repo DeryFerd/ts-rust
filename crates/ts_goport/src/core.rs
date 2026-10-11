@@ -271,8 +271,29 @@ impl Default for Name {
 }
 
 impl std::hash::Hash for Name {
-    // Hashes the text, so `Borrow<str>` lookups stay correct.
+    // Hashes like the text, so `Borrow<str>` lookups stay correct.
+    // PERF: intern1 fix 5. On a 64-bit target the hash comes from the
+    // `hash_str` hash that the interner keeps, with no text read. It is the
+    // `str` hash only for `FxHasher` (rustc-hash `=2.1.2`, no `nightly`
+    // feature): `<str as Hash>` is `write(bytes)`, which is
+    // `write_u64(hash_bytes(bytes))`, then `write_u8(0xff)`, and `hash_str`
+    // is `hash_bytes(bytes).wrapping_mul(K).rotate_left(26)`. Every map and
+    // set of `Name` keys is an `Fx` one. A map of `Name` keys with another
+    // hasher and `&str` lookups would not find its keys
+    // (`name_hash_is_the_fx_str_hash` tests the identity).
+    #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        #[cfg(target_pointer_width = "64")]
+        {
+            /// The inverse of `FxHasher`'s `K` (0xf1357aea2e62a9c5) mod 2^64.
+            const K_INV: u64 = 0x7814_94a5_5daa_ed0d;
+            let hash_bytes = intern::full_hash(self.0)
+                .rotate_right(26)
+                .wrapping_mul(K_INV);
+            state.write_u64(hash_bytes);
+            state.write_u8(0xff);
+        }
+        #[cfg(not(target_pointer_width = "64"))]
         self.as_str().hash(state);
     }
 }
@@ -452,7 +473,7 @@ mod intern {
     use std::cell::{Cell, OnceCell};
     use std::collections::HashMap;
     use std::hash::{BuildHasherDefault, Hasher};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock, PoisonError};
 
     /// Chunk `k` holds `FIRST_CHUNK << k` ids, so a few chunks cover all ids.
@@ -470,10 +491,13 @@ mod intern {
 
     type Slots = Box<[OnceLock<&'static str>]>;
     static TEXTS: [OnceLock<Slots>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
-    /// The table hash (`super::fold_hash`) of each id's text, in the same
-    /// chunks as `TEXTS`. A table lookup by `Name` reads it instead of
-    /// reading and hashing the text again.
-    static HASHES: [OnceLock<Box<[AtomicU32]>>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
+    /// The `hash_str` hash of each id's text, in the same chunks as
+    /// `TEXTS`. A table lookup by `Name` reads it (folded, `table_hash`)
+    /// and so does `Name::hash`, instead of reading and hashing the text
+    /// again.
+    // PERF: intern1 fix 5. The full 64-bit hash, not the folded table hash,
+    // so `Name::hash` gives the `str` hash from it (`full_hash`).
+    static HASHES: [OnceLock<Box<[AtomicU64]>>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
     /// The next sequence number block. Only `next_id` reads it. Sequence
     /// number 1 is `DEFAULT_ID`, and the lib names come next.
     static NEXT: AtomicU32 = AtomicU32::new(LIB_FIRST_SEQ + lib_names::COUNT as u32);
@@ -680,18 +704,17 @@ mod intern {
         let _ = slots[index].set(stored);
     }
 
-    /// Records the table hash of id `id`, from its `hash_str` hash `hash`.
-    /// Writes only a slot that does not hold it yet, so threads that find
-    /// the same lib name do not write one cache line in turn.
+    /// Records the `hash_str` hash `hash` of id `id`. Writes only a slot
+    /// that does not hold it yet, so threads that find the same lib name do
+    /// not write one cache line in turn.
     #[inline]
     fn set_hash(id: u32, hash: u64) {
         let (chunk, index) = slot(id);
         let chunk_len = 1usize << (FIRST_CHUNK_SHIFT as usize + chunk);
         let hashes =
-            HASHES[chunk].get_or_init(|| (0..chunk_len).map(|_| AtomicU32::new(0)).collect());
-        let folded = super::fold_hash(hash);
-        if hashes[index].load(Ordering::Relaxed) != folded {
-            hashes[index].store(folded, Ordering::Relaxed);
+            HASHES[chunk].get_or_init(|| (0..chunk_len).map(|_| AtomicU64::new(0)).collect());
+        if hashes[index].load(Ordering::Relaxed) != hash {
+            hashes[index].store(hash, Ordering::Relaxed);
         }
     }
 
@@ -812,8 +835,14 @@ mod intern {
     /// The table hash of the text of name id `id`.
     #[inline]
     pub(super) fn table_hash(id: u32) -> u32 {
+        super::fold_hash(full_hash(id))
+    }
+
+    /// `hash_str` of the text of name id `id`.
+    #[inline]
+    pub(super) fn full_hash(id: u32) -> u64 {
         if id == 0 {
-            return super::fold_hash(hash_str(""));
+            return hash_str("");
         }
         let (chunk, index) = slot(id);
         // Relaxed is enough: a thread gets `id` from `intern_shared` under
@@ -936,6 +965,45 @@ mod intern {
                     .map(|i| char::from(b'a' + (i * 7 % 26) as u8))
                     .collect();
                 assert_eq!(fx_hash_64(text.as_bytes()), hash_str(&text), "{text:?}");
+            }
+        }
+
+        /// intern1 fix 5: a `Name` hashes like its text under `FxHasher`
+        /// (`Hash for Name`), alone and inside a tuple key, for "", the
+        /// fixed "default" id, lib names, internal names, short and long
+        /// shard names. A failure after a rustc-hash update means the
+        /// `Hash for Name` identity no longer holds: hash the text there.
+        #[test]
+        fn name_hash_is_the_fx_str_hash() {
+            use std::hash::BuildHasher;
+            let long = "a_name_of_forty_bytes_or_more_for_the_bulk_loop_xyz";
+            let internal = format!("{}@noderef1", crate::ast::INTERNAL_SYMBOL_NAME_PREFIX);
+            for text in [
+                "",
+                crate::ast::INTERNAL_SYMBOL_NAME_DEFAULT,
+                "constructor",
+                "addEventListener",
+                "Array",
+                "x",
+                "noderef1_shard_name",
+                long,
+                &internal,
+                "\u{e9}t\u{e9}",
+            ] {
+                let name = Name::from(text);
+                assert_eq!(
+                    FxBuildHasher.hash_one(&name),
+                    FxBuildHasher.hash_one(text),
+                    "{text:?}"
+                );
+                assert_eq!(
+                    FxBuildHasher.hash_one((&name, 7u32)),
+                    FxBuildHasher.hash_one((text, 7u32)),
+                    "{text:?}"
+                );
+                let mut set = rustc_hash::FxHashSet::default();
+                set.insert(name.clone());
+                assert!(set.contains(text), "{text:?}");
             }
         }
 
@@ -2370,6 +2438,18 @@ impl<'a> From<&'a str> for TableKey<'a> {
 impl<'a> From<&'a Name> for TableKey<'a> {
     fn from(name: &'a Name) -> Self {
         TableKey::Name(name)
+    }
+}
+
+impl<'a> From<&'a String> for TableKey<'a> {
+    fn from(text: &'a String) -> Self {
+        TableKey::Text(text)
+    }
+}
+
+impl<'a> From<&'a std::borrow::Cow<'_, str>> for TableKey<'a> {
+    fn from(text: &'a std::borrow::Cow<'_, str>) -> Self {
+        TableKey::Text(text)
     }
 }
 

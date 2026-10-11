@@ -740,8 +740,16 @@ impl Checker {
 
     // Go: checker/checker.go:19358 getTypeOfPropertyOfType
     // Return the type of the given property in the given type, or nil if no such property exists
-    pub fn get_type_of_property_of_type(&mut self, t: TypeId, name: &str) -> TypeId {
-        let prop = self.get_property_of_type(t, name);
+    // PERF: intern1 fix 7. A `Name` key looks the property up by id.
+    pub fn get_type_of_property_of_type<'a>(
+        &mut self,
+        t: TypeId,
+        name: impl Into<TableKey<'a>>,
+    ) -> TypeId {
+        let prop = self.get_property_of_type_ex(
+            t, name, false, /*skipObjectFunctionPropertyAugment*/
+            false, /*includeTypeOnlyMembers*/
+        );
         if prop.is_some() {
             return self.get_type_of_symbol(prop);
         }
