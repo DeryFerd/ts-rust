@@ -981,12 +981,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "a66862e810b2d6427",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "aa2dc06503672fc00",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R194 pipeline (candidate.sh side)."
