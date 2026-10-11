@@ -77,7 +77,10 @@ pub fn analyze_all_of_map_to_for_each(
                     && (transformation.kind == TransformationKind::Pipe
                         || transformation.kind == TransformationKind::Pipeable)
                     && transformation.callee.is_some()
-                    && tp.is_node_reference_to_effect_module_api(transformation.callee, "all")
+                    && tp.is_node_reference_to_effect_module_api(
+                        transformation.callee,
+                        member!("all"),
+                    )
             };
         let mut predicates: [&mut PipingFlowTransformationPredicate<'_>; 2] =
             [&mut any_transformation, &mut all_reference];
@@ -154,7 +157,7 @@ fn analyze_all_of_map_to_for_each_call(
     if all_call.expression().is_nil() || all_args.is_empty() || all_args.len() > 2 {
         return None;
     }
-    if !tp.is_node_reference_to_effect_module_api(all_call.expression(), "all")
+    if !tp.is_node_reference_to_effect_module_api(all_call.expression(), member!("all"))
         || contains_spread_element(&all_args)
     {
         return None;

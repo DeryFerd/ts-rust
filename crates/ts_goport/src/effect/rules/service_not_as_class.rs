@@ -122,7 +122,8 @@ fn check_service_not_as_class(
     }
 
     let mut service_module = "";
-    if tp.is_node_reference_to_effect_context_module_api(call_expr.expression(), "Service") {
+    if tp.is_node_reference_to_effect_context_module_api(call_expr.expression(), member!("Service"))
+    {
         service_module = "Context";
     }
     if service_module.is_empty() {

@@ -153,12 +153,26 @@ fn find_rule_severities(s: &[u8]) -> Vec<(String, String)> {
 }
 
 // Go: directives/parser.go CollectEffectDirectives
+// PERF: Go matches its pattern on every line. The port finds the directive
+// text in the whole file first and parses only the lines that hold it: most
+// files have none. A line without the text cannot match, so the same lines
+// give the same directives (effperf3 item 7).
 #[must_use]
 pub fn collect_effect_directives(source_text: &str) -> Vec<Directive> {
+    let text = source_text.as_bytes();
     let mut directives = Vec::new();
-    let mut line_start_pos: usize = 0;
-    for (line_num, line) in source_text.split('\n').enumerate() {
-        let bytes = line.as_bytes();
+    // `line_num` is the 0-based line of the byte at `counted`.
+    let mut line_num: usize = 0;
+    let mut counted: usize = 0;
+    let mut from: usize = 0;
+    let finder = memchr::memmem::Finder::new(DIRECTIVE);
+    while let Some(offset) = finder.find(&text[from..]) {
+        let hit = from + offset;
+        let line_start_pos = memchr::memrchr(b'\n', &text[..hit]).map_or(0, |i| i + 1);
+        let line_end = memchr::memchr(b'\n', &text[hit..]).map_or(text.len(), |i| hit + i);
+        line_num += memchr::memchr_iter(b'\n', &text[counted..line_start_pos]).count();
+        counted = line_start_pos;
+        let bytes = &text[line_start_pos..line_end];
         if let Some((match_start, match_end, is_next_line, rules_start, rules_end)) =
             find_directive(bytes)
         {
@@ -179,7 +193,7 @@ pub fn collect_effect_directives(source_text: &str) -> Vec<Directive> {
                 });
             }
         }
-        line_start_pos += line.len() + 1; // +1 for newline
+        from = line_end;
     }
     directives
 }
@@ -384,6 +398,55 @@ mod tests {
         assert!(ds[1].is_next_line);
         assert_eq!(rules(&ds[1]), [("*", Severity::Off)]);
         assert_eq!(rules(&ds[2]), [("*", Severity::SkipFile)]);
+    }
+
+    /// Go's scan: the pattern on every line.
+    fn collect_per_line(source_text: &str) -> Vec<Directive> {
+        let mut directives = Vec::new();
+        let mut line_start_pos = 0;
+        for (line_num, line) in source_text.split('\n').enumerate() {
+            let bytes = line.as_bytes();
+            if let Some((match_start, match_end, is_next_line, rules_start, rules_end)) =
+                find_directive(bytes)
+            {
+                let rules: Vec<RuleSeverity> = find_rule_severities(&bytes[rules_start..rules_end])
+                    .into_iter()
+                    .map(|(rule, severity)| RuleSeverity {
+                        rule,
+                        severity: Severity::parse(&severity),
+                    })
+                    .collect();
+                if !rules.is_empty() {
+                    directives.push(Directive {
+                        line: line_num as i32,
+                        pos: (line_start_pos + match_start) as i32,
+                        end: (line_start_pos + match_end) as i32,
+                        is_next_line,
+                        rules,
+                    });
+                }
+            }
+            line_start_pos += line.len() + 1;
+        }
+        directives
+    }
+
+    #[test]
+    fn whole_text_search_finds_the_per_line_directives() {
+        for src in [
+            "",
+            "@effect-diagnostics",
+            "x\r\n// @effect-diagnostics a:off\r\n\r\n//@effect-diagnostics-next-line b:warning",
+            "// @effect-diagnostics @effect-diagnostics a:off b:error\n\n",
+            "// @effect-diagnosticsX a:off\n// @effect-diagnostics\n// @effect-diagnostics c:off",
+            "\n\n\n// @effect-diagnostics-next-line\tq:off @effect-diagnostics r:off",
+        ] {
+            assert_eq!(
+                collect_effect_directives(src),
+                collect_per_line(src),
+                "{src:?}"
+            );
+        }
     }
 
     #[test]

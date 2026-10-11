@@ -91,7 +91,8 @@ pub fn analyze_multiple_effect_provide(
 
         for transformation in &flow.transformations {
             // Check if this is an Effect.provide call
-            if !tp.is_node_reference_to_effect_module_api(transformation.callee, "provide") {
+            if !tp.is_node_reference_to_effect_module_api(transformation.callee, member!("provide"))
+            {
                 finalize_chunk(
                     &mut matches,
                     &mut current_chunk,

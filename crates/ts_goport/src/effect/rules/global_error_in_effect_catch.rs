@@ -7,7 +7,12 @@ use crate::effect::typeparser::*;
 use crate::prelude::*;
 
 /// Go `globalErrorCatchApis`: the Effect module APIs that have a catch callback parameter.
-static GLOBAL_ERROR_CATCH_APIS: &[&str] = &["tryPromise", "try", "tryMap", "tryMapPromise"];
+static GLOBAL_ERROR_CATCH_APIS: [ExportMember; 4] = [
+    ExportMember::new("tryPromise"),
+    ExportMember::new("try"),
+    ExportMember::new("tryMap"),
+    ExportMember::new("tryMapPromise"),
+];
 
 // Go: rules.GlobalErrorInEffectCatch
 /// GlobalErrorInEffectCatch detects when catch callbacks in Effect APIs return the global 'Error'
@@ -132,7 +137,7 @@ fn check_global_error_in_effect_catch(
 // Go: rules.isGlobalErrorCatchCallee
 /// isGlobalErrorCatchCallee checks if a node references one of the Effect module catch APIs.
 fn is_global_error_catch_callee(tp: &mut TypeParser<'_>, node: Node) -> bool {
-    for name in GLOBAL_ERROR_CATCH_APIS {
+    for name in &GLOBAL_ERROR_CATCH_APIS {
         if tp.is_node_reference_to_effect_module_api(node, name) {
             return true;
         }

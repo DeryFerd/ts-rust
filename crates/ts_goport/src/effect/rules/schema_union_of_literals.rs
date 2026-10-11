@@ -97,7 +97,7 @@ fn analyze_schema_union_of_literals_node(
     let call = node;
 
     // Check if this is Schema.Union
-    if !tp.is_node_reference_to_effect_schema_module_api(call.expression(), "Union") {
+    if !tp.is_node_reference_to_effect_schema_module_api(call.expression(), member!("Union")) {
         return (SchemaUnionOfLiteralsMatch::default(), false);
     }
 
@@ -115,7 +115,10 @@ fn analyze_schema_union_of_literals_node(
             return (SchemaUnionOfLiteralsMatch::default(), false);
         }
         let arg_call = arg;
-        if !tp.is_node_reference_to_effect_schema_module_api(arg_call.expression(), "Literal") {
+        if !tp.is_node_reference_to_effect_schema_module_api(
+            arg_call.expression(),
+            member!("Literal"),
+        ) {
             return (SchemaUnionOfLiteralsMatch::default(), false);
         }
 

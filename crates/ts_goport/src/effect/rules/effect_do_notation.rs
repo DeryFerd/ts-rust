@@ -52,7 +52,7 @@ pub fn analyze_effect_do_notation(tp: &mut TypeParser<'_>, sf: Node) -> Vec<Effe
             return false;
         }
 
-        if tp.is_node_reference_to_effect_module_api(n, "Do") {
+        if tp.is_node_reference_to_effect_module_api(n, member!("Do")) {
             matches.push(EffectDoNotationMatch {
                 source_file: sf,
                 location: get_error_range_for_node(sf, n),

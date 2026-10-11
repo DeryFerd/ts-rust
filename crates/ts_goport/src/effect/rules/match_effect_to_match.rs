@@ -61,12 +61,15 @@ pub fn analyze_match_effect_to_match(
                 continue;
             }
             let (match_effect_name, replacement_name) = if tp
-                .is_node_reference_to_effect_module_api(transformation.callee, "matchEffect")
-            {
+                .is_node_reference_to_effect_module_api(
+                    transformation.callee,
+                    member!("matchEffect"),
+                ) {
                 ("matchEffect", "match")
-            } else if tp
-                .is_node_reference_to_effect_module_api(transformation.callee, "matchCauseEffect")
-            {
+            } else if tp.is_node_reference_to_effect_module_api(
+                transformation.callee,
+                member!("matchCauseEffect"),
+            ) {
                 ("matchCauseEffect", "matchCause")
             } else {
                 continue;
@@ -80,12 +83,12 @@ pub fn analyze_match_effect_to_match(
                 continue;
             }
             let (failure_result, failure_argument, ok) =
-                match_effect_constructor_handler(tp, on_failure, "succeed");
+                match_effect_constructor_handler(tp, on_failure, member!("succeed"));
             if !ok {
                 continue;
             }
             let (success_result, success_argument, ok) =
-                match_effect_constructor_handler(tp, on_success, "succeed");
+                match_effect_constructor_handler(tp, on_success, member!("succeed"));
             if !ok {
                 continue;
             }
@@ -115,7 +118,7 @@ pub fn analyze_match_effect_to_match(
 pub fn match_effect_constructor_handler(
     tp: &mut TypeParser<'_>,
     node: Node,
-    constructor_name: &str,
+    constructor_name: &ExportMember,
 ) -> (Node, Node, bool) {
     let Some(lazy) = parse_lazy_expression(node, LazyExpressionFlags::NONE) else {
         return (Node::NIL, Node::NIL, false);

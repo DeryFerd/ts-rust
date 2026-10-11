@@ -518,7 +518,7 @@ impl TypeParser<'_> {
             return Node::NIL;
         }
 
-        if !self.is_node_reference_to_effect_module_api(call.expression(), "withSpan") {
+        if !self.is_node_reference_to_effect_module_api(call.expression(), member!("withSpan")) {
             return Node::NIL;
         }
 
@@ -646,13 +646,13 @@ impl TypeParser<'_> {
         if node.is_nil() {
             return "";
         }
-        if self.is_node_reference_to_effect_layer_module_api(node, "effect") {
+        if self.is_node_reference_to_effect_layer_module_api(node, member!("effect")) {
             return "effect";
         }
-        if self.is_node_reference_to_effect_layer_module_api(node, "succeed") {
+        if self.is_node_reference_to_effect_layer_module_api(node, member!("succeed")) {
             return "succeed";
         }
-        if self.is_node_reference_to_effect_layer_module_api(node, "sync") {
+        if self.is_node_reference_to_effect_layer_module_api(node, member!("sync")) {
             return "sync";
         }
         ""

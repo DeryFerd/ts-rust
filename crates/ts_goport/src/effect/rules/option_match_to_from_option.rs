@@ -79,7 +79,8 @@ fn analyze_option_match_calls(
         for transformation in &flow.transformations {
             let callee = transformation.callee;
             let args = &transformation.args;
-            if args.len() != 1 || !tp.is_node_reference_to_effect_option_module_api(callee, "match")
+            if args.len() != 1
+                || !tp.is_node_reference_to_effect_option_module_api(callee, member!("match"))
             {
                 continue;
             }
@@ -175,7 +176,7 @@ fn analyze_option_match_handlers(tp: &mut TypeParser<'_>, node: Node) -> (Node, 
 fn analyze_effect_succeed_handler(tp: &mut TypeParser<'_>, node: Node) -> (Node, bool) {
     let (target, type_arguments, _) = tp.unwrap_identity_forwarder(node);
     if type_arguments.is_some() && !type_arguments.nodes().is_empty()
-        || !tp.is_node_reference_to_effect_module_api(target, "succeed")
+        || !tp.is_node_reference_to_effect_module_api(target, member!("succeed"))
     {
         return (Node::NIL, false);
     }
@@ -196,7 +197,7 @@ fn analyze_effect_fail_handler(tp: &mut TypeParser<'_>, node: Node) -> (Node, No
         || call.argument_list().is_nil()
         || call.argument_list().nodes().len() != 1
         || call.type_argument_list().is_some() && !call.type_argument_list().nodes().is_empty()
-        || !tp.is_node_reference_to_effect_module_api(call.expression(), "fail")
+        || !tp.is_node_reference_to_effect_module_api(call.expression(), member!("fail"))
     {
         return (Node::NIL, Node::NIL, false, false);
     }
@@ -300,9 +301,9 @@ fn analyze_option_conditional(
     }
 
     let is_some =
-        tp.is_node_reference_to_effect_option_module_api(condition.expression(), "isSome");
+        tp.is_node_reference_to_effect_option_module_api(condition.expression(), member!("isSome"));
     let is_none =
-        tp.is_node_reference_to_effect_option_module_api(condition.expression(), "isNone");
+        tp.is_node_reference_to_effect_option_module_api(condition.expression(), member!("isNone"));
     if is_some == is_none {
         return (OptionMatchToFromOptionMatch::default(), false);
     }
@@ -360,7 +361,7 @@ fn analyze_conditional_succeed(
         || call.argument_list().is_nil()
         || call.argument_list().nodes().len() != 1
         || call.type_argument_list().is_some() && !call.type_argument_list().nodes().is_empty()
-        || !tp.is_node_reference_to_effect_module_api(call.expression(), "succeed")
+        || !tp.is_node_reference_to_effect_module_api(call.expression(), member!("succeed"))
     {
         return (Node::NIL, false);
     }
@@ -391,7 +392,7 @@ fn analyze_effect_fail_call(tp: &mut TypeParser<'_>, node: Node) -> (Node, Node,
         || call.argument_list().is_nil()
         || call.argument_list().nodes().len() != 1
         || call.type_argument_list().is_some() && !call.type_argument_list().nodes().is_empty()
-        || !tp.is_node_reference_to_effect_module_api(call.expression(), "fail")
+        || !tp.is_node_reference_to_effect_module_api(call.expression(), member!("fail"))
     {
         return (Node::NIL, Node::NIL, false);
     }
@@ -435,5 +436,8 @@ fn is_default_no_such_element_error(tp: &mut TypeParser<'_>, node: Node) -> bool
     {
         return false;
     }
-    tp.is_node_reference_to_effect_cause_module_api(expression.expression(), "NoSuchElementError")
+    tp.is_node_reference_to_effect_cause_module_api(
+        expression.expression(),
+        member!("NoSuchElementError"),
+    )
 }

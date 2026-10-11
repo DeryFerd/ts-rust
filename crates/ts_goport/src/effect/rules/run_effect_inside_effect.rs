@@ -7,7 +7,12 @@ use crate::effect::typeparser::*;
 use crate::prelude::*;
 
 /// runEffectApis lists the Effect module run APIs that should not be called inside Effect generators.
-static RUN_EFFECT_APIS: &[&str] = &["runSync", "runPromise", "runFork", "runCallback"];
+static RUN_EFFECT_APIS: [ExportMember; 4] = [
+    ExportMember::new("runSync"),
+    ExportMember::new("runPromise"),
+    ExportMember::new("runFork"),
+    ExportMember::new("runCallback"),
+];
 
 /// RunEffectInsideEffect detects Effect.runSync, Effect.runPromise, Effect.runFork, and
 /// Effect.runCallback call expressions inside Effect generator contexts and suggests alternatives.
@@ -186,9 +191,9 @@ fn analyze_run_effect_inside_effect_node(
 /// matchRunEffectApi checks if the node references one of the Effect.run* APIs and returns the method name.
 /// Returns empty string if no match.
 fn match_run_effect_api(tp: &mut TypeParser<'_>, node: Node) -> String {
-    for name in RUN_EFFECT_APIS {
+    for name in &RUN_EFFECT_APIS {
         if tp.is_node_reference_to_effect_module_api(node, name) {
-            return (*name).to_string();
+            return name.name.to_string();
         }
     }
     String::new()

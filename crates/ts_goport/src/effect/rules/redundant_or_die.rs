@@ -120,7 +120,7 @@ fn analyze_redundant_or_die_flow_candidate(
     if last_transform.callee.is_nil() {
         return none;
     }
-    if !tp.is_node_reference_to_effect_module_api(last_transform.callee, "orDie") {
+    if !tp.is_node_reference_to_effect_module_api(last_transform.callee, member!("orDie")) {
         return none;
     }
 
