@@ -39,12 +39,16 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('work', type=Path)
     parser.add_argument('--suite', choices=['all', 'apps', 't3'], default='all')
+    cases = apps + [f't3-{project}-{mode}' for project in projects for mode in ['noeffect', 'effect']]
+    parser.add_argument('--case', choices=cases)
     args = parser.parse_args()
     results = args.work / 'results'
-    if args.suite in ['all', 'apps']:
+    if args.case:
+        compare(results, args.case, effect_only=args.case.endswith('-effect'))
+    elif args.suite in ['all', 'apps']:
         for app in apps:
             compare(results, app)
-    if args.suite in ['all', 't3']:
+    if not args.case and args.suite in ['all', 't3']:
         for project in projects:
             compare(results, f't3-{project}-noeffect')
             # effect-tsgo has its own TypeScript pin. Compare its Effect rules only;

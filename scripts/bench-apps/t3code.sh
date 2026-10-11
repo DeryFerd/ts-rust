@@ -60,6 +60,7 @@ GOE=$(cd "$work/effectgo" && "$ETSGO" get-exe-path)
 [[ -x $GOE ]] || { echo "no Effect-patched tsc: $GOE" >&2; exit 1; }
 TS6="node --max-old-space-size=16384 $work/node_modules/ts6/lib/tsc.js"
 TS6E="node --max-old-space-size=16384 $work/ts6effect/node_modules/typescript/lib/tsc.js"
+if [[ ${PREPARE_ONLY:-0} == 1 ]]; then echo ready; exit 0; fi
 # --composite false: apps/web is composite, which needs incremental.
 F="--noEmit --incremental false --composite false"
 names=(tsc6 tsc7 tsc-rs bun tsc-rs-0.3.0)

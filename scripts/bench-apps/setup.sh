@@ -3,6 +3,7 @@
 # the apps at their measured commits, with dependencies installed without install scripts.
 # usage: scripts/bench-apps/setup.sh <work-dir>
 # Use a work dir whose name ends in .noindex, so Spotlight does not index the repos.
+# BENCH_APPS selects repository names (for example "sentry" or "t3code"); default all.
 set -euo pipefail
 [[ $# == 1 ]] || { sed -n '4p' "$0" >&2; exit 2; }
 mkdir -p "$1" && cd "$1"
@@ -37,6 +38,7 @@ install() { # name
   fi
 }
 while read -r name url sha; do
+  [[ ${BENCH_APPS:-all} == all || " ${BENCH_APPS:-all} " == *" $name "* ]] || continue
   checkout "$name" "$url" "$sha"
   (install "$name") >"logs/install-$name.log" 2>&1 || { echo "install failed: $name (logs/install-$name.log)" >&2; exit 1; }
 done <<'EOF'
@@ -50,17 +52,21 @@ EOF
 
 # The fixes that make each config check with 0 errors under tsc 7. Nothing else changes.
 # VS Code: its postinstall puts the electron typings in node_modules.
-if [[ ! -d repos/vscode/node_modules/electron ]]; then
+if [[ -d repos/vscode && ! -d repos/vscode/node_modules/electron ]]; then
   mkdir -p tmp-electron && (cd tmp-electron && echo '{ "private": true }' >package.json &&
     npm i -q --ignore-scripts --no-audit --no-fund electron@43.7.7)
   cp -R tmp-electron/node_modules/electron repos/vscode/node_modules/electron && rm -rf tmp-electron
 fi
 # Playwright: its build generates the injected sources that the checked files import.
-(cd repos/playwright && node utils/generate_injected.js)
+if [[ -d repos/playwright ]]; then (cd repos/playwright && node utils/generate_injected.js); fi
 # Excalidraw: TS 7 removed baseUrl. The paths are already relative to the config.
-grep -v '"baseUrl"' repos/excalidraw/tsconfig.json >repos/excalidraw/tsconfig.bench.json
+if [[ -d repos/excalidraw ]]; then
+  grep -v '"baseUrl"' repos/excalidraw/tsconfig.json >repos/excalidraw/tsconfig.bench.json
+fi
 # TypeORM: TS 7 removed moduleResolution node (node10). The package is CommonJS, so nodenext keeps
 # its extensionless imports.
-echo '{ "extends": "./tsconfig.json", "compilerOptions": { "module": "nodenext", "moduleResolution": "nodenext" } }' \
-  >repos/typeorm/packages/typeorm/tsconfig.bench.json
+if [[ -d repos/typeorm ]]; then
+  echo '{ "extends": "./tsconfig.json", "compilerOptions": { "module": "nodenext", "moduleResolution": "nodenext" } }' \
+    >repos/typeorm/packages/typeorm/tsconfig.bench.json
+fi
 echo ready

@@ -66,5 +66,9 @@ for name in ['typescript', 'ts6', 'tsc-rs', '../effectgo/node_modules/@effect/ts
 for name in ['package-lock.json', 'effectgo/package-lock.json', 'ts6effect/package-lock.json']:
     path = work / name
     metadata[name] = digest(path)
-(results / 'metadata.json').write_text(json.dumps(metadata, indent=2) + '\n')
+build = Path(os.environ.get('RS_BIN', '/nonexistent')).parent / 'build.json'
+if build.exists():
+    metadata['compilerBuild'] = json.loads(build.read_text())
+case = os.environ.get('BENCH_CASE')
+(results / (f'metadata-{case}.json' if case else 'metadata.json')).write_text(json.dumps(metadata, indent=2) + '\n')
 print(json.dumps(metadata, indent=2))
