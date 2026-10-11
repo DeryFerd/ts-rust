@@ -178,8 +178,12 @@ of the same names. `checker_integration.rs` is the Effect-owned Go shim
   (`scanner_util::compare_go_strings`).
 - `materialized_value_symbol_links` (the only `value_symbol_links` read) reads
   with `try_get_by_id`, which gives the symbol its id, as Go
-  `symbolArenaLinkStore.TryGet` does. Node ids from `nodeLinkStore.TryGet` are not given (the
-  port never gives them on link reads).
+  `materializedValueSymbolLinks` does with `ast.GetSymbolId`
+  (`_tools/gen_shims/providers/typescript/checker/integration.go:340`). The
+  other link reads of the shim (`typeNodeLinks`, `declaredTypeLinks`,
+  `typeAliasLinks`, `sourceFileLinks`, `aliasSymbolLinks`) are `core.LinkStore`
+  maps in Go (TypeScript-Go `internal/checker/checker.go:677-700`), which give
+  no ids. The port gives none there either, as Go.
 - A surface clones its findings map where Go copies a struct that shares
   the map. Go never writes a shared map, so results are the same.
 - The allow lists (`allowedUnstableApis`, `allowedExperimentalApis`, root

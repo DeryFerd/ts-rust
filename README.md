@@ -151,7 +151,8 @@ How it was measured: the same machine and method as the real-world apps below, w
 projects `apps/server`, `apps/web`, `apps/mobile`, `packages/client-runtime` and
 `packages/shared`. Without Effect, the configs have no Effect plugin. With Effect, `tsc` 7 is the
 Effect-patched 7.0.2 from `@effect/tsgo` 0.46.1, and `tsc` 6 is 6.0.3 patched with
-`@effect/language-service`. The script is
+`@effect/language-service`. These numbers are from `tsc-rs` when it was a port of 0.46.1. They
+were not measured again after the port moved to 0.51.1. The script is
 [scripts/bench-apps/t3code.sh](scripts/bench-apps/t3code.sh). The `tsc-rs` switch in T3 Code is
 [pingdotgg/t3code#16704](https://github.com/pingdotgg/t3code/pull/16704).
 
