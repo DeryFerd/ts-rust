@@ -17,7 +17,7 @@
 //
 // usage: node scripts/effect/ls-cases.mjs --server <tsc> [--effect-repo DIR] [--kinds K,...]
 //          [--versions effect-v4,effect-v3] [--filter SUBSTR] [--out DIR] [--jobs N] [--timeout S]
-//          [--dump DIR]
+//          [--dump DIR] [--effect-baselines]
 //   --kinds      quickfixes,refactors,symbols,inlay,hover,completion (default: all)
 //   --dump       completion cases also write each whole answer (sorted as the Go client sorts it)
 //                to DIR/<case>.json, to compare two servers beyond the Go assertions
@@ -27,6 +27,11 @@
 //                from an independent clone)
 // Writes <out>/summary.json (per case: same, diff or error) and, for each case that is not same,
 // <out>/<kind>/<version>/<case>.actual and .diff. Exit 0 when every case is same, 1 otherwise.
+// scripts/effect/ls-baselines/<kind>/<version>/ holds the baselines that effect-tsgo does not commit:
+// the answers of effect-tsgo 0.51.1 to the schemagen port cases (PORT_SCHEMAGEN_CASES), and the
+// baselines rebased at our Go pin N prime (NP_REBASED). --effect-baselines compares the rebased cases
+// with the effect-tsgo baselines instead, to check an effect-tsgo 0.51.1 build (TS 7.0.2, 7.1.0-dev or
+// E0 at pin N).
 //
 // Go sources (effect-tsgo 47cb1ed7): internal/effecttest/runner.go (parseTestUnits, DefaultTsConfig),
 // quickfix_runner.go, quickfix_baseline.go, refactor_runner.go, refactor_baseline.go,
@@ -73,6 +78,7 @@ const { values: args } = parseArgs({
     jobs: { type: "string", default: String(Math.max(1, Math.min(8, os.availableParallelism() - 2))) },
     timeout: { type: "string", default: "120" },
     dump: { type: "string" },
+    "effect-baselines": { type: "boolean", default: false },
   },
 });
 if (!args.server) {
@@ -99,6 +105,7 @@ if (!fs.existsSync(path.join(effectRepo, "testdata/baselines/reference"))) {
 }
 const EFFECT_REPO = fs.realpathSync(effectRepo);
 const REFERENCE = path.join(EFFECT_REPO, "testdata/baselines/reference");
+const LS_BASELINES = path.join(root, "scripts/effect/ls-baselines");
 const TIMEOUT_MS = Number(args.timeout) * 1000;
 fs.mkdirSync(args.out, { recursive: true });
 const OUT = fs.realpathSync(args.out);
@@ -663,6 +670,29 @@ async function runRefactors(c) {
     await server.stop();
   }
 }
+
+// Schemagen refactor cases that the Go harness does not have (version `<profile>-port`, as the port
+// refactor cases): self-recursive types, which no effect-tsgo 0.51.1 baseline has. The structural
+// schemagen hoists a named type only after its members, so each self-reference processes the type
+// again until the depth limit, and the action inserts `undefined /* maximum depth exceeded */`
+// (structural.go processType, Process). The baseline of each is the answer of effect-tsgo 0.51.1
+// (TS 7.0.2, 7.1.0-dev.20261006.1 and E0 at pin N give the same text), in
+// ls-baselines/refactors/<profile>-port/<name>.refactors.txt.
+// A v3 case mounts effect-v3 through its `// @effect-v3` line (mountVersion).
+const recursiveSchemaContent = (marker, line) => `// refactor: ${line}:18-${line}:22, ${line + 5}:13-${line + 5}:17
+${marker}import * as Schema from "effect/Schema"
+
+export interface Tree {
+  value: number
+  children: Array<Tree>
+}
+
+export type Json = string | number | boolean | null | ReadonlyArray<Json> | { readonly [key: string]: Json }
+`;
+const PORT_SCHEMAGEN_CASES = [
+  { name: "structuralTypeToSchema_selfRecursive", profile: "effect-v4", content: recursiveSchemaContent("", 4) },
+  { name: "structuralTypeToSchema_selfRecursive", profile: "effect-v3", content: recursiveSchemaContent("// @effect-v3\n", 5) },
+];
 
 // ---------------------------------------------------------------------------
 // Document symbols
@@ -1437,6 +1467,13 @@ function collectCases() {
   if (kinds.includes("inlay")) for (const c of inlayCases()) add("inlay", "inlayHints", c.name, { content: c.content, baseline: path.join(REFERENCE, "inlayHints", c.name + ".baseline"), run: runInlay });
   if (kinds.includes("hover")) for (const c of hoverCases()) add("hover", "hover_test", c.name, { content: c.content, checks: c.checks, expected: hoverExpected(c), run: runHover });
   if (kinds.includes("completion")) for (const c of completionCases()) add("completion", c.file.replace(/\.go$/, ""), c.name, { ...c, expected: "ok\n", run: runCompletion });
+  if (kinds.includes("refactors")) {
+    for (const c of PORT_SCHEMAGEN_CASES) {
+      const version = c.profile + "-port";
+      const baseline = path.join(LS_BASELINES, "refactors", version, c.name + ".refactors.txt");
+      if (versions.includes(c.profile)) add("refactors", version, c.name, { file: c.name + ".ts", content: c.content, baseline, run: runRefactors });
+    }
+  }
   return cases;
 }
 
@@ -1455,14 +1492,26 @@ function lineDiff(expected, actual) {
   return out.slice(0, 400).join("\n") + "\n";
 }
 
+// Cases whose effect-tsgo baseline differs at our Go pin N prime (fed0bf24149f) only through a
+// TypeScript change, as `<kind>/<version>/<case>`; the rebased baseline has the same file name in
+// ls-baselines/<kind>/<version>/.
+// symbols: N prime leaves top-level import declarations out of the document symbols
+// (ls/symbols.go:164-166; pin N and the TypeScript of effect-tsgo 0.51.1 list each imported name).
+// Each rebase is the effect-tsgo baseline without those entries, in both the hierarchical and the
+// flat answer: its Effect part is unchanged, and the rest equals the answer of the plain tsgo oracle
+// at N prime.
+const NP_REBASED = new Set(["symbols/effect-v4/debugDocumentSymbolFlows", "symbols/effect-v4/documentSymbolEffectStub"]);
+
 async function runCase(c) {
   const resultDir = path.join(OUT, c.kind, c.version);
   const started = Date.now();
+  const rebased = !args["effect-baselines"] && NP_REBASED.has(`${c.kind}/${c.version}/${c.name}`);
+  const baseline = rebased ? path.join(LS_BASELINES, c.kind, c.version, path.basename(c.baseline)) : c.baseline;
   let status, detail;
   try {
-    if (c.expected === undefined && !fs.existsSync(c.baseline)) throw new Error(`no baseline ${path.relative(EFFECT_REPO, c.baseline)}`);
+    if (c.expected === undefined && !fs.existsSync(baseline)) throw new Error(`no baseline ${baseline}`);
     const actual = await c.run(c);
-    const expected = c.expected ?? fs.readFileSync(c.baseline, "utf8");
+    const expected = c.expected ?? fs.readFileSync(baseline, "utf8");
     const norm = c.kind === "hover" ? inflateMermaid : (text) => text;
     status = norm(actual) === norm(expected) ? "same" : "diff";
     if (status === "diff") {
@@ -1477,7 +1526,7 @@ async function runCase(c) {
     fs.writeFileSync(path.join(resultDir, c.name + ".error"), detail + "\n");
   }
   fs.rmSync(c.dir, { recursive: true, force: true });
-  return { kind: c.kind, version: c.version, case: c.name, status, ms: Date.now() - started, ...(detail ? { detail } : {}) };
+  return { kind: c.kind, version: c.version, case: c.name, status, ms: Date.now() - started, ...(rebased ? { rebased } : {}), ...(detail ? { detail } : {}) };
 }
 
 const cases = collectCases();
