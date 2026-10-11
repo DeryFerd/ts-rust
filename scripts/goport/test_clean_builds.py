@@ -100,13 +100,17 @@ class Tree(unittest.TestCase):
         self.assertIn("dry run: 2 dirs.", out)
         self.assertTrue(os.path.exists(os.path.join(self.release, "tsgo")))
 
-    def test_go_cache_inside_cargo_dir_is_listed_once(self):
-        make_tree(os.path.join(self.release, "gocache"), {"trim.txt": "x", "README": GO_README})
-        os.utime(self.release, (OLD, OLD))
+    def test_go_cache_inside_cargo_dir(self):
+        # Listed once, with its Cargo dir, but its own entries (7 levels under release/) still count as use.
+        cache = os.path.join(self.release, "build/pkg/out/gocache")
+        make_tree(cache, {"trim.txt": "x", "README": GO_README, "0a/entry-d": "x"})
+        os.utime(os.path.dirname(cache), (OLD, OLD))
         rc, out, _ = self.run_main()
         self.assertEqual(rc, 0)
-        self.assertNotIn(os.path.join(self.release, "gocache"), out)
+        self.assertNotIn(cache, out)
         self.assertIn("dry run: 2 dirs.", out)
+        rewrite(os.path.join(cache, "0a/entry-d"))
+        self.assertIn("dry run: 0 dirs.", self.run_main()[1])
 
     def test_failed_remove_is_counted_and_exits_1(self):
         with mock.patch.object(cb.shutil, "rmtree", side_effect=OSError("denied")) as rmtree:

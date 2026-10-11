@@ -201,12 +201,11 @@ def main(argv):
             continue
         if any(c == wt or c.startswith(wt + '/') for c in busy):
             continue
-        cargo = build_dirs(wt)
-        # A Go cache inside a Cargo dir goes with it.
-        dirs = cargo + [g for g in go_cache_dirs(wt) if not any(g.startswith(c + os.sep) for c in cargo)]
+        dirs = build_dirs(wt) + go_cache_dirs(wt)
         if not dirs or git_files_mtime(wt) > cutoff or changed_since(dirs, cutoff):
             continue
-        for d in dirs:
+        # A Go cache inside a Cargo dir goes with it: remove only the outer dirs.
+        for d in [d for d in dirs if not any(d.startswith(o + os.sep) for o in dirs)]:
             print(('remove ' if apply else 'would remove ') + d, flush=True)
             if apply:
                 try:
