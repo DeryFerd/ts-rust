@@ -179,9 +179,12 @@ Go `t.id` equals the arena index, so Go's per-checker `TypeId` counter order
 is kept. Link stores: `mapped_symbol_links: LinkStore<SymbolId, MappedSymbolLinks>`
 etc. with the Go field names (`value_symbol_links` is a
 `ValueSymbolLinkStore`, whose reads give symbol ids; see Threads). A store
-keeps its values in 64-key pages, so a value over 32 bytes (a compile-time
-check in `LinkStore`), or one that few keys have, goes in a `Box`
-(`type_node_links: LinkStore<Node, Box<TypeNodeLinks>>`).
+keeps its values in 64-key pages. A `LinkStore` page holds a value for each
+key, used or not, so a value over 32 bytes (a compile-time check in
+`LinkStore`) goes in a `Box`. A `SparseLinkStore` page holds only the
+values that its keys have, of any size, so a store whose values few keys
+have uses it (lspage1: `type_node_links: SparseLinkStore<Node,
+TypeNodeLinks>`).
 
 `checker/mapper.rs` defines `TypeMapper` (an enum over the Go mapper kinds)
 and its constructors. Go `m.Map(t)` -> `self.mapper_map(m, t)`,
@@ -1765,30 +1768,37 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
         earlier, and its client could answer it before the end.
     - Go's races give more outcomes than the port: a reply that comes
       just before the signal, and a signal less than about 0.5 ms before
-      the end of the read loop. There the port gives one of Go's
-      outcomes.
-    - A held build in a window of about 0.5 to 1 ms gives an outcome
-      that Go and R188 do not give. The build waits in its first
-      writeFile, a nested request holds it, and SIGINT and then the end
-      of the input come 0.5 to 1 ms apart. Go and R188 fail both writes
-      with `context canceled`. The port fails them with
-      `ipc: connection closed`: Go wrote the later writeFile requests
-      before the signal, from concurrent emit workers, but the port's
-      held worker hands over its writes one at a time after the hold, and
-      the Go clock adds that work, so the later writes come after the
-      end (Phase B). Runs with `ipc: connection closed` of 10 per cell
-      (the apisig4 skeptic's `heldbuild.py`; Go and R188: 0 in each
-      cell): 0.5 ms: 10 on alvin, 5 on mini-743d; 0.75 ms: 10 and 0;
-      1 ms: 2 and 0; 1.5 ms and 2 ms: 0. At 0.25 ms Go gives both
-      outcomes and the port only `ipc: connection closed`.
+      the end of the read loop. There the port mostly gives one of Go's
+      outcomes. Not for a held cleanBuild with SIGINT and EOF 0.25 ms
+      apart (mini-743d): Go wrote only the removeFile of a.js (10 of 10
+      runs), the port also that of b.js (9 of 10; R188 10 of 10).
+    - A held build in a window of about 0.25 to 1.5 ms gives an outcome
+      that Go and R188 mostly do not give. The build waits in its first
+      writeFile, a nested request holds it, and SIGINT or SIGTERM and
+      then the end of the read loop (EOF or a read error) come 0.25 to
+      1.5 ms apart. Go and R188 fail both writes with `context canceled`.
+      The port fails them with `ipc: connection closed`: Go wrote the
+      later writeFile requests before the signal, from concurrent emit
+      workers, but the port's held worker hands over its writes one at a
+      time after the hold, and the Go clock adds that work, so the later
+      writes come after the end (Phase B). Runs outside Go's outcomes of
+      10 per cell (the apisig4 skeptics' `heldbuild.py` and
+      `heldwin.py`): SIGINT and EOF: 0.5 ms: 10 on alvin, 10 on cup2, 4
+      to 5 on mini-743d; 0.75 ms: 10 on alvin, 5 on cup2, 0 on
+      mini-743d; 1 ms: 2 to 3 on alvin, 0 on mini-743d; 1.5 ms: 1 on
+      cup2. SIGINT and a read error (mini-743d): 0.25 ms: 10; 0.5 ms: 3.
+      SIGTERM and EOF (mini-743d), 0.5 ms: 4. Go itself gave
+      `ipc: connection closed` in a few cup2 runs (2 of 10 at 1 ms, 1 of
+      10 at 2 ms), and in 2 runs the port gave a mixed outcome that Go
+      did not give (b.js `context canceled`, a.js
+      `ipc: connection closed`). At 0.25 ms (SIGINT and EOF) Go gives
+      both outcomes and the port only `ipc: connection closed`.
     - A worker makes one callback at a time, so fewer directoryExists or
       writeFile requests are out at the signal (Go: 2 or more). The
-      answers are the same, except for a build after a write error: the
-      port's build writes its outputs again after a failed write, so its
-      write errors can differ from Go's, and it orders the diagnostics in
-      another way. With no signal, b.js written and a.js failed gives 2
-      write errors (Go: 1), and b.js failed then written gives 0 (Go:
-      1). It is not a signal effect; R188 does the same.
+      answers are the same. The apisig4 probes K14 and K17 found a build
+      that wrote its outputs again after a failed write (with no signal
+      too, and in R188); since emitretry1 the build makes each write
+      once (see the flush in the build emit notes).
     - On wasm, which has no threads, the reads stay on the dispatch
       thread: a waiting callback wakes only at the next message, and
       there is no Phase B.

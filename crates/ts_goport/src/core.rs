@@ -4161,6 +4161,11 @@ impl<V: Default> LinkPage<V> for SparseLinkPage<V> {
 
     #[inline(always)]
     fn insert_record(&mut self, index: usize, value: V) -> &mut V {
+        debug_assert_eq!(
+            self.places[index % LINK_PAGE_SIZE],
+            0,
+            "insert_record on a key that has a record"
+        );
         self.push(index, value)
     }
 }

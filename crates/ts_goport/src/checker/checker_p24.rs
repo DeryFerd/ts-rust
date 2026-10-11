@@ -15,9 +15,13 @@ use std::sync::OnceLock;
 // PORT: not in Go. An environment variable, not a tsconfig option: the
 // tsconfig is shared with Go, which reports an unknown option (TS5023), and
 // the option table is output too (`--showConfig`, `--help --all`, the build
-// info options, the API `parseCommandLine` result). The switch changes only
-// how much work the checker does, for every checker of the process (tsc, the
-// LSP and the API server), as `GOPORT_FLOWSKIP` does.
+// info options, the API `parseCommandLine` result). The switch changes how
+// much work the checker does, for every checker of the process (tsc, the LSP
+// and the API server), as `GOPORT_FLOWSKIP` does. That can also change the
+// output near the TS2589 limit (5,000,000 instantiations in one statement or
+// expression, `instantiate_type_with_alias`): with fewer instantiations, a
+// TS2589 that Go reports can go away, and the types after it can change
+// (nevfast1 skeptic repro r02-ts2589-count).
 pub fn fast_never_order_from_env() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("GOPORT_FAST_NEVER_ORDER").as_deref() == Ok("1"))
@@ -1017,10 +1021,12 @@ impl Checker {
 
     /// `some_property_reduces_to_never` in a faster order, used when
     /// `GOPORT_FAST_NEVER_ORDER=1` (`Checker::fast_never_order`). The answer
-    /// is the same, so diagnostics and emit equal Go. It makes fewer
-    /// synthetic properties, so the `--extendedDiagnostics` Symbols, Types
-    /// and Instantiations (and the `--generateTrace` type ids) can be lower
-    /// than Go's.
+    /// is the same. It makes fewer synthetic properties, so the
+    /// `--extendedDiagnostics` Symbols, Types and Instantiations (and the
+    /// `--generateTrace` type ids) can be lower than Go's. Diagnostics and
+    /// emit equal Go, except near the TS2589 limit of 5,000,000
+    /// instantiations: there the lower count can remove a TS2589 that Go
+    /// reports, and change the types after it.
     // PORT: not in Go. This is the port's order before ts#64521 was ported
     // (int3 b78f6653b): first the names that are not a public method in
     // some constituent, then the names that are a public method in every

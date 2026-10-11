@@ -859,6 +859,46 @@ fn api_async_held_request_keeps_its_reply_at_the_end() {
     }
 }
 
+/// A held request's callback reply as the 1 message read after the signal
+/// (the apisig4 skeptic's D3). Go's `Call` returned `context canceled` at
+/// the signal, so `Run` reads a reply for a call that no longer waits, and
+/// request 1 makes no next callback. The port leaves that message in the
+/// inbox (`ipc/conn_async.rs`). A port that gives it to the held call
+/// answers request 1 with `ipc: connection closed`.
+#[test]
+fn api_async_reply_read_after_a_signal_stays_in_the_inbox() {
+    for (signal, end) in [(Signal::INT, "eof"), (Signal::TERM, "bad")] {
+        let what = format!("--api --async, a held request, {signal:?}, its reply, {end}");
+        let dir = project("sigreply");
+        dir.write("p2/src/c.ts", "export const c: number = 3;\n");
+        let config = dir.fifo("p2/tsconfig.json");
+        let mut tsgo = api_async(&dir, &["--callbacks", "getAccessibleEntries"]);
+        tsgo.send_json(&create_snapshot(1, &dir.0));
+        let call = tsgo.wait_callback("getAccessibleEntries");
+        tsgo.send_json(&create_snapshot(3, &dir.0.join("p2")));
+        let mut writer = open_fifo_writer(&config);
+        tsgo.settle(&what);
+        tsgo.signal(signal);
+        tsgo.expect_alive(&what);
+        tsgo.reply(&call);
+        tsgo.expect_alive(&what);
+        end_read_loop(&mut tsgo, end);
+        tsgo.expect_alive(&what);
+        let start = Instant::now();
+        writer.write_all(FIFO_TEXT).unwrap();
+        drop(writer);
+        tsgo.expect_end(start, &what, 0, "");
+        tsgo.expect_answer(1, PANIC_CANCELED, &what);
+        tsgo.expect_answer(3, PANIC_CLOSED, &what);
+        assert_eq!(
+            tsgo.callbacks("getAccessibleEntries"),
+            1,
+            "{what}: {:?}",
+            tsgo.messages()
+        );
+    }
+}
+
 /// The answer of resolveModuleName (id 6) when its callback request went
 /// out before the end of the read loop and the end was EOF or a read
 /// error with no signal: Go's `closePendingCalls` closed its channel

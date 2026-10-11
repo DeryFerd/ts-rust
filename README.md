@@ -108,6 +108,11 @@ goes away when the port moves to a newer pin.
 - **Real projects.** On 120 open-source repos, the command-line output differs from Go's only in
   the problems below and where Go's own output changes from run to run.
 
+`GOPORT_FAST_NEVER_ORDER=1` (off by default) checks some intersection types in a faster order
+(mongodb's test project: 8.9 s to 1.6 s). The `--extendedDiagnostics` counts are then lower than Go's.
+Diagnostics and emit stay the same as Go's, except near the TS2589 limit (5,000,000 type
+instantiations): there, a TS2589 that Go reports can go away.
+
 ## Benchmark: T3 Code
 
 Full type check of [T3 Code](https://github.com/pingdotgg/t3code), compared with `tsc` 6, `tsc` 7
