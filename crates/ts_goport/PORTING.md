@@ -272,16 +272,19 @@ methods reach the AST through it.
   `pos()`, `end()`, `loc()`, `has_trailing_comma()`, `is_nil()`.
   `ModifierList` has `.nodes()`, `.modifier_flags()`, `is_nil()`.
 - `NodeList`, `ModifierList` and `NodeSlice` are Copy handles defined in
-  `ast/node.rs`. A list of parsed data points at its astdata list (it lives
-  for the process). A list of synthetic data is an index into the thread's
-  synthetic arena (`SyntheticList`), so it is valid only on the thread
-  that made it, like a synthetic `Node`. A list of a store that owns its
-  nodes (a freeable parse, lsshells M3c) is a `StoreList` handle (file,
-  node data cell or pending list, and the id of its selector,
-  `SelectorSite`), read at each use; it is valid on any thread while its
-  file version lives, and its `list_ptr` address can repeat after the
-  version is freed, so keep that address only for keys of one request.
-  Equality is Go pointer equality.
+  `ast/node.rs`. Node data holds a list field as a 4-byte index into the
+  list table of its owner (`astdata::NodeList`, astshrink1); read it with
+  `list_of!` or `data_list`, not in place. A list of a static store points
+  at its `StaticList` (it lives for the process); the parser's list and the
+  same list read from node data are one list, like the Go pointer. A list
+  of synthetic data is an index into the thread's synthetic arena
+  (`SyntheticList`), so it is valid only on the thread that made it, like a
+  synthetic `Node`. A list of a store that owns its nodes (a freeable
+  parse, lsshells M3c) is a `StoreList` handle (file and list table entry),
+  read at each use; it is valid on any thread while its file version lives,
+  and its `list_ptr` address can repeat after the version is freed, so keep
+  that address only for keys of one request. Equality is Go pointer
+  equality.
 - Node factory (`c.factory.NewX`) is unported for now: `unported!("NewX")`.
 - Go `ast.IsX(node)` predicates -> `is_x(n)` free functions.
 - Node data reads are scoped, because a thread owns its synthetic nodes
@@ -590,7 +593,7 @@ The batch that adds it is not accepted until Theo approves.
   default in a language server or API process since M3g,
   `GOPORT_OWNED_NODES=0` turns them off) its parse was a freeable parse
   (`enter_freeable_parse`, opened by the parse cache), so its store owns
-  its astdata nodes, pending lists, JSDoc cache and parse diagnostics
+  its astdata nodes, list table, JSDoc cache and parse diagnostics
   (`OwnedAst`), and they are freed with its store, when the version dies
   or after it on a free thread (`FileVersion::take_data`); its node data
   reads are pinned reads, and its lists are `StoreList` handles. Only with
