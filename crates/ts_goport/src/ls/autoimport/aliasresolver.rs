@@ -112,16 +112,15 @@ impl AliasResolver {
     // nil only when the host gives nil (aliasresolver.go:86). A file read on
     // demand does not join the checker's files (Go `c.files`): the host's
     // parse cache key keeps it live until the clone's `dispose`.
-    // PORT: Go binds a second-pass root file only if an earlier pass bound
-    // the parse that the host gives (registry.go:1102 reads it from the
-    // host, with no bind). That is true inside one clone. A file of an
-    // ancestor bucket that this clone did not build (`resolveAmbientModuleName`,
-    // registry.go:1844) can be a new parse: the host releases its keys at the
-    // end of each clone (project/snapshot.go:722), and the parse cache drops
-    // an entry at refcount 0 (refcountcache.go:125). Go's `initializeChecker`
-    // then merges nothing from it. Here every root file is bound, and the
-    // session keeps one parse per path (`kept_files`, project/autoimport.rs
-    // `dispose`).
+    // PORT: Go reads a second-pass root file from the host with no bind
+    // (registry.go:1102), but Go's parse cache binds each new parse
+    // (project/parsecache.go:80, ts#63952). So a root file is always bound
+    // in Go, also a new parse of a file of an ancestor bucket that this
+    // clone did not build (`resolveAmbientModuleName`, registry.go:1844).
+    // The port's registry host does not bind (`parsecache::acquire_bound`),
+    // so every root file is bound here. The registry test
+    // `second_pass_reads_a_root_file_of_an_ancestor_bucket_in_a_later_clone`
+    // gives Go N''s export counts.
     // PORT: Go's `NewChecker` has no context. `ctx` is for
     // `should_stop_build`: a build that the caller drops on cancel stops
     // before the program, and gets `None`. For any other context the result
