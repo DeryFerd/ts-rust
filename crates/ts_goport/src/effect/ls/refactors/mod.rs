@@ -3,9 +3,9 @@
 //! per Rust file.
 //!
 //! Lane E9a ports the 9 refactors of group a (pipe, toggle, arrow and gen
-//! wrappers). The other 12 are comments in [`ALL`] at their Go place: E9b
-//! (async/await and effectGenToFn), E9c (the Schema refactors) and E9d
-//! (layerMagic, writeTagClassAccessors).
+//! wrappers) and lane E9b the 5 of group b (async/await and effectGenToFn).
+//! The other 7 are comments in [`ALL`] at their Go place: E9c (the Schema
+//! refactors) and E9d (layerMagic, writeTagClassAccessors).
 
 use std::borrow::Cow;
 
@@ -15,6 +15,11 @@ use crate::ls::CodeAction;
 use crate::lsp::lsproto;
 use crate::prelude::*;
 
+pub mod async_await_to_fn;
+pub mod async_await_to_fn_try_promise;
+pub mod async_await_to_gen;
+pub mod async_await_to_gen_try_promise;
+pub mod effect_gen_to_fn;
 pub mod function_to_arrow;
 pub mod pipeable_to_datafirst;
 pub mod remove_unnecessary_effect_gen;
@@ -34,11 +39,11 @@ pub static ALL: &[&Refactor] = &[
     &pipeable_to_datafirst::PIPEABLE_TO_DATAFIRST,
     &wrap_with_effect_gen::WRAP_WITH_EFFECT_GEN,
     &remove_unnecessary_effect_gen::REMOVE_UNNECESSARY_EFFECT_GEN,
-    // E9b: AsyncAwaitToGen,
-    // E9b: AsyncAwaitToGenTryPromise,
-    // E9b: AsyncAwaitToFn,
-    // E9b: AsyncAwaitToFnTryPromise,
-    // E9b: EffectGenToFn,
+    &async_await_to_gen::ASYNC_AWAIT_TO_GEN,
+    &async_await_to_gen_try_promise::ASYNC_AWAIT_TO_GEN_TRY_PROMISE,
+    &async_await_to_fn::ASYNC_AWAIT_TO_FN,
+    &async_await_to_fn_try_promise::ASYNC_AWAIT_TO_FN_TRY_PROMISE,
+    &effect_gen_to_fn::EFFECT_GEN_TO_FN,
     &toggle_type_annotation::TOGGLE_TYPE_ANNOTATION,
     &toggle_return_type_annotation::TOGGLE_RETURN_TYPE_ANNOTATION,
     &toggle_lazy_const::TOGGLE_LAZY_CONST,
