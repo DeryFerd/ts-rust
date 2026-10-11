@@ -2728,10 +2728,11 @@ mod tests {
             assert_eq!(read.nodes().to_vec(), vec![a]);
             assert_eq!(a.text(), "a");
 
-            // A data write gives the field a new list. The old handle still
-            // reads the old list, like a Go pointer.
+            // A data write of a copy of the data keeps the list: node data
+            // names its list by index (astshrink1), as a Go struct copy keeps
+            // its `*NodeList` pointer. The old handle still reads the list.
             replace_node_data(block, with_ast_data(block, Clone::clone));
-            assert_ne!(block.statement_list(), read);
+            assert_eq!(block.statement_list(), read);
             assert_eq!(read.nodes().get(0), a);
 
             assert!(synthetic_slot_count() > 1);
