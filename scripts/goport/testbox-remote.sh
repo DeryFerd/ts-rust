@@ -15,6 +15,9 @@
 #        testbox-remote.sh np-suite KEY LABEL RUN  a stable release tsgo, np-suite.sh run LABEL at pin KEY, pack
 #                                                  the label dir in RUN/out.tar.gz, then remove the label dir
 #                                                  (after a failed build, only its build.log)
+#        testbox-remote.sh perf RUN LABEL [NAME=VALUE...] ARGS...
+#                                                  perf.sh ARGS... (ARGS hold LABEL) with the NAME=VALUE variables,
+#                                                  pack the label dir in RUN/out.tar.gz, then remove the label dir
 # pin.py exec binds a pin's oracle and Go checkout over the default ones; bwrap makes those bind targets.
 # Only microsoft/TypeScript pins (layout typescript) are set up: the older layout needs the TypeScript submodule.
 set -euo pipefail
@@ -147,6 +150,27 @@ case $cmd in
     tar -czf "$run/out.tar.gz" -C "$run" build.log -C "$PWD/$np" "$label"
     # The local copy is the record: the sticky target/ keeps no label dirs.
     rm -rf "${np:?}/${label:?}"
+    exit "$rc"
+    ;;
+  perf)
+    (($# >= 3)) || die "usage: perf RUN LABEL [NAME=VALUE...] ARGS..."
+    run=$1 label=$2 envs=()
+    shift 2
+    while [[ ${1:-} =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do
+      envs+=("$1")
+      shift
+    done
+    [[ ! -e $run ]] || die "$run exists"
+    on_testbox
+    mkdir -p "$run"
+    pd=target/continuation-r97-goport/perf
+    rc=0
+    # PERF_WAIT: the sync and the job start can leave the load over 1.5 for a while.
+    PERF_WAIT=1 env "${envs[@]}" scripts/goport/perf.sh "$@" || rc=$?
+    [[ -d $pd/$label ]] || die "perf.sh wrote no $pd/$label (rc $rc)"
+    tar -czf "$run/out.tar.gz" -C "$pd" "$label"
+    # The local copy is the record: the sticky target/ keeps no label dirs.
+    rm -rf "${pd:?}/${label:?}"
     exit "$rc"
     ;;
   *) die "unknown command $cmd (testbox-remote.sh help)" ;;
