@@ -3716,7 +3716,32 @@ impl Node {
     // Go: ast.go:194 ForEachChild
     /// Calls `v` on each child in Go source order. Stops and returns true
     /// when `v` returns true.
+    // PERF: perfP1 item 1b. The child chain walk of `for_each_child_dyn`
+    // is inline here, so each child is a direct call of `v` (the caller's
+    // closure, often its own recursive walk), not a `dyn` call. Every other
+    // node takes `for_each_child_dyn`.
+    #[inline]
     pub fn for_each_child(self, mut v: impl FnMut(Node) -> bool) -> bool {
+        if let Some(f) = frozen_store_node(self) {
+            let kind = f.kind();
+            // Go `ForEachChild` has no case for these kinds (`for_each_child_dyn`).
+            if has_no_child_fields(kind) {
+                debug_assert!(children_by_data(self).next().is_none(), "{kind:?}");
+                return false;
+            }
+            if let Some(children) = f.children() {
+                debug_assert!(
+                    children.eq(children_by_data(self)),
+                    "child links differ from the data walk of {kind:?}"
+                );
+                for child in children {
+                    if v(child) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
         for_each_child_dyn(self, &mut v)
     }
 
