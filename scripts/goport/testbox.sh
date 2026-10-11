@@ -37,6 +37,12 @@
 #                                             a stable release tsgo and np-suite.sh run LABEL on the testbox, fetched to
 #                                             the main checkout's np-suite dir (LABEL must not exist), then
 #                                             np-suite.sh diff BASE LABEL
+#        testbox.sh perf [--mode M] [--rounds N] LABEL BIN... [-- TSGO_ARG...]
+#                                             perf.sh on the testbox (default --mode both, 3 rounds): pushes the
+#                                             bins, fetches the result to the main checkout's perf dir (LABEL must
+#                                             not exist). Without a saved testbox it warms one up (TESTBOX_IDLE 30)
+#                                             and stops it at the end. Read instructions:u and RSS; wall is not valid.
+#                                             The variables of `perf.sh env` pass on to perf.sh there
 # The gate and the oracles run as on zbook: the testbox env sets HOME=/home/theo and the workflow binds the
 # workspace on /home/theo/Code/sandbox/ts-rust (testbox-data.sh). Fetch a commit that the bins name before a
 # gate: run git fetch --depth=1 origin <sha>.
@@ -241,6 +247,53 @@ case "$cmd" in
     rmdir "$tmp"
     cat "$np/$1/summary.txt"
     [[ -z ${2:-} ]] || scripts/goport/np-suite.sh diff "$2" "$1" | tail -20
+    exit "$rc"
+    ;;
+  perf)
+    args=("$@")
+    opts=(--mode both)
+    while [[ ${1:-} == --mode || ${1:-} == --rounds ]]; do
+      (($# >= 2)) || { echo "usage: testbox.sh perf [--mode M] [--rounds N] LABEL BIN... [-- TSGO_ARG...]" >&2; exit 2; }
+      opts+=("$1" "$2")
+      shift 2
+    done
+    (($# >= 2)) || { echo "usage: testbox.sh perf [--mode M] [--rounds N] LABEL BIN... [-- TSGO_ARG...]" >&2; exit 2; }
+    label=$1
+    shift
+    [[ -n $label && $label != */* && $label != .* ]] || { echo "LABEL must be a dir name: $label" >&2; exit 2; }
+    pd=/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/perf
+    [[ ! -e $pd/$label ]] || { echo "$pd/$label exists (results are never replaced)" >&2; exit 2; }
+    bins=() targs=()
+    while (($#)); do
+      # The rest, with the --, goes to perf.sh: tsgo arguments such as --noEmit.
+      [[ $1 != -- ]] || { targs=("$@"); break; }
+      [[ -f $1 && -x $1 ]] || { echo "not an executable file: $1" >&2; exit 2; }
+      bins+=("$(realpath -s -- "$1")")
+      shift
+    done
+    if [[ -z ${TESTBOX_ID:-} && ! -s $id_file ]]; then
+      # A new process: push_paths replaces the EXIT trap, and set -e is off on the left of ||.
+      TESTBOX_IDLE=${TESTBOX_IDLE:-30} "$0" warmup
+      rc=0
+      "$0" perf "${args[@]}" || rc=$?
+      "$0" stop
+      exit "$rc"
+    fi
+    # The same absolute paths there, so bins.txt names the zbook files.
+    push_paths "${bins[@]}"
+    run=target/testbox-runs/perf-$(date -u +%Y%m%dT%H%M%S)-$label
+    # The caller's GOPORT_* and allocator variables: perf.sh there passes them on to tsgo.
+    mapfile -t envs < <(scripts/goport/perf.sh env)
+    rc=0
+    job "$run" perf "$run" "$label" "${envs[@]}" "${opts[@]}" "$label" "${bins[@]}" "${targs[@]}" || rc=$?
+    mkdir -p "$pd" target
+    tmp=$(mktemp -d "$repo_root/target/testbox-perf.XXXXXX")
+    fetch "$run" "$tmp" || exit 1
+    [[ -d $tmp/$label ]] || { echo "no perf.sh result (rc $rc): $tmp/testbox.log" >&2; exit 1; }
+    mv "$tmp/$label" "$pd/$label"
+    mv "$tmp/testbox.log" "$pd/$label/"
+    rmdir "$tmp"
+    echo "results $pd/$label (perf.sh compare <base> $label compares with another run)"
     exit "$rc"
     ;;
   get)
