@@ -1255,18 +1255,15 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25345 getGenericObjectFlags
-    // PERF: the type header (flags and object flags) is read once. The mapped,
-    // tuple and string-like tests make their call only for a type of that
-    // kind (`MAPPED`, `REFERENCE`, a template literal or string mapping), in
-    // Go's `||` order, so the calls with effects are the same.
     pub fn get_generic_object_flags(&mut self, t: TypeId) -> ObjectFlags {
         let mut combined_flags = ObjectFlags::NONE;
-        let (flags, object_flags) = {
-            let ty = self.ty(t);
-            (ty.flags, ty.object_flags)
-        };
+        let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::UNION_OR_INTERSECTION | TypeFlags::SUBSTITUTION) {
-            if !object_flags.intersects(ObjectFlags::IS_GENERIC_TYPE_COMPUTED) {
+            if !self
+                .ty(t)
+                .object_flags
+                .intersects(ObjectFlags::IS_GENERIC_TYPE_COMPUTED)
+            {
                 if flags.intersects(TypeFlags::UNION_OR_INTERSECTION) {
                     for i in 0..self.ty(t).types().len() {
                         let u = self.type_at(t, i);
@@ -1286,14 +1283,13 @@ impl Checker {
             return self.ty(t).object_flags & ObjectFlags::IS_GENERIC_TYPE;
         }
         if flags.intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE)
-            || object_flags.intersects(ObjectFlags::MAPPED) && self.is_generic_mapped_type_worker(t)
-            || object_flags.intersects(ObjectFlags::REFERENCE) && self.is_generic_tuple_type(t)
+            || self.is_generic_mapped_type(t)
+            || self.is_generic_tuple_type(t)
         {
             combined_flags |= ObjectFlags::IS_GENERIC_OBJECT_TYPE;
         }
         if flags.intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE | TypeFlags::INDEX)
-            || flags.intersects(TypeFlags::TEMPLATE_LITERAL | TypeFlags::STRING_MAPPING)
-                && self.is_generic_string_like_type(t)
+            || self.is_generic_string_like_type(t)
         {
             combined_flags |= ObjectFlags::IS_GENERIC_INDEX_TYPE;
         }
