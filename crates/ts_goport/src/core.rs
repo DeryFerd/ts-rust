@@ -4057,6 +4057,8 @@ pub trait LinkPage<V: Default> {
     fn record_or_default(&mut self, index: usize) -> &mut V;
     /// Adds the record of key `index`, which has none, with `value`.
     fn insert_record(&mut self, index: usize, value: V) -> &mut V;
+    /// Removes the record of key `index` and returns it.
+    fn remove_record(&mut self, index: usize) -> Option<V>;
 }
 
 /// The records of `LINK_PAGE_SIZE` keys in place, `None` for a key with no
@@ -4092,6 +4094,10 @@ impl<V: Default> LinkPage<V> for DenseLinkPage<V> {
     #[inline(always)]
     fn insert_record(&mut self, index: usize, value: V) -> &mut V {
         self[index % LINK_PAGE_SIZE].insert(value)
+    }
+
+    fn remove_record(&mut self, index: usize) -> Option<V> {
+        self[index % LINK_PAGE_SIZE].take()
     }
 }
 
@@ -4167,6 +4173,23 @@ impl<V: Default> LinkPage<V> for SparseLinkPage<V> {
             "insert_record on a key that has a record"
         );
         self.push(index, value)
+    }
+
+    fn remove_record(&mut self, index: usize) -> Option<V> {
+        let at =
+            usize::from(std::mem::take(&mut self.places[index % LINK_PAGE_SIZE])).checked_sub(1)?;
+        let value = self.records.swap_remove(at);
+        // The last record moved to `at`: its key gets that place.
+        let moved = self.records.len() + 1;
+        if at + 1 < moved {
+            let key = self
+                .places
+                .iter()
+                .position(|&place| usize::from(place) == moved)
+                .expect("the place of the last record");
+            self.places[key] = (at + 1) as u8;
+        }
+        Some(value)
     }
 }
 
@@ -4404,10 +4427,10 @@ impl<K: LinkKey, V: Default, P: LinkPage<V>> LinkStore<K, V, P> {
         match key.link_slot() {
             LinkSlot::Map => self.map.remove(&key),
             slot => {
-                if !self.cell(slot).is_some_and(Option::is_some) {
+                if !self.has(key) {
                     return None;
                 }
-                self.cell_mut(key, slot).take()
+                self.page_mut(key, slot).remove_record(slot.index())
             }
         }
     }
@@ -4602,6 +4625,33 @@ mod link_store_tests {
         }
         assert!(!nodes.has(node(63)) && !nodes.has(node(128)));
         assert!(nodes.try_get(node(200)).is_none());
+    }
+
+    // `remove` takes the record of a key and leaves the other records of its
+    // page, on dense and sparse pages: a sparse page moves its last record
+    // into the freed place.
+    #[test]
+    fn link_store_remove_keeps_the_other_records() {
+        let node = |local: u64| Node(2 << 32 | local);
+        let mut dense = LinkStore::<Node, u32>::default();
+        let mut sparse = SparseLinkStore::<Node, u32>::default();
+        for local in 64..72 {
+            *dense.get(node(local)) = local as u32;
+            *sparse.get(node(local)) = local as u32;
+        }
+        for local in [66, 71, 64, 66, 200] {
+            let want = dense.has(node(local)).then_some(local as u32);
+            assert_eq!(dense.remove(node(local)), want, "dense {local}");
+            assert_eq!(sparse.remove(node(local)), want, "sparse {local}");
+        }
+        for local in 64..72 {
+            let want = (![64, 66, 71].contains(&local)).then_some(local as u32);
+            assert_eq!(dense.try_get(node(local)).copied(), want, "dense {local}");
+            assert_eq!(sparse.try_get(node(local)).copied(), want, "sparse {local}");
+        }
+        *sparse.get(node(66)) = 1;
+        assert_eq!(sparse.try_get(node(66)), Some(&1));
+        assert_eq!(sparse.try_get(node(70)), Some(&70));
     }
 }
 
