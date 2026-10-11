@@ -137,7 +137,7 @@ impl TypeParser<'_> {
         }
         cached!(self, strict_effect_type, t, 'compute: {
             let sym = self.checker.ty(t).symbol;
-            if sym.is_nil() || self.checker.sym(sym).name.as_str() != "Effect" {
+            if sym.is_nil() || self.checker.sym(sym).name != *EFFECT_NAME {
                 break 'compute None;
             }
             self.effect_type(t)
