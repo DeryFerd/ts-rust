@@ -20,6 +20,9 @@ pub struct NodeOrder {
     end: Vec<u32>,
 }
 
+/// The index of a node that `NodeOrder::index_under` did not find.
+pub const NO_INDEX: u32 = u32::MAX;
+
 /// What `NodeOrder::walk_preorder` does after a node.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Walk {
@@ -84,6 +87,41 @@ impl NodeOrder {
                 child
             })
         })
+    }
+
+    /// The index of `n` in the subtree of node `i` (`i` included): a child
+    /// first, then any node under `i`. `NO_INDEX` when `i` is `NO_INDEX` or
+    /// `n` is not there. For the work lists that push nodes under the node
+    /// they handle.
+    #[must_use]
+    pub fn index_under(&self, i: u32, n: Node) -> u32 {
+        if i == NO_INDEX || n.is_nil() {
+            return NO_INDEX;
+        }
+        if self.nodes[i as usize] == n {
+            return i;
+        }
+        self.children(i)
+            .find(|&c| self.nodes[c as usize] == n)
+            .or_else(|| (i + 1..self.end[i as usize]).find(|&c| self.nodes[c as usize] == n))
+            .unwrap_or(NO_INDEX)
+    }
+
+    /// Calls `f` with each child of `node` and the child's index, in
+    /// `for_each_child` order. `i` is the index of `node`; when it is
+    /// `NO_INDEX`, the children come from `for_each_child`, with index
+    /// `NO_INDEX`.
+    pub fn for_each_child_of(&self, i: u32, node: Node, mut f: impl FnMut(Node, u32)) {
+        if i == NO_INDEX {
+            node.for_each_child(|child| {
+                f(child, NO_INDEX);
+                false
+            });
+        } else {
+            for child in self.children(i) {
+                f(self.nodes[child as usize], child);
+            }
+        }
     }
 
     /// Go's recursive rule walk from the root: `f` sees each node in
@@ -193,5 +231,35 @@ mod tests {
             stack.extend(n.iter_children());
         }
         assert_eq!(seen, expect);
+    }
+
+    #[test]
+    fn index_under_finds_nodes_of_the_subtree() {
+        let sf = parse("a.pipe(f)(b);\nc;\n");
+        let order = NodeOrder::build(sf);
+        let call = order.node(order.children(0).next().unwrap()).expression();
+        let i = order.index_under(0, call);
+        assert_eq!(order.node(i), call);
+        // A child, a node further down, the node itself.
+        let callee = call.expression();
+        assert_eq!(order.node(order.index_under(i, callee)), callee);
+        let subject = callee.expression().expression();
+        assert_eq!(order.node(order.index_under(i, subject)), subject);
+        assert_eq!(order.index_under(i, call), i);
+        // Not under the node, or no index to start from.
+        let other = order.node(order.children(0).nth(1).unwrap());
+        assert_eq!(order.index_under(i, other), NO_INDEX);
+        assert_eq!(order.index_under(NO_INDEX, callee), NO_INDEX);
+        // Children with and without an index.
+        let mut with = Vec::new();
+        order.for_each_child_of(i, call, |c, ci| with.push((c, order.node(ci))));
+        assert!(with.iter().all(|(c, n)| c == n));
+        let mut without = Vec::new();
+        order.for_each_child_of(NO_INDEX, call, |c, ci| without.push((c, ci)));
+        assert_eq!(
+            with.iter().map(|w| w.0).collect::<Vec<_>>(),
+            without.iter().map(|w| w.0).collect::<Vec<_>>()
+        );
+        assert!(without.iter().all(|w| w.1 == NO_INDEX));
     }
 }
