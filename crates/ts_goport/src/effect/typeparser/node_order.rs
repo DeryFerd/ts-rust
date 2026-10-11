@@ -20,15 +20,14 @@ pub struct NodeOrder {
     end: Vec<u32>,
 }
 
-/// What `NodeOrder::walk_preorder` does after a node.
+/// What `NodeOrder::walk_preorder` does after a node. No Go walk that
+/// uses it ends early (each Go visitor returns false), so there is no stop.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Walk {
     /// Visit the node's children next (Go: the walk calls `ForEachChild`).
     Descend,
     /// Do not visit the node's children (Go: the walk returns first).
     SkipChildren,
-    /// End the walk (Go: `true` returned through every `ForEachChild`).
-    Stop,
 }
 
 impl NodeOrder {
@@ -103,7 +102,6 @@ impl NodeOrder {
             match f(self.nodes[i]) {
                 Walk::Descend => i += 1,
                 Walk::SkipChildren => i = self.end[i] as usize,
-                Walk::Stop => return,
             }
         }
     }
