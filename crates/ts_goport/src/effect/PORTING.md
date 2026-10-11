@@ -161,6 +161,15 @@ etscore.SeverityError` becomes `Severity::Error`.
   Drop Go's separate `c *checker.Checker` parameter; use `tp.checker`.
 - Skip code that only quick fixes use (`internal/fixables`), but keep any
   helper the rule's own `Run` reaches.
+- PERF (effperf4): a walk of the whole file reads `tp.node_order(sf)`
+  (`typeparser/node_order.rs`), not `for_each_child`. The order holds the
+  file's nodes in Go `ForEachChild` pre-order, built once per file. Go's
+  recursive walk becomes a loop over `nodes()`, or `walk_preorder` with
+  `Walk::SkipChildren` where Go returns before `ForEachChild`. Go's stack
+  and queue walks keep their pushes and pops on node order indexes
+  (`children(i)`). Each rule still runs alone and visits the same nodes in
+  the same order, so its checker queries keep Go's order. Walks of a
+  subtree (a callback body, a heritage clause) keep `for_each_child`.
 
 ## API stability rules (0.51.1)
 
