@@ -659,11 +659,12 @@ fn api_build_panics_as_go() {
 /// section 3, with the Go runs per case). The emit order is b, c, a.
 /// - Async, `declarationMap`, `b.d.ts.map` fails: the other d.ts maps are
 ///   in flight (12 of 50 runs).
-/// - Sync (one call at a time): every file's first output is called. A
-///   failure there writes the failed file's outputs and the next file's
-///   first output (`b.js.map`: 37 of 160, `a.js.map`: 6 of 30). A later
-///   failure calls the next file's output of its round, without its write
-///   (`c.js`: 4 of 30, `b.d.ts.map`: 3 of 36).
+/// - Sync (one call at a time): in the round of the failure the next file
+///   (in emit order) writes its output too. In the first round every
+///   file's output is called (`b.js.map`: 37 of 160 runs, `a.js.map`: 6
+///   of 30); in a later round the next file's output is the last call,
+///   and the round's earlier writes are lost (`c.js`: 4 of 60,
+///   `b.d.ts.map`: 6 of 66).
 #[cfg(unix)]
 #[test]
 fn api_build_calls_after_a_failed_write_are_one_of_gos() {
@@ -696,14 +697,14 @@ fn api_build_calls_after_a_failed_write_are_one_of_gos() {
             true,
             "c.js",
             "a.js a.js.map b.js b.js.map c.js c.js.map",
-            "a.js.map b.js b.js.map c.js.map",
+            "a.js a.js.map b.js.map c.js.map",
         ),
         (
             dmaps,
             true,
             "b.d.ts.map",
             "a.js b.d.ts.map b.js c.d.ts.map c.js",
-            "a.js b.js c.js",
+            "a.js b.js c.d.ts.map c.js",
         ),
     ] {
         let case = format!("{options}, sync {sync}, {fail} fails");

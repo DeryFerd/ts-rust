@@ -975,11 +975,10 @@ fn is_declaration_output(write: &BufferedWrite) -> bool {
 ///   other files' calls are in flight), then the doomed file's own
 ///   outputs. Go's panic needs no more answers, and another file's next
 ///   output needs one more.
-/// - With `Serialized` calls (`flush_serialized_client_writes`): every
-///   file's first output is called, then the doomed file's own outputs.
-///   Of the other files' first outputs, only the next file's (after the
-///   doomed one, in file order, the first after the last) is written; the
-///   process ends before the others' writes.
+/// - With `Serialized` calls (`flush_serialized_client_writes`): in the
+///   round of the failure the next file's output is written too, and in
+///   the first round every file's output is called; then the doomed
+///   file's own outputs.
 /// - No other write is made: the replay panics at the doomed d.ts, and the
 ///   process ends (`program_emit::wait_emit_jobs`).
 ///
@@ -1084,18 +1083,17 @@ impl ClientFlush<'_> {
 }
 
 /// `flush_client_writes` with `Serialized` calls. Go `SyncConn.Call` takes
-/// one mutex for each call (ipc/conn_sync.go:170): each emit goroutine's
-/// first call gets its turn before the panic. The OS writes of that first
-/// round wait until it is known whether a file is doomed
-/// (`defer_os_writes`):
-/// - A doomed file in the first round: the doomed file's and the next
-///   file's first outputs are written (the next file after the doomed one,
-///   in file order, the first after the last), then the doomed file's own
-///   outputs.
-/// - Else every first output is written, and the rounds go on. After a
-///   failure that dooms a file, the next file's output of that round (if
-///   it comes later) is called and not written (the process ends first),
-///   then the doomed file's own outputs.
+/// one mutex for each call (ipc/conn_sync.go:170), so the emit goroutines
+/// take turns. The OS writes of a round wait until the round's calls end
+/// (`defer_os_writes`). After a failure that dooms a file in the round,
+/// the next file (after the doomed one, in file order, the first after the
+/// last) writes its output of the round and the process ends:
+/// - in the first round every file's first output is called, and only the
+///   doomed file's and the next file's are written;
+/// - in a later round only the next file's output is called after the
+///   failure, and the earlier writes of the round are lost.
+///
+/// Then only the doomed file's own outputs are made.
 fn flush_serialized_client_writes(
     rounds: Vec<((bool, usize, usize), BufferedWrite)>,
     flush: &mut ClientFlush<'_>,
@@ -1105,49 +1103,51 @@ fn flush_serialized_client_writes(
         .map(|&((.., file), _)| file + 1)
         .max()
         .unwrap_or(0);
-    let mut rest = rounds.into_iter().peekable();
-    let mut first = Vec::new();
-    while let Some(&((false, 0, file), _)) = rest.peek() {
-        let (_, write) = rest.next().expect("peeked");
-        let name = write.file_name.clone();
-        let deferred = defer_os_writes(|| flush.write(file, write));
-        first.extend(
-            deferred
-                .into_iter()
-                .map(|os_write| (file, name.clone(), os_write)),
-        );
-    }
-    let first_doomed = flush.doomed;
-    for (file, name, os_write) in first {
-        let written =
-            first_doomed.is_none_or(|doomed| file == doomed || file == (doomed + 1) % files);
-        if !written {
-            continue;
+    let mut rounds = rounds.into_iter().peekable();
+    let mut first_round = true;
+    while let Some(&((declaration, place, _), _)) = rounds.peek() {
+        let mut round = Vec::new();
+        while let Some(((_, _, file), write)) =
+            rounds.next_if(|&((d, p, _), _)| (d, p) == (declaration, place))
+        {
+            round.push((file, write));
         }
-        if let Err(err) = os_write() {
-            flush.failed.insert(file);
-            flush.failures.insert(name, Some(fs_error_text(&err)));
-        }
-    }
-    let mut doomed_round = None;
-    for ((declaration, place, file), write) in rest {
-        match (flush.doomed, doomed_round) {
-            (None, _) => {
-                if flush.write(file, write) {
-                    doomed_round = Some((declaration, place));
+        if let Some(doomed) = flush.doomed {
+            for (file, write) in round {
+                if file == doomed {
+                    flush.write(file, write);
                 }
             }
-            (Some(doomed), _) if file == doomed => {
-                flush.write(file, write);
-            }
-            (Some(doomed), Some(round))
-                if (declaration, place) == round && file == (doomed + 1) % files =>
-            {
-                // The call is made; its OS write is not.
-                drop(defer_os_writes(|| flush.write(file, write)));
-            }
-            _ => {}
+            continue;
         }
+        let mut held = Vec::new();
+        for (file, write) in round {
+            let called = match flush.doomed {
+                None => true,
+                Some(doomed) => first_round || file == (doomed + 1) % files,
+            };
+            if called {
+                let name = write.file_name.clone();
+                held.push((file, name, defer_os_writes(|| flush.write(file, write))));
+            }
+        }
+        for (file, name, os_writes) in held {
+            let written = flush
+                .doomed
+                .is_none_or(|doomed| file == doomed || file == (doomed + 1) % files);
+            if !written {
+                continue;
+            }
+            for os_write in os_writes {
+                if let Err(err) = os_write() {
+                    flush.failed.insert(file);
+                    flush
+                        .failures
+                        .insert(name.clone(), Some(fs_error_text(&err)));
+                }
+            }
+        }
+        first_round = false;
     }
 }
 
