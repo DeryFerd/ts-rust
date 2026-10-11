@@ -1,11 +1,12 @@
 //! Port of Effect-TS/tsgo `internal/layergraph` (`types.go`, `extract.go`,
-//! `outline.go`, `format.go`, `mermaidurl.go`, `providers.go`). It models
+//! `outline.go`, `format.go`, `mermaidurl.go`, `providers.go`, `magic.go`). It models
 //! how Effect Layers are composed in source code. It builds directed graphs
 //! where nodes represent Layer expressions and edges represent composition
 //! relationships (pipe, call, array literal, symbol). The Layer hover
 //! (`effect::ls::hover`) formats them as text and Mermaid diagrams.
 //!
-//! PORT: `magic.go` is not ported: only the layerMagic refactor uses it.
+//! `magic.go` (lane E9d) orders the outline graph for the layerMagic
+//! refactor (`effect::ls::refactors::layer_magic`).
 
 use crate::effect::graph::{Direction, Graph, MermaidOptions, NodeIndex};
 use crate::effect::typeparser::*;
@@ -1419,10 +1420,222 @@ pub fn extract_providers_and_requirers(
     result
 }
 
+// ---------------------------------------------------------------------------
+// magic.go
+// ---------------------------------------------------------------------------
+
+// Go: magic.go:15 ConvertOutlineGraphToLayerMagic
+/// Takes an outline graph and a set of target output types,
+/// then computes an ordered list of layer nodes annotated with merges/provides flags
+/// that determine which Layer.* combinator to use (provide, provideMerge, or merge).
+// PORT: Go returns a `*LayerMagicResult` that is never nil; the port returns
+// it by value. Steps 2 to 6 are `layer_magic_from_output_types`, so the Go
+// unit test that passes a nil type parser and no target types runs without a
+// checker.
+pub fn convert_outline_graph_to_layer_magic(
+    tp: &mut TypeParser<'_>,
+    outline_graph: &Graph<LayerOutlineGraphNodeInfo, ()>,
+    target_output_types: &[TypeId],
+) -> LayerMagicResult {
+    // Step 1: Unroll target output types into individual types
+    let mut output_types: Vec<TypeId> = Vec::new();
+    for &t in target_output_types {
+        output_types.extend(tp.unroll_union_members(t));
+    }
+
+    layer_magic_from_output_types(outline_graph, &output_types)
+}
+
+// Go: magic.go:26-94 (ConvertOutlineGraphToLayerMagic after step 1)
+fn layer_magic_from_output_types(
+    outline_graph: &Graph<LayerOutlineGraphNodeInfo, ()>,
+    output_types: &[TypeId],
+) -> LayerMagicResult {
+    // Build a set of missing output types for fast lookup
+    let mut missing_output_types: FxHashSet<TypeId> = output_types.iter().copied().collect();
+
+    // Step 2: Clone and reverse the outline graph
+    let mut reversed_graph = outline_graph.clone();
+    reversed_graph.reverse();
+
+    // Step 3: Find root indices (nodes with no incoming edges in the reversed graph)
+    let mut root_indices: Vec<NodeIndex> = reversed_graph
+        .externals(Direction::Incoming)
+        .map(|(idx, _)| idx)
+        .collect();
+
+    // Sort roots by layer shape, then provides/requires count.
+    // PORT: Go `slices.SortFunc`; the comparison ends with the index, so the
+    // order is total and the sort kind does not show.
+    root_indices.sort_by(|&a, &b| compare_nodes_by_order(&reversed_graph, a, b).cmp(&0));
+
+    // Step 4: Run custom DFS post-order with ordering on the reversed graph
+    let all_nodes = dfs_post_order_with_order(&reversed_graph, &root_indices);
+
+    // Step 5: Process each visited node
+    let mut result: Vec<LayerMagicNode> = Vec::new();
+    for node_info in all_nodes {
+        if !is_expression(node_info.node) {
+            continue;
+        }
+
+        // Determine if this node should merge (provides a type still in missingOutputTypes)
+        let should_merge = node_info
+            .actual_provides
+            .iter()
+            .any(|t| missing_output_types.contains(t));
+
+        // If merging, remove actual provides from missing output types
+        if should_merge {
+            for t in &node_info.actual_provides {
+                missing_output_types.remove(t);
+            }
+        }
+
+        result.push(LayerMagicNode {
+            merges: should_merge,
+            provides: true,
+            node: node_info.node,
+            provided_types: node_info.provides,
+            actual_provided_types: node_info.actual_provides,
+            required_types: node_info.requires,
+        });
+    }
+
+    // Step 6: Collect remaining missing output types
+    let remaining: Vec<TypeId> = output_types
+        .iter()
+        .copied()
+        .filter(|t| missing_output_types.contains(t))
+        .collect();
+
+    LayerMagicResult {
+        nodes: result,
+        missing_output_types: remaining,
+    }
+}
+
+// Go: magic.go:99 dfsPostOrderWithOrder
+/// Performs an iterative post-order DFS with custom node ordering.
+/// Neighbors are sorted by layer shape, then provides/requires count.
+fn dfs_post_order_with_order(
+    g: &Graph<LayerOutlineGraphNodeInfo, ()>,
+    start: &[NodeIndex],
+) -> Vec<LayerOutlineGraphNodeInfo> {
+    // Go: the local `entry` type.
+    struct Entry {
+        node: NodeIndex,
+        expanded: bool,
+    }
+
+    let mut discovered: FxHashSet<NodeIndex> = FxHashSet::default();
+    let mut result: Vec<LayerOutlineGraphNodeInfo> = Vec::new();
+
+    // Initialize stack with start nodes in reverse order (first start node on top)
+    let mut stack: Vec<Entry> = Vec::with_capacity(start.len());
+    for &node in start.iter().rev() {
+        stack.push(Entry {
+            node,
+            expanded: false,
+        });
+    }
+
+    while let Some(top) = stack.pop() {
+        if discovered.contains(&top.node) {
+            if top.expanded {
+                // Second visit — emit post-order
+                if let Some(node_data) = g.get_node(top.node) {
+                    result.push(node_data.clone());
+                }
+            }
+            continue;
+        }
+
+        // First visit — mark discovered, push back with expanded=true, then push children
+        discovered.insert(top.node);
+        stack.push(Entry {
+            node: top.node,
+            expanded: true,
+        });
+
+        // Get neighbors in outgoing direction and sort by custom order
+        let neighbors = neighbors_outgoing_sorted(g, top.node);
+        for &neighbor in neighbors.iter().rev() {
+            if !discovered.contains(&neighbor) {
+                stack.push(Entry {
+                    node: neighbor,
+                    expanded: false,
+                });
+            }
+        }
+    }
+
+    result
+}
+
+// Go: magic.go:149 neighborsOutgoingSorted
+/// Returns outgoing neighbor indices sorted by the layer ordering:
+/// layer shape, then provides/requires count.
+fn neighbors_outgoing_sorted(
+    g: &Graph<LayerOutlineGraphNodeInfo, ()>,
+    node_index: NodeIndex,
+) -> Vec<NodeIndex> {
+    let mut neighbors = g.neighbors_directed(node_index, Direction::Outgoing);
+    neighbors.sort_by(|&a, &b| compare_nodes_by_order(g, a, b).cmp(&0));
+    neighbors
+}
+
+// Go: magic.go:162 compareNodesByOrder
+/// Compares two nodes by composition priority:
+/// both provides/requires, only provides, neither, only requires.
+// PORT: Go `g.GetNode` gives the zero node info for a missing index; the
+// port uses the default node info the same way. The `int` lengths are
+// `i64` here, so the differences cannot overflow.
+fn compare_nodes_by_order(
+    g: &Graph<LayerOutlineGraphNodeInfo, ()>,
+    a: NodeIndex,
+    b: NodeIndex,
+) -> i64 {
+    let zero = LayerOutlineGraphNodeInfo::default();
+    let node_a = g.get_node(a).unwrap_or(&zero);
+    let node_b = g.get_node(b).unwrap_or(&zero);
+
+    let rank_diff = layer_order_rank(node_a) - layer_order_rank(node_b);
+    if rank_diff != 0 {
+        return rank_diff;
+    }
+    // Sort by provides count descending (reverse order)
+    let len_diff = node_b.provides.len() as i64 - node_a.provides.len() as i64;
+    if len_diff != 0 {
+        return len_diff;
+    }
+    // Tiebreak by requires count descending (reverse order)
+    let len_diff = node_b.requires.len() as i64 - node_a.requires.len() as i64;
+    if len_diff != 0 {
+        return len_diff;
+    }
+    i64::from(a) - i64::from(b)
+}
+
+// Go: magic.go:183 layerOrderRank
+fn layer_order_rank(node: &LayerOutlineGraphNodeInfo) -> i64 {
+    let has_provides = !node.provides.is_empty();
+    let has_requires = !node.requires.is_empty();
+    if has_provides && has_requires {
+        0
+    } else if has_provides {
+        1
+    } else if !has_requires {
+        2
+    } else {
+        3
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Ports of `internal/layergraph` `format_test.go`, `mermaidurl_test.go`,
-    //! `providers_test.go` and `types_test.go` (`magic_test.go` is lane E9).
+    //! `providers_test.go`, `types_test.go` and `magic_test.go`.
     //! One `#[test]` per Go test function; the table rows keep their Go
     //! names in the messages.
 
@@ -1703,5 +1916,233 @@ mod tests {
         for (name, edge, expected) in tests {
             assert_eq!(edge.marshal_json(), expected, "{name}");
         }
+    }
+
+    // Go: magic_test.go makeOutlineNode
+    // makeOutlineNode creates a LayerOutlineGraphNodeInfo for testing with the given
+    // number of provides and requires (using nil types, sufficient for ordering tests).
+    // PORT: Go makes a bare CallExpression node; the port makes an identifier
+    // (also an expression), one new node per call as in Go.
+    fn make_outline_node(
+        f: &NodeFactory,
+        num_provides: usize,
+        num_requires: usize,
+    ) -> LayerOutlineGraphNodeInfo {
+        let node = f.new_identifier("n");
+        LayerOutlineGraphNodeInfo {
+            node,
+            display_node: node,
+            provides: vec![TypeId::NIL; num_provides],
+            actual_provides: vec![TypeId::NIL; num_provides],
+            requires: vec![TypeId::NIL; num_requires],
+        }
+    }
+
+    // Go: magic_test.go TestCompareNodesByOrder
+    #[test]
+    fn compare_nodes_by_order_counts() {
+        let mut g: Graph<LayerOutlineGraphNodeInfo, ()> = Graph::new();
+
+        // Node A: 3 provides, 1 requires
+        let idx_a = g.add_node(LayerOutlineGraphNodeInfo {
+            provides: vec![TypeId::NIL; 3],
+            requires: vec![TypeId::NIL; 1],
+            ..Default::default()
+        });
+        // Node B: 1 provides, 2 requires
+        let idx_b = g.add_node(LayerOutlineGraphNodeInfo {
+            provides: vec![TypeId::NIL; 1],
+            requires: vec![TypeId::NIL; 2],
+            ..Default::default()
+        });
+        // Node C: 3 provides, 3 requires
+        let idx_c = g.add_node(LayerOutlineGraphNodeInfo {
+            provides: vec![TypeId::NIL; 3],
+            requires: vec![TypeId::NIL; 3],
+            ..Default::default()
+        });
+
+        // A (3 provides) should come before B (1 provides) — compare returns negative
+        let cmp = compare_nodes_by_order(&g, idx_a, idx_b);
+        assert!(cmp < 0, "expected A < B (more provides first), got {cmp}");
+
+        // B (1 provides) should come after A (3 provides) — compare returns positive
+        let cmp = compare_nodes_by_order(&g, idx_b, idx_a);
+        assert!(cmp > 0, "expected B > A, got {cmp}");
+
+        // A (3 provides, 1 requires) vs C (3 provides, 3 requires) — tiebreak by requires
+        let cmp = compare_nodes_by_order(&g, idx_a, idx_c);
+        assert!(
+            cmp > 0,
+            "expected A > C (C has more requires, so C first), got {cmp}"
+        );
+    }
+
+    // Go: magic_test.go TestCompareNodesByOrderLayerShapes
+    #[test]
+    fn compare_nodes_by_order_layer_shapes() {
+        let f = NodeFactory::new();
+        let mut g: Graph<LayerOutlineGraphNodeInfo, ()> = Graph::new();
+
+        let both_provides_and_requires = g.add_node(make_outline_node(&f, 1, 1));
+        let only_provides = g.add_node(make_outline_node(&f, 1, 0));
+        let no_provides_or_requires = g.add_node(make_outline_node(&f, 0, 0));
+        let only_requires = g.add_node(make_outline_node(&f, 0, 1));
+
+        let ordered = [
+            both_provides_and_requires,
+            only_provides,
+            no_provides_or_requires,
+            only_requires,
+        ];
+        for i in 0..ordered.len() - 1 {
+            let cmp = compare_nodes_by_order(&g, ordered[i], ordered[i + 1]);
+            assert!(
+                cmp < 0,
+                "expected node at order {i} to sort before order {}, got {cmp}",
+                i + 1
+            );
+        }
+    }
+
+    // Go: magic_test.go TestDFSPostOrderWithOrder
+    #[test]
+    fn dfs_post_order_with_order_children_first() {
+        // Build a small graph:
+        //   A (3 provides) -> B (1 provides)
+        //   A -> C (2 provides)
+        //   B -> D (0 provides)
+        let f = NodeFactory::new();
+        let mut g: Graph<LayerOutlineGraphNodeInfo, ()> = Graph::new();
+
+        let idx_a = g.add_node(make_outline_node(&f, 3, 0));
+        let idx_b = g.add_node(make_outline_node(&f, 1, 0));
+        let idx_c = g.add_node(make_outline_node(&f, 2, 0));
+        let idx_d = g.add_node(make_outline_node(&f, 0, 0));
+
+        g.add_edge(idx_a, idx_b, ());
+        g.add_edge(idx_a, idx_c, ());
+        g.add_edge(idx_b, idx_d, ());
+
+        let result = dfs_post_order_with_order(&g, &[idx_a]);
+
+        // Post-order: children before parents
+        // A's neighbors sorted by provides desc: C (2) before B (1)
+        // Visiting C first (post-order): C has no children -> emit C
+        // Then B: B has child D -> emit D, then B
+        // Finally A
+        // Expected order: C, D, B, A
+        assert_eq!(result.len(), 4, "expected 4 nodes");
+
+        let expected_provides = [2, 0, 1, 3];
+        for (i, expected) in expected_provides.into_iter().enumerate() {
+            assert_eq!(
+                result[i].provides.len(),
+                expected,
+                "result[{i}] expected {expected} provides"
+            );
+        }
+    }
+
+    // Go: magic_test.go TestDFSPostOrderWithOrderMultipleRoots
+    #[test]
+    fn dfs_post_order_with_order_multiple_roots() {
+        let f = NodeFactory::new();
+        let mut g: Graph<LayerOutlineGraphNodeInfo, ()> = Graph::new();
+
+        let idx_a = g.add_node(make_outline_node(&f, 3, 0));
+        let idx_b = g.add_node(make_outline_node(&f, 1, 0));
+
+        // Two disconnected roots, sorted by provides desc: A (3) before B (1)
+        let result = dfs_post_order_with_order(&g, &[idx_a, idx_b]);
+
+        assert_eq!(result.len(), 2, "expected 2 nodes");
+        // Start order is reversed on stack, so B pushed first, A on top
+        // A popped first -> emitted first, then B
+        assert_eq!(
+            result[0].provides.len(),
+            3,
+            "expected first node to have 3 provides"
+        );
+        assert_eq!(
+            result[1].provides.len(),
+            1,
+            "expected second node to have 1 provides"
+        );
+    }
+
+    // Go: magic_test.go TestConvertOutlineGraphToLayerMagicOrdersUnrelatedLayers
+    // PORT: Go calls `ConvertOutlineGraphToLayerMagic(nil, g, nil)`; with no
+    // target types the type parser is not used, so the port calls the part
+    // after the unroll step with no output types.
+    #[test]
+    fn convert_outline_graph_to_layer_magic_orders_unrelated_layers() {
+        let f = NodeFactory::new();
+        let mut g: Graph<LayerOutlineGraphNodeInfo, ()> = Graph::new();
+
+        let both_provides_and_requires = make_outline_node(&f, 1, 1);
+        let only_provides = make_outline_node(&f, 1, 0);
+        let no_provides_or_requires = make_outline_node(&f, 0, 0);
+        let only_requires = make_outline_node(&f, 0, 1);
+
+        // Add nodes in an order that differs from the expected composition order to
+        // verify unrelated roots are sorted by their layer shape, not source order.
+        g.add_node(no_provides_or_requires.clone());
+        g.add_node(only_requires.clone());
+        g.add_node(only_provides.clone());
+        g.add_node(both_provides_and_requires.clone());
+
+        let result = layer_magic_from_output_types(&g, &[]);
+        assert_eq!(result.nodes.len(), 4, "expected 4 nodes");
+
+        let expected = [
+            both_provides_and_requires,
+            only_provides,
+            no_provides_or_requires,
+            only_requires,
+        ];
+        for (i, expected_node) in expected.iter().enumerate() {
+            assert!(
+                result.nodes[i].node == expected_node.node,
+                "result[{i}] expected provides={} requires={}, got provides={} requires={}",
+                expected_node.provides.len(),
+                expected_node.requires.len(),
+                result.nodes[i].provided_types.len(),
+                result.nodes[i].required_types.len(),
+            );
+        }
+    }
+
+    // Go: magic_test.go TestNeighborsOutgoingSorted
+    #[test]
+    fn neighbors_outgoing_sorted_by_provides() {
+        let f = NodeFactory::new();
+        let mut g: Graph<LayerOutlineGraphNodeInfo, ()> = Graph::new();
+
+        let idx_a = g.add_node(make_outline_node(&f, 0, 0));
+        let idx_b = g.add_node(make_outline_node(&f, 1, 0));
+        let idx_c = g.add_node(make_outline_node(&f, 3, 0));
+        let idx_d = g.add_node(make_outline_node(&f, 2, 0));
+
+        g.add_edge(idx_a, idx_b, ());
+        g.add_edge(idx_a, idx_c, ());
+        g.add_edge(idx_a, idx_d, ());
+
+        let neighbors = neighbors_outgoing_sorted(&g, idx_a);
+
+        // Should be sorted by provides desc: C (3), D (2), B (1)
+        assert_eq!(neighbors.len(), 3, "expected 3 neighbors");
+        assert_eq!(
+            neighbors[0], idx_c,
+            "expected first neighbor to be C (3 provides)"
+        );
+        assert_eq!(
+            neighbors[1], idx_d,
+            "expected second neighbor to be D (2 provides)"
+        );
+        assert_eq!(
+            neighbors[2], idx_b,
+            "expected third neighbor to be B (1 provides)"
+        );
     }
 }

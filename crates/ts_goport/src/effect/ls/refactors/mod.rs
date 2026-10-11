@@ -16,6 +16,7 @@ use crate::lsp::lsproto;
 use crate::prelude::*;
 
 pub mod function_to_arrow;
+pub mod layer_magic;
 pub mod pipeable_to_datafirst;
 pub mod remove_unnecessary_effect_gen;
 pub mod toggle_lazy_const;
@@ -24,6 +25,7 @@ pub mod toggle_return_type_annotation;
 pub mod toggle_type_annotation;
 pub mod wrap_with_effect_gen;
 pub mod wrap_with_pipe;
+pub mod write_tag_class_accessors;
 
 // Go: refactors/refactors.go:9 All
 /// All is the list of all refactor providers.
@@ -43,8 +45,8 @@ pub static ALL: &[&Refactor] = &[
     &toggle_return_type_annotation::TOGGLE_RETURN_TYPE_ANNOTATION,
     &toggle_lazy_const::TOGGLE_LAZY_CONST,
     &function_to_arrow::FUNCTION_TO_ARROW,
-    // E9d: LayerMagic,
-    // E9d: WriteTagClassAccessors,
+    &layer_magic::LAYER_MAGIC,
+    &write_tag_class_accessors::WRITE_TAG_CLASS_ACCESSORS,
     // E9c: TypeToEffectSchema,
     // E9c: TypeToEffectSchemaClass,
     // E9c: MakeSchemaOpaque,
