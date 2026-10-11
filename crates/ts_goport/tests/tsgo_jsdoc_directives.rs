@@ -1,9 +1,9 @@
-//! Issue #49: a `// @ts-ignore` or `// @ts-expect-error` inside a JSDoc
+//! Issue #49: a `// @ts-ignore` or `// @ts-expect-error` inside a `JSDoc`
 //! type expression. Go drops it and keeps the file's other directives
-//! (parser/jsdoc.go:153-181: the JSDoc scan appends to a new slice). The
+//! (parser/jsdoc.go:153-181: the `JSDoc` scan appends to a new slice). The
 //! port wrote it over the earlier directives: after 2 of them the parse
 //! panicked (exit 70), after 1 the wrong line was suppressed. JS files parse
-//! every JSDoc, TS files only one with `@see` or `@link`. Each test runs
+//! every `JSDoc`, TS files only one with `@see` or `@link`. Each test runs
 //! `tsgo -p` in a new scratch dir and expects the result of Go N prime
 //! (tsgo-oracle-fed0bf24149f): no output and exit code 0. A passing test
 //! deletes its dir.
@@ -84,9 +84,9 @@ fn js_directive_in_jsdoc_type_after_two_directives() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The issue's repro 3 with `@ts-expect-error`: the JSDoc directive took
+/// The issue's repro 3 with `@ts-expect-error`: the `JSDoc` directive took
 /// the place of the first one, so the error of line 2 was reported, and
-/// the JSDoc directive got TS2578.
+/// the `JSDoc` directive got TS2578.
 #[test]
 fn js_expect_error_in_jsdoc_type_after_one_directive() {
     let (code, output, dir) = tsc(
@@ -106,7 +106,7 @@ fn js_expect_error_in_jsdoc_type_after_one_directive() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// The issue's repro 2: a TS file parses a JSDoc with `@see` at once
+/// The issue's repro 2: a TS file parses a `JSDoc` with `@see` at once
 /// (Go jsdoc.go:62-72), and the parse panicked.
 #[test]
 fn ts_directive_in_jsdoc_with_see() {
