@@ -1719,6 +1719,20 @@ pub fn catch_up_checker(symbols: &mut SymbolArena) {
     with_lineage(|lineage| symbols.catch_up(&lineage.symbols, &lineage.freed));
 }
 
+/// `catch_up_checker` for a checker of an alias resolver program
+/// (`new_alias_resolver_program`); a no-op for any other program. The
+/// checker calls it after `get_source_file_for_resolved_module` gives it a
+/// file, before it reads the file's symbols (checker.go:15531).
+// PORT: Go's alias resolver binds a file when the checker asks for it
+// (aliasresolver.go:83-91), and the checker reads its symbols at once. Here
+// the resolver binds the file into the binder lineage, after the checker
+// copied it, so the checker first adds the new lineage chunks.
+pub fn catch_up_alias_resolver_checker(symbols: &mut SymbolArena) {
+    if state().alias_resolver {
+        catch_up_checker(symbols);
+    }
+}
+
 // Go: compiler/program.go:595 BindSourceFiles
 // PORT: Go binds files in parallel into per-file symbol tables. Here every
 // file binds into the shared `LINEAGE` arena, and the program's binder

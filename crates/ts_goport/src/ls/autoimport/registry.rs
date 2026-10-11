@@ -1760,65 +1760,51 @@ impl RegistryBuilder {
                 resolver_options.host = Some(self.host.clone());
                 resolver_options.compiler_options = Some(Rc::new(CompilerOptions::default()));
                 let module_resolver = Rc::new(module::new_resolver(resolver_options));
+                let alias_resolver = new_alias_resolver(
+                    root_files.values().copied().collect(),
+                    FxHashMap::default(),
+                    self.host.clone(),
+                    module_resolver.clone(),
+                    self.base.to_path.clone(),
+                    Rc::new(|_: &dyn HasFileName, _: &str| {
+                        // no-op
+                    }),
+                );
                 let sources = br
                     .possible_failed_ambient_module_lookup_sources
                     .as_ref()
                     .unwrap_or_else(|| crate::core::go_nil_dereference());
-                // PORT: as in `extract_package`, a checker that asks for a
-                // file that it cannot read is dropped with its results, and a
-                // new checker can also read the missed files. So the exports
-                // go into the index after a pass with no miss.
-                let mut reads: Vec<Node> = Vec::new();
-                let all_exports = loop {
-                    let alias_resolver = new_alias_resolver(
-                        root_files.values().copied().collect(),
-                        FxHashMap::default(),
-                        self.host.clone(),
-                        module_resolver.clone(),
-                        self.base.to_path.clone(),
-                        Rc::new(|_: &dyn HasFileName, _: &str| {
-                            // no-op
-                        }),
-                    );
-                    // PORT: Go reads each source file after NewChecker. Here
-                    // they are read first, so the checker's arena holds them
-                    // (`AliasResolver::new_checker`).
-                    let source_files: Vec<Node> = sources
-                        .values()
-                        .map(|source| alias_resolver.get_source_file(&source.borrow().file_name))
-                        .collect();
-                    let checker_reads: Vec<Node> =
-                        source_files.iter().chain(&reads).copied().collect();
-                    let Some((ch, _alias_program)) =
-                        alias_resolver.new_checker(ctx, &checker_reads)
-                    else {
-                        return;
-                    };
-                    let mut ch_ref = ch.borrow_mut();
-                    let mut pass_exports = Vec::with_capacity(source_files.len());
-                    for (source, &source_file) in sources.values().zip(&source_files) {
-                        if should_stop_build(ctx) {
-                            return;
-                        }
-                        let source = source.borrow();
-                        let host = self.host.clone();
-                        let realpath: Rc<dyn Fn(&str) -> String> =
-                            Rc::new(move |f: &str| host.fs().realpath(f));
-                        let mut extractor = self.new_export_extractor(
-                            &source.package_name,
-                            &mut ch_ref,
-                            module_resolver.clone(),
-                            Some(realpath),
-                        );
-                        pass_exports.push(extractor.extract_from_file(source_file));
-                    }
-                    let missed = alias_resolver.take_missed_files();
-                    if missed.is_empty() {
-                        break pass_exports;
-                    }
-                    reads.extend(missed);
+                // PORT: Go reads each source file after NewChecker
+                // (registry.go:1122). Here they are read first, and the
+                // checker's program keeps them live with the root files
+                // (`AliasResolver::new_checker`), so the extraction reads
+                // them with no catch-up of the checker's arena. The order
+                // does not change the set of file system calls: each
+                // distinct call reaches the client once per clone.
+                let source_files: Vec<Node> = sources
+                    .values()
+                    .map(|source| alias_resolver.get_source_file(&source.borrow().file_name))
+                    .collect();
+                let Some((ch, _alias_program)) = alias_resolver.new_checker(ctx, &source_files)
+                else {
+                    return;
                 };
-                for file_exports in all_exports {
+                let mut ch_ref = ch.borrow_mut();
+                for (source, &source_file) in sources.values().zip(&source_files) {
+                    if should_stop_build(ctx) {
+                        return;
+                    }
+                    let source = source.borrow();
+                    let host = self.host.clone();
+                    let realpath: Rc<dyn Fn(&str) -> String> =
+                        Rc::new(move |f: &str| host.fs().realpath(f));
+                    let mut extractor = self.new_export_extractor(
+                        &source.package_name,
+                        &mut ch_ref,
+                        module_resolver.clone(),
+                        Some(realpath),
+                    );
+                    let file_exports = extractor.extract_from_file(source_file);
                     let index = br
                         .bucket
                         .as_ref()
@@ -2404,8 +2390,18 @@ impl RegistryBuilder {
             return None;
         }
 
-        // PORT: `result` is made for each checker below.
-        let mut is_symlinked = false;
+        let mut result = PerPackageExtractionResult {
+            package_files: FxHashMap::default(),
+            entrypoints: package_entrypoints.clone(),
+            exports: IndexMap::new(),
+            ambient_modules: FxHashMap::default(),
+            stats_exports: 0,
+            stats_used_checker: 0,
+            skipped_entrypoints,
+            is_symlinked: false,
+            failed_ambient_module_lookup_sources: Rc::new(RefCell::new(IndexMap::new())),
+            failed_ambient_module_lookup_targets: Rc::new(RefCell::new(IndexSet::new())),
+        };
 
         // Resolve entrypoint source files and build the alias resolver.
         let mut seen_files: FxHashSet<tspath::Path> = FxHashSet::default();
@@ -2436,7 +2432,7 @@ impl RegistryBuilder {
                         file_name: file_name.clone(),
                     },
                 );
-                is_symlinked = true;
+                result.is_symlinked = true;
             }
             // PORT: Go parses these files on goroutines, so a request never
             // waits for them. Here they run on the dispatch thread, and the
@@ -2465,126 +2461,97 @@ impl RegistryBuilder {
             return None;
         }
 
-        // PORT: the checker can read only the root files and `reads`
-        // (`AliasResolver::new_checker`). When it asks for another file, that
-        // checker and every result of it are dropped, and the package is
-        // extracted again with a new checker that can also read the missed
-        // files. Each pass extracts every entrypoint, so it finds the misses
-        // of the next level of files at once. A pass with no miss gives Go's
-        // results.
-        let mut reads: Vec<Node> = Vec::new();
-        loop {
-            let mut result = PerPackageExtractionResult {
-                package_files: FxHashMap::default(),
-                entrypoints: package_entrypoints.clone(),
-                exports: IndexMap::new(),
-                ambient_modules: FxHashMap::default(),
-                stats_exports: 0,
-                stats_used_checker: 0,
-                skipped_entrypoints,
-                is_symlinked,
-                failed_ambient_module_lookup_sources: Rc::new(RefCell::new(IndexMap::new())),
-                failed_ambient_module_lookup_targets: Rc::new(RefCell::new(IndexSet::new())),
-            };
-            let failed_targets = result.failed_ambient_module_lookup_targets.clone();
-            let failed_sources = result.failed_ambient_module_lookup_sources.clone();
-            let alias_resolver = new_alias_resolver(
-                root_files.clone(),
-                symlinks.clone(),
-                self.host.clone(),
-                resolver.clone(),
-                self.base.to_path.clone(),
-                Rc::new(move |source: &dyn HasFileName, module_name: &str| {
-                    failed_targets.borrow_mut().insert(module_name.to_string());
-                    let source_path = source.path();
-                    let exists = failed_sources.borrow().contains_key(&source_path);
-                    if !exists {
-                        failed_sources.borrow_mut().insert(
-                            source_path,
-                            Rc::new(RefCell::new(FailedAmbientModuleLookupSource {
-                                file_name: source.file_name(),
-                                package_name: String::new(),
-                            })),
-                        );
-                    }
-                }),
-            );
-
-            // PORT: `None` only for a stopped build (`should_stop_build`).
-            let (ch, _alias_program) = alias_resolver.new_checker(ctx, &reads)?;
-            let mut ch_ref = ch.borrow_mut();
-            let mut extractor = self.new_export_extractor(
-                package_name,
-                &mut ch_ref,
-                resolver.clone(),
-                Some(to_realpath.clone()),
-            );
-
-            let mut non_module_files: FxHashSet<tspath::Path> = FxHashSet::default();
-            for entrypoint in alias_resolver.root_files.clone() {
-                if ctx.err().is_some() {
-                    return None;
+        let failed_targets = result.failed_ambient_module_lookup_targets.clone();
+        let failed_sources = result.failed_ambient_module_lookup_sources.clone();
+        let alias_resolver = new_alias_resolver(
+            root_files,
+            symlinks,
+            self.host.clone(),
+            resolver.clone(),
+            self.base.to_path.clone(),
+            Rc::new(move |source: &dyn HasFileName, module_name: &str| {
+                failed_targets.borrow_mut().insert(module_name.to_string());
+                let source_path = source.path();
+                let exists = failed_sources.borrow().contains_key(&source_path);
+                if !exists {
+                    failed_sources.borrow_mut().insert(
+                        source_path,
+                        Rc::new(RefCell::new(FailedAmbientModuleLookupSource {
+                            file_name: source.file_name(),
+                            package_name: String::new(),
+                        })),
+                    );
                 }
-                let file_exports = extractor.extract_from_file(entrypoint);
-                let entrypoint_path = tspath::Path(source_file_info(entrypoint).path.clone());
-                let entrypoint_file_name = source_file_file_name(entrypoint).to_string();
-                for name in &source_file_info(entrypoint).ambient_module_names {
-                    result
-                        .ambient_modules
-                        .entry(name.clone())
-                        .or_default()
-                        .push(entrypoint_file_name.clone());
-                }
+            }),
+        );
+
+        // PORT: `None` only for a stopped build (`should_stop_build`).
+        let (ch, _alias_program) = alias_resolver.new_checker(ctx, &[])?;
+        let mut ch_ref = ch.borrow_mut();
+        let mut extractor = self.new_export_extractor(
+            package_name,
+            &mut ch_ref,
+            resolver.clone(),
+            Some(to_realpath),
+        );
+
+        let mut non_module_files: FxHashSet<tspath::Path> = FxHashSet::default();
+        for entrypoint in alias_resolver.root_files.clone() {
+            if ctx.err().is_some() {
+                return None;
+            }
+            let file_exports = extractor.extract_from_file(entrypoint);
+            let entrypoint_path = tspath::Path(source_file_info(entrypoint).path.clone());
+            let entrypoint_file_name = source_file_file_name(entrypoint).to_string();
+            for name in &source_file_info(entrypoint).ambient_module_names {
+                result
+                    .ambient_modules
+                    .entry(name.clone())
+                    .or_default()
+                    .push(entrypoint_file_name.clone());
+            }
+            result
+                .package_files
+                .insert(entrypoint_path.clone(), entrypoint_file_name.clone());
+            let symlink = alias_resolver.symlinks.get(&entrypoint_path).cloned();
+            if let Some(symlink) = &symlink {
                 result
                     .package_files
-                    .insert(entrypoint_path.clone(), entrypoint_file_name.clone());
-                let symlink = alias_resolver.symlinks.get(&entrypoint_path).cloned();
+                    .insert(symlink.path.clone(), symlink.file_name.clone());
+            }
+
+            let external_module_indicator = source_file_info(entrypoint).external_module_indicator;
+            let mut has_exports = !file_exports.is_empty() && external_module_indicator.is_some();
+            let source = result
+                .failed_ambient_module_lookup_sources
+                .borrow()
+                .get(&entrypoint_path)
+                .cloned();
+            if let Some(source) = source {
+                source.borrow_mut().package_name = package_name.to_string();
+                has_exports = external_module_indicator.is_some();
+            } else {
+                result.exports.insert(entrypoint_path.clone(), file_exports);
+            }
+
+            if !has_exports {
+                non_module_files.insert(entrypoint_path.clone());
                 if let Some(symlink) = &symlink {
-                    result
-                        .package_files
-                        .insert(symlink.path.clone(), symlink.file_name.clone());
-                }
-
-                let external_module_indicator =
-                    source_file_info(entrypoint).external_module_indicator;
-                let mut has_exports =
-                    !file_exports.is_empty() && external_module_indicator.is_some();
-                let source = result
-                    .failed_ambient_module_lookup_sources
-                    .borrow()
-                    .get(&entrypoint_path)
-                    .cloned();
-                if let Some(source) = source {
-                    source.borrow_mut().package_name = package_name.to_string();
-                    has_exports = external_module_indicator.is_some();
-                } else {
-                    result.exports.insert(entrypoint_path.clone(), file_exports);
-                }
-
-                if !has_exports {
-                    non_module_files.insert(entrypoint_path.clone());
-                    if let Some(symlink) = &symlink {
-                        non_module_files.insert(symlink.path.clone());
-                    }
+                    non_module_files.insert(symlink.path.clone());
                 }
             }
-            let missed = alias_resolver.take_missed_files();
-            if !missed.is_empty() {
-                reads.extend(missed);
-                continue;
-            }
-
-            // Discard entrypoints for non-module files and empty modules.
-            // Go: slices.DeleteFunc
-            result.entrypoints.retain(|ep| {
-                !non_module_files.contains(&(self.base.to_path)(&ep.resolved_file_name))
-            });
-
-            let stats = extractor.stats();
-            result.stats_exports = stats.exports.get();
-            result.stats_used_checker = stats.used_checker.get();
-            return Some(Rc::new(result));
         }
+
+        // Discard entrypoints for non-module files and empty modules.
+        // Go: slices.DeleteFunc
+        result
+            .entrypoints
+            .retain(|ep| !non_module_files.contains(&(self.base.to_path)(&ep.resolved_file_name)));
+
+        let stats = extractor.stats();
+        result.stats_exports = stats.exports.get();
+        result.stats_used_checker = stats.used_checker.get();
+        Some(Rc::new(result))
     }
 }
 

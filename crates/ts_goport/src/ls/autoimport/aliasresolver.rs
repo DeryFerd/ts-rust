@@ -12,7 +12,10 @@ use crate::ls::autoimport::prelude::*;
 // give Go's constant or panic for the others.
 // PORT: the registry host parses the files outside any program. Each file
 // is published with no program and bound into the binder lineage, as
-// sourcedefinition does (`bind_alias_resolver_source_file`).
+// sourcedefinition does (`bind_alias_resolver_source_file`). A file that
+// the checker asks for is read, published and bound then, and the checker
+// catches its arena up to the lineage before it reads the file (see
+// `new_checker`).
 
 use crate::frontend::core_ext::HasFileName;
 use crate::frontend::module;
@@ -35,8 +38,8 @@ pub struct PathAndFileName {
 
 // Go: ls/autoimport/aliasresolver.go:21 aliasResolver
 // PORT: Go `collections.SyncMap` values are `RefCell<FxHashMap>` (one
-// thread). A Go nil `symlinks` map is an empty map. The fields after
-// `resolved_modules` are the port's (see `new_checker`).
+// thread). A Go nil `symlinks` map is an empty map. `checker_program` is
+// the port's (see `new_checker`).
 pub struct AliasResolver {
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     pub host: Rc<dyn RegistryCloneHost>,
@@ -52,13 +55,9 @@ pub struct AliasResolver {
             Rc<RefCell<FxHashMap<module::ModeAwareCacheKey, Arc<ResolvedModule>>>>,
         >,
     >,
-    /// The program of the checker, once `new_checker` made it.
+    /// The program of the checker, once `new_checker` made it (a stopped
+    /// build makes none).
     pub checker_program: Cell<Option<&'static GoProgram>>,
-    /// The ids of the files that the checker can read (`new_checker`).
-    pub checker_files: RefCell<FxHashSet<usize>>,
-    /// The files that the checker asked for outside `checker_files`
-    /// (`get_source_file`, `take_missed_files`).
-    pub missed_files: RefCell<Vec<Node>>,
 }
 
 // Go: ls/autoimport/aliasresolver.go:33 newAliasResolver
@@ -79,8 +78,6 @@ pub fn new_alias_resolver(
         on_failed_ambient_module_lookup,
         resolved_modules: RefCell::new(FxHashMap::default()),
         checker_program: Cell::new(None),
-        checker_files: RefCell::new(FxHashSet::default()),
-        missed_files: RefCell::new(Vec::new()),
     });
     r
 }
@@ -95,46 +92,36 @@ pub fn bind_alias_resolver_source_file(current_directory: &str, file: Node) {
     crate::program::bind_file_outside_program(file);
 }
 
-/// True when the arena of a checker of `program` holds the symbols of
-/// `file`: the file is bound, and its symbols are older than the program's
-/// copy of the binder lineage.
-fn checker_arena_holds(program: &'static GoProgram, file: Node) -> bool {
-    let Some(go_file) = crate::ast::try_go_file(file.file_index()) else {
-        return false;
-    };
-    if go_file.file_bind.get().is_none() {
-        return false;
-    }
-    let symbol = file.symbol();
-    let count =
-        crate::program::bound_symbols_of(program).map_or(0, |symbols| symbols.symbol_count());
-    symbol.is_nil() || symbol.index() < count
-}
-
 impl AliasResolver {
     /// Go `checker.NewChecker(aliasResolver, nil)`. The checker's program is
     /// current on this thread while the returned scope lives; keep the scope
-    /// as long as the checker is used. `reads` are the other files that the
-    /// checker can read: the files that the caller reads with
-    /// `get_source_file` while the checker lives, and the files that an
-    /// earlier checker of the same extraction missed (`take_missed_files`).
+    /// as long as the checker is used. `reads` are files that the caller
+    /// read with `get_source_file` before the checker (the second pass of
+    /// the node_modules index update); the program keeps them live with the
+    /// root files.
     // PORT: a checker copies the binder lineage when it is made
-    // (`SymbolArena::for_checker`), so it cannot read a file bound later. Go
-    // binds each file when `GetSourceFile` parses it, while the checker
-    // runs. Here the checker can read only the root files and `reads`, bound
-    // first. When it asks for another file, `get_source_file` reads that file
-    // with the same host call as Go, keeps it as a missed file and gives nil.
-    // The caller then drops the checker and every result of it, and makes a
-    // new checker with the missed files in `reads` (`extract_package` and the
-    // second pass of the node_modules index update). A checker with no miss
-    // got every file that it asked for, and it read no other file. The module
-    // names resolve when the checker asks for them (`get_resolved_module`),
-    // as in Go. So the host and file system calls are those of Go: Go
-    // N' fed0bf24149f calls the client's file system callbacks
-    // (`api/callbackfs.go`) only for these files and resolutions.
+    // (`SymbolArena::for_checker`). Go binds a file when `GetSourceFile`
+    // reads it, while the checker runs, and the checker reads its symbols at
+    // once (checker.go:15531, :15639). Here `get_source_file` binds the file
+    // into the lineage, and the checker catches its arena up to the lineage
+    // before it reads the file (`program::catch_up_alias_resolver_checker`,
+    // at the one checker read site). So, as in Go, a module name resolves
+    // (`get_resolved_module`) and a file is read only when the checker asks
+    // for it, also inside `NewChecker` (`mergeModuleAugmentation`,
+    // checker.go:1458). There is one checker and one pass. The checker gets
+    // nil only when the host gives nil (aliasresolver.go:85). A file read on
+    // demand does not join the checker's files (Go `c.files`): the host's
+    // parse cache key keeps it live until the clone's `dispose`.
     // PORT: Go binds a second-pass root file only if an earlier pass bound
-    // it (registry.go:1078 reads it from the host). Here every root file is
-    // bound.
+    // the parse that the host gives (registry.go:1102 reads it from the
+    // host, with no bind). That is true inside one clone. A file of an
+    // ancestor bucket that this clone did not build (`resolveAmbientModuleName`,
+    // registry.go:1843) can be a new parse: the host releases its keys at the
+    // end of each clone (project/snapshot.go:722), and the parse cache drops
+    // an entry at refcount 0 (refcountcache.go:125). Go's `initializeChecker`
+    // then merges nothing from it. Here every root file is bound, and the
+    // session keeps one parse per path (`kept_files`, project/autoimport.rs
+    // `dispose`).
     // PORT: Go's `NewChecker` has no context. `ctx` is for
     // `should_stop_build`: a build that the caller drops on cancel stops
     // before the program, and gets `None`. For any other context the result
@@ -149,8 +136,7 @@ impl AliasResolver {
             crate::core::go_nil_dereference();
         }
         let current_directory = self.get_current_directory();
-        // The registry reads the second-pass root files and the missed files
-        // from its host.
+        // The registry reads the second-pass root files from its host.
         crate::program::publish_parsed_files(&current_directory);
         let mut files: Vec<Node> = Vec::new();
         let mut seen: FxHashSet<usize> = FxHashSet::default();
@@ -172,32 +158,17 @@ impl AliasResolver {
             self.use_case_sensitive_file_names(),
             self.clone(),
         );
-        *self.checker_files.borrow_mut() = seen;
         self.checker_program.set(Some(scope.program()));
         let checker = ls_program::new_checker_for_version(scope.program());
         Some((Rc::new(RefCell::new(checker)), scope))
     }
 
-    /// The files that the checker asked for and could not read (see
-    /// `new_checker`), in the order of the first ask, once each. When this is
-    /// empty, the checker's results are those of Go.
-    pub fn take_missed_files(&self) -> Vec<Node> {
-        std::mem::take(&mut *self.missed_files.borrow_mut())
-    }
-
     /// Go `binder.BindSourceFile(file)` in `GetSourceFile`.
-    // PORT: before the checker exists, the file is published and bound
-    // (`bind_alias_resolver_source_file`). After, the checker's arena must
-    // already hold it: `get_source_file` binds only the files of
-    // `checker_files`, which `new_checker` bound first.
+    // PORT: the file is published and bound into the binder lineage
+    // (`bind_alias_resolver_source_file`). A checker that exists catches up
+    // before it reads the file (see `new_checker`).
     fn bind_source_file(&self, file: Node) {
-        let Some(program) = self.checker_program.get() else {
-            bind_alias_resolver_source_file(self.host.get_current_directory(), file);
-            return;
-        };
-        if !checker_arena_holds(program, file) {
-            unported!("aliasResolver.GetSourceFile after NewChecker");
-        }
+        bind_alias_resolver_source_file(self.host.get_current_directory(), file);
     }
 
     // Go: ls/autoimport/aliasresolver.go:53 BindSourceFiles
@@ -247,16 +218,6 @@ impl AliasResolver {
             .get_source_file(file_name, &(self.to_path)(file_name));
         // file may be nil due to symlink/realpath mismatch; see TestAutoImportBuilderFS
         if file.is_nil() {
-            return Node::NIL;
-        }
-        // PORT: a file that the checker cannot read (`new_checker`).
-        if self.checker_program.get().is_some()
-            && !self.checker_files.borrow().contains(&file.file_index())
-        {
-            let mut missed = self.missed_files.borrow_mut();
-            if !missed.iter().any(|m| m.file_index() == file.file_index()) {
-                missed.push(file);
-            }
             return Node::NIL;
         }
         self.bind_source_file(file);
