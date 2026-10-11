@@ -18,6 +18,10 @@
 #        testbox-remote.sh perf RUN LABEL [NAME=VALUE...] ARGS...
 #                                                  perf.sh ARGS... (ARGS hold LABEL) with the NAME=VALUE variables,
 #                                                  pack the label dir in RUN/out.tar.gz, then remove the label dir
+#        testbox-remote.sh release-build COMMIT RUN [NAME=VALUE...]
+#                                                  build-release.sh at COMMIT with RELEASE_BOLT_PROFILE=instrument
+#                                                  and the NAME=VALUE variables (the guest has no branch sampling),
+#                                                  pack <out>/bin and the logs in RUN/out.tar.gz, then remove <out>
 # pin.py exec binds a pin's oracle and Go checkout over the default ones; bwrap makes those bind targets.
 # Only microsoft/TypeScript pins (layout typescript) are set up: the older layout needs the TypeScript submodule.
 set -euo pipefail
@@ -67,6 +71,24 @@ at_commit() {
   git cat-file -e "$1^{commit}" 2> /dev/null || git fetch -q --depth=1 origin "$1" ||
     die "commit $1 is not on origin: push it first"
   git reset -q "$1"
+}
+
+# release_tools: what build-release.sh needs and the runner image lacks: its rustc with llvm-tools (the
+# llvm-profdata of rustc's LLVM), llvm-bolt and merge-fdata of zbook's LLVM major (apt.llvm.org), and qemu-user
+# for its CPU check. Prints the PATH entry of the LLVM tools.
+release_tools() {
+  local llvm=23 tc
+  tc=$(sed -n 's/^export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-\([^}]*\)}"$/\1/p' crates/ts_goport/scripts/build-release.sh)
+  [[ -n $tc ]] || die "no default RUSTUP_TOOLCHAIN in build-release.sh"
+  rustup toolchain install "$tc" --profile minimal -c llvm-tools > /dev/null 2>&1 || die "rustup toolchain install $tc failed"
+  if [[ ! -x /usr/lib/llvm-$llvm/bin/llvm-bolt || ! -x /usr/bin/qemu-x86_64 ]]; then
+    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+    echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-$llvm main" | sudo tee /etc/apt/sources.list.d/llvm-$llvm.list > /dev/null
+    sudo apt-get update -qq > /dev/null
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "bolt-$llvm" "llvm-$llvm" qemu-user > /dev/null ||
+      die "apt-get install bolt-$llvm llvm-$llvm qemu-user failed"
+  fi
+  echo "/usr/lib/llvm-$llvm/bin"
 }
 
 cmd=$1
@@ -171,6 +193,34 @@ case $cmd in
     tar -czf "$run/out.tar.gz" -C "$pd" "$label"
     # The local copy is the record: the sticky target/ keeps no label dirs.
     rm -rf "${pd:?}/${label:?}"
+    exit "$rc"
+    ;;
+  release-build)
+    (($# >= 2)) || die "usage: release-build COMMIT RUN [NAME=VALUE...]"
+    commit=$1 run=$2
+    shift 2
+    [[ ! -e $run ]] || die "$run exists"
+    on_testbox
+    at_commit "$commit"
+    mkdir -p "$run"
+    llvm_bin=$(release_tools)
+    cargo fetch --locked -q || die "cargo fetch failed"
+    # Outside the sticky target/: each build makes two fat LTO target dirs.
+    out=$(getent passwd "$(id -u)" | cut -d: -f6)/release-build/${run##*/}
+    rc=0
+    echo "build-release.sh at ${commit:0:12}, $("$llvm_bin/llvm-bolt" --version | grep -m1 'LLVM version' | xargs) ($(date -u +%T))"
+    # From the zbook path, as the gate runs: the inputs, the corpus and BUILD.txt then have zbook's paths.
+    (cd "$ZBOOK_REPO" && env PATH="$llvm_bin:$PATH" RELEASE_BOLT_PROFILE=instrument "$@" \
+      crates/ts_goport/scripts/build-release.sh "$out") > "$run/build.log" 2>&1 || rc=$?
+    tail -25 "$run/build.log"
+    # The bins and the logs, not the target dirs, the profiles or the BOLT inputs.
+    (cd "$out" 2> /dev/null && for f in bin build-*.log cpu-check-* bolt/*.log bolt/data/*.out; do
+      [[ ! -e $f ]] || echo "$f"
+    done) > "$run/pack.list" || true
+    if [[ -s $run/pack.list ]]; then tar -czf "$run/out.tar.gz" -C "$run" build.log -C "$out" -T "$PWD/$run/pack.list"
+    else tar -czf "$run/out.tar.gz" -C "$run" build.log; fi
+    rm -rf "$out"
+    echo "packed $run/out.tar.gz ($(du -h "$run/out.tar.gz" | cut -f1)); rc $rc ($(date -u +%T))"
     exit "$rc"
     ;;
   *) die "unknown command $cmd (testbox-remote.sh help)" ;;

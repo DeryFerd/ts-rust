@@ -43,6 +43,12 @@
 #                                             not exist). Without a saved testbox it warms one up (TESTBOX_IDLE 30)
 #                                             and stops it at the end. Read instructions:u and RSS; wall is not valid.
 #                                             The variables of `perf.sh env` pass on to perf.sh there
+#        testbox.sh release-build OUT [NAME=VALUE...]
+#                                             crates/ts_goport/scripts/build-release.sh at HEAD with
+#                                             RELEASE_BOLT_PROFILE=instrument (the guest has no branch sampling) and the
+#                                             NAME=VALUE variables (RELEASE_*, BOLT_*, PGO_*), fetch <out>/bin (with COMMIT
+#                                             and bins.sha256) and the logs to OUT (must not exist). HEAD must be pushed;
+#                                             crates/, Cargo.toml and Cargo.lock must be clean
 # The gate and the oracles run as on zbook: the testbox env sets HOME=/home/theo and the workflow binds the
 # workspace on /home/theo/Code/sandbox/ts-rust (testbox-data.sh). Fetch a commit that the bins name before a
 # gate: run git fetch --depth=1 origin <sha>.
@@ -294,6 +300,26 @@ case "$cmd" in
     mv "$tmp/testbox.log" "$pd/$label/"
     rmdir "$tmp"
     echo "results $pd/$label (perf.sh compare <base> $label compares with another run)"
+    exit "$rc"
+    ;;
+  release-build)
+    (($# >= 1)) || { echo "usage: testbox.sh release-build OUT [NAME=VALUE...]" >&2; exit 2; }
+    out=$(realpath -m -- "$1")
+    shift
+    [[ ! -e $out ]] || { echo "$out exists (results are never replaced)" >&2; exit 2; }
+    for a in "$@"; do [[ $a =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || { echo "not NAME=VALUE: $a" >&2; exit 2; }; done
+    [[ -z $(git status --porcelain --untracked-files=all -- crates Cargo.toml Cargo.lock) ]] ||
+      { echo "crates/, Cargo.toml or Cargo.lock has changes: commit them (the build is of HEAD)" >&2; exit 2; }
+    head=$(git rev-parse HEAD)
+    git branch -r --contains "$head" | grep -q . ||
+      echo "warning: no remote branch here has HEAD ${head:0:12}; the testbox fetches it from origin" >&2
+    run=target/testbox-runs/release-$(date -u +%Y%m%dT%H%M%S)-${head:0:9}
+    rc=0
+    job "$run" release-build "$head" "$run" "$@" || rc=$?
+    fetch "$run" "$out" || exit 1
+    [[ -f $out/bin/BUILD.txt ]] || { echo "no release bins (rc $rc): see $out/build.log" >&2; exit 1; }
+    (cd "$out/bin" && echo "$head" > COMMIT && find . -maxdepth 1 -type f -perm -u+x -printf '%f\n' | sort | xargs sha256sum > bins.sha256)
+    echo "release bins $out/bin (BUILD.txt, COMMIT, bins.sha256)"
     exit "$rc"
     ;;
   get)
