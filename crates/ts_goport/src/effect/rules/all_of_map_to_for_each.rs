@@ -64,7 +64,11 @@ pub fn analyze_all_of_map_to_for_each(
     let mut matches = Vec::new();
 
     // Direct data-first calls: Effect.all(xs.map(f), options?)
-    walk(tp, sf, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, n);
+    }
 
     // Data-last Effect.all references inside piping flows. A bare reference is
     // invisible to the call walk above because it never appears as a call.
@@ -77,7 +81,10 @@ pub fn analyze_all_of_map_to_for_each(
                     && (transformation.kind == TransformationKind::Pipe
                         || transformation.kind == TransformationKind::Pipeable)
                     && transformation.callee.is_some()
-                    && tp.is_node_reference_to_effect_module_api(transformation.callee, "all")
+                    && tp.is_node_reference_to_effect_module_api(
+                        transformation.callee,
+                        member!("all"),
+                    )
             };
         let mut predicates: [&mut PipingFlowTransformationPredicate<'_>; 2] =
             [&mut any_transformation, &mut all_reference];
@@ -104,22 +111,10 @@ pub fn analyze_all_of_map_to_for_each(
     matches
 }
 
-fn walk(
-    tp: &mut TypeParser<'_>,
-    sf: Node,
-    matches: &mut Vec<AllOfMapToForEachMatch>,
-    node: Node,
-) -> bool {
-    if node.is_nil() {
-        return false;
-    }
-
+fn visit(tp: &mut TypeParser<'_>, sf: Node, matches: &mut Vec<AllOfMapToForEachMatch>, node: Node) {
     if let Some(m) = analyze_all_of_map_to_for_each_call(tp, sf, node) {
         matches.push(m);
     }
-
-    node.for_each_child(|child| walk(tp, sf, matches, child));
-    false
 }
 
 // Go: rules.transformationApplicationNode
@@ -154,7 +149,7 @@ fn analyze_all_of_map_to_for_each_call(
     if all_call.expression().is_nil() || all_args.is_empty() || all_args.len() > 2 {
         return None;
     }
-    if !tp.is_node_reference_to_effect_module_api(all_call.expression(), "all")
+    if !tp.is_node_reference_to_effect_module_api(all_call.expression(), member!("all"))
         || contains_spread_element(&all_args)
     {
         return None;

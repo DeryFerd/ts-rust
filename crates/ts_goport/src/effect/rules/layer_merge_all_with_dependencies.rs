@@ -62,13 +62,13 @@ pub fn analyze_layer_merge_all_with_dependencies(
     let mut matches = Vec::new();
 
     // Stack-based traversal
-    let mut node_to_visit: Vec<Node> = Vec::new();
-    sf.for_each_child(|child| {
-        node_to_visit.push(child);
-        false
-    });
+    // PERF: Go walks the tree with a stack of nodes; this stack holds node
+    // order indexes and pushes and pops at the same points (effperf4).
+    let order = tp.node_order(sf);
+    let mut node_to_visit: Vec<u32> = order.children(0).collect();
 
-    while let Some(node) = node_to_visit.pop() {
+    while let Some(i) = node_to_visit.pop() {
+        let node = order.node(i);
         if node.kind() == SyntaxKind::CallExpression {
             let result = analyze_layer_merge_all_call(tp, sf, node);
             if !result.is_empty() {
@@ -77,10 +77,7 @@ pub fn analyze_layer_merge_all_with_dependencies(
         }
 
         // Enqueue children
-        node.for_each_child(|child| {
-            node_to_visit.push(child);
-            false
-        });
+        node_to_visit.extend(order.children(i));
     }
 
     matches
@@ -104,7 +101,7 @@ fn analyze_layer_merge_all_call(
     let call = node;
 
     // Check if this is Layer.mergeAll
-    if !tp.is_node_reference_to_effect_layer_module_api(call.expression(), "mergeAll") {
+    if !tp.is_node_reference_to_effect_layer_module_api(call.expression(), member!("mergeAll")) {
         return Vec::new();
     }
 

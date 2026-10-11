@@ -48,8 +48,9 @@
 //! - a new node, a factory list and a list copy go to the current program
 //!   version when it is an owner on this thread and no base scope
 //!   (`enter_base_synthetic_owner`) is open, else to the base owner;
-//! - a data write (`replace_node_data`, `set_node_kind`) goes to the owner
-//!   of the node, so a base node never points into a program version;
+//! - a data write (`replace_node_data`, `set_node_kind`, and
+//!   `set_node_modifiers` with its new list) goes to the owner of the node,
+//!   so a base node never points into a program version;
 //! - an alias slot goes to the file version of its parsed node when that is
 //!   a freeable version (`ast/file_version.rs`), else to the base owner. An
 //!   alias lives as long as the node it names: after the version dies, the
@@ -60,7 +61,12 @@
 //!   list or list copy goes to the file version of a parsed node in the
 //!   same way. Lazy JSDoc opens one: its cache keeps the JSDoc nodes of a
 //!   parsed node for as long as that node lives;
-//! - node slices always go to the base owner.
+//! - node slices always go to the base owner;
+//! - in a print scope (`enter_print_scope`, a to-string call of the
+//!   checker), a new node or list of a to-string factory
+//!   (`NodeFactory::set_print_owned`) goes to the print owner of the
+//!   thread. The end of the call frees them, unless the call is pinned
+//!   (`pin_print_scope`): then they go to the current owner.
 //!
 //! Code whose nodes a cache keeps across program versions (the token cache,
 //! parses) opens a base scope.
@@ -108,6 +114,9 @@ enum Slot {
     /// A slot of a checker thread that no print pack copied to its d.ts
     /// twin (`print_pack`). A read panics.
     Absent,
+    /// A node of a to-string call that ended (`exit_print_scope`). A read
+    /// panics.
+    Freed,
 }
 
 /// The mutable Go `NodeBase` fields of a factory node.
@@ -184,20 +193,39 @@ pub struct SyntheticSourceFileData {
     pub content_mapper_info: Option<&'static ContentMapperFileInfo>,
 }
 
-/// A list that the factory made (`new_synthetic_node_list`,
-/// `new_synthetic_modifier_list`) or that a read copied
-/// (`copy_synthetic_list`).
+/// A list of the synthetic arena of a thread: a factory list
+/// (`new_synthetic_node_list`, `new_synthetic_modifier_list`), or a list
+/// field of synthetic node data, which names it by index (astshrink1,
+/// `synthetic_list_value`).
+#[derive(Clone, Debug)]
+pub struct SyntheticListData {
+    /// Go `list.Loc` in astdata form.
+    pub range: crate::astdata::text::TextRange,
+    /// The synthetic-space ids of the nodes (`synthetic_child_id`).
+    pub nodes: Vec<crate::astdata::NodeId>,
+    /// The astdata missing-list bit (`NodeList::stored_trailing_comma`).
+    pub has_trailing_comma: bool,
+    /// Go `ModifiersToFlags(nodes)` of a modifier list, 0 for a node list.
+    pub flags: crate::astdata::ModifierFlags,
+}
+
+/// An entry of the list table of the synthetic arena.
 #[derive(Clone)]
 enum OwnList {
-    Nodes(crate::astdata::NodeList),
-    Modifiers(crate::astdata::ModifierList),
+    List(SyntheticListData),
+    /// A list of a to-string call that ended. A read panics.
+    Freed,
+    /// A list that no print pack brought to this d.ts twin. A read panics
+    /// (`ABSENT`).
+    Absent,
 }
 
 impl OwnList {
-    fn get(&self) -> AnyList<'_> {
+    fn get(&self) -> &SyntheticListData {
         match self {
-            Self::Nodes(l) => AnyList::Nodes(l),
-            Self::Modifiers(m) => AnyList::Modifiers(m),
+            Self::List(l) => l,
+            Self::Freed => panic!("{PRINT_FREED}"),
+            Self::Absent => panic!("{ABSENT}"),
         }
     }
 }
@@ -224,6 +252,10 @@ type DataChunk = Rc<[OnceCell<crate::astdata::Node>]>;
 
 /// The panic of a read of an entry whose owner was freed.
 const FREED: &str = "synthetic entry of a released program or file version is read";
+
+/// The panic of a read of an entry of a to-string call that ended
+/// (`Slot::Freed`, `OwnList::Freed`; see `exit_print_scope`).
+const PRINT_FREED: &str = "a synthetic node of a to-string call that ended is read";
 
 /// The panic of a read on a d.ts twin of a checker entry that no print pack
 /// copied (`Slot::Absent`).
@@ -252,6 +284,10 @@ enum OwnerKey {
     /// The alias slots of the nodes of a freeable file version (its file
     /// id) and the entries made in its file scopes, in chunks of their own.
     File(u32),
+    /// The nodes and lists that a to-string factory makes in a print scope
+    /// (`enter_print_scope`). One per thread. Its entries are freed when
+    /// their call ends.
+    Print,
 }
 
 /// The chunk numbers of one owner, oldest first. New entries of the owner
@@ -321,6 +357,35 @@ struct SyntheticArena {
     /// chunks take their numbers from it, and a table has no chunk (`None`)
     /// at the numbers of the other thread.
     shared: Option<Arc<SharedChunks>>,
+    /// The chunks of `OwnerKey::Print` and the open print scopes.
+    print: PrintState,
+}
+
+/// The print owner of a thread (`enter_print_scope`).
+#[derive(Default)]
+struct PrintState {
+    chunks: OwnerChunks,
+    /// Open print scopes. Only the outermost frees.
+    depth: u32,
+    /// The open call keeps its nodes (`pin_print_scope`).
+    pinned: bool,
+    /// When the outermost scope opened: the index in `chunks.slots` and the
+    /// filled slots of that chunk.
+    start: (usize, usize),
+    /// The same for `chunks.datas` (filled cells) and `chunks.lists`.
+    data_start: (usize, usize),
+    list_start: (usize, usize),
+}
+
+impl PrintState {
+    const EMPTY: Self = Self {
+        chunks: OwnerChunks::EMPTY,
+        depth: 0,
+        pinned: false,
+        start: (0, 0),
+        data_start: (0, 0),
+        list_start: (0, 0),
+    };
 }
 
 impl SyntheticArena {
@@ -345,6 +410,7 @@ impl SyntheticArena {
             last: None,
             slots_made: 1,
             shared: None,
+            print: PrintState::EMPTY,
         }
     }
 
@@ -391,6 +457,16 @@ impl SyntheticArena {
         owner
     }
 
+    /// The owner of a new node or list: the print owner for a to-string
+    /// factory (`print`) in a print scope, else `current_owner`.
+    #[inline]
+    fn owner_for(&mut self, print: bool) -> OwnerKey {
+        if print && self.print.depth > 0 {
+            return OwnerKey::Print;
+        }
+        self.current_owner()
+    }
+
     /// The owner of a new alias slot for parsed node `n`, or of a file
     /// scope (`enter_file_synthetic_owner`): its file version when that is
     /// a live freeable version, else the thread. It frees the entries of the
@@ -425,17 +501,7 @@ impl SyntheticArena {
             return;
         }
         for &file in &dead {
-            if let Some(chunks) = self.alias_files.remove(&(file as u32)) {
-                for c in chunks.slots {
-                    self.slots[c as usize] = None;
-                }
-                for c in chunks.datas {
-                    self.datas[c as usize] = None;
-                }
-                for c in chunks.lists {
-                    self.lists[c as usize] = None;
-                }
-            }
+            self.free_file_owner(file as u32);
         }
         // PERF: emitast2. An editor edit kills one version: compare its id,
         // with no set lookup per alias.
@@ -444,6 +510,21 @@ impl SyntheticArena {
         } else {
             let dead: FxHashSet<usize> = dead.into_iter().collect();
             self.aliases.retain(|n, _| !dead.contains(&n.file_index()));
+        }
+    }
+
+    /// Frees the entries of the file version `file` (`OwnerKey::File`).
+    fn free_file_owner(&mut self, file: u32) {
+        if let Some(chunks) = self.alias_files.remove(&file) {
+            for c in chunks.slots {
+                self.slots[c as usize] = None;
+            }
+            for c in chunks.datas {
+                self.datas[c as usize] = None;
+            }
+            for c in chunks.lists {
+                self.lists[c as usize] = None;
+            }
         }
     }
 
@@ -474,9 +555,10 @@ impl SyntheticArena {
             owners,
             alias_files,
             shared,
+            print,
             ..
         } = self;
-        let chunks = owner_chunks(base, owners, alias_files, owner);
+        let chunks = owner_chunks(base, owners, alias_files, &mut print.chunks, owner);
         push_slot_into(slots, slot_owner, shared, chunks, owner, slot)
     }
 
@@ -502,9 +584,10 @@ impl SyntheticArena {
             owners,
             alias_files,
             shared,
+            print,
             ..
         } = self;
-        let chunks = owner_chunks(base, owners, alias_files, owner);
+        let chunks = owner_chunks(base, owners, alias_files, &mut print.chunks, owner);
         let data = push_data_into(datas, shared, chunks, node);
         push_slot_into(slots, slot_owner, shared, chunks, owner, slot(data))
     }
@@ -527,9 +610,10 @@ impl SyntheticArena {
             owners,
             alias_files,
             shared,
+            print,
             ..
         } = self;
-        let chunks = owner_chunks(base, owners, alias_files, owner);
+        let chunks = owner_chunks(base, owners, alias_files, &mut print.chunks, owner);
         push_data_into(datas, shared, chunks, node)
     }
 
@@ -548,9 +632,10 @@ impl SyntheticArena {
             owners,
             alias_files,
             shared,
+            print,
             ..
         } = self;
-        let chunks = owner_chunks(base, owners, alias_files, owner);
+        let chunks = owner_chunks(base, owners, alias_files, &mut print.chunks, owner);
         let open = chunks
             .lists
             .last()
@@ -594,15 +679,13 @@ impl SyntheticArena {
             Slot::Alias(target) => *target,
             Slot::Node(_) => handle(index as u32),
             Slot::Absent => panic!("{ABSENT}"),
+            Slot::Freed => panic!("{PRINT_FREED}"),
         }
     }
 
     /// The list that `list` names. Panics on a node slice.
-    fn list(&self, list: SyntheticList) -> AnyList<'_> {
+    fn list(&self, list: SyntheticList) -> &SyntheticListData {
         match list {
-            SyntheticList::Field { data, sel } => sel(&self.data(data).data)
-                .flatten()
-                .expect("synthetic list field is not in its node data"),
             SyntheticList::Own { index } => self.own_list(index).get(),
             SyntheticList::Slice { .. } => panic!("a node slice is not a NodeList"),
         }
@@ -638,10 +721,12 @@ fn owner_chunks<'a>(
     base: &'a mut OwnerChunks,
     owners: &'a mut FxHashMap<u32, OwnerChunks>,
     alias_files: &'a mut FxHashMap<u32, OwnerChunks>,
+    print: &'a mut OwnerChunks,
     owner: OwnerKey,
 ) -> &'a mut OwnerChunks {
     match owner {
         OwnerKey::Base => base,
+        OwnerKey::Print => print,
         OwnerKey::Program(id) => owners.get_mut(&id).expect("synthetic owner is not open"),
         OwnerKey::File(file) => alias_files
             .get_mut(&file)
@@ -721,6 +806,7 @@ fn push_data_into(
 fn not_a_node_slot(slot: &Slot) -> ! {
     match slot {
         Slot::Absent => panic!("{ABSENT}"),
+        Slot::Freed => panic!("{PRINT_FREED}"),
         _ => panic!("synthetic handle does not name a node slot"),
     }
 }
@@ -822,6 +908,284 @@ pub fn free_synthetic_owner(id: u32) {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Print scopes (Go `getNodeBuilder` release: `Factory.ReleaseArenas`)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Opens a print scope on this thread, for a to-string call of the checker
+/// (Go `getNodeBuilder`, whose callers defer its `release`). While a scope
+/// is open, the new nodes and lists of a to-string factory
+/// (`NodeFactory::set_print_owned`) belong to the print owner. A nested
+/// call joins the outermost scope. `exit_print_scope` closes it.
+// PORT: Go `release` (`Factory.ReleaseArenas`) only drops the factory's
+// arena slices, and the GC frees the nodes that nothing reaches. Here the end
+// of the outermost scope frees the nodes of the call at once, unless a cache
+// that a later call reads keeps one of them (`pin_print_scope`).
+pub fn enter_print_scope() {
+    ARENA.with(|a| {
+        let mut a = a.borrow_mut();
+        let SyntheticArena {
+            slots,
+            lists,
+            print,
+            ..
+        } = &mut *a;
+        print.depth += 1;
+        if print.depth > 1 {
+            return;
+        }
+        print.pinned = false;
+        // (the index in the chunk list of the chunk that the next entry
+        // goes to, the filled entries of that chunk).
+        let next = |chunks: &[u32], fill: Option<usize>, per_chunk: usize| match fill {
+            Some(fill) if fill < per_chunk => (chunks.len() - 1, fill),
+            _ => (chunks.len(), 0),
+        };
+        let c = &print.chunks;
+        print.start = next(
+            &c.slots,
+            c.slots
+                .last()
+                .map(|&c| slots[c as usize].as_ref().expect(FREED).len()),
+            SLOT_CHUNK,
+        );
+        print.data_start = next(
+            &c.datas,
+            c.datas.last().map(|_| c.data_fill as usize),
+            DATA_CHUNK,
+        );
+        print.list_start = next(
+            &c.lists,
+            c.lists
+                .last()
+                .map(|&c| lists[c as usize].as_ref().expect(FREED).len()),
+            LIST_CHUNK,
+        );
+    });
+}
+
+/// Keeps the nodes of the open print call: a cache that a later call reads
+/// (the node builder's serialized types under an enclosing declaration)
+/// stored one of them, or the call returns one. Does nothing outside a print
+/// scope.
+pub fn pin_print_scope() {
+    ARENA.with(|a| {
+        let mut a = a.borrow_mut();
+        if a.print.depth > 0 {
+            a.print.pinned = true;
+        }
+    });
+}
+
+/// True when `n` is a node of the print owner: a node of the open print
+/// call.
+#[must_use]
+pub fn is_print_node(n: Node) -> bool {
+    is_synthetic_node(n)
+        && ARENA.with(|a| {
+            a.borrow().slot_owner.get(slot_index(n) / SLOT_CHUNK) == Some(&OwnerKey::Print)
+        })
+}
+
+/// True when `n` is a node in the slot index ranges of an ended print call
+/// (`exit_print_scope`).
+#[must_use]
+pub fn in_print_ranges(ranges: &[(u32, u32)], n: Node) -> bool {
+    if !is_synthetic_node(n) {
+        return false;
+    }
+    let i = slot_index(n) as u32;
+    ranges.iter().any(|&(lo, hi)| (lo..hi).contains(&i))
+}
+
+/// The handles of the nodes in the slot index ranges of an ended print call
+/// (`exit_print_scope`).
+pub fn print_range_nodes(ranges: &[(u32, u32)]) -> impl Iterator<Item = Node> + '_ {
+    ranges.iter().flat_map(|&(lo, hi)| (lo..hi).map(handle))
+}
+
+/// Closes a print scope (`enter_print_scope`). At the end of the outermost
+/// scope of a call that is not pinned, it frees the entries of the call:
+/// their slots become `Slot::Freed`, their lists `OwnList::Freed` and their
+/// data cells empty, so a later read panics. The print chunks that are full
+/// go. It returns the slot index ranges `[lo, hi)` of the freed nodes, so
+/// the caller drops their side data (emit records, idToSymbol entries). The
+/// chunks of a pinned call go to the current owner and live on, as before
+/// print scopes. During a panic it frees nothing (as for a pinned call).
+/// Returns `None` when it frees nothing.
+pub fn exit_print_scope() -> Option<Vec<(u32, u32)>> {
+    let panicking = std::thread::panicking();
+    let (ranges, freed) = ARENA.with(|a| {
+        let mut a = a.borrow_mut();
+        // 0 when the arena was replaced while the scope was open
+        // (`free_synthetic_nodes`, a seed): there is nothing to close.
+        if a.print.depth == 0 {
+            return (None, None);
+        }
+        a.print.depth -= 1;
+        if a.print.depth > 0 {
+            return (None, None);
+        }
+        if std::mem::take(&mut a.print.pinned) || panicking {
+            a.adopt_print_chunks();
+            return (None, None);
+        }
+        let ranges = a.print_call_ranges();
+        let SyntheticArena {
+            slots,
+            datas,
+            lists,
+            print,
+            ..
+        } = &mut *a;
+        clear_print_call(print, slots, datas, lists, &ranges);
+        let freed = take_full_print_chunks(&mut print.chunks, slots, datas, lists);
+        (Some(ranges), Some(freed))
+    });
+    // The payloads drop after the arena borrow ends.
+    drop(freed);
+    ranges
+}
+
+impl SyntheticArena {
+    /// The slot index ranges of the open print call: from `print.start` to
+    /// the end of each print slot chunk.
+    fn print_call_ranges(&self) -> Vec<(u32, u32)> {
+        let (first, filled) = self.print.start;
+        let mut ranges = Vec::new();
+        for (i, &c) in self.print.chunks.slots.iter().enumerate().skip(first) {
+            let len = self.slots[c as usize].as_ref().expect(FREED).len();
+            let lo = if i == first { filled } else { 0 };
+            if len > lo {
+                let base = c as usize * SLOT_CHUNK;
+                ranges.push(((base + lo) as u32, (base + len) as u32));
+            }
+        }
+        ranges
+    }
+
+    /// Gives all print chunks to the current owner, before the chunk that
+    /// the owner fills now, so the owner keeps filling that one. The next
+    /// print call starts new chunks.
+    fn adopt_print_chunks(&mut self) {
+        let owner = self.current_owner();
+        let chunks = std::mem::take(&mut self.print.chunks);
+        for &c in &chunks.slots {
+            self.slot_owner[c as usize] = owner;
+        }
+        let SyntheticArena {
+            base,
+            owners,
+            alias_files,
+            print,
+            ..
+        } = self;
+        let target = owner_chunks(base, owners, alias_files, &mut print.chunks, owner);
+        fn put(dst: &mut Vec<u32>, src: Vec<u32>) {
+            let at = dst.len().saturating_sub(1);
+            dst.splice(at..at, src);
+        }
+        if target.datas.is_empty() {
+            target.data_fill = chunks.data_fill;
+        }
+        put(&mut target.slots, chunks.slots);
+        put(&mut target.datas, chunks.datas);
+        put(&mut target.lists, chunks.lists);
+    }
+}
+
+/// Frees in place the entries of the ended print call (`ranges`: its slot
+/// ranges) that are in the last print chunk of each table, the chunk that
+/// the next call fills. Its slots become `Slot::Freed`, its lists
+/// `OwnList::Freed`, and its data cells are emptied (their payloads are
+/// freed now, while they are hot). `take_full_print_chunks` takes the other
+/// chunks whole.
+fn clear_print_call(
+    print: &PrintState,
+    slots: &mut [Option<Vec<Slot>>],
+    datas: &mut [Option<DataChunk>],
+    lists: &mut [Option<Vec<OwnList>>],
+    ranges: &[(u32, u32)],
+) {
+    let c = &print.chunks;
+    if let (Some(&last), Some(&(lo, hi))) = (c.slots.last(), ranges.last())
+        && lo as usize / SLOT_CHUNK == last as usize
+    {
+        let base = last as usize * SLOT_CHUNK;
+        let chunk = slots[last as usize].as_mut().expect(FREED);
+        for slot in &mut chunk[lo as usize - base..hi as usize - base] {
+            *slot = Slot::Freed;
+        }
+    }
+    // The filled entries of the call in the last chunk of a table: from its
+    // start when the call started in that chunk, else from 0.
+    // `None` when the call put no entry in the table.
+    let call_from = |(first, filled): (usize, usize), chunk_count: usize| {
+        if first >= chunk_count {
+            None
+        } else if first + 1 == chunk_count {
+            Some(filled)
+        } else {
+            Some(0)
+        }
+    };
+    if let Some(&last) = c.datas.last()
+        && let Some(lo) = call_from(print.data_start, c.datas.len())
+        // A read that still holds the chunk (none at a call end) keeps it.
+        && let Some(cells) = datas[last as usize].as_mut().and_then(Rc::get_mut)
+    {
+        for cell in &mut cells[lo..(c.data_fill as usize).max(lo)] {
+            drop(cell.take());
+        }
+    }
+    if let Some(&last) = c.lists.last()
+        && let Some(lo) = call_from(print.list_start, c.lists.len())
+    {
+        let chunk = lists[last as usize].as_mut().expect(FREED);
+        for list in chunk.iter_mut().skip(lo) {
+            *list = OwnList::Freed;
+        }
+    }
+}
+
+/// Chunks that `take_full_print_chunks` took out of the tables.
+type FreedChunks = (
+    Vec<Option<Vec<Slot>>>,
+    Vec<Option<DataChunk>>,
+    Vec<Option<Vec<OwnList>>>,
+);
+
+/// Takes all print chunks but the last of each table out of the tables (the
+/// holes stay `None`, so a read of their entries panics). Each of them is
+/// full, and every call that put entries in it has ended.
+fn take_full_print_chunks(
+    chunks: &mut OwnerChunks,
+    slots: &mut [Option<Vec<Slot>>],
+    datas: &mut [Option<DataChunk>],
+    lists: &mut [Option<Vec<OwnList>>],
+) -> FreedChunks {
+    fn all_but_last(v: &mut Vec<u32>) -> Vec<u32> {
+        let last = v.pop();
+        let full = std::mem::take(v);
+        v.extend(last);
+        full
+    }
+    (
+        all_but_last(&mut chunks.slots)
+            .into_iter()
+            .map(|c| slots[c as usize].take())
+            .collect(),
+        all_but_last(&mut chunks.datas)
+            .into_iter()
+            .map(|c| datas[c as usize].take())
+            .collect(),
+        all_but_last(&mut chunks.lists)
+            .into_iter()
+            .map(|c| lists[c as usize].take())
+            .collect(),
+    )
+}
+
 /// New synthetic entries of this thread belong to the thread (the base
 /// owner) while the scope lives, whatever program is current. Open it
 /// around code whose nodes a cache keeps across program versions: the token
@@ -876,8 +1240,9 @@ impl Drop for SyntheticOwnerScope {
 pub struct SyntheticSeed {
     slots: Vec<Option<Vec<Slot>>>,
     aliases: FxHashMap<Node, u32>,
-    /// The filled cells of each chunk of `SyntheticArena::datas`.
-    datas: Vec<Option<Vec<crate::astdata::Node>>>,
+    /// The cells of each chunk of `SyntheticArena::datas`, up to the last
+    /// filled one (`None` for an empty cell).
+    datas: Vec<Option<Vec<Option<crate::astdata::Node>>>>,
     lists: Vec<Option<Vec<OwnList>>>,
     slices: Vec<Box<[Node]>>,
     slots_made: usize,
@@ -895,6 +1260,7 @@ pub struct SyntheticSeed {
 pub fn synthetic_seed() -> SyntheticSeed {
     ARENA.with(|a| {
         let a = a.borrow();
+        debug_assert_eq!(a.print.depth, 0, "a synthetic seed in a print scope");
         SyntheticSeed {
             slots: a.slots.clone(),
             aliases: a.aliases.clone(),
@@ -903,10 +1269,16 @@ pub fn synthetic_seed() -> SyntheticSeed {
                 .iter()
                 .map(|chunk| {
                     chunk.as_ref().map(|chunk| {
-                        chunk
-                            .iter()
-                            .map_while(|cell| cell.get().cloned())
-                            .collect::<Vec<_>>()
+                        // Empty cells stay in place: a print call that ended
+                        // empties its cells, and a chunk that a pinned call
+                        // gave to another owner can have live cells after
+                        // them (`exit_print_scope`).
+                        let mut cells: Vec<_> =
+                            chunk.iter().map(|cell| cell.get().cloned()).collect();
+                        while cells.last().is_some_and(Option::is_none) {
+                            cells.pop();
+                        }
+                        cells
                     })
                 })
                 .collect(),
@@ -941,7 +1313,12 @@ pub fn install_synthetic_seed(seed: SyntheticSeed) {
             .datas
             .into_iter()
             .map(|chunk| {
-                chunk.map(|nodes| nodes.into_iter().map(OnceCell::from).collect::<DataChunk>())
+                chunk.map(|cells| {
+                    cells
+                        .into_iter()
+                        .map(|cell| cell.map_or_else(OnceCell::new, OnceCell::from))
+                        .collect::<DataChunk>()
+                })
             })
             .collect(),
         lists: seed.lists,
@@ -953,6 +1330,7 @@ pub fn install_synthetic_seed(seed: SyntheticSeed) {
         last: None,
         slots_made: seed.slots_made,
         shared: None,
+        print: PrintState::EMPTY,
     };
     ARENA.with(|a| *a.borrow_mut() = arena);
 }
@@ -997,6 +1375,7 @@ pub fn install_twin_synthetic_arena(shared: Arc<SharedChunks>) {
         last: None,
         slots_made: 0,
         shared: Some(shared),
+        print: PrintState::EMPTY,
     };
     ARENA.with(|a| *a.borrow_mut() = arena);
 }
@@ -1007,6 +1386,11 @@ pub fn install_twin_synthetic_arena(shared: Arc<SharedChunks>) {
 /// `program::create_checkers`).
 pub fn forget_synthetic_nodes() {
     ARENA.with(|a| {
+        debug_assert_eq!(
+            a.borrow().print.depth,
+            0,
+            "synthetic nodes forgotten in a print scope"
+        );
         std::mem::forget(std::mem::replace(
             &mut *a.borrow_mut(),
             SyntheticArena::new(),
@@ -1018,7 +1402,14 @@ pub fn forget_synthetic_nodes() {
 /// again on this thread. A checker worker of a released program calls it
 /// (`program::release_program`).
 pub fn free_synthetic_nodes() {
-    let nodes = ARENA.with(|a| std::mem::replace(&mut *a.borrow_mut(), SyntheticArena::new()));
+    let nodes = ARENA.with(|a| {
+        debug_assert_eq!(
+            a.borrow().print.depth,
+            0,
+            "synthetic nodes freed in a print scope"
+        );
+        std::mem::replace(&mut *a.borrow_mut(), SyntheticArena::new())
+    });
     drop(nodes);
 }
 
@@ -1254,6 +1645,46 @@ pub fn read_scoped_ast_node<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
     crate::ast::store::with_scoped_store_node(n, f)
 }
 
+/// `static_tier_ast_node` with the list table of the data (the `list_of!`
+/// read).
+#[inline]
+#[must_use]
+pub fn static_tier_ast_node_lists(
+    n: Node,
+) -> Option<(
+    &'static NodeData,
+    &'static [&'static crate::ast::store::StaticList],
+)> {
+    assert!(n.is_some(), "nil node dereference");
+    crate::ast::store::frozen_store_ast_node_lists(n)
+}
+
+/// The `NodeList` handle of list field `l` of the node data of node `n`,
+/// parsed or synthetic (astshrink1: node data names a list by its index in
+/// the list table of its owner).
+#[must_use]
+pub fn data_list(n: Node, l: crate::astdata::NodeList) -> NodeList {
+    if n.file_index() == SYNTHETIC_NODE_FILE {
+        return NodeList::synthetic(SyntheticList::Own {
+            index: l.index() as u32,
+        });
+    }
+    crate::ast::store::store_data_list(n, l)
+}
+
+/// `data_list` for a modifier list field.
+#[must_use]
+pub fn data_modifiers(n: Node, m: crate::astdata::ModifierList) -> ModifierList {
+    let list = data_list(n, m.list);
+    if let Some(l) = list.static_list() {
+        return ModifierList::from_static(list.file(), l);
+    }
+    if let Some(l) = list.store_list() {
+        return ModifierList::store(l);
+    }
+    ModifierList::synthetic(list.synthetic_list().expect("a synthetic list"))
+}
+
 /// The inline part of `static_ast_node`: the node data of a published
 /// store node of a static tier, or `None` for any other node (`with_data!`
 /// then reads it with `read_ast_node_miss`). Go dereferences the pointer,
@@ -1364,13 +1795,14 @@ pub(crate) use with_data;
 macro_rules! list_of {
     ($n:expr, |$d:ident| $body:expr) => {{
         let n__: $crate::core::Node = $n;
-        match $crate::ast::synthetic::static_tier_ast_node(n__) {
-            Some(data__) => {
+        match $crate::ast::synthetic::static_tier_ast_node_lists(n__) {
+            Some((data__, lists__)) => {
                 let $d: &'static crate::astdata::NodeData = data__;
                 let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
                 found.map(|l| {
-                    $crate::ast::NodeList::from_ts(
+                    $crate::ast::NodeList::from_table(
                         n__.file_index(),
+                        lists__,
                         l.map($crate::ast::synthetic::AnyList::nodes),
                     )
                 })
@@ -1389,13 +1821,14 @@ pub(crate) use list_of;
 macro_rules! modifiers_of {
     ($n:expr, |$d:ident| $body:expr) => {{
         let n__: $crate::core::Node = $n;
-        match $crate::ast::synthetic::static_tier_ast_node(n__) {
-            Some(data__) => {
+        match $crate::ast::synthetic::static_tier_ast_node_lists(n__) {
+            Some((data__, lists__)) => {
                 let $d: &'static crate::astdata::NodeData = data__;
                 let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
                 found.map(|m| {
-                    $crate::ast::ModifierList::from_ts(
+                    $crate::ast::ModifierList::from_table(
                         n__.file_index(),
+                        lists__,
                         m.map($crate::ast::synthetic::AnyList::modifiers),
                     )
                 })
@@ -1436,9 +1869,10 @@ impl<'a> AnyList<'a> {
         }
     }
 
-    /// The address of the node list, for Go pointer equality.
-    fn ptr(self) -> *const () {
-        std::ptr::from_ref(self.nodes()).cast()
+    /// The list table index of the list.
+    #[must_use]
+    pub fn index(self) -> usize {
+        self.nodes().index()
     }
 }
 
@@ -1446,23 +1880,13 @@ impl<'a> AnyList<'a> {
 /// kind without it). `Some(None)`: the field is Go `nil`.
 pub type ListSel = for<'a> fn(&'a NodeData) -> Option<Option<AnyList<'a>>>;
 
-/// The most list selector sites (`SelectorSite`) in the process.
-const SELECTOR_LIMIT: usize = 1024;
-
-/// The selectors that `SelectorSite::id` gave ids, by id.
-static SELECTORS: [OnceLock<ListSel>; SELECTOR_LIMIT] = [const { OnceLock::new() }; SELECTOR_LIMIT];
-
 /// The number of ids that `SelectorSite::id` gave.
 static SELECTOR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// The list selector of one `list_of!` or `modifiers_of!` site, with a
-/// small process-wide id (lsshells M3c): a list handle of a store that owns
-/// its nodes (`ast::StoreList`) names its selector with 4 bytes, so
-/// `NodeList` and `ModifierList` stay 16 bytes. Each site gets its id at its
-/// first scoped read.
-// PORT: Go keeps a `*NodeList` pointer. A list of a freeable file version
-// cannot be borrowed past its read, so the handle names the node data cell
-// and the selector, and the list is found again at each use.
+/// A small process-wide id of one `list_of!` or `modifiers_of!` site: the
+/// key of the site's answers in the hot list cache of the edited file
+/// (`ast::store::scoped_store_list_of`). Each site gets its id at its first
+/// scoped read.
 pub struct SelectorSite(AtomicU32);
 
 impl SelectorSite {
@@ -1471,11 +1895,11 @@ impl SelectorSite {
         Self(AtomicU32::new(0))
     }
 
-    /// The id of `sel`, the selector of this site (`list_selector`).
+    /// The id of this site.
     #[inline]
-    pub fn id(&self, sel: ListSel) -> u32 {
+    pub fn id(&self) -> u32 {
         match self.0.load(Ordering::Acquire) {
-            0 => self.new_id(sel),
+            0 => self.new_id(),
             id => id - 1,
         }
     }
@@ -1483,17 +1907,9 @@ impl SelectorSite {
     /// The first `id` of this site.
     #[cold]
     #[inline(never)]
-    fn new_id(&self, sel: ListSel) -> u32 {
+    fn new_id(&self) -> u32 {
         let id = SELECTOR_COUNT.fetch_add(1, Ordering::Relaxed);
-        // The last id is `ast::store::PENDING_SEL`.
-        assert!(
-            id < SELECTOR_LIMIT - 1,
-            "more than {} list selector sites",
-            SELECTOR_LIMIT - 1
-        );
-        // A new id: this is its only write.
-        let _ = SELECTORS[id].set(sel);
-        let id = id as u32;
+        let id = u32::try_from(id).expect("too many list selector sites");
         // Two threads can give one site an id at once. The first id stays;
         // the other one is not used again.
         match self
@@ -1512,17 +1928,8 @@ impl Default for SelectorSite {
     }
 }
 
-/// The list selector with id `id` (`SelectorSite::id`).
-#[inline]
-#[must_use]
-pub fn list_selector(id: u32) -> ListSel {
-    *SELECTORS[id as usize]
-        .get()
-        .expect("a list selector id has its selector")
-}
-
 /// `list_of!` for a node that is not a node of a static tier
-/// (`static_tier_ast_node`): a `Field` handle for a synthetic node, a
+/// (`static_tier_ast_node`): a synthetic list handle for a synthetic node, a
 /// `StoreList` handle for a node that a freeable parse owns (lsshells M3c),
 /// and a static handle for any other store node (an unpublished store).
 #[cold]
@@ -1533,9 +1940,9 @@ pub fn scoped_node_list_of(n: Node, site: &SelectorSite, sel: ListSel) -> Option
         return synthetic_node_list_of(n, sel);
     }
     let file = n.file_index();
-    scoped_store_list_of(n, site.id(sel), sel).map(|found| match found {
+    scoped_store_list_of(n, site.id(), sel).map(|found| match found {
         None => NodeList::NIL,
-        Some(ScopedList::Static(l)) => NodeList::from_ts(file, Some(l.nodes())),
+        Some(ScopedList::Static(l)) => NodeList::from_static(file, l),
         Some(ScopedList::Store(l)) => NodeList::store(l),
     })
 }
@@ -1550,9 +1957,9 @@ pub fn scoped_modifiers_of(n: Node, site: &SelectorSite, sel: ListSel) -> Option
         return synthetic_modifiers_of(n, sel);
     }
     let file = n.file_index();
-    scoped_store_list_of(n, site.id(sel), sel).map(|found| match found {
+    scoped_store_list_of(n, site.id(), sel).map(|found| match found {
         None => ModifierList::NIL,
-        Some(ScopedList::Static(m)) => ModifierList::from_ts(file, Some(m.modifiers())),
+        Some(ScopedList::Static(m)) => ModifierList::from_static(file, m),
         Some(ScopedList::Store(m)) => ModifierList::store(m),
     })
 }
@@ -1663,25 +2070,13 @@ pub fn synthetic_expression_type(n: Node) -> TypeId {
 /// A list of synthetic data: the `NodeList`, `ModifierList` and `NodeSlice`
 /// form of a list that this thread's arena owns. It is an index, so it is
 /// only valid on the thread that made it (like a synthetic `Node`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum SyntheticList {
-    /// The list field that `sel` finds in node data `data`
-    /// (`SyntheticNode::data`).
-    Field { data: u32, sel: ListSel },
-    /// A factory list.
+    /// An entry of the list table: a factory list, or a list field of node
+    /// data (astshrink1).
     Own { index: u32 },
     /// A node slice that a read made (`NodeSlice` only).
     Slice { index: u32 },
-}
-
-impl std::fmt::Debug for SyntheticList {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Field { data, .. } => write!(f, "Field({data})"),
-            Self::Own { index } => write!(f, "Own({index})"),
-            Self::Slice { index } => write!(f, "Slice({index})"),
-        }
-    }
 }
 
 /// The list field that `sel` finds in the data of synthetic node `n`. `None`
@@ -1691,14 +2086,18 @@ pub fn synthetic_list_of(n: Node, sel: ListSel) -> Option<Option<SyntheticList>>
     ARENA.with(|a| {
         let a = a.borrow();
         let data = a.node(n).data;
-        sel(&a.data(data).data).map(|l| l.map(|_| SyntheticList::Field { data, sel }))
+        sel(&a.data(data).data).map(|l| {
+            l.map(|l| SyntheticList::Own {
+                index: l.index() as u32,
+            })
+        })
     })
 }
 
 /// Calls `f` with the list that `list` names. Panics on a node slice. The
 /// arena stays borrowed while `f` runs, so `f` must not make or change
 /// synthetic nodes.
-pub fn with_synthetic_list<R>(list: SyntheticList, f: impl FnOnce(AnyList<'_>) -> R) -> R {
+pub fn with_synthetic_list<R>(list: SyntheticList, f: impl FnOnce(&SyntheticListData) -> R) -> R {
     ARENA.with(|a| f(a.borrow().list(list)))
 }
 
@@ -1709,7 +2108,7 @@ pub fn synthetic_list_len(list: SyntheticList) -> usize {
         let a = a.borrow();
         match list {
             SyntheticList::Slice { index } => a.slices[index as usize].len(),
-            _ => a.list(list).nodes().nodes.len(),
+            SyntheticList::Own { .. } => a.list(list).nodes.len(),
         }
     })
 }
@@ -1721,7 +2120,7 @@ pub fn synthetic_list_node(list: SyntheticList, i: usize) -> Node {
         let a = a.borrow();
         match list {
             SyntheticList::Slice { index } => a.slices[index as usize][i],
-            _ => a.resolve(a.list(list).nodes().nodes[i].index()),
+            SyntheticList::Own { .. } => a.resolve(a.list(list).nodes[i].index()),
         }
     })
 }
@@ -1732,23 +2131,16 @@ pub fn synthetic_list_eq(x: SyntheticList, y: SyntheticList) -> bool {
     match (x, y) {
         (SyntheticList::Own { index: i }, SyntheticList::Own { index: j })
         | (SyntheticList::Slice { index: i }, SyntheticList::Slice { index: j }) => i == j,
-        (SyntheticList::Field { data: d, .. }, SyntheticList::Field { data: e, .. }) => {
-            d == e
-                && ARENA.with(|a| {
-                    let a = a.borrow();
-                    a.list(x).ptr() == a.list(y).ptr()
-                })
-        }
         _ => false,
     }
 }
 
 /// The address of the node list that `list` names, for Go pointer keys
 /// (`NodeList::list_ptr`). It stays the same while the owner of the list
-/// lives: node data and factory lists are in chunks that do not move.
+/// lives: list chunks do not move.
 #[must_use]
 pub fn synthetic_list_ptr(list: SyntheticList) -> *const () {
-    ARENA.with(|a| a.borrow().list(list).ptr())
+    ARENA.with(|a| std::ptr::from_ref(a.borrow().list(list)).cast())
 }
 
 /// A new node slice of this thread (Go allocates one on each call, for
@@ -1765,31 +2157,28 @@ pub fn new_synthetic_slice(nodes: Vec<Node>) -> SyntheticList {
     })
 }
 
-/// A factory list with a copy of `list`, a list of synthetic node data that
-/// a read has in place (the `Node::for_each_child_and_lists` hook). The
-/// thread's arena owns the copy.
-#[must_use]
-pub fn copy_synthetic_list(list: &crate::astdata::NodeList) -> NodeList {
-    NodeList::synthetic(push_own_list(OwnList::Nodes(list.clone())))
-}
-
 /// Parser `createMissingList` for synthetic `list` (see
 /// `NodeList::with_missing_marker`): a new empty factory list at the `Loc`
 /// of `list`, with the astdata `has_trailing_comma` bit set.
 #[must_use]
 pub fn synthetic_missing_list(list: SyntheticList) -> SyntheticList {
-    let range = with_synthetic_list(list, |l| l.nodes().range);
-    push_own_list(OwnList::Nodes(crate::astdata::NodeList {
+    let range = with_synthetic_list(list, |l| l.range);
+    push_own_list(OwnList::List(SyntheticListData {
         range,
         nodes: Vec::new(),
         has_trailing_comma: true,
+        flags: crate::astdata::ModifierFlags::default(),
     }))
 }
 
 fn push_own_list(list: OwnList) -> SyntheticList {
+    push_own_list_in(false, list)
+}
+
+fn push_own_list_in(print: bool, list: OwnList) -> SyntheticList {
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
-        let owner = a.current_owner();
+        let owner = a.owner_for(print);
         SyntheticList::Own {
             index: a.push_list(owner, list),
         }
@@ -1917,7 +2306,12 @@ fn new_ts_node(kind: SyntaxKind, data: NodeData) -> crate::astdata::Node {
 // `modifiers` field set it (ModifiersBase, NamedMemberBase,
 // BinaryExpression); other kinds do nothing, like Go `NodeDefault`.
 pub fn set_node_modifiers(n: Node, modifiers: ModifierList) {
-    let mods = synthetic_modifiers_value(modifiers);
+    // astshrink1: the list goes into the list table of the node's owner.
+    let mods = if is_store_node(n) {
+        crate::ast::store::store_modifiers_value(n.file_index(), modifiers)
+    } else {
+        node_modifiers_value(n, modifiers)
+    };
     let mut data = with_ast_data(n, Clone::clone);
     match &mut data {
         NodeData::ArrowFunction(d) => d.modifiers = mods,
@@ -1992,6 +2386,17 @@ pub fn set_node_locals(n: Node, locals: SymbolTable) {
 /// `Loc = UndefinedTextRange()`, nil parent, no flags and no binder data. It
 /// belongs to the current owner (see "Owners" in the module comment).
 pub fn alloc_synthetic_node(kind: SyntaxKind, data: NodeData) -> Node {
+    alloc_synthetic_node_in(false, kind, data)
+}
+
+/// `alloc_synthetic_node` for a to-string factory
+/// (`NodeFactory::set_print_owned`): in a print scope the node belongs to
+/// the print owner.
+pub fn alloc_synthetic_print_node(kind: SyntaxKind, data: NodeData) -> Node {
+    alloc_synthetic_node_in(true, kind, data)
+}
+
+fn alloc_synthetic_node_in(print: bool, kind: SyntaxKind, data: NodeData) -> Node {
     debug_assert!(
         data.matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
@@ -1999,7 +2404,7 @@ pub fn alloc_synthetic_node(kind: SyntaxKind, data: NodeData) -> Node {
     let node = new_ts_node(kind, data);
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
-        let owner = a.current_owner();
+        let owner = a.owner_for(print);
         handle(a.push_node(owner, node, |data| {
             Slot::Node(SyntheticNode {
                 data,
@@ -2185,12 +2590,18 @@ fn ts_range(loc: TextRange) -> crate::astdata::text::TextRange {
     }
 }
 
-/// The astdata list for a synthetic node's list field.
-fn ts_list(nodes: &[Node], loc: TextRange, has_trailing_comma: bool) -> crate::astdata::NodeList {
-    crate::astdata::NodeList {
+/// The synthetic list over `nodes` at `loc`.
+fn ts_list(
+    nodes: &[Node],
+    loc: TextRange,
+    has_trailing_comma: bool,
+    flags: crate::astdata::ModifierFlags,
+) -> SyntheticListData {
+    SyntheticListData {
         range: ts_range(loc),
         nodes: nodes.iter().map(|&n| synthetic_child_id(n)).collect(),
         has_trailing_comma,
+        flags,
     }
 }
 
@@ -2199,65 +2610,126 @@ fn ts_list(nodes: &[Node], loc: TextRange, has_trailing_comma: bool) -> crate::a
 // creation. Callers that set `list.Loc` later pass it here instead.
 #[must_use]
 pub fn new_synthetic_node_list(nodes: &[Node], loc: TextRange) -> NodeList {
-    let list = ts_list(nodes, loc, false);
-    NodeList::synthetic(push_own_list(OwnList::Nodes(list)))
+    new_synthetic_node_list_in(false, nodes, loc)
+}
+
+/// `new_synthetic_node_list`; with `print` (a to-string factory), in a
+/// print scope the list belongs to the print owner
+/// (`alloc_synthetic_print_node`).
+#[must_use]
+pub fn new_synthetic_node_list_in(print: bool, nodes: &[Node], loc: TextRange) -> NodeList {
+    let list = ts_list(nodes, loc, false, crate::astdata::ModifierFlags::default());
+    NodeList::synthetic(push_own_list_in(print, OwnList::List(list)))
 }
 
 /// Go `f.NewModifierList(nodes)` with a given `Loc`. `modifier_flags()` in
 /// node.rs recomputes `ModifiersToFlags(nodes)`, as the Go factory does.
 #[must_use]
 pub fn new_synthetic_modifier_list(nodes: &[Node], loc: TextRange) -> ModifierList {
-    let list = crate::astdata::ModifierList {
-        list: ts_list(nodes, loc, false),
-        flags: crate::astdata::ModifierFlags(modifiers_to_flags(nodes).0 as u32),
-    };
-    ModifierList::synthetic(push_own_list(OwnList::Modifiers(list)))
+    new_synthetic_modifier_list_in(false, nodes, loc)
 }
 
-/// A list value to store inside new synthetic `NodeData`. Go stores the
-/// `*NodeList` pointer; a list that already is synthetic is copied as is, and
-/// a parsed list is rebuilt over alias ids with its own `Loc`.
-// PORT: astdata stores lists by value, so a synthetic node that takes a
-// parsed (or another synthetic) list gets a copy. `NodeList` equality on the
-// copy is false where Go compares equal pointers.
+/// `new_synthetic_modifier_list` (`print`: see `new_synthetic_node_list_in`).
 #[must_use]
-pub fn synthetic_list_value(list: NodeList) -> Option<crate::astdata::NodeList> {
+pub fn new_synthetic_modifier_list_in(print: bool, nodes: &[Node], loc: TextRange) -> ModifierList {
+    let flags = crate::astdata::ModifierFlags(modifiers_to_flags(nodes).0 as u32);
+    let list = ts_list(nodes, loc, false, flags);
+    ModifierList::synthetic(push_own_list_in(print, OwnList::List(list)))
+}
+
+/// A list value to store inside new synthetic `NodeData`: the index of a
+/// new list of the arena, which the node's owner owns (`print`: see
+/// `new_synthetic_node_list_in`). Go stores the `*NodeList` pointer; a list
+/// that already is synthetic is copied as is, and a parsed list is rebuilt
+/// over alias ids with its own `Loc`.
+// PORT: a synthetic node that takes a list gets a copy, so the list has the
+// lifetime of the node. `NodeList` equality on the copy is false where Go
+// compares equal pointers.
+#[must_use]
+pub fn synthetic_list_value(print: bool, list: NodeList) -> Option<crate::astdata::NodeList> {
     if list.is_nil() {
         return None;
     }
-    if let Some(l) = list.synthetic_list() {
-        return Some(with_synthetic_list(l, |l| l.nodes().clone()));
-    }
-    let nodes = list.nodes().to_vec();
-    Some(ts_list(&nodes, list.loc(), list.stored_trailing_comma()))
+    let copy = match list.synthetic_list() {
+        Some(l) => with_synthetic_list(l, SyntheticListData::clone),
+        None => {
+            let nodes = list.nodes().to_vec();
+            ts_list(
+                &nodes,
+                list.loc(),
+                list.stored_trailing_comma(),
+                crate::astdata::ModifierFlags::default(),
+            )
+        }
+    };
+    Some(own_list_field(print, copy))
 }
 
 /// Like `synthetic_list_value` for a list field that astdata requires. Go
 /// `nil` becomes an empty list with an undefined `Loc`.
 // PORT: Go keeps `nil`; `NodeList::is_nil` on that field is false here.
 #[must_use]
-pub fn synthetic_req_list_value(list: NodeList) -> crate::astdata::NodeList {
-    synthetic_list_value(list).unwrap_or_else(|| ts_list(&[], TextRange::undefined(), false))
+pub fn synthetic_req_list_value(print: bool, list: NodeList) -> crate::astdata::NodeList {
+    synthetic_list_value(print, list).unwrap_or_else(|| {
+        let empty = ts_list(&[], TextRange::undefined(), false, Default::default());
+        own_list_field(print, empty)
+    })
 }
 
-/// A modifier list value to store inside new synthetic `NodeData`.
+/// A modifier list value to store inside new synthetic `NodeData` (see
+/// `synthetic_list_value`).
 #[must_use]
-pub fn synthetic_modifiers_value(modifiers: ModifierList) -> Option<crate::astdata::ModifierList> {
+pub fn synthetic_modifiers_value(
+    print: bool,
+    modifiers: ModifierList,
+) -> Option<crate::astdata::ModifierList> {
+    let copy = modifiers_copy(modifiers)?;
+    Some(crate::astdata::ModifierList {
+        list: own_list_field(print, copy),
+    })
+}
+
+/// `synthetic_modifiers_value` for a data write on synthetic node `n`
+/// (`set_node_modifiers`). The list goes to the owner of `n`, as the new
+/// data does (`replace_synthetic_ast_node`), so it lives as long as the
+/// data that names it.
+fn node_modifiers_value(n: Node, modifiers: ModifierList) -> Option<crate::astdata::ModifierList> {
+    let copy = modifiers_copy(modifiers)?;
+    let index = ARENA.with(|a| {
+        let mut a = a.borrow_mut();
+        let owner = a.slot_owner[slot_index(n) / SLOT_CHUNK];
+        a.push_list(owner, OwnList::List(copy))
+    });
+    Some(crate::astdata::ModifierList {
+        list: crate::astdata::NodeList::new(index),
+    })
+}
+
+/// The list that a modifier list value copies, or `None` for Go `nil`.
+fn modifiers_copy(modifiers: ModifierList) -> Option<SyntheticListData> {
     if modifiers.is_nil() {
         return None;
     }
-    if let Some(m) = modifiers.synthetic_list() {
-        return Some(with_synthetic_list(m, |m| m.modifiers().clone()));
-    }
-    let nodes = modifiers.nodes().to_vec();
-    Some(crate::astdata::ModifierList {
-        list: ts_list(
-            &nodes,
-            modifiers.loc(),
-            modifiers.node_list().stored_trailing_comma(),
-        ),
-        flags: crate::astdata::ModifierFlags(modifiers_to_flags(&nodes).0 as u32),
+    Some(match modifiers.synthetic_list() {
+        Some(m) => with_synthetic_list(m, SyntheticListData::clone),
+        None => {
+            let nodes = modifiers.nodes().to_vec();
+            ts_list(
+                &nodes,
+                modifiers.loc(),
+                modifiers.node_list().stored_trailing_comma(),
+                crate::astdata::ModifierFlags(modifiers_to_flags(&nodes).0 as u32),
+            )
+        }
     })
+}
+
+/// Adds `list` to the arena for a list field of new node data.
+fn own_list_field(print: bool, list: SyntheticListData) -> crate::astdata::NodeList {
+    match push_own_list_in(print, OwnList::List(list)) {
+        SyntheticList::Own { index } => crate::astdata::NodeList::new(index),
+        SyntheticList::Slice { .. } => unreachable!("a factory list is not a slice"),
+    }
 }
 
 #[cfg(test)]
@@ -2283,10 +2755,11 @@ mod tests {
             assert_eq!(read.nodes().to_vec(), vec![a]);
             assert_eq!(a.text(), "a");
 
-            // A data write gives the field a new list. The old handle still
-            // reads the old list, like a Go pointer.
+            // A data write of a copy of the data keeps the list: node data
+            // names its list by index (astshrink1), as a Go struct copy keeps
+            // its `*NodeList` pointer. The old handle still reads the list.
             replace_node_data(block, with_ast_data(block, Clone::clone));
-            assert_ne!(block.statement_list(), read);
+            assert_eq!(block.statement_list(), read);
             assert_eq!(read.nodes().get(0), a);
 
             assert!(synthetic_slot_count() > 1);
@@ -2437,6 +2910,255 @@ mod tests {
             assert_eq!(local::garbage_len(), 1, "the chunks do not wait");
             local::drop_garbage(|| false);
             assert_eq!(local::garbage_len(), 0);
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    // `set_node_modifiers` on a synthetic node puts the new list in the
+    // owner of the node, with its new data, not in the current owner. A
+    // base node or a program node changed in a file scope, and a base node
+    // changed while a program version is current, keep their modifiers
+    // after that file version or program version is freed.
+    #[test]
+    fn set_node_modifiers_puts_the_list_in_the_node_owner() {
+        std::thread::spawn(|| {
+            let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
+                id: next_program_id(),
+                options: Box::leak(Box::default()),
+                state: std::sync::OnceLock::new(),
+            }));
+            let f = NodeFactory::new();
+            let export = f.new_modifier(SyntaxKind::ExportKeyword);
+            let mods = f.new_modifier_list(&[export]);
+            let member = |name: &str| f.new_enum_member(f.new_identifier(name), Node::NIL);
+            let (in_program, in_file) = (member("a"), member("b"));
+
+            open_synthetic_owner(program.id);
+            let program_node = {
+                let _program = enter_program(Some(program));
+                set_node_modifiers(in_program, mods);
+                let program_node = member("c");
+                // A file scope of a freeable file version (`alias_owner`).
+                let file = u32::MAX;
+                ARENA.with(|a| {
+                    let mut a = a.borrow_mut();
+                    a.alias_files.insert(file, OwnerChunks::default());
+                });
+                {
+                    let _file = enter_owner_scope(OwnerKey::File(file));
+                    set_node_modifiers(in_file, mods);
+                    set_node_modifiers(program_node, mods);
+                }
+                // The file version dies (`free_dead_aliases`).
+                ARENA.with(|a| a.borrow_mut().free_file_owner(file));
+                program_node
+            };
+            let read = |n: Node| read_panic(|| n.modifiers().nodes().to_vec());
+            assert_eq!(read(in_file), None);
+            assert_eq!(in_file.modifiers().nodes().to_vec(), vec![export]);
+            assert_eq!(read(program_node), None);
+            assert_eq!(program_node.modifiers().nodes().to_vec(), vec![export]);
+
+            free_synthetic_owner(program.id);
+            assert_eq!(read(in_program), None);
+            assert_eq!(in_program.modifiers().nodes().to_vec(), vec![export]);
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    /// The number of chunks of each table of the print owner of this
+    /// thread.
+    fn print_chunk_counts() -> (usize, usize, usize) {
+        ARENA.with(|a| {
+            let c = &a.borrow().print.chunks;
+            (c.slots.len(), c.datas.len(), c.lists.len())
+        })
+    }
+
+    /// The panic message of `read`, or `None` when it does not panic.
+    fn read_panic<R>(read: impl FnOnce() -> R) -> Option<String> {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).err()?;
+        Some(panic_message(&*payload).unwrap_or("").to_string())
+    }
+
+    // The end of a print scope frees the nodes and lists of the to-string
+    // factory made in it: a read of one panics. The nodes of other
+    // factories and of earlier calls stay, and a handle is never used again.
+    #[test]
+    fn print_scope_frees_the_nodes_of_its_call() {
+        std::thread::spawn(|| {
+            let printer = NodeFactory::new();
+            printer.set_print_owned();
+            let plain = NodeFactory::new();
+            let before = printer.new_identifier("before");
+
+            enter_print_scope();
+            let a = printer.new_identifier("a");
+            let list = printer.new_node_list(&[a, before]);
+            let block = printer.new_block(list, false);
+            let cloned = printer.new_synthetic_node_list(&[a], TextRange::new(-1, -1));
+            let other = plain.new_identifier("other");
+            assert!(is_print_node(a) && is_print_node(block));
+            assert!(!is_print_node(before) && !is_print_node(other));
+            assert_eq!(block.statement_list().nodes().to_vec(), vec![a, before]);
+            let ranges = exit_print_scope().expect("an unpinned call frees");
+
+            let freed: Vec<Node> = print_range_nodes(&ranges).collect();
+            assert_eq!(freed, vec![a, block]);
+            for read in [read_panic(|| a.text()), read_panic(|| block.kind())] {
+                assert_eq!(read.as_deref(), Some(PRINT_FREED));
+            }
+            assert_eq!(
+                read_panic(|| list.nodes().to_vec()).as_deref(),
+                Some(PRINT_FREED)
+            );
+            assert_eq!(
+                read_panic(|| cloned.nodes().to_vec()).as_deref(),
+                Some(PRINT_FREED)
+            );
+            assert_eq!(before.text(), "before");
+            assert_eq!(other.text(), "other");
+
+            // Outside a scope the to-string factory makes ordinary nodes.
+            let after = printer.new_identifier("after");
+            assert!(!is_print_node(after));
+            enter_print_scope();
+            let b = printer.new_identifier("b");
+            assert!(b != a && b != block && b != after);
+            exit_print_scope();
+            assert_eq!(after.text(), "after");
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    // A pinned call keeps its nodes: they go to the current owner. A seed
+    // keeps them in place, also behind the emptied cells of an earlier call
+    // in the same data chunk.
+    #[test]
+    fn a_pinned_print_scope_keeps_its_nodes() {
+        std::thread::spawn(|| {
+            let printer = NodeFactory::new();
+            printer.set_print_owned();
+            enter_print_scope();
+            let gone = printer.new_identifier("gone");
+            exit_print_scope();
+
+            enter_print_scope();
+            let kept = printer.new_identifier("kept");
+            let list = printer.new_node_list(&[kept]);
+            pin_print_scope();
+            assert_eq!(exit_print_scope(), None);
+            assert!(!is_print_node(kept));
+            assert_eq!(print_chunk_counts(), (0, 0, 0));
+            assert_eq!(kept.text(), "kept");
+            assert_eq!(list.nodes().to_vec(), vec![kept]);
+            assert_eq!(read_panic(|| gone.text()).as_deref(), Some(PRINT_FREED));
+
+            // The next call starts new chunks, and the base keeps filling its own.
+            enter_print_scope();
+            let next = printer.new_identifier("next");
+            exit_print_scope();
+            assert!(read_panic(|| next.text()).is_some());
+            let base = printer.new_identifier("base");
+
+            let seed = synthetic_seed();
+            std::thread::spawn(move || {
+                install_synthetic_seed(seed);
+                assert_eq!(kept.text(), "kept");
+                assert_eq!(list.nodes().to_vec(), vec![kept]);
+                assert_eq!(base.text(), "base");
+                assert!(read_panic(|| gone.text()).is_some());
+            })
+            .join()
+            .expect("seed thread panicked");
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    // A nested scope joins the outermost one: its nodes live until the
+    // outermost scope ends.
+    #[test]
+    fn nested_print_scopes_free_at_the_outermost_end() {
+        std::thread::spawn(|| {
+            let printer = NodeFactory::new();
+            printer.set_print_owned();
+            enter_print_scope();
+            let outer = printer.new_identifier("outer");
+            enter_print_scope();
+            let inner = printer.new_identifier("inner");
+            assert_eq!(exit_print_scope(), None);
+            assert_eq!(inner.text(), "inner");
+            let late = printer.new_identifier("late");
+            let ranges = exit_print_scope().expect("the outermost scope frees");
+            assert_eq!(
+                print_range_nodes(&ranges).collect::<Vec<_>>(),
+                vec![outer, inner, late]
+            );
+            for n in [outer, inner, late] {
+                assert!(read_panic(|| n.text()).is_some());
+            }
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    // Calls across many chunks: each ended call's nodes panic, the full
+    // chunks go, and the print owner keeps one chunk per table.
+    #[test]
+    fn print_scopes_free_full_chunks() {
+        std::thread::spawn(|| {
+            let printer = NodeFactory::new();
+            printer.set_print_owned();
+            let mut last = Vec::new();
+            for i in 0..3 * SLOT_CHUNK {
+                enter_print_scope();
+                let id = printer.new_identifier(format!("n{i}"));
+                let list = printer.new_node_list(&[id, id]);
+                last = vec![printer.new_type_literal_node(list)];
+                assert_eq!(list.nodes().len(), 2);
+                exit_print_scope().expect("an unpinned call frees");
+                assert!(print_chunk_counts().0 <= 1);
+            }
+            assert_eq!(print_chunk_counts(), (1, 1, 1));
+            assert!(read_panic(|| last[0].kind()).is_some());
+            // Freed slots stay in the kept chunk; the rest went.
+            assert!(synthetic_live_slot_count() <= 1 + SLOT_CHUNK);
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    // A scope that ends while its call panics keeps the call's nodes.
+    #[test]
+    fn a_print_scope_that_unwinds_keeps_its_nodes() {
+        struct Scope;
+        impl Drop for Scope {
+            fn drop(&mut self) {
+                assert_eq!(exit_print_scope(), None);
+            }
+        }
+        std::thread::spawn(|| {
+            let printer = NodeFactory::new();
+            printer.set_print_owned();
+            let made = std::cell::Cell::new(Node::NIL);
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                enter_print_scope();
+                let _scope = Scope;
+                made.set(printer.new_identifier("made"));
+                panic!("in a to-string call");
+            }));
+            assert!(caught.is_err());
+            assert_eq!(made.get().text(), "made");
             free_synthetic_nodes();
         })
         .join()

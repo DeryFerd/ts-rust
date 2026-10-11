@@ -137,7 +137,7 @@ impl TypeParser<'_> {
         }
         cached!(self, strict_effect_type, t, 'compute: {
             let sym = self.checker.ty(t).symbol;
-            if sym.is_nil() || self.checker.sym(sym).name.as_str() != "Effect" {
+            if sym.is_nil() || self.checker.sym(sym).name != *EFFECT_NAME {
                 break 'compute None;
             }
             self.effect_type(t)
@@ -254,9 +254,9 @@ impl TypeParser<'_> {
     pub fn is_node_reference_to_effect_module_api(
         &mut self,
         node: Node,
-        member_name: &str,
+        member: &ExportMember,
     ) -> bool {
-        self.is_node_reference_to_module_export(node, &EFFECT_MODULE_DESCRIPTOR, member_name)
+        self.is_node_reference_to_module_export(node, &EFFECT_MODULE_DESCRIPTOR, member)
     }
 
     /// IsNodeReferenceToEffectPackageExport reports whether node resolves to a member
@@ -267,12 +267,8 @@ impl TypeParser<'_> {
     pub fn is_node_reference_to_effect_package_export(
         &mut self,
         node: Node,
-        member_name: &str,
+        member: &ExportMember,
     ) -> bool {
-        self.is_node_reference_to_module_export(
-            node,
-            &EFFECT_PACKAGE_EXPORT_DESCRIPTOR,
-            member_name,
-        )
+        self.is_node_reference_to_module_export(node, &EFFECT_PACKAGE_EXPORT_DESCRIPTOR, member)
     }
 }

@@ -13,6 +13,7 @@ use super::childprog::{
     in_child, install_map_fs, new_program, new_program_with_config, source_file,
 };
 use crate::support::vfstest::{MapFile, MapFs};
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use ts_goport::ast::{MappedDiagnosticDirective, MappedDiagnosticDirectivePolicy, TextRange};
 use ts_goport::contentmapper;
@@ -26,7 +27,7 @@ use ts_goport::frontend::json::json_unmarshal;
 use ts_goport::frontend::json_ext::LspAny;
 use ts_goport::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
 use ts_goport::frontend::tsoptions::{ParsedCommandLine, ParsedOptions};
-use ts_goport::frontend::vfs::{FileMode, Fs, os_override_installed};
+use ts_goport::frontend::vfs::{FileMode, Fs, Replacements, os_override_installed, wrapvfs_wrap};
 use ts_goport::gostd::context;
 use ts_goport::gostd::{GoError, errors};
 use ts_goport::locale;
@@ -126,10 +127,12 @@ const ESNEXT_LIBS: &[&str] = &[
     "lib.es2026.json.d.ts",
     "lib.es2026.math.d.ts",
     "lib.es2026.typedarrays.d.ts",
+    "lib.esnext.promise.d.ts",
     "lib.esnext.date.d.ts",
     "lib.esnext.decorators.d.ts",
     "lib.esnext.disposable.d.ts",
     "lib.esnext.intl.d.ts",
+    "lib.esnext.modulesource.d.ts",
     "lib.esnext.sharedmemory.d.ts",
     "lib.esnext.temporal.d.ts",
     "lib.decorators.d.ts",
@@ -325,6 +328,86 @@ fn test_include_processor_diagnostics_with_missing_file_casing() {
     );
 }
 
+/// `collectPackageNames` looks up the package scope of the directory of each
+/// resolved file (`49614e16e`, ts#64159): Go N' fed0bf24149f passes
+/// `ResolvedFileName.Directory()` (compiler/program.go:2280, :2298), so its
+/// ancestor walk never asks `directoryExists` for the file itself. `pkg` has
+/// no version, so its package ID has no name and the name comes from the
+/// scope; `pkg/sub` is a deep import, which looks up the scope again.
+// PORT: no Go counterpart.
+#[test]
+fn test_collect_package_names_looks_up_the_scope_of_the_file_directory() {
+    in_child(
+        module_path!(),
+        "test_collect_package_names_looks_up_the_scope_of_the_file_directory",
+        || {
+            let map_fs = MapFs::from_map(
+                Vec::<(String, MapFile)>::new(),
+                true, /*useCaseSensitiveFileNames*/
+            );
+            install_map_fs(&map_fs, "/src");
+            for (file_name, contents) in [
+                (
+                    "/src/index.ts",
+                    "import { x } from \"pkg\";\nimport { y } from \"pkg/sub\";\n",
+                ),
+                (
+                    "/src/node_modules/pkg/package.json",
+                    r#"{"name":"pkg","types":"index.d.ts"}"#,
+                ),
+                (
+                    "/src/node_modules/pkg/index.d.ts",
+                    "export declare const x: number;\n",
+                ),
+                (
+                    "/src/node_modules/pkg/sub.d.ts",
+                    "export declare const y: number;\n",
+                ),
+            ] {
+                let _ = map_fs.fs().write_file(file_name, contents);
+            }
+            let recording = Rc::new(Cell::new(false));
+            let calls: Rc<RefCell<Vec<String>>> = Rc::default();
+            let fs = {
+                let inner = map_fs.fs();
+                let recording = Rc::clone(&recording);
+                let calls = Rc::clone(&calls);
+                wrapvfs_wrap(
+                    map_fs.fs(),
+                    Replacements {
+                        directory_exists: Some(Box::new(move |path: &str| {
+                            if recording.get() {
+                                calls.borrow_mut().push(path.to_string());
+                            }
+                            inner.directory_exists(path)
+                        })),
+                        ..Default::default()
+                    },
+                )
+            };
+            let program = new_program(
+                fs,
+                "/src",
+                &["/src/index.ts"],
+                CompilerOptions {
+                    module: ModuleKind::ES_NEXT,
+                    module_resolution: ModuleResolutionKind::BUNDLER,
+                    ..Default::default()
+                },
+            );
+
+            recording.set(true);
+            assert!(program.resolved_package_names().contains("pkg"));
+            assert!(program.deep_import_package_names().contains("pkg"));
+            let calls = calls.borrow();
+            assert!(
+                !calls.iter().any(|path| path.ends_with(".d.ts")),
+                "directoryExists of a resolved file: {calls:?}"
+            );
+        },
+    );
+}
+
 // Go: checker/checker_test.go:20 TestGetSymbolAtLocation
 #[test]
 fn test_get_symbol_at_location() {
@@ -396,7 +479,7 @@ foo.bar;";
 // parse (`resolveJSDoc`, ast.go:2745) added. The parser defers a TS comment
 // whose `{@link}` its prefilter misses (`{@link<form feed>Foo}`). The call
 // `f()` before `f` reads that comment lazily (the `@deprecated` check), so
-// `checkSourceElementWorker` (checker.go:2296) sees the link and marks `Foo`
+// `checkSourceElementWorker` (checker.go:2299) sees the link and marks `Foo`
 // used. Go N reports nothing; before 6472f970b the port reported TS6133
 // "'Foo' is declared but its value is never read".
 #[test]
@@ -450,7 +533,7 @@ fn test_lazy_js_doc_link_marks_its_target_used() {
 // list that `SharedList::detach` does not read in place. This one installs
 // its program as `tsc` does (`program::load`, one program in the process),
 // so such a list is in the checker arena, and the `has_base_type` walk reads
-// it in place. The answers must be Go `hasBaseType`'s (checker.go:19888).
+// it in place. The answers must be Go `hasBaseType`'s (checker.go:19955).
 #[test]
 fn test_has_base_type_reads_arena_base_types_in_place() {
     in_child(
@@ -511,9 +594,9 @@ fn test_has_base_type_reads_arena_base_types_in_place() {
 }
 
 // PORT: no Go test (basetype1). `has_base_type` (Go `hasBaseType`,
-// checker.go:19888) reads resolved base types in place with
+// checker.go:19955) reads resolved base types in place with
 // `Type::resolved_base_types` and calls `get_base_types_shared` (Go
-// `getBaseTypes`, checker.go:19504) only for a type whose base types are
+// `getBaseTypes`, checker.go:19571) only for a type whose base types are
 // not resolved yet. The in-place read must be `None` before resolution, so
 // the walk still runs `getBaseTypes` and its side effects in Go's order,
 // and must equal `get_base_types_shared` after it.
@@ -587,7 +670,7 @@ fn test_has_base_type_reads_resolved_base_types_in_place() {
 
                 // C -> B -> A. The walk resolves C's base types; the
                 // circularity check in Go `resolveBaseTypesOfClass`
-                // (`hasBaseType(B, C)`, checker.go:19597) resolves B's and A's,
+                // (`hasBaseType(B, C)`, checker.go:19664) resolves B's and A's,
                 // so the walk then reads B's in place.
                 assert!(c.has_base_type(cc, a));
                 assert_eq!(resolved(c, cc), Some(vec![b]));

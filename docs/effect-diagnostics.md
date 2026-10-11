@@ -117,8 +117,48 @@ All take the reference Effect-patched `tsc` as `--ref`:
 - `scripts/effect/t3-parity.mjs` and `scripts/effect/bench-t3.mjs`: T3 Code
   parity and timing.
 
+## Editor features
+
+The language server (`--lsp`) has these editor features of effect-tsgo
+0.51.1, each only with the plugin (`crates/ts_goport/src/effect/ls`):
+
+- Hover: the Effect type parameters, `yield*`, and the Layer summary with
+  its Mermaid links.
+- The inlay hint filter (`inlays`).
+- The auto-import style (`namespaceImportPackages`,
+  `barrelImportPackages`, `importAliases`, `topLevelNamedReexports`).
+- Quick fixes: the 2 disable actions and all 55 fixes.
+- Document symbols: the `Effect` symbol with Layers, Services, Errors and
+  Schemas, and Flows with the `debug` option.
+- Completions (`completions`): the 13 providers. They add class snippets
+  after `extends` (Schema, Model, Data, Context, v3 Effect, `@effect/sql`
+  Model, `@effect/rpc`), `gen(function*(){})`, `fn` and `fnUntraced`
+  items, the `@effect-diagnostics`, `@effect-codegens` and
+  `@effect-identifier` comment directives, Duration units and the v3
+  Schema `brand`. They come after the plain items.
+- Refactors (`refactors`): all 21, after the other code actions, each with
+  the kind `refactor.rewrite.effect.<name>`. Pipe: `wrapWithPipe`,
+  `togglePipeStyle`, `pipeableToDatafirst`. `Effect.gen` and `Effect.fn`:
+  `wrapWithEffectGen`, `removeUnnecessaryEffectGen`, `asyncAwaitToGen`,
+  `asyncAwaitToGenTryPromise`, `asyncAwaitToFn`,
+  `asyncAwaitToFnTryPromise`, `effectGenToFn`. Types and functions:
+  `toggleTypeAnnotation`, `toggleReturnTypeAnnotation`, `toggleLazyConst`,
+  `functionToArrow`. Layers and services: `layerMagic` (build and
+  prepare), `writeTagClassAccessors`. Schema: `typeToEffectSchema`,
+  `typeToEffectSchemaClass`, `makeSchemaOpaque`, `makeSchemaOpaqueWithNs`,
+  `structuralTypeToSchema`. When more than one Schema in scope matches a
+  type, `structuralTypeToSchema` in effect-tsgo picks one in Go map order
+  (it can change from run to run). tsc-rs picks the first in scope order.
+
+tsc mode never runs them.
+
 ## Not ported
 
-Editor features of the language service: quick fixes, refactors, hover,
-completions, inlay hints, document symbols and goto. tsc mode never runs
-them.
+Editor features: none. One server change is not ported: effect-tsgo adds
+`refactor.rewrite` to the code action kinds of the `initialize` answer
+(patch 017). Without it, the lightbulb and the quick fix menu show the
+Effect refactors, because they ask for all code actions. The editor
+"Refactor..." menu asks only servers that list a `refactor` kind, so it
+does not show them. This waits for a decision (D1), because it changes the
+`initialize` answer that the LSP oracle compares. The `goto` and `renames`
+options are read, but effect-tsgo does not use them either.

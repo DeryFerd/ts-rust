@@ -78,20 +78,22 @@ fn run_stability_api_usage(ctx: &mut RuleContext<'_, '_>, wanted: &'static str) 
     let mut allow = StabilityApiAllowlist::new(ctx, wanted);
     let mut diagnostics = Vec::new();
     let sf = ctx.source_file;
-    walk(ctx, &mut allow, &mut diagnostics, wanted, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    ctx.tp
+        .node_order(sf)
+        .walk_preorder(|n| visit(ctx, &mut allow, &mut diagnostics, wanted, n));
     diagnostics
 }
 
-fn walk(
+/// The body of Go's recursive `walk` closure, for one node.
+fn visit(
     ctx: &mut RuleContext<'_, '_>,
     allow: &mut StabilityApiAllowlist,
     diagnostics: &mut Vec<Diagnostic>,
     wanted: &'static str,
     node: Node,
-) -> bool {
-    if node.is_nil() {
-        return false;
-    }
+) -> Walk {
     if node.kind() == SyntaxKind::Identifier && !is_declaration_name_or_import_property_name(node) {
         // The selected overload is authoritative for calls. A tagged overload
         // may differ from other declarations of the same symbol.
@@ -142,7 +144,7 @@ fn walk(
             let mut name = node.text().to_string();
             let (allowed, api_name) = allow.decide(ctx, stability.declaration);
             if allowed {
-                return false;
+                return Walk::SkipChildren;
             }
             if !api_name.is_empty() {
                 name = api_name;
@@ -160,8 +162,7 @@ fn walk(
             ));
         }
     }
-    node.for_each_child(|child| walk(ctx, allow, diagnostics, wanted, child));
-    false
+    Walk::Descend
 }
 
 // Go: rules/stability_api_usage.go symbolHasDeclaration

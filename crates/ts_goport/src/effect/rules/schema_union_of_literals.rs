@@ -63,13 +63,13 @@ pub fn analyze_schema_union_of_literals(
 
     let mut matches = Vec::new();
 
-    let mut node_to_visit: Vec<Node> = Vec::new();
-    sf.for_each_child(|child| {
-        node_to_visit.push(child);
-        false
-    });
+    // PERF: Go walks the tree with a stack of nodes; this stack holds node
+    // order indexes and pushes and pops at the same points (effperf4).
+    let order = tp.node_order(sf);
+    let mut node_to_visit: Vec<u32> = order.children(0).collect();
 
-    while let Some(node) = node_to_visit.pop() {
+    while let Some(i) = node_to_visit.pop() {
+        let node = order.node(i);
         if node.kind() == SyntaxKind::CallExpression {
             let (m, ok) = analyze_schema_union_of_literals_node(tp, sf, node);
             if ok {
@@ -77,10 +77,7 @@ pub fn analyze_schema_union_of_literals(
             }
         }
 
-        node.for_each_child(|child| {
-            node_to_visit.push(child);
-            false
-        });
+        node_to_visit.extend(order.children(i));
     }
 
     matches
@@ -97,7 +94,7 @@ fn analyze_schema_union_of_literals_node(
     let call = node;
 
     // Check if this is Schema.Union
-    if !tp.is_node_reference_to_effect_schema_module_api(call.expression(), "Union") {
+    if !tp.is_node_reference_to_effect_schema_module_api(call.expression(), member!("Union")) {
         return (SchemaUnionOfLiteralsMatch::default(), false);
     }
 
@@ -115,7 +112,10 @@ fn analyze_schema_union_of_literals_node(
             return (SchemaUnionOfLiteralsMatch::default(), false);
         }
         let arg_call = arg;
-        if !tp.is_node_reference_to_effect_schema_module_api(arg_call.expression(), "Literal") {
+        if !tp.is_node_reference_to_effect_schema_module_api(
+            arg_call.expression(),
+            member!("Literal"),
+        ) {
             return (SchemaUnionOfLiteralsMatch::default(), false);
         }
 

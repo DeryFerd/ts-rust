@@ -46,24 +46,18 @@ pub fn analyze_schema_number(tp: &mut TypeParser<'_>, sf: Node) -> Vec<SchemaNum
         return Vec::new();
     }
 
-    fn walk(
-        tp: &mut TypeParser<'_>,
-        sf: Node,
-        matches: &mut Vec<SchemaNumberMatch>,
-        node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    let mut matches = Vec::new();
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    tp.node_order(sf).walk_preorder(|node| {
         match node.kind() {
             SyntaxKind::ImportDeclaration | SyntaxKind::ImportEqualsDeclaration => {
-                return false;
+                return Walk::SkipChildren;
             }
             SyntaxKind::PropertyAccessExpression => {
                 if let Some(m) = analyze_schema_number_reference(tp, sf, node) {
                     matches.push(m);
-                    return false;
+                    return Walk::SkipChildren;
                 }
             }
             SyntaxKind::Identifier => {
@@ -73,13 +67,8 @@ pub fn analyze_schema_number(tp: &mut TypeParser<'_>, sf: Node) -> Vec<SchemaNum
             }
             _ => {}
         }
-
-        node.for_each_child(|child| walk(tp, sf, matches, child));
-        false
-    }
-
-    let mut matches = Vec::new();
-    walk(tp, sf, &mut matches, sf);
+        Walk::Descend
+    });
 
     let flows = tp.piping_flows(sf, false);
     let mut filtered = Vec::with_capacity(matches.len());
@@ -100,8 +89,8 @@ fn analyze_schema_number_reference(
     sf: Node,
     node: Node,
 ) -> Option<SchemaNumberMatch> {
-    for api in SCHEMA_NUMBER_APIS {
-        if tp.is_node_reference_to_effect_schema_module_api(node, api.name) {
+    for api in &SCHEMA_NUMBER_APIS {
+        if tp.is_node_reference_to_effect_schema_module_api(node, &api.name) {
             let reference_node = schema_number_reference_location(node);
             return Some(SchemaNumberMatch {
                 source_file: sf,
@@ -175,7 +164,10 @@ fn schema_number_has_finite_piping_check(
         }
         for transformation in &flow.transformations {
             if transformation.callee.is_some()
-                && tp.is_node_reference_to_effect_schema_module_api(transformation.callee, "check")
+                && tp.is_node_reference_to_effect_schema_module_api(
+                    transformation.callee,
+                    member!("check"),
+                )
                 && schema_number_has_finite_predicate(tp, &transformation.args)
             {
                 return true;
@@ -196,10 +188,13 @@ fn schema_number_has_finite_predicate(tp: &mut TypeParser<'_>, arguments: &[Node
         if predicate_call.expression().is_nil() {
             continue;
         }
-        if tp.is_node_reference_to_effect_schema_module_api(predicate_call.expression(), "isFinite")
-            || tp
-                .is_node_reference_to_effect_schema_module_api(predicate_call.expression(), "isInt")
-        {
+        if tp.is_node_reference_to_effect_schema_module_api(
+            predicate_call.expression(),
+            member!("isFinite"),
+        ) || tp.is_node_reference_to_effect_schema_module_api(
+            predicate_call.expression(),
+            member!("isInt"),
+        ) {
             return true;
         }
     }
@@ -216,19 +211,19 @@ fn schema_number_node_contains(ancestor: Node, target: Node) -> bool {
 
 /// Go `schemaNumberApi`.
 pub struct SchemaNumberApi {
-    pub name: &'static str,
+    pub name: ExportMember,
     pub replacement: &'static str,
     pub replacement_identifier: &'static str,
 }
 
-static SCHEMA_NUMBER_APIS: &[SchemaNumberApi] = &[
+static SCHEMA_NUMBER_APIS: [SchemaNumberApi; 2] = [
     SchemaNumberApi {
-        name: "Number",
+        name: ExportMember::new("Number"),
         replacement: "Schema.Finite",
         replacement_identifier: "Finite",
     },
     SchemaNumberApi {
-        name: "NumberFromString",
+        name: ExportMember::new("NumberFromString"),
         replacement: "Schema.FiniteFromString",
         replacement_identifier: "FiniteFromString",
     },

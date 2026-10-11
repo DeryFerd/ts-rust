@@ -64,7 +64,9 @@ pub fn analyze_race_first_with_sleep_to_timeout(
 
             let mut left: Option<Rc<PartialPipingFlow>> = None;
             let mut right: Option<Rc<PartialPipingFlow>> = None;
-            if tp.is_node_reference_to_effect_module_api(transformation.callee, "raceFirst") {
+            if tp
+                .is_node_reference_to_effect_module_api(transformation.callee, member!("raceFirst"))
+            {
                 // An onWinner option has observable behavior that timeoutOrElse
                 // cannot carry over, so only match the two-arm form.
                 if transformation.args.len() != 1 {
@@ -74,9 +76,10 @@ pub fn analyze_race_first_with_sleep_to_timeout(
                 if let Some(right_flow) = tp.longest_piping_flow_at(transformation.args[0], true) {
                     right = Some(Rc::new(right_flow.partial_piping_flow.clone()));
                 }
-            } else if tp
-                .is_node_reference_to_effect_module_api(transformation.callee, "raceAllFirst")
-            {
+            } else if tp.is_node_reference_to_effect_module_api(
+                transformation.callee,
+                member!("raceAllFirst"),
+            ) {
                 let input = flow.copy_prefix(i as i32);
                 let Some(input) = input else {
                     continue;
@@ -129,10 +132,10 @@ fn is_race_first_timer_flow(tp: &mut TypeParser<'_>, flow: Option<&PartialPiping
         if transformation.callee.is_nil() {
             continue;
         }
-        if tp.is_node_reference_to_effect_module_api(transformation.callee, "sleep") {
+        if tp.is_node_reference_to_effect_module_api(transformation.callee, member!("sleep")) {
             return i == 0 && timer_trailing_transformations(tp, &flow.transformations[i + 1..]);
         }
-        if tp.is_node_reference_to_effect_module_api(transformation.callee, "delay") {
+        if tp.is_node_reference_to_effect_module_api(transformation.callee, member!("delay")) {
             return timer_trailing_transformations(tp, &flow.transformations[i + 1..]);
         }
     }
@@ -147,10 +150,10 @@ fn timer_trailing_transformations(
     for t in transformations {
         let callee = t.callee;
         if callee.is_nil()
-            || !tp.is_node_reference_to_effect_module_api(callee, "flatMap")
-                && !tp.is_node_reference_to_effect_module_api(callee, "andThen")
-                && !tp.is_node_reference_to_effect_module_api(callee, "as")
-                && !tp.is_node_reference_to_effect_module_api(callee, "map")
+            || !tp.is_node_reference_to_effect_module_api(callee, member!("flatMap"))
+                && !tp.is_node_reference_to_effect_module_api(callee, member!("andThen"))
+                && !tp.is_node_reference_to_effect_module_api(callee, member!("as"))
+                && !tp.is_node_reference_to_effect_module_api(callee, member!("map"))
         {
             return false;
         }

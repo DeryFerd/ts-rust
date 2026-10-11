@@ -28,13 +28,13 @@ fn run_generic_effect_services(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic>
     let mut diags = Vec::new();
 
     // Stack-based traversal
-    let mut node_to_visit: Vec<Node> = Vec::new();
-    ctx.source_file.for_each_child(|child| {
-        node_to_visit.push(child);
-        false
-    });
+    // PERF: Go walks the tree with a stack of nodes; this stack holds node
+    // order indexes and pushes and pops at the same points (effperf4).
+    let order = ctx.tp.node_order(ctx.source_file);
+    let mut node_to_visit: Vec<u32> = order.children(0).collect();
 
-    while let Some(node) = node_to_visit.pop() {
+    while let Some(i) = node_to_visit.pop() {
+        let node = order.node(i);
         if node.kind() == SyntaxKind::ClassDeclaration {
             let class_decl = node;
             if node.name().is_some()
@@ -62,10 +62,7 @@ fn run_generic_effect_services(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic>
         }
 
         // Enqueue children for further traversal
-        node.for_each_child(|child| {
-            node_to_visit.push(child);
-            false
-        });
+        node_to_visit.extend(order.children(i));
     }
 
     diags

@@ -82,7 +82,10 @@ pub fn analyze_multiple_catch_tag(tp: &mut TypeParser<'_>, sf: Node) -> Vec<Mult
         let mut introduced_tags: Vec<TypeId> = Vec::new();
 
         for transformation in &flow.transformations {
-            if !tp.is_node_reference_to_effect_package_export(transformation.callee, "catchTag") {
+            if !tp.is_node_reference_to_effect_package_export(
+                transformation.callee,
+                member!("catchTag"),
+            ) {
                 flush(sf, &mut matches, &mut chain, &mut introduced_tags);
                 continue;
             }

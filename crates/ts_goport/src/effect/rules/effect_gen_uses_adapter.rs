@@ -20,23 +20,20 @@ pub static EFFECT_GEN_USES_ADAPTER: Rule = Rule {
 fn run_effect_gen_uses_adapter(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
-    fn walk(ctx: &mut RuleContext<'_, '_>, n: Node, diags: &mut Vec<Diagnostic>) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    fn visit(ctx: &mut RuleContext<'_, '_>, n: Node, diags: &mut Vec<Diagnostic>) {
         if n.kind() == SyntaxKind::CallExpression
             && let Some(diag) = check_effect_gen_uses_adapter(ctx, n)
         {
             diags.push(diag);
         }
-
-        n.for_each_child(|child| walk(ctx, child, diags));
-        false
     }
 
     let sf = ctx.source_file;
-    walk(ctx, sf, &mut diags);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, n, &mut diags);
+    }
 
     diags
 }

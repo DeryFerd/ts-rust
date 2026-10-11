@@ -334,11 +334,14 @@ pub fn is_this_in_type_query(node: Node) -> bool {
     if !is_this_identifier(node) {
         return false;
     }
-    let mut node = node;
-    while is_qualified_name(node.parent()) && node.parent().left() == node {
-        node = node.parent();
+    // PERF: noderef1 G1. The parents are read through views (`NodeRef`).
+    let mut node = NodeRef::new(node);
+    let mut parent = node.parent();
+    while parent.kind() == SyntaxKind::QualifiedName && parent.node().left() == node.node() {
+        node = parent;
+        parent = node.parent();
     }
-    node.parent().kind() == SyntaxKind::TypeQuery
+    parent.kind() == SyntaxKind::TypeQuery
 }
 
 // Go: ast/utilities.go:3043 IsLet
@@ -466,7 +469,7 @@ fn has_function_like_data_p4(node: Node) -> bool {
     )
 }
 
-// Go: ast/utilities.go:3106 GetTypeAnnotationNode
+// Go: ast/utilities.go:3137 GetTypeAnnotationNode
 pub fn get_type_annotation_node(node: Node) -> Node {
     match node.kind() {
         SyntaxKind::VariableDeclaration
@@ -487,6 +490,7 @@ pub fn get_type_annotation_node(node: Node) -> Node {
         | SyntaxKind::RestType
         | SyntaxKind::TemplateLiteralTypeSpan
         | SyntaxKind::JsDocTypeExpression
+        | SyntaxKind::JsDocParameterTag
         | SyntaxKind::JsDocPropertyTag
         | SyntaxKind::JsDocNullableType
         | SyntaxKind::JsDocNonNullableType
@@ -1128,7 +1132,7 @@ pub fn get_non_augmentation_declaration(symbols: &SymbolArena, symbol: SymbolId)
         .unwrap_or(Node::NIL)
 }
 
-// Go: ast/utilities.go:3627 IsTypeDeclaration
+// Go: ast/utilities.go:3658 IsTypeDeclaration
 pub fn is_type_declaration(node: Node) -> bool {
     match node.kind() {
         SyntaxKind::TypeParameter
@@ -1137,7 +1141,7 @@ pub fn is_type_declaration(node: Node) -> bool {
         | SyntaxKind::TypeAliasDeclaration
         | SyntaxKind::JsTypeAliasDeclaration
         | SyntaxKind::EnumDeclaration => true,
-        SyntaxKind::ImportClause => node.is_type_only(),
+        SyntaxKind::ImportClause => node.is_type_only() && node.name().is_some(),
         SyntaxKind::ImportSpecifier | SyntaxKind::ExportSpecifier => {
             node.parent().parent().is_type_only()
         }

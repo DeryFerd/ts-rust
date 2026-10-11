@@ -40,7 +40,7 @@ fn dir_path(p: &str) -> Path {
     tspath::to_path(p, "/test/dir", true).ensure_trailing_directory_separator()
 }
 
-// Go: knownsymlinks_test.go:25 TestSetDirectory
+// Go: knownsymlinks_test.go:23 TestSetDirectory
 #[test]
 fn test_set_directory() {
     let mut cache = KnownSymlinks::new("/test/dir", true);
@@ -48,6 +48,7 @@ fn test_set_directory() {
     let real_directory = KnownDirectoryLink {
         real: "/real/path/".to_string(),
         real_path: dir_path("/real/path"),
+        ..Default::default()
     };
 
     cache.set_directory(
@@ -65,6 +66,11 @@ fn test_set_directory() {
         .expect("Expected a directory link");
     assert_eq!(stored.real, real_directory.real);
     assert_eq!(stored.real_path, real_directory.real_path);
+    // Go N' (ts#64159, knownsymlinks_test.go:45-47)
+    assert_eq!(
+        stored.symlink, "/test/symlink",
+        "Expected Symlink to preserve '/test/symlink'"
+    );
 
     // Check that realpath mapping was created
     let set = cache
@@ -78,7 +84,40 @@ fn test_set_directory() {
     );
 }
 
-// Go: knownsymlinks_test.go:56 TestSetFile
+// Go: knownsymlinks_test.go:59 TestKnownDirectoryLinkPreservesChildSpelling (ts#64544)
+#[test]
+fn test_known_directory_link_preserves_child_spelling() {
+    let mut cache = KnownSymlinks::new("/test/dir", false);
+    let symlink = "/Project/Node_Modules/pkg";
+    let symlink_path =
+        tspath::to_path(symlink, "/test/dir", false).ensure_trailing_directory_separator();
+    cache.set_directory(
+        symlink,
+        symlink_path.clone(),
+        Some(KnownDirectoryLink {
+            real: "/Real/Package/".to_string(),
+            real_path: tspath::to_path("/Real/Package", "/test/dir", false)
+                .ensure_trailing_directory_separator(),
+            ..Default::default()
+        }),
+    );
+
+    let link = cache
+        .directories()
+        .get(&symlink_path)
+        .cloned()
+        .flatten()
+        .expect("Expected directory link");
+    let resolved = link
+        .resolve_file_name("/PROJECT/node_modules/pkg/Src/File.ts", false)
+        .expect("Expected child path to resolve through directory link");
+    assert_eq!(
+        resolved, "/Real/Package/Src/File.ts",
+        "Expected child spelling to be preserved"
+    );
+}
+
+// Go: knownsymlinks_test.go:86 TestSetFile
 #[test]
 fn test_set_file() {
     let mut cache = KnownSymlinks::new("/test/dir", true);
@@ -95,7 +134,7 @@ fn test_set_file() {
     assert_eq!(stored, realpath);
 }
 
-// Go: knownsymlinks_test.go:74 TestProcessResolution
+// Go: knownsymlinks_test.go:104 TestProcessResolution
 #[test]
 fn test_process_resolution() {
     let mut cache = KnownSymlinks::new("/test/dir", true);
@@ -118,7 +157,7 @@ fn test_process_resolution() {
     assert_eq!(stored, resolved_path);
 }
 
-// Go: knownsymlinks_test.go:193 TestSetSymlinksFromResolutions
+// Go: knownsymlinks_test.go:223 TestSetSymlinksFromResolutions
 #[test]
 fn test_set_symlinks_from_resolutions() {
     let mut cache = KnownSymlinks::new("/test/dir", true);
@@ -174,7 +213,7 @@ fn test_set_symlinks_from_resolutions() {
     }
 }
 
-// Go: knownsymlinks_test.go:258 TestKnownSymlinksThreadSafety
+// Go: knownsymlinks_test.go:282 TestKnownSymlinksThreadSafety
 #[test]
 fn test_known_symlinks_thread_safety() {
     let mut cache = KnownSymlinks::new("/test/dir", true);
@@ -185,6 +224,7 @@ fn test_known_symlinks_thread_safety() {
         let real_directory = KnownDirectoryLink {
             real: format!("/real/path{r}/"),
             real_path: dir_path(&format!("/real/path{r}")),
+            ..Default::default()
         };
         cache.set_directory(
             &format!("/test/symlink{r}"),

@@ -71,17 +71,14 @@ pub fn analyze_unsafe_effect_type_assertion(
         }
         (TypeId::NIL, TypeId::NIL, false)
     }
-    let mut nodes_to_visit: Vec<Node> = Vec::new();
-    sf.for_each_child(|child| {
-        nodes_to_visit.push(child);
-        false
-    });
+    // PERF: Go walks the tree with a stack of nodes; this stack holds node
+    // order indexes and pushes and pops at the same points (effperf4).
+    let order = tp.node_order(sf);
+    let mut nodes_to_visit: Vec<u32> = order.children(0).collect();
 
-    while let Some(node) = nodes_to_visit.pop() {
-        node.for_each_child(|child| {
-            nodes_to_visit.push(child);
-            false
-        });
+    while let Some(i) = nodes_to_visit.pop() {
+        let node = order.node(i);
+        nodes_to_visit.extend(order.children(i));
 
         if node.kind() != SyntaxKind::AsExpression
             && node.kind() != SyntaxKind::TypeAssertionExpression

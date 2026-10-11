@@ -48,7 +48,7 @@ impl Checker {
         &mut self.object_type_instantiations[id.0 as usize]
     }
 
-    // Go: checker/checker.go:22724 getObjectTypeInstantiation
+    // Go: checker/checker.go:22792 getObjectTypeInstantiation
     pub fn get_object_type_instantiation(
         &mut self,
         t: TypeId,
@@ -256,7 +256,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:22823 isTypeParameterPossiblyReferenced
+    // Go: checker/checker.go:22891 isTypeParameterPossiblyReferenced
     pub fn is_type_parameter_possibly_referenced(&mut self, tp: TypeId, node: Node) -> bool {
         // If the type parameter doesn't have exactly one declaration, if there are intervening statement blocks
         // between the node and the type parameter declaration, if the node contains actual references to the
@@ -342,7 +342,7 @@ impl Checker {
         node.for_each_child(&mut |child: Node| self.contains_reference_p25(tp, child))
     }
 
-    // Go: checker/checker.go:22878 instantiateAnonymousType
+    // Go: checker/checker.go:22946 instantiateAnonymousType
     pub fn instantiate_anonymous_type(
         &mut self,
         t: TypeId,
@@ -361,8 +361,11 @@ impl Checker {
             t_symbol,
         );
         if t_object_flags.intersects(ObjectFlags::MAPPED) {
-            let declaration = self.ty(t).as_mapped_type().declaration;
-            self.ty_mut(result).as_mapped_type_mut().declaration = declaration;
+            // Go: checker/checker.go:22950
+            let declaration = self.ty(t).as_mapped_type().declaration();
+            self.ty_mut(result)
+                .as_mapped_type_mut()
+                .set_declaration(declaration);
             // C.f. instantiateSignature
             let orig_type_parameter = self.get_type_parameter_from_mapped_type(t);
             let fresh_type_parameter = self.clone_type_parameter(orig_type_parameter);
@@ -395,7 +398,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:22905 getConditionalTypeInstantiation
+    // Go: checker/checker.go:22973 getConditionalTypeInstantiation
     pub fn get_conditional_type_instantiation(
         &mut self,
         t: TypeId,
@@ -497,7 +500,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:22938 cloneTypeParameter
+    // Go: checker/checker.go:23006 cloneTypeParameter
     pub fn clone_type_parameter(&mut self, tp: TypeId) -> TypeId {
         let symbol = self.ty(tp).symbol;
         let result = self.new_type_parameter(symbol);
@@ -505,7 +508,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:22944 getHomomorphicTypeVariable
+    // Go: checker/checker.go:23012 getHomomorphicTypeVariable
     pub fn get_homomorphic_type_variable(&mut self, t: TypeId) -> TypeId {
         let constraint_type = self.get_constraint_type_from_mapped_type(t);
         if self.ty(constraint_type).flags.intersects(TypeFlags::INDEX) {
@@ -522,7 +525,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:22955 instantiateMappedType
+    // Go: checker/checker.go:23023 instantiateMappedType
     pub fn instantiate_mapped_type(
         &mut self,
         t: TypeId,
@@ -583,8 +586,7 @@ impl Checker {
         {
             return s;
         }
-        let declaration = self.ty(t).as_mapped_type().declaration;
-        if declaration.name_type().is_nil() {
+        if self.ty(t).as_mapped_type().declaration_name_type().is_nil() {
             if self.is_array_type(s)
                 || s_flags.intersects(TypeFlags::ANY)
                     && self.find_resolution_cycle_start_index(
@@ -610,7 +612,7 @@ impl Checker {
         self.instantiate_anonymous_type(t, prepended, None)
     }
 
-    // Go: checker/checker.go:23000 hasArrayOrTypeTypeConstraint
+    // Go: checker/checker.go:23068 hasArrayOrTypeTypeConstraint
     pub fn has_array_or_type_type_constraint(&mut self, type_variable: TypeId) -> bool {
         let constraint = self.get_constraint_of_type_parameter(type_variable);
         constraint.is_some()
@@ -619,7 +621,7 @@ impl Checker {
             })
     }
 
-    // Go: checker/checker.go:23005 instantiateMappedArrayType
+    // Go: checker/checker.go:23073 instantiateMappedArrayType
     pub fn instantiate_mapped_array_type(
         &mut self,
         array_type: TypeId,
@@ -644,7 +646,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:23013 instantiateMappedTupleType
+    // Go: checker/checker.go:23081 instantiateMappedTupleType
     pub fn instantiate_mapped_tuple_type(
         &mut self,
         tuple_type: TypeId,
@@ -716,7 +718,7 @@ impl Checker {
         self.create_tuple_type_ex(&new_element_types, &new_element_infos, new_readonly)
     }
 
-    // Go: checker/checker.go:23066 instantiateMappedTypeTemplate
+    // Go: checker/checker.go:23134 instantiateMappedTypeTemplate
     pub fn instantiate_mapped_type_template(
         &mut self,
         t: TypeId,
@@ -751,7 +753,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:23080 getModifiedReadonlyState
+// Go: checker/checker.go:23148 getModifiedReadonlyState
 pub fn get_modified_readonly_state(state: bool, modifiers: MappedTypeModifiers) -> bool {
     if modifiers.intersects(MappedTypeModifiers::INCLUDE_READONLY) {
         return true;
@@ -762,10 +764,10 @@ pub fn get_modified_readonly_state(state: bool, modifiers: MappedTypeModifiers) 
 }
 
 impl Checker {
-    // Go: checker/checker.go:23090 getTypeParameterFromMappedType
+    // Go: checker/checker.go:23158 getTypeParameterFromMappedType
     pub fn get_type_parameter_from_mapped_type(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).as_mapped_type().type_parameter.is_nil() {
-            let declaration = self.ty(t).as_mapped_type().declaration;
+            let declaration = self.ty(t).as_mapped_type().declaration();
             let symbol = self.get_symbol_of_declaration(declaration.type_parameter());
             let type_parameter = self.get_declared_type_of_type_parameter(symbol);
             self.ty_mut(t).as_mapped_type_mut().type_parameter = type_parameter;
@@ -773,40 +775,48 @@ impl Checker {
         self.ty(t).as_mapped_type().type_parameter
     }
 
-    // Go: checker/checker.go:23098 getConstraintTypeFromMappedType
+    // Go: checker/checker.go:23166 getConstraintTypeFromMappedType
+    // PERF: the cached path reads the mapped data once.
     pub fn get_constraint_type_from_mapped_type(&mut self, t: TypeId) -> TypeId {
-        if self.ty(t).as_mapped_type().constraint_type.is_nil() {
-            let type_parameter = self.get_type_parameter_from_mapped_type(t);
-            let constraint = self.get_constraint_of_type_parameter(type_parameter);
-            let constraint_type = if constraint.is_some() {
-                constraint
-            } else {
-                self.error_type
-            };
-            self.ty_mut(t).as_mapped_type_mut().constraint_type = constraint_type;
+        let constraint_type = self.ty(t).as_mapped_type().constraint_type;
+        if constraint_type.is_some() {
+            return constraint_type;
         }
-        self.ty(t).as_mapped_type().constraint_type
+        let type_parameter = self.get_type_parameter_from_mapped_type(t);
+        let constraint = self.get_constraint_of_type_parameter(type_parameter);
+        let constraint_type = if constraint.is_some() {
+            constraint
+        } else {
+            self.error_type
+        };
+        self.ty_mut(t).as_mapped_type_mut().constraint_type = constraint_type;
+        constraint_type
     }
 
-    // Go: checker/checker.go:23106 getNameTypeFromMappedType
+    // Go: checker/checker.go:23174 getNameTypeFromMappedType
+    // PERF: reads `declaration_name_type` (Go `m.declaration.NameType`), and
+    // the mapped data once on the cached path.
     pub fn get_name_type_from_mapped_type(&mut self, t: TypeId) -> TypeId {
-        let declaration = self.ty(t).as_mapped_type().declaration;
-        if declaration.name_type().is_nil() {
+        let (name_type_node, name_type, mapper) = {
+            let m = self.ty(t).as_mapped_type();
+            (m.declaration_name_type(), m.name_type, m.object.mapper)
+        };
+        if name_type_node.is_nil() {
             return TypeId::NIL;
         }
-        if self.ty(t).as_mapped_type().name_type.is_nil() {
-            let type_from_node = self.get_type_from_type_node(declaration.name_type());
-            let mapper = self.ty(t).as_mapped_type().object.mapper;
-            let name_type = self.instantiate_type(type_from_node, mapper);
-            self.ty_mut(t).as_mapped_type_mut().name_type = name_type;
+        if name_type.is_some() {
+            return name_type;
         }
-        self.ty(t).as_mapped_type().name_type
+        let type_from_node = self.get_type_from_type_node(name_type_node);
+        let name_type = self.instantiate_type(type_from_node, mapper);
+        self.ty_mut(t).as_mapped_type_mut().name_type = name_type;
+        name_type
     }
 
-    // Go: checker/checker.go:23117 getTemplateTypeFromMappedType
+    // Go: checker/checker.go:23185 getTemplateTypeFromMappedType
     pub fn get_template_type_from_mapped_type(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).as_mapped_type().template_type.is_nil() {
-            let declaration = self.ty(t).as_mapped_type().declaration;
+            let declaration = self.ty(t).as_mapped_type().declaration();
             let template_type = if declaration.type_().is_some() {
                 let type_from_node = self.get_type_from_type_node(declaration.type_());
                 let is_optional = self
@@ -824,23 +834,23 @@ impl Checker {
         self.ty(t).as_mapped_type().template_type
     }
 
-    // Go: checker/checker.go:23129 isMappedTypeWithKeyofConstraintDeclaration
+    // Go: checker/checker.go:23197 isMappedTypeWithKeyofConstraintDeclaration
     pub fn is_mapped_type_with_keyof_constraint_declaration(&self, t: TypeId) -> bool {
         let constraint_declaration = self.get_constraint_declaration_for_mapped_type(t);
         is_type_operator_node(constraint_declaration)
             && constraint_declaration.operator() == SyntaxKind::KeyOfKeyword
     }
 
-    // Go: checker/checker.go:23134 getConstraintDeclarationForMappedType
+    // Go: checker/checker.go:23202 getConstraintDeclarationForMappedType
     pub fn get_constraint_declaration_for_mapped_type(&self, t: TypeId) -> Node {
         self.ty(t)
             .as_mapped_type()
-            .declaration
+            .declaration()
             .type_parameter()
             .constraint()
     }
 
-    // Go: checker/checker.go:23138 getApparentMappedTypeKeys
+    // Go: checker/checker.go:23206 getApparentMappedTypeKeys
     pub fn get_apparent_mapped_type_keys(
         &mut self,
         name_type: TypeId,
@@ -863,7 +873,7 @@ impl Checker {
         self.get_union_type(&mapped_keys)
     }
 
-    // Go: checker/checker.go:23147 forEachMappedTypePropertyKeyTypeAndIndexSignatureKeyType
+    // Go: checker/checker.go:23215 forEachMappedTypePropertyKeyTypeAndIndexSignatureKeyType
     pub fn for_each_mapped_type_property_key_type_and_index_signature_key_type(
         &mut self,
         t: TypeId,
@@ -893,7 +903,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:23162 instantiateReverseMappedType
+    // Go: checker/checker.go:23230 instantiateReverseMappedType
     pub fn instantiate_reverse_mapped_type(&mut self, t: TypeId, m: MapperId) -> TypeId {
         let r_mapped_type = self.ty(t).as_reverse_mapped_type().mapped_type;
         let r_constraint_type = self.ty(t).as_reverse_mapped_type().constraint_type;
@@ -923,7 +933,7 @@ impl Checker {
         // Nested invocation of `inferTypeForHomomorphicMappedType` or the `source` instantiated into something unmappable
     }
 
-    // Go: checker/checker.go:23180 instantiateTypeAlias
+    // Go: checker/checker.go:23248 instantiateTypeAlias
     pub fn instantiate_type_alias(
         &mut self,
         alias: Option<Rc<TypeAlias>>,
@@ -937,7 +947,7 @@ impl Checker {
         }))
     }
 
-    // Go: checker/checker.go:23187 instantiateTypes
+    // Go: checker/checker.go:23255 instantiateTypes
     pub fn instantiate_types(&mut self, types: &[TypeId], m: MapperId) -> Vec<TypeId> {
         self.instantiate_list(types, m, Checker::instantiate_type)
     }
@@ -959,12 +969,12 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:23191 instantiateSymbols
+    // Go: checker/checker.go:23259 instantiateSymbols
     pub fn instantiate_symbols(&mut self, symbols: &[SymbolId], m: MapperId) -> Vec<SymbolId> {
         self.instantiate_list(symbols, m, Checker::instantiate_symbol)
     }
 
-    // Go: checker/checker.go:23195 instantiateSignatures
+    // Go: checker/checker.go:23263 instantiateSignatures
     pub fn instantiate_signatures(
         &mut self,
         signatures: &[SignatureId],
@@ -973,7 +983,7 @@ impl Checker {
         self.instantiate_list(signatures, m, Checker::instantiate_signature)
     }
 
-    // Go: checker/checker.go:23199 instantiateIndexInfos
+    // Go: checker/checker.go:23267 instantiateIndexInfos
     pub fn instantiate_index_infos(
         &mut self,
         index_infos: &[IndexInfoId],
@@ -982,7 +992,7 @@ impl Checker {
         self.instantiate_list(index_infos, m, Checker::instantiate_index_info)
     }
 
-    // Go: checker/checker.go:23203 instantiateList
+    // Go: checker/checker.go:23271 instantiateList
     // PORT: Go returns the input slice itself when nothing changes. Rust
     // returns an owned copy in that case.
     pub fn instantiate_list<T: Copy + PartialEq>(
@@ -1029,7 +1039,7 @@ impl Checker {
         None
     }
 
-    // Go: checker/checker.go:23219 tryGetTypeFromTypeNode
+    // Go: checker/checker.go:23287 tryGetTypeFromTypeNode
     pub fn try_get_type_from_type_node(&mut self, node: Node) -> TypeId {
         let type_node = node.type_();
         if type_node.is_some() {
@@ -1038,13 +1048,13 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:23227 getTypeFromTypeNode
+    // Go: checker/checker.go:23295 getTypeFromTypeNode
     pub fn get_type_from_type_node(&mut self, node: Node) -> TypeId {
         let t = self.get_type_from_type_node_worker(node);
         self.get_conditional_flow_type_of_type(t, node)
     }
 
-    // Go: checker/checker.go:23231 getTypeFromTypeNodeWorker
+    // Go: checker/checker.go:23299 getTypeFromTypeNodeWorker
     pub fn get_type_from_type_node_worker(&mut self, node: Node) -> TypeId {
         match node.kind() {
             SyntaxKind::AnyKeyword | SyntaxKind::JsDocAllType => self.any_type,
@@ -1114,7 +1124,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:23320 getTypeFromThisTypeNode
+    // Go: checker/checker.go:23388 getTypeFromThisTypeNode
     pub fn get_type_from_this_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let t = self.get_this_type(node);
@@ -1123,7 +1133,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:23328 getThisType
+    // Go: checker/checker.go:23396 getThisType
     pub fn get_this_type(&mut self, node: Node) -> TypeId {
         let container = get_this_container(
             node,  /*includeArrowFunctions*/
@@ -1156,7 +1166,7 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/checker.go:23342 getTypeFromLiteralTypeNode
+    // Go: checker/checker.go:23410 getTypeFromLiteralTypeNode
     pub fn get_type_from_literal_type_node(&mut self, node: Node) -> TypeId {
         if node.literal().kind() == SyntaxKind::NullKeyword {
             return self.null_type;
@@ -1169,7 +1179,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:23353 getTypeFromTypeLiteralOrFunctionOrConstructorTypeNode
+    // Go: checker/checker.go:23421 getTypeFromTypeLiteralOrFunctionOrConstructorTypeNode
     pub fn get_type_from_type_literal_or_function_or_constructor_type_node(
         &mut self,
         node: Node,
@@ -1193,7 +1203,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:23369 getTypeFromIndexedAccessTypeNode
+    // Go: checker/checker.go:23437 getTypeFromIndexedAccessTypeNode
     pub fn get_type_from_indexed_access_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let object_type = self.get_type_from_type_node(node.object_type());
@@ -1211,7 +1221,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:23380 getTypeFromTypeOperatorNode
+    // Go: checker/checker.go:23448 getTypeFromTypeOperatorNode
     pub fn get_type_from_type_operator_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let arg_type = node.type_();
@@ -1237,7 +1247,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:23402 getESSymbolLikeTypeForNode
+    // Go: checker/checker.go:23470 getESSymbolLikeTypeForNode
     pub fn get_es_symbol_like_type_for_node(&mut self, node: Node) -> TypeId {
         if is_valid_es_symbol_declaration(node) {
             let symbol = self.get_symbol_of_node(node);
@@ -1263,7 +1273,7 @@ impl Checker {
         self.es_symbol_type
     }
 
-    // Go: checker/checker.go:23423 getTypeFromTypeReference
+    // Go: checker/checker.go:23491 getTypeFromTypeReference
     pub fn get_type_from_type_reference(&mut self, node: Node) -> TypeId {
         // PORT: a cache hit reads the links once. The miss path stores the
         // result and returns it, which is what Go reads back from the links.
@@ -1291,7 +1301,7 @@ impl Checker {
         cached
     }
 
-    // Go: checker/checker.go:23440 getDistributedTypeParameter
+    // Go: checker/checker.go:23508 getDistributedTypeParameter
     pub fn get_distributed_type_parameter(&mut self, node: Node, t: TypeId) -> TypeId {
         if self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER)
             && !self.ty(t).as_type_parameter().is_distributed
@@ -1314,7 +1324,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:23455 getDistributedTypeFromTypeParameter
+    // Go: checker/checker.go:23523 getDistributedTypeFromTypeParameter
     pub fn get_distributed_type_from_type_parameter(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).as_type_parameter().distributed_type.is_nil() {
             let symbol = self.ty(t).symbol;
@@ -1327,7 +1337,7 @@ impl Checker {
         self.ty(t).as_type_parameter().distributed_type
     }
 
-    // Go: checker/checker.go:23465 getNonDistributedTypeParameter
+    // Go: checker/checker.go:23533 getNonDistributedTypeParameter
     // PORT: a Go package function; a `Checker` method here because it reads
     // the type arena.
     pub fn get_non_distributed_type_parameter(&self, t: TypeId) -> TypeId {
@@ -1338,7 +1348,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:23476 getIntendedTypeFromJSDocTypeReference
+    // Go: checker/checker.go:23544 getIntendedTypeFromJSDocTypeReference
     pub fn get_intended_type_from_js_doc_type_reference(&mut self, node: Node) -> TypeId {
         if node.flags().intersects(NodeFlags::JS_DOC) && is_type_reference_node(node) {
             let type_name = node.type_name();
@@ -1416,7 +1426,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:23533 getSymbolFromTypeReference
+    // Go: checker/checker.go:23601 getSymbolFromTypeReference
     pub fn get_symbol_from_type_reference(&mut self, node: Node) -> SymbolId {
         if self.symbol_node_links.get(node).resolved_symbol.is_nil() {
             // The `const` in a `const` assertion resolves to nothing; resolveName knows not to
@@ -1431,7 +1441,7 @@ impl Checker {
         self.symbol_node_links.get(node).resolved_symbol
     }
 
-    // Go: checker/checker.go:23543 resolveTypeReferenceName
+    // Go: checker/checker.go:23611 resolveTypeReferenceName
     pub fn resolve_type_reference_name(
         &mut self,
         type_reference: Node,
@@ -1458,7 +1468,7 @@ impl Checker {
         self.get_unresolved_symbol_for_entity_name(name)
     }
 
-    // Go: checker/checker.go:23558 getUnresolvedSymbolForEntityName
+    // Go: checker/checker.go:23626 getUnresolvedSymbolForEntityName
     pub fn get_unresolved_symbol_for_entity_name(&mut self, name: Node) -> SymbolId {
         let identifier = match name.kind() {
             SyntaxKind::QualifiedName => name.right(),
@@ -1498,7 +1508,7 @@ impl Checker {
         self.unknown_symbol
     }
 
-    // Go: checker/checker.go:23595 getSymbolPath
+    // Go: checker/checker.go:23663 getSymbolPath
     pub fn get_symbol_path(&self, symbol: SymbolId) -> String {
         let parent = self.sym(symbol).parent;
         if parent.is_some() {
@@ -1507,7 +1517,7 @@ impl Checker {
         self.sym(symbol).name.to_string()
     }
 
-    // Go: checker/checker.go:23602 getTypeReferenceType
+    // Go: checker/checker.go:23670 getTypeReferenceType
     pub fn get_type_reference_type(&mut self, node: Node, symbol: SymbolId) -> TypeId {
         if symbol == self.unknown_symbol {
             return self.error_type;
@@ -1532,7 +1542,7 @@ impl Checker {
     /**
      * Get type from type-reference that reference to class or interface
      */
-    // Go: checker/checker.go:23625 getTypeFromClassOrInterfaceReference
+    // Go: checker/checker.go:23693 getTypeFromClassOrInterfaceReference
     pub fn get_type_from_class_or_interface_reference(
         &mut self,
         node: Node,
@@ -1628,7 +1638,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:23472 isSimpleIdentifierTypeReference
+// Go: checker/checker.go:23540 isSimpleIdentifierTypeReference
 pub fn is_simple_identifier_type_reference(node: Node) -> bool {
     is_type_reference_node(node)
         && is_identifier(node.type_name())

@@ -59,7 +59,7 @@ pub fn analyze_flat_map_to_map(tp: &mut TypeParser<'_>, sf: Node) -> Vec<FlatMap
             if args.is_empty() || callee.is_nil() {
                 continue;
             }
-            if !tp.is_node_reference_to_effect_module_api(callee, "flatMap") {
+            if !tp.is_node_reference_to_effect_module_api(callee, member!("flatMap")) {
                 continue;
             }
 
@@ -79,7 +79,10 @@ pub fn analyze_flat_map_to_map(tp: &mut TypeParser<'_>, sf: Node) -> Vec<FlatMap
             {
                 continue;
             }
-            if !tp.is_node_reference_to_effect_module_api(succeed_call.expression(), "succeed") {
+            if !tp.is_node_reference_to_effect_module_api(
+                succeed_call.expression(),
+                member!("succeed"),
+            ) {
                 continue;
             }
 

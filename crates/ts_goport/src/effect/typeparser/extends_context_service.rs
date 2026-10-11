@@ -89,7 +89,7 @@ impl TypeParser<'_> {
                 }
                 if !self.is_node_reference_to_effect_context_module_api(
                     inner_call.expression(),
-                    "Service",
+                    member!("Service"),
                 ) {
                     continue;
                 }

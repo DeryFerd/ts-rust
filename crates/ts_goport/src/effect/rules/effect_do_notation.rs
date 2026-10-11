@@ -42,30 +42,20 @@ pub struct EffectDoNotationMatch {
 // Go: rules/effect_do_notation.go AnalyzeEffectDoNotation
 /// AnalyzeEffectDoNotation finds all references to Effect.Do-style helpers.
 pub fn analyze_effect_do_notation(tp: &mut TypeParser<'_>, sf: Node) -> Vec<EffectDoNotationMatch> {
-    fn walk(
-        tp: &mut TypeParser<'_>,
-        sf: Node,
-        matches: &mut Vec<EffectDoNotationMatch>,
-        n: Node,
-    ) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
-        if tp.is_node_reference_to_effect_module_api(n, "Do") {
+    let mut matches = Vec::new();
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4). A match is not walked into.
+    tp.node_order(sf).walk_preorder(|n| {
+        if tp.is_node_reference_to_effect_module_api(n, member!("Do")) {
             matches.push(EffectDoNotationMatch {
                 source_file: sf,
                 location: get_error_range_for_node(sf, n),
                 node: n,
             });
+            Walk::SkipChildren
         } else {
-            n.for_each_child(|child| walk(tp, sf, matches, child));
+            Walk::Descend
         }
-
-        false
-    }
-
-    let mut matches = Vec::new();
-    walk(tp, sf, &mut matches, sf);
+    });
     matches
 }
