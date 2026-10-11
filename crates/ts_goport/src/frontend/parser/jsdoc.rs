@@ -266,6 +266,13 @@ impl<'a> Parser<'a> {
         let save_context_flags = self.context_flags;
         let save_parsing_contexts = self.parsing_contexts;
         let save_scanner_state = self.scanner.mark();
+        // Go: jsdoc.go:153 Mark saves the `commentDirectives` slice header,
+        // SetText (jsdoc.go:164, scanner.go:400) starts a nil slice, so the
+        // JSDoc scan appends to a new array, and Rewind (jsdoc.go:181) gives
+        // back the outer slice unchanged. A directive inside the JSDoc is
+        // dropped. PORT: the scanner state keeps only a length into the
+        // scanner's one `Vec`, so the save also takes that `Vec` (issue #49).
+        let save_comment_directives = std::mem::take(&mut self.scanner.comment_directives);
         let save_diagnostics_length = self.diagnostics.borrow().diagnostics.len();
         let save_has_parse_error = self.has_parse_error();
         let save_has_await_identifier = self.statement_has_await_identifier;
@@ -329,6 +336,7 @@ impl<'a> Parser<'a> {
         self.scanner.set_text(self.source_text);
         self.parsing_contexts = save_parsing_contexts;
         self.context_flags = save_context_flags;
+        self.scanner.comment_directives = save_comment_directives;
         self.scanner.rewind(save_scanner_state);
         self.token = save_token;
         self.set_has_parse_error(save_has_parse_error);
