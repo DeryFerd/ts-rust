@@ -1590,15 +1590,17 @@ impl Checker {
         let mut symbol = SymbolId::NIL;
         if !node_is_missing(node) {
             // PERF: U1 (a). The name interned at parse (`Node::text_name`)
-            // goes to the resolver, so neither the node data nor an intern is
-            // needed. noderef1 G4: with no text (`resolve_name_key`).
-            let name = node.text_name();
+            // goes to the resolver with its text (`resolver_name_text`), so
+            // neither the node data nor an intern is needed.
+            let text = resolver_name_text(node.text_name());
             // PERF: the resolver builds the Go
             // `getCannotFindNameDiagnosticForName(node)` message only when
             // the name is not found (see `NameNotFound`).
-            symbol = self.resolve_name_key(
+            let resolve_name = self.resolve_name.clone();
+            symbol = resolve_name(
+                self,
                 node,
-                &name,
+                text,
                 SymbolFlags::VALUE | SymbolFlags::EXPORT_VALUE,
                 Some(NameNotFound::CannotFindName(node)),
                 !is_write_only_access(node),

@@ -1698,14 +1698,14 @@ impl Checker {
                     resolve_location = name;
                 }
                 // PERF: U1 (a). The name interned at parse
-                // (`Node::text_name`) goes to each resolve call, so neither
-                // the node data nor an intern is needed. noderef1 G4: with
-                // no text (`resolve_name_key`).
+                // (`Node::text_name`) goes to each resolve call with its
+                // text (`resolver_name_text`), so neither the node data nor
+                // an intern is needed.
                 let name_key = name.text_name();
                 if meaning == SymbolFlags::NAMESPACE {
-                    let resolved = self.resolve_name_key(
+                    let resolved = self.resolve_name(
                         resolve_location,
-                        &name_key,
+                        resolver_name_text(name_key.clone()),
                         meaning,
                         None,
                         true,  /*isUse*/
@@ -1713,9 +1713,9 @@ impl Checker {
                     );
                     symbol = self.get_merged_symbol(resolved);
                     if symbol.is_nil() {
-                        let resolved_alias = self.resolve_name_key(
+                        let resolved_alias = self.resolve_name(
                             resolve_location,
-                            &name_key,
+                            resolver_name_text(name_key.clone()),
                             SymbolFlags::ALIAS,
                             None,
                             true,  /*isUse*/
@@ -1730,9 +1730,11 @@ impl Checker {
                         }
                     }
                     if symbol.is_nil() && message.is_some() {
-                        self.resolve_name_key(
+                        let resolve_name = self.resolve_name.clone();
+                        resolve_name(
+                            self,
                             resolve_location,
-                            &name_key,
+                            resolver_name_text(name_key),
                             meaning,
                             message,
                             true,  /*isUse*/
@@ -1740,9 +1742,11 @@ impl Checker {
                         );
                     }
                 } else {
-                    let resolved = self.resolve_name_key(
+                    let resolve_name = self.resolve_name.clone();
+                    let resolved = resolve_name(
+                        self,
                         resolve_location,
-                        &name_key,
+                        resolver_name_text(name_key),
                         meaning,
                         message,
                         true,  /*isUse*/

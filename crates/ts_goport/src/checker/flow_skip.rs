@@ -1981,9 +1981,6 @@ impl Checker {
         let path = self.flow_skip_path(reference, flow_container, flow);
         let calls = Rc::new(Cell::new(0u64));
         let resolve_name = self.resolve_name.clone();
-        // Every resolve goes through the counting wrapper below
-        // (`Checker::name_resolver`).
-        let name_resolver = self.name_resolver.take();
         {
             let calls = calls.clone();
             let inner = resolve_name.clone();
@@ -2009,7 +2006,6 @@ impl Checker {
             .expect("the recording of this walk");
         let after = self.flow_skip_snapshot(calls.get());
         self.resolve_name = resolve_name;
-        self.name_resolver = name_resolver;
         let expected = before;
         let problem = if result != declared_type {
             let result_text = self.type_to_string(result);
