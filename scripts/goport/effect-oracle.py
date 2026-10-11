@@ -10,7 +10,8 @@ plain file, so a TypeScript line that effect-tsgo gets wrong (the reference TS61
 usage: GOPORT_PIN=<key> scripts/upstream/pin.py exec -- python3 scripts/goport/effect-oracle.py
            --effect-tsc <effect-tsgo tsc> [--out DIR] [--counts] [label ...]
   --effect-tsc  the tsc of the effect-tsgo package at the Effect pin (run through scripts/tsgo-oracle.sh with
-                TS_GO_ORACLE_BIN, --pretty false, in the same cwd as the plain oracle run).
+                TS_GO_ORACLE_BIN, --pretty false, in the same cwd as the plain oracle run). Its --version must
+                end in +effect-tsgo.<EFFECT_VERSION of crates/ts_goport/src/effect/etscore.rs>, else the run stops.
   --out DIR     write DIR/<project>/oracle/<label>.effect.txt (and .effect-counts.txt). Default: next to the
                 plain file (in a pin run, the pin's oracle cache).
   --counts      write only the counts files, for the configs that have an .effect.txt (next to the plain file
@@ -46,6 +47,12 @@ HEAD = re.compile(r'^(.*)\((\d+),(\d+)\): \w+ TS(\d+): ')
 COUNTS = ('Symbols', 'Types', 'Instantiations')
 COUNT_LINE = re.compile(r'^(Symbols|Types|Instantiations): +(\d+)$', re.M)
 RUNS = 3
+
+
+def effect_pin():
+    """The effect-tsgo release that the port pins: EFFECT_VERSION (etscore.rs, Go version_generated.go)."""
+    text = (REPO / 'crates/ts_goport/src/effect/etscore.rs').read_text()
+    return re.search(r'^pub const EFFECT_VERSION: &str = "([^"]+)";', text, re.M)[1]
 
 
 def entries():
@@ -144,6 +151,8 @@ def main():
     if a.labels and len(rows) != len(a.labels):
         sys.exit(f'unknown labels: {sorted(set(a.labels) - {e[0] for e in rows})}')
     version = subprocess.run([a.effect_tsc, '--version'], capture_output=True, text=True).stdout.strip()
+    if not version.endswith(f'+effect-tsgo.{effect_pin()}'):
+        sys.exit(f'{a.effect_tsc} is {version!r}, not effect-tsgo {effect_pin()} (the Effect pin)')
     print(f'effect-tsc {a.effect_tsc} ({version}); plain oracle {oracle}; pin {os.environ.get("GOPORT_PIN_ACTIVE", "default")}')
     for label, proj, cwd, config, ofile in rows:
         cwd = X / proj / cwd

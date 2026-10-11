@@ -6,7 +6,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
-- **Now (2026-10-11):** R191 = bump D accepted (main at microsoft/TypeScript fed0bf24149f; note r191 accept). Next revision R192 = goport-int60p f0d8c2df8 (note int60p-r2-2026-10-11): merge main (R191 accepted head), perfP2 d620bef7d (item 2), then the side run. Before the R192 verdicts (R191 reviewer item 9): record N prime goldens for the 5 extra LSP batteries and run them on the R191 bins. Then R193 = int61 goport-effint1 b38ba8de8 (merge main at N prime first). Running lanes: astshrink1, jsdocstr1, effperf3 (on int60p plus perfP2), invokeonce1 and chk4split (R191 reviewer item 3: also time Go N and N prime; likely cause Go checkerpool.go:437). Queued: apicb follow-ups (R191 reviewer item 7), the tree-wide Go line reference refresh (ruling 18), T3 web +1.38 to measure again.
+- **Now (2026-10-11):** R193 accepted (int60 without effperf1 F3; main 3323eeb9f; notes r193-side, timing-r193). Running after the accept: extrabatR193 and followups42 (workflow after-r193). Next: int61 = R194 on main: effint1 b38ba8de8 (Effect editor features, D1 stays out), effperf3 bc6cd8b72, invokeonce1 75866d18c, jsdocstr1 e9c2aff12, astshrink1 b5611fa68, apicbfu1 1b7532c48, i50 (PR #54); then main's light-path PRs #55 (CI fix) and #53 (#49).
 
 - **Public issues 2026-10-11 (note issues52-result-2026-10-11):** #52 replied (effect-tsgo 0.51.1 parity, workaround, upstream Effect-TS/tsgo#820, labeled; port the upstream fix when it lands). #49: PR #53 (light path; root merges after the R193 accept, then lib blobs once). #50: PR #54 (loader: into int61; macOS CI runs realpath_case.rs).
 
@@ -16,7 +16,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 - **effperf3 bc6cd8b72 (not the head 91ad83a5e): skeptic PASS, into int61 (note effperf3-result-2026-10-11).** Effect st instructions -2.0%, tests -2.0%, T3 server -1.4%; output equal. Items 9 and 10 dropped as below the bar. Base is int60p f0d8c2df8 + perfP2: merge after R192.
 
-- **Running: effperf4 (effperf2 item 1: one pre-order node list per file for the Effect rule walks; study estimate effect -4.5%, T3 -4.5%), on effperf3 bc6cd8b72, goport-effperf4.**
+- **effperf4 b553fc3d5: skeptic PASS, g4 reverted (note effperf4-result-2026-10-11): effect st -6.4 percent, T3 server -6.8, output equal. Into int62.**
 
 - **astshrink1 f56430d3b skeptic PASS (note astshrink1-result-2026-10-11): default peak RSS -2.2 to -6.7 percent, output equal. Running: astshrink2 (round 2: the 2 latent list-owner and print-pack defects). Then into int61 with its 2 protected expectation changes for the reviewer.**
 
