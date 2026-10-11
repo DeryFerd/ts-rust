@@ -53,6 +53,9 @@ impl TypeParser<'_> {
 
         cached!(self, reference_symbol, node, {
             let mut sym = self.get_symbol_at_location(node);
+            if node.kind() == SyntaxKind::Identifier {
+                self.links().raw_symbol_at_identifier.insert(node, sym);
+            }
             if sym.is_nil() && node.kind() == SyntaxKind::PropertyAccessExpression {
                 let prop = node;
                 if prop.name().is_some() {
@@ -67,6 +70,20 @@ impl TypeParser<'_> {
                 sym
             }
         })
+    }
+
+    /// The checker's `GetSymbolAtLocation(node)` for an Identifier: the
+    /// result that `reference_symbol_at_node` kept when it computed `node`,
+    /// or a new checker call. Call `reference_symbol_at_node(node)` first.
+    // PORT: not in Go. Go `runStabilityApiUsage` calls `GetSymbolAtLocation`
+    // and then `ReferenceSymbolAtNode`, which calls it again on a cache miss.
+    // The checker gives an Identifier the same symbol on every call, so the
+    // port keeps the first result and saves one call per identifier per rule.
+    pub fn raw_symbol_at_identifier(&mut self, node: Node) -> SymbolId {
+        if let Some(&symbol) = self.links().raw_symbol_at_identifier.get(&node) {
+            return symbol;
+        }
+        self.checker.get_symbol_at_location_exported(node)
     }
 
     pub fn resolve_constant_alias_symbol(&mut self, sym: SymbolId) -> SymbolId {
