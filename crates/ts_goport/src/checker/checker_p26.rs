@@ -435,16 +435,29 @@ impl Checker {
     // directly. `Type::target` (a jump table over the object kinds) takes
     // the rest: generic interface and tuple targets. The value is the same:
     // TypeReference data always has `TypeFlags::OBJECT`.
-    #[inline]
+    // PERF: always inline, with the jump table out of line
+    // (`is_tuple_type_of_target`). Out of line, the call cost more than the
+    // test in hot callers (`get_normalized_type`, the relater).
+    #[inline(always)]
     pub fn is_tuple_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         if !ty.object_flags.intersects(ObjectFlags::REFERENCE) {
             return false;
         }
-        let target = match &ty.data {
-            TypeData::TypeReference(r) => r.object.target,
-            _ => ty.target(),
-        };
+        match &ty.data {
+            TypeData::TypeReference(r) => self
+                .ty(r.object.target)
+                .object_flags
+                .intersects(ObjectFlags::TUPLE),
+            _ => self.is_tuple_type_of_target(t),
+        }
+    }
+
+    /// `is_tuple_type` for a type with `REFERENCE` that is not
+    /// `TypeReference` data (a generic interface or tuple target).
+    #[inline(never)]
+    fn is_tuple_type_of_target(&self, t: TypeId) -> bool {
+        let target = self.ty(t).target();
         self.ty(target).object_flags.intersects(ObjectFlags::TUPLE)
     }
 
