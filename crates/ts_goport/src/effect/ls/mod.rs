@@ -40,6 +40,7 @@ pub mod inlay_hints;
 pub mod refactor;
 pub mod refactors;
 pub mod rewriter;
+pub mod schemagen;
 
 // Go: etslshooks/init.go:87 effectFixProvider
 /// The code fix provider for the Effect diagnostic codes.
