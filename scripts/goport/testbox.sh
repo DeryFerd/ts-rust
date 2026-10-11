@@ -8,6 +8,9 @@
 #        testbox.sh run <command...>          sync this worktree, then run the command with the testbox env
 #                                             (e.g. run scripts/run-cargo-capped.sh build --release -p ts_goport --bins).
 #                                             Arguments keep their boundaries; use run bash -c '...' for pipes and &&
+#        testbox.sh job <command...>          as run, but detached from the SSH session (testbox-remote.sh start): a
+#                                             dropped SSH session does not stop it, and it keeps the testbox alive. Its
+#                                             output comes back as it grows; the exit code is the command's
 #        testbox.sh get <remote> [local]      copy a file or dir back with rsync (remote path absolute or relative
 #                                             to the repo root; a trailing / copies a dir's contents)
 #        testbox.sh push <path>...            copy zbook files or dirs to the same absolute paths (e.g. a bins dir)
@@ -26,6 +29,11 @@
 #        testbox.sh pin [KEY...]              check out each pin's Go repo at its zbook path, with npm ci node_modules
 #                                             (default: the batch pin, which warmup checks out). KEY comes from this
 #                                             worktree's UPSTREAM.json
+#        testbox.sh oracle [KEY]              push zbook's recorded oracle of the pin when the testbox's copy differs
+#        testbox.sh source <checkout>         the checkout at its own zbook path on the testbox: a git worktree at its
+#                                             HEAD (with a git bundle of the commits that origin lacks), then a copy of
+#                                             each modified or untracked file. Stops unless fp.py gives the same
+#                                             fingerprint on both sides. candidate.sh side --host testbox uses it
 #        testbox.sh tests [--pin KEY] OUT BASE
 #                                             the protected test suite at HEAD: build-goport-tests.sh and
 #                                             goport-tests.sh on the testbox (pushes the pin oracle first when the
@@ -41,7 +49,8 @@
 # workspace on /home/theo/Code/sandbox/ts-rust (testbox-data.sh). Fetch a commit that the bins name before a
 # gate: run git fetch --depth=1 origin <sha>.
 # KEY defaults to the batch pin (docs/typechecker-state/current.json batch.upstreamPin.to).
-# TESTBOX_ID overrides the saved ID. TESTBOX_IDLE: idle minutes before the testbox stops (default 15).
+# TESTBOX_ID overrides the saved ID. TESTBOX_ID_FILE: the file of the saved ID (default target/testbox-id of
+# this worktree). TESTBOX_IDLE: idle minutes before the testbox stops (default 15).
 # TESTBOX_REF: the ref the workflow runs from (default main: the workflow must be on the default branch).
 # Auth: `blacksmith auth login` once per host (`blacksmith auth status` shows it).
 # scripts/goport/testbox-remote.sh holds the steps that run on the testbox.
@@ -49,7 +58,7 @@ set -euo pipefail
 case "${1:-help}" in help | -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; esac
 
 repo_root="$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
-id_file="$repo_root/target/testbox-id"
+id_file="${TESTBOX_ID_FILE:-$repo_root/target/testbox-id}"
 # The synced repo root on the testbox, relative to the SSH login dir (/home/runner).
 remote_root=_work/ts-rust/ts-rust
 cd "$repo_root"
@@ -191,13 +200,67 @@ case "$cmd" in
     [[ -n "$id" ]] || { echo "warmup printed no testbox ID" >&2; exit 1; }
     mkdir -p "$(dirname "$id_file")"
     echo "$id" >"$id_file"
-    echo "testbox $id (saved to target/testbox-id)"
+    echo "testbox $id (saved to $id_file)"
     ;;
   run)
     (($#)) || { echo "usage: testbox.sh run <command...>" >&2; exit 2; }
     remote "$@"
     ;;
   pin) remote scripts/goport/testbox-remote.sh pin "$@" ;;
+  oracle)
+    (($# <= 1)) || { echo "usage: testbox.sh oracle [KEY]" >&2; exit 2; }
+    push_oracle "${1:-$pin_key}"
+    ;;
+  job)
+    (($#)) || { echo "usage: testbox.sh job <command...>" >&2; exit 2; }
+    run=target/testbox-runs/job-$(date -u +%Y%m%dT%H%M%S)-$$
+    rc=0
+    job "$run" exec "$@" || rc=$?
+    # Quiet: a caller can judge the last output line (for example DONE).
+    ssh_route > /dev/null 2>&1
+    $ssh "runner@$host" rm -rf "$remote_root/$run.log" "$remote_root/$run.rc" < /dev/null > /dev/null 2>&1 || true
+    exit "$rc"
+    ;;
+  source)
+    (($# == 1)) || { echo "usage: testbox.sh source <checkout>" >&2; exit 2; }
+    co=$(realpath -- "$1")
+    [[ $co == /home/theo/Code/sandbox/ts-rust/target/* ]] ||
+      { echo "$co is not under /home/theo/Code/sandbox/ts-rust/target (the testbox makes it there)" >&2; exit 2; }
+    head=$(git -C "$co" rev-parse HEAD)
+    t=$(mktemp -d /tmp/testbox-source.XXXXXX)
+    # shellcheck disable=SC2064 # expand now
+    trap "rm -rf '$t'" EXIT
+    bundle=
+    # The commits of HEAD that no origin branch has (as zbook last saw origin) go in a bundle; the testbox
+    # fetches the bundle's prerequisites from origin.
+    if [[ -n $(git -C "$co" rev-list -n 1 HEAD --not --remotes=origin) ]]; then
+      bundle=$t/source.bundle
+      git -C "$co" bundle create "$bundle" HEAD --not --remotes=origin
+      push_paths "$bundle"
+      # push_paths clears the EXIT trap.
+      # shellcheck disable=SC2064
+      trap "rm -rf '$t'" EXIT
+    fi
+    remote scripts/goport/testbox-remote.sh source "$co" "$head" $bundle
+    [[ -z $bundle ]] || { ssh_route; $ssh "runner@$host" rm -f "$bundle" < /dev/null || true; }
+    # Each file that differs from HEAD or is untracked (not ignored), with a new mtime (no -t: cargo judges by
+    # mtime), and each deleted file.
+    git -C "$co" diff -z --name-only --no-renames --diff-filter=D HEAD > "$t/deleted"
+    { git -C "$co" diff -z --name-only --no-renames --diff-filter=d HEAD; git -C "$co" ls-files -z -o --exclude-standard; } > "$t/files"
+    ssh_route
+    if [[ -s $t/files ]]; then
+      echo "copy $(tr -cd '\0' < "$t/files" | wc -c) modified or untracked files"
+      rsync -rlpH --from0 --files-from="$t/files" -e "$ssh" "$co/" "runner@$host:$co/"
+    fi
+    if [[ -s $t/deleted ]]; then
+      (cd "$t" && tr '\0' '\n' < deleted | sed "s|^|$co/|" > deleted.list)
+      $ssh "runner@$host" "xargs -d '\\n' rm -f" < "$t/deleted.list"
+    fi
+    here_fp=$(python3 scripts/goport/fp.py "$co" | cut -d' ' -f1)
+    there_fp=$($ssh "runner@$host" "cd $remote_root && python3 scripts/goport/fp.py $co" < /dev/null | cut -d' ' -f1)
+    [[ $here_fp == "$there_fp" ]] || { echo "fp.py $co: zbook $here_fp, testbox $there_fp" >&2; exit 1; }
+    echo "source $co ${head:0:12} on the testbox, fp ${here_fp:0:12}"
+    ;;
   tests)
     (($# == 2)) || { echo "usage: testbox.sh tests [--pin KEY] OUT BASE" >&2; exit 2; }
     out=$(realpath -m -- "$1") base=$(realpath -- "$2")

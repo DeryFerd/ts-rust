@@ -15,6 +15,11 @@
 #        testbox-remote.sh np-suite KEY LABEL RUN  a stable release tsgo, np-suite.sh run LABEL at pin KEY, pack
 #                                                  the label dir in RUN/out.tar.gz, then remove the label dir
 #                                                  (after a failed build, only its build.log)
+#        testbox-remote.sh exec CMD...             run CMD (the step of testbox.sh job)
+#        testbox-remote.sh source DIR COMMIT [BUNDLE]
+#                                                  DIR (a zbook path under target/) as a git worktree of this repo
+#                                                  at COMMIT, fetched from BUNDLE (its prerequisites from origin)
+#                                                  or from origin. A DIR that is not that worktree is replaced
 # pin.py exec binds a pin's oracle and Go checkout over the default ones; bwrap makes those bind targets.
 # Only microsoft/TypeScript pins (layout typescript) are set up: the older layout needs the TypeScript submodule.
 set -euo pipefail
@@ -148,6 +153,37 @@ case $cmd in
     # The local copy is the record: the sticky target/ keeps no label dirs.
     rm -rf "${np:?}/${label:?}"
     exit "$rc"
+    ;;
+  exec)
+    on_testbox
+    (($#)) || die "usage: exec CMD..."
+    exec "$@"
+    ;;
+  source)
+    (($# == 2 || $# == 3)) || die "usage: source DIR COMMIT [BUNDLE]"
+    dir=$1 commit=$2 bundle=${3:-}
+    # First: DIR is a zbook path, and this step replaces it.
+    on_testbox
+    [[ $dir == "$ZBOOK_REPO"/target/?* && $dir != *..* ]] || die "source: $dir is not under $ZBOOK_REPO/target"
+    if [[ -n $bundle ]]; then
+      # The prerequisites: the "-<sha>" lines of the bundle header, which ends at the first empty line.
+      for p in $(awk '/^$/ {exit} /^-/ {print substr($1, 2)}' "$bundle"); do
+        git cat-file -e "$p^{commit}" 2> /dev/null || git fetch -q --depth=1 origin "$p" || die "prerequisite $p is not on origin"
+      done
+      git fetch -q "$bundle" HEAD || die "cannot fetch $bundle"
+    fi
+    git cat-file -e "$commit^{commit}" 2> /dev/null || git fetch -q --depth=1 origin "$commit" ||
+      die "commit $commit is not on origin and not in a bundle"
+    if [[ $(git -C "$dir" rev-parse HEAD 2> /dev/null) == "$commit" && $(git -C "$dir" rev-parse --git-common-dir 2> /dev/null) -ef .git ]]; then
+      git -C "$dir" reset -q --hard
+      git -C "$dir" clean -q -fdx -e target/
+    else
+      # A dir from an older testbox (target/ is a sticky disk), or another commit: a new worktree.
+      rm -rf "$dir"
+      git worktree prune
+      git worktree add -q --detach "$dir" "$commit"
+    fi
+    echo "$dir at ${commit:0:12}"
     ;;
   *) die "unknown command $cmd (testbox-remote.sh help)" ;;
 esac
