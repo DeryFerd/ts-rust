@@ -323,7 +323,7 @@ mod tests {
 
     /// The Go panic text of the effectGenToFn edit on the function around the
     /// first `gen(` of `text`, a named import of gen.
-    fn named_gen_panic(text: &str) -> Option<String> {
+    fn named_gen_panic(text: &'static str) -> Option<String> {
         let opts = SourceFileParseOptions {
             file_name: "/gen.ts".to_string(),
             ..Default::default()
