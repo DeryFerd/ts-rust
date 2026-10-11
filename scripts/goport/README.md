@@ -17,6 +17,9 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
   running labels, age). `wfstatus <run-id>` prints that run's agent results. Use it instead of
   parsing `journal.jsonl` by hand.
 - `prune-worktrees.py`: lists stale worktrees and merged branches. `--apply` removes them.
+- `clean-builds.py`: lists the Cargo build dirs and private Go caches of worktrees idle for 3 days, and the
+  Go build cache when it is over 40 GB. `--apply` removes them (logs, reports and evidence stay). On zbook the
+  `ts-rust-clean-builds` systemd user timer runs `--apply` daily (`clean-builds.py timer` installs it).
 - `fp.py <checkout>`: the source fingerprint recorded in the saved state. `fpcommit.py <checkout> <commit>`
   gives the same value for the checkout as it was at a commit.
 - `gate.sh` also runs an editor stage (memory and answers limits of `ls_edit_bench.py` on Query
