@@ -2994,7 +2994,9 @@ pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
     // (checker/nodebuilderimpl.go:687). The port's file info of nil has no
     // name.
     if source_file.is_nil() {
-        go_nil_dereference();
+        // Go N' `(*SourceFile).FileName` (not inlined here) loads `parseOptions.FileName` (offset
+        // 0x60): addr=0x60 (ast.go:2704).
+        crate::core::go_nil_dereference_at(0x60);
     }
     let info = source_file_info(source_file);
     with_file_options_and_meta(source_file, |options, meta| {

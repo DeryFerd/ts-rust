@@ -626,7 +626,25 @@ The batch that adds it is not accepted until Theo approves.
   started projects work at the same time, like Go's goroutines. A
   project's emit starts behind its check when `Program::start_emit`
   allows it, and its writes wait in a buffer
-  (`buffer_early_emit_writes`) until the task finishes. A task finishes
+  (`buffer_early_emit_writes`) until the task finishes. The flush makes
+  each write once, as Go's emit goroutines do, also after a failed write.
+  When one failed, the files emit again from the start state and each
+  write gives the flush's result with no write (`emit_files::Writes`), so
+  the TS5033s, the emitted files, the d.ts signatures and the build info
+  are Go's. The API build flushes on its orchestrator thread only
+  (`flush_writes_on_this_thread`). Only that thread reaches its file
+  system, so an API build emit with no early emit (noEmitOnError, F1 to
+  F4, `GOPORT_EARLY_EMIT=0`, or no incremental state) also keeps its
+  writes, and that thread flushes them when the emit ends, with the same
+  replay (`EmitFilesHandler::emit_with_writes_here`). So a TS5033 is in
+  its file's result, sorted and in `emitDiagnosticsPerFile`, as in Go.
+  `tsc -b` and `tsc -p` write at once there. When each API write is a
+  client `writeFile` call (`System::client_writes`), and the build is not
+  single-threaded, the flush writes in rounds (each file's outputs before
+  its declarations first), and after a failed write whose file's d.ts
+  signature then panics it makes only the writes that Go's race mostly
+  makes before that panic (`emit_files::flush_client_writes`, see Exit
+  codes). A task finishes
   when its check and its early emit (when it has one) have ended (the
   barrier jobs behind them also
   wait for the d.ts twins and the emit pool,
@@ -748,7 +766,70 @@ runs `f` under `core::go_wait_group_task`. Where the port runs it inline
 inside work that a Go `recover()` guards (the auto-import registry build
 under a request), it runs `f` under `core::go_wait_group_goroutine`: a Go
 panic ends the process there, because Go's recover sees only its own
-goroutine.
+goroutine. Go's `Program.Emit` emits each file on a work group goroutine
+unless the program is single-threaded. The port waits for its emit jobs
+under `core::go_work_group_task` (`program_emit::wait_emit_jobs`), so a Go
+panic in an emit (an `es_decorator` nil dereference, or the d.ts signature
+of a file after a failed write, incremental/snapshot.go:411) gets the
+suffix in `tsc -p`, `tsc -w`, `tsc -b` (also with `--builders 1`) and the
+API build, and in the API build it ends the process with no answer and
+exit 2, as Go does. With `--singleThreaded` Go emits on the caller's
+goroutine: no suffix, and the API answers the request with the panic.
+`tsc -b` also adds the suffix for its builder goroutine
+(`BuildTask::keep_go_panic`).
+
+A Go nil dereference is a SIGSEGV that the runtime turns into a panic,
+so Go prints a second line, `[signal SIGSEGV: segmentation violation
+code=0x1 addr=<fault address> pc=<pc>]` (runtime `dopanic_m`), before the
+goroutine trace. A site that knows Go's fault address uses
+`core::go_nil_dereference_at(address)`, and the port prints the line with
+`pc=0x0`: Go's `pc` is an instruction of its own binary (0xc5efe9 in
+tsgo-oracle-fed0bf24149f). The d.ts signature site
+(`diagnostic_to_string_builder`) has it (0x68). gopanicout2 gave 39 more
+sites their address: the CLI, build, checker, transformer, API and IPC
+sites, and the LSP sites that a client message reaches (a nil element in
+`changes` or `files`, a code lens without `data`). gopanicout3 gave the 2
+sites of `initialized` theirs: before `initialize`, and a null workspace
+folder (server.go:1716 and 1752). Each address is the
+first load through the nil pointer in Go's compiled code, read from
+`go tool objdump` of the pinned oracle; 6 of them are checked against
+Go's own output (tests/go_nil_signal.rs). The other `go_nil_dereference()`
+sites print no signal line: the `checker::types` accessors (Go returns a
+nil pointer there, and the fault address is the field that each caller
+reads) and LSP and project sites that no known input reaches (Go N'
+answers a request or notification whose `params` is null with
+InvalidParams, so the `params` sites are not reached). The signal stays with the goroutine
+until a recovery completes, so a panic in the deferred function that
+recovered a nil dereference keeps the line (`core::go_after_recover`).
+
+In that panic case Go's other emit goroutines go on until the process
+ends, so which of their outputs exist varies by timing (a file can also be
+cut to 0 bytes). The port's written files are one of the sets that Go N'
+gave in repeated runs (gopanicout1 `go-model.md`): in the CLI modes, and
+in the API build without the `writeFile` callback or single-threaded,
+every other file in full (the flush leaves out only the panicking d.ts).
+In the API build with the callback each write waits for a client answer,
+so the panic mostly wins. Both the client's calls and the written files
+are one of Go's results (gopanicout2 `go-model.md`). After the failed
+write, `flush_client_writes` makes the other outputs before the
+declarations and, for a failed declaration output, the rest of its round,
+and no other declaration (`--async`). With sync msgpack, whose calls go
+one at a time, every file's first output is called; a failure there
+writes the next file's first output too, and a later failure calls and
+writes the next file's output of its round, and the round's earlier
+writes are lost (`flush_serialized_client_writes`). A failed OS write
+after a `useOS` answer dooms its file one round later, because Go tries
+that write again after it makes the directory: in the next round the
+file's output is called and written, and the next file's output is called
+without its write (gopanicout3 `go-model.md`).
+
+The LSP request recover (`Server::recover_guard`) and the API session
+recover are `core::go_recover`: a Go `recover()` sees only its own
+goroutine, so a Go panic in a work group task under a request ends the
+process. The recover logs the port site of a Go panic in place of Go's
+`debug.Stack()` text (`core::go_recovered_stack`), and so does the
+recover of a cross-project queued function
+(`ls::crossproject::panic_occured_text`).
 
 ## Process start
 

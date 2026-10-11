@@ -5,6 +5,7 @@ use crate::api::prelude::*;
 use crate::api::callbackfs::{CallbackFS, new_callback_fs};
 use crate::api::protocol_msgpack::new_message_pack_protocol;
 use crate::contentmapper;
+use crate::execute::incremental::emit_files::ClientWrites;
 use crate::frontend::bundled;
 use crate::frontend::json_ext::{AnyValue, JsonValue};
 use crate::frontend::vfs::{self, Fs};
@@ -262,6 +263,20 @@ impl StdioServer {
         }
         // ts#64299
         session.set_connection(conn.clone());
+        // PORT: not in Go. Each build write is a client call with the
+        // `writeFile` callback (`Session::client_writes`).
+        if self
+            .options
+            .callbacks
+            .iter()
+            .any(|name| name == "writeFile")
+        {
+            session.client_writes.set(Some(if self.options.async_ {
+                ClientWrites::Concurrent
+            } else {
+                ClientWrites::Serialized
+            }));
+        }
 
         // ts#64276
         server_run_error(ctx, conn.run(ctx))
