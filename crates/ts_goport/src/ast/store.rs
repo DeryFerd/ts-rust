@@ -4666,6 +4666,7 @@ pub fn frozen_store_ast_node(n: Node) -> Option<&'static NodeData> {
 #[derive(Clone, Copy)]
 pub struct FrozenNode {
     block: &'static FileBlock,
+    file: usize,
     index: usize,
 }
 
@@ -4687,6 +4688,16 @@ impl FrozenNode {
             .node_column()
             .map(|nodes| slot_node(nodes[self.index]))
     }
+
+    /// How `Node::new(file, id)` maps the child ids in the data of this
+    /// node (`frozen_store_ids`).
+    // PERF: noderef1 W2. A child id becomes its handle with no call and no
+    // second registry lookup.
+    #[inline]
+    #[must_use]
+    pub fn ids(self) -> FrozenIds {
+        block_ids(self.block, self.file)
+    }
 }
 
 /// The `FrozenNode` of `n`. `None` as for `frozen_store_kind`: nil,
@@ -4697,8 +4708,10 @@ pub fn frozen_store_node(n: Node) -> Option<FrozenNode> {
     if n.is_nil() {
         return None;
     }
+    let file = n.file_index();
     Some(FrozenNode {
-        block: file_block(n.file_index())?,
+        block: file_block(file)?,
+        file,
         index: slot_index(n),
     })
 }
@@ -5282,16 +5295,21 @@ impl FrozenIds {
 #[inline]
 #[must_use]
 pub fn frozen_store_ids(file: usize) -> Option<FrozenIds> {
-    let b = file_block(file)?;
+    file_block(file).map(|b| block_ids(b, file))
+}
+
+/// The `FrozenIds` of published store `file`, whose block is `b`.
+#[inline]
+fn block_ids(b: &FileBlock, file: usize) -> FrozenIds {
     let base = (file as u64) << 32;
-    Some(if b.file.facts.alias_free {
+    if b.file.facts.alias_free {
         FrozenIds::Direct { base }
     } else {
         FrozenIds::Records {
             base,
             records: b.records,
         }
-    })
+    }
 }
 
 /// U1 (e): capacity hints for binding published store file `file`

@@ -3777,8 +3777,9 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<L
             return false;
         }
         if let Some(data) = f.data() {
-            let mut visit = NodeChildVisit {
-                n,
+            let mut visit = FrozenChildVisit {
+                kind,
+                id_map: f.ids(),
                 file: n.file_index(),
                 v,
                 lists,
@@ -3935,6 +3936,88 @@ impl ChildVisit<'static> for NodeChildVisit<'_, '_> {
     #[inline(always)]
     fn case_expression(&mut self, id: crate::astdata::NodeId) -> bool {
         visit(self.v, case_expression(self.n, self.file, id))
+    }
+}
+
+/// The walk of `for_each_child_impl` over the data of a published store
+/// node (`FrozenNode`). It visits like `NodeChildVisit`, and makes each
+/// child handle from the id map of the store (`FrozenIds`) that the node
+/// lookup read.
+// PERF: noderef1 W2. `NodeChildVisit` makes each child with an out-of-line
+// `req` or `opt` call, a registry lookup each (about 25 instructions per
+// field, Go 7, getsym1 report), and each list with a third lookup
+// (`NodeSlice::iter`).
+struct FrozenChildVisit<'a, 'b> {
+    /// Go `n.Kind` (`case_expression`).
+    kind: SyntaxKind,
+    id_map: FrozenIds,
+    file: usize,
+    v: &'a mut dyn FnMut(Node) -> bool,
+    lists: Option<ListHook<'b>>,
+}
+
+impl FrozenChildVisit<'_, '_> {
+    #[inline(always)]
+    fn report(&mut self, l: NodeList, is_mod: bool) {
+        if let Some(h) = self.lists.as_mut() {
+            if l.is_some() {
+                h(l, is_mod);
+            }
+        }
+    }
+
+    /// Go `visitNodeList` of a list field.
+    #[inline(always)]
+    fn visit_list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
+        self.report(list(self.file, l), false);
+        !is_nil_list_marker(l) && self.ids(&l.nodes)
+    }
+}
+
+impl ChildVisit<'static> for FrozenChildVisit<'_, '_> {
+    #[inline(always)]
+    fn node(&mut self, id: crate::astdata::NodeId) -> bool {
+        let child = self.id_map.node(id);
+        debug_assert_eq!(child, Node::new(self.file, id));
+        visit(self.v, child)
+    }
+
+    #[inline(always)]
+    fn opt(&mut self, id: Option<crate::astdata::NodeId>) -> bool {
+        id.is_some_and(|id| self.node(id))
+    }
+
+    #[inline(always)]
+    fn list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
+        self.visit_list(l)
+    }
+
+    #[inline(always)]
+    fn opt_list(&mut self, l: &'static Option<crate::astdata::NodeList>) -> bool {
+        l.as_ref().is_some_and(|l| self.visit_list(l))
+    }
+
+    // Go `visitModifiers`: `ModifierList::is_some` has no nil marker.
+    #[inline(always)]
+    fn mods(&mut self, m: &'static Option<crate::astdata::ModifierList>) -> bool {
+        self.report(mods(self.file, m).node_list(), true);
+        m.as_ref().is_some_and(|m| self.ids(&m.list.nodes))
+    }
+
+    /// Go `visitNodes`: no nil test.
+    #[inline(always)]
+    fn ids(&mut self, ids: &'static [crate::astdata::NodeId]) -> bool {
+        let (map, file) = (self.id_map, self.file);
+        ids.iter().any(|&id| {
+            let child = map.node(id);
+            debug_assert_eq!(child, Node::new(file, id));
+            (self.v)(child)
+        })
+    }
+
+    #[inline(always)]
+    fn case_expression(&mut self, id: crate::astdata::NodeId) -> bool {
+        self.kind == SyntaxKind::CaseClause && self.node(id)
     }
 }
 
