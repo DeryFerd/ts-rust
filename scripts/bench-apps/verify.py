@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Verify the fresh benchmark's Rust/Go diagnostics before publishing its tables."""
-import sys
+import argparse
 import re
 from pathlib import Path
 
@@ -36,11 +36,17 @@ def compare(results: Path, stem: str, effect_only: bool = False) -> None:
 
 
 if __name__ == '__main__':
-    results = Path(sys.argv[1]) / 'results'
-    for app in apps:
-        compare(results, app)
-    for project in projects:
-        compare(results, f't3-{project}-noeffect')
-        # effect-tsgo has its own TypeScript pin. Compare its Effect rules only;
-        # the plain pinned TypeScript comparison above covers TypeScript errors.
-        compare(results, f't3-{project}-effect', effect_only=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('work', type=Path)
+    parser.add_argument('--suite', choices=['all', 'apps', 't3'], default='all')
+    args = parser.parse_args()
+    results = args.work / 'results'
+    if args.suite in ['all', 'apps']:
+        for app in apps:
+            compare(results, app)
+    if args.suite in ['all', 't3']:
+        for project in projects:
+            compare(results, f't3-{project}-noeffect')
+            # effect-tsgo has its own TypeScript pin. Compare its Effect rules only;
+            # the plain pinned TypeScript comparison above covers TypeScript errors.
+            compare(results, f't3-{project}-effect', effect_only=True)

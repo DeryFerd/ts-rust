@@ -4,6 +4,12 @@ name: App benchmarks
 
 on:
   workflow_dispatch:
+    inputs:
+      suite:
+        type: choice
+        description: Benchmark suite
+        default: all
+        options: [all, apps, t3]
   pull_request:
     types: [opened]
     paths:
@@ -78,12 +84,16 @@ jobs:
       - name: Prepare pinned apps
         run: scripts/bench-apps/setup.sh "$RUNNER_TEMP/bench.noindex"
       - name: App benchmarks
+        if: ${{ !inputs.suite || inputs.suite == 'all' || inputs.suite == 'apps' }}
         run: scripts/bench-apps/run.sh "$RUNNER_TEMP/bench.noindex"
       - name: T3 Code benchmarks
+        if: ${{ !inputs.suite || inputs.suite == 'all' || inputs.suite == 't3' }}
         run: scripts/bench-apps/t3code.sh "$RUNNER_TEMP/bench.noindex"
       - name: Verify outputs and summarize
+        env:
+          SUITE: ${{ inputs.suite || 'all' }}
         run: |
-          python3 scripts/bench-apps/verify.py "$RUNNER_TEMP/bench.noindex"
+          python3 scripts/bench-apps/verify.py "$RUNNER_TEMP/bench.noindex" --suite "$SUITE"
           python3 scripts/bench-apps/summary.py "$RUNNER_TEMP/bench.noindex" | tee "$RUNNER_TEMP/bench.noindex/results/summary.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Record source, tools and runner
         if: always()
@@ -97,5 +107,6 @@ jobs:
             ${{ runner.temp }}/bench.noindex/logs
             ${{ runner.temp }}/bench.noindex/package-lock.json
             ${{ runner.temp }}/pgo/*.log
+            ${{ runner.temp }}/current
           if-no-files-found: error
           retention-days: 90

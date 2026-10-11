@@ -51,10 +51,12 @@ bench_tools "$work"
 if [[ ! -d $work/effectgo/node_modules/@effect/tsgo ]]; then
   mkdir -p "$work/effectgo"
   (cd "$work/effectgo" && echo '{ "private": true }' >package.json &&
-    npm i -q --no-audit --no-fund @effect/tsgo@0.51.1)
+    npm i -q --no-audit --no-fund @effect/tsgo@0.51.1 typescript@7.0.2)
 fi
 ETSGO=$work/effectgo/node_modules/.bin/effect-tsgo
-GOE=$("$ETSGO" get-exe-path | tail -1)
+# The launcher resolves TypeScript from cwd and selects the matching native
+# artifact. Use its isolated install, with the same TypeScript as T3 Code.
+GOE=$(cd "$work/effectgo" && "$ETSGO" get-exe-path)
 [[ -x $GOE ]] || { echo "no Effect-patched tsc: $GOE" >&2; exit 1; }
 TS6="node --max-old-space-size=16384 $work/node_modules/ts6/lib/tsc.js"
 TS6E="node --max-old-space-size=16384 $work/ts6effect/node_modules/typescript/lib/tsc.js"
