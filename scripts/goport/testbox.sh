@@ -224,6 +224,8 @@ case "$cmd" in
     ;;
   np-suite)
     (($# == 1 || $# == 2)) || { echo "usage: testbox.sh np-suite [--pin KEY] LABEL [BASE]" >&2; exit 2; }
+    # One dir name: the result moves to $np/LABEL, and np-suite.sh diff takes labels.
+    [[ -n $1 && $1 != */* ]] || { echo "LABEL must be a dir name without /: $1" >&2; exit 2; }
     np=/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/compat-backlog/np-suite
     [[ ! -e $np/$1 ]] || { echo "$np/$1 exists (results are never replaced)" >&2; exit 2; }
     run=target/testbox-runs/np-$(date -u +%Y%m%dT%H%M%S)-$1
