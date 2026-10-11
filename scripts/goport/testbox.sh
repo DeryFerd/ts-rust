@@ -74,8 +74,9 @@ oracles() {
     return
   fi
   echo "uploading oracles: ${missing[*]}"
+  # A new dir only: the trap must not remove a dir (or follow a symlink) that this run did not make.
+  mkdir testbox-upload || { echo "$repo_root/testbox-upload exists: remove it (a left-over upload dir)" >&2; exit 1; }
   trap 'rm -rf "$repo_root/testbox-upload"' EXIT
-  mkdir -p testbox-upload
   for k in "${missing[@]}"; do cp --reflink=auto "$(python3 scripts/upstream/pin.py path oracle "$k")" "testbox-upload/$k"; done
   remote scripts/goport/testbox-remote.sh oracles-install testbox-upload
   rm -rf "$repo_root/testbox-upload"
