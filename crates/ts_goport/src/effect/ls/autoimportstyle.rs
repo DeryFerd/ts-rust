@@ -21,7 +21,7 @@
 use crate::effect::etscore::{ResolvedEffectPluginOptions, TopLevelNamedReexportsMode};
 use crate::effect::pluginoptions::resolve_effect_plugin_options_for_source_file;
 use crate::effect::rulerunner::enabled_options;
-use crate::ls::autoimport::{Export, ExportSyntax, Fix};
+use crate::ls::autoimport::{Export, ExportSyntax, Fix, ModuleID};
 use crate::ls::prelude::*;
 
 /// Go `func(export *autoimport.Export) (string, modulespecifiers.ResultKind)`:
@@ -192,7 +192,6 @@ impl StylePolicy {
             if module_specifier.is_empty() {
                 return Some(Rc::clone(fix));
             }
-            // PORT: Go `autoimport.ModuleIDFileName` is the module ID at pin N.
             return Some(Rc::new(Fix {
                 auto_import_fix: lsproto::AutoImportFix {
                     kind: lsproto::AutoImportFixKind::ADD_NEW,
@@ -205,14 +204,14 @@ impl StylePolicy {
                     ..Default::default()
                 },
                 module_specifier_kind,
-                module_file_name: export.target.module_id.0.clone(),
+                module_file_name: module_id_file_name(&export.target.module_id),
                 ..Default::default()
             }));
         }
 
         // Check if this is a top-level named reexport
-        let is_reexport =
-            !export.target.module_id.0.is_empty() && export.target.module_id != export.module_id;
+        let is_reexport = !export.target.module_id.as_string().is_empty()
+            && export.target.module_id != export.module_id;
         if is_reexport && !self.follow_reexports {
             // When topLevelNamedReexports is "ignore", skip rewriting top-level reexports
             return Some(Rc::clone(fix));
@@ -324,8 +323,17 @@ impl StylePolicy {
 fn is_namespace_reexport(export: &Export) -> bool {
     export.syntax == ExportSyntax::MODIFIER
         && export.flags.intersects(SymbolFlags::MODULE)
-        && !export.target.module_id.0.is_empty()
+        && !export.target.module_id.as_string().is_empty()
         && export.target.module_id != export.module_id
+}
+
+// Go: shim/ls/autoimport/integration.go ModuleIDFileName (effect-tsgo 0.51.1)
+// The file path of a file module, "" for an ambient module.
+// PORT: Go `tspath.RootedFilePath` is `String` here, as `Fix::module_file_name`.
+fn module_id_file_name(id: &ModuleID) -> String {
+    id.as_path_key()
+        .map(|path| path.0.clone())
+        .unwrap_or_default()
 }
 
 // Go: internal/autoimportstyle/stylepolicy.go:227 effectNestedBarrel
@@ -408,8 +416,7 @@ pub fn new_view_fix_transformer(
     new_fix_transformer(
         Some(&resolved_options),
         Some(Box::new(move |export: &Export| {
-            // PORT: Go `autoimport.ModuleIDFileName` is the module ID at pin N.
-            let mut target_file_name = export.target.module_id.0.clone();
+            let mut target_file_name = module_id_file_name(&export.target.module_id);
             if let Some(target_file) = program.get_source_file(&target_file_name) {
                 target_file_name = target_file.file_name().to_string();
             }
@@ -436,7 +443,15 @@ pub fn new_view_fix_transformer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ls::autoimport::{ExportID, ModuleID};
+    use crate::ls::autoimport::{ExportID, ambient_module_id};
+
+    // Go: shim/ls/autoimport/integration.go NewAmbientModuleID (effect-tsgo 0.51.1)
+    fn new_ambient_module_id(specifier: &str) -> ModuleID {
+        if specifier.is_empty() {
+            return ModuleID::default();
+        }
+        ambient_module_id(specifier)
+    }
 
     fn options(
         namespace: &[&str],
@@ -469,12 +484,12 @@ mod tests {
     fn make_export(package_name: &str, module_id: &str, target_module_id: &str) -> Export {
         Export {
             export_id: ExportID {
-                module_id: ModuleID(module_id.to_string()),
+                module_id: new_ambient_module_id(module_id),
                 export_name: "succeed".to_string(),
             },
             package_name: package_name.to_string(),
             target: ExportID {
-                module_id: ModuleID(target_module_id.to_string()),
+                module_id: new_ambient_module_id(target_module_id),
                 ..Default::default()
             },
             ..Default::default()
@@ -600,7 +615,7 @@ mod tests {
     fn apply_namespace_reexport() {
         let mut sp = namespace_policy();
         sp.resolve_target = Some(Box::new(|export: &Export| {
-            assert_eq!(export.target.module_id.0, "effect/Effect");
+            assert_eq!(export.target.module_id.as_string(), "effect/Effect");
             (
                 "effect/Effect".to_string(),
                 modulespecifiers::ResultKind::NodeModules,
