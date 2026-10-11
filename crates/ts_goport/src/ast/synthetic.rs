@@ -1874,23 +1874,13 @@ impl<'a> AnyList<'a> {
 /// kind without it). `Some(None)`: the field is Go `nil`.
 pub type ListSel = for<'a> fn(&'a NodeData) -> Option<Option<AnyList<'a>>>;
 
-/// The most list selector sites (`SelectorSite`) in the process.
-const SELECTOR_LIMIT: usize = 1024;
-
-/// The selectors that `SelectorSite::id` gave ids, by id.
-static SELECTORS: [OnceLock<ListSel>; SELECTOR_LIMIT] = [const { OnceLock::new() }; SELECTOR_LIMIT];
-
 /// The number of ids that `SelectorSite::id` gave.
 static SELECTOR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// The list selector of one `list_of!` or `modifiers_of!` site, with a
-/// small process-wide id (lsshells M3c): a list handle of a store that owns
-/// its nodes (`ast::StoreList`) names its selector with 4 bytes, so
-/// `NodeList` and `ModifierList` stay 16 bytes. Each site gets its id at its
-/// first scoped read.
-// PORT: Go keeps a `*NodeList` pointer. A list of a freeable file version
-// cannot be borrowed past its read, so the handle names the node data cell
-// and the selector, and the list is found again at each use.
+/// A small process-wide id of one `list_of!` or `modifiers_of!` site: the
+/// key of the site's answers in the hot list cache of the edited file
+/// (`ast::store::scoped_store_list_of`). Each site gets its id at its first
+/// scoped read.
 pub struct SelectorSite(AtomicU32);
 
 impl SelectorSite {
@@ -1899,11 +1889,11 @@ impl SelectorSite {
         Self(AtomicU32::new(0))
     }
 
-    /// The id of `sel`, the selector of this site (`list_selector`).
+    /// The id of this site.
     #[inline]
-    pub fn id(&self, sel: ListSel) -> u32 {
+    pub fn id(&self) -> u32 {
         match self.0.load(Ordering::Acquire) {
-            0 => self.new_id(sel),
+            0 => self.new_id(),
             id => id - 1,
         }
     }
@@ -1911,17 +1901,9 @@ impl SelectorSite {
     /// The first `id` of this site.
     #[cold]
     #[inline(never)]
-    fn new_id(&self, sel: ListSel) -> u32 {
+    fn new_id(&self) -> u32 {
         let id = SELECTOR_COUNT.fetch_add(1, Ordering::Relaxed);
-        // The last id is `ast::store::PENDING_SEL`.
-        assert!(
-            id < SELECTOR_LIMIT - 1,
-            "more than {} list selector sites",
-            SELECTOR_LIMIT - 1
-        );
-        // A new id: this is its only write.
-        let _ = SELECTORS[id].set(sel);
-        let id = id as u32;
+        let id = u32::try_from(id).expect("too many list selector sites");
         // Two threads can give one site an id at once. The first id stays;
         // the other one is not used again.
         match self
@@ -1940,17 +1922,8 @@ impl Default for SelectorSite {
     }
 }
 
-/// The list selector with id `id` (`SelectorSite::id`).
-#[inline]
-#[must_use]
-pub fn list_selector(id: u32) -> ListSel {
-    *SELECTORS[id as usize]
-        .get()
-        .expect("a list selector id has its selector")
-}
-
 /// `list_of!` for a node that is not a node of a static tier
-/// (`static_tier_ast_node`): a `Field` handle for a synthetic node, a
+/// (`static_tier_ast_node`): a synthetic list handle for a synthetic node, a
 /// `StoreList` handle for a node that a freeable parse owns (lsshells M3c),
 /// and a static handle for any other store node (an unpublished store).
 #[cold]
@@ -1961,7 +1934,7 @@ pub fn scoped_node_list_of(n: Node, site: &SelectorSite, sel: ListSel) -> Option
         return synthetic_node_list_of(n, sel);
     }
     let file = n.file_index();
-    scoped_store_list_of(n, site.id(sel), sel).map(|found| match found {
+    scoped_store_list_of(n, site.id(), sel).map(|found| match found {
         None => NodeList::NIL,
         Some(ScopedList::Static(l)) => NodeList::from_static(file, l),
         Some(ScopedList::Store(l)) => NodeList::store(l),
@@ -1978,7 +1951,7 @@ pub fn scoped_modifiers_of(n: Node, site: &SelectorSite, sel: ListSel) -> Option
         return synthetic_modifiers_of(n, sel);
     }
     let file = n.file_index();
-    scoped_store_list_of(n, site.id(sel), sel).map(|found| match found {
+    scoped_store_list_of(n, site.id(), sel).map(|found| match found {
         None => ModifierList::NIL,
         Some(ScopedList::Static(m)) => ModifierList::from_static(file, m),
         Some(ScopedList::Store(m)) => ModifierList::store(m),

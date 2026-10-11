@@ -2643,8 +2643,9 @@ pub struct OwnedPending {
     flags: Option<crate::astdata::ModifierFlags>,
 }
 
-/// The selector id of a pending list (`StoreList::sel_id`). The selector
-/// ids of the list sites are below it (`ast::synthetic::SELECTOR_LIMIT`).
+/// The selector bits of every `StoreList` (`StoreList::sel_id`): the handle
+/// names a list table entry (astshrink1; it named a list field of node data
+/// by its selector before).
 pub(crate) const PENDING_SEL: u32 = (1 << StoreList::SEL_BITS) - 1;
 
 /// A list of a store that owns its astdata nodes (a freeable parse,

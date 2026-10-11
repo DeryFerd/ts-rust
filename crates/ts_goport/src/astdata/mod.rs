@@ -165,8 +165,9 @@ mod tests {
 
     use super::{
         Child, ConditionalExpressionData, DoStatementData, FileId, ImportDeclarationData,
-        JsDocParameterOrPropertyTagData, ModifierList, Node, NodeArena, NodeData, NodeFlags,
-        NodeId, NodeList, NodeRef, SourceFileData, SyntaxKind, SyntaxListData, TokenData,
+        JsDocParameterOrPropertyTagData, ModifierFlags, ModifierList, Node, NodeArena, NodeData,
+        NodeFlags, NodeId, NodeList, NodeRef, SourceFileData, SyntaxKind, SyntaxListData,
+        TokenData,
     };
 
     thread_local! {
