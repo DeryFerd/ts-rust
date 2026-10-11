@@ -22,56 +22,81 @@
 //! Not ported here: patch 017 (`refactor.rewrite` in the server's code
 //! action kinds; root decision D1 keeps the plain list), and the auto-import
 //! transformer of `init()` (lane E3). The lists that later lanes fill:
-//! fixables (E4, E5), refactors (E9), completions (E6), document symbols
-//! (E8) and the Layer hover (E7).
+//! fixables (E4 ported the disable actions and 12 fixes; E5 the other 43),
+//! refactors (E9), completions (E6), document symbols (E8) and the Layer
+//! hover (E7).
 
 use std::sync::LazyLock;
 
+use crate::effect::pluginoptions::resolve_effect_plugin_options_for_source_file;
 use crate::effect::rulerunner::enabled_options;
+use crate::effect::typeparser::TypeParser;
 use crate::ls::prelude::*;
 
+pub mod fixable;
+pub mod fixables;
 pub mod hover;
 pub mod inlay_hints;
+pub mod rewriter;
 
-// Go: etslshooks/init.go:89 effectFixProvider
+// Go: etslshooks/init.go:87 effectFixProvider
 /// The code fix provider for the Effect diagnostic codes.
-/// `ls/codeactions.rs` runs it after the built-in providers.
-// PORT: Go `ErrorCodes: fixables.AllErrorCodes()` and
-// `FixIds: fixables.AllFixIDs()`. Lane E4 ports `internal/fixables`. Until
-// then `fixables.All` is empty, so both lists are empty and the provider
-// matches no diagnostic.
+/// `ls/codeactions.rs` runs it after the built-in providers. It delegates to
+/// the fixables of [`fixables::ALL`].
+// PORT: Go sets `FixIds`, but nothing reads them, and no Effect action has a
+// fix ID, so there is no fix-all.
 pub static EFFECT_FIX_PROVIDER: LazyLock<CodeFixProvider> = LazyLock::new(|| CodeFixProvider {
-    error_codes: Vec::new(),
+    error_codes: fixables::all_error_codes(),
     get_code_actions: get_effect_code_actions,
-    fix_ids: Vec::new(),
+    fix_ids: fixables::all_fix_ids(),
     get_all_code_actions: None,
 });
 
-// Go: etslshooks/init.go:96 getEffectCodeActions
+// Go: etslshooks/init.go:94 getEffectCodeActions
 // getEffectCodeActions finds applicable fixables and collects their code actions.
-// PORT: lane E4 ports the body after the plugin check: the options for the
-// file, the checker for the file, the type parser, `fixable.NewContext` and
-// each fixable of `fixables.ByErrorCode`. Until then `fixables.All` is
-// empty, so Go collects no action (and the provider has no error code, so
-// it is not called).
+// PORT: Go `fixCtx.Program == nil` cannot happen in Rust, and
+// `GetTypeCheckerForFile` never gives a nil checker. The plugin check is
+// `rulerunner::enabled_options`, so a standalone API process without
+// `TSGO_EFFECT_API=1` gets no Effect action, as it gets no Effect
+// diagnostic.
 fn get_effect_code_actions(
-    _ctx: &Context,
+    ctx: &Context,
     fix_ctx: &CodeFixContext<'_>,
 ) -> Result<Vec<CodeAction>, GoError> {
-    if enabled_options(fix_ctx.program.options()).is_none() {
+    let Some(parsed_effect_config) = enabled_options(fix_ctx.program.options()) else {
         return Ok(Vec::new());
+    };
+    let options = resolve_effect_plugin_options_for_source_file(
+        parsed_effect_config,
+        source_file_file_name(fix_ctx.source_file),
+        &fix_ctx.program.options().config_file_path,
+        use_case_sensitive_file_names(),
+    );
+
+    let (ch, done) =
+        ls_program::get_type_checker_for_file(fix_ctx.program, ctx, fix_ctx.source_file);
+    let mut actions = Vec::new();
+    {
+        let mut ch = ch.borrow_mut();
+        let program = ch.program;
+        let mut tp = TypeParser::new(program, &mut ch);
+        let mut f_ctx = fixable::new_context(ctx, fix_ctx, &options, &mut tp);
+        for provider in fixables::by_error_code(fix_ctx.error_code) {
+            actions.extend((provider.run)(&mut f_ctx));
+        }
     }
-    Ok(Vec::new())
+    done.call();
+    Ok(actions)
 }
 
-// Go: etslshooks/init.go:130 effectRefactorProvider
+// Go: etslshooks/init.go:128 effectRefactorProvider
 /// The refactor provider for the Effect refactors. `ls/codeactions.rs`
 /// runs it in its refactor loop.
 pub static EFFECT_REFACTOR_PROVIDER: RefactorProvider = RefactorProvider {
     get_refactor_actions: get_effect_refactor_actions,
 };
 
-// Go: etslshooks/init.go:135 getEffectRefactorActions
+// Go: etslshooks/init.go:133 getEffectRefactorActions
 // getEffectRefactorActions iterates all registered refactors and collects their code actions.
 // PORT: lane E9 ports `internal/refactor` and `internal/refactors`. Until
 // then `refactors.All` is empty, so Go collects no action. The port does not
@@ -92,7 +117,7 @@ fn get_effect_refactor_actions(
     Ok(Vec::new())
 }
 
-// Go: etslshooks/init.go:157 afterCompletion
+// Go: etslshooks/init.go:155 afterCompletion
 /// Called by `ls/completions_p1.rs` after the completion list is built
 /// (Effect-TS/tsgo patch 022). Returns the items with the Effect completions
 /// appended.
