@@ -3785,8 +3785,8 @@ fn for_each_child_dyn(n: Node, v: &mut dyn FnMut(Node) -> bool) -> bool {
 }
 
 /// The children of `n` from its node data (`for_each_child_impl`), not
-/// from its child chain: the debug checks of the chain walks.
-pub(crate) fn children_by_data(n: Node) -> std::vec::IntoIter<Node> {
+/// from its child chain: the debug check of the chain walk.
+fn children_by_data(n: Node) -> std::vec::IntoIter<Node> {
     let mut out = Vec::new();
     for_each_child_impl(
         n,
@@ -4714,7 +4714,7 @@ fn walk_children<'d>(data: &'d NodeData, w: &mut impl ChildVisit<'d>) -> bool {
 /// data is a variant of the last arm of `walk_children`, which visits
 /// nothing.
 #[inline]
-pub(crate) const fn has_no_child_fields(kind: SyntaxKind) -> bool {
+const fn has_no_child_fields(kind: SyntaxKind) -> bool {
     kind.is_token()
         || matches!(
             kind,

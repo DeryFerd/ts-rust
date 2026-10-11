@@ -350,12 +350,10 @@ pub fn is_function_expression_or_arrow_function(node: Node) -> bool {
 // Go: ast/utilities.go:1157 ForEachReturnStatement
 /// Warning: This has the same semantics as the forEach family of functions in
 /// that traversal terminates in the event that 'visitor' returns true.
-// PERF: perfP1 item 9. The walk reads the kinds and the children through
-// one view of the file (`NodeRef::for_each_child`).
 pub fn for_each_return_statement(body: Node, mut visitor: impl FnMut(Node) -> bool) -> bool {
-    fn traverse(node: NodeRef, visitor: &mut dyn FnMut(Node) -> bool) -> bool {
+    fn traverse(node: Node, visitor: &mut dyn FnMut(Node) -> bool) -> bool {
         match node.kind() {
-            SyntaxKind::ReturnStatement => visitor(node.node()),
+            SyntaxKind::ReturnStatement => visitor(node),
             SyntaxKind::CaseBlock
             | SyntaxKind::Block
             | SyntaxKind::IfStatement
@@ -370,11 +368,13 @@ pub fn for_each_return_statement(body: Node, mut visitor: impl FnMut(Node) -> bo
             | SyntaxKind::DefaultClause
             | SyntaxKind::LabeledStatement
             | SyntaxKind::TryStatement
-            | SyntaxKind::CatchClause => node.for_each_child(|child| traverse(child, visitor)),
+            | SyntaxKind::CatchClause => {
+                node.for_each_child(&mut |child: Node| traverse(child, visitor))
+            }
             _ => false,
         }
     }
-    traverse(NodeRef::new(body), &mut visitor)
+    traverse(body, &mut visitor)
 }
 
 // Go: ast/utilities.go:1173 GetRootDeclaration
