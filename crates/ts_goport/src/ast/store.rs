@@ -4841,6 +4841,19 @@ impl NodeRef {
         }
     }
 
+    /// Go `node.Flags & mask` for a `mask` without a binder-added bit
+    /// (`Node::parser_flags`).
+    #[inline]
+    #[must_use]
+    pub fn parser_flags(self, mask: NodeFlags) -> NodeFlags {
+        debug_assert!(
+            !mask.intersects(super::node::BINDER_ADDED_FLAGS),
+            "parser_flags mask {:#x} has binder bits",
+            mask.bits()
+        );
+        self.flags() & mask
+    }
+
     /// Go `node.Loc` (`Node::loc`).
     #[inline]
     #[must_use]
@@ -4849,6 +4862,17 @@ impl NodeRef {
             Some(b) => b.records[slot_index(self.node)].loc(),
             None => node_ref_loc(self.node),
         }
+    }
+
+    /// Go `GetSourceFileOfNode(node)` when the node's parent walk ends at
+    /// its store root (`frozen_source_file_of_node`), else `None`.
+    #[inline]
+    #[must_use]
+    pub fn source_file_root(self) -> Option<Node> {
+        let b = self.block?;
+        b.records[slot_index(self.node)]
+            .has_bit(NodeRecord::SOURCE_FILE_ROOT)
+            .then(|| b.file.root)
     }
 
     /// The node data (`static_ast_node`), or `None` for a node with no
@@ -4904,6 +4928,19 @@ impl NodeRef {
                 initializer
             }
             None => node_ref_initializer(self.node),
+        }
+    }
+
+    /// Go `node.Type()` (`Node::type_`).
+    #[inline]
+    #[must_use]
+    pub fn type_(self) -> Node {
+        match self.column_child(StoreChild::Type) {
+            Some(type_) => {
+                debug_assert_eq!(type_, self.node.type_(), "NodeRef type");
+                type_
+            }
+            None => node_ref_type(self.node),
         }
     }
 
@@ -4965,6 +5002,11 @@ fn node_ref_initializer(n: Node) -> Node {
 #[inline(never)]
 fn node_ref_type_name(n: Node) -> Node {
     n.type_name()
+}
+
+#[inline(never)]
+fn node_ref_type(n: Node) -> Node {
+    n.type_()
 }
 
 /// `store_ast_node(n)` when `n` is a store node, in one lookup (see

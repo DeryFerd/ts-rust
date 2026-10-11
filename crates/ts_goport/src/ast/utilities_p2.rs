@@ -72,10 +72,13 @@ pub fn find_ancestor_with_kind(
 
 // Go: ast/utilities.go:941 FindAncestorKind
 /// Walks up the parents of a node to find the ancestor that matches the kind.
-pub fn find_ancestor_kind(mut node: Node, kind: SyntaxKind) -> Node {
+// PERF: noderef1 G2. Through views (`NodeRef`): no registry lookup for a
+// parent in the same store.
+pub fn find_ancestor_kind(node: Node, kind: SyntaxKind) -> Node {
+    let mut node = NodeRef::new(node);
     while node.is_some() {
         if node.kind() == kind {
-            return node;
+            return node.node();
         }
         node = node.parent();
     }

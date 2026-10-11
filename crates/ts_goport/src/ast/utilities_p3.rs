@@ -352,14 +352,18 @@ pub fn is_in_expression_context_of(node: Node, parent: NodeRef) -> bool {
 }
 
 // Go: ast/utilities.go:2058 IsPartOfTypeNode
+// PERF: noderef1 G2. The node and its parents are read through views
+// (`NodeRef`): one registry lookup for the node, none for a parent in its
+// store.
 pub fn is_part_of_type_node(node: Node) -> bool {
+    let node = NodeRef::new(node);
     let kind = node.kind();
     if (kind as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
         && (kind as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
     {
         return true;
     }
-    match node.kind() {
+    match kind {
         SyntaxKind::AnyKeyword
         | SyntaxKind::UnknownKeyword
         | SyntaxKind::NumberKeyword
@@ -377,26 +381,31 @@ pub fn is_part_of_type_node(node: Node) -> bool {
             return node.parent().kind() != SyntaxKind::VoidExpression;
         }
         SyntaxKind::ExpressionWithTypeArguments => {
-            return is_part_of_type_expression_with_type_arguments(node);
+            return is_part_of_type_expression_with_type_arguments(node.node());
         }
         SyntaxKind::TypeParameter => {
-            return node.parent().kind() == SyntaxKind::MappedType
-                || node.parent().kind() == SyntaxKind::InferType;
+            return matches!(
+                node.parent().kind(),
+                SyntaxKind::MappedType | SyntaxKind::InferType
+            );
         }
         SyntaxKind::Identifier => {
             let parent = node.parent();
-            if is_qualified_name(parent) && parent.right() == node {
-                return is_part_of_type_node_in_parent(parent);
+            match parent.kind() {
+                SyntaxKind::QualifiedName if parent.node().right() == node.node() => {
+                    return is_part_of_type_node_in_parent_of(parent.node(), parent.parent());
+                }
+                SyntaxKind::PropertyAccessExpression if parent.name() == node.node() => {
+                    return is_part_of_type_node_in_parent_of(parent.node(), parent.parent());
+                }
+                _ => {}
             }
-            if is_property_access_expression(parent) && parent.name() == node {
-                return is_part_of_type_node_in_parent(parent);
-            }
-            return is_part_of_type_node_in_parent(node);
+            return is_part_of_type_node_in_parent_of(node.node(), parent);
         }
         SyntaxKind::QualifiedName
         | SyntaxKind::PropertyAccessExpression
         | SyntaxKind::ThisKeyword => {
-            return is_part_of_type_node_in_parent(node);
+            return is_part_of_type_node_in_parent_of(node.node(), node.parent());
         }
         _ => {}
     }
@@ -405,12 +414,18 @@ pub fn is_part_of_type_node(node: Node) -> bool {
 
 // Go: ast/utilities.go:2089 isPartOfTypeNodeInParent
 pub fn is_part_of_type_node_in_parent(node: Node) -> bool {
-    let parent = node.parent();
-    if parent.kind() == SyntaxKind::TypeQuery {
+    is_part_of_type_node_in_parent_of(node, NodeRef::new(node).parent())
+}
+
+/// `is_part_of_type_node_in_parent(node)`, where `parent` is the view of
+/// the parent of `node`.
+fn is_part_of_type_node_in_parent_of(node: Node, parent: NodeRef) -> bool {
+    let parent_kind = parent.kind();
+    if parent_kind == SyntaxKind::TypeQuery {
         return false;
     }
-    if parent.kind() == SyntaxKind::ImportType {
-        return !parent.is_type_of();
+    if parent_kind == SyntaxKind::ImportType {
+        return !parent.node().is_type_of();
     }
 
     // Do not recursively call isPartOfTypeNode on the parent. In the example:
@@ -419,17 +434,17 @@ pub fn is_part_of_type_node_in_parent(node: Node) -> bool {
     //
     // Calling isPartOfTypeNode would consider the qualified name A.B a type node.
     // Only C and A.B.C are type nodes.
-    if (parent.kind() as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
-        && (parent.kind() as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
+    if (parent_kind as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
+        && (parent_kind as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
     {
         return true;
     }
-    match parent.kind() {
+    match parent_kind {
         SyntaxKind::ExpressionWithTypeArguments => {
-            return is_part_of_type_expression_with_type_arguments(parent);
+            return is_part_of_type_expression_with_type_arguments(parent.node());
         }
         SyntaxKind::TypeParameter => {
-            return node == parent.constraint();
+            return node == parent.node().constraint();
         }
         SyntaxKind::VariableDeclaration
         | SyntaxKind::Parameter
@@ -452,7 +467,7 @@ pub fn is_part_of_type_node_in_parent(node: Node) -> bool {
         SyntaxKind::CallExpression
         | SyntaxKind::NewExpression
         | SyntaxKind::TaggedTemplateExpression => {
-            return parent.type_arguments().to_vec().contains(&node);
+            return parent.node().type_arguments().to_vec().contains(&node);
         }
         _ => {}
     }

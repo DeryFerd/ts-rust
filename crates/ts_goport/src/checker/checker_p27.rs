@@ -1525,23 +1525,32 @@ pub fn is_unary_tuple_type_node(node: Node) -> bool {
 /// can fire, in walk order. It reads only the AST. The loop body at other
 /// steps adds nothing for any type, and a conditional step never takes the
 /// mapped branch (its parent is not a MappedType).
+// PERF: noderef1 G2. The walk reads each node through a view (`NodeRef`):
+// no registry lookup for a parent in the same store, where the Go reads
+// made about six per step.
 fn for_each_conditional_flow_step(node: Node, mut f: impl FnMut(FlowStep)) {
     let mut covariant = true;
-    let mut node = node;
-    while node.is_some() && !is_statement(node) && node.kind() != SyntaxKind::JsDoc {
+    let mut node = NodeRef::new(node);
+    while node.is_some() && !is_statement_ref(node) && node.kind() != SyntaxKind::JsDoc {
         let parent = node.parent();
+        let parent_kind = parent.kind();
         // only consider variance flipped by parameter locations - `keyof` types would usually be considered variance inverting, but
         // often get used in indexed accesses where they behave sortof invariantly, but our checking is lax
-        if is_parameter_declaration(parent) {
+        if parent_kind == SyntaxKind::Parameter {
             covariant = !covariant;
         }
-        if is_conditional_type_node(parent) && node == parent.true_type() {
-            f(FlowStep::Conditional { parent, covariant });
-        } else if is_mapped_type_node(parent)
-            && parent.name_type().is_nil()
-            && node == parent.type_()
+        if parent_kind == SyntaxKind::ConditionalType && node.node() == parent.node().true_type() {
+            f(FlowStep::Conditional {
+                parent: parent.node(),
+                covariant,
+            });
+        } else if parent_kind == SyntaxKind::MappedType
+            && parent.node().name_type().is_nil()
+            && node.node() == parent.type_()
         {
-            f(FlowStep::Mapped { parent });
+            f(FlowStep::Mapped {
+                parent: parent.node(),
+            });
         }
         node = parent;
     }
