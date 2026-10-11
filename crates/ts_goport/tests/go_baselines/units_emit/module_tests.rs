@@ -1453,6 +1453,60 @@ fn test_resolve_peer_dependency_nil_contents_race() {
     assert!(second, "\"/repo/src/b/file.ts\" failed to resolve pkg");
 }
 
+/// `directoryExists` gets each peer package directory with no trailing
+/// separator (`df62e89d6`, ts#64159): Go N' fed0bf24149f looks it up with
+/// `nodeModules.ResolveDirectory(...)` (module/resolver.go:2074), a
+/// `RootedDirectoryPath`, which has none. The API's callback file system
+/// passes the path on to the client as it is.
+// PORT: no Go counterpart.
+#[test]
+fn test_peer_dependency_directory_has_no_trailing_separator() {
+    let inner = vfstest::from_map(
+        [
+            (
+                "/repo/node_modules/pkg/package.json",
+                r#"{"name":"pkg","version":"1.0.0","types":"index.d.ts","peerDependencies":{"peer":"*"}}"#,
+            ),
+            (
+                "/repo/node_modules/pkg/index.d.ts",
+                "export declare const x: number;",
+            ),
+            (
+                "/repo/node_modules/peer/package.json",
+                r#"{"name":"peer","version":"2.0.0"}"#,
+            ),
+            ("/repo/src/file.ts", ""),
+        ],
+        true,
+    );
+    let calls: Rc<RefCell<Vec<String>>> = Rc::default();
+    let fs = {
+        let inner = Rc::clone(&inner);
+        let calls = Rc::clone(&calls);
+        wrapvfs_wrap(
+            Rc::clone(&inner),
+            Replacements {
+                directory_exists: Some(Box::new(move |path: &str| {
+                    calls.borrow_mut().push(path.to_string());
+                    inner.directory_exists(path)
+                })),
+                ..Default::default()
+            },
+        )
+    };
+    let resolver = new_repo_resolver(fs);
+    assert!(resolves(&resolver, "pkg", "/repo/src/file.ts"));
+    let calls = calls.borrow();
+    assert!(
+        calls.iter().any(|path| path == "/repo/node_modules/peer"),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|path| path == "/repo/node_modules/peer/"),
+        "{calls:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // module/staticresolver_test.go
 // ---------------------------------------------------------------------------
