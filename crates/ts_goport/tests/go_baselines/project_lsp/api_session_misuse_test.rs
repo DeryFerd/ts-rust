@@ -11,14 +11,17 @@
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 
+use ts_goport::api::requestfilesystem::{Kind, RequestFileSystem, RequestSymlink};
 use ts_goport::api::{
     self, CheckerNodeParams, CheckerSymbolParams, CheckerTypeParams, CreateSnapshotParams,
-    GetCompletionsAtPositionParams, GetContextualTypeForArgumentParams, GetContextualTypeParams,
+    CreateSourceFileParams, DocumentIdentifier, GetCompletionsAtPositionParams,
+    GetContextualTypeForArgumentParams, GetContextualTypeParams,
     GetCurrentLanguageServerSnapshotParams, GetDefaultProjectForFileParams, GetDiagnosticsParams,
     GetSourceFileParams, GetSymbolAtPositionParams, GetTypeAtPositionParams,
-    GetTypeFromTypeNodeParams, GetTypePropertyParams, NodeHandle,
-    SignatureToSignatureDeclarationParams, SnapshotID, SnapshotRequestChangesParams,
-    SourceFileResponse, TypeToTypeNodeParams,
+    GetTypeFromTypeNodeParams, GetTypePropertyParams, NodeHandle, ParseConfigFileParams,
+    ParseJsonConfigFileContentParams, ReadConfigFileParams, SignatureToSignatureDeclarationParams,
+    SnapshotID, SnapshotRequestChangesParams, SourceFileResponse, TranspileFromFileParams,
+    TypeToTypeNodeParams,
 };
 use ts_goport::astdata::SyntaxKind;
 use ts_goport::flags::ScriptKind;
@@ -33,6 +36,7 @@ use ts_goport::{program, project};
 
 use super::api_util::{doc, nil_error};
 use super::projecttestutil::{self, files};
+use super::requestfilesystem_test::{directories, files as request_files, listing};
 use super::util::{bg, uri};
 
 /// Go's runtime text for a nil pointer dereference.
@@ -195,7 +199,7 @@ fn signature_id_of_f(before: impl FnOnce(&Api)) -> String {
 
 child_test! {
     // optapifuzz1 E1 (d030): Go `declaration.Parameters()` dereferences nil
-    // on a node that is not function-like (checker.go:20192). The port read
+    // on a node that is not function-like (checker.go:20259). The port read
     // the nil list as empty and made and registered a signature, so the
     // next signature had another id.
     fn get_signature_from_declaration_of_a_node_that_is_not_function_like() {
@@ -216,7 +220,7 @@ child_test! {
 child_test! {
     // optapifuzz1 E2 (d026): from the SourceFile, Go's walk in
     // getConditionalFlowTypeOfType reads the nil parent of the SourceFile
-    // (checker.go:25424). The port's shortcut for a store with no
+    // (checker.go:25493). The port's shortcut for a store with no
     // conditional or mapped type skipped the walk and answered a type.
     fn get_type_from_type_node_of_the_source_file() {
         let api = api_a();
@@ -238,7 +242,7 @@ child_test! {
 child_test! {
     // optapifuzz1 E3 (d035): typeToTypeNode with no location builds an
     // import type into node_modules under nodenext, and Go reads the file
-    // name of the nil context file (nodebuilderimpl.go:686,
+    // name of the nil context file (nodebuilderimpl.go:687,
     // compiler/program.go:1744). The port read nil as a file and answered
     // null.
     fn type_to_type_node_of_a_node_modules_type_with_no_location() {
@@ -347,7 +351,7 @@ child_test! {
     // optapifuzz1 D: a type getter on the wrong type kind. A cast to a
     // concrete struct (`t.data.(*ConditionalType)`, types.go:709-727) panics
     // with Go's runtime text. A cast to an embedded struct returns nil, and
-    // the caller dereferences it (checker.go:22285 for getTypeArguments).
+    // the caller dereferences it (checker.go:22353 for getTypeArguments).
     // The port panicked with its own text for both.
     fn type_getters_on_the_wrong_type_kind() {
         let api = api_a();
@@ -385,12 +389,12 @@ child_test! {
 child_test! {
     // optapifuzz1 F: other requests where Go panics, each with Go's text.
     // F1: getContextualType reads the nil parent of the SourceFile
-    // (checker.go:29839). F2: getImmediateAliasedSymbol asserts an alias
-    // (checker.go:2197); the port's assert was off in release. F3: argument
+    // (checker.go:29903). F2: getImmediateAliasedSymbol asserts an alias
+    // (checker.go:2200); the port's assert was off in release. F3: argument
     // index -1 (relater.go:1801). F4: a position of 2^31, which Go keeps as
     // an int, past the text in the JSDoc snippet slice (jsdoc_snippet.go:77);
     // the port wrapped it to a negative i32. F5: a kind that is no syntax
-    // kind (nodebuilderimpl.go:1972).
+    // kind (nodebuilderimpl.go:1973).
     fn misuse_panics_with_go_texts() {
         let api = api_a();
         let text = go_panic_text(|| {
@@ -412,7 +416,7 @@ child_test! {
                 &CheckerSymbolParams {
                     snapshot: api.snapshot,
                     project: api.project.clone(),
-                    symbol: a.id,
+                    symbol: a.reference.clone(),
                 },
             )
         });
@@ -473,6 +477,250 @@ child_test! {
         });
         assert_eq!(text, "Unhandled kind in signatureToSignatureDeclarationHelper", "F5");
         api.close();
+    }
+}
+
+child_test! {
+    // ts#64159 (api skeptic, bump D wave 2b): Go N' roots each client path
+    // with `tspath.ToRootedPath` (rooted_path.go:29), which panics on an
+    // empty path (:31) and on a URL path with a query or fragment (:34).
+    // The sites: `DocumentIdentifier.ToFileName` (proto.go:357; a request
+    // without its file field has the zero identifier), transpileFromFile
+    // (session.go:2310), createSourceFile (`ResolveFile`, session.go:2108),
+    // parseJsonConfigFileContent's configDirectory (session.go:2026) and the
+    // request file system's names (requestfilesystem.go:256,
+    // filechanges.go:57, :62, :72). The port read "" as the current
+    // directory and kept the URL names.
+    // api round 3: the listed child directories (requestfilesystem.go:172)
+    // and the listing names (:501, :573, :579) resolve with
+    // `RootedDirectoryPath.ResolveDirectory` (rooted_path.go:784), which
+    // panics on a relative name with a query or fragment in a URL
+    // directory (:791) and on a URL result with one (:803). The port
+    // joined them with `combine_paths`.
+    fn empty_and_url_suffixed_paths_panic_with_go_texts() {
+        const EMPTY: &str = "path must not be empty";
+        const URL: &str = "path must not contain a URL query or fragment";
+        const RELATIVE_URL: &str = "relative URL path must not contain a query or fragment";
+        let api = api_a();
+        let named = |file_name: &str| DocumentIdentifier {
+            file_name: file_name.to_string(),
+            ..Default::default()
+        };
+        let symbol_at = |file: DocumentIdentifier| {
+            go_panic_text(|| {
+                api.session.handle_get_symbol_at_position(
+                    &api.ctx,
+                    &GetSymbolAtPositionParams {
+                        snapshot: api.snapshot,
+                        project: api.project.clone(),
+                        file,
+                        position: 1,
+                    },
+                )
+            })
+        };
+        let metadata = |file: DocumentIdentifier| {
+            go_panic_text(|| {
+                api.session.handle_get_source_file_metadata(
+                    &api.ctx,
+                    &GetSourceFileParams {
+                        snapshot: api.snapshot,
+                        project: api.project.clone(),
+                        file,
+                    },
+                )
+            })
+        };
+        let default_project = |file: DocumentIdentifier| {
+            go_panic_text(|| {
+                api.session.handle_get_default_project_for_file(
+                    &api.ctx,
+                    &GetDefaultProjectForFileParams {
+                        snapshot: api.snapshot,
+                        file,
+                    },
+                )
+            })
+        };
+        assert_eq!(symbol_at(DocumentIdentifier::default()), EMPTY);
+        assert_eq!(metadata(DocumentIdentifier::default()), EMPTY);
+        assert_eq!(default_project(DocumentIdentifier::default()), EMPTY);
+        let text = go_panic_text(|| {
+            api.session
+                .handle_read_config_file(&api.ctx, &ReadConfigFileParams::default())
+        });
+        assert_eq!(text, EMPTY, "readConfigFile");
+        let text = go_panic_text(|| {
+            api.session
+                .handle_parse_config_file(&api.ctx, &ParseConfigFileParams::default())
+        });
+        assert_eq!(text, EMPTY, "parseConfigFile");
+        for file_name in ["file:///a.ts?x", "http://h/a.ts#f"] {
+            assert_eq!(metadata(named(file_name)), URL, "{file_name}");
+            assert_eq!(default_project(named(file_name)), URL, "{file_name}");
+        }
+
+        for (file_name, expected) in [("", EMPTY), ("file:///a.ts?x", URL)] {
+            let text = go_panic_text(|| {
+                api.session.handle_transpile_from_file(
+                    &api.ctx,
+                    &TranspileFromFileParams {
+                        file_name: file_name.to_string(),
+                        ..Default::default()
+                    },
+                    false,
+                )
+            });
+            assert_eq!(text, expected, "transpileFromFile {file_name:?}");
+        }
+        let text = go_panic_text(|| {
+            api.session.handle_create_source_file(
+                &api.ctx,
+                &CreateSourceFileParams {
+                    file_name: "http://h/a.ts#f".to_string(),
+                    source_text: "let a = 1".to_string(),
+                    ..Default::default()
+                },
+            )
+        });
+        assert_eq!(text, URL, "createSourceFile");
+        let text = go_panic_text(|| {
+            api.session.handle_parse_json_config_file_content(
+                &api.ctx,
+                &ParseJsonConfigFileContentParams {
+                    config_directory: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+        });
+        assert_eq!(text, EMPTY, "parseJsonConfigFileContent");
+
+        let file_system = |kind: Kind| RequestFileSystem {
+            kind,
+            ..Default::default()
+        };
+        let symlink = |target: &str| RequestSymlink {
+            target: target.to_string(),
+            host: false,
+        };
+        let full_with_file = |name: &str| RequestFileSystem {
+            files: [(name.to_string(), "x".to_string())].into_iter().collect(),
+            ..file_system(Kind::FULL)
+        };
+        let full_with_child = |directory: &str, child: &str| RequestFileSystem {
+            directories: directories(vec![(directory, listing(&["b.ts"], &[child]))]),
+            ..full_with_file("a.ts")
+        };
+        for (label, request, expected) in [
+            ("listed URL child", full_with_child("d", "file:///a?x"), URL),
+            ("listed URL child, fragment", full_with_child("d", "http://h/x#f"), URL),
+            ("listed URL child, query", full_with_child("d", "http://h/x?y"), URL),
+            (
+                "listed relative child of a URL directory, query",
+                full_with_child("http://h/d", "x?y"),
+                RELATIVE_URL,
+            ),
+            (
+                "listed relative child of a URL directory, fragment",
+                full_with_child("file:///d", "x#y"),
+                RELATIVE_URL,
+            ),
+            ("empty file key", full_with_file(""), EMPTY),
+            ("URL file key", full_with_file("file:///a.ts?x"), URL),
+            (
+                "empty directory key",
+                RequestFileSystem {
+                    directories: [(String::new(), Default::default())].into_iter().collect(),
+                    ..file_system(Kind::FULL)
+                },
+                EMPTY,
+            ),
+            (
+                "empty symlink key",
+                RequestFileSystem {
+                    symlinks: [(String::new(), symlink("a.ts"))].into_iter().collect(),
+                    ..file_system(Kind::LAYER)
+                },
+                EMPTY,
+            ),
+            (
+                "empty symlink target",
+                RequestFileSystem {
+                    symlinks: [("l.ts".to_string(), symlink(""))].into_iter().collect(),
+                    ..file_system(Kind::LAYER)
+                },
+                EMPTY,
+            ),
+            (
+                "empty removed path",
+                RequestFileSystem {
+                    removed_paths: vec![String::new()],
+                    ..file_system(Kind::LAYER)
+                },
+                EMPTY,
+            ),
+        ] {
+            let text = go_panic_text(|| {
+                api.session.handle_create_snapshot(
+                    &api.ctx,
+                    &CreateSnapshotParams {
+                        file_system: Some(request),
+                        ..Default::default()
+                    },
+                )
+            });
+            assert_eq!(text, expected, "createSnapshot {label}");
+        }
+        // Go answers these: the name is not a URL, or has no query.
+        for (label, request) in [
+            ("listed relative child, query", full_with_child("d", "x?y")),
+            (
+                "listed relative child of a URL directory",
+                full_with_child("http://h/d", "x"),
+            ),
+        ] {
+            if let Err(err) = api.session.handle_create_snapshot(
+                &api.ctx,
+                &CreateSnapshotParams {
+                    file_system: Some(request),
+                    ..Default::default()
+                },
+            ) {
+                panic!("createSnapshot {label}: {}", err.error());
+            }
+        }
+        api.close();
+
+        // A listing name (requestfilesystem.go:501) that the wildcard of
+        // `include` reads.
+        let (project_session, _) = projecttestutil::setup(files(&[]));
+        let session = api::new_lsp_session(project_session.clone(), None);
+        let wildcard = |name: &str| CreateSnapshotParams {
+            snapshot_request_changes_params: SnapshotRequestChangesParams {
+                open_projects: vec![doc("/home/projects/q/tsconfig.json")],
+                ..Default::default()
+            },
+            file_system: Some(RequestFileSystem {
+                files: request_files(&[
+                    (
+                        "/home/projects/q/tsconfig.json",
+                        r#"{"include": ["src"], "compilerOptions": {"noLib": true}}"#,
+                    ),
+                    ("/home/projects/q/src/main.ts", "export const m = 1;"),
+                ]),
+                directories: directories(vec![(
+                    "/home/projects/q/src",
+                    listing(&[name, "main.ts"], &[]),
+                )]),
+                ..file_system(Kind::FULL)
+            }),
+            ..Default::default()
+        };
+        let text = go_panic_text(|| session.handle_create_snapshot(&bg(), &wildcard("file:///z.ts?x")));
+        assert_eq!(text, URL, "createSnapshot wildcard URL listing name");
+        nil_error(session.handle_create_snapshot(&bg(), &wildcard("z.ts?x")));
+        session.close();
+        project_session.close();
     }
 }
 

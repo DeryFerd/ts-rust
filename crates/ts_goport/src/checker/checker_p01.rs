@@ -15,7 +15,7 @@ use crate::jsnum::{Number, PseudoBigInt};
 use crate::prelude::*;
 use std::sync::LazyLock;
 
-// Go: checker/checker.go:52 TypeSystemEntity
+// Go: checker/checker.go:53 TypeSystemEntity
 // PORT: Go `TypeSystemEntity any`. The Go callers of `pushTypeResolution`
 // pass a declaration node, a symbol, a type or a signature, so the Rust type
 // is an enum over those four handles. Go compares targets with `==` on the
@@ -52,7 +52,7 @@ impl From<SignatureId> for TypeSystemEntity {
     }
 }
 
-// Go: checker/checker.go:69 TypeResolution
+// Go: checker/checker.go:70 TypeResolution
 #[derive(Clone, Copy, Debug)]
 pub struct TypeResolution {
     pub target: TypeSystemEntity,
@@ -62,7 +62,7 @@ pub struct TypeResolution {
 
 // ContextualInfo
 
-// Go: checker/checker.go:77 ContextualInfo
+// Go: checker/checker.go:78 ContextualInfo
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ContextualInfo {
     pub node: Node,
@@ -72,7 +72,7 @@ pub struct ContextualInfo {
 
 // InferenceContextInfo
 
-// Go: checker/checker.go:85 InferenceContextInfo
+// Go: checker/checker.go:86 InferenceContextInfo
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InferenceContextInfo {
     pub node: Node,
@@ -81,7 +81,7 @@ pub struct InferenceContextInfo {
 
 // EnumLiteralKey
 
-// Go: checker/checker.go:103 EnumLiteralKey
+// Go: checker/checker.go:104 EnumLiteralKey
 // PORT: Go `value any` holds a `LiteralValue`. `LiteralValue` is not `Hash`
 // (it holds `f64`), so the key stores `LiteralValueKey`, which compares like
 // Go interface `==` (numbers as floats, -0 == +0). Build it with
@@ -117,7 +117,7 @@ impl From<&LiteralValue> for LiteralValueKey {
 
 // EnumRelationKey
 
-// Go: checker/checker.go:110 EnumRelationKey
+// Go: checker/checker.go:111 EnumRelationKey
 // PORT: Go `ast.SymbolId` values are symbol handles here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct EnumRelationKey {
@@ -127,7 +127,7 @@ pub struct EnumRelationKey {
 
 // CachedTypeKey
 
-// Go: checker/checker.go:146 CachedTypeKey
+// Go: checker/checker.go:147 CachedTypeKey
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct CachedTypeKey {
     pub kind: CachedTypeKind,
@@ -136,7 +136,7 @@ pub struct CachedTypeKey {
 
 // NarrowedTypeKey
 
-// Go: checker/checker.go:153 NarrowedTypeKey
+// Go: checker/checker.go:154 NarrowedTypeKey
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct NarrowedTypeKey {
     pub t: TypeId,
@@ -147,7 +147,7 @@ pub struct NarrowedTypeKey {
 
 // UnionOfUnionKey
 
-// Go: checker/checker.go:162 UnionOfUnionKey
+// Go: checker/checker.go:163 UnionOfUnionKey
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UnionOfUnionKey {
     pub id1: TypeId,
@@ -158,7 +158,7 @@ pub struct UnionOfUnionKey {
 
 // CachedSignatureKey
 
-// Go: checker/checker.go:171 CachedSignatureKey
+// Go: checker/checker.go:172 CachedSignatureKey
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CachedSignatureKey {
     pub sig: SignatureId,
@@ -191,7 +191,7 @@ pub static SIGNATURE_KEY_OUTER: LazyLock<CacheHashKey> = LazyLock::new(|| signat
 
 // StringMappingKey
 
-// Go: checker/checker.go:186 StringMappingKey
+// Go: checker/checker.go:187 StringMappingKey
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct StringMappingKey {
     pub s: SymbolId,
@@ -200,7 +200,7 @@ pub struct StringMappingKey {
 
 // AssignmentReducedKey
 
-// Go: checker/checker.go:193 AssignmentReducedKey
+// Go: checker/checker.go:194 AssignmentReducedKey
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct AssignmentReducedKey {
     pub id1: TypeId,
@@ -209,7 +209,7 @@ pub struct AssignmentReducedKey {
 
 // DiscriminatedContextualTypeKey
 
-// Go: checker/checker.go:200 DiscriminatedContextualTypeKey
+// Go: checker/checker.go:201 DiscriminatedContextualTypeKey
 // PORT: Go `ast.NodeId` is the node handle here (a `Node` is unique per
 // node, like a Go node id).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -220,7 +220,7 @@ pub struct DiscriminatedContextualTypeKey {
 
 // InstantiationExpressionKey
 
-// Go: checker/checker.go:207 InstantiationExpressionKey
+// Go: checker/checker.go:208 InstantiationExpressionKey
 // PORT: Go `ast.NodeId` is the node handle here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct InstantiationExpressionKey {
@@ -230,7 +230,7 @@ pub struct InstantiationExpressionKey {
 
 // SubstitutionTypeKey
 
-// Go: checker/checker.go:214 SubstitutionTypeKey
+// Go: checker/checker.go:215 SubstitutionTypeKey
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SubstitutionTypeKey {
     pub base_id: TypeId,
@@ -239,7 +239,7 @@ pub struct SubstitutionTypeKey {
 
 // ReverseMappedTypeKey
 
-// Go: checker/checker.go:221 ReverseMappedTypeKey
+// Go: checker/checker.go:222 ReverseMappedTypeKey
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ReverseMappedTypeKey {
     pub source_id: TypeId,
@@ -249,7 +249,7 @@ pub struct ReverseMappedTypeKey {
 
 // IterationTypesKey
 
-// Go: checker/checker.go:229 IterationTypesKey
+// Go: checker/checker.go:230 IterationTypesKey
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct IterationTypesKey {
     pub type_id: TypeId,
@@ -258,7 +258,7 @@ pub struct IterationTypesKey {
 
 // PropertiesTypesKey
 
-// Go: checker/checker.go:236 PropertiesTypesKey
+// Go: checker/checker.go:237 PropertiesTypesKey
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PropertiesTypesKey {
     pub type_id: TypeId,
@@ -268,7 +268,7 @@ pub struct PropertiesTypesKey {
 
 // NonExistentPropertyKey
 
-// Go: checker/checker.go:244 NonExistentPropertyKey
+// Go: checker/checker.go:245 NonExistentPropertyKey
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct NonExistentPropertyKey {
     pub prop_node: Node,
@@ -278,14 +278,14 @@ pub struct NonExistentPropertyKey {
 
 // FlowLoopKey
 
-// Go: checker/checker.go:252 FlowLoopKey
+// Go: checker/checker.go:253 FlowLoopKey
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlowLoopKey {
     pub flow_node: FlowNodeId,
     pub ref_key: CacheHashKey,
 }
 
-// Go: checker/checker.go:257 FlowLoopInfo
+// Go: checker/checker.go:258 FlowLoopInfo
 #[derive(Clone)]
 pub struct FlowLoopInfo {
     pub key: FlowLoopKey,
@@ -294,7 +294,7 @@ pub struct FlowLoopInfo {
 
 // InferenceContext
 
-// Go: checker/checker.go:276 InferenceContext
+// Go: checker/checker.go:277 InferenceContext
 // PERF (infermem1): 56 bytes (asserted below), not 120. The port keeps every context
 // of a run (typebox: about 3.9M, almost all from conditional types with
 // `infer`), so the fields that those contexts never set are in `rare`, a box
@@ -403,7 +403,7 @@ impl Default for InferenceContext {
     }
 }
 
-// Go: checker/checker.go:289 InferenceInfo
+// Go: checker/checker.go:290 InferenceInfo
 // PORT: Go `*InferenceInfo` is an index into `InferenceContext::inferences`.
 // PERF (infermem1): 32 bytes (asserted below), not 72. The two candidate
 // lists are in one box that the first candidate makes (typebox: about 6M
@@ -461,14 +461,14 @@ impl InferenceInfo {
     }
 }
 
-// Go: checker/checker.go:321 IntraExpressionInferenceSite
+// Go: checker/checker.go:322 IntraExpressionInferenceSite
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IntraExpressionInferenceSite {
     pub node: Node,
     pub t: TypeId,
 }
 
-// Go: checker/checker.go:360 intrinsicTypeKinds
+// Go: checker/checker.go:361 intrinsicTypeKinds
 // PORT: Go package map var; read with `INTRINSIC_TYPE_KINDS.get(name)`.
 pub static INTRINSIC_TYPE_KINDS: LazyLock<FxHashMap<&'static str, IntrinsicTypeKind>> =
     LazyLock::new(|| {
@@ -481,7 +481,7 @@ pub static INTRINSIC_TYPE_KINDS: LazyLock<FxHashMap<&'static str, IntrinsicTypeK
         m
     });
 
-// Go: checker/checker.go:507 IterationTypes
+// Go: checker/checker.go:508 IterationTypes
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct IterationTypes {
     pub yield_type: TypeId,
@@ -489,7 +489,7 @@ pub struct IterationTypes {
     pub next_type: TypeId,
 }
 
-// Go: checker/checker.go:521 IterationTypesResolver
+// Go: checker/checker.go:522 IterationTypesResolver
 // PORT: Go func fields are `Rc<dyn Fn(&mut Checker, ...)>`. Go
 // `*diagnostics.Message` fields are always set by
 // `initializeIterationResolvers`, so they are plain `&'static Message`.
@@ -510,7 +510,7 @@ pub struct IterationTypesResolver {
     pub must_have_a_value_diagnostic: &'static Message,
 }
 
-// Go: checker/checker.go:537 WideningContext
+// Go: checker/checker.go:538 WideningContext
 // PORT: Go `*WideningContext` links become `Rc<RefCell<WideningContext>>`;
 // a nil parent is `None`.
 #[derive(Clone, Default)]
@@ -530,14 +530,14 @@ pub struct WideningContext {
     pub widened_types: FxHashMap<TypeId, TypeId>,
 }
 
-// Go: checker/checker.go:546 VarianceStackEntry
+// Go: checker/checker.go:547 VarianceStackEntry
 #[derive(Clone, Debug, Default)]
 pub struct VarianceStackEntry {
     pub symbol: SymbolId,
     pub type_parameters: Vec<TypeId>,
 }
 
-// Go: checker/checker.go:551 maxSerializationLevel
+// Go: checker/checker.go:552 maxSerializationLevel
 pub const MAX_SERIALIZATION_LEVEL: i32 = 2;
 
 // PORT: Go `Program` and `Host` interfaces (checker.go:555-583) are not
@@ -787,8 +787,11 @@ impl FlatKey for TypeId {
 // - `regExpScanner` (Go scanner) and `mu` are out of scope (scanner object,
 //   concurrency) and are not fields. The nil-able Go `ctx` is
 //   `Option<Context>`. `tracer` is the last field (see `crate::tracing`).
-//   `emitResolver` plus `emitResolverOnce` is the `Option<Rc<EmitResolver>>`
-//   field `emit_resolver`.
+//   `emitResolverLinks` (ts#64649) is `emit_resolver_links`. The
+//   `emit_resolver` field is not in Go N' (ts#64649 removed `emitResolver`
+//   and `emitResolverOnce`): it keeps the resolver of `get_emit_resolver`,
+//   which the declarations symbol tracker and declaration diagnostics use
+//   (see its note).
 // - `sync.Once` fields become `bool` "done" flags.
 // - `*T` pools and shared structs (`*Relation`, `*Relater`, `*FlowState`,
 //   `*InferenceState`) are `Rc<RefCell<T>>`; nil-able ones are `Option`.
@@ -834,6 +837,8 @@ pub struct Checker {
     pub exact_optional_property_types: bool,
     pub can_collect_symbol_alias_accessibility_data: bool,
     pub emit_resolver: Option<Rc<crate::checker::emit_resolver_p1::EmitResolver>>,
+    // ts#64649, Go N' checker.go:893
+    pub emit_resolver_links: crate::checker::emit_resolver_p1::EmitResolverLinks,
     pub was_canceled: bool,
     pub array_variances: SharedList<VarianceFlags>,
     pub globals: SymbolTable,
@@ -895,6 +900,8 @@ pub struct Checker {
     pub diagnostics: DiagnosticsCollection,
     pub suggestion_diagnostics: DiagnosticsCollection,
     pub merged_symbols: FxHashMap<SymbolId, SymbolId>,
+    // Go N' checker.go:673 mergedExportsChecked (ts#64566)
+    pub merged_exports_checked: FxHashSet<SymbolId>,
     pub factory: NodeFactory,
     pub node_links: LinkStore<Node, NodeLinks>,
     pub signature_links: LinkStore<Node, Box<SignatureLinks>>,
@@ -923,6 +930,9 @@ pub struct Checker {
     pub reverse_mapped_symbol_links: LinkStore<SymbolId, ReverseMappedSymbolLinks>,
     pub marked_assignment_symbol_links: LinkStore<SymbolId, MarkedAssignmentSymbolLinks>,
     pub symbol_container_links: LinkStore<SymbolId, Box<ContainingSymbolLinks>>,
+    // ts#64469, Go N' checker.go:701. Go nil is `None`.
+    pub external_module_containers:
+        Option<Box<crate::checker::symbol_accessibility::ExternalModuleContainerIndex>>,
     pub source_file_links: LinkStore<Node, Box<SourceFileLinks>>,
     pub pattern_for_type: FxHashMap<TypeId, Node>,
     pub context_free_types: FxHashMap<Node, TypeId>,
@@ -1084,6 +1094,8 @@ pub struct Checker {
     pub get_global_promise_type: GlobalTypeFn,
     pub get_global_promise_type_checked: GlobalTypeFn,
     pub get_global_promise_like_type: GlobalTypeFn,
+    // ts#63915, Go N' checker.go:854
+    pub get_global_abstract_module_source_type: GlobalTypeFn,
     pub get_global_promise_constructor_symbol: GlobalSymbolFn,
     pub get_global_promise_constructor_symbol_or_nil: GlobalSymbolFn,
     pub get_global_omit_symbol: GlobalSymbolFn,
@@ -1277,7 +1289,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:911 NewChecker
+// Go: checker/checker.go:913 NewChecker
 // PORT: Go `NewChecker(program) (*Checker, *sync.Mutex)` becomes
 // `Checker::new(checker_index)`. The program is the installed `prog()`; the
 // mutex is dropped, and the tracer comes from the process tracing session
@@ -1360,6 +1372,7 @@ impl Checker {
                 .verbatim_module_syntax
                 .is_false_or_unknown(),
             emit_resolver: None,
+            emit_resolver_links: Default::default(),
             was_canceled: false,
             array_variances: vec![VarianceFlags::COVARIANT].into(),
             globals: SymbolTable::NIL,
@@ -1412,6 +1425,7 @@ impl Checker {
             diagnostics: DiagnosticsCollection::default(),
             suggestion_diagnostics: DiagnosticsCollection::default(),
             merged_symbols: FxHashMap::default(),
+            merged_exports_checked: FxHashSet::default(),
             // Go leaves `factory` as the zero `ast.NodeFactory`.
             factory: NodeFactory::new(),
             node_links: LinkStore::default(),
@@ -1440,6 +1454,7 @@ impl Checker {
             reverse_mapped_symbol_links: LinkStore::default(),
             marked_assignment_symbol_links: LinkStore::default(),
             symbol_container_links: LinkStore::default(),
+            external_module_containers: None,
             source_file_links: LinkStore::default(),
             pattern_for_type: FxHashMap::default(),
             context_free_types: FxHashMap::default(),
@@ -1595,6 +1610,7 @@ impl Checker {
             get_global_promise_type: nil_global_type_fn(),
             get_global_promise_type_checked: nil_global_type_fn(),
             get_global_promise_like_type: nil_global_type_fn(),
+            get_global_abstract_module_source_type: nil_global_type_fn(),
             get_global_promise_constructor_symbol: nil_global_symbol_fn(),
             get_global_promise_constructor_symbol_or_nil: nil_global_symbol_fn(),
             get_global_omit_symbol: nil_global_symbol_fn(),
@@ -2088,6 +2104,12 @@ impl Checker {
             c.get_global_type_resolver("Promise", 1 /*arity*/, true /*reportErrors*/);
         c.get_global_promise_like_type =
             c.get_global_type_resolver("PromiseLike", 1 /*arity*/, true /*reportErrors*/);
+        // ts#63915, Go N' checker.go:1095
+        c.get_global_abstract_module_source_type = c.get_global_type_resolver(
+            "AbstractModuleSource",
+            0,    /*arity*/
+            true, /*reportErrors*/
+        );
         c.get_global_promise_constructor_symbol =
             c.get_global_value_symbol_resolver("Promise", true /*reportErrors*/);
         c.get_global_promise_constructor_symbol_or_nil =

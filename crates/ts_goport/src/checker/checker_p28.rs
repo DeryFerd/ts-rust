@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::hash::BuildHasher;
 
 impl Checker {
-    // Go: checker/checker.go:25520 newUniqueESSymbolType
+    // Go: checker/checker.go:25589 newUniqueESSymbolType
     pub fn new_unique_es_symbol_type(&mut self, symbol: SymbolId, name: &str) -> TypeId {
         let name = name.to_string();
         let t = self.new_type_with(TypeFlags::UNIQUE_ES_SYMBOL, ObjectFlags::NONE, move || {
@@ -21,7 +21,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25528 newObjectType
+    // Go: checker/checker.go:25597 newObjectType
     pub fn new_object_type(&mut self, object_flags: ObjectFlags, symbol: SymbolId) -> TypeId {
         // PERF: the boxed kinds are allocated here, before `new_type_with`,
         // so its closure makes no call and the `Type` (with the large inline
@@ -71,7 +71,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25555 newAnonymousType
+    // Go: checker/checker.go:25624 newAnonymousType
     pub fn new_anonymous_type(
         &mut self,
         symbol: SymbolId,
@@ -91,7 +91,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25561 tryCreateTypeReference
+    // Go: checker/checker.go:25630 tryCreateTypeReference
     pub fn try_create_type_reference(
         &mut self,
         target: TypeId,
@@ -103,12 +103,12 @@ impl Checker {
         self.create_type_reference(target, type_arguments)
     }
 
-    // Go: checker/checker.go:25568 createTypeReference
+    // Go: checker/checker.go:25637 createTypeReference
     pub fn create_type_reference(&mut self, target: TypeId, type_arguments: &[TypeId]) -> TypeId {
         self.create_type_reference_ex(target, type_arguments, ObjectFlags::NONE)
     }
 
-    // Go: checker/checker.go:25572 createTypeReferenceEx
+    // Go: checker/checker.go:25641 createTypeReferenceEx
     pub fn create_type_reference_ex(
         &mut self,
         target: TypeId,
@@ -143,7 +143,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25586 createDeferredTypeReference
+    // Go: checker/checker.go:25655 createDeferredTypeReference
     pub fn create_deferred_type_reference(
         &mut self,
         target: TypeId,
@@ -178,7 +178,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25602 cloneTypeReference
+    // Go: checker/checker.go:25671 cloneTypeReference
     pub fn clone_type_reference(&mut self, source: TypeId) -> TypeId {
         let source_symbol = self.ty(source).symbol;
         let t = self.new_object_type(ObjectFlags::REFERENCE, source_symbol);
@@ -197,7 +197,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25610 setStructuredTypeMembers
+    // Go: checker/checker.go:25679 setStructuredTypeMembers
     pub fn set_structured_type_members(
         &mut self,
         t: TypeId,
@@ -259,7 +259,7 @@ impl Checker {
         data.set_signatures(signatures, call_signature_count as i32, index_infos);
     }
 
-    // Go: checker/checker.go:25633 newTypeParameter
+    // Go: checker/checker.go:25702 newTypeParameter
     pub fn new_type_parameter(&mut self, symbol: SymbolId) -> TypeId {
         let t = self.new_type_with(TypeFlags::TYPE_PARAMETER, ObjectFlags::NONE, || {
             TypeData::TypeParameter(TypeParameter::default())
@@ -272,7 +272,7 @@ impl Checker {
     // It is only necessary to do so if a constituent type might be the undefined type, the null type, the type
     // of an object literal or a non-inferrable type. This is because there are operations in the type checker
     // that care about the presence of such types at arbitrary depth in a containing type.
-    // Go: checker/checker.go:25643 getPropagatingFlagsOfTypes
+    // Go: checker/checker.go:25712 getPropagatingFlagsOfTypes
     pub fn get_propagating_flags_of_types(
         &self,
         types: &[TypeId],
@@ -291,7 +291,7 @@ impl Checker {
     // PERF: the data is made in its arena or heap slot (`new_with`) and
     // `types` is written there, so the 216-byte `UnionType` is not copied.
     // The `new_type_with` closure only moves the `ArenaBox` and makes no call.
-    // Go: checker/checker.go:25653 newUnionType
+    // Go: checker/checker.go:25722 newUnionType
     pub fn new_union_type(&mut self, object_flags: ObjectFlags, types: &[TypeId]) -> TypeId {
         let types = SharedList::from(types);
         let mut data = ArenaBox::new_with(UnionType::default);
@@ -302,7 +302,7 @@ impl Checker {
     }
 
     // PERF: built in place, as in `new_union_type`.
-    // Go: checker/checker.go:25659 newIntersectionType
+    // Go: checker/checker.go:25728 newIntersectionType
     pub fn new_intersection_type(&mut self, object_flags: ObjectFlags, types: &[TypeId]) -> TypeId {
         let types = SharedList::from(types);
         let mut data = ArenaBox::new_with(IntersectionType::default);
@@ -312,7 +312,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:25665 newIndexedAccessType
+    // Go: checker/checker.go:25734 newIndexedAccessType
     pub fn new_indexed_access_type(
         &mut self,
         object_type: TypeId,
@@ -328,7 +328,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:25673 newIndexType
+    // Go: checker/checker.go:25742 newIndexType
     pub fn new_index_type(&mut self, target: TypeId, index_flags: IndexFlags) -> TypeId {
         self.new_type_with(TypeFlags::INDEX, ObjectFlags::NONE, || {
             let mut data = IndexType::default();
@@ -338,7 +338,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:25680 newTemplateLiteralType
+    // Go: checker/checker.go:25749 newTemplateLiteralType
     pub fn new_template_literal_type(&mut self, texts: &[String], types: &[TypeId]) -> TypeId {
         // PERF: the lists are made first, so the `new_type_with` closure
         // makes no call.
@@ -357,7 +357,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:25687 newStringMappingType
+    // Go: checker/checker.go:25756 newStringMappingType
     pub fn new_string_mapping_type(&mut self, symbol: SymbolId, target: TypeId) -> TypeId {
         let t = self.new_type_with(TypeFlags::STRING_MAPPING, ObjectFlags::NONE, || {
             let mut data = StringMappingType::default();
@@ -368,7 +368,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25695 newConditionalType
+    // Go: checker/checker.go:25764 newConditionalType
     pub fn new_conditional_type(
         &mut self,
         root: Rc<RefCell<ConditionalRoot>>,
@@ -401,7 +401,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:25705 newSubstitutionType
+    // Go: checker/checker.go:25774 newSubstitutionType
     pub fn new_substitution_type(&mut self, base_type: TypeId, constraint: TypeId) -> TypeId {
         self.new_type_with(TypeFlags::SUBSTITUTION, ObjectFlags::NONE, || {
             let mut data = SubstitutionType::default();
@@ -411,7 +411,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:25712 newSignature
+    // Go: checker/checker.go:25781 newSignature
     // PORT: Go allocates from `signatureArena` and numbers signatures with
     // `SignatureCount`. Here the arena index is the id; both counters stay equal
     // because the arena has a dummy entry at index 0.
@@ -527,7 +527,7 @@ impl Checker {
                     && s.type_parameters_origin == t.type_parameters_origin)
     }
 
-    // Go: checker/checker.go:25728 newIndexInfo
+    // Go: checker/checker.go:25797 newIndexInfo
     pub fn new_index_info(
         &mut self,
         key_type: TypeId,
@@ -548,7 +548,7 @@ impl Checker {
         id
     }
 
-    // Go: checker/checker.go:25738 getRegularTypeOfLiteralType
+    // Go: checker/checker.go:25807 getRegularTypeOfLiteralType
     pub fn get_regular_type_of_literal_type(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::FRESHABLE) {
@@ -566,7 +566,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25752 getFreshTypeOfLiteralType
+    // Go: checker/checker.go:25821 getFreshTypeOfLiteralType
     pub fn get_fresh_type_of_literal_type(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::FRESHABLE) {
@@ -583,13 +583,13 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25766 isFreshLiteralType
+    // Go: checker/checker.go:25835 isFreshLiteralType
     pub fn is_fresh_literal_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         ty.flags.intersects(TypeFlags::FRESHABLE) && ty.as_literal_type().fresh_type == t
     }
 
-    // Go: checker/checker.go:25770 getStringLiteralType
+    // Go: checker/checker.go:25839 getStringLiteralType
     pub fn get_string_literal_type(&mut self, value: &str) -> TypeId {
         self.get_string_literal_type_cow(Cow::Borrowed(value))
     }
@@ -601,7 +601,7 @@ impl Checker {
         self.get_string_literal_type_cow(Cow::Owned(value))
     }
 
-    // Go: checker/checker.go:25770 getStringLiteralType
+    // Go: checker/checker.go:25839 getStringLiteralType
     // PORT: perf (tcsplit1). In Go the map key and the type share one
     // string. Here `string_literal_types` keys on the FxHash of the value and
     // a lookup compares the value of each type in the bucket, so the value
@@ -626,7 +626,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25779 getNumberLiteralType
+    // Go: checker/checker.go:25848 getNumberLiteralType
     pub fn get_number_literal_type(&mut self, value: Number) -> TypeId {
         // NaN cannot be used as a Go map key because NaN != NaN in IEEE 754,
         // so Go map lookups for NaN always miss. Cache NaN type separately.
@@ -657,7 +657,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25796 getBigIntLiteralType
+    // Go: checker/checker.go:25865 getBigIntLiteralType
     pub fn get_big_int_literal_type(&mut self, value: PseudoBigInt) -> TypeId {
         let key = PseudoBigIntKey::from(&value);
         let mut t = self
@@ -678,19 +678,19 @@ impl Checker {
 
     // text is a valid bigint string excluding a trailing `n`, but including a possible prefix `-`.
     // Use `isValidBigIntString(text, roundTripOnly)` before calling this function.
-    // Go: checker/checker.go:25807 parseBigIntLiteralType
+    // Go: checker/checker.go:25876 parseBigIntLiteralType
     pub fn parse_big_int_literal_type(&mut self, text: &str) -> TypeId {
         self.get_big_int_literal_type(PseudoBigInt::parse_valid(text))
     }
 
-    // Go: checker/checker.go:25811 getStringLiteralValue
+    // Go: checker/checker.go:25880 getStringLiteralValue
     pub fn get_string_literal_value(&self, t: TypeId) -> String {
         self.get_string_literal_value_ref(t).to_string()
     }
 
     // PORT: borrowing form of `getStringLiteralValue`. Callers that only read
     // the value use it to skip the `String` clone.
-    // Go: checker/checker.go:25811 getStringLiteralValue
+    // Go: checker/checker.go:25880 getStringLiteralValue
     pub fn get_string_literal_value_ref(&self, t: TypeId) -> &str {
         match self.ty(t).as_literal_type().value.as_ref() {
             Some(LiteralValue::String(s)) => s,
@@ -711,7 +711,7 @@ impl Checker {
             })
     }
 
-    // Go: checker/checker.go:25815 getNumberLiteralValue
+    // Go: checker/checker.go:25884 getNumberLiteralValue
     pub fn get_number_literal_value(&self, t: TypeId) -> Number {
         match self.ty(t).as_literal_type().value.as_ref() {
             Some(LiteralValue::Number(n)) => *n,
@@ -719,7 +719,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:25819 getBigIntLiteralValue
+    // Go: checker/checker.go:25888 getBigIntLiteralValue
     pub fn get_big_int_literal_value(&self, t: TypeId) -> PseudoBigInt {
         match self.ty(t).as_literal_type().value.as_ref() {
             Some(LiteralValue::PseudoBigInt(v)) => v.clone(),
@@ -727,7 +727,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:25823 getBooleanLiteralValue
+    // Go: checker/checker.go:25892 getBooleanLiteralValue
     pub fn get_boolean_literal_value(&self, t: TypeId) -> bool {
         match self.ty(t).as_literal_type().value.as_ref() {
             Some(LiteralValue::Bool(b)) => *b,
@@ -735,7 +735,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:25827 getEnumLiteralType
+    // Go: checker/checker.go:25896 getEnumLiteralType
     pub fn get_enum_literal_type(
         &mut self,
         value: LiteralValue,
@@ -784,7 +784,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25858 isLiteralType
+    // Go: checker/checker.go:25927 isLiteralType
     pub fn is_literal_type(&self, t: TypeId) -> bool {
         let ty = self.ty(t);
         if ty.flags.intersects(TypeFlags::BOOLEAN) {
@@ -799,7 +799,7 @@ impl Checker {
         self.is_unit_type(t)
     }
 
-    // Go: checker/checker.go:25871 isNeitherUnitTypeNorNever
+    // Go: checker/checker.go:25940 isNeitherUnitTypeNorNever
     pub fn is_neither_unit_type_nor_never(&self, t: TypeId) -> bool {
         !self
             .ty(t)
@@ -807,12 +807,12 @@ impl Checker {
             .intersects(TypeFlags::UNIT | TypeFlags::NEVER)
     }
 
-    // Go: checker/checker.go:25875 isUnitType
+    // Go: checker/checker.go:25944 isUnitType
     pub fn is_unit_type(&self, t: TypeId) -> bool {
         self.ty(t).flags.intersects(TypeFlags::UNIT)
     }
 
-    // Go: checker/checker.go:25879 isUnitLikeType
+    // Go: checker/checker.go:25948 isUnitLikeType
     pub fn is_unit_like_type(&mut self, t: TypeId) -> bool {
         // Intersections that reduce to 'never' (e.g. 'T & null' where 'T extends {}') are not unit types.
         let t = self.get_base_constraint_or_type(t);
@@ -829,7 +829,7 @@ impl Checker {
         self.is_unit_type(t)
     }
 
-    // Go: checker/checker.go:25889 extractUnitType
+    // Go: checker/checker.go:25958 extractUnitType
     pub fn extract_unit_type(&self, t: TypeId) -> TypeId {
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
             let u = self
@@ -848,7 +848,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25899 getBaseTypeOfLiteralType
+    // Go: checker/checker.go:25968 getBaseTypeOfLiteralType
     pub fn get_base_type_of_literal_type(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::ENUM_LIKE) {
@@ -871,7 +871,7 @@ impl Checker {
 
     // This like getBaseTypeOfLiteralType, but instead treats enum literals as strings/numbers instead
     // of returning their enum base type (which depends on the types of other literals in the enum).
-    // Go: checker/checker.go:25919 getBaseTypeOfLiteralTypeForComparison
+    // Go: checker/checker.go:25988 getBaseTypeOfLiteralTypeForComparison
     pub fn get_base_type_of_literal_type_for_comparison(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(
@@ -892,7 +892,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25935 getBaseTypeOfEnumLikeType
+    // Go: checker/checker.go:26004 getBaseTypeOfEnumLikeType
     pub fn get_base_type_of_enum_like_type(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         let symbol = self.ty(t).symbol;
@@ -905,7 +905,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25942 getBaseTypeOfLiteralTypeUnion
+    // Go: checker/checker.go:26011 getBaseTypeOfLiteralTypeUnion
     pub fn get_base_type_of_literal_type_union(&mut self, t: TypeId) -> TypeId {
         let key = CachedTypeKey {
             kind: CachedTypeKind::LITERAL_UNION_BASE_TYPE,
@@ -921,7 +921,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:25952 getWidenedLiteralType
+    // Go: checker/checker.go:26021 getWidenedLiteralType
     pub fn get_widened_literal_type(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::ENUM_LIKE) && self.is_fresh_literal_type(t) {
@@ -942,7 +942,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25970 getWidenedUniqueESSymbolType
+    // Go: checker/checker.go:26039 getWidenedUniqueESSymbolType
     pub fn get_widened_unique_es_symbol_type(&mut self, t: TypeId) -> TypeId {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::UNIQUE_ES_SYMBOL) {
@@ -955,7 +955,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:25980 getWidenedLiteralLikeTypeForContextualType
+    // Go: checker/checker.go:26049 getWidenedLiteralLikeTypeForContextualType
     pub fn get_widened_literal_like_type_for_contextual_type(
         &mut self,
         t: TypeId,
@@ -969,7 +969,7 @@ impl Checker {
         self.get_regular_type_of_literal_type(t)
     }
 
-    // Go: checker/checker.go:25987 isLiteralOfContextualType
+    // Go: checker/checker.go:26056 isLiteralOfContextualType
     pub fn is_literal_of_contextual_type(
         &mut self,
         candidate_type: TypeId,
@@ -1021,7 +1021,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:26019 mapTypeWithAlias
+    // Go: checker/checker.go:26088 mapTypeWithAlias
     pub fn map_type_with_alias(
         &mut self,
         t: TypeId,
@@ -1035,7 +1035,7 @@ impl Checker {
         self.map_type(t, f)
     }
 
-    // Go: checker/checker.go:26026 mapType
+    // Go: checker/checker.go:26095 mapType
     pub fn map_type(
         &mut self,
         t: TypeId,
@@ -1044,7 +1044,7 @@ impl Checker {
         self.map_type_ex(t, f, false /*noReductions*/)
     }
 
-    // Go: checker/checker.go:26030 mapTypeEx
+    // Go: checker/checker.go:26099 mapTypeEx
     pub fn map_type_ex(
         &mut self,
         t: TypeId,
@@ -1110,7 +1110,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:26075 getUnionOrIntersectionType
+    // Go: checker/checker.go:26144 getUnionOrIntersectionType
     pub fn get_union_or_intersection_type(
         &mut self,
         types: &[TypeId],
@@ -1123,7 +1123,7 @@ impl Checker {
         self.get_intersection_type(types)
     }
 
-    // Go: checker/checker.go:26082 getUnionType
+    // Go: checker/checker.go:26151 getUnionType
     pub fn get_union_type(&mut self, types: &[TypeId]) -> TypeId {
         self.get_union_type_ex(
             types,
@@ -1140,7 +1140,7 @@ impl Checker {
     // expression constructs such as array literals and the || and ?: operators). Named types can
     // circularly reference themselves and therefore cannot be subtype reduced during their declaration.
     // For example, "type Item = string | (() => Item" is a named type that circularly references itself.
-    // Go: checker/checker.go:26093 getUnionTypeEx
+    // Go: checker/checker.go:26162 getUnionTypeEx
     pub fn get_union_type_ex(
         &mut self,
         types: &[TypeId],
@@ -1190,7 +1190,7 @@ impl Checker {
         self.get_union_type_worker(types, union_reduction, alias, origin)
     }
 
-    // Go: checker/checker.go:26118 getUnionTypeWorker
+    // Go: checker/checker.go:26187 getUnionTypeWorker
     pub fn get_union_type_worker(
         &mut self,
         types: &[TypeId],
@@ -1270,7 +1270,7 @@ impl Checker {
         if origin.is_nil() && includes.intersects(TypeFlags::UNION) {
             let named_unions = self.add_named_unions(Vec::new(), types);
             let mut reduced_types: Vec<TypeId> = Vec::new();
-            // Go: checker/checker.go:26175 `containsType(u.Types(), t)` for
+            // Go: checker/checker.go:26244 `containsType(u.Types(), t)` for
             // each `t` and named union `u`, until one contains `t`.
             // PERF: unionsort1. The keys of each named union's types are read
             // once, when it is first searched, and the key of each `t` once.
@@ -1323,7 +1323,7 @@ impl Checker {
     }
 
     // This function assumes the constituent type list is sorted and deduplicated.
-    // Go: checker/checker.go:26201 getUnionTypeFromSortedList
+    // Go: checker/checker.go:26270 getUnionTypeFromSortedList
     pub fn get_union_type_from_sorted_list(
         &mut self,
         types: &[TypeId],
@@ -1361,14 +1361,14 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:26222 UnionTypes
+    // Go: checker/checker.go:26291 UnionTypes
     // PORT: Go returns `iter.Seq[*Type]` over the map values; this returns
     // them as a `Vec` (map order, like Go).
     pub fn union_types(&self) -> Vec<TypeId> {
         self.union_types.values().copied().collect()
     }
 
-    // Go: checker/checker.go:26226 addTypesToUnion
+    // Go: checker/checker.go:26295 addTypesToUnion
     pub fn add_types_to_union(&mut self, source_types: &[TypeId]) -> (TypeSet, TypeFlags) {
         let mut types = TypeSet::with_capacity(source_types.len());
         let mut includes = TypeFlags::NONE;
@@ -1423,14 +1423,14 @@ impl Checker {
         }
         if types.len() >= 2 {
             // Sort and deduplicate types
-            // Go: checker/checker.go:26275 slices.SortStableFunc(types, CompareTypes)
+            // Go: checker/checker.go:26344 slices.SortStableFunc(types, CompareTypes)
             self.sort_union_types(&mut types);
             types.dedup();
         }
         (types, includes)
     }
 
-    // Go: checker/checker.go:26289 addNamedUnions
+    // Go: checker/checker.go:26358 addNamedUnions
     pub fn add_named_unions(&self, named_unions: Vec<TypeId>, types: &[TypeId]) -> Vec<TypeId> {
         let mut named_unions = named_unions;
         for &t in types {
@@ -1451,7 +1451,7 @@ impl Checker {
         named_unions
     }
 
-    // Go: checker/checker.go:26303 removeRedundantLiteralTypes
+    // Go: checker/checker.go:26372 removeRedundantLiteralTypes
     // PORT: Go returns the filtered slice; Rust filters `types` in place.
     pub fn remove_redundant_literal_types(
         &mut self,
@@ -1484,7 +1484,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:26322 removeStringLiteralsMatchedByTemplateLiterals
+    // Go: checker/checker.go:26391 removeStringLiteralsMatchedByTemplateLiterals
     // PORT: Go returns the filtered slice; Rust filters `types` in place.
     // PERF (sortmisc1): Go calls `isTypeMatchedByTemplateLiteralOrStringMapping`
     // for each template until one matches. For a template literal, that call
@@ -1521,7 +1521,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:26339 isTypeMatchedByTemplateLiteralOrStringMapping
+    // Go: checker/checker.go:26408 isTypeMatchedByTemplateLiteralOrStringMapping
     pub fn is_type_matched_by_template_literal_or_string_mapping(
         &mut self,
         t: TypeId,
@@ -1550,7 +1550,7 @@ impl Checker {
         self.is_member_of_string_mapping(t, template)
     }
 
-    // Go: checker/checker.go:26346 removeConstrainedTypeVariables
+    // Go: checker/checker.go:26415 removeConstrainedTypeVariables
     // PORT: Go returns the new slice; Rust changes `types` in place.
     pub fn remove_constrained_type_variables(&mut self, types: &mut TypeSet) {
         let mut type_variables: Vec<TypeId> = Vec::new();
@@ -1631,7 +1631,7 @@ impl Checker {
         None
     }
 
-    // Go: checker/checker.go:26399 removeSubtypes
+    // Go: checker/checker.go:26468 removeSubtypes
     // PORT: Go returns the reduced slice, or nil when the union is too
     // complex. Rust reduces `types` in place and returns false for nil.
     pub fn remove_subtypes(&mut self, types: &mut TypeSet, has_object_types: bool) -> bool {

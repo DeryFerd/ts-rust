@@ -253,6 +253,7 @@ fn observe_project(session: &Rc<Session>, root: &str, config: &str) -> Observed 
             })
             .collect(),
         resolutions,
+        // ts#64544: the seen files map each path to its file name.
         seen: paths(
             &host
                 .source_fs
@@ -260,7 +261,10 @@ fn observe_project(session: &Rc<Session>, root: &str, config: &str) -> Observed 
                 .borrow()
                 .as_ref()
                 .unwrap()
-                .borrow(),
+                .borrow()
+                .keys()
+                .cloned()
+                .collect(),
         ),
         missing_directories: paths(
             &host
@@ -1294,7 +1298,7 @@ os_child_test! {
             .expect("the default resolver");
         for name in [&broken, &not_installed] {
             assert!(
-                resolver.caches.package_json_info_cache.get(name).is_none(),
+                resolver.package_json_info_cache.get(name).is_none(),
                 "the loader looked up {name} itself"
             );
         }
