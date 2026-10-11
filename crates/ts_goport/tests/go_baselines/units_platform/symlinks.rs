@@ -40,7 +40,7 @@ fn dir_path(p: &str) -> Path {
     tspath::to_path(p, "/test/dir", true).ensure_trailing_directory_separator()
 }
 
-// Go: knownsymlinks_test.go:25 TestSetDirectory
+// Go: knownsymlinks_test.go:23 TestSetDirectory
 #[test]
 fn test_set_directory() {
     let mut cache = KnownSymlinks::new("/test/dir", true);
@@ -66,10 +66,10 @@ fn test_set_directory() {
         .expect("Expected a directory link");
     assert_eq!(stored.real, real_directory.real);
     assert_eq!(stored.real_path, real_directory.real_path);
-    // ts#64544
+    // Go N' (ts#64159, knownsymlinks_test.go:45-47)
     assert_eq!(
-        stored.symlink, "/test/symlink/",
-        "Expected Symlink to preserve '/test/symlink/'"
+        stored.symlink, "/test/symlink",
+        "Expected Symlink to preserve '/test/symlink'"
     );
 
     // Check that realpath mapping was created
