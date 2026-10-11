@@ -44,8 +44,9 @@ jobs:
         with:
           persist-credentials: false
       # After checkout: its clean step would empty a disk mounted in the workspace. A sticky disk commits only
-      # when the job ends with no failed or cancelled step: the idle timeout end commits (testbox.sh release),
-      # `blacksmith testbox stop` cancels the job and does not (testbox.sh stop).
+      # when the job ends with no failed or cancelled step: the idle timeout end requests a commit (testbox.sh
+      # release; not every request lands, see scripts/goport/README.md), `blacksmith testbox stop` cancels the
+      # job and does not (testbox.sh stop).
       - uses: useblacksmith/stickydisk@v1
         with:
           key: ts-rust-testbox-target

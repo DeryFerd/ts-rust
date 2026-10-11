@@ -323,10 +323,13 @@ scripts/goport/testbox.sh stop                                  # or release (se
   failed or cancelled step. `stop` cancels the job, so its writes are lost. `release` forgets the testbox,
   which ends at its idle timeout (`TESTBOX_IDLE`, default 15 minutes) and requests a commit.
   - Not every requested commit lands. On 2026-10-10, five testboxes that lived 2 to 13 minutes committed,
-    up to 2.1 GiB (a warm target after `tests` and `np-suite`). Two that lived 25 and 27 minutes, each with
-    15 idle minutes at the end, requested 2 GiB commits that never landed, one of them with no `stop`.
-  - So for a commit, warm up with `TESTBOX_IDLE=1` and release right after the last command (a gap of more
-    than a minute between commands then ends the testbox). `TESTBOX_ID=<id> testbox.sh status` shows the end.
+    up to 2.1 GiB (a warm target after `tests` and `np-suite`). One that lived 27 minutes (10 to 15 idle
+    minutes at the end, no `stop`) requested a 2 GiB commit that never landed. The cause is not known: a
+    39-minute testbox of another session probably did commit.
+  - `TESTBOX_IDLE=1` with a release right after the last command gave commits that landed. Only `tests`
+    and `np-suite` keep a testbox alive: with a short idle timeout, a `run` or `pin` command longer than
+    about 6 minutes is cut off (the VM waits at most 290 s for SSH sessions, then shuts down).
+    `TESTBOX_ID=<id> testbox.sh status` shows the end.
   - The last commit wins, across branches too: every branch uses the same disk keys.
 - Times (2026-10-10, cold target): `tests` 502 s (test bins 3.6 min, suite 4.7 min), `np-suite` 112 s.
 - Not on testboxes yet: the gate, the LSP and API oracle batteries, `candidate.sh side` and `perf.sh`.
