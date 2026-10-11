@@ -236,12 +236,6 @@ struct FileStore {
     /// (`SlotLinks::NONE`) when the slot is made and written by
     /// `StoreChildLinks` and `replace_store_node_data`.
     build_links: Vec<SlotLinks>,
-    /// The name and keyword bit of each identifier text of this file, keyed
-    /// by the interned text. Port only: Go stopped interning parser texts
-    /// (`internIdentifier`) in tsgo#4731. Dropped by the freeze.
-    // PERF: one text hash per identifier node; the process-wide intern (a
-    // shard `Mutex`) runs once per distinct text of the file.
-    identifier_names: FxHashMap<&'static str, (Name, bool)>,
     /// U1 (e): binder capacity hints, made with `facts`.
     bind_estimate: BindEstimate,
 }
@@ -2039,6 +2033,81 @@ pub fn new_file_store(file_name: &'static str, text: impl Into<FileText>) -> usi
     id
 }
 
+thread_local! {
+    /// U1 (a): the name and the `text_is_keyword` bit of each identifier
+    /// text that a parse on this thread made (`slot_text_name`), keyed by
+    /// the interned text. Port only: Go stopped interning parser texts
+    /// (`internIdentifier`) in tsgo#4731. A cache of `Name::from`, whose id
+    /// of a text never changes, so what it holds and when it is emptied
+    /// change no output. Emptied when it reaches `IDENTIFIER_NAMES_CAP`
+    /// texts, and on the loading thread by `publish_file_stores`, so the
+    /// check phase does not hold it. A parse worker's map goes with its
+    /// thread.
+    // PERF: perfP2 item 3. One map per thread, not per file: a text that an
+    // earlier file of the thread had is one probe, not a process-wide
+    // intern (the text hash again, the thread cache, the lib name table,
+    // the shard lock), a keyword test and an insert.
+    static IDENTIFIER_NAMES: RefCell<FxHashMap<&'static str, (Name, bool)>> =
+        const { RefCell::new(FxHashMap::with_hasher(rustc_hash::FxBuildHasher)) };
+}
+
+/// `IDENTIFIER_NAMES` is emptied before an insert at this many texts (about
+/// 3 MiB of map).
+const IDENTIFIER_NAMES_CAP: usize = 1 << 16;
+
+/// U1 (a): the name and the `text_is_keyword` bit of a new slot of kind
+/// `kind` with data `data`. The text is `text`, or the data text when `text`
+/// is `None`. `Name::default()` and false for a kind other than Identifier
+/// and PrivateIdentifier.
+#[inline]
+fn slot_text_name(kind: SyntaxKind, data: &NodeData, text: Option<&str>) -> (Name, bool) {
+    if !is_name_kind(kind) {
+        return (Name::default(), false);
+    }
+    let text = text.unwrap_or_else(|| identifier_text(data));
+    // After the thread-local destructors ran (`try_with` fails), the text
+    // takes the intern without the map.
+    IDENTIFIER_NAMES
+        .try_with(|names| {
+            let mut names = names.borrow_mut();
+            match names.get(text) {
+                Some(entry) => entry.clone(),
+                None => new_identifier_name(&mut names, text),
+            }
+        })
+        .unwrap_or_else(|_| interned_identifier_name(text))
+}
+
+/// `slot_text_name` for a text that `names` does not hold: interns it and
+/// adds it.
+#[inline(never)]
+fn new_identifier_name(
+    names: &mut FxHashMap<&'static str, (Name, bool)>,
+    text: &str,
+) -> (Name, bool) {
+    if names.len() >= IDENTIFIER_NAMES_CAP {
+        names.clear();
+    }
+    let entry = interned_identifier_name(text);
+    // U1 (d): the key is the interned text, which lives as long as the map.
+    // The data of a store identifier has no text to borrow.
+    names.insert(entry.0.as_str(), entry.clone());
+    entry
+}
+
+/// The name and the `text_is_keyword` bit of identifier text `text`.
+fn interned_identifier_name(text: &str) -> (Name, bool) {
+    (
+        Name::from(text),
+        get_identifier_token(text) != SyntaxKind::Identifier,
+    )
+}
+
+/// Empties the `IDENTIFIER_NAMES` map of this thread.
+fn clear_identifier_names() {
+    let _ = IDENTIFIER_NAMES.try_with(|names| *names.borrow_mut() = FxHashMap::default());
+}
+
 /// Text bytes per slot that a new store reserves for (`FileStore::new`).
 // PERF: U1 (e). The TypeScript parser makes one node for about 6 to 8 text
 // bytes of the Query, Zod and Hono sources, and one for about 14 to 21 bytes
@@ -2061,9 +2130,6 @@ impl FileStore {
         nodes.push(None);
         let mut build_links = Vec::with_capacity(slots);
         build_links.push(SlotLinks::NONE);
-        // PERF: U1 (a). About one distinct identifier text per 16 slots, so
-        // the map of a large file does not rehash while it grows.
-        let identifier_names = FxHashMap::with_capacity_and_hasher(slots / 16, Default::default());
         Self {
             file_name,
             text,
@@ -2072,38 +2138,8 @@ impl FileStore {
             kids,
             nodes,
             build_links,
-            identifier_names,
             ..Self::default()
         }
-    }
-
-    /// U1 (a): the name and the `text_is_keyword` bit of a new slot
-    /// of kind `kind` with data `data`. The text is `text`, or the data text
-    /// when `text` is `None`. `Name::default()` and false for a kind other
-    /// than Identifier and PrivateIdentifier.
-    #[inline]
-    fn slot_text_name(
-        &mut self,
-        kind: SyntaxKind,
-        data: &NodeData,
-        text: Option<&str>,
-    ) -> (Name, bool) {
-        if !matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier) {
-            return (Name::default(), false);
-        }
-        let text = text.unwrap_or_else(|| identifier_text(data));
-        if let Some(entry) = self.identifier_names.get(text) {
-            return entry.clone();
-        }
-        // U1 (d): the key is the interned text, which lives as long as the
-        // map. The data of a store identifier has no text to borrow.
-        let entry = (
-            Name::from(text),
-            get_identifier_token(text) != SyntaxKind::Identifier,
-        );
-        self.identifier_names
-            .insert(entry.0.as_str(), entry.clone());
-        entry
     }
 
     /// The record, kind, kids and link vectors have one entry per slot.
@@ -3744,7 +3780,7 @@ impl FileStore {
 
     /// Makes `facts` and the U1 (e) `bind_estimate` in one pass over the
     /// slots, and calls `each` on every slot record. Then moves the R2-5
-    /// build vector into `links` and drops `identifier_names`.
+    /// build vector into `links`.
     // PERF: no pass over the node data. Debug builds check the records and
     // kids against the node data (`debug_check_kids`).
     fn make_facts(&mut self, mut each: impl FnMut(&NodeRecord)) {
@@ -3760,7 +3796,6 @@ impl FileStore {
         self.facts = facts;
         self.facts_made = true;
         self.bind_estimate = counts.estimate();
-        self.identifier_names = FxHashMap::default();
         #[cfg(debug_assertions)]
         self.debug_check_kids();
         // R2-5: a link written after the slot was made must have gone
@@ -3995,6 +4030,7 @@ pub fn publish_file_stores(go_files: Vec<GoFile>) {
     // The cells stay leaked and empty. Nothing reads them after this, and
     // the next build stores of this thread reuse them (`build_store_cell`).
     ACTIVE.set(None);
+    clear_identifier_names();
     let BuildStores {
         base,
         stores: cells,
@@ -6005,7 +6041,7 @@ pub fn replace_store_node_data(n: Node, data: NodeData) {
         let keeps_name = is_name_kind(kind) && identifier_text(&data).is_empty();
         let modifier_bits = super::node::store_node_modifier_bits(kind, &data);
         if !keeps_name {
-            let (name, text_is_keyword) = s.slot_text_name(kind, &data, None);
+            let (name, text_is_keyword) = slot_text_name(kind, &data, None);
             s.records[index].set_bit(NodeRecord::TEXT_IS_KEYWORD, text_is_keyword);
             s.kids[index].set_word(NodeKids::word_of(kind, &name, modifier_bits));
         }
@@ -6288,9 +6324,8 @@ pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
             ),
             format!("facts {:?} bind {:?}", s.facts, s.bind_estimate),
             format!(
-                "build {} {} names {}",
+                "build {} {}",
                 s.build_links.len(),
-                s.identifier_names.len(),
                 s.ecma_line_starts.get().is_some()
             ),
             format!(
@@ -6470,7 +6505,7 @@ fn alloc_store_slot_node(
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.records.len() as u32;
-        let (name, text_is_keyword) = s.slot_text_name(kind, node, text);
+        let (name, text_is_keyword) = slot_text_name(kind, node, text);
         s.push_node_header(kind, text_is_keyword);
         s.nodes.push(Some(node));
         s.push_no_cell();
@@ -6523,7 +6558,7 @@ fn alloc_store_owned_slot(
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.records.len() as u32;
-        let (name, text_is_keyword) = s.slot_text_name(kind, &node, text);
+        let (name, text_is_keyword) = slot_text_name(kind, &node, text);
         s.push_node_header(kind, text_is_keyword);
         let owned = s.owned_mut();
         let cell = owned.push(node);
