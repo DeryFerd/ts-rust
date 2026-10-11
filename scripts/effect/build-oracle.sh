@@ -19,6 +19,8 @@
 # the pin's go.mod names only "go 1.27") and go build runs with -trimpath, so every out dir gives the
 # same tsc. With the default revisions that is KNOWN_SHA below: the e1 goldens are keyed to it
 # (lsp_oracle.py golden/<sha12>). A different sha with the default revisions stops the script (exit 3).
+# The shared copy that lsp_battery_effect.py uses by default is ls-oracle/effect/oracle/<sha12>/bin/tsc
+# (with BUILD.json) in the main checkout's target/continuation-r97-goport.
 #
 # Why it is not a plain repoctl build: effect-tsgo 0.51.1 targets TypeScript a1ef42b9
 # (7.1.0-dev.20261006.1), 55 commits after pin N 673a5f17d713. Between them TypeScript added typed

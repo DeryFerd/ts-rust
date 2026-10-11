@@ -45,7 +45,11 @@ Usage:
 Defaults are in the main checkout's target/continuation-r97-goport: the parent
 of the git common dir from the main checkout or any worktree, or the main
 checkout of lsp_battery_edits.py from an independent clone. A default that is
-not there stops the command with the name of its flag.
+not there stops the command with the name of its flag. The shared out root is
+ls-oracle/effect (traces, golden/<sha12>, results). The default oracle is the
+E0 copy in ls-oracle/effect/oracle/<sha12>/bin/tsc (with its BUILD.json), where
+<sha12> starts the KNOWN_SHA of scripts/effect/build-oracle.sh. A new E0 goes
+in a new oracle/<sha12> dir, and its goldens go in golden/<sha12>.
 
 selfcheck runs E0 16 times by default and then checks the codeAction answers
 that hold two actions with one title. effect-tsgo returns these in a random
@@ -90,9 +94,10 @@ def main_checkout() -> Path:
 
 
 LANES = main_checkout() / "target/continuation-r97-goport"
-DEFAULT_OUT_ROOT = LANES / "effectls0b/ls-oracle/effect"
-# E0 from scripts/effect/build-oracle.sh; its sha256 is the KNOWN_SHA there and keys the goldens.
-DEFAULT_ORACLE = LANES / "effectls0b/e0/a/bin/tsc"
+DEFAULT_OUT_ROOT = LANES / "ls-oracle/effect"
+# E0 from scripts/effect/build-oracle.sh; its sha256 is the KNOWN_SHA there and keys the goldens
+# (golden/<sha12>). The shared copy is in the out root, under oracle/<sha12>.
+DEFAULT_ORACLE = DEFAULT_OUT_ROOT / "oracle/93a772ca8d28/bin/tsc"
 DEFAULT_T3CODE = LANES / "effectlsp1/t3code"
 T3CODE_COMMIT = "e95b57dc"
 LSP_ORACLE = REPO / "scripts/goport/lsp_oracle.py"
