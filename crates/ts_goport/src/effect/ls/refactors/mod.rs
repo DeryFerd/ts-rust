@@ -21,12 +21,17 @@ pub mod async_await_to_gen;
 pub mod async_await_to_gen_try_promise;
 pub mod effect_gen_to_fn;
 pub mod function_to_arrow;
+pub mod make_schema_opaque;
+pub mod make_schema_opaque_with_ns;
 pub mod pipeable_to_datafirst;
 pub mod remove_unnecessary_effect_gen;
+pub mod structural_type_to_schema;
 pub mod toggle_lazy_const;
 pub mod toggle_pipe_style;
 pub mod toggle_return_type_annotation;
 pub mod toggle_type_annotation;
+pub mod type_to_effect_schema;
+pub mod type_to_effect_schema_class;
 pub mod wrap_with_effect_gen;
 pub mod wrap_with_pipe;
 
@@ -50,11 +55,11 @@ pub static ALL: &[&Refactor] = &[
     &function_to_arrow::FUNCTION_TO_ARROW,
     // E9d: LayerMagic,
     // E9d: WriteTagClassAccessors,
-    // E9c: TypeToEffectSchema,
-    // E9c: TypeToEffectSchemaClass,
-    // E9c: MakeSchemaOpaque,
-    // E9c: MakeSchemaOpaqueWithNs,
-    // E9c: StructuralTypeToSchema,
+    &type_to_effect_schema::TYPE_TO_EFFECT_SCHEMA,
+    &type_to_effect_schema_class::TYPE_TO_EFFECT_SCHEMA_CLASS,
+    &make_schema_opaque::MAKE_SCHEMA_OPAQUE,
+    &make_schema_opaque_with_ns::MAKE_SCHEMA_OPAQUE_WITH_NS,
+    &structural_type_to_schema::STRUCTURAL_TYPE_TO_SCHEMA,
 ];
 
 /// The refactor's answer: `action` with its full LSP kind
