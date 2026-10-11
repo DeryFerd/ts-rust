@@ -1346,6 +1346,38 @@ export const program = () =>
 `,
   },
   {
+    // effectGenToFn with a named import of gen in a catch clause variable initializer. Go builds the
+    // nil `.fn` receiver with no panic and prints it only in ReplaceNode, so the panic of
+    // replaceExpressionViaStatement on the CatchClause parent (async_await_to_gen.go:93) comes first.
+    name: "effectGenToFn_namedGenInCatch",
+    profile: "effect-v4",
+    content: `// refactor: 7:22, 2:10
+import { gen, succeed } from "effect/Effect"
+
+export const handler = () => {
+  try {
+    return 1
+  } catch (e = () => gen(function*() { const a = yield* succeed(1); return a })) {
+    return 2
+  }
+}
+`,
+    expected: `=== Refactor Inventory ===
+
+[R1] selection: "7:22-7:22"
+  (error) -32603: InternalError: panic handling request textDocument/codeAction: interface conversion: ast.nodeData is *ast.CatchClause, not *ast.VariableDeclarationList
+
+[R2] selection: "2:10-2:10"
+  (no refactors)
+
+[R3] selection: "empty (0:0-0:0)"
+  (no refactors)
+
+=== Refactor Application Results ===
+(no refactors to apply)
+`,
+  },
+  {
     // asyncAwaitToGen on an async arrow in a catch clause variable initializer under a variable
     // statement: varDecl.Parent is the CatchClause (async_await_to_gen.go:93).
     name: "asyncAwaitToGen_catchVariable",

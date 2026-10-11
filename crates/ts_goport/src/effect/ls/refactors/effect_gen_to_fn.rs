@@ -54,22 +54,37 @@ fn run_effect_gen_to_fn(ctx: &mut RefactorContext<'_, '_>) -> Vec<CodeAction> {
 
     let sf = ctx.source_file;
     let action = ctx.new_refactor_action(&description, |tracker| {
-        let new_node = build_effect_gen_to_fn_replacement(tracker, &parsed, &fn_name);
-        if new_node.is_nil() {
-            return;
-        }
-        set_parent_in_children(new_node);
-
-        match parsed.func_node.kind() {
-            SyntaxKind::FunctionDeclaration | SyntaxKind::MethodDeclaration => {
-                tracker.replace_node(sf, parsed.func_node, new_node, None);
-            }
-            _ => {
-                replace_expression_via_statement(tracker, sf, parsed.func_node, new_node);
-            }
-        }
+        replace_with_effect_fn(tracker, sf, &parsed, &fn_name);
     });
     with_kind(action, "refactor.rewrite.effect.effectGenToFn")
+}
+
+// Go: refactors/effect_gen_to_fn.go:50 the Run closure of runEffectGenToFn
+// PORT: a function of its own, so a test can run it without a program.
+// Both replace calls print the new node inside the call (rewriter
+// `Tracker::replace_node`, as Go `ReplaceNode`). The `<nil>.fn` of a named
+// `gen` import reaches the printer there, after replaceExpressionViaStatement
+// had its chance to panic first.
+fn replace_with_effect_fn(
+    tracker: &mut Tracker,
+    sf: Node,
+    parsed: &EffectGenParsed,
+    fn_name: &str,
+) {
+    let new_node = build_effect_gen_to_fn_replacement(tracker, parsed, fn_name);
+    if new_node.is_nil() {
+        return;
+    }
+    set_parent_in_children(new_node);
+
+    match parsed.func_node.kind() {
+        SyntaxKind::FunctionDeclaration | SyntaxKind::MethodDeclaration => {
+            tracker.replace_node(sf, parsed.func_node, new_node, None);
+        }
+        _ => {
+            replace_expression_via_statement(tracker, sf, parsed.func_node, new_node);
+        }
+    }
 }
 
 // Go: refactors/effect_gen_to_fn.go:76 findFunctionReturningEffectGen
@@ -214,14 +229,9 @@ fn build_effect_gen_to_fn_replacement(
 
     // Build Effect.fn or Effect.fn("name")
     // PORT: `EffectModule` is nil for a named import (`gen(function* ...)`).
-    // Go then builds a property access with a nil expression, and the
-    // printer dereferences it when `NewRefactorAction` gets the changes. The
-    // codeAction request answers Go's internal error for that nil
-    // dereference; the port panics here with the same value. Go prints no
-    // signal line in an answer, so no fault address is needed.
-    if gen_call.effect_module.is_nil() {
-        crate::core::go_nil_dereference();
-    }
+    // As in Go, the clone is nil and the access holds a nil expression with
+    // no panic here. The printer in the replace call reads its kind, which
+    // is Go's nil dereference (`Node::kind`).
     let effect_id = f.deep_clone_node(gen_call.effect_module);
     let fn_access = f.new_property_access_expression(
         effect_id,
@@ -301,5 +311,79 @@ fn build_effect_gen_to_fn_declaration(tracker: &Tracker, node: Node, effect_fn_c
 
         // For arrow functions and function expressions, return the expression directly
         _ => effect_fn_call,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+    use crate::ls::{change, lsconv, lsutil};
+    use crate::lsp::lsproto;
+
+    /// The Go panic text of the effectGenToFn edit on the function around the
+    /// first `gen(` of `text`, a named import of gen.
+    fn named_gen_panic(text: &str) -> Option<String> {
+        let opts = SourceFileParseOptions {
+            file_name: "/gen.ts".to_string(),
+            ..Default::default()
+        };
+        let sf = parse_source_file(&opts, text, ScriptKind::TS).root;
+        let pos = text.find("gen(").expect("a gen call") as i32;
+        let call = astnav::get_token_at_position(sf, pos).parent();
+        assert_eq!(call.kind(), SyntaxKind::CallExpression);
+        let generator_function = call.arguments().get(0);
+        let parsed = EffectGenParsed {
+            func_node: call.parent(),
+            // typeparser EffectGenCall gives no module for a named import.
+            gen_call: Rc::new(EffectGenCallResult {
+                call,
+                effect_module: Node::NIL,
+                options_node: Node::NIL,
+                generator_function,
+                body: generator_function.body(),
+                pipe_arguments: Vec::new(),
+            }),
+            pipe_args: Vec::new(),
+        };
+        let fn_name = get_function_like_name(parsed.func_node);
+        let mut tracker = Tracker::new(change::new_tracker(
+            &crate::gostd::context::background(),
+            &crate::options::CompilerOptions::default(),
+            lsutil::FormatCodeSettings::default(),
+            lsconv::new_converters(lsproto::PositionEncodingKind::UTF16, |_| None),
+        ));
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            replace_with_effect_fn(&mut tracker, sf, &parsed, &fn_name);
+        }))
+        .expect_err("Go panics");
+        payload
+            .downcast_ref::<crate::core::GoPanic>()
+            .map(|p| p.message.clone())
+    }
+
+    // Go builds `<nil>.fn` for a named gen import with no panic
+    // (effect_gen_to_fn.go:216). The nil dereference comes when ReplaceNode
+    // prints the new node. In a catch clause variable,
+    // replaceExpressionViaStatement panics first (async_await_to_gen.go:93),
+    // before any print.
+    #[test]
+    fn named_gen_panics_where_go_panics() {
+        assert_eq!(
+            named_gen_panic(
+                "import { gen } from \"effect/Effect\"\nexport const program = () => gen(function*() { return 1 })\n"
+            )
+            .as_deref(),
+            Some("runtime error: invalid memory address or nil pointer dereference")
+        );
+        assert_eq!(
+            named_gen_panic(
+                "import { gen } from \"effect/Effect\"\nexport const handler = () => {\n  try {\n    return 1\n  } catch (e = () => gen(function*() { return 1 })) {\n    return 2\n  }\n}\n"
+            )
+            .as_deref(),
+            Some(
+                "interface conversion: ast.nodeData is *ast.CatchClause, not *ast.VariableDeclarationList"
+            )
+        );
     }
 }
