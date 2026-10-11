@@ -117,10 +117,10 @@ impl AliasResolver {
     // (project/parsecache.go:80, ts#63952). So a root file is always bound
     // in Go, also a new parse of a file of an ancestor bucket that this
     // clone did not build (`resolveAmbientModuleName`, registry.go:1844).
-    // The port's registry host does not bind (`parsecache::acquire_bound`),
-    // so every root file is bound here. The registry test
-    // `second_pass_reads_a_root_file_of_an_ancestor_bucket_in_a_later_clone`
-    // gives Go N''s export counts.
+    // The port's parse cache does not bind (`parsecache::new_parse_cache`),
+    // so every root file is bound here. Go N' and the port give the same
+    // export counts in the registry test
+    // `second_pass_reads_a_root_file_of_an_ancestor_bucket_in_a_later_clone`.
     // PORT: Go's `NewChecker` has no context. `ctx` is for
     // `should_stop_build`: a build that the caller drops on cancel stops
     // before the program, and gets `None`. For any other context the result
