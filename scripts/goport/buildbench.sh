@@ -29,6 +29,11 @@ OUT=$1 LABEL=$2 TC=$3 PROFILE=$4 ACTION=$5 FLAGS=${6:-}
 WT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$WT" || exit 2
 mkdir -p "$OUT/logs"
+# A results.tsv from before the cmd and peak_kib columns would get rows with 2 more fields.
+if [[ -s $OUT/results.tsv ]] && ! head -1 "$OUT/results.tsv" | grep -q $'\tpeak_kib$'; then
+  echo "$OUT/results.tsv has no cmd and peak_kib columns (an older buildbench.sh): use a new out-dir" >&2
+  exit 2
+fi
 INCR=${BENCH_INCREMENTAL:-0}
 CMD=${BENCH_CMD:-build --bins}
 read -ra cmd <<< "$CMD"
