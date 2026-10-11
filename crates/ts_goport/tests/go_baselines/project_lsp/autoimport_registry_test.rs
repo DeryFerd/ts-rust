@@ -1576,3 +1576,63 @@ child_test! {
         assert_eq!(exports[0].module_file_name, format!("{aug}/index.ts"));
     }
 }
+
+child_test! {
+    // R191 reviewer item 7: no program imports dep-pkg, so its other.d.ts
+    // is in no program. The checker asks for it when it resolves the alias
+    // `y`, and the alias resolver reads and binds it then
+    // (aliasresolver.go:83-91), after the checker copied the binder
+    // lineage. The checker must add the new lineage chunks before it reads
+    // the file's symbols (`program::catch_up_alias_resolver_checker`, at
+    // the checker.go:15531 site). The tests above do not show this: their
+    // alias targets are program files, which the program bound before the
+    // checker was made.
+    fn alias_target_in_no_program_is_bound_after_the_checker() {
+        let root = "/home/src/alias-catch-up";
+        let pkg = format!("{root}/node_modules/dep-pkg");
+        let index_text = "export const app = 1;\n";
+        let mut files = FileMap::new();
+        let mut add = |path: String, text: &str| {
+            files.insert(path, text.into());
+        };
+        add(
+            format!("{root}/tsconfig.json"),
+            r#"{"compilerOptions":{"module":"esnext","moduleResolution":"bundler"}}"#,
+        );
+        add(
+            format!("{root}/package.json"),
+            r#"{"name":"alias-catch-up","dependencies":{"dep-pkg":"*"}}"#,
+        );
+        add(format!("{root}/index.ts"), index_text);
+        add(
+            format!("{pkg}/package.json"),
+            r#"{"name":"dep-pkg","version":"1.0.0","types":"index.d.ts"}"#,
+        );
+        add(format!("{pkg}/index.d.ts"), "import { y } from \"./other\";\nexport { y };\n");
+        add(format!("{pkg}/other.d.ts"), "export declare const y: number;\n");
+        let (session, _) = projecttestutil::setup(files);
+        let index_uri = uri(&format!("file://{root}/index.ts"));
+        open_uri(&session, &index_uri, index_text, lsproto::LanguageKind::TYPE_SCRIPT);
+
+        with_auto_imports(&session, &index_uri);
+
+        let snapshot = session.snapshot();
+        let project = snapshot.get_default_project(&index_uri).expect("default project");
+        let program = project.borrow().get_program().expect("project has a program");
+        assert!(program.get_source_file(&format!("{pkg}/other.d.ts")).is_none());
+        let registry = snapshot
+            .auto_import_registry()
+            .expect("auto import registry not initialized");
+        assert_eq!(registry.node_modules.len(), 1);
+        let bucket = registry.node_modules.values().next().unwrap();
+        let index = bucket.index.as_ref().expect("an indexed bucket").borrow();
+        let exports = index.find("y", true);
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert_eq!(exports[0].module_file_name, format!("{pkg}/index.d.ts"));
+        assert_eq!(
+            exports[0].target.module_id.as_string(),
+            format!("{pkg}/other.d.ts")
+        );
+        assert_eq!(exports[0].target.export_name, "y");
+    }
+}
