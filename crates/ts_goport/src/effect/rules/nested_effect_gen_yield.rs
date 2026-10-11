@@ -48,17 +48,13 @@ pub fn analyze_nested_effect_gen_yield(
 ) -> Vec<NestedEffectGenYieldMatch> {
     let mut matches = Vec::new();
 
-    // PORT: Go's recursive `walk` closure.
-    fn walk(
+    // PORT: the body of Go's recursive `walk` closure, for one node.
+    fn visit(
         tp: &mut TypeParser<'_>,
         sf: Node,
         matches: &mut Vec<NestedEffectGenYieldMatch>,
         node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    ) {
         if node.kind() == SyntaxKind::YieldExpression {
             let yield_expr = node;
             if yield_expr.asterisk_token().is_some()
@@ -73,11 +69,12 @@ pub fn analyze_nested_effect_gen_yield(
                 });
             }
         }
-
-        node.for_each_child(|child| walk(tp, sf, matches, child));
-        false
     }
 
-    walk(tp, sf, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, n);
+    }
     matches
 }

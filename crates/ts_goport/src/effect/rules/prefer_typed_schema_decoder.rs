@@ -90,16 +90,13 @@ pub fn analyze_prefer_typed_schema_decoder(
         }
     }
 
-    fn walk(
+    fn visit(
         tp: &mut TypeParser<'_>,
         sf: Node,
         matches: &mut Vec<PreferTypedSchemaDecoderMatch>,
         handled_decoder_names: &mut FxHashSet<Node>,
         node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
+    ) {
         if node.kind() == SyntaxKind::CallExpression {
             let call = node;
             if call.argument_list().is_some()
@@ -125,10 +122,12 @@ pub fn analyze_prefer_typed_schema_decoder(
                 }
             }
         }
-        node.for_each_child(|child| walk(tp, sf, matches, handled_decoder_names, child));
-        false
     }
-    walk(tp, sf, &mut matches, &mut handled_decoder_names, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, &mut handled_decoder_names, n);
+    }
     // PORT: Go `sort.Slice` is not stable; the port sorts stably. Matches
     // with the same start come from one decoder name node.
     matches.sort_by(|a, b| a.location.pos().cmp(&b.location.pos()));

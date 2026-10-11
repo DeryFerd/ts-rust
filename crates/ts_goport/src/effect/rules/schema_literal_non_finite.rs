@@ -20,11 +20,7 @@ pub static SCHEMA_LITERAL_NON_FINITE: Rule = Rule {
 fn run_schema_literal_non_finite(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
-    fn walk(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, node: Node) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    fn visit(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, node: Node) {
         if node.kind() == SyntaxKind::CallExpression {
             let call = node;
             if call.is_some() && call.argument_list().is_some() && !call.arguments().is_empty() {
@@ -62,12 +58,13 @@ fn run_schema_literal_non_finite(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnosti
                 }
             }
         }
-
-        node.for_each_child(|child| walk(ctx, diags, child));
-        false
     }
 
     let sf = ctx.source_file;
-    walk(ctx, &mut diags, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diags, n);
+    }
     diags
 }

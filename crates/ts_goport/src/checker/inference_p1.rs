@@ -1851,7 +1851,7 @@ impl Checker {
             && self
                 .ty(target)
                 .as_mapped_type()
-                .declaration
+                .declaration()
                 .name_type()
                 .is_nil()
         {

@@ -54,7 +54,7 @@ fn run_global_fetch(ctx: &mut RuleContext<'_, '_>, check_in_effect: bool) -> Vec
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn walk(
+    fn visit(
         ctx: &mut RuleContext<'_, '_>,
         diags: &mut Vec<Diagnostic>,
         check_in_effect: bool,
@@ -62,10 +62,7 @@ fn run_global_fetch(ctx: &mut RuleContext<'_, '_>, check_in_effect: bool) -> Vec
         message: &'static crate::diagnostics::Message,
         package_name: &str,
         node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
+    ) {
         if node.kind() == SyntaxKind::CallExpression {
             let in_effect = ctx
                 .tp
@@ -85,32 +82,23 @@ fn run_global_fetch(ctx: &mut RuleContext<'_, '_>, check_in_effect: bool) -> Vec
                 }
             }
         }
-
-        node.for_each_child(|child| {
-            walk(
-                ctx,
-                diags,
-                check_in_effect,
-                fetch_symbol,
-                message,
-                package_name,
-                child,
-            )
-        });
-        false
     }
 
     let mut diags = Vec::new();
     let sf = ctx.source_file;
-    walk(
-        ctx,
-        &mut diags,
-        check_in_effect,
-        fetch_symbol,
-        message,
-        package_name,
-        sf,
-    );
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(
+            ctx,
+            &mut diags,
+            check_in_effect,
+            fetch_symbol,
+            message,
+            package_name,
+            n,
+        );
+    }
 
     diags
 }

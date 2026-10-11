@@ -71,27 +71,19 @@ pub fn analyze_outdated_api(tp: &mut TypeParser<'_>, sf: Node) -> Vec<OutdatedAp
 
     let mut matches = Vec::new();
 
-    fn walk(
-        tp: &mut TypeParser<'_>,
-        sf: Node,
-        matches: &mut Vec<OutdatedApiMatch>,
-        n: Node,
-    ) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    fn visit(tp: &mut TypeParser<'_>, sf: Node, matches: &mut Vec<OutdatedApiMatch>, n: Node) {
         if n.kind() == SyntaxKind::PropertyAccessExpression {
             if let Some(m) = check_outdated_api_property_access(tp, sf, n) {
                 matches.push(m);
             }
         }
-
-        n.for_each_child(|child| walk(tp, sf, matches, child));
-        false
     }
 
-    walk(tp, sf, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, n);
+    }
 
     matches
 }

@@ -1273,7 +1273,7 @@ pub const DETACHED_STORE_LIMIT: usize = 0x4000_0000;
 // (one id per edit). At 2^28 that is 7,456 hours, and the 64-byte entry of
 // each id from `LOW_BLOCKS` on (16 GiB at the cap) plus the other memory
 // of each edit runs out first.
-const FILE_ID_LIMIT: usize = 1 << 28;
+pub(crate) const FILE_ID_LIMIT: usize = 1 << 28;
 /// AST node records, step 3: a file id below this has its entry in
 /// `FILE_BLOCKS`; a higher one in a chunk of `HIGH_BLOCKS`.
 const LOW_BLOCKS: usize = 1 << 16;

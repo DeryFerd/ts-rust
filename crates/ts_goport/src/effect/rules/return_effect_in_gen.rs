@@ -56,16 +56,12 @@ pub fn analyze_return_effect_in_gen(
 ) -> Vec<ReturnEffectInGenMatch> {
     let mut matches: Vec<ReturnEffectInGenMatch> = Vec::new();
 
-    fn walk(
+    fn visit(
         tp: &mut TypeParser<'_>,
         sf: Node,
         matches: &mut Vec<ReturnEffectInGenMatch>,
         n: Node,
-    ) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    ) {
         if n.kind() == SyntaxKind::ReturnStatement {
             if check_return_effect_in_gen_scope(tp, sf, n) {
                 matches.push(ReturnEffectInGenMatch {
@@ -75,12 +71,13 @@ pub fn analyze_return_effect_in_gen(
                 });
             }
         }
-
-        n.for_each_child(|child| walk(tp, sf, matches, child));
-        false
     }
 
-    walk(tp, sf, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, n);
+    }
     matches
 }
 

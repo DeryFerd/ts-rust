@@ -25,16 +25,12 @@ fn run_new_promise(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
         return Vec::new();
     }
 
-    fn walk(
+    fn visit(
         ctx: &mut RuleContext<'_, '_>,
         diags: &mut Vec<Diagnostic>,
         promise_symbol: SymbolId,
         node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    ) {
         if node.kind() == SyntaxKind::NewExpression {
             let new_expr = node;
             let sym = ctx.tp.get_symbol_at_location(new_expr.expression());
@@ -48,13 +44,14 @@ fn run_new_promise(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
                 ));
             }
         }
-
-        node.for_each_child(|child| walk(ctx, diags, promise_symbol, child));
-        false
     }
 
     let mut diags = Vec::new();
     let sf = ctx.source_file;
-    walk(ctx, &mut diags, promise_symbol, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diags, promise_symbol, n);
+    }
     diags
 }

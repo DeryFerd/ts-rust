@@ -72,30 +72,27 @@ pub fn analyze_acquire_release_disposable(
     }
 
     let mut matches = Vec::new();
-    walk(tp, sf, disposable, global_symbol, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, disposable, global_symbol, &mut matches, n);
+    }
     matches
 }
 
-fn walk(
+fn visit(
     tp: &mut TypeParser<'_>,
     sf: Node,
     disposable: TypeId,
     global_symbol: SymbolId,
     matches: &mut Vec<AcquireReleaseDisposableMatch>,
     node: Node,
-) -> bool {
-    if node.is_nil() {
-        return false;
-    }
-
+) {
     if let Some(m) =
         analyze_acquire_release_disposable_call(tp, sf, node, disposable, global_symbol)
     {
         matches.push(m);
     }
-
-    node.for_each_child(|child| walk(tp, sf, disposable, global_symbol, matches, child));
-    false
 }
 
 // Go: rules.globalDisposableUnion

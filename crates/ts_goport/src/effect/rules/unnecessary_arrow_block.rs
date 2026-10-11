@@ -47,27 +47,21 @@ pub struct UnnecessaryArrowBlockMatch {
 
 // Go: rules/unnecessary_arrow_block.go AnalyzeUnnecessaryArrowBlock
 pub fn analyze_unnecessary_arrow_block(
-    _tp: &mut TypeParser<'_>,
+    tp: &mut TypeParser<'_>,
     sf: Node,
 ) -> Vec<UnnecessaryArrowBlockMatch> {
     let mut matches = Vec::new();
 
-    fn walk(sf: Node, matches: &mut Vec<UnnecessaryArrowBlockMatch>, n: Node) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
         if n.kind() == SyntaxKind::ArrowFunction
             && let Some(m) = analyze_unnecessary_arrow_block_node(sf, n)
         {
             matches.push(m);
         }
-
-        n.for_each_child(|child| walk(sf, matches, child));
-        false
     }
 
-    walk(sf, &mut matches, sf);
     matches
 }
 
