@@ -1460,14 +1460,14 @@ child_test! {
 }
 
 child_test! {
-    // followups4 (R153 reviewer): the registry extracts a package first with
-    // the narrow walk of lspreg1 (`AliasResolver::new_narrow_checker`), which
-    // does not read the imports of a .ts source. This entrypoint exports a
-    // binding that it imports, so the checker asks for other.ts, which the
-    // narrow walk did not read. That is a miss: the narrow results are
-    // dropped, and the full walk extracts the package again. The export `y`
-    // then has its target in other.ts, as Go gives (Go reads the files that
-    // the checker asks for).
+    // followups4 (R153 reviewer): the first checker of a package can read
+    // only its entrypoints (`AliasResolver::new_checker`; the name is from
+    // the narrow and full walks of lspreg1, which bump D apicb1 replaced).
+    // This entrypoint exports a binding that it imports, so the checker asks
+    // for other.ts. That is a miss: the results are dropped, and a new
+    // checker that can also read other.ts extracts the package again. The
+    // export `y` then has its target in other.ts, as Go gives (Go reads the
+    // files that the checker asks for).
     fn narrow_walk_miss_extracts_the_package_with_the_full_walk() {
         let root = "/home/src/narrow-miss";
         let pkg = format!("{root}/node_modules/src-pkg");

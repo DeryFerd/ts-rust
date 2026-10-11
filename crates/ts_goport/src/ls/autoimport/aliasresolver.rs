@@ -36,8 +36,7 @@ pub struct PathAndFileName {
 // Go: ls/autoimport/aliasresolver.go:21 aliasResolver
 // PORT: Go `collections.SyncMap` values are `RefCell<FxHashMap>` (one
 // thread). A Go nil `symlinks` map is an empty map. The fields after
-// `resolved_modules` are the port's (see `new_checker` and
-// `new_narrow_checker`).
+// `resolved_modules` are the port's (see `new_checker`).
 pub struct AliasResolver {
     pub to_path: Rc<dyn Fn(&str) -> tspath::Path>,
     pub host: Rc<dyn RegistryCloneHost>,
@@ -53,19 +52,13 @@ pub struct AliasResolver {
             Rc<RefCell<FxHashMap<module::ModeAwareCacheKey, Arc<ResolvedModule>>>>,
         >,
     >,
-    /// The resolutions that `new_checker` made before the checker, by file
-    /// path (`prefetch_resolved_module`).
-    pub prefetched_modules:
-        RefCell<FxHashMap<tspath::Path, FxHashMap<module::ModeAwareCacheKey, Arc<ResolvedModule>>>>,
     /// The program of the checker, once `new_checker` made it.
     pub checker_program: Cell<Option<&'static GoProgram>>,
-    /// The ids of the files that the walk of `new_narrow_checker` read. None
-    /// for a full walk.
-    pub narrow_files: RefCell<Option<FxHashSet<usize>>>,
-    /// Set when the checker of a narrow walk asked for a file outside it
-    /// (`get_source_file`). The caller then drops the checker and its
-    /// results, and makes a checker with the full walk.
-    pub missed: Cell<bool>,
+    /// The ids of the files that the checker can read (`new_checker`).
+    pub checker_files: RefCell<FxHashSet<usize>>,
+    /// The files that the checker asked for outside `checker_files`
+    /// (`get_source_file`, `take_missed_files`).
+    pub missed_files: RefCell<Vec<Node>>,
 }
 
 // Go: ls/autoimport/aliasresolver.go:33 newAliasResolver
@@ -85,10 +78,9 @@ pub fn new_alias_resolver(
         symlinks,
         on_failed_ambient_module_lookup,
         resolved_modules: RefCell::new(FxHashMap::default()),
-        prefetched_modules: RefCell::new(FxHashMap::default()),
         checker_program: Cell::new(None),
-        narrow_files: RefCell::new(None),
-        missed: Cell::new(false),
+        checker_files: RefCell::new(FxHashSet::default()),
+        missed_files: RefCell::new(Vec::new()),
     });
     r
 }
@@ -101,100 +93,6 @@ pub fn new_alias_resolver(
 pub fn bind_alias_resolver_source_file(current_directory: &str, file: Node) {
     crate::program::publish_parsed_files(current_directory);
     crate::program::bind_file_outside_program(file);
-}
-
-/// The module names that a checker of an alias resolver can resolve from
-/// `file` (Go `GetResolvedModule` in checker `resolveExternalModule`): every
-/// string module specifier of an import, export, import-equals or JSDoc
-/// import at any module declaration depth, the import calls, `require`
-/// calls and import types, and the string literal module augmentations.
-// PORT: a syntactic walk shaped like Go parser/references.go
-// collectExternalModuleReferences. That walk makes `file.imports`, and it
-// skips relative names inside ambient modules and the bodies of
-// augmentations and namespaces. The checker still resolves those names
-// (`declare module "pkg" { export { foo } from "./impl"; }`), so this walk
-// keeps them. The import calls, `require` calls and import types come from
-// `file.imports`: the parser found them with
-// `ForEachDynamicImportOrRequireCall` (references.go:16), which reads the
-// whole file text, ambient module bodies too. A name found twice is resolved
-// once (`prefetch_resolved_module`).
-fn checker_module_references(file: Node) -> Vec<String> {
-    let info = source_file_info(file);
-    let mut names: Vec<String> = Vec::new();
-    for node in file.statements().iter() {
-        collect_checker_module_references(node, false, &mut names);
-    }
-    names.extend(info.imports.iter().map(|name| name.text().to_string()));
-    // Go: checker mergeModuleAugmentation resolves each augmentation name.
-    names.extend(
-        info.module_augmentations
-            .iter()
-            .filter(|name| is_string_literal(**name))
-            .map(|name| name.text().to_string()),
-    );
-    names
-}
-
-/// The module names that the walk of `new_narrow_checker` follows from
-/// `file`: every name of `checker_module_references` for a declaration
-/// file. For any other file only the re-exports (`export ... from`) and
-/// the string literal module augmentations: the imports, `require` calls
-/// and import calls of JS and TS sources reach their whole implementation
-/// (about 870 files of jsdom, css-tree and cssstyle in Query core), and the
-/// export extraction rarely asks for them.
-fn narrow_module_references(file: Node) -> Vec<String> {
-    let info = source_file_info(file);
-    if info.is_declaration_file {
-        return checker_module_references(file);
-    }
-    let mut names: Vec<String> = Vec::new();
-    for node in file.statements().iter() {
-        collect_checker_module_references(node, true, &mut names);
-    }
-    names.extend(
-        info.module_augmentations
-            .iter()
-            .filter(|name| is_string_literal(**name))
-            .map(|name| name.text().to_string()),
-    );
-    names
-}
-
-// Go: parser/references.go:24 collectModuleReferences
-// PORT: without the ambient module conditions (see
-// `checker_module_references`). Go checker `resolveExternalModuleNameWorker`
-// takes any string literal like specifier.
-// PORT: `re_exports_only` keeps only the export declarations
-// (`narrow_module_references`).
-fn collect_checker_module_references(node: Node, re_exports_only: bool, names: &mut Vec<String>) {
-    if re_exports_only && is_any_import_or_re_export(node) && !is_export_declaration(node) {
-        return;
-    }
-    if is_any_import_or_re_export(node) {
-        let module_name_expr = crate::ast::get_external_module_name(node);
-        if module_name_expr.is_some() && is_string_literal_like(module_name_expr) {
-            let module_name = module_name_expr.text();
-            if !module_name.is_empty() {
-                names.push(module_name.to_string());
-            }
-        }
-        return;
-    }
-    if is_module_declaration(node) {
-        // The body is a module block, or the next module declaration of
-        // `namespace A.B {}`.
-        let body = node.body();
-        if body.is_nil() {
-            return;
-        }
-        if is_module_block(body) {
-            for statement in body.statements().iter() {
-                collect_checker_module_references(statement, re_exports_only, names);
-            }
-        } else {
-            collect_checker_module_references(body, re_exports_only, names);
-        }
-    }
 }
 
 /// True when the arena of a checker of `program` holds the symbols of
@@ -216,106 +114,53 @@ fn checker_arena_holds(program: &'static GoProgram, file: Node) -> bool {
 impl AliasResolver {
     /// Go `checker.NewChecker(aliasResolver, nil)`. The checker's program is
     /// current on this thread while the returned scope lives; keep the scope
-    /// as long as the checker is used. `also_reads` are files that the caller
-    /// reads with `get_source_file` while the checker lives.
+    /// as long as the checker is used. `reads` are the other files that the
+    /// checker can read: the files that the caller reads with
+    /// `get_source_file` while the checker lives, and the files that an
+    /// earlier checker of the same extraction missed (`take_missed_files`).
     // PORT: a checker copies the binder lineage when it is made
     // (`SymbolArena::for_checker`), so it cannot read a file bound later. Go
     // binds each file when `GetSourceFile` parses it, while the checker
-    // runs. Here the files that the checker can reach are read and bound
-    // first: the root files, `also_reads`, and from each file the modules
-    // that its module specifiers resolve to (`checker_module_references`).
-    // This reads more files than Go, never fewer. The resolutions are kept
-    // (`prefetch_resolved_module`); `get_resolved_module` fills the Go cache
-    // and reports a failed lookup only when the checker asks, as Go does. A
-    // file that the checker asks for later and that its arena does not hold
-    // is unported (`bind_source_file`).
+    // runs. Here the checker can read only the root files and `reads`, bound
+    // first. When it asks for another file, `get_source_file` reads that file
+    // with the same host call as Go, keeps it as a missed file and gives nil.
+    // The caller then drops the checker and every result of it, and makes a
+    // new checker with the missed files in `reads` (`extract_package` and the
+    // second pass of the node_modules index update). A checker with no miss
+    // got every file that it asked for, and it read no other file. The module
+    // names resolve when the checker asks for them (`get_resolved_module`),
+    // as in Go. So the host and file system calls are those of Go: Go
+    // N' fed0bf24149f calls the client's file system callbacks
+    // (`api/callbackfs.go`) only for these files and resolutions.
     // PORT: Go binds a second-pass root file only if an earlier pass bound
     // it (registry.go:1078 reads it from the host). Here every root file is
     // bound.
     // PORT: Go's `NewChecker` has no context. `ctx` is for
-    // `should_stop_build`: a build that the caller drops on cancel stops the
-    // file walk between two files, or before the program, and gets `None`.
-    // For any other context the result is always `Some`. Each walk step
-    // finishes its file (it resolves each module name, and reads and binds
-    // each target), so a stop leaves only complete cache entries.
+    // `should_stop_build`: a build that the caller drops on cancel stops
+    // before the program, and gets `None`. For any other context the result
+    // is always `Some`.
     pub fn new_checker(
         self: &Rc<Self>,
         ctx: &Context,
-        also_reads: &[Node],
-    ) -> Option<(Rc<RefCell<Checker>>, AliasResolverProgramScope)> {
-        self.new_checker_walk(ctx, also_reads, false)
-    }
-
-    /// `new_checker` with a narrow walk: it follows only
-    /// `narrow_module_references`, and the checker can read only the walked
-    /// files. For any other file `get_source_file` sets `missed` and gives
-    /// nil; the caller must then drop the checker and every result of it, and
-    /// use `new_checker` on a new resolver. With no miss, the checker read
-    /// only files that it asked for, so its results are those of
-    /// `new_checker`.
-    // PERF: Go reads only the files that the checker asks for: 450
-    // node_modules files in the Query core editor session, against 1,316
-    // for the full walk. The first auto-import of that session added 162 MiB
-    // of RSS with the full walk, and 16 MiB with this one (Go: 17 to 35).
-    pub fn new_narrow_checker(
-        self: &Rc<Self>,
-        ctx: &Context,
-    ) -> Option<(Rc<RefCell<Checker>>, AliasResolverProgramScope)> {
-        self.new_checker_walk(ctx, &[], true)
-    }
-
-    /// `new_checker`, with the narrow walk of `new_narrow_checker` when
-    /// `narrow` is set.
-    fn new_checker_walk(
-        self: &Rc<Self>,
-        ctx: &Context,
-        also_reads: &[Node],
-        narrow: bool,
+        reads: &[Node],
     ) -> Option<(Rc<RefCell<Checker>>, AliasResolverProgramScope)> {
         // Go: NewChecker reads each root file; a nil file is a nil dereference.
         if self.root_files.iter().any(|file| file.is_nil()) {
             crate::core::go_nil_dereference();
         }
         let current_directory = self.get_current_directory();
-        // The registry reads the second-pass root files from its host.
+        // The registry reads the second-pass root files and the missed files
+        // from its host.
         crate::program::publish_parsed_files(&current_directory);
         let mut files: Vec<Node> = Vec::new();
         let mut seen: FxHashSet<usize> = FxHashSet::default();
-        for &file in self.root_files.iter().chain(also_reads) {
+        for &file in self.root_files.iter().chain(reads) {
             if file.is_some() && seen.insert(file.file_index()) {
                 crate::program::bind_file_outside_program(file);
                 files.push(file);
             }
         }
-        // The host gives the same file for a name each time.
-        let mut read_names: FxHashSet<String> = FxHashSet::default();
-        let mut next = 0;
-        while next < files.len() {
-            if should_stop_build(ctx) {
-                return None;
-            }
-            let file = files[next];
-            next += 1;
-            let module_references = if narrow {
-                narrow_module_references(file)
-            } else {
-                checker_module_references(file)
-            };
-            for module_reference in module_references {
-                let resolved = self.prefetch_resolved_module(file, &module_reference);
-                if !resolved.is_resolved()
-                    || !read_names.insert(resolved.resolved_file_name.clone())
-                {
-                    continue;
-                }
-                // Go: GetSourceFileForResolvedModule
-                let target = self.get_source_file(&resolved.resolved_file_name);
-                if target.is_some() && seen.insert(target.file_index()) {
-                    files.push(target);
-                }
-            }
-        }
-        // PORT: a stop here also makes no program shell.
+        // PORT: a stop here makes no program shell.
         if should_stop_build(ctx) {
             return None;
         }
@@ -327,53 +172,24 @@ impl AliasResolver {
             self.use_case_sensitive_file_names(),
             self.clone(),
         );
-        if narrow {
-            *self.narrow_files.borrow_mut() =
-                Some(files.iter().map(|file| file.file_index()).collect());
-        }
+        *self.checker_files.borrow_mut() = seen;
         self.checker_program.set(Some(scope.program()));
         let checker = ls_program::new_checker_for_version(scope.program());
         Some((Rc::new(RefCell::new(checker)), scope))
     }
 
-    /// The resolution that Go `GetResolvedModule` gives the checker for
-    /// `module_reference` in `file` (the mode is Go `GetModeForUsageLocation`,
-    /// always ESNext), made before the checker. It does not fill the Go
-    /// cache or report a failed lookup.
-    fn prefetch_resolved_module(&self, file: Node, module_reference: &str) -> Arc<ResolvedModule> {
-        let info = source_file_info(file);
-        let path = tspath::Path(info.path.clone());
-        let key = module::ModeAwareCacheKey {
-            name: module_reference.to_string(),
-            mode: ModuleKind::ES_NEXT,
-        };
-        let cached = self
-            .prefetched_modules
-            .borrow()
-            .get(&path)
-            .and_then(|modules| modules.get(&key).cloned());
-        if let Some(resolved) = cached {
-            return resolved;
-        }
-        let (resolved, _, _) = self.module_resolver.resolve_module_name(
-            module_reference,
-            &info.file_name,
-            ModuleKind::ES_NEXT,
-            None,
-        );
-        self.prefetched_modules
-            .borrow_mut()
-            .entry(path)
-            .or_default()
-            .insert(key, resolved.clone());
-        resolved
+    /// The files that the checker asked for and could not read (see
+    /// `new_checker`), in the order of the first ask, once each. When this is
+    /// empty, the checker's results are those of Go.
+    pub fn take_missed_files(&self) -> Vec<Node> {
+        std::mem::take(&mut *self.missed_files.borrow_mut())
     }
 
     /// Go `binder.BindSourceFile(file)` in `GetSourceFile`.
     // PORT: before the checker exists, the file is published and bound
     // (`bind_alias_resolver_source_file`). After, the checker's arena must
-    // already hold it (see `new_checker`). The unported guard is for a
-    // module name that `checker_module_references` does not find.
+    // already hold it: `get_source_file` binds only the files of
+    // `checker_files`, which `new_checker` bound first.
     fn bind_source_file(&self, file: Node) {
         let Some(program) = self.checker_program.get() else {
             bind_alias_resolver_source_file(self.host.get_current_directory(), file);
@@ -433,15 +249,14 @@ impl AliasResolver {
         if file.is_nil() {
             return Node::NIL;
         }
-        // PORT: a file outside a narrow walk (`new_narrow_checker`).
+        // PORT: a file that the checker cannot read (`new_checker`).
         if self.checker_program.get().is_some()
-            && self
-                .narrow_files
-                .borrow()
-                .as_ref()
-                .is_some_and(|files| !files.contains(&file.file_index()))
+            && !self.checker_files.borrow().contains(&file.file_index())
         {
-            self.missed.set(true);
+            let mut missed = self.missed_files.borrow_mut();
+            if !missed.iter().any(|m| m.file_index() == file.file_index()) {
+                missed.push(file);
+            }
             return Node::NIL;
         }
         self.bind_source_file(file);
@@ -509,26 +324,12 @@ impl AliasResolver {
         if let Some(resolved) = cached {
             return resolved;
         }
-        // PORT: `new_checker` made most resolutions before the checker
-        // (`prefetch_resolved_module`); they are the same.
-        let prefetched = self
-            .prefetched_modules
-            .borrow()
-            .get(&current_source_file.path())
-            .and_then(|modules| modules.get(&key).cloned());
-        let resolved = match prefetched {
-            Some(resolved) => resolved,
-            None => {
-                self.module_resolver
-                    .resolve_module_name(
-                        module_reference,
-                        &current_source_file.file_name(),
-                        mode,
-                        None,
-                    )
-                    .0
-            }
-        };
+        let (resolved, _, _) = self.module_resolver.resolve_module_name(
+            module_reference,
+            &current_source_file.file_name(),
+            mode,
+            None,
+        );
         // Go: cache.LoadOrStore(key, resolved)
         let resolved = cache.borrow_mut().entry(key).or_insert(resolved).clone();
         if !resolved.is_resolved() && !tspath::path_is_relative(module_reference) {

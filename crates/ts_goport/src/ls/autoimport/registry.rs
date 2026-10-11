@@ -1760,47 +1760,65 @@ impl RegistryBuilder {
                 resolver_options.host = Some(self.host.clone());
                 resolver_options.compiler_options = Some(Rc::new(CompilerOptions::default()));
                 let module_resolver = Rc::new(module::new_resolver(resolver_options));
-                let alias_resolver = new_alias_resolver(
-                    root_files.values().copied().collect(),
-                    FxHashMap::default(),
-                    self.host.clone(),
-                    module_resolver.clone(),
-                    self.base.to_path.clone(),
-                    Rc::new(|_: &dyn HasFileName, _: &str| {
-                        // no-op
-                    }),
-                );
                 let sources = br
                     .possible_failed_ambient_module_lookup_sources
                     .as_ref()
                     .unwrap_or_else(|| crate::core::go_nil_dereference());
-                // PORT: Go reads each source file after NewChecker. Here they
-                // are read first, so the checker's arena holds them
-                // (`AliasResolver::new_checker`).
-                let source_files: Vec<Node> = sources
-                    .values()
-                    .map(|source| alias_resolver.get_source_file(&source.borrow().file_name))
-                    .collect();
-                let Some((ch, _alias_program)) = alias_resolver.new_checker(ctx, &source_files)
-                else {
-                    return;
-                };
-                let mut ch_ref = ch.borrow_mut();
-                for (source, &source_file) in sources.values().zip(&source_files) {
-                    if should_stop_build(ctx) {
-                        return;
-                    }
-                    let source = source.borrow();
-                    let host = self.host.clone();
-                    let realpath: Rc<dyn Fn(&str) -> String> =
-                        Rc::new(move |f: &str| host.fs().realpath(f));
-                    let mut extractor = self.new_export_extractor(
-                        &source.package_name,
-                        &mut ch_ref,
+                // PORT: as in `extract_package`, a checker that asks for a
+                // file that it cannot read is dropped with its results, and a
+                // new checker can also read the missed files. So the exports
+                // go into the index after a pass with no miss.
+                let mut reads: Vec<Node> = Vec::new();
+                let all_exports = loop {
+                    let alias_resolver = new_alias_resolver(
+                        root_files.values().copied().collect(),
+                        FxHashMap::default(),
+                        self.host.clone(),
                         module_resolver.clone(),
-                        Some(realpath),
+                        self.base.to_path.clone(),
+                        Rc::new(|_: &dyn HasFileName, _: &str| {
+                            // no-op
+                        }),
                     );
-                    let file_exports = extractor.extract_from_file(source_file);
+                    // PORT: Go reads each source file after NewChecker. Here
+                    // they are read first, so the checker's arena holds them
+                    // (`AliasResolver::new_checker`).
+                    let source_files: Vec<Node> = sources
+                        .values()
+                        .map(|source| alias_resolver.get_source_file(&source.borrow().file_name))
+                        .collect();
+                    let checker_reads: Vec<Node> =
+                        source_files.iter().chain(&reads).copied().collect();
+                    let Some((ch, _alias_program)) =
+                        alias_resolver.new_checker(ctx, &checker_reads)
+                    else {
+                        return;
+                    };
+                    let mut ch_ref = ch.borrow_mut();
+                    let mut pass_exports = Vec::with_capacity(source_files.len());
+                    for (source, &source_file) in sources.values().zip(&source_files) {
+                        if should_stop_build(ctx) {
+                            return;
+                        }
+                        let source = source.borrow();
+                        let host = self.host.clone();
+                        let realpath: Rc<dyn Fn(&str) -> String> =
+                            Rc::new(move |f: &str| host.fs().realpath(f));
+                        let mut extractor = self.new_export_extractor(
+                            &source.package_name,
+                            &mut ch_ref,
+                            module_resolver.clone(),
+                            Some(realpath),
+                        );
+                        pass_exports.push(extractor.extract_from_file(source_file));
+                    }
+                    let missed = alias_resolver.take_missed_files();
+                    if missed.is_empty() {
+                        break pass_exports;
+                    }
+                    reads.extend(missed);
+                };
+                for file_exports in all_exports {
                     let index = br
                         .bucket
                         .as_ref()
@@ -2442,18 +2460,20 @@ impl RegistryBuilder {
         }
         // Go: wg.Wait()
         root_files.retain(|f| f.is_some());
-        // PORT: see the check in the loop above. `new_checker` also reads the
-        // files that the root files import.
+        // PORT: see the check in the loop above.
         if ctx.err().is_some() {
             return None;
         }
 
-        // PERF: a checker with the narrow walk first
-        // (`AliasResolver::new_narrow_checker`). When it asks for a file
-        // outside the walk, that checker and every result of it are dropped,
-        // and the package is extracted again with the full walk. A narrow
-        // checker with no miss gives the results of the full walk.
-        for narrow in [true, false] {
+        // PORT: the checker can read only the root files and `reads`
+        // (`AliasResolver::new_checker`). When it asks for another file, that
+        // checker and every result of it are dropped, and the package is
+        // extracted again with a new checker that can also read the missed
+        // files. Each pass extracts every entrypoint, so it finds the misses
+        // of the next level of files at once. A pass with no miss gives Go's
+        // results.
+        let mut reads: Vec<Node> = Vec::new();
+        loop {
             let mut result = PerPackageExtractionResult {
                 package_files: FxHashMap::default(),
                 entrypoints: package_entrypoints.clone(),
@@ -2491,11 +2511,7 @@ impl RegistryBuilder {
             );
 
             // PORT: `None` only for a stopped build (`should_stop_build`).
-            let (ch, _alias_program) = if narrow {
-                alias_resolver.new_narrow_checker(ctx)?
-            } else {
-                alias_resolver.new_checker(ctx, &[])?
-            };
+            let (ch, _alias_program) = alias_resolver.new_checker(ctx, &reads)?;
             let mut ch_ref = ch.borrow_mut();
             let mut extractor = self.new_export_extractor(
                 package_name,
@@ -2510,9 +2526,6 @@ impl RegistryBuilder {
                     return None;
                 }
                 let file_exports = extractor.extract_from_file(entrypoint);
-                if alias_resolver.missed.get() {
-                    break;
-                }
                 let entrypoint_path = tspath::Path(source_file_info(entrypoint).path.clone());
                 let entrypoint_file_name = source_file_file_name(entrypoint).to_string();
                 for name in &source_file_info(entrypoint).ambient_module_names {
@@ -2555,7 +2568,9 @@ impl RegistryBuilder {
                     }
                 }
             }
-            if alias_resolver.missed.get() {
+            let missed = alias_resolver.take_missed_files();
+            if !missed.is_empty() {
+                reads.extend(missed);
                 continue;
             }
 
@@ -2570,7 +2585,6 @@ impl RegistryBuilder {
             result.stats_used_checker = stats.used_checker.get();
             return Some(Rc::new(result));
         }
-        unreachable!("a checker with the full walk sets no miss")
     }
 }
 
