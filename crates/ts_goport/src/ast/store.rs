@@ -344,10 +344,17 @@ impl StoreFacts {
 // PERF: 12 bytes of the `NodeKids` of the slot. A read is one kids word
 // and the per-store record of `Node::new`, not the chain kind table, node
 // pointer, node tag, data box, field.
+// PERF: perfP2 item 2. Two words, `name` and `other` in one: a struct of two
+// scalars comes back from `store_node_children` in two registers. Three
+// `u32` fields came back through memory, three 4-byte stores, and the caller
+// read `name` and `other` with one 8-byte load right after the call. That
+// load cannot take its value from two stores still in the store buffer, so
+// it waited for them: two thirds of the cycles of `alloc_store_slot_node`
+// and of the lib snapshot load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotChildren {
-    name: u32,
-    other: u32,
+    /// `name` in the low half, `other` in the high half.
+    name_other: u64,
     typed: u32,
 }
 
@@ -377,12 +384,34 @@ impl SlotChildren {
     /// `NO_TYPE_ARGUMENTS` bit is clear.
     const TYPED_UNKNOWN_VALUE: u32 = Self::TYPED_UNKNOWN << Self::TYPED_TAG_SHIFT;
 
+    /// The entry of a slot whose data has none of the fields
+    /// (`store_node_children`), such as an Identifier: no name,
+    /// none of the `other` fields (tag 0, id 0), no type or initializer
+    /// (`TYPED_TYPE`, id 0) and no type argument list.
+    pub(crate) const NO_FIELDS: Self = Self {
+        name_other: 0,
+        typed: Self::NO_TYPE_ARGUMENTS,
+    };
     /// Every read takes the node data.
     pub(crate) const UNKNOWN: Self = Self {
-        name: Self::UNKNOWN_ID,
-        other: Self::UNKNOWN_ID,
+        name_other: Self::name_other_of(Self::UNKNOWN_ID, Self::UNKNOWN_ID),
         typed: Self::TYPED_UNKNOWN_VALUE,
     };
+    /// The `name_other` word of field values `name` and `other`.
+    #[inline]
+    const fn name_other_of(name: u32, other: u32) -> u64 {
+        (name as u64) | ((other as u64) << 32)
+    }
+    /// The `name` field value.
+    #[inline]
+    fn name(self) -> u32 {
+        self.name_other as u32
+    }
+    /// The `other` field value.
+    #[inline]
+    fn other(self) -> u32 {
+        (self.name_other >> 32) as u32
+    }
 
     /// `name` is the name child id (0 for nil or no field, `None` for
     /// unknown); `other` is `(tag, id)` (`None` for unknown). The `typed`
@@ -398,8 +427,7 @@ impl SlotChildren {
         Self {
             // `UNKNOWN_ID` itself is not a slot id a store can reach, and
             // it reads as unknown, which is always exact.
-            name: name.unwrap_or(Self::UNKNOWN_ID),
-            other,
+            name_other: Self::name_other_of(name.unwrap_or(Self::UNKNOWN_ID), other),
             typed: Self::TYPED_UNKNOWN_VALUE,
         }
     }
@@ -446,7 +474,7 @@ impl SlotChildren {
     /// The tag and id of `other`.
     #[cfg(test)]
     fn other_parts(self) -> (u32, u32) {
-        Self::other_parts_of(self.other)
+        Self::other_parts_of(self.other())
     }
 
     /// C2: the tag and id of `typed`.
@@ -867,8 +895,8 @@ impl NodeKids {
     #[inline]
     fn new(children: SlotChildren, word: u32) -> Self {
         Self {
-            name: AtomicU32::new(children.name),
-            other: AtomicU32::new(children.other),
+            name: AtomicU32::new(children.name()),
+            other: AtomicU32::new(children.other()),
             typed: AtomicU32::new(children.typed),
             word: AtomicU32::new(word),
         }
@@ -890,8 +918,10 @@ impl NodeKids {
     #[inline]
     fn children(&self) -> SlotChildren {
         SlotChildren {
-            name: self.name.load(Ordering::Relaxed),
-            other: self.other.load(Ordering::Relaxed),
+            name_other: SlotChildren::name_other_of(
+                self.name.load(Ordering::Relaxed),
+                self.other.load(Ordering::Relaxed),
+            ),
             typed: self.typed.load(Ordering::Relaxed),
         }
     }
@@ -936,8 +966,8 @@ impl NodeKids {
 
     #[inline]
     fn set_children(&mut self, children: SlotChildren) {
-        *self.name.get_mut() = children.name;
-        *self.other.get_mut() = children.other;
+        *self.name.get_mut() = children.name();
+        *self.other.get_mut() = children.other();
         *self.typed.get_mut() = children.typed;
     }
 
@@ -5678,15 +5708,51 @@ fn try_with_build_slot(n: Node, f: impl FnOnce(&mut FileStore, usize)) -> bool {
     true
 }
 
-/// Go `finishNode` writes `node.Loc = loc` and `node.Flags |= flags` on a
-/// node of an unfinished store, in one store access. False (nothing
-/// written) when `n` is not a store node of this thread.
-pub fn finish_store_node(n: Node, loc: TextRange, flags: NodeFlags) -> bool {
-    try_with_build_slot(n, |s, index| {
-        s.set_slot_loc(index, loc);
-        let flags = s.records[index].flags() | flags;
-        s.set_slot_flags(index, flags);
-    })
+/// What `finish_store_node_and_parents` wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinishedStoreNode {
+    /// Nothing: the node is not a node of an unfinished store of this
+    /// thread.
+    NotStore,
+    /// The loc and the flags. The parents of the children are not all set
+    /// (an alias child, a nil list entry): the caller runs the generic walk,
+    /// as after `set_parent_in_store_children` gave false.
+    LocAndFlags,
+    /// The loc, the flags, and the parents and the R2-5 chain of the
+    /// children (`set_parent_in_store_children`).
+    All,
+}
+
+/// parser.go `finishNodeWithEnd` on a node of an unfinished store of this
+/// thread, in one store access: `node.Loc = loc`, `node.Flags |= flags`, and
+/// then `overrideParentInImmediateChildren` as `set_parent_in_store_children`
+/// does it. Panics on a finished store, like `with_slot_mut`.
+// PERF: perfP2 item 2. One thread-local lookup, `RefCell` borrow and slot
+// check per finished node, not one for the loc and flags and one more for
+// the parents.
+pub fn finish_store_node_and_parents(
+    n: Node,
+    loc: TextRange,
+    flags: NodeFlags,
+) -> FinishedStoreNode {
+    let Some(store) = thread_build_cell(n) else {
+        return FinishedStoreNode::NotStore;
+    };
+    let mut guard = store.borrow_mut();
+    let s = &mut *guard;
+    assert!(!s.frozen, "cannot mutate a node of a finished file");
+    let index = slot_index(n);
+    let Some(node) = s.nodes[index] else {
+        panic!("store handle does not name a node slot");
+    };
+    s.set_slot_loc(index, loc);
+    let flags = s.records[index].flags() | flags;
+    s.set_slot_flags(index, flags);
+    if s.set_slot_child_parents(index, node) {
+        FinishedStoreNode::All
+    } else {
+        FinishedStoreNode::LocAndFlags
+    }
 }
 
 /// Go `node.Parent = parent` on a node of an unfinished store, in one store
@@ -5789,32 +5855,43 @@ pub fn set_parent_in_store_children(parent: Node) -> bool {
     let Some(node) = s.nodes[index] else {
         return false;
     };
-    // lsshells M3c: a node that the store owns (a freeable parse).
-    if s.cell_of(index) != NO_CELL {
-        return set_parent_in_owned_store_children(s, index);
+    s.set_slot_child_parents(index, node)
+}
+
+impl FileStore {
+    /// `set_parent_in_store_children` for node slot `index` of this
+    /// unfinished store, whose node column entry is `node`.
+    #[inline]
+    fn set_slot_child_parents(&mut self, index: usize, node: &'static NodeData) -> bool {
+        // lsshells M3c: a node that the store owns (a freeable parse).
+        if self.cell_of(index) != NO_CELL {
+            return set_parent_in_owned_store_children(self, index);
+        }
+        let kind = self.kinds[index];
+        // `NodeHeader::stored_parent` of a child in the store of `parent`.
+        let stored = handle(LOCAL_STORE, index as u32);
+        // `StoreChildLinks::new`.
+        self.unlink_children(index);
+        self.build_links[index].first_child = LINK_END;
+        let mut last = LINK_END;
+        let mut linking = true;
+        let stopped = super::node::for_each_store_child_id(kind, node, |child| {
+            let child = child as usize;
+            // PERF: perfP2 item 2. The record bit, not the node column: the
+            // parent write below reads and writes the same record.
+            if !self.records[child].is_node() {
+                return true;
+            }
+            // `StoreChildLinks::set_parent`.
+            self.set_slot_parent(child, stored);
+            if linking && !self.link_child(index, &mut last, child) {
+                linking = false;
+                self.unlink_children(index);
+            }
+            false
+        });
+        !stopped
     }
-    let kind = s.kinds[index];
-    // `NodeHeader::stored_parent` of a child in the store of `parent`.
-    let stored = handle(LOCAL_STORE, index as u32);
-    // `StoreChildLinks::new`.
-    s.unlink_children(index);
-    s.build_links[index].first_child = LINK_END;
-    let mut last = LINK_END;
-    let mut linking = true;
-    let stopped = super::node::for_each_store_child_id(kind, node, |child| {
-        let child = child as usize;
-        if s.nodes[child].is_none() {
-            return true;
-        }
-        // `StoreChildLinks::set_parent`.
-        s.set_slot_parent(child, stored);
-        if linking && !s.link_child(index, &mut last, child) {
-            linking = false;
-            s.unlink_children(index);
-        }
-        false
-    });
-    !stopped
 }
 
 /// `set_parent_in_store_children` for slot `index` of `s`, whose node the
@@ -6059,8 +6136,7 @@ impl FileStore {
             .push(NodeRecord::new(bits, flags, loc, u64::from(parent)));
         self.kinds.push(kind);
         self.nodes.push(Some(node));
-        let modifier_bits = super::node::store_node_modifier_bits(kind, node);
-        let children = super::node::store_node_children(kind, node);
+        let (modifier_bits, children) = slot_kids_parts(kind, node);
         self.kids.push(NodeKids::new(
             children,
             NodeKids::word_of(kind, &name, modifier_bits),
@@ -6390,8 +6466,7 @@ fn alloc_store_slot_node(
         "a name node keeps its text in the name column"
     );
     // PERF: U1 (b), U4. Read while the new data is hot, not at freeze.
-    let modifier_bits = super::node::store_node_modifier_bits(kind, node);
-    let children = super::node::store_node_children(kind, node);
+    let (modifier_bits, children) = slot_kids_parts(kind, node);
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.records.len() as u32;
@@ -6402,6 +6477,29 @@ fn alloc_store_slot_node(
         s.push_build_columns(kind, name, modifier_bits, children);
         handle(file, index)
     })
+}
+
+/// The U1 (b) modifier bits and the U4 child entry of a new node slot of
+/// kind `kind` with data `node` (`store_node_modifier_bits`,
+/// `store_node_children`).
+// PERF: perfP2 item 2. About a third of the slots are identifiers, whose
+// entries are fixed (no modifier list, none of the child fields): no call.
+// A test for the other kinds with fixed entries (tokens, keyword types,
+// string and numeric literals) took fewer instructions but more cycles.
+#[inline]
+fn slot_kids_parts(kind: SyntaxKind, node: &NodeData) -> (u32, SlotChildren) {
+    if kind == SyntaxKind::Identifier {
+        debug_assert_eq!(super::node::store_node_modifier_bits(kind, node), 0);
+        debug_assert_eq!(
+            super::node::store_node_children(kind, node),
+            SlotChildren::NO_FIELDS
+        );
+        return (0, SlotChildren::NO_FIELDS);
+    }
+    (
+        super::node::store_node_modifier_bits(kind, node),
+        super::node::store_node_children(kind, node),
+    )
 }
 
 /// `alloc_store_slot` inside a freeable parse (lsshells M3c): a store that
@@ -7141,13 +7239,18 @@ mod tests {
     #[test]
     fn slot_children_tags_round_trip() {
         let entry = SlotChildren::new(Some(7), Some((SlotChildren::TAG_QUESTION, 9)));
-        assert_eq!(entry.name, 7);
+        assert_eq!(entry.name(), 7);
         assert_eq!(entry.other_parts(), (SlotChildren::TAG_QUESTION, 9));
         // An id that does not fit next to the tag is unknown.
         let big = SlotChildren::new(Some(1), Some((SlotChildren::TAG_POSTFIX, 1 << 30)));
-        assert_eq!(big.other, SlotChildren::UNKNOWN_ID);
+        assert_eq!(big.other(), SlotChildren::UNKNOWN_ID);
         assert_eq!(big.other_parts().0, SlotChildren::TAG_UNKNOWN);
         assert_eq!(SlotChildren::new(None, None), SlotChildren::UNKNOWN);
+        assert_eq!(
+            SlotChildren::new(Some(0), Some((SlotChildren::TAG_EXPRESSION, 0)))
+                .with_typed(Some((SlotChildren::TYPED_TYPE, 0)), true),
+            SlotChildren::NO_FIELDS
+        );
         // C2: the tag, the id and the type arguments bit round trip, and an
         // id that does not fit is unknown.
         let typed = entry.with_typed(Some((SlotChildren::TYPED_TYPE_NAME, 11)), true);
