@@ -51,7 +51,10 @@ pub fn new_package_source_file_descriptor(
 #[derive(Clone, Copy, Debug)]
 pub struct ReferenceSymbols {
     /// The first `get_symbol_at_location(node)` result. For an Identifier it
-    /// is the checker's `GetSymbolAtLocation(node)`.
+    /// is the checker's `GetSymbolAtLocation(node)`. A later call can give a
+    /// new transient symbol (a for-of binding element's property name does)
+    /// with the same declarations and flags; the stability walk reads only
+    /// those, so the first result gives the same answers.
     pub at_location: SymbolId,
     /// Go `ReferenceSymbolAtNode(node)`.
     pub reference: SymbolId,
@@ -66,8 +69,10 @@ impl TypeParser<'_> {
     /// starts from.
     // PORT: not in Go. Go `runStabilityApiUsage` calls `GetSymbolAtLocation`
     // and then `ReferenceSymbolAtNode`, which calls it again on a cache miss.
-    // The checker gives an Identifier the same symbol on every call, so the
-    // port keeps the first result and saves one call per identifier per rule.
+    // A later call on an Identifier gives a symbol with the same declarations
+    // and flags (sometimes a new transient one), and the walk reads only those,
+    // so the port keeps the first result and saves one call per identifier per
+    // rule.
     pub fn reference_symbols_at_node(&mut self, node: Node) -> ReferenceSymbols {
         if node.is_nil() {
             return ReferenceSymbols {
