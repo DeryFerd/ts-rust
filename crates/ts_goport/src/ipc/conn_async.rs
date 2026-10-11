@@ -332,8 +332,10 @@ impl AsyncConn {
             if let Err(request_err) = self.handle_request(ctx, msg)
                 && self.record_request_error(request_err)
             {
-                // PORT: Go checks `c.rwc != nil`; the Rust transport is
-                // always set.
+                // Go: ipc/conn_async.go:102. PORT: Go checks `c.rwc !=
+                // nil`; the Rust transport is always set. A stdio close
+                // does not wait for the reader thread, as Go's close of
+                // a blocking `os.Stdin` (transport.rs `StdioIn`).
                 let _ = self.rwc.close();
             }
         } else if msg.is_notification() {
