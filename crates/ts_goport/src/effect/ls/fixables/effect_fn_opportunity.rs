@@ -17,6 +17,7 @@ use crate::effect::typeparser::{
 use crate::frontend::scanner::new_scanner;
 use crate::gostd::strconv;
 use crate::ls::CodeAction;
+use crate::ls::utilities::{go_check_slice_bounds, go_text_slice};
 use crate::lsp::lsproto;
 use crate::prelude::*;
 use crate::scanner_util::{get_text_of_node, get_token_pos_of_node, skip_trivia};
@@ -207,7 +208,9 @@ fn effect_fn_build_replacement(
 
     let file_text = source_file_text(sf);
     let text: &str = &file_text;
-    let slice = |a: i32, b: i32| &text[a as usize..b as usize];
+    // Go `text[a:b]` slices bytes: a bound inside a char keeps the cut bytes
+    // (`go_text_slice`), and a bound out of range panics with Go's text.
+    let slice = |a: i32, b: i32| go_text_slice(text, a, b);
     let start = get_token_pos_of_node(target, sf, false);
     let body_start = get_token_pos_of_node(body, sf, false);
     let mut module = find_effect_module_identifier(sf);
@@ -223,17 +226,24 @@ fn effect_fn_build_replacement(
 
     if !result.has_gen_body && target.kind() == SyntaxKind::FunctionExpression {
         // Keep the original function expression's signature verbatim.
-        prefix += slice(start, body_start);
+        prefix += &slice(start, body_start);
     } else {
         prefix += "function";
         if result.has_gen_body {
             prefix.push('*');
         }
         let signature = effect_fn_signature_range(sf, target);
-        let mut signature_text = slice(signature.pos(), signature.end()).to_string();
-        // PORT: Go indexes byte 0 (a panic on an empty text); the signature
-        // is never empty.
-        if !matches!(signature_text.as_bytes().first(), Some(b'(' | b'<')) {
+        // `signature.end()` is one byte past the closing parenthesis (or the
+        // `=` of a bare parameter's `=>`), an ASCII byte in a parsed tree, so
+        // the cut bytes of `slice` stay a Go-only case here.
+        let mut signature_text = slice(signature.pos(), signature.end()).into_owned();
+        // Go `signatureText[0]` on an empty text panics.
+        let Some(&first) = signature_text.as_bytes().first() else {
+            crate::core::go_panic(
+                "runtime error: index out of range [0] with length 0".to_string(),
+            );
+        };
+        if first != b'(' && first != b'<' {
             signature_text = format!("({signature_text})");
         }
         let mut comment_start = start;
@@ -259,7 +269,7 @@ fn effect_fn_build_replacement(
         let mut declaration_prefix = String::new();
         let modifiers = decl.modifiers();
         if modifiers.is_some() {
-            declaration_prefix = slice(start, modifiers.end()).to_string() + " ";
+            declaration_prefix = slice(start, modifiers.end()).into_owned() + " ";
         }
         prefix = declaration_prefix + "const " + &get_text_of_node(decl.name()) + " = " + &prefix;
     }
@@ -272,9 +282,9 @@ fn effect_fn_build_replacement(
         let start = get_token_pos_of_node(arg, sf, false);
         suffix.push(',');
         suffix += &effect_fn_comments(sf, cursor, arg.pos(), Node::NIL);
-        suffix += slice(arg.pos(), start);
-        suffix += &effect_fn_pipe_argument_text(arg, slice(start, arg.end()));
-        suffix += slice(arg.end(), end);
+        suffix += &slice(arg.pos(), start);
+        suffix += &effect_fn_pipe_argument_text(arg, &slice(start, arg.end()));
+        suffix += &slice(arg.end(), end);
         cursor = end;
     }
     let moved_trace = if trace.is_empty() {
@@ -370,6 +380,25 @@ fn effect_fn_signature_range(sf: Node, target: Node) -> TextRange {
 /// outer return statement. Arguments and the function body are copied separately.
 fn effect_fn_comments(sf: Node, start: i32, end: i32, moved: Node) -> String {
     let file_text = source_file_text(sf);
+    go_check_slice_bounds(&file_text, start, end);
+    if start == end {
+        return String::new();
+    }
+    // Go slices bytes, so `start` can cut a char (the `+ 1` of
+    // `effect_fn_signature_range`; the callers' ends are node bounds). The
+    // text then starts with a byte that is not UTF-8, and Go's scanner reads
+    // all of it as one NonTextFileMarkerTrivia token ("File appears to be
+    // binary"), so the loop below adds nothing, unless `start` is in `moved`:
+    // then it goes on from the end of `moved`, a char boundary.
+    if !file_text.is_char_boundary(start as usize) {
+        if moved.is_some()
+            && start >= get_token_pos_of_node(moved, sf, false)
+            && start < moved.end()
+        {
+            return effect_fn_comments(sf, moved.end().min(end), end, moved);
+        }
+        return String::new();
+    }
     let text = &file_text[start as usize..end as usize];
     let slice = |a: i32, b: i32| &text[a as usize..b as usize];
     let mut s = new_scanner();
@@ -423,4 +452,57 @@ fn effect_fn_comments(sf: Node, start: i32, end: i32, moved: Node) -> String {
         comments += &text[trivia_start as usize..];
     }
     comments
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+    use crate::scanner_util::{go_string_bytes, go_string_from_bytes};
+
+    // Go slices the file text by bytes (effect_fn_opportunity.go:296
+    // `sf.Text()[start:end]`), so a start inside a char is no panic: the
+    // text starts with a byte that is not UTF-8, which Go's scanner reads
+    // as one NonTextFileMarkerTrivia token to the end, and no comment is
+    // kept. The answers are those of the Go function on the same texts
+    // (effect-tsgo 0.51.1, followups43 go-test.log).
+    #[test]
+    fn comments_from_a_start_inside_a_char_are_empty_as_go() {
+        let cases = [
+            (
+                "const f = (a: string) => /* \u{e9} */ 1 // \u{fc}\n",
+                "\u{e9}",
+                1,
+            ),
+            (
+                "const f = (a: string) => /* \u{e9} */ 1 // \u{fc}\n",
+                "\u{fc}",
+                1,
+            ),
+            ("const f\u{e9} = 1 /* c */ + 2\n", "\u{e9}", 1),
+            ("const s = \"\u{4e2d}\" /* c */ + 2\n", "\u{4e2d}", 1),
+            ("const s = \"\u{4e2d}\" /* c */ + 2\n", "\u{4e2d}", 2),
+            ("const g = 1 /* \u{4e2d} */ + 2\n", "\u{4e2d}", 2),
+        ];
+        for (text, at, offset) in cases {
+            let opts = SourceFileParseOptions {
+                file_name: "/t.ts".to_string(),
+                ..Default::default()
+            };
+            let sf = parse_source_file(&opts, text, ScriptKind::TS).root;
+            let start = (text.find(at).expect("the char") + offset) as i32;
+            assert_eq!(
+                effect_fn_comments(sf, start, text.len() as i32, Node::NIL),
+                "",
+                "{text:?} from {start}"
+            );
+        }
+        // The signature slice keeps the cut byte, as Go's `text[a:b]`.
+        let text = "const f = (a) => 1 // \u{e9}\n";
+        let cut = go_text_slice(text, 0, text.find('\u{e9}').expect("the char") as i32 + 1);
+        let mut want = b"const f = (a) => 1 // ".to_vec();
+        want.push(0xc3);
+        assert_eq!(go_string_bytes(&cut).into_owned(), want);
+        assert_eq!(cut, go_string_from_bytes(want));
+    }
 }
