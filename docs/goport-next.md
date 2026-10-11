@@ -24,7 +24,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 - **jsdocstr1 e9c2aff12: skeptic PASS, kept below the bar (note jsdocstr1-result-2026-10-11; parse mallocs -9 to -30 percent, Go substring model). Into int61.**
 
-- **Running: sweepgap1 (compat study: LSP sweep battery diffs against Go N prime, svelte 289 and effect 14, mostly completions; Go selfcheck first).**
+- **sweepgap1 done: 0 port gaps in the LSP sweep battery (303 diffs: Go nondeterminism or the Effect class; note sweepgap1-result-2026-10-11).**
 
 - **invokeonce1 75866d18c: skeptic PASS (T3 server st -5.1 percent, T3 web -1.5 to -2; output and counts equal). Into int61. chk4split: the 4-checker split is Go's (lib updates moved it); hono 4-checker wall is a named Go-parity cost (note invokeonce1-result-2026-10-11).**
 
