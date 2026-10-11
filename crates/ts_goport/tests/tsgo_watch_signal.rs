@@ -23,9 +23,9 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{AtFlags, Mode, OFlags, Timespec, Timestamps, UTIME_NOW};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process};
 
@@ -154,13 +154,43 @@ impl Project {
 
     /// Puts a FIFO in the place of `src/a.ts` with one rename, so the
     /// watch sees one change, and the next read of the file waits.
+    ///
+    /// The FIFO's time must be after the clock time when the build wrote
+    /// its build info. `-b -w` reads an input only when the input's time is
+    /// after that time (Go execute/build/buildtask.go:441
+    /// `getUpToDateStatus`; `onBuildInfoEmit` keeps `Sys.Now()` at :870). A
+    /// file system with coarse times (4 ms steps in the testbox /tmp) gives
+    /// a new file a time up to one step before the clock, and then neither
+    /// Go nor the port reads the FIFO. The build is done when this runs, so
+    /// the test sets the FIFO's time to now again until it is after the
+    /// clock time at the start. The rename keeps that time.
     fn hold_a_ts(&self) -> Fifo {
+        let start = SystemTime::now();
         let staged = self.root.join("x").join("a.fifo");
         rustix::fs::mkfifoat(rustix::fs::CWD, &staged, Mode::RUSR | Mode::WUSR).unwrap();
+        let end = Instant::now() + LIMIT;
+        while modified(&staged) <= start {
+            assert!(Instant::now() < end, "the FIFO time is not after {start:?}");
+            std::thread::sleep(Duration::from_millis(1));
+            let now = Timespec {
+                tv_sec: 0,
+                tv_nsec: UTIME_NOW,
+            };
+            let times = Timestamps {
+                last_access: now,
+                last_modification: now,
+            };
+            rustix::fs::utimensat(rustix::fs::CWD, &staged, &times, AtFlags::empty()).unwrap();
+        }
         let path = self.proj.join("src/a.ts");
         std::fs::rename(&staged, &path).unwrap();
         Fifo(path)
     }
+}
+
+/// The modification time of `path`.
+fn modified(path: &Path) -> SystemTime {
+    std::fs::metadata(path).unwrap().modified().unwrap()
 }
 
 impl Drop for Project {
