@@ -1044,8 +1044,11 @@ impl ApiStabilitySession {
     }
 
     // Go: typeparser/api_stability.go ApiStabilitySession.UsedBySignature
-    // Callers: only Go tests (api_stability_surface_test.go:121, :342 and
-    // more); the port's `test_api_stability_overload_tags_stay_distinct`.
+    // Callers: only Go tests (api_stability_surface_test.go:121, :342,
+    // api_stability_test.go:458, :467 and more) and
+    // `api_stability_used_by_signature`; the port's
+    // `test_api_stability_overload_tags_stay_distinct` and
+    // `test_api_stability_signature_surface_retains_substitution`.
     /// UsedBySignature computes the stability the children of an already
     /// represented signature expose inside this session. The signature's own
     /// declared tag is excluded from the returned dependencies and minimum; its
@@ -1138,9 +1141,23 @@ impl TypeParser<'_> {
         session.used_by_type(self, t)
     }
 
-    // PORT: Go `TypeParser.ApiStabilityUsedBySignature` (api_stability.go:758)
-    // has no caller, not even a test, so it is not ported. Use
-    // `new_api_stability_session` and `ApiStabilitySession::used_by_signature`.
+    // Go: typeparser/api_stability.go TypeParser.ApiStabilityUsedBySignature
+    // Callers: only Go tests (api_stability_test.go:480 in
+    // TestApiStabilitySignatureSurfaceRetainsSubstitution; :659 and :662 in
+    // TestApiStabilitySignatureCacheIsolation, which needs two programs and is
+    // not portable here); the port's
+    // `test_api_stability_signature_surface_retains_substitution`.
+    /// ApiStabilityUsedBySignature computes the stability the children of an
+    /// already represented signature expose in a fresh one-call session. The
+    /// signature's own declared tag is excluded; use DeclaredApiStabilityOfSignature
+    /// to read it. A concrete signature's instantiated parameter and return
+    /// components are preferred; the uninstantiated target plus the represented
+    /// substitution remains the fallback, so a directly exported inferred return
+    /// such as `make<E>()` still exposes `E` without expanding a recursive alias.
+    pub fn api_stability_used_by_signature(&mut self, signature: SignatureId) -> ApiStabilityUsed {
+        let mut session = self.new_api_stability_session();
+        session.used_by_signature(self, signature)
+    }
 }
 
 /// Go `apiStabilityOwnTag`.

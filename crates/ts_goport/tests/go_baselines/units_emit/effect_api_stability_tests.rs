@@ -1,10 +1,10 @@
 //! Ports of small Effect-TS/tsgo unit tests of the API stability engine, at
 //! `@effect/tsgo@0.51.1` (`47cb1ed7`, `internal/typeparser`; R190 reviewer
 //! item 4): the Safe verdict memo, the guard budget, settle after the budget,
-//! the declared and shared cache keys, the incomplete result and the
-//! inheritance minimum. They read the engine state that the CLI output cannot
-//! show. `scripts/effect/go-unit-cases.mjs` compares the CLI output of every
-//! Go test source with effect-tsgo.
+//! the declared and shared cache keys, the session signature memo, the
+//! incomplete result and the inheritance minimum. They read the engine state
+//! that the CLI output cannot show. `scripts/effect/go-unit-cases.mjs`
+//! compares the CLI output of every Go test source with effect-tsgo.
 //!
 //! PORT: a Go `t.Run` subtest that makes a program of its own is a test of
 //! its own here: a program and the OS override are process-wide, so each
@@ -12,8 +12,9 @@
 //! (`program.GetSemanticDiagnostics(ctx, nil)`) checks each root file with
 //! the test's checker (`prime`): with `skipDefaultLibCheck` the lib files are
 //! not checked, and the single-threaded program has only that checker. Go
-//! `TestApiStabilityCacheDifferentCheckerIsolation` needs two programs at
-//! once and is not ported.
+//! `TestApiStabilityCacheDifferentCheckerIsolation` and
+//! `TestApiStabilitySignatureCacheIsolation` need two programs at once and
+//! are not ported.
 
 use super::childprog::{in_child, install_map_fs, source_file};
 use crate::support::vfstest::MapFs;
@@ -430,6 +431,68 @@ fn test_api_stability_signature_declared_cache_keeps_overloads_distinct() {
                         "both overload declarations should be cached separately"
                     );
                 }
+            });
+        },
+    );
+}
+
+// Go: typeparser/api_stability_test.go:441 TestApiStabilitySignatureSurfaceRetainsSubstitution
+#[test]
+fn test_api_stability_signature_surface_retains_substitution() {
+    in_child(
+        module_path!(),
+        "test_api_stability_signature_surface_retains_substitution",
+        || {
+            let source = "/** @stability experimental */\ninterface E { value: string }\ndeclare function make<T>(): (x: T) => T\nexport const f = make<E>()\n";
+            with_type_parser(&[(TEST_FILE, source)], |tp, files| {
+                let f = export(tp, files[0], "f");
+                let instantiated = call_signatures(tp, f)[0];
+
+                let mut session = tp.new_api_stability_session();
+                let computed = session.used_by_signature(tp, instantiated);
+                assert!(
+                    contains_dependency(tp, &computed, "E"),
+                    "instantiated signature should expose E, got {:?}",
+                    dependency_names(tp, &computed)
+                );
+                let key = ApiStabilitySignatureKey {
+                    signature: instantiated,
+                    ..Default::default()
+                };
+                let analysis = session.analysis.as_deref().expect("session analysis");
+                assert!(
+                    analysis
+                        .session_signatures
+                        .get(&key)
+                        .is_some_and(|surface| surface.complete),
+                    "completed signature surface should be memoized in the session"
+                );
+                let work = analysis.work;
+                let repeat = session.used_by_signature(tp, instantiated);
+                assert!(
+                    contains_dependency(tp, &repeat, "E"),
+                    "repeated session query lost E, got {:?}",
+                    dependency_names(tp, &repeat)
+                );
+                assert_eq!(
+                    session.analysis.as_deref().expect("session analysis").work,
+                    work,
+                    "repeated session query recomputed the memoized signature surface"
+                );
+
+                // The raw target's type parameter is not an experimental
+                // dependency, so the shallow form must not report E.
+                let raw = raw_signature(&*tp.checker, instantiated);
+                assert_ne!(
+                    raw, instantiated,
+                    "expected an instantiated signature with a raw target"
+                );
+                let shallow = tp.api_stability_used_by_signature(raw);
+                assert!(
+                    !contains_dependency(tp, &shallow, "E"),
+                    "raw target should stay shallow, got {:?}",
+                    dependency_names(tp, &shallow)
+                );
             });
         },
     );
