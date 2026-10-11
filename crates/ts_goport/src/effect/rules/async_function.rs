@@ -20,12 +20,8 @@ pub static ASYNC_FUNCTION: Rule = Rule {
 fn run_async_function(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
-    // PORT: Go's recursive `walk` closure.
-    fn walk(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, node: Node) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    // PORT: the body of Go's recursive `walk` closure, for one node.
+    fn visit(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, node: Node) {
         match node.kind() {
             SyntaxKind::FunctionDeclaration
             | SyntaxKind::FunctionExpression
@@ -43,12 +39,13 @@ fn run_async_function(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
             }
             _ => {}
         }
-
-        node.for_each_child(|child| walk(ctx, diags, child));
-        false
     }
 
     let sf = ctx.source_file;
-    walk(ctx, &mut diags, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diags, n);
+    }
     diags
 }

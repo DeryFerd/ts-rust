@@ -31,24 +31,21 @@ fn run_global_error_in_effect_catch(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagno
     let mut diags = Vec::new();
 
     let source_file = ctx.source_file;
-    walk(ctx, &mut diags, source_file);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(source_file).nodes() {
+        visit(ctx, &mut diags, n);
+    }
 
     diags
 }
 
-fn walk(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, n: Node) -> bool {
-    if n.is_nil() {
-        return false;
-    }
-
+fn visit(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, n: Node) {
     if n.kind() == SyntaxKind::CallExpression {
         if let Some(diag) = check_global_error_in_effect_catch(ctx, n) {
             diags.push(diag);
         }
     }
-
-    n.for_each_child(|child| walk(ctx, diags, child));
-    false
 }
 
 // Go: rules.checkGlobalErrorInEffectCatch

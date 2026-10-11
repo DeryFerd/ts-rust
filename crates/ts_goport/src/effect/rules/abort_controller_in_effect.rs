@@ -30,20 +30,20 @@ fn run_abort_controller_in_effect(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnost
 
     let mut diags = Vec::new();
     let source_file = ctx.source_file;
-    walk(ctx, abort_controller_symbol, &mut diags, source_file);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(source_file).nodes() {
+        visit(ctx, abort_controller_symbol, &mut diags, n);
+    }
     diags
 }
 
-fn walk(
+fn visit(
     ctx: &mut RuleContext<'_, '_>,
     abort_controller_symbol: SymbolId,
     diags: &mut Vec<Diagnostic>,
     node: Node,
-) -> bool {
-    if node.is_nil() {
-        return false;
-    }
-
+) {
     if node.kind() == SyntaxKind::NewExpression
         && ctx
             .tp
@@ -62,7 +62,4 @@ fn walk(
             ));
         }
     }
-
-    node.for_each_child(|n| walk(ctx, abort_controller_symbol, diags, n));
-    false
 }

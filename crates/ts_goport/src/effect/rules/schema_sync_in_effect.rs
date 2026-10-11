@@ -57,28 +57,25 @@ fn run_schema_sync_in_effect(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
 
     let mut diags = Vec::new();
 
-    fn walk(
+    fn visit(
         ctx: &mut RuleContext<'_, '_>,
         sync_to_effect_method: &'static [(ExportMember, &'static str)],
         diags: &mut Vec<Diagnostic>,
         n: Node,
-    ) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    ) {
         if n.kind() == SyntaxKind::CallExpression
             && let Some(d) = check_schema_sync_in_effect(ctx, n, sync_to_effect_method)
         {
             diags.push(d);
         }
-
-        n.for_each_child(|child| walk(ctx, sync_to_effect_method, diags, child));
-        false
     }
 
     let sf = ctx.source_file;
-    walk(ctx, sync_to_effect_method, &mut diags, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, sync_to_effect_method, &mut diags, n);
+    }
     diags
 }
 

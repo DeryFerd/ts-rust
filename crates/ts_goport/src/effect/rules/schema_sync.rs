@@ -23,15 +23,12 @@ fn run_schema_sync(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
         methods = &super::schema_sync_in_effect::SYNC_TO_EFFECT_METHOD_V4;
     }
 
-    fn walk(
+    fn visit(
         ctx: &mut RuleContext<'_, '_>,
         diags: &mut Vec<Diagnostic>,
         methods: &[(ExportMember, &str)],
         node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
+    ) {
         if node.kind() == SyntaxKind::CallExpression {
             let callee = node.expression();
             let mut reference = skip_parentheses(callee);
@@ -66,12 +63,14 @@ fn run_schema_sync(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
                 }
             }
         }
-        node.for_each_child(|child| walk(ctx, diags, methods, child));
-        false
     }
 
     let mut diags = Vec::new();
     let sf = ctx.source_file;
-    walk(ctx, &mut diags, methods, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diags, methods, n);
+    }
     diags
 }
