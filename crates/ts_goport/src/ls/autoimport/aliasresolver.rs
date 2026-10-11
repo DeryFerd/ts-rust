@@ -118,7 +118,10 @@ impl AliasResolver {
     // in Go, also a new parse of a file of an ancestor bucket that this
     // clone did not build (`resolveAmbientModuleName`, registry.go:1844).
     // The port's parse cache does not bind (`parsecache::new_parse_cache`),
-    // so every root file is bound here. Go N' and the port give the same
+    // so every root file is bound here. That bind matters only for a new
+    // parse: the session keeps one parse per path (`kept_files`,
+    // project/autoimport.rs `dispose`), so a later clone usually reuses a
+    // parse that an earlier clone bound. Go N' and the port give the same
     // export counts in the registry test
     // `second_pass_reads_a_root_file_of_an_ancestor_bucket_in_a_later_clone`.
     // PORT: Go's `NewChecker` has no context. `ctx` is for

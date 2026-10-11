@@ -150,7 +150,8 @@ fn build_watch_keeps_the_first_json_parse_of_a_cycle() {
 /// watch. Why the root is `/tmp/<dir>`: there `out` is 3 levels below `/`,
 /// and it gets no watch. Under the system temp dir it can be deeper and get
 /// a watch. Go gives the same output at any depth, so where `/tmp` is
-/// deeper the test still runs and passes, but it does not check the drop. `expected.txt` and the counts are from
+/// deeper the test still runs and passes, but it does not check the drop.
+/// `expected.txt` and the counts are from
 /// `tsgo-oracle-fed0bf24149f` and `tsgo-oracle-673a5f17d713` in place of
 /// `tsgo` for this test (3 of 3 runs each).
 // PORT: no Go counterpart; the output is Go's.

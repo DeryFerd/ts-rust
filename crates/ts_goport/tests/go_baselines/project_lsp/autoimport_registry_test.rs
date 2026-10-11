@@ -1644,10 +1644,12 @@ child_test! {
     // ambient-decl declares, so the second pass extracts reexporter with
     // ambient-decl as a root file (registry.go:1088-1131, :1844). The edits
     // rebuild only the app bucket. Its export count is Go N' fed0bf24149f's
-    // in each clone (2, 3, 4: `virtualValue` stays): Go's parse cache binds
-    // each new parse (project/parsecache.go:80), so the ambient-decl file
-    // that a later clone reads again is bound, as the port binds every root
-    // file (`AliasResolver::new_checker`).
+    // in each clone (2, 3, 4: `virtualValue` stays). In Go a later clone
+    // gets a new parse of ambient-decl, and the parse cache binds it
+    // (project/parsecache.go:80). The port's session keeps one parse per
+    // path (`kept_files`, project/autoimport.rs `dispose`), so a later clone
+    // reuses the parse that clone 1 bound: this test pins Go's counts, but it
+    // does not reach the root-file bind of `AliasResolver::new_checker`.
     fn second_pass_reads_a_root_file_of_an_ancestor_bucket_in_a_later_clone() {
         let root = "/home/src/second-pass-ancestor";
         let app = format!("{root}/apps/web");
