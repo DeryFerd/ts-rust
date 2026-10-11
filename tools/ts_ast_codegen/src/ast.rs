@@ -1310,22 +1310,22 @@ mod tests {
         let output = generate_ast(UPSTREAM_AST).unwrap();
 
         assert!(output.contains(
-            "Self::DoStatement(node) => {\n                visitor(node.statement)?;\n                visitor(node.expression)"
+            "Self::DoStatement(node) => {\n                visitor(Child::Node(node.statement))?;\n                visitor(Child::Node(node.expression))"
         ));
         assert!(output.contains(
-            "Self::FunctionDeclaration(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;\n                visit_optional_child(visitor, node.asterisk_token)?;\n                visit_optional_child(visitor, node.name)?;\n                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;\n                visit_node_list(visitor, &node.parameters)?;\n                visit_optional_child(visitor, node.type_)?;\n                visit_optional_child(visitor, node.full_signature)?;\n                visit_optional_child(visitor, node.body)"
+            "Self::FunctionDeclaration(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers)?;\n                visit_optional_child(visitor, node.asterisk_token)?;\n                visit_optional_child(visitor, node.name)?;\n                visit_optional_node_list(visitor, node.type_parameters)?;\n                visitor(Child::List(node.parameters))?;\n                visit_optional_child(visitor, node.type_)?;\n                visit_optional_child(visitor, node.full_signature)?;\n                visit_optional_child(visitor, node.body)"
         ));
         assert!(output.contains(
-            "Self::ImportDeclaration(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;\n                visit_optional_child(visitor, node.import_clause)?;\n                visitor(node.module_specifier)?;\n                visit_optional_child(visitor, node.attributes)"
+            "Self::ImportDeclaration(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers)?;\n                visit_optional_child(visitor, node.import_clause)?;\n                visitor(Child::Node(node.module_specifier))?;\n                visit_optional_child(visitor, node.attributes)"
         ));
         assert!(output.contains(
-            "Self::ExportAssignment(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;\n                visit_optional_child(visitor, node.type_)?;\n                visitor(node.expression)"
+            "Self::ExportAssignment(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers)?;\n                visit_optional_child(visitor, node.type_)?;\n                visitor(Child::Node(node.expression))"
         ));
         assert!(output.contains(
-            "Self::SourceFile(node) => {\n                visit_node_list(visitor, &node.statements)?;\n                visitor(node.end_of_file_token)"
+            "Self::SourceFile(node) => {\n                visitor(Child::List(node.statements))?;\n                visitor(Child::Node(node.end_of_file_token))"
         ));
         assert!(output.contains(
-            "Self::JsDocParameterOrPropertyTag(node) => {\n                visitor(node.tag_name)?;\n                if node.is_name_first"
+            "Self::JsDocParameterOrPropertyTag(node) => {\n                visitor(Child::Node(node.tag_name))?;\n                if node.is_name_first"
         ));
     }
 }
