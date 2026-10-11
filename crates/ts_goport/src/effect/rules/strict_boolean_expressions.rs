@@ -27,18 +27,14 @@ fn run_strict_boolean_expressions(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnost
         |checks: &FxHashMap<Node, bool>, n: Node| checks.get(&n).copied().unwrap_or(false);
 
     // Breadth-first traversal matching the reference implementation
-    let mut node_to_visit: VecDeque<Node> = VecDeque::new();
-    ctx.source_file.for_each_child(|child| {
-        node_to_visit.push_back(child);
-        false
-    });
+    // PERF: the queue holds node order indexes (effperf4).
+    let order = ctx.tp.node_order(ctx.source_file);
+    let mut node_to_visit: VecDeque<u32> = order.children(0).collect();
 
-    while let Some(node) = node_to_visit.pop_front() {
+    while let Some(i) = node_to_visit.pop_front() {
+        let node = order.node(i);
         // Enqueue children
-        node.for_each_child(|child| {
-            node_to_visit.push_back(child);
-            false
-        });
+        node_to_visit.extend(order.children(i));
 
         let mut nodes_to_check: Vec<Node> = Vec::new();
 

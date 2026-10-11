@@ -18,19 +18,23 @@ pub static PROMISE_IN_EFFECT_SUCCESS: Rule = Rule {
 
 fn run_promise_in_effect_success(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
+    // PERF: the node is a node order index (effperf4).
     struct StackEntry {
-        node: Node,
+        index: u32,
         visited: bool,
     }
 
+    // PERF: Go walks the tree with a stack of nodes; this stack holds node
+    // order indexes and pushes and pops at the same points (effperf4).
+    let order = ctx.tp.node_order(ctx.source_file);
     let mut stack = vec![StackEntry {
-        node: ctx.source_file,
+        index: 0,
         visited: false,
     }];
     let mut matched: FxHashMap<Node, bool> = FxHashMap::default();
 
     while let Some(entry) = stack.pop() {
-        let node = entry.node;
+        let node = order.node(entry.index);
         if node.is_nil() {
             continue;
         }
@@ -40,16 +44,13 @@ fn run_promise_in_effect_success(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnosti
                 continue;
             }
             stack.push(StackEntry {
-                node,
+                index: entry.index,
                 visited: true,
             });
-            node.for_each_child(|child| {
-                stack.push(StackEntry {
-                    node: child,
-                    visited: false,
-                });
-                false
-            });
+            stack.extend(order.children(entry.index).map(|child| StackEntry {
+                index: child,
+                visited: false,
+            }));
             continue;
         }
 

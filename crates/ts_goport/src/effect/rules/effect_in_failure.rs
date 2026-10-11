@@ -21,8 +21,9 @@ pub static EFFECT_IN_FAILURE: Rule = Rule {
 };
 
 // Go: rules/effect_in_failure.go stackEntry (local type of the Run closure)
+// PERF: the node is a node order index (effperf4).
 struct StackEntry {
-    node: Node,
+    index: u32,
     visited: bool,
 }
 
@@ -33,28 +34,28 @@ fn run_effect_in_failure(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
     // Children are processed before parents so that the
     // shouldSkipBecauseChildMatched mechanism can suppress
     // redundant diagnostics on parent nodes.
+    // PERF: Go walks the tree with a stack of nodes; this stack holds node
+    // order indexes and pushes and pops at the same points (effperf4).
+    let order = ctx.tp.node_order(ctx.source_file);
     let mut stack = vec![StackEntry {
-        node: ctx.source_file,
+        index: 0,
         visited: false,
     }];
     let mut should_skip: FxHashMap<Node, bool> = FxHashMap::default();
 
     while let Some(entry) = stack.pop() {
-        let node = entry.node;
+        let node = order.node(entry.index);
 
         // First visit: push self again (marked visited) then push children
         if !entry.visited {
             stack.push(StackEntry {
-                node,
+                index: entry.index,
                 visited: true,
             });
-            node.for_each_child(|child| {
-                stack.push(StackEntry {
-                    node: child,
-                    visited: false,
-                });
-                false
-            });
+            stack.extend(order.children(entry.index).map(|child| StackEntry {
+                index: child,
+                visited: false,
+            }));
             continue;
         }
 
