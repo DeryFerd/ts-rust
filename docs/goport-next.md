@@ -8,7 +8,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 - **Now (2026-10-11):** R193 accepted (int60 without effperf1 F3; main 3323eeb9f; notes r193-side, timing-r193). Running after the accept: extrabatR193 and followups42 (workflow after-r193). Next: int61 = R194 on main: effint1 b38ba8de8 (Effect editor features, D1 stays out), effperf3 bc6cd8b72, invokeonce1 75866d18c, jsdocstr1 e9c2aff12, astshrink1 b5611fa68, apicbfu1 1b7532c48, i50 (PR #54); then main's light-path PRs #55 (CI fix) and #53 (#49).
 
-- **Public issues 2026-10-11 (note issues52-result-2026-10-11):** #52 replied (effect-tsgo 0.51.1 parity, workaround, upstream Effect-TS/tsgo#820, labeled; port the upstream fix when it lands). #49: PR #53 (light path; root merges after the R193 accept, then lib blobs once). #50: PR #54 (loader: into int61; macOS CI runs realpath_case.rs).
+- **Public issues 2026-10-11 (note issues52-result-2026-10-11):** #52 replied (effect-tsgo 0.51.1 parity, workaround, upstream Effect-TS/tsgo#820, labeled; port the upstream fix when it lands). #49: PR #53 merged (ef82c3e59, light path). #50: PR #54 (loader: into int61; macOS CI runs realpath_case.rs).
 
 - **R192 withdrawn (reviewer B1: effperf1 F3 changed Effect plugin-on counts; note effperf1-f3-dropped-2026-10-11). R193 = goport-int60p 24a676449 (int60 without F3): side running, then np-suite, timing-r193 (running), extrabatNp, verdict request.** Follow-ups: a count-preserving F3 lane; plugin-on counts in the gate's Effect items (tool path in a batch).
 
