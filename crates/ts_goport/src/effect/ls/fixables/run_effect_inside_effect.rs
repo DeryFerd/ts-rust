@@ -3,7 +3,7 @@
 use crate::effect::ls::fixable::{Fixable, FixableContext};
 use crate::effect::ls::rewriter::Tracker;
 use crate::effect::rules::run_effect_inside_effect::analyze_run_effect_inside_effect;
-use crate::effect::typeparser::{EffectMajorVersion, TypeParser, find_module_identifier};
+use crate::effect::typeparser::{EffectMajorVersion, TypeParser, find_module_identifier, member};
 use crate::ls::CodeAction;
 use crate::ls::change::NodeOptions;
 use crate::prelude::*;
@@ -138,10 +138,12 @@ fn yielded_runtime_and_services_identifiers(
             continue;
         }
         let identifier = get_text_of_node(decl.name());
-        if tp.is_node_reference_to_effect_module_api(yielded_call.expression(), "runtime") {
+        if tp.is_node_reference_to_effect_module_api(yielded_call.expression(), member!("runtime"))
+        {
             runtime_identifier.clone_from(&identifier);
         }
-        if tp.is_node_reference_to_effect_module_api(yielded_call.expression(), "context") {
+        if tp.is_node_reference_to_effect_module_api(yielded_call.expression(), member!("context"))
+        {
             services_identifier = identifier;
         }
     }

@@ -5,7 +5,7 @@ use crate::effect::ls::completion::{
     Completion, CompletionContext, parse_data_for_extends_class_completion,
 };
 use crate::effect::typeparser::{
-    EffectMajorVersion, find_module_identifier, find_module_identifier_for_package,
+    EffectMajorVersion, find_module_identifier, find_module_identifier_for_package, member,
 };
 use crate::ls::prelude::*;
 
@@ -45,7 +45,7 @@ fn run_effect_schema_self_in_classes(
     if is_fully_qualified
         || ctx
             .tp
-            .is_node_reference_to_effect_schema_module_api(data.accessed_object, "Class")
+            .is_node_reference_to_effect_schema_module_api(data.accessed_object, member!("Class"))
     {
         let insert_text = if is_fully_qualified {
             format!(r#"{schema_identifier}.Class<{class_name}>("{class_name}")({{${{0}}}}){{}}"#)
@@ -63,9 +63,10 @@ fn run_effect_schema_self_in_classes(
 
     // Schema.TaggedError (both v3 and v4)
     if is_fully_qualified
-        || ctx
-            .tp
-            .is_node_reference_to_effect_schema_module_api(data.accessed_object, "TaggedError")
+        || ctx.tp.is_node_reference_to_effect_schema_module_api(
+            data.accessed_object,
+            member!("TaggedError"),
+        )
     {
         let insert_text = if is_fully_qualified {
             format!(
@@ -85,9 +86,10 @@ fn run_effect_schema_self_in_classes(
 
     // Schema.TaggedClass (both v3 and v4)
     if is_fully_qualified
-        || ctx
-            .tp
-            .is_node_reference_to_effect_schema_module_api(data.accessed_object, "TaggedClass")
+        || ctx.tp.is_node_reference_to_effect_schema_module_api(
+            data.accessed_object,
+            member!("TaggedClass"),
+        )
     {
         let insert_text = if is_fully_qualified {
             format!(
@@ -110,7 +112,7 @@ fn run_effect_schema_self_in_classes(
         && (is_fully_qualified
             || ctx.tp.is_node_reference_to_effect_schema_module_api(
                 data.accessed_object,
-                "TaggedRequest",
+                member!("TaggedRequest"),
             ))
     {
         let insert_text = if is_fully_qualified {
@@ -132,9 +134,10 @@ fn run_effect_schema_self_in_classes(
     // Schema.Error (v4 only)
     if version == EffectMajorVersion::V4
         && (is_fully_qualified
-            || ctx
-                .tp
-                .is_node_reference_to_effect_schema_module_api(data.accessed_object, "Error"))
+            || ctx.tp.is_node_reference_to_effect_schema_module_api(
+                data.accessed_object,
+                member!("Error"),
+            ))
     {
         let insert_text = if is_fully_qualified {
             format!(r#"{schema_identifier}.Error<{class_name}>("{class_name}")({{${{0}}}}){{}}"#)
@@ -158,9 +161,10 @@ fn run_effect_schema_self_in_classes(
         let is_model_fully_qualified = model_identifier == accessed_text;
 
         if is_model_fully_qualified
-            || ctx
-                .tp
-                .is_node_reference_to_effect_model_module_api(data.accessed_object, "Class")
+            || ctx.tp.is_node_reference_to_effect_model_module_api(
+                data.accessed_object,
+                member!("Class"),
+            )
         {
             let insert_text = if is_model_fully_qualified {
                 format!(r#"{model_identifier}.Class<{class_name}>("{class_name}")({{${{0}}}}){{}}"#)

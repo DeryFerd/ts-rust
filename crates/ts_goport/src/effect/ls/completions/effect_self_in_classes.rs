@@ -6,7 +6,7 @@ use super::effect_schema_self_in_classes::{byte_span_to_range, make_extends_comp
 use crate::effect::ls::completion::{
     Completion, CompletionContext, parse_data_for_extends_class_completion,
 };
-use crate::effect::typeparser::{EffectMajorVersion, find_module_identifier};
+use crate::effect::typeparser::{EffectMajorVersion, find_module_identifier, member};
 use crate::ls::prelude::*;
 
 // Go: completions/effect_self_in_classes.go:14 effectSelfInClasses
@@ -50,7 +50,7 @@ fn run_effect_self_in_classes(ctx: &mut CompletionContext<'_, '_>) -> Vec<lsprot
     if is_fully_qualified
         || ctx
             .tp
-            .is_node_reference_to_effect_module_api(data.accessed_object, "Service")
+            .is_node_reference_to_effect_module_api(data.accessed_object, member!("Service"))
     {
         let insert_text = if is_fully_qualified {
             format!(r#"{effect_identifier}.Service<{class_name}>()("{tag_key}", {{${{0}}}}){{}}"#)
@@ -70,7 +70,7 @@ fn run_effect_self_in_classes(ctx: &mut CompletionContext<'_, '_>) -> Vec<lsprot
     if is_fully_qualified
         || ctx
             .tp
-            .is_node_reference_to_effect_module_api(data.accessed_object, "Tag")
+            .is_node_reference_to_effect_module_api(data.accessed_object, member!("Tag"))
     {
         let insert_text = if is_fully_qualified {
             format!(r#"{effect_identifier}.Tag("{tag_key}")<{class_name}, {{${{0}}}}>(){{}}"#)

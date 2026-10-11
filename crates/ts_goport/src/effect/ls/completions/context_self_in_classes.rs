@@ -7,7 +7,7 @@ use crate::effect::ls::completion::{
     Completion, CompletionContext, parse_data_for_extends_class_completion,
 };
 use crate::effect::pluginoptions::resolve_effect_plugin_options_for_source_file;
-use crate::effect::typeparser::{EffectMajorVersion, TypeParser, find_module_identifier};
+use crate::effect::typeparser::{EffectMajorVersion, TypeParser, find_module_identifier, member};
 use crate::ls::prelude::*;
 
 // Go: completions/context_self_in_classes.go:18 contextSelfInClasses
@@ -40,9 +40,10 @@ fn run_context_self_in_classes(
 
     if version == EffectMajorVersion::V3 {
         if !is_fully_qualified
-            && !ctx
-                .tp
-                .is_node_reference_to_effect_context_module_api(data.accessed_object, "Tag")
+            && !ctx.tp.is_node_reference_to_effect_context_module_api(
+                data.accessed_object,
+                member!("Tag"),
+            )
         {
             return Vec::new();
         }
@@ -63,9 +64,10 @@ fn run_context_self_in_classes(
     }
 
     if !is_fully_qualified
-        && !ctx
-            .tp
-            .is_node_reference_to_effect_context_module_api(data.accessed_object, "Service")
+        && !ctx.tp.is_node_reference_to_effect_context_module_api(
+            data.accessed_object,
+            member!("Service"),
+        )
     {
         return Vec::new();
     }

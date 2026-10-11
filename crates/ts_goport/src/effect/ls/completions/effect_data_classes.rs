@@ -5,7 +5,7 @@ use super::effect_schema_self_in_classes::{byte_span_to_range, make_extends_comp
 use crate::effect::ls::completion::{
     Completion, CompletionContext, parse_data_for_extends_class_completion,
 };
-use crate::effect::typeparser::find_module_identifier;
+use crate::effect::typeparser::{find_module_identifier, member};
 use crate::ls::prelude::*;
 
 // Go: completions/effect_data_classes.go:14 effectDataClasses
@@ -38,9 +38,10 @@ fn run_effect_data_classes(ctx: &mut CompletionContext<'_, '_>) -> Vec<lsproto::
 
     // Data.TaggedError
     if is_fully_qualified
-        || ctx
-            .tp
-            .is_node_reference_to_effect_data_module_api(data.accessed_object, "TaggedError")
+        || ctx.tp.is_node_reference_to_effect_data_module_api(
+            data.accessed_object,
+            member!("TaggedError"),
+        )
     {
         let insert_text = if is_fully_qualified {
             format!(r#"{data_identifier}.TaggedError("{class_name}")<{{${{0}}}}>{{}}"#)
@@ -58,9 +59,10 @@ fn run_effect_data_classes(ctx: &mut CompletionContext<'_, '_>) -> Vec<lsproto::
 
     // Data.TaggedClass
     if is_fully_qualified
-        || ctx
-            .tp
-            .is_node_reference_to_effect_data_module_api(data.accessed_object, "TaggedClass")
+        || ctx.tp.is_node_reference_to_effect_data_module_api(
+            data.accessed_object,
+            member!("TaggedClass"),
+        )
     {
         let insert_text = if is_fully_qualified {
             format!(r#"{data_identifier}.TaggedClass("{class_name}")<{{${{0}}}}>{{}}"#)

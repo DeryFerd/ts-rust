@@ -5,7 +5,7 @@ use super::effect_schema_self_in_classes::{byte_span_to_range, make_extends_comp
 use crate::effect::ls::completion::{
     Completion, CompletionContext, parse_data_for_extends_class_completion,
 };
-use crate::effect::typeparser::{EffectMajorVersion, find_module_identifier_for_package};
+use crate::effect::typeparser::{EffectMajorVersion, find_module_identifier_for_package, member};
 use crate::ls::prelude::*;
 
 // Go: completions/effect_sql_model_self_in_classes.go:14 effectSqlModelSelfInClasses
@@ -40,9 +40,10 @@ fn run_effect_sql_model_self_in_classes(
 
     // For non-fully-qualified: validate with IsNodeReferenceToEffectSqlModelModuleApi
     if !is_fully_qualified
-        && !ctx
-            .tp
-            .is_node_reference_to_effect_sql_model_module_api(data.accessed_object, "Class")
+        && !ctx.tp.is_node_reference_to_effect_sql_model_module_api(
+            data.accessed_object,
+            member!("Class"),
+        )
     {
         return Vec::new();
     }
