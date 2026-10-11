@@ -1,0 +1,101 @@
+# One fixed runner size, serial measurements, and the same PGO build as release.yml.
+# Pull requests run once when opened; later README edits do not repeat the benchmark.
+name: App benchmarks
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened]
+    paths:
+      - ".github/workflows/bench-apps.yml"
+      - "scripts/bench-apps/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-apps-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUSTUP_TOOLCHAIN: 1.95.0
+  CARGO_INCREMENTAL: 0
+  TS_CARGO_CGROUP_ACTIVE: 1
+  TS_CARGO_JOBS: 16
+  TS_CARGO_SLOTS: 1
+  TS_CARGO_NIGHTLY: 0
+  TS_CARGO_INCREMENTAL: 0
+  RUNS: 5
+  BUN_SHA256: 55ed2a2d26b838acb3e39f19db60f43056da1a3650e18d3c24b7d7de723a1a2d
+
+jobs:
+  benchmark:
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.19.0
+      - name: Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -yq musl-tools hyperfine
+          npm install -g pnpm@11.10.0 corepack@0.34.5 --force
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl --component llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-apps-musl
+          save-if: ${{ github.event_name == 'workflow_dispatch' }}
+      - name: Build release reference
+        run: |
+          conf=$(sed -n 's/^const JEMALLOC_CONF: &str = "\([^"]*\)";$/\1/p' crates/ts_goport/src/bin/tsgo.rs | head -1)
+          [[ -n $conf ]]
+          echo "JEMALLOC_SYS_WITH_MALLOC_CONF=$conf" >> "$GITHUB_ENV"
+          export JEMALLOC_SYS_WITH_MALLOC_CONF=$conf CC_x86_64_unknown_linux_musl=musl-gcc
+          export RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"
+          scripts/run-cargo-capped.sh build --profile goport --locked -p ts_goport --bin tsgo --features noembed --target x86_64-unknown-linux-musl
+          mkdir -p "$RUNNER_TEMP/plain"
+          cp target/x86_64-unknown-linux-musl/goport/tsgo "$RUNNER_TEMP/plain/tsc"
+      - name: Build and verify PGO compiler
+        env:
+          PGO_TARGET: x86_64-unknown-linux-musl
+          PGO_LINK: static
+          PGO_BINS: tsgo
+          CARGO_FEATURES: --features noembed
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          scripts/goport/pgo-train.sh setup "$RUNNER_TEMP/train"
+          PGO_TRAIN="scripts/goport/pgo-train.sh run $RUNNER_TEMP/train" crates/ts_goport/scripts/build-pgo.sh "$RUNNER_TEMP/pgo"
+          scripts/goport/pgo-train.sh compare "$RUNNER_TEMP/train" "$RUNNER_TEMP/plain/tsc" "$RUNNER_TEMP/pgo/target-use/goport/tsgo"
+          mkdir -p "$RUNNER_TEMP/current"
+          crates/ts_goport/scripts/copy-libs.sh "$RUNNER_TEMP/current"
+          cp "$RUNNER_TEMP/pgo/target-use/goport/tsgo" "$RUNNER_TEMP/current/tsc"
+          echo "RS_BIN=$RUNNER_TEMP/current/tsc" >> "$GITHUB_ENV"
+      - name: Prepare pinned apps
+        run: scripts/bench-apps/setup.sh "$RUNNER_TEMP/bench.noindex"
+      - name: App benchmarks
+        run: scripts/bench-apps/run.sh "$RUNNER_TEMP/bench.noindex"
+      - name: T3 Code benchmarks
+        run: scripts/bench-apps/t3code.sh "$RUNNER_TEMP/bench.noindex"
+      - name: Verify outputs and summarize
+        run: |
+          python3 scripts/bench-apps/verify.py "$RUNNER_TEMP/bench.noindex"
+          python3 scripts/bench-apps/summary.py "$RUNNER_TEMP/bench.noindex" | tee "$RUNNER_TEMP/bench.noindex/results/summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Record source, tools and runner
+        if: always()
+        run: python3 scripts/bench-apps/metadata.py "$RUNNER_TEMP/bench.noindex"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-benchmarks-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/bench.noindex/results
+            ${{ runner.temp }}/bench.noindex/logs
+            ${{ runner.temp }}/bench.noindex/package-lock.json
+            ${{ runner.temp }}/pgo/*.log
+          if-no-files-found: error
+          retention-days: 90
