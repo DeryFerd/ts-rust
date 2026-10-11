@@ -12,11 +12,11 @@
 #        testbox.sh stop                      end the saved testbox now. stop cancels the job, and the sticky disks
 #                                             do not commit after a cancelled step: the writes to target/ are lost
 #        testbox.sh release                   forget the saved testbox: it ends at its idle timeout (TESTBOX_IDLE
-#                                             minutes after the last command), and that end commits the sticky disks.
-#                                             Use it after a cold build or new oracles; the idle minutes cost the same.
-#                                             Do not stop a released testbox: the commit is applied at VM shutdown,
-#                                             and `list` shows it ready for minutes after its job ends (a stop then
-#                                             lost testbox C's commit on 2026-10-10). `status` shows when it completed
+#                                             minutes after the last command), and that end requests a commit of the
+#                                             sticky disks. Use it after a cold build or new oracles. Commits of
+#                                             testboxes that lived 2 to 13 minutes landed (up to 2.1 GiB); those of two
+#                                             that lived 25 and 27 minutes did not. For a commit, warm up with
+#                                             TESTBOX_IDLE=1 and release after the last command. `status` shows the end
 #        testbox.sh pin [KEY...]              set up the zbook path mirror and each pin's Go checkout (default: the batch
 #                                             pin, which warmup sets up). KEY comes from this worktree's UPSTREAM.json
 #        testbox.sh oracles [KEY...]          seed the recorded oracle of each pin (default: the batch pin): upload the
@@ -211,8 +211,8 @@ case "$cmd" in
     if [[ $cmd == stop ]]; then
       blacksmith testbox stop --id "$id"
     else
-      echo "testbox $id: released; it ends and commits its sticky disks after its idle timeout. Do not stop it:"
-      echo "TESTBOX_ID=$id scripts/goport/testbox.sh status shows when it completed"
+      echo "testbox $id: released; it ends at its idle timeout and requests a commit of its sticky disks"
+      echo "(TESTBOX_ID=$id scripts/goport/testbox.sh status shows when it completed)"
     fi
     # Keep the saved ID when TESTBOX_ID named another testbox.
     [[ "$(cat "$id_file" 2>/dev/null || true)" != "$id" ]] || rm -f "$id_file"
