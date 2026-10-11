@@ -1036,65 +1036,52 @@ impl Binder {
     }
 
     // Go: binder/binder.go:2542 addDeclarationToSymbol
-    // PERF: one `&mut Symbol` for the whole function, as Go writes the fields
-    // of one struct (5 to 7 arena lookups before). The single declaration is
-    // pushed in place: built in a local and stored, the 16-byte list went
-    // through the stack with two 8-byte stores and one 16-byte load (a store
-    // forwarding stall on every new symbol).
     pub fn add_declaration_to_symbol(
         &mut self,
         symbol: SymbolId,
         node: Node,
         symbol_flags: SymbolFlags,
     ) {
+        self.symbols.sym_mut(symbol).flags |= symbol_flags;
         self.p3_node_bind_mut(node).symbol = symbol;
-        let s = self.symbols.sym_mut(symbol);
-        s.flags |= symbol_flags;
-        // PORT: Go `newSingleDeclaration` for a nil list, else
-        // `core.AppendIfUnique`. A push on the empty list makes the same
-        // single declaration (`new_single_declaration`).
-        if !s.declarations.contains(&node) {
-            s.declarations.push(node);
+        if self.symbols.sym(symbol).declarations.is_empty() {
+            let declarations = self.new_single_declaration(node);
+            self.symbols.sym_mut(symbol).declarations = declarations;
+        } else {
+            // Go core.AppendIfUnique
+            let declarations = &mut self.symbols.sym_mut(symbol).declarations;
+            if !declarations.contains(&node) {
+                declarations.push(node);
+            }
         }
         // On merge of const enum module with class or function, reset const enum only flag (namespaces will already recalculate)
-        if s.flags.intersects(SymbolFlags::CONST_ENUM_ONLY_MODULE)
-            && s.flags
+        let flags = self.symbols.sym(symbol).flags;
+        if flags.intersects(SymbolFlags::CONST_ENUM_ONLY_MODULE)
+            && flags
                 .intersects(SymbolFlags::FUNCTION | SymbolFlags::CLASS | SymbolFlags::REGULAR_ENUM)
         {
+            let s = self.symbols.sym_mut(symbol);
             s.flags = s.flags.without(SymbolFlags::CONST_ENUM_ONLY_MODULE);
             self.not_const_enum_only_modules.insert(symbol);
         }
-        // Go `SetValueDeclaration(symbol, node)`.
-        if symbol_flags.intersects(SymbolFlags::VALUE)
-            && takes_value_declaration(s.value_declaration, node)
-        {
-            s.value_declaration = node;
+        if symbol_flags.intersects(SymbolFlags::VALUE) {
+            set_value_declaration(&mut self.symbols, symbol, node);
         }
     }
 }
 
 // Go: binder/binder.go:2560 SetValueDeclaration
 pub fn set_value_declaration(symbols: &mut SymbolArena, symbol: SymbolId, node: Node) {
-    if takes_value_declaration(symbols.sym(symbol).value_declaration, node) {
+    let value_declaration = symbols.sym(symbol).value_declaration;
+    if value_declaration.is_nil()
+        || is_assignment_declaration(value_declaration) && !is_assignment_declaration(node)
+        || value_declaration.kind() != node.kind()
+            && is_effective_module_declaration(value_declaration)
+    {
+        // Non-assignment declarations take precedence over assignment declarations and
+        // non-namespace declarations take precedence over namespace declarations.
         symbols.sym_mut(symbol).value_declaration = node;
     }
-}
-
-/// The test of Go `SetValueDeclaration`: whether `node` replaces the value
-/// declaration `value_declaration` of its symbol.
-// PERF: reads each node kind once (Go reads `Kind` fields; a port kind read
-// goes through the node store).
-#[inline]
-fn takes_value_declaration(value_declaration: Node, node: Node) -> bool {
-    if value_declaration.is_nil() {
-        return true;
-    }
-    let value_kind = value_declaration.kind();
-    let node_kind = node.kind();
-    // Non-assignment declarations take precedence over assignment declarations and
-    // non-namespace declarations take precedence over namespace declarations.
-    is_assignment_declaration_kind(value_kind) && !is_assignment_declaration_kind(node_kind)
-        || value_kind != node_kind && is_effective_module_declaration_kind(value_kind)
 }
 
 // Go: binder/binder.go:2580 GetContainerFlags
@@ -1466,30 +1453,13 @@ pub fn is_top_level_logical_expression(node: Node) -> bool {
 
 // Go: binder/binder.go:2796 isAssignmentDeclaration
 pub fn is_assignment_declaration(decl: Node) -> bool {
-    is_assignment_declaration_kind(decl.kind())
-}
-
-/// `is_assignment_declaration` of a node of kind `kind`: binary, access,
-/// identifier or call expression.
-#[inline]
-fn is_assignment_declaration_kind(kind: SyntaxKind) -> bool {
-    matches!(
-        kind,
-        SyntaxKind::BinaryExpression
-            | SyntaxKind::PropertyAccessExpression
-            | SyntaxKind::ElementAccessExpression
-            | SyntaxKind::Identifier
-            | SyntaxKind::CallExpression
-    )
+    is_binary_expression(decl)
+        || is_access_expression(decl)
+        || is_identifier(decl)
+        || is_call_expression(decl)
 }
 
 // Go: binder/binder.go:2800 isEffectiveModuleDeclaration
 pub fn is_effective_module_declaration(node: Node) -> bool {
-    is_effective_module_declaration_kind(node.kind())
-}
-
-/// `is_effective_module_declaration` of a node of kind `kind`.
-#[inline]
-fn is_effective_module_declaration_kind(kind: SyntaxKind) -> bool {
-    matches!(kind, SyntaxKind::ModuleDeclaration | SyntaxKind::Identifier)
+    is_module_declaration(node) || is_identifier(node)
 }
