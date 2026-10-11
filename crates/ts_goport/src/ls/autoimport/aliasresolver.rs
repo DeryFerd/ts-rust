@@ -109,14 +109,14 @@ impl AliasResolver {
     // (`get_resolved_module`) and a file is read only when the checker asks
     // for it, also inside `NewChecker` (`mergeModuleAugmentation`,
     // checker.go:1458). There is one checker and one pass. The checker gets
-    // nil only when the host gives nil (aliasresolver.go:85). A file read on
+    // nil only when the host gives nil (aliasresolver.go:86). A file read on
     // demand does not join the checker's files (Go `c.files`): the host's
     // parse cache key keeps it live until the clone's `dispose`.
     // PORT: Go binds a second-pass root file only if an earlier pass bound
     // the parse that the host gives (registry.go:1102 reads it from the
     // host, with no bind). That is true inside one clone. A file of an
     // ancestor bucket that this clone did not build (`resolveAmbientModuleName`,
-    // registry.go:1843) can be a new parse: the host releases its keys at the
+    // registry.go:1844) can be a new parse: the host releases its keys at the
     // end of each clone (project/snapshot.go:722), and the parse cache drops
     // an entry at refcount 0 (refcountcache.go:125). Go's `initializeChecker`
     // then merges nothing from it. Here every root file is bound, and the
