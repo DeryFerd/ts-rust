@@ -70,23 +70,20 @@ pub fn analyze_service_not_as_class(
 
     let mut matches: Vec<ServiceNotAsClassMatch> = Vec::new();
 
-    let mut node_to_visit: Vec<Node> = Vec::new();
-    sf.for_each_child(|child| {
-        node_to_visit.push(child);
-        false
-    });
+    // PERF: Go walks the tree with a stack of nodes; this stack holds node
+    // order indexes and pushes and pops at the same points (effperf4).
+    let order = tp.node_order(sf);
+    let mut node_to_visit: Vec<u32> = order.children(0).collect();
 
-    while let Some(node) = node_to_visit.pop() {
+    while let Some(i) = node_to_visit.pop() {
+        let node = order.node(i);
         if node.kind() == SyntaxKind::VariableDeclaration {
             if let Some(m) = check_service_not_as_class(tp, sf, node) {
                 matches.push(m);
             }
         }
 
-        node.for_each_child(|child| {
-            node_to_visit.push(child);
-            false
-        });
+        node_to_visit.extend(order.children(i));
     }
 
     matches

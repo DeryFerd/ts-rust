@@ -752,3 +752,45 @@ fn forget_print_keys<V>(map: &mut FxHashMap<Node, V>, ranges: &[(u32, u32)]) {
         *map = FxHashMap::default();
     }
 }
+
+#[cfg(test)]
+mod print_scope_tests {
+    use crate::ast::synthetic::is_print_node;
+    use crate::checker::utilities_p1::union_sort_tests::with_alias_types;
+    use crate::prelude::*;
+
+    /// n1free: a to-string call that stores a serialized type under an
+    /// enclosing declaration pins its print scope (`pin_print_scope` in
+    /// `visit_and_transform_type`). The cached node outlives the call: it
+    /// left the print owner, and a later call with that declaration clones
+    /// it. Without the pin, the end of the first call frees the node, and a
+    /// read of it panics.
+    #[test]
+    fn a_cached_type_pins_its_print_call() {
+        const SOURCE: &str = "type U = { a: 1 } | string;\n";
+        let got = with_alias_types(SOURCE, |c, types| {
+            let object = *types
+                .iter()
+                .find(|&&t| c.ty(t).flags.intersects(TypeFlags::OBJECT))
+                .expect("U has an object member");
+            let declaration = c.sym(c.ty(object).symbol).declarations[0];
+            let first = c.type_to_string_enclosing(object, declaration);
+            let impl_ = c.get_node_builder().borrow().impl_.clone();
+            let cached: Vec<Node> = impl_
+                .borrow()
+                .links
+                .try_get(declaration)
+                .map(|links| links.serialized_types.values().map(|e| e.node).collect())
+                .unwrap_or_default();
+            let kept: Vec<(bool, SyntaxKind)> = cached
+                .iter()
+                .map(|&n| (is_print_node(n), n.kind()))
+                .collect();
+            let second = c.type_to_string_enclosing(object, declaration);
+            (first, second, kept)
+        });
+        assert_eq!(got.0, "{ a: 1; }");
+        assert_eq!(got.1, got.0);
+        assert_eq!(got.2, [(false, SyntaxKind::TypeLiteral)]);
+    }
+}

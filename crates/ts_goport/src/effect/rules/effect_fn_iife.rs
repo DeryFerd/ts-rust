@@ -71,16 +71,7 @@ pub struct EffectFnIifeResult {
 pub fn analyze_effect_fn_iife(tp: &mut TypeParser<'_>, sf: Node) -> Vec<EffectFnIifeMatch> {
     let mut matches = Vec::new();
 
-    fn walk(
-        tp: &mut TypeParser<'_>,
-        sf: Node,
-        matches: &mut Vec<EffectFnIifeMatch>,
-        n: Node,
-    ) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    fn visit(tp: &mut TypeParser<'_>, sf: Node, matches: &mut Vec<EffectFnIifeMatch>, n: Node) {
         if let Some(result) = parse_effect_fn_iife(tp, n) {
             matches.push(EffectFnIifeMatch {
                 source_file: sf,
@@ -88,12 +79,13 @@ pub fn analyze_effect_fn_iife(tp: &mut TypeParser<'_>, sf: Node) -> Vec<EffectFn
                 result,
             });
         }
-
-        n.for_each_child(|child| walk(tp, sf, matches, child));
-        false
     }
 
-    walk(tp, sf, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, n);
+    }
 
     matches
 }

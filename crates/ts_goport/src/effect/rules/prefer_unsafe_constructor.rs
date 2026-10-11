@@ -75,27 +75,24 @@ pub fn analyze_prefer_unsafe_constructor(
 ) -> Vec<PreferUnsafeConstructorMatch> {
     let mut matches = Vec::new();
 
-    fn walk(
+    fn visit(
         tp: &mut TypeParser<'_>,
         sf: Node,
         matches: &mut Vec<PreferUnsafeConstructorMatch>,
         n: Node,
-    ) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    ) {
         if n.kind() == SyntaxKind::CallExpression
             && let Some(m) = analyze_prefer_unsafe_constructor_node(tp, sf, n)
         {
             matches.push(m);
         }
-
-        n.for_each_child(|child| walk(tp, sf, matches, child));
-        false
     }
 
-    walk(tp, sf, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, n);
+    }
     matches
 }
 

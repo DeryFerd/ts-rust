@@ -275,7 +275,7 @@ impl Checker {
                 // Otherwise, get the declared constraint type, and if the constraint type is a type parameter,
                 // get the constraint of that type parameter. If the resulting type is an indexed type 'keyof T',
                 // the modifiers type is T. Otherwise, the modifiers type is unknown.
-                let declaration = self.ty(t).as_mapped_type().declaration;
+                let declaration = self.ty(t).as_mapped_type().declaration();
                 let declared_type = self.get_type_from_mapped_type_node(declaration);
                 let constraint = self.get_constraint_type_from_mapped_type(declared_type);
                 let mut extended_constraint = constraint;

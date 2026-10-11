@@ -19,11 +19,7 @@ pub static LAZY_PROMISE_IN_EFFECT_SYNC: Rule = Rule {
 fn run_lazy_promise_in_effect_sync(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
-    fn walk(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, node: Node) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    fn visit(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, node: Node) {
         if node.kind() == SyntaxKind::CallExpression {
             let call = node;
             if ctx
@@ -45,13 +41,14 @@ fn run_lazy_promise_in_effect_sync(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnos
                 }
             }
         }
-
-        node.for_each_child(|child| walk(ctx, diags, child));
-        false
     }
 
     let sf = ctx.source_file;
-    walk(ctx, &mut diags, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diags, n);
+    }
     diags
 }
 

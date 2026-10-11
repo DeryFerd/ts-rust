@@ -1203,11 +1203,25 @@ thread_local! {
 /// when Go's goroutine would have written before the panic ends the
 /// process.
 fn defer_os_writes(f: impl FnOnce() -> bool) -> Vec<DeferredOsWrite> {
-    DEFERRED_OS_WRITES.with(|deferred| *deferred.borrow_mut() = Some(Vec::new()));
+    /// Puts back the deferral of the caller when `f` ends, also when it
+    /// panics (as `buffer_early_emit_writes`). After a caught panic, a
+    /// `useOS` write on this thread is made at once, and the writes that
+    /// `f` held are dropped: Go's panic ends the process before them.
+    struct Restore(Option<Vec<DeferredOsWrite>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let outer = self.0.take();
+            DEFERRED_OS_WRITES.with(|deferred| *deferred.borrow_mut() = outer);
+        }
+    }
+    let restore =
+        Restore(DEFERRED_OS_WRITES.with(|deferred| deferred.borrow_mut().replace(Vec::new())));
     f();
-    DEFERRED_OS_WRITES
+    let writes = DEFERRED_OS_WRITES
         .with(|deferred| deferred.borrow_mut().take())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    drop(restore);
+    writes
 }
 
 /// The OS write of a `writeFile` call that the client answered with
@@ -1440,7 +1454,35 @@ pub(crate) fn finish_emit_files(
 
 #[cfg(test)]
 mod tests {
-    use super::{BUFFER_EARLY_EMIT_WRITES, buffer_early_emit_writes};
+    use super::{
+        BUFFER_EARLY_EMIT_WRITES, buffer_early_emit_writes, defer_os_writes, os_write_or_defer,
+    };
+    use crate::frontend::vfs::FsError;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// followups42: a panic inside `defer_os_writes` ends the deferral. A
+    /// caller that catches it (`tsc -b` keeps a task's panic and goes on)
+    /// would else hold every later `useOS` write on this thread for a
+    /// round that never ends.
+    #[test]
+    fn defer_os_writes_ends_on_a_panic() {
+        let result = std::panic::catch_unwind(|| {
+            defer_os_writes(|| {
+                let held = os_write_or_defer(|| Err(FsError::Closed));
+                assert!(held.is_ok(), "the write is held");
+                panic!("the call panics");
+            })
+        });
+        assert!(result.is_err(), "the panic reaches the caller");
+        let made = Rc::new(Cell::new(false));
+        let write = made.clone();
+        let result = os_write_or_defer(move || {
+            write.set(true);
+            Ok(())
+        });
+        assert!(result.is_ok() && made.get(), "the write is made at once");
+    }
 
     /// k2gaps1: a panic inside the buffered start ends the buffering. `tsc -b`
     /// keeps a task's panic and goes on, so a flag left on would make every

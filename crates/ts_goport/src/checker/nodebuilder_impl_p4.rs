@@ -159,7 +159,7 @@ impl Checker {
             // Growing type arguments can prevent a reverse mapped type from repeating.
             // Bound expansion by its mapped declaration as well as its type identity.
             let mapped_type = self.ty(t).as_reverse_mapped_type().mapped_type;
-            let declaration = self.ty(mapped_type).as_mapped_type().declaration;
+            let declaration = self.ty(mapped_type).as_mapped_type().declaration();
             let origin = CompositeSymbolIdentity {
                 is_constructor_node: false,
                 symbol_id: 0,

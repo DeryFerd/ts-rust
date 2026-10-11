@@ -119,8 +119,11 @@ Three switches make some projects faster or use less memory. They are off by def
   Go's own output can change from 4 to 8 checkers (on zod, a TS5115 moves).
 - **`GOPORT_LAZY_MEMBERS=1`** makes a member of an instantiated class or interface only when the
   checker needs it, as microsoft/TypeScript#64475 does (open, not in the pin). Peak memory goes
-  down (zod 15%, T3 Code server 6.5%, Effect 4%). The time stays about the same. Diagnostics and
-  emit stay the same as Go's. The `--extendedDiagnostics` Symbols count is then lower than Go's.
+  down (zod 15%, T3 Code server 6.5%, Effect 4%). The time stays about the same. The
+  `--extendedDiagnostics` Symbols count is then lower than Go's. Diagnostics and emit stay the
+  same as Go's, except when the members of a type resolve inside their own resolution (a cycle):
+  there, as with #64475 in Go, a TS2589, TS5114 or TS5115 can move to another node or go away.
+  None of the tested projects has such a case.
 - **`GOPORT_FAST_NEVER_ORDER=1`** checks some intersection types in a faster order (mongodb's
   test project: 8.9 s to 1.6 s). The `--extendedDiagnostics` counts are then lower than Go's.
   Diagnostics and emit stay the same as Go's, except near the TS2589 limit (5,000,000 type

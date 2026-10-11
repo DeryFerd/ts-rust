@@ -38,17 +38,14 @@ fn run_crypto_random_uuid(ctx: &mut RuleContext<'_, '_>, check_in_effect: bool) 
 
     let mut diags = Vec::new();
 
-    // PORT: Go's recursive `walk` closure.
-    fn walk(
+    // PORT: the body of Go's recursive `walk` closure, for one node.
+    fn visit(
         ctx: &mut RuleContext<'_, '_>,
         diags: &mut Vec<Diagnostic>,
         message: &'static Message,
         check_in_effect: bool,
         node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
+    ) {
         if node.kind() == SyntaxKind::CallExpression {
             let call = node;
             let in_effect = ctx
@@ -71,13 +68,14 @@ fn run_crypto_random_uuid(ctx: &mut RuleContext<'_, '_>, check_in_effect: bool) 
                 ));
             }
         }
-
-        node.for_each_child(|child| walk(ctx, diags, message, check_in_effect, child));
-        false
     }
 
     let sf = ctx.source_file;
-    walk(ctx, &mut diags, message, check_in_effect, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diags, message, check_in_effect, n);
+    }
 
     diags
 }

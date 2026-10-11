@@ -27,11 +27,7 @@ fn run_effect_fn_implicit_any(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> 
 
     let mut diags = Vec::new();
 
-    fn walk(ctx: &mut RuleContext<'_, '_>, n: Node, diags: &mut Vec<Diagnostic>) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    fn visit(ctx: &mut RuleContext<'_, '_>, n: Node, diags: &mut Vec<Diagnostic>) {
         if let Some(result) = ctx.tp.effect_fn_call(n) {
             if result.is_generator() {
                 diags.extend(check_effect_fn_implicit_any(ctx, &result));
@@ -43,13 +39,14 @@ fn run_effect_fn_implicit_any(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> 
                 ));
             }
         }
-
-        n.for_each_child(|child| walk(ctx, child, diags));
-        false
     }
 
     let sf = ctx.source_file;
-    walk(ctx, sf, &mut diags);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, n, &mut diags);
+    }
 
     diags
 }

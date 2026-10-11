@@ -46,24 +46,18 @@ pub fn analyze_schema_number(tp: &mut TypeParser<'_>, sf: Node) -> Vec<SchemaNum
         return Vec::new();
     }
 
-    fn walk(
-        tp: &mut TypeParser<'_>,
-        sf: Node,
-        matches: &mut Vec<SchemaNumberMatch>,
-        node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    let mut matches = Vec::new();
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    tp.node_order(sf).walk_preorder(|node| {
         match node.kind() {
             SyntaxKind::ImportDeclaration | SyntaxKind::ImportEqualsDeclaration => {
-                return false;
+                return Walk::SkipChildren;
             }
             SyntaxKind::PropertyAccessExpression => {
                 if let Some(m) = analyze_schema_number_reference(tp, sf, node) {
                     matches.push(m);
-                    return false;
+                    return Walk::SkipChildren;
                 }
             }
             SyntaxKind::Identifier => {
@@ -73,13 +67,8 @@ pub fn analyze_schema_number(tp: &mut TypeParser<'_>, sf: Node) -> Vec<SchemaNum
             }
             _ => {}
         }
-
-        node.for_each_child(|child| walk(tp, sf, matches, child));
-        false
-    }
-
-    let mut matches = Vec::new();
-    walk(tp, sf, &mut matches, sf);
+        Walk::Descend
+    });
 
     let flows = tp.piping_flows(sf, false);
     let mut filtered = Vec::with_capacity(matches.len());
