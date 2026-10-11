@@ -6940,18 +6940,24 @@ mod tests {
             NodeData::NotEmittedStatement(Box::new(a::NotEmittedStatementData)),
             NodeData::NotEmittedTypeElement(Box::new(a::NotEmittedTypeElementData)),
         ];
-        // No file has the file id of this node, so a child that a wrong arm
-        // visits reads no store: a parallel test may free file 0 (the file
-        // of `Node::NIL`) or file 1, and a debug build checks that the file
-        // of a node is not freed (`file_block`).
-        let no_file = Node(((crate::ast::store::FILE_ID_LIMIT as u64) << 32) | 1);
-        let fields = |kind: SyntaxKind, d: &NodeData| {
+        // `n` is the node of `d`: a list field reads the lists of its file.
+        let fields = |kind: SyntaxKind, n: Node, d: &NodeData| {
             let mut fields = 0;
-            for_each_child_field(kind, no_file, d, |_| fields += 1);
+            for_each_child_field(kind, n, d, |_| fields += 1);
             fields
         };
+        // The leaves are in no file, so a child that a wrong arm visits
+        // reads no store: a parallel test may free file 0 or file 1, and a
+        // debug build checks that the file of a node is not freed
+        // (`file_block`).
+        let no_file = Node(((crate::ast::store::FILE_ID_LIMIT as u64) << 32) | 1);
         for d in &leaves {
-            assert_eq!(fields(SyntaxKind::Unknown, d), 0, "{}", d.schema_name());
+            assert_eq!(
+                fields(SyntaxKind::Unknown, no_file, d),
+                0,
+                "{}",
+                d.schema_name()
+            );
         }
         for k in 0..SyntaxKind::COUNT as u16 {
             let kind = SyntaxKind::try_from(k).unwrap();
@@ -7001,7 +7007,7 @@ mod tests {
         let (mut leaves_seen, mut inner_seen) = (0, 0);
         for &n in &nodes {
             let kind = n.kind();
-            let leaf = with_ast_data(n, |d| fields(kind, d)) == 0;
+            let leaf = with_ast_data(n, |d| fields(kind, n, d)) == 0;
             assert_eq!(has_no_child_fields(kind), leaf, "{kind:?}");
             if leaf {
                 leaves_seen += 1;
