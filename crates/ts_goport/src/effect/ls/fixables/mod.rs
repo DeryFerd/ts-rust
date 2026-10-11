@@ -10,16 +10,30 @@ use std::sync::LazyLock;
 use crate::effect::ls::fixable::Fixable;
 
 pub mod all_of_map_to_for_each;
+pub mod catch_all_tag_dispatch_to_catch_tag;
+pub mod catch_all_to_map_error;
+pub mod catch_die_to_or_die;
+pub mod catch_if_tag_to_catch_tag;
+pub mod catch_tag_to_catch_reason;
 pub mod catch_to_ignore;
+pub mod catch_to_or_else_succeed;
 pub mod disable;
 mod effect_module;
+pub mod effect_succeed_with_void;
 pub mod flat_map_conditional_to_filter_or_fail;
 pub mod flat_map_ignored_param_to_and_then;
 pub mod flat_map_to_map;
+pub mod floating_effect_yield;
 pub mod map_some_to_as_some;
+pub mod match_effect_to_map_both;
+pub mod match_effect_to_match;
+pub mod missing_effect_error_catch;
+pub mod missing_return_yield_star;
+pub mod missing_star_in_yield_effect_gen;
 pub mod option_match_to_from_option;
 pub mod prefer_succeed_some_or_none;
 pub mod provide_layer_succeed_to_provide_service;
+pub mod return_effect_in_gen;
 pub mod schema_number;
 pub mod sync_to_succeed;
 pub mod timeout_catch_tag_to_timeout_or_else;
@@ -35,31 +49,31 @@ pub static ALL: LazyLock<Vec<&'static Fixable>> = LazyLock::new(|| {
         &*disable::EFFECT_DISABLE,
         // Add future fixables here:
         // POCRuleFix,
-        // E5: FloatingEffectYieldFix,
-        // E5: MissingReturnYieldStarFix,
-        // E5: MissingStarInYieldEffectGenFix,
-        // E5: CatchDieToOrDieFix,
+        &floating_effect_yield::FLOATING_EFFECT_YIELD_FIX,
+        &missing_return_yield_star::MISSING_RETURN_YIELD_STAR_FIX,
+        &missing_star_in_yield_effect_gen::MISSING_STAR_IN_YIELD_EFFECT_GEN_FIX,
+        &catch_die_to_or_die::CATCH_DIE_TO_OR_DIE_FIX,
         &timeout_catch_tag_to_timeout_or_else::TIMEOUT_CATCH_TAG_TO_TIMEOUT_OR_ELSE_FIX,
-        // E5: CatchAllToMapErrorFix,
-        // E5: CatchAllTagDispatchToCatchTagFix,
-        // E5: CatchIfTagToCatchTagFix,
-        // E5: CatchTagToCatchReasonFix,
+        &catch_all_to_map_error::CATCH_ALL_TO_MAP_ERROR_FIX,
+        &catch_all_tag_dispatch_to_catch_tag::CATCH_ALL_TAG_DISPATCH_TO_CATCH_TAG_FIX,
+        &catch_if_tag_to_catch_tag::CATCH_IF_TAG_TO_CATCH_TAG_FIX,
+        &catch_tag_to_catch_reason::CATCH_TAG_TO_CATCH_REASON_FIX,
         &all_of_map_to_for_each::ALL_OF_MAP_TO_FOR_EACH_FIX,
         &flat_map_to_map::FLAT_MAP_TO_MAP_FIX,
         &flat_map_ignored_param_to_and_then::FLAT_MAP_IGNORED_PARAM_TO_AND_THEN_FIX,
-        // E5: MatchEffectToMatchFix,
-        // E5: MatchEffectToMapBothFix,
+        &match_effect_to_match::MATCH_EFFECT_TO_MATCH_FIX,
+        &match_effect_to_map_both::MATCH_EFFECT_TO_MAP_BOTH_FIX,
         &flat_map_conditional_to_filter_or_fail::FLAT_MAP_CONDITIONAL_TO_FILTER_OR_FAIL_FIX,
         &map_some_to_as_some::MAP_SOME_TO_AS_SOME_FIX,
         &option_match_to_from_option::OPTION_MATCH_TO_FROM_OPTION_FIX,
         &sync_to_succeed::SYNC_TO_SUCCEED_FIX,
-        // E5: CatchToOrElseSucceedFix,
+        &catch_to_or_else_succeed::CATCH_TO_OR_ELSE_SUCCEED_FIX,
         &catch_to_ignore::CATCH_TO_IGNORE_FIX,
         // E5: EffectFnIifeFix,
         // E5: UnnecessaryPipeFix,
         // E5: UnnecessaryPipeChainFix,
-        // E5: ReturnEffectInGenFix,
-        // E5: EffectSucceedWithVoidFix,
+        &return_effect_in_gen::RETURN_EFFECT_IN_GEN_FIX,
+        &effect_succeed_with_void::EFFECT_SUCCEED_WITH_VOID_FIX,
         &prefer_succeed_some_or_none::PREFER_SUCCEED_SOME_OR_NONE_FIX,
         // E5: UnnecessaryEffectGenFix,
         // E5: UnnecessaryArrowBlockFix,
@@ -75,7 +89,7 @@ pub static ALL: LazyLock<Vec<&'static Fixable>> = LazyLock::new(|| {
         // E5: InstanceOfSchemaFix,
         // E5: LayerMergeAllWithDependenciesFix,
         // E5: UnsafeEffectTypeAssertionFix,
-        // E5: MissingEffectErrorCatchFix,
+        &missing_effect_error_catch::MISSING_EFFECT_ERROR_CATCH_FIX,
         // E5: MultipleEffectProvideFix,
         &provide_layer_succeed_to_provide_service::PROVIDE_LAYER_SUCCEED_TO_PROVIDE_SERVICE_FIX,
         // E5: SchemaStructWithTagFix,
