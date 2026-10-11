@@ -2249,7 +2249,7 @@ mod distribution_dependent_tests {
     use crate::checker::utilities_p1::union_sort_tests::with_alias_types;
 
     /// `is_distribution_dependent` gives the answer of Go's walk
-    /// (relater.go:5026, checker.go:22823) on the first call and on a repeat,
+    /// (relater.go:5026, checker.go:22891) on the first call and on a repeat,
     /// and the root keeps it after the first call. A root that is not
     /// distributive keeps nothing. The roots: `T` in the true type, `T` in
     /// the false type, `T` in neither, a `typeof` of a value outside the

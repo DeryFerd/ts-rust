@@ -79,8 +79,16 @@ the plugin, as with `@effect/language-service`:
 ```
 
 The rules, options and `@effect-diagnostics` comments are a port of
-[Effect-TS/tsgo](https://github.com/Effect-TS/tsgo) 0.46.1. The editor features of the language
+[Effect-TS/tsgo](https://github.com/Effect-TS/tsgo) 0.51.1. The editor features of the language
 service (quick fixes, refactors, hover, completions) are not ported.
+
+The API stability rules of 0.51.1 read the `@stability` JSDoc tags of Effect 4.
+`unstableApiUsage` (TS377136) and `experimentalApiUsage` (TS377135) report each use of an
+`unstable` or `experimental` API, as warnings by default. `allowedUnstableApis` and
+`allowedExperimentalApis` in the plugin entry allow a module (`effect/cli`) or one export
+(`effect/cli/Command#make`). `apiStabilityLeak` (TS377137, off by default) is for library
+maintainers. So a project on `effect@4` gets TS377136 warnings for its unstable imports, as with
+effect-tsgo 0.51.1. See [the Effect diagnostics doc](docs/effect-diagnostics.md#api-stability-rules).
 
 ## Status
 
@@ -99,6 +107,21 @@ goes away when the port moves to a newer pin.
   neither), so they are slower than that measured build.
 - **Real projects.** On 120 open-source repos, the command-line output differs from Go's only in
   the problems below and where Go's own output changes from run to run.
+
+Three switches make some projects faster or use less memory. They are off by default.
+
+- **`--checkers 8`** (Go's option; the default is 4) runs 8 checkers. On an 8-core host, VS Code
+  checks in 30% less time and mui in 23% less, but T3 Code server gains nothing. CPU time goes
+  up 13% to 51% and peak memory 7% to 34%. The output is the same as Go's with `--checkers 8`.
+  Go's own output can change from 4 to 8 checkers (on zod, a TS5115 moves).
+- **`GOPORT_LAZY_MEMBERS=1`** makes a member of an instantiated class or interface only when the
+  checker needs it, as microsoft/TypeScript#64475 does (open, not in the pin). Peak memory goes
+  down (zod 15%, T3 Code server 6.5%, Effect 4%). The time stays about the same. Diagnostics and
+  emit stay the same as Go's. The `--extendedDiagnostics` Symbols count is then lower than Go's.
+- **`GOPORT_FAST_NEVER_ORDER=1`** checks some intersection types in a faster order (mongodb's
+  test project: 8.9 s to 1.6 s). The `--extendedDiagnostics` counts are then lower than Go's.
+  Diagnostics and emit stay the same as Go's, except near the TS2589 limit (5,000,000 type
+  instantiations): there, a TS2589 that Go reports can go away.
 
 ## Benchmark: T3 Code
 
@@ -143,7 +166,8 @@ How it was measured: the same machine and method as the real-world apps below, w
 projects `apps/server`, `apps/web`, `apps/mobile`, `packages/client-runtime` and
 `packages/shared`. Without Effect, the configs have no Effect plugin. With Effect, `tsc` 7 is the
 Effect-patched 7.0.2 from `@effect/tsgo` 0.46.1, and `tsc` 6 is 6.0.3 patched with
-`@effect/language-service`. The script is
+`@effect/language-service`. These numbers are from `tsc-rs` when it was a port of 0.46.1. They
+were not measured again after the port moved to 0.51.1. The script is
 [scripts/bench-apps/t3code.sh](scripts/bench-apps/t3code.sh). The `tsc-rs` switch in T3 Code is
 [pingdotgg/t3code#16704](https://github.com/pingdotgg/t3code/pull/16704).
 
@@ -217,7 +241,8 @@ The lead of `bun check` is all in the check step. Its checkers share one type st
 `tsc` 7 runs 4 checkers, and each one makes its own copies of the types it needs: on T3 Code
 `apps/server`, 57% of the types. `tsc-rs` keeps the `tsc` 7 model, because its goal is output that
 is identical to `tsc` 7. More checkers or one shared store would change that output, so `tsc-rs`
-does not copy them.
+does not copy them. `--checkers 8` uses more cores with output identical to `tsc` 7 at
+`--checkers 8` (see [Status](#status)).
 
 Per thread, `tsc-rs` is not slower. On T3 Code it was 1.5× to 7× faster per thread than
 `bun check`, and on 28 other open-source repos the two did about the same check work per thread.

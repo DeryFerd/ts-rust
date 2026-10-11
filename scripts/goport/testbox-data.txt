@@ -1,0 +1,35 @@
+# The zbook files that the gate and the LSP and API oracles read and that git does not hold
+# (scripts/goport/testbox-data.sh). Each line: <disk> <absolute path>, a dir when it ends in /.
+# Disk "inputs" is the same for every Go pin. Disk "pin" holds the files of one pin: @PIN@ is the
+# pin key and @ORACLE@ the first 12 hex digits of the pin oracle's sha256.
+# Every path here is public: project sources with their npm packages, outputs of the pinned Go
+# tsgo, and the runner scripts and corpus cases built from the Go repo.
+inputs /home/theo/Code/sandbox/ts-rust/target/project-inputs/
+inputs /home/theo/Code/sandbox/ts-rust/target/project-inputs-extra/
+inputs /home/theo/Code/sandbox/ts-rust/target/project-inputs-wide/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r104-conformance-sample/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/tools-port/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/sample-f1/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/emit/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/build-mode/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/corpus-full/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/corpus-int3/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/emit-corpus/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/errcopies/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/typesyms/compare-int.py
+# A mount target of the pin dumper: pin.py binds a file cache only over a file that exists.
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/typesyms/typesymdump-go
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/battery/traces/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/battery/counts.json
+pin /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/pins/@PIN@/
+pin /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/battery/golden/@ORACLE@/
+pin /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/tests2/api/golden/@ORACLE@/
+pin /home/theo/.local/bin/tsgo-oracle-@PIN@
+# The Effect LSP battery e1 (scripts/goport/lsp_battery_effect.py): its traces, the E0 goldens of each E0 sha,
+# the E0 oracle copies, the T3 Code copy of e1-t3code and the effect-tsgo 0.51.1 repo (E0's source).
+# Not ls-oracle/effect/results: check writes its results there (the target disk).
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/effect/traces/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/effect/golden/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/effect/oracle/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/effectlsp1/t3code/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/effect051/effect-tsgo-0511/

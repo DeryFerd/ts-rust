@@ -1,7 +1,7 @@
 use crate::prelude::*;
 
 impl Checker {
-    // Go: checker/checker.go:32252 getIndexSignaturesAtLocation
+    // Go: checker/checker.go:32317 getIndexSignaturesAtLocation
     pub fn get_index_signatures_at_location(&mut self, node: Node) -> Vec<Node> {
         let mut signatures: Vec<Node> = Vec::new();
         if is_identifier(node)
@@ -26,12 +26,22 @@ impl Checker {
         signatures
     }
 
-    // Go: checker/checker.go:32268 getSymbolOfNameOrPropertyAccessExpression
+    // Go: checker/checker.go:32333 getSymbolOfNameOrPropertyAccessExpression
+    // PERF: noderef1 G1. `name_ref` is the view (`NodeRef`) of `name`: the
+    // kind and parent reads of the predicates below do one registry lookup
+    // per node, not one per read.
     pub fn get_symbol_of_name_or_property_access_expression(&mut self, mut name: Node) -> SymbolId {
-        if is_declaration_name(name) {
-            return self.get_symbol_of_node(name.parent());
+        let mut name_ref = NodeRef::new(name);
+        if is_declaration_name_ref(name_ref) {
+            return self.get_symbol_of_node(name_ref.parent().node());
         }
-        if name.parent().kind() == SyntaxKind::ExportAssignment && is_entity_name_expression(name) {
+        let is_entity_name_kind = matches!(
+            name_ref.kind(),
+            SyntaxKind::Identifier | SyntaxKind::QualifiedName
+        );
+        if name_ref.parent().kind() == SyntaxKind::ExportAssignment
+            && is_entity_name_expression(name)
+        {
             // Even an entity name expression that doesn't resolve as an entityname may still typecheck as a property access expression
             let success = self.resolve_entity_name(
                 name,
@@ -47,7 +57,9 @@ impl Checker {
             if success.is_some() && success != self.unknown_symbol {
                 return success;
             }
-        } else if is_entity_name(name) && is_in_right_side_of_import_or_export_assignment(name) {
+        } else if is_entity_name_kind
+            && is_in_right_side_of_import_or_export_assignment_ref(name_ref)
+        {
             // Since we already checked for ExportAssignment, this really could only be an Import
             let import_equals_declaration =
                 find_ancestor_kind(name, SyntaxKind::ImportEqualsDeclaration);
@@ -57,8 +69,8 @@ impl Checker {
             return self.get_symbol_of_part_of_right_hand_side_of_import_equals(name);
         }
 
-        if is_entity_name(name) {
-            let possible_import_node = is_import_type_qualifier_part(name);
+        if is_entity_name_kind {
+            let possible_import_node = is_import_type_qualifier_part_ref(name_ref);
             if possible_import_node.is_some() {
                 self.get_type_from_type_node(possible_import_node);
                 let sym = self.get_resolved_symbol_or_nil(name);
@@ -70,15 +82,21 @@ impl Checker {
             }
         }
 
-        while is_right_side_of_qualified_name_or_property_access(name) {
-            name = name.parent();
+        loop {
+            let parent = name_ref.parent();
+            if !is_right_side_of_qualified_name_or_property_access_of(name_ref.node(), parent) {
+                break;
+            }
+            name_ref = parent;
         }
+        name = name_ref.node();
 
-        if is_in_name_of_expression_with_type_arguments_or_heritage_type_reference(name) {
+        if is_in_name_of_expression_with_type_arguments_or_heritage_type_reference_ref(name_ref) {
             let mut meaning: SymbolFlags;
-            if name.parent().kind() == SyntaxKind::ExpressionWithTypeArguments
-                || name.parent().kind() == SyntaxKind::TypeReference
-            {
+            if matches!(
+                name_ref.parent().kind(),
+                SyntaxKind::ExpressionWithTypeArguments | SyntaxKind::TypeReference
+            ) {
                 // A heritage element name may appear in type space, value space, or both;
                 // ensure the meaning matches its context.
                 meaning = if is_part_of_type_node(name) {
@@ -111,14 +129,14 @@ impl Checker {
             }
         }
 
-        if is_expression_node(name) {
+        if is_expression_node_ref(name_ref) {
             if node_is_missing(name) {
                 // Missing entity name.
                 return SymbolId::NIL;
             }
             let is_js_doc = is_js_doc_name_reference_context(name);
-            if is_identifier(name) {
-                if is_jsx_tag_name(name) && is_jsx_intrinsic_tag_name(name) {
+            if name_ref.kind() == SyntaxKind::Identifier {
+                if is_jsx_tag_name_of(name, name_ref.parent()) && is_jsx_intrinsic_tag_name(name) {
                     let symbol = self.get_intrinsic_tag_symbol(name.parent());
                     return if symbol == self.unknown_symbol {
                         SymbolId::NIL
@@ -221,7 +239,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:32403 isThisPropertyAndThisTyped
+    // Go: checker/checker.go:32468 isThisPropertyAndThisTyped
     pub fn is_this_property_and_this_typed(&mut self, node: Node) -> bool {
         if node.expression().kind() == SyntaxKind::ThisKeyword {
             let container = self.get_this_container(
@@ -246,7 +264,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:32418 getTypeOfNode
+    // Go: checker/checker.go:32483 getTypeOfNode
     pub fn get_type_of_node(&mut self, node: Node) -> TypeId {
         if is_source_file(node) && !is_external_or_common_js_module(node) {
             return self.error_type;
@@ -376,7 +394,7 @@ impl Checker {
         self.error_type
     }
 
-    // Go: checker/checker.go:32530 getThisTypeOfObjectLiteralFromContextualType
+    // Go: checker/checker.go:32595 getThisTypeOfObjectLiteralFromContextualType
     pub fn get_this_type_of_object_literal_from_contextual_type(
         &mut self,
         containing_literal: Node,
@@ -398,7 +416,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:32547 getThisTypeFromContextualType
+    // Go: checker/checker.go:32612 getThisTypeFromContextualType
     pub fn get_this_type_from_contextual_type(&mut self, t: TypeId) -> TypeId {
         self.map_type(t, &mut |c: &mut Checker, t: TypeId| -> TypeId {
             if c.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
@@ -416,7 +434,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:32563 getThisTypeArgument
+    // Go: checker/checker.go:32628 getThisTypeArgument
     pub fn get_this_type_argument(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).object_flags.intersects(ObjectFlags::REFERENCE)
             && self.ty(t).target() == self.global_this_type
@@ -426,7 +444,7 @@ impl Checker {
         TypeId::NIL
     }
 
-    // Go: checker/checker.go:32570 getApplicableIndexInfos
+    // Go: checker/checker.go:32635 getApplicableIndexInfos
     pub fn get_applicable_index_infos(&mut self, t: TypeId, key_type: TypeId) -> Vec<IndexInfoId> {
         // Go: core.Filter
         let infos = self.get_index_infos_of_type(t);
@@ -440,7 +458,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:32574 getApplicableIndexSymbol
+    // Go: checker/checker.go:32639 getApplicableIndexSymbol
     pub fn get_applicable_index_symbol(&mut self, t: TypeId, key_type: TypeId) -> SymbolId {
         let info = self.get_applicable_index_info(t, key_type);
         if info.is_some() && info != self.any_base_type_index_info {
@@ -482,7 +500,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:32603 getRegularTypeOfExpression
+    // Go: checker/checker.go:32668 getRegularTypeOfExpression
     pub fn get_regular_type_of_expression(&mut self, mut expr: Node) -> TypeId {
         if is_right_side_of_qualified_name_or_property_access(expr) {
             expr = expr.parent();
@@ -491,7 +509,7 @@ impl Checker {
         self.get_regular_type_of_literal_type(t)
     }
 
-    // Go: checker/checker.go:32610 containsArgumentsReference
+    // Go: checker/checker.go:32675 containsArgumentsReference
     pub fn contains_arguments_reference(&mut self, node: Node) -> bool {
         if node.body().is_nil() {
             return false;
@@ -544,12 +562,12 @@ impl Checker {
         node.for_each_child(&mut |child: Node| self.contains_arguments_reference_visit(child))
     }
 
-    // Go: checker/checker.go:32647 GetTypeAtLocation
+    // Go: checker/checker.go:32712 GetTypeAtLocation
     pub fn get_type_at_location(&mut self, node: Node) -> TypeId {
         self.get_type_of_node(get_reparsed_node_for_node(node))
     }
 
-    // Go: checker/checker.go:32659 GetAliasedSymbol
+    // Go: checker/checker.go:32720 GetAliasedSymbol
     pub fn get_aliased_symbol(&mut self, symbol: SymbolId) -> SymbolId {
         self.resolve_alias(symbol)
     }
