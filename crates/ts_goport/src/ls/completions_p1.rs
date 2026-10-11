@@ -65,11 +65,32 @@ impl LanguageService {
             trigger_character,
             false, /*includeSymbols*/
         )?;
-        let mut completion_list = ensure_item_data(
-            file,
-            position,
-            CompletionList::to_lsp(completion_list_internal.as_ref()),
-        );
+        let mut completion_list = CompletionList::to_lsp(completion_list_internal.as_ref());
+        // EFFECT HOOK (Effect-TS/tsgo patch 022): Allow Effect to add or modify completion items.
+        // PORT: Go passes the list's item slice and sets the list's items to a
+        // non-empty result. The hook here takes the items and gives them back;
+        // Effect only appends, so an empty result means an empty list, which
+        // the hook leaves as it is.
+        {
+            let existing_items = completion_list
+                .as_mut()
+                .map(|list| std::mem::take(&mut list.items))
+                .unwrap_or_default();
+            let items = crate::effect::ls::after_completion(
+                ctx,
+                file,
+                position,
+                existing_items,
+                program,
+                self,
+            );
+            if !items.is_empty() {
+                completion_list
+                    .get_or_insert_with(lsproto::CompletionList::default)
+                    .items = items;
+            }
+        }
+        let mut completion_list = ensure_item_data(file, position, completion_list);
         if lsconv::Script::span_map(&file).is_some() {
             self.filter_content_mapped_auto_imports(ctx, program, file, completion_list.as_mut());
         }

@@ -103,6 +103,7 @@ fn get_code_actions_to_fix_class_incorrectly_implements_interface(
                 &locale,
                 &args![],
             ),
+            ..Default::default()
         });
     }
     Ok(actions)

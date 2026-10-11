@@ -4,10 +4,12 @@
 // and inlay hints (inlayHints/*.baseline). Each case starts `<server> --lsp --stdio` on a small
 // project made as the Go harness makes it, sends the requests the Go runner sends, formats the
 // answers as the Go baseline writers do, and compares the text with the committed baseline.
+// Hover cases have no baseline file: the expected text is the VerifyQuickInfoAt arguments of
+// internal/effecttest/hover_test.go (one case per Go test, one block per marker).
 //
 // usage: node scripts/effect/ls-cases.mjs --server <tsc> [--effect-repo DIR] [--kinds K,...]
 //          [--versions effect-v4,effect-v3] [--filter SUBSTR] [--out DIR] [--jobs N] [--timeout S]
-//   --kinds      quickfixes,refactors,symbols,inlay (default: all)
+//   --kinds      quickfixes,refactors,symbols,inlay,hover (default: all)
 //   --effect-repo  effect-tsgo checkout with `pnpm install` done in testdata/tests/effect-v4 and
 //                effect-v3 (default target/continuation-r97-goport/effect051/effect-tsgo-0511 in the
 //                main checkout: the parent of the git common dir, or /home/theo/Code/sandbox/ts-rust
@@ -22,7 +24,8 @@
 // internal/bundledeffect/effect.go (MountEffect), _patches/typescript/010-fourslash-fourslash.patch
 // (GetQuickFixesForDiagnostics, ApplyQuickFix, GetRefactorActionsForRange, ApplyRefactorAction), and
 // TypeScript tsc/internal/fourslash (getCapabilitiesWithDefaults, openFile, applyTextEdits) and
-// tsc/internal/testrunner/test_case_parser.go (unit split).
+// tsc/internal/testrunner/test_case_parser.go (unit split), tsc/internal/fourslash/test_parser.go
+// (parseFileContent: markers) and fourslash.go (VerifyQuickInfoAt, verifyHoverMarkdown).
 //
 // Differences from the Go harness, by design:
 // - Real files in <out>/projects/<kind>/<version>/<case>/ stand for the Go test VFS root "/". The Go
@@ -51,7 +54,7 @@ const { values: args } = parseArgs({
   options: {
     server: { type: "string" },
     "effect-repo": { type: "string" },
-    kinds: { type: "string", default: "quickfixes,refactors,symbols,inlay" },
+    kinds: { type: "string", default: "quickfixes,refactors,symbols,inlay,hover" },
     versions: { type: "string", default: "effect-v4,effect-v3" },
     filter: { type: "string", default: "" },
     out: { type: "string", default: path.join(os.tmpdir(), "effect-ls-cases") },
@@ -795,6 +798,166 @@ async function runInlay(c) {
 }
 
 // ---------------------------------------------------------------------------
+// Hover (cases are the Go tests in internal/effecttest/hover_test.go)
+// ---------------------------------------------------------------------------
+
+// A Go string expression: interpreted literals joined by `+` (the only forms hover_test.go uses).
+function goStringExpr(src, i) {
+  let out = "";
+  for (;;) {
+    while (/\s/.test(src[i])) i++;
+    if (src[i] !== '"') throw new Error(`hover_test.go: string literal expected at ${src.slice(i, i + 40)}`);
+    let j = i + 1;
+    while (src[j] !== '"') j += src[j] === "\\" ? 2 : 1;
+    out += JSON.parse(src.slice(i, j + 1));
+    i = j + 1;
+    let k = i;
+    while (/\s/.test(src[k])) k++;
+    if (src[k] !== "+") return { value: out, end: i };
+    i = k + 1;
+  }
+}
+
+// Each Go test: its fourslash content and its VerifyQuickInfoAt calls (marker, text, documentation).
+// A call inside `for _, marker := range []string{...}` runs once per marker of the list.
+function hoverCases() {
+  const src = fs.readFileSync(path.join(EFFECT_REPO, "internal/effecttest/hover_test.go"), "utf8");
+  const cases = [];
+  for (const chunk of src.split(/\nfunc Test/).slice(1)) {
+    const m = /^(\w+)\(t \*testing\.T\) \{([\s\S]*)$/.exec(chunk);
+    if (!m) continue;
+    const body = m[2];
+    const content = /const content = `([\s\S]*?)`/.exec(body);
+    if (!content) continue;
+    if (!/fourslash\.NewFourslash\(t, nil \/\*capabilities\*\/, content\)/.test(body)) {
+      throw new Error(`hover case Test${m[1]} has a setup this tool does not know`);
+    }
+    const checks = [];
+    const call = "f.VerifyQuickInfoAt(t,";
+    for (let at = body.indexOf(call); at >= 0; at = body.indexOf(call, at + 1)) {
+      let i = at + call.length;
+      while (/\s/.test(body[i])) i++;
+      let markers;
+      if (body[i] === '"') {
+        const name = goStringExpr(body, i);
+        markers = [name.value];
+        i = name.end;
+      } else {
+        const ident = /^\w+/.exec(body.slice(i))[0];
+        const loop = new RegExp(`for _, ${ident} := range \\[\\]string\\{([^}]*)\\}`).exec(body.slice(0, at));
+        if (!loop) throw new Error(`hover case Test${m[1]}: no marker list for ${ident}`);
+        markers = [...loop[1].matchAll(/"([^"]*)"/g)].map((x) => x[1]);
+        i += ident.length;
+      }
+      i = body.indexOf(",", i) + 1;
+      const text = goStringExpr(body, i);
+      i = body.indexOf(",", text.end) + 1;
+      const doc = goStringExpr(body, i);
+      for (const marker of markers) checks.push({ marker, text: text.value, doc: doc.value });
+    }
+    if (!checks.length) continue;
+    const name = m[1][0].toLowerCase() + m[1].slice(1);
+    cases.push({ name, content: content[1], checks });
+  }
+  return cases;
+}
+
+// Go fourslash parseFileContent (test_parser.go): the file text without its markers, and the
+// marker offsets (bytes in the Go text; the cases are ASCII, so string offsets here).
+function stripMarkers(raw) {
+  const lines = raw.split("\n");
+  const content = lines.every((l) => !l.length || l[0] === " ") ? lines.map((l) => l.slice(1)).join("\n") : raw;
+  let out = "";
+  const markers = {};
+  let diff = 0;
+  let last = 0;
+  let open = null;
+  let state = "none";
+  let prev = content[0];
+  const flush = (end) => { out += content.slice(last, end === -1 ? undefined : end); };
+  for (let i = 1; i < content.length; i++) {
+    const cur = content[i];
+    if (state === "none") {
+      if ((prev === "[" && cur === "|") || (prev === "|" && cur === "]")) {
+        flush(i - 1);
+        last = i + 1;
+        diff += 2;
+      } else if (prev === "/" && cur === "*" && content[i + 1] !== "/") {
+        state = "slashStar";
+        open = { position: i - 1 - diff, source: i - 1 };
+      } else if (prev === "{" && cur === "|") {
+        state = "object";
+        open = { position: i - 1 - diff, source: i - 1 };
+        flush(i - 1);
+      }
+    } else if (state === "object") {
+      if (prev === "|" && cur === "}") {
+        last = i + 1;
+        diff += i + 1 - open.source;
+        open = null;
+        state = "none";
+      }
+    } else if (state === "slashStar") {
+      if (prev === "*" && cur === "/") {
+        markers[content.slice(open.source + 2, i - 1).trim()] = open.position;
+        flush(open.source);
+        last = i + 1;
+        diff += i + 1 - open.source;
+        open = null;
+        state = "none";
+      } else if (!/[0-9A-Za-z$_]/.test(cur) && !(cur === "*" && content[i + 1] === "/")) {
+        flush(i);
+        last = i;
+        open = null;
+        state = "none";
+      }
+    }
+    // Go keeps the previous character across a line break.
+    if (cur === "\n" || cur === "\r") continue;
+    prev = i >= last ? cur : "\uFFFD"; // Go utf8.RuneError
+  }
+  flush(-1);
+  return { text: out, markers };
+}
+
+async function runHover(c) {
+  const files = fourslashFiles(c.content).map((f) => {
+    const { text, markers } = stripMarkers(f.content);
+    return { name: f.name, content: text, markers };
+  });
+  fs.rmSync(c.dir, { recursive: true, force: true });
+  fs.mkdirSync(c.dir, { recursive: true });
+  const m = mountVersion(files.map((f) => f.content));
+  if (m) mount(c.dir, m.version, m.vitest);
+  writeFiles(c.dir, files);
+  const project = new Project(c.dir);
+  const server = new Server(c.dir, capabilities(), null);
+  const out = [];
+  try {
+    await server.start(c.dir);
+    openAll(server, project, files);
+    for (const check of c.checks) {
+      const file = files.find((f) => check.marker in f.markers);
+      if (!file) throw new Error(`no marker ${check.marker}`);
+      const before = file.content.slice(0, file.markers[check.marker]);
+      const line = before.split("\n").length - 1;
+      const col = before.slice(before.lastIndexOf("\n") + 1);
+      const character = server.encoding === "utf-8" ? Buffer.byteLength(col) : col.length;
+      const hover = await server.request("textDocument/hover", { textDocument: { uri: project.uri(file.name) }, position: { line, character } });
+      const contents = hover?.contents;
+      const value = hover === null || hover === undefined ? "(no hover)" : typeof contents?.value === "string" && contents.kind !== undefined ? contents.value : `(not markup content) ${JSON.stringify(contents)}`;
+      out.push(`=== marker ${check.marker} ===\n${value}\n`);
+    }
+    return project.normalize(out.join("\n"));
+  } finally {
+    await server.stop();
+  }
+}
+
+// Go fourslash verifyHoverMarkdown: the markdown each VerifyQuickInfoAt expects.
+const hoverExpected = (c) => c.checks.map((check) => `=== marker ${check.marker} ===\n\`\`\`typescript\n${check.text}\n\`\`\`\n${check.doc}\n`).join("\n");
+
+// ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
 
@@ -817,6 +980,7 @@ function collectCases() {
     if (kinds.includes("symbols")) for (const f of listTs(path.join(tests, v + "-document-symbols"))) add("symbols", v, path.basename(f, ".ts"), { file: f, baseline: path.join(REFERENCE, v, path.basename(f, ".ts") + ".symbols.txt"), run: runSymbols });
   }
   if (kinds.includes("inlay")) for (const c of inlayCases()) add("inlay", "inlayHints", c.name, { content: c.content, baseline: path.join(REFERENCE, "inlayHints", c.name + ".baseline"), run: runInlay });
+  if (kinds.includes("hover")) for (const c of hoverCases()) add("hover", "hover_test", c.name, { content: c.content, checks: c.checks, expected: hoverExpected(c), run: runHover });
   return cases;
 }
 
@@ -840,9 +1004,9 @@ async function runCase(c) {
   const started = Date.now();
   let status, detail;
   try {
-    if (!fs.existsSync(c.baseline)) throw new Error(`no baseline ${path.relative(EFFECT_REPO, c.baseline)}`);
+    if (c.expected === undefined && !fs.existsSync(c.baseline)) throw new Error(`no baseline ${path.relative(EFFECT_REPO, c.baseline)}`);
     const actual = await c.run(c);
-    const expected = fs.readFileSync(c.baseline, "utf8");
+    const expected = c.expected ?? fs.readFileSync(c.baseline, "utf8");
     status = actual === expected ? "same" : "diff";
     if (status === "diff") {
       fs.mkdirSync(resultDir, { recursive: true });

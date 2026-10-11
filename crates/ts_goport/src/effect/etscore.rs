@@ -200,10 +200,47 @@ pub fn diagnostics_enabled(config: Option<&EffectPluginOptions>) -> bool {
 }
 
 impl EffectPluginOptions {
+    // Go: etscore/options.go GetRefactorsEnabled (nil receiver is true; callers pass Some)
+    #[must_use]
+    pub fn get_refactors_enabled(&self) -> bool {
+        self.refactors
+    }
+
+    // Go: etscore/options.go GetQuickinfoEnabled (nil receiver is true; callers pass Some)
+    #[must_use]
+    pub fn get_quickinfo_enabled(&self) -> bool {
+        self.quickinfo
+    }
+
+    // Go: etscore/options.go GetCompletionsEnabled (nil receiver is true; callers pass Some)
+    #[must_use]
+    pub fn get_completions_enabled(&self) -> bool {
+        self.completions
+    }
+
+    // Go: etscore/options.go GetDebugEnabled (nil receiver is false; callers pass Some)
+    #[must_use]
+    pub fn get_debug_enabled(&self) -> bool {
+        self.debug
+    }
+
     // Go: GetIncludeSuggestionsInTsc (nil receiver is true; callers pass Some)
     #[must_use]
     pub fn get_include_suggestions_in_tsc(&self) -> bool {
         self.include_suggestions_in_tsc
+    }
+
+    // Go: etscore/options.go GetMermaidBaseURL
+    /// The Mermaid base URL of `mermaidProvider`: "" or "mermaid.live" is
+    /// https://mermaid.live/edit#, "mermaid.com" is
+    /// https://www.mermaidchart.com/play#, any other value is `<value>/edit#`.
+    #[must_use]
+    pub fn get_mermaid_base_url(&self) -> String {
+        match self.mermaid_provider.as_str() {
+            "" | "mermaid.live" => "https://mermaid.live/edit#".to_string(),
+            "mermaid.com" => "https://www.mermaidchart.com/play#".to_string(),
+            provider => format!("{provider}/edit#"),
+        }
     }
 
     #[must_use]
