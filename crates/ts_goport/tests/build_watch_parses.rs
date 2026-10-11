@@ -106,43 +106,37 @@ fn build_watch_keeps_the_first_json_parse_of_a_cycle() {
     fs::remove_dir_all(&root).unwrap_or_else(|error| panic!("remove {}: {error}", root.display()));
 }
 
-/// The bwsig2 skeptic case, at Go fed0bf24149f. `lib` writes `a.d.ts` to
-/// `out`, beside the project. `side` imports `out/a.d.ts` and has no
-/// reference to `lib`. The steps, with the OS watcher, and the number of
-/// builds that ended after each:
+/// The bwsig2 skeptic case: a written `.d.ts` whose time goes back (as on a
+/// coarse clock), with no watch event that builds the project that reads
+/// it. `lib` writes `a.d.ts` to `out`, beside the project. `side` imports
+/// `out/a.d.ts`, has no reference to `lib` and is not incremental
+/// (`"composite": false`). The steps, with the OS watcher, and the number
+/// of builds that ended after each:
 ///
 /// 1. The start: 1.
 /// 2. A `side` edit: `side` builds and parses `out/a.d.ts` (`a: number`): 2.
-/// 3. A `lib` edit (`a: string`): `lib` builds and writes `out/a.d.ts`: 3.
-///    The write gives a watch event, so `side` builds in the next cycle
-///    with the new `a.d.ts`: TS2322, 4.
+/// 3. A `lib` edit (`a: string`): `lib` builds and writes `out/a.d.ts`.
+///    `side` does not build: 3.
 /// 4. The test sets both times of each `out/*.d.ts` back to the time that
-///    step 2 saw (it set them before the watch started too): no build, 4.
-/// 5. A `side` edit: `side` builds: TS2322, 5.
+///    step 2 saw (it set them before the watch started too): no build, 3.
+/// 5. A `side` edit: `side` builds. Go reads the new `a.d.ts`, because
+///    `resetCaches` drops every parse at the end of a cycle
+///    (execute/build/orchestrator.go:506-513, called at :862): TS2322, 4.
 ///
-/// Go watches `out` since #64366: `addProgramFileWatchDir` watches the
-/// directory of a program file at any depth, with no `CanWatchDirectory`
-/// check (execute/build/orchestrator.go:775-781), for each root file
-/// (:712) and each file name of the build info (:752), here `out/a.d.ts`
-/// of `side`. `ResolveDesiredDirs` checks the depth only for an ancestor
-/// fallback (execute/watchmanager/watchmanager.go:219-222). The watch masks
-/// have create and modify but not attrib (fswatch/inotify_linux.go:77-86,
-/// fswatch/fanotify_linux.go:118-120). So the write starts a build, and a
-/// change of both times does not: Linux reports it as `IN_ATTRIB`. A change
-/// of the modification time alone is `IN_MODIFY`, and `side` builds again.
+/// A non-incremental build info has no file names
+/// (execute/incremental/snapshottobuildinfo.go:37, :51). So Go watches no
+/// directory for `out/a.d.ts` (execute/build/orchestrator.go:746-753), and
+/// an event there names no file of `side` (:586-615). Lines are at Go
+/// fed0bf24149f. Go 673a5f17d713 does the same, so no directory depth
+/// matters.
 ///
-/// At Go 673a5f17d713 no watch covered `/tmp/<dir>/out`: `side` did not
-/// build in step 3, no build started after step 4, and step 5 checked that
-/// the next cycle parses a written `.d.ts` again although no event named
-/// it and its time did not change (a coarse clock). That case does not
-/// occur here. It still occurs when `side` is not incremental: its build
-/// info has no file names (execute/incremental/snapshottobuildinfo.go:37,
-/// :51), so no watch covers `out`. For that case the end of
-/// `build_all_tasks` drops the kept parse of each written file
-/// (`BuildHost::drop_written_watch_sources`); its test is
-/// `execute::build::host::tests::a_written_file_is_parsed_again_in_the_next_cycle`.
-/// `expected.txt` and the counts are from `tsgo-oracle-fed0bf24149f` in
-/// place of `tsgo` for this test (3 of 3 runs).
+/// The port keeps a `.d.ts` parse from one cycle to the next and checks it
+/// by its modification time. The end of `build_all_tasks` drops the kept
+/// parse of each written file (`BuildHost::drop_written_watch_sources`).
+/// Without that call the port keeps the parse of step 2 and finds no
+/// error: this test checks that call. `expected.txt` and the counts are
+/// from `tsgo-oracle-fed0bf24149f` and `tsgo-oracle-673a5f17d713` in place
+/// of `tsgo` for this test (3 of 3 runs each).
 // PORT: no Go counterpart; the output is Go's.
 #[cfg(target_os = "linux")]
 #[test]
@@ -189,12 +183,12 @@ fn build_watch_parses_a_written_dts_again_in_the_next_cycle() {
     edit("side/index.ts", "edits/side-index-1.ts");
     watch.expect_builds(2, "the first side edit", &root);
     edit("lib/a.ts", "edits/lib-a.ts");
-    watch.expect_builds(4, "the lib edit", &root);
+    watch.expect_builds(3, "the lib edit", &root);
     set_dts_times_back();
     std::thread::sleep(os_watch::QUIET);
-    watch.expect_builds(4, "the time change", &root);
+    watch.expect_builds(3, "the time change", &root);
     edit("side/index.ts", "edits/side-index-2.ts");
-    watch.expect_builds(5, "the second side edit", &root);
+    watch.expect_builds(4, "the second side edit", &root);
     let (stdout, stderr) = watch.stop();
     assert_eq!(
         normalize_watch_output(&stdout),
