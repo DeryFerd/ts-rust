@@ -86,6 +86,7 @@ mod customconfigfilename_test;
 mod dirty_syncmap_test;
 mod effect_fixables_test;
 mod effect_ls_hooks_test;
+mod effect_ls_layer_hover_test;
 mod effect_refactors_test;
 mod extendedconfigcache_test;
 mod file_version_test;
