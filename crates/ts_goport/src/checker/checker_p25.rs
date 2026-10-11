@@ -361,13 +361,11 @@ impl Checker {
             t_symbol,
         );
         if t_object_flags.intersects(ObjectFlags::MAPPED) {
-            let (declaration, declaration_name_type) = {
-                let d = self.ty(t).as_mapped_type();
-                (d.declaration, d.declaration_name_type)
-            };
-            let d = self.ty_mut(result).as_mapped_type_mut();
-            d.declaration = declaration;
-            d.declaration_name_type = declaration_name_type;
+            // Go: checker/checker.go:22950
+            let declaration = self.ty(t).as_mapped_type().declaration();
+            self.ty_mut(result)
+                .as_mapped_type_mut()
+                .set_declaration(declaration);
             // C.f. instantiateSignature
             let orig_type_parameter = self.get_type_parameter_from_mapped_type(t);
             let fresh_type_parameter = self.clone_type_parameter(orig_type_parameter);
@@ -588,7 +586,7 @@ impl Checker {
         {
             return s;
         }
-        if self.ty(t).as_mapped_type().declaration_name_type.is_nil() {
+        if self.ty(t).as_mapped_type().declaration_name_type().is_nil() {
             if self.is_array_type(s)
                 || s_flags.intersects(TypeFlags::ANY)
                     && self.find_resolution_cycle_start_index(
@@ -769,7 +767,7 @@ impl Checker {
     // Go: checker/checker.go:23158 getTypeParameterFromMappedType
     pub fn get_type_parameter_from_mapped_type(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).as_mapped_type().type_parameter.is_nil() {
-            let declaration = self.ty(t).as_mapped_type().declaration;
+            let declaration = self.ty(t).as_mapped_type().declaration();
             let symbol = self.get_symbol_of_declaration(declaration.type_parameter());
             let type_parameter = self.get_declared_type_of_type_parameter(symbol);
             self.ty_mut(t).as_mapped_type_mut().type_parameter = type_parameter;
@@ -801,7 +799,7 @@ impl Checker {
     pub fn get_name_type_from_mapped_type(&mut self, t: TypeId) -> TypeId {
         let (name_type_node, name_type, mapper) = {
             let m = self.ty(t).as_mapped_type();
-            (m.declaration_name_type, m.name_type, m.object.mapper)
+            (m.declaration_name_type(), m.name_type, m.object.mapper)
         };
         if name_type_node.is_nil() {
             return TypeId::NIL;
@@ -818,7 +816,7 @@ impl Checker {
     // Go: checker/checker.go:23185 getTemplateTypeFromMappedType
     pub fn get_template_type_from_mapped_type(&mut self, t: TypeId) -> TypeId {
         if self.ty(t).as_mapped_type().template_type.is_nil() {
-            let declaration = self.ty(t).as_mapped_type().declaration;
+            let declaration = self.ty(t).as_mapped_type().declaration();
             let template_type = if declaration.type_().is_some() {
                 let type_from_node = self.get_type_from_type_node(declaration.type_());
                 let is_optional = self
@@ -847,7 +845,7 @@ impl Checker {
     pub fn get_constraint_declaration_for_mapped_type(&self, t: TypeId) -> Node {
         self.ty(t)
             .as_mapped_type()
-            .declaration
+            .declaration()
             .type_parameter()
             .constraint()
     }

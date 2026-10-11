@@ -1365,7 +1365,7 @@ impl Checker {
                 && self
                     .ty(source)
                     .as_mapped_type()
-                    .declaration
+                    .declaration()
                     .name_type()
                     .is_nil()
                 && {
@@ -1704,7 +1704,7 @@ impl Checker {
             let keys_remapped = self
                 .ty(target)
                 .as_mapped_type()
-                .declaration
+                .declaration()
                 .name_type()
                 .is_some();
             let template_type = self.get_template_type_from_mapped_type(target);

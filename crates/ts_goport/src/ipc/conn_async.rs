@@ -332,8 +332,10 @@ impl AsyncConn {
             if let Err(request_err) = self.handle_request(ctx, msg)
                 && self.record_request_error(request_err)
             {
-                // PORT: Go checks `c.rwc != nil`; the Rust transport is
-                // always set.
+                // Go: ipc/conn_async.go:102. PORT: Go checks `c.rwc !=
+                // nil`; the Rust transport is always set. A stdio close
+                // does not wait for the reader thread, as Go's close of
+                // a blocking `os.Stdin` (transport.rs `StdioIn`).
                 let _ = self.rwc.close();
             }
         } else if msg.is_notification() {
@@ -980,6 +982,10 @@ impl Inbox {
     ///   to its call before `ctx.Done()`. When `ctx` is done, only the
     ///   responses are taken: Go's goroutines run the requests, here `run`
     ///   does.
+    /// - The message read after the `ctx` of `run` was done
+    ///   (`after_cancel`), when the call's `ctx` is not done: Go's `Run`
+    ///   dispatched it (:94-110) before it returned and its deferred
+    ///   `closePendingCalls` ran, so the call gets its response.
     /// - The end of a loop that ended before `ctx` was done (EOF, a read
     ///   error): Go's `closePendingCalls` runs before `cancelHandlers`.
     /// - `ctx` done. After a signal the loop ends only at its next read (1
@@ -993,6 +999,16 @@ impl Inbox {
                 .iter()
                 .position(|(msg, _)| canceled.is_none() || msg.is_response());
             if let Some((msg, read_at)) = next.and_then(|i| state.messages.remove(i)) {
+                return CallStep::Message(msg, read_at);
+            }
+            // PORT: a call whose `ctx` is not the `ctx` of `run` (nor made
+            // from it). A call with a `ctx` that is done takes no
+            // `after_cancel`: when it is the `ctx` of `run`, its
+            // `ctx.Done()` came first; for another `ctx`, the port does not
+            // know which came first, and takes the cancel.
+            if canceled.is_none()
+                && let Some((msg, read_at)) = state.after_cancel.take()
+            {
                 return CallStep::Message(msg, read_at);
             }
             if state.ended && !state.ended_after_cancel {
@@ -2418,6 +2434,30 @@ pub(crate) mod tests {
             .map(|(msg, _)| msg.is_response())
             .collect();
         assert_eq!(responses, [false, true]);
+    }
+
+    // PORT: no Go test; Go `Run` and `Call` (ipc/conn_async.go:83-110,
+    // :289-303). A call whose `ctx` is not done (not the `ctx` of `run`)
+    // gets a response that `Run` read after its `ctx` was done: `Run`
+    // handed it to the call before it returned and closed the pending
+    // calls.
+    #[test]
+    fn test_async_conn_reader_call_with_another_ctx_takes_the_late_response() {
+        let inbox = Inbox::default();
+        let (run_ctx, cancel) = context::with_cancel(&context::background());
+        cancel();
+        let late = message(Some(jsonrpc::new_id_string("api1")), "");
+        let err = run_ctx.err().expect("ctx is done");
+        inbox.end(Some(late), ReadEnd::Returned(Err(err)), true);
+        let ctx = context::background();
+        let step = inbox.next_for_call(&ctx);
+        assert!(
+            matches!(&step, CallStep::Message(msg, _) if msg.is_response()),
+            "the late response is lost"
+        );
+        let step = inbox.next_for_call(&ctx);
+        assert!(matches!(step, CallStep::Ended), "the end is lost");
+        assert!(inbox.next_for_run().is_none(), "run gets it again");
     }
 
     // PORT: no Go test; Go `Call` (ipc/conn_async.go:289-303). A call that

@@ -2278,17 +2278,17 @@ pub struct InstantiationExpressionType {
 // MappedType
 
 // Go: checker/types.go:1110 MappedType
-// PORT: write `declaration` with `set_declaration`, which also keeps
-// `declaration_name_type`.
+// PORT: `declaration` and `declaration_name_type` are private, so only
+// `set_declaration` writes them and they stay in step.
 #[derive(Clone, Default)]
 pub struct MappedType {
     pub object: ObjectType,
-    pub declaration: Node, // *ast.MappedTypeNode
+    declaration: Node, // *ast.MappedTypeNode
     // PERF: no Go field. Go `declaration.NameType`, kept when the declaration
     // is set (the node never changes). The mapped-type checks read it on hot
     // paths (`is_generic_mapped_type`), and a node field read goes through
     // the file's node store. `MappedType` is boxed, so `Type` does not grow.
-    pub declaration_name_type: Node,
+    declaration_name_type: Node,
     pub type_parameter: TypeId,
     pub constraint_type: TypeId,
     pub name_type: TypeId,
@@ -2304,6 +2304,18 @@ impl MappedType {
     pub fn set_declaration(&mut self, declaration: Node) {
         self.declaration = declaration;
         self.declaration_name_type = declaration.name_type();
+    }
+
+    /// Go `m.declaration` (a `MappedTypeNode`).
+    #[inline]
+    pub fn declaration(&self) -> Node {
+        self.declaration
+    }
+
+    /// Go `m.declaration.NameType`, kept by `set_declaration`.
+    #[inline]
+    pub fn declaration_name_type(&self) -> Node {
+        self.declaration_name_type
     }
 
     // Go: checker/types.go:1122 MappedType.TypeParameter

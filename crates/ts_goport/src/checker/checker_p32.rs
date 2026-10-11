@@ -35,7 +35,7 @@ impl Checker {
     // Go: checker/checker.go:29541 getMappedTypeModifiers
     // PORT: Go package function; it reads type data, so it is a `Checker` method.
     pub fn get_mapped_type_modifiers(&self, t: TypeId) -> MappedTypeModifiers {
-        let declaration = self.ty(t).as_mapped_type().declaration;
+        let declaration = self.ty(t).as_mapped_type().declaration();
         let mut modifiers = MappedTypeModifiers::default();
         let readonly_token = declaration.readonly_token();
         if readonly_token.is_some() {
