@@ -870,10 +870,14 @@ echo "headers: all bins have a RW PT_GNU_STACK and a program header table that o
 # found") exits 1, which is also a tsgo exit code. The malloc variable is set
 # so the run stays in qemu: an exec would run the new image on the host CPU.
 # Any GLIBC_TUNABLES value stops the glibc re-exec.
+# LD_LIBRARY_PATH=/usr/lib (the sysroot's, through -L) comes before the
+# host's ld.so.cache, which can name other dirs that -L does not map: on
+# Ubuntu (a testbox) the 2.28 loader read /lib/x86_64-linux-gnu from it and
+# loaded the host's libc 2.39 (exit 127).
 tunables="$(malloc_env tsgo)"
 [[ $jemalloc == 1 ]] || tunables="GLIBC_TUNABLES=glibc.malloc.hugetlb=1"
 qemu=(qemu-x86_64 -cpu qemu64)
-[[ $static == 1 ]] || qemu+=(-L "$glibc_root")
+[[ $static == 1 ]] || qemu+=(-L "$glibc_root" -E LD_LIBRARY_PATH=/usr/lib)
 # check_run <name> <log> <cmd...>: runs tsgo on project <name>, prints the
 # exit code.
 check_run() {
