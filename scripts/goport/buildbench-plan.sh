@@ -5,8 +5,9 @@
 #     'export RUSTUP_HOME=/home/dbook/.rustup CARGO_HOME=/home/dbook/.cargo; <wt>/scripts/goport/buildbench-plan.sh <session> <out-dir>'
 # Sessions: setup, s1 .. s7, identity, perf (the 2026-09-28 measurement, bench.md in
 # target/continuation-r97-goport/buildspeed/), defaults (the run-cargo-capped.sh edit-loop
-# defaults; run it before and after a build change) and devloop (the same defaults in the dev
-# profile: check, --bin tsgo, --bins and test --no-run). The last line is DONE or FAIL rc=N.
+# defaults; run it before and after a build change), devloop (the same defaults in the dev
+# profile: check, --bin tsgo, --bins and test --no-run) and toolchains (the evidence toolchain:
+# 1.93.0, 1.95.0 and 1.99.0, with bin-identity.sh). The last line is DONE or FAIL rc=N.
 set -uo pipefail
 S=${1:?session} OUT=${2:?out-dir}
 mkdir -p "$OUT"; echo "host $(hostname) session $S start $(date -Is) load $(cut -d" " -f1-3 /proc/loadavg)"
@@ -117,6 +118,24 @@ case $S in
           BENCH_CMD=$c BENCH_INCREMENTAL=ts_goport b "dev-$n-$l-r$r" "$NT" dev "$a" "-Zthreads=8"
         done
       done
+    done ;;
+  # The evidence toolchain: release builds with the candidate.sh evidence settings (no nightly, no
+  # incremental) on 1.93.0, 1.95.0 (build-release.sh) and a newer stable, then bin-identity.sh of each
+  # against 1.93.0. The revert cell rebuilds the unedited source, so the copied bins are of it.
+  toolchains)
+    T=$H/../../target/bench
+    for tc in "$ST" 1.95.0 1.99.0; do
+      rustup toolchain install "$tc" --profile minimal > /dev/null 2>&1 || rc=$?
+      b "tc-$tc-clean-r1" "$tc" release clean ""
+      b "tc-$tc-touch-checker-r1" "$tc" release "touch:$CK" ""
+      b "tc-$tc-edit-checker-r1" "$tc" release "edit:$CK" ""
+      b "tc-$tc-revert-checker-r1" "$tc" release build ""
+      mkdir -p "$OUT/bins/$tc"
+      for f in tsgo goport; do cp "$T/$tc-release/release/$f" "$OUT/bins/$tc/" || rc=$?; done
+    done
+    for tc in 1.95.0 1.99.0; do
+      "$H/bin-identity.sh" "$OUT/identity-$tc" "$OUT/bins/$ST" "$OUT/bins/$tc" | sed "s/^/$tc vs $ST: /" || rc=$?
+      grep -q DIFF "$OUT/identity-$tc/summary.txt" || rm -rf "$OUT/identity-$tc/a" "$OUT/identity-$tc/b"
     done ;;
   *) echo "unknown session $S" >&2; rc=2 ;;
 esac
