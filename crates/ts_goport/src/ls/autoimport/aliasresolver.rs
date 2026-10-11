@@ -671,6 +671,16 @@ impl AliasResolver {
         false
     }
 
+    // Go: ls/autoimport/aliasresolver.go:226 IsSourceFileFromExternalLibrary
+    // IsSourceFileFromExternalLibrary implements checker.Program.
+    // Effect-TS/tsgo patch 018 adds it, because patch 002 adds the method to
+    // `checker.Program`.
+    // PORT: no port path calls it on an alias resolver; the Effect caller
+    // (`rulerunner::run`) never runs on an alias resolver checker.
+    pub fn is_source_file_from_external_library(&self, _file: Node) -> bool {
+        false
+    }
+
     // Go: ls/autoimport/aliasresolver.go:228 IsSourceFromProjectReference
     // IsSourceFromProjectReference implements checker.Program.
     pub fn is_source_from_project_reference(&self, path: &tspath::Path) -> bool {
