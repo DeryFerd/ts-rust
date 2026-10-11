@@ -228,18 +228,26 @@ pub fn has_trailing_directory_separator(path: &str) -> bool {
 // Combines paths. If a path is absolute, it replaces any previous path. Relative paths are not simplified.
 // PORT: Go writes into one `strings.Builder` and "sets" the result by moving
 // `start`. Building the current result directly gives the same string.
+// PERF: portonly1 item 9. Go grows one builder to the size of all the parts
+// first (path.go:88-95) and writes each part into it, and `NormalizeSlashes`
+// returns its input when it has no backslash. The port made a String for
+// each part and grew the result as it went (three allocations for one join).
 pub fn combine_paths(first_path: &str, paths: &[&str]) -> String {
     // TODO (drosen): There is potential for a fast path here.
     // In the case where we find the last absolute path and just path.Join from there.
-    let mut result = normalize_slashes(first_path);
+    let first_path = normalize_slashes_cow(first_path);
+    let size = first_path.len() + paths.len() + paths.iter().map(|p| p.len()).sum::<usize>();
+    let mut result = String::with_capacity(size);
+    result.push_str(&first_path);
     for trailing_path in paths {
         if trailing_path.is_empty() {
             continue;
         }
-        let trailing_path = normalize_slashes(trailing_path);
+        let trailing_path = normalize_slashes_cow(trailing_path);
         if result.is_empty() || get_root_length(&trailing_path) != 0 {
             // `trailingPath` is absolute.
-            result = trailing_path;
+            result.clear();
+            result.push_str(&trailing_path);
         } else {
             if !has_trailing_directory_separator(&result) {
                 result.push(DIRECTORY_SEPARATOR as char);
@@ -248,6 +256,39 @@ pub fn combine_paths(first_path: &str, paths: &[&str]) -> String {
         }
     }
     result
+}
+
+// Go: tspath/rooted_path.go:737 (`RootedDirectoryPath.ResolveFile`) and :794
+// (`ResolveDirectory`): the `canAppendPathWithoutNormalization` fast path
+// (rooted_path.go:841) with `appendPathToDirectory` (rooted_path.go:853).
+/// `normalize_path(&combine_paths(directory, &[path]))` when that is just
+/// `directory`, a separator and `path`: `directory` is not empty and is
+/// normal (`is_normalized_path`), and `path` is a relative path with no
+/// backslash, no "." or ".." segment, no empty segment and no trailing
+/// separator. Then the joined path has no segment that `normalize_path`
+/// changes. `None` otherwise: the caller joins and normalizes.
+// PORT: Go's resolver keeps its directories as `RootedDirectoryPath`, which
+// is normal by type; the port tests `directory` here.
+#[must_use]
+pub fn append_relative_to_normal_directory(directory: &str, path: &str) -> Option<String> {
+    let appendable = !path.is_empty()
+        && get_root_length(path) == 0
+        && !path.as_bytes().contains(&b'\\')
+        && !has_relative_path_segment(path)
+        && !has_trailing_directory_separator(path)
+        && !directory.is_empty()
+        && is_normalized_path(directory);
+    if !appendable {
+        return None;
+    }
+    let mut joined = String::with_capacity(directory.len() + 1 + path.len());
+    joined.push_str(directory);
+    if !has_trailing_directory_separator(directory) {
+        joined.push(DIRECTORY_SEPARATOR as char);
+    }
+    joined.push_str(path);
+    debug_assert_eq!(joined, normalize_path(&combine_paths(directory, &[path])));
+    Some(joined)
 }
 
 // Go: tspath/path.go:128 GetPathComponents
