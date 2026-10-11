@@ -1563,6 +1563,12 @@ impl Checker {
     // Go: checker/checker.go:22466 getResolvedTypeParameterDefault
     pub fn get_resolved_type_parameter_default(&mut self, t: TypeId) -> TypeId {
         let resolved_default_type = self.ty(t).as_type_parameter().resolved_default_type;
+        // PERF: portonly1 item 6. Go reads `d.resolvedDefaultType` once
+        // (checker.go:22467) and returns it when it is set and not the
+        // resolving marker; the port read the type data again at the end.
+        if resolved_default_type.is_some() && resolved_default_type != self.resolving_default_type {
+            return resolved_default_type;
+        }
         if resolved_default_type.is_nil() {
             let target = self.ty(t).as_type_parameter().target;
             if target.is_some() {
