@@ -38,7 +38,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 - **portonly1 up to 17d03b190 (items 3, 5, 6, 9; item 10 dropped): into int63. jemtune1 dropped (note perfscan3-lanes-result-2026-10-11).**
 
-- **Running: followups43 round 2 (effectGenToFn panic point as Go; note followups43-r1-2026-10-11); parsefast1 (perfscan3 items 1 and 7: identifier interning with the scanner hash, binder per-node work; on main R194).**
+- **followups43 98333a1f8: round 2 skeptic PASS, into int63 (note followups43-result-2026-10-11). Running: parsefast1 (perfscan3 items 1 and 7: identifier interning with the scanner hash, binder per-node work; on main R194).**
 
 - **int61 (R194) = goport-effint1 b38ba8de8 (all Effect editor features of effect-tsgo 0.51.1; note effint3-result-2026-10-11).** After bump D and int60: merge the accepted head, then a revision. D1 (refactor.rewrite in initialize codeActionKinds) needs Theo.
 
