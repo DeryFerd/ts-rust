@@ -231,17 +231,18 @@ child_test! {
 
 child_test! {
     // Patches 011 and 024: on this file the code action and document symbol
-    // answers with the plugin are the answers without it. The range has no
-    // Effect diagnostic, so the fixables (E4, E5) add no action. The file has
-    // no Layer, service, error or schema, and flows need the `debug` option,
-    // so the document symbols (E8) add no `Effect` symbol. The refactors (E9)
-    // are not ported yet. The completion answer is not the same: at
-    // `Effect.` the plugin appends `gen` and `fn` items
+    // answers with the plugin are the answers without it, except for the
+    // Effect refactors (E9a), which come after the other code actions. Their
+    // edits are in `effect_refactors_test.rs`. The range has no Effect
+    // diagnostic, so the fixables (E4, E5) add no action. The file has no
+    // Layer, service, error or schema, and flows need the `debug` option, so
+    // the document symbols (E8) add no `Effect` symbol. The completion answer
+    // is not the same: at `Effect.` the plugin appends `gen` and `fn` items
     // (`effect_ls_completions_test.rs`).
     fn code_actions_and_symbols_are_unchanged() {
         let answers = |service: &LanguageService| {
             let ctx = projecttestutil::with_request_id(&bg());
-            let actions = service
+            let mut actions = service
                 .provide_code_actions(
                     &ctx,
                     &lsproto::CodeActionParams {
@@ -254,15 +255,42 @@ child_test! {
                         ..Default::default()
                     },
                 )
-                .unwrap_or_else(|err| panic!("{}", err.error()));
+                .unwrap_or_else(|err| panic!("{}", err.error()))
+                .command_or_code_action_array
+                .unwrap_or_default();
+            let kind = |action: &lsproto::CommandOrCodeAction| {
+                action
+                    .code_action
+                    .as_ref()
+                    .and_then(|action| action.kind.as_ref())
+                    .map(|kind| kind.0.to_string())
+                    .unwrap_or_default()
+            };
+            let first_refactor = actions
+                .iter()
+                .position(|action| kind(action).starts_with("refactor.rewrite.effect."))
+                .unwrap_or(actions.len());
+            let refactors: Vec<String> =
+                actions.split_off(first_refactor).iter().map(kind).collect();
             let symbols = service
                 .provide_document_symbols(&ctx, &uri(MAIN_URI))
                 .unwrap_or_else(|err| panic!("{}", err.error()));
-            format!("{actions:?}\n{symbols:?}")
+            (format!("{actions:?}\n{symbols:?}"), refactors)
         };
         let (_session, on) = service(PLUGIN, None);
         let (_session, off) = service("", None);
-        assert_eq!(answers(&on), answers(&off));
+        let (on, on_refactors) = answers(&on);
+        let (off, off_refactors) = answers(&off);
+        assert_eq!(on, off);
+        assert_eq!(off_refactors, Vec::<String>::new());
+        assert_eq!(
+            on_refactors,
+            [
+                "refactor.rewrite.effect.wrapWithPipe",
+                "refactor.rewrite.effect.toggleTypeAnnotation",
+                "refactor.rewrite.effect.toggleLazyConst",
+            ]
+        );
     }
 }
 

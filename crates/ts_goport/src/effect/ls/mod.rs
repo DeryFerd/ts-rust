@@ -22,11 +22,11 @@
 //!
 //! Ported: the Effect hover and the inlay filter (lane E2), the auto-import
 //! style (E3), the fixable framework with the disable actions and all 55
-//! fixes (E4, E5a, E5b, E5c), the completions (E6), the Layer hover (E7)
-//! and the document symbols (E8). Not ported here: patch 017
+//! fixes (E4, E5a, E5b, E5c), the completions (E6), the Layer hover (E7),
+//! the document symbols (E8) and the refactor framework with 9 refactors
+//! (E9a; E9b to E9d the other 12). Not ported here: patch 017
 //! (`refactor.rewrite` in the server's code action kinds; root decision D1
-//! keeps the plain list). The refactors (E9) are still to come:
-//! [`EFFECT_REFACTOR_PROVIDER`] gives no action.
+//! keeps the plain list).
 
 use std::sync::LazyLock;
 
@@ -43,6 +43,8 @@ pub mod fixable;
 pub mod fixables;
 pub mod hover;
 pub mod inlay_hints;
+pub mod refactor;
+pub mod refactors;
 pub mod rewriter;
 
 // Go: etslshooks/init.go:87 effectFixProvider
@@ -104,15 +106,15 @@ pub static EFFECT_REFACTOR_PROVIDER: RefactorProvider = RefactorProvider {
 
 // Go: etslshooks/init.go:133 getEffectRefactorActions
 // getEffectRefactorActions iterates all registered refactors and collects their code actions.
-// PORT: lane E9 ports `internal/refactor` and `internal/refactors`. Until
-// then `refactors.All` is empty, so Go collects no action. The port does not
-// take the checker for the file until then (Go takes it and gives it back).
+// PORT: the plugin check is `rulerunner::enabled_options`, as for the code
+// fix provider. One context runs all refactors of [`refactors::ALL`], in
+// Go order.
 fn get_effect_refactor_actions(
-    _ctx: &Context,
-    _file: Node,
-    _span: TextRange,
+    ctx: &Context,
+    file: Node,
+    span: TextRange,
     program: &compiler::NewProgram,
-    _ls: &LanguageService,
+    lang_service: &LanguageService,
 ) -> Result<Vec<CodeAction>, GoError> {
     let Some(effect_config) = enabled_options(program.options()) else {
         return Ok(Vec::new());
@@ -120,7 +122,20 @@ fn get_effect_refactor_actions(
     if !effect_config.get_refactors_enabled() {
         return Ok(Vec::new());
     }
-    Ok(Vec::new())
+
+    let (ch, done) = ls_program::get_type_checker_for_file(program, ctx, file);
+    let mut actions = Vec::new();
+    {
+        let mut ch = ch.borrow_mut();
+        let go_program = ch.program;
+        let mut tp = TypeParser::new(go_program, &mut ch);
+        let mut r_ctx = refactor::new_context(ctx, file, span, program, lang_service, &mut tp);
+        for r in refactors::ALL {
+            actions.extend((r.run)(&mut r_ctx));
+        }
+    }
+    done.call();
+    Ok(actions)
 }
 
 // Go: etslshooks/init.go:155 afterCompletion
