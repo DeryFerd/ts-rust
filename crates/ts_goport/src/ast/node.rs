@@ -6964,6 +6964,66 @@ mod tests {
         assert!(cached > 10 && computed > 10, "{cached} {computed}");
     }
 
+    /// perfP1 item 1 (perfscan2), in a release build: the child chain of
+    /// each published node that has one (R2-5 links, which
+    /// `for_each_child_dyn` walks) is the walk of its node data, in Go
+    /// `ForEachChild` order. A debug build checks this at each walk; the
+    /// protected tests run release builds, so this test checks a sample.
+    #[test]
+    fn child_chains_are_the_data_walk() {
+        const SOURCE: &str = "@dec export abstract class C<T extends object = {}> extends B implements I {\n\
+            ;  #p?: T; static { debugger; } constructor(private a: number) { super(); }\n\
+            get g(): this { return this; } set g(v) {} [k: string]: any; m?<U>(...r: U[]): void;\n\
+            }\n\
+            interface I { (x: number): string; new (): I; readonly [P in keyof T]-?: T[P] }\n\
+            type M<T> = { [P in keyof T as `k${string & P}`]+?: T[P] extends infer U ? U : never };\n\
+            enum E { A = 1 << 2, B }\n\
+            namespace N.M { export import Q = N.Q; }\n\
+            import d, { a as b, type c } from 'm';\n\
+            label: for (const [a, , ...b] of x) { if (a) continue label; else break; }\n\
+            switch (x) { case 1: throw new Error(); default: }\n\
+            try { using r = f(); } catch ({ e = 1 }) { } finally { }\n\
+            async function* g() { yield* await x!; return void delete o[1]?.[2]; }\n\
+            const o = { a, b: 1, ...c, ['d']: 2, m() {}, get x() { return 1; } } satisfies O as const;\n\
+            let t = tag<string>`a${1}b${2}c` + /re/g.source + 1n + (x, y++) - ~!x + (-x) ** 2;\n\
+            /** @param a text */ function h(this: Window, a: unknown): asserts a is string {}\n";
+        let dir =
+            std::env::temp_dir().join(format!("ts_goport_child_chains_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), SOURCE).unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "noLib": true, "types": [] }, "files": ["a.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = crate::program::try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scope = crate::core::enter_program(Some(program));
+        let root = program
+            .source_files()
+            .find(|file| file.info.file_name.ends_with("/a.ts"))
+            .expect("a.ts is not in the program")
+            .root;
+        // (nodes, nodes with a known chain, those with children).
+        let mut counts = (0, 0, 0);
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            counts.0 += 1;
+            let by_data: Vec<Node> = children_by_data(n).collect();
+            if let Some(chain) = frozen_store_node(n).and_then(|f| f.children()) {
+                assert_eq!(chain.collect::<Vec<_>>(), by_data, "{:?}", n.kind());
+                counts.1 += 1;
+                counts.2 += usize::from(!by_data.is_empty());
+            }
+            stack.extend(by_data);
+        }
+        drop(scope);
+        crate::program::release_program(program);
+        assert!(counts.1 > 250 && counts.2 > 100, "{counts:?}");
+    }
+
     /// noderef1 W1: `has_no_child_fields` holds for exactly the kinds of the
     /// variants of the last arm of `walk_children`, and that arm visits no
     /// field. In parsed code, a node has a child field exactly when its kind
@@ -7044,9 +7104,13 @@ mod tests {
             NodeData::NotEmittedStatement(Box::new(a::NotEmittedStatementData { flow_node: None })),
             NodeData::NotEmittedTypeElement(Box::new(a::NotEmittedTypeElementData)),
         ];
+        // No file has this id, so a child that a wrong arm visits reads no
+        // store: a parallel test may free file 1, and a debug build checks
+        // that the file of a node is not freed (`file_block`).
+        let no_file = crate::ast::store::FILE_ID_LIMIT;
         let fields = |kind: SyntaxKind, d: &NodeData| {
             let mut fields = 0;
-            for_each_child_field(kind, 1, d, |_| fields += 1);
+            for_each_child_field(kind, no_file, d, |_| fields += 1);
             fields
         };
         for d in &leaves {

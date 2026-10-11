@@ -2496,7 +2496,9 @@ type I<T, U> = T & U;
     /// `kind` (`"a" & "b"` is never, a discriminant, Go
     /// `isDiscriminantWithNeverType`, checker.go:22341) ends the test. In
     /// `C & D` `kind` is seen first, so the test ends before `m` is tested,
-    /// and the property cache of the intersection has no `m`.
+    /// and the property cache of the intersection has no `m`. The test
+    /// turns `fast_never_order` off itself, so it holds when the test run
+    /// sets `GOPORT_FAST_NEVER_ORDER=1`.
     #[test]
     fn never_reduction_tests_names_in_first_seen_order() {
         const SOURCE: &str = r#"
@@ -2508,6 +2510,7 @@ type MK = A & B;
 type KM = C & D;
 "#;
         let got = with_alias_types(SOURCE, |c, types| {
+            c.fast_never_order = false;
             types[..2]
                 .iter()
                 .map(|&i| {
