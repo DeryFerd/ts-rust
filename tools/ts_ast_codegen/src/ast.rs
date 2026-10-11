@@ -533,6 +533,57 @@ impl<'a> AstGenerator<'a> {
         Ok(())
     }
 
+    /// `NodeData::for_each_list`: every list field of the data, also the
+    /// ones that `try_for_each_child` does not visit. A print pack copies
+    /// them all (astshrink1).
+    fn generate_list_walk(&self, output: &mut String) -> Result<(), String> {
+        output.push_str(
+            "
+    /// Visits every list field of the data, also the ones that
+    /// `try_for_each_child` skips, as Go `ForEachChild` does.
+    #[allow(clippy::too_many_lines)]
+    pub fn for_each_list(&self, mut visitor: impl FnMut(NodeList)) {
+        let mut visit = |list: Option<NodeList>| {
+            if let Some(list) = list {
+                visitor(list);
+            }
+        };
+        match self {
+",
+        );
+        for (name, node) in &self.schema.nodes.definitions {
+            let mut visits = Vec::new();
+            for field in self.node_fields(name, node)? {
+                let f = rust_field_name(&field.schema_name);
+                let ty = self.rust_type(&field.ty, field.list, field.optional)?;
+                visits.push(match ty.as_str() {
+                    "NodeList" => format!("visit(Some(node.{f}))"),
+                    "Option<NodeList>" => format!("visit(node.{f})"),
+                    "ModifierList" => format!("visit(Some(node.{f}.list))"),
+                    "Option<ModifierList>" => format!("visit(node.{f}.map(|m| m.list))"),
+                    _ => continue,
+                });
+            }
+            let rust_name = rust_type_name(name);
+            match visits.as_slice() {
+                [] => {}
+                [visit] => {
+                    writeln!(output, "            Self::{rust_name}(node) => {visit},").unwrap();
+                }
+                _ => {
+                    let visits = visits.join("; ");
+                    writeln!(
+                        output,
+                        "            Self::{rust_name}(node) => {{ {visits}; }}"
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        output.push_str("            _ => {}\n        }\n    }\n");
+        Ok(())
+    }
+
     fn generate_hand_written_child_arm(
         output: &mut String,
         schema_name: &str,
@@ -692,6 +743,7 @@ impl<'a> AstGenerator<'a> {
         writeln!(output, "        }}").unwrap();
         writeln!(output, "    }}").unwrap();
         self.generate_child_traversal(&mut output)?;
+        self.generate_list_walk(&mut output)?;
         writeln!(output, "}}").unwrap();
         writeln!(output).unwrap();
         write_child_traversal_helpers(&mut output);

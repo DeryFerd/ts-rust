@@ -2616,6 +2616,196 @@ impl NodeData {
         }
         // END schema-exhaustive direct child visitor
     }
+
+    /// Visits every list field of the data, also the ones that
+    /// `try_for_each_child` skips, as Go `ForEachChild` does.
+    #[allow(clippy::too_many_lines)]
+    pub fn for_each_list(&self, mut visitor: impl FnMut(NodeList)) {
+        let mut visit = |list: Option<NodeList>| {
+            if let Some(list) = list {
+                visitor(list);
+            }
+        };
+        match self {
+            Self::ArrayLiteralExpression(node) => visit(Some(node.elements)),
+            Self::ArrowFunction(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::BinaryExpression(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::BindingPattern(node) => visit(Some(node.elements)),
+            Self::Block(node) => visit(Some(node.statements)),
+            Self::CallExpression(node) => {
+                visit(Some(node.arguments));
+                visit(node.type_arguments);
+            }
+            Self::CallSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+            }
+            Self::CaseBlock(node) => visit(Some(node.clauses)),
+            Self::CaseOrDefaultClause(node) => visit(Some(node.statements)),
+            Self::ClassDeclaration(node) => {
+                visit(node.heritage_clauses);
+                visit(Some(node.members));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ClassExpression(node) => {
+                visit(node.heritage_clauses);
+                visit(Some(node.members));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ClassStaticBlockDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ConstructSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+            }
+            Self::ConstructorDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ConstructorTypeNode(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::EnumDeclaration(node) => {
+                visit(Some(node.members));
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::EnumMember(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ExportAssignment(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ExportDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ExpressionWithTypeArguments(node) => visit(node.type_arguments),
+            Self::FunctionDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::FunctionExpression(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::FunctionTypeNode(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::GetAccessorDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::HeritageClause(node) => visit(Some(node.types)),
+            Self::ImportAttributes(node) => visit(Some(node.attributes)),
+            Self::ImportDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ImportEqualsDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ImportTypeNode(node) => visit(node.type_arguments),
+            Self::IndexSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::InterfaceDeclaration(node) => {
+                visit(node.heritage_clauses);
+                visit(Some(node.members));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::IntersectionTypeNode(node) => visit(Some(node.types)),
+            Self::JsDoc(node) => {
+                visit(Some(node.comment));
+                visit(node.tags);
+            }
+            Self::JsDocAugmentsTag(node) => visit(node.comment),
+            Self::JsDocCallbackTag(node) => visit(node.comment),
+            Self::JsDocDeprecatedTag(node) => visit(node.comment),
+            Self::JsDocImplementsTag(node) => visit(node.comment),
+            Self::JsDocImportTag(node) => visit(node.comment),
+            Self::JsDocOverloadTag(node) => visit(node.comment),
+            Self::JsDocOverrideTag(node) => visit(node.comment),
+            Self::JsDocParameterOrPropertyTag(node) => visit(node.comment),
+            Self::JsDocPrivateTag(node) => visit(node.comment),
+            Self::JsDocProtectedTag(node) => visit(node.comment),
+            Self::JsDocPublicTag(node) => visit(node.comment),
+            Self::JsDocReadonlyTag(node) => visit(node.comment),
+            Self::JsDocReturnTag(node) => visit(node.comment),
+            Self::JsDocSatisfiesTag(node) => visit(node.comment),
+            Self::JsDocSeeTag(node) => visit(node.comment),
+            Self::JsDocSignature(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+            }
+            Self::JsDocTemplateTag(node) => {
+                visit(node.comment);
+                visit(Some(node.type_parameters));
+            }
+            Self::JsDocThisTag(node) => visit(node.comment),
+            Self::JsDocThrowsTag(node) => visit(node.comment),
+            Self::JsDocTypeTag(node) => visit(node.comment),
+            Self::JsDocTypedefTag(node) => visit(node.comment),
+            Self::JsDocUnknownTag(node) => visit(node.comment),
+            Self::JsxAttributes(node) => visit(Some(node.properties)),
+            Self::JsxElement(node) => visit(Some(node.children)),
+            Self::JsxFragment(node) => visit(Some(node.children)),
+            Self::JsxOpeningElement(node) => visit(node.type_arguments),
+            Self::JsxSelfClosingElement(node) => visit(node.type_arguments),
+            Self::MappedTypeNode(node) => visit(node.members),
+            Self::MethodDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::MethodSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::MissingDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ModuleBlock(node) => visit(Some(node.statements)),
+            Self::ModuleDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::NamedExports(node) => visit(Some(node.elements)),
+            Self::NamedImports(node) => visit(Some(node.elements)),
+            Self::NamespaceExportDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::NewExpression(node) => {
+                visit(node.arguments);
+                visit(node.type_arguments);
+            }
+            Self::ObjectLiteralExpression(node) => visit(Some(node.properties)),
+            Self::ParameterDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::PropertyAssignment(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::PropertyDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::PropertySignatureDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::SetAccessorDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ShorthandPropertyAssignment(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::SourceFile(node) => visit(Some(node.statements)),
+            Self::TaggedTemplateExpression(node) => visit(node.type_arguments),
+            Self::TemplateExpression(node) => visit(Some(node.template_spans)),
+            Self::TemplateLiteralTypeNode(node) => visit(Some(node.template_spans)),
+            Self::TupleTypeNode(node) => visit(Some(node.elements)),
+            Self::TypeAliasDeclaration(node) => {
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::TypeLiteralNode(node) => visit(Some(node.members)),
+            Self::TypeParameterDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::TypeQueryNode(node) => visit(node.type_arguments),
+            Self::TypeReferenceNode(node) => visit(node.type_arguments),
+            Self::UnionTypeNode(node) => visit(Some(node.types)),
+            Self::VariableDeclarationList(node) => visit(Some(node.declarations)),
+            Self::VariableStatement(node) => visit(node.modifiers.map(|m| m.list)),
+            _ => {}
+        }
+    }
 }
 
 fn visit_optional_child<B, F>(visitor: &mut F, child: Option<NodeId>) -> std::ops::ControlFlow<B>

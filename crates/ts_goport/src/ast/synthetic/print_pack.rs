@@ -35,10 +35,11 @@ impl PrintPack {
 
 /// Copies the synthetic slots of this thread that `roots` reach, with the
 /// astdata node of each node slot. From a node slot the walk goes to the
-/// children in its data, its parent and the nodes of its SourceFile fields,
-/// and to the nodes that `more` adds for it (the emit context entries of
-/// the node). A parsed node ends the walk: every thread reads it. `more`
-/// must not make or change synthetic nodes.
+/// children in its data (with every list field: `NodeData::for_each_list`),
+/// its parent and the nodes of its SourceFile fields, and to the nodes that
+/// `more` adds for it (the emit context entries of the node). A parsed node
+/// ends the walk: every thread reads it. `more` must not make or change
+/// synthetic nodes.
 pub fn export_print_pack(roots: &[Node], mut more: impl FnMut(Node, &mut Vec<Node>)) -> PrintPack {
     let mut pack = PrintPack {
         slots: Vec::new(),
@@ -73,14 +74,19 @@ pub fn export_print_pack(roots: &[Node], mut more: impl FnMut(Node, &mut Vec<Nod
                     pack.slots.push((index, Slot::Node(node.clone())));
                     let data = a.data(node.data);
                     pack.datas.push((node.data, data.clone()));
-                    data.for_each_child(|child| match child {
-                        crate::astdata::Child::Node(id) => stack.push(id.index() as u32),
-                        crate::astdata::Child::List(l) => {
-                            let index = l.index() as u32;
-                            let list = a.own_list(index).get();
-                            stack.extend(list.nodes.iter().map(|id| id.index() as u32));
-                            pack.lists.push((index, list.clone()));
+                    data.for_each_child(|child| {
+                        if let crate::astdata::Child::Node(id) = child {
+                            stack.push(id.index() as u32);
                         }
+                    });
+                    // Every list field, also the ones that `for_each_child`
+                    // skips (`EnumMember.modifiers`, which
+                    // `set_node_modifiers` can set).
+                    data.data.for_each_list(|l| {
+                        let index = l.index() as u32;
+                        let list = a.own_list(index).get();
+                        stack.extend(list.nodes.iter().map(|id| id.index() as u32));
+                        pack.lists.push((index, list.clone()));
                     });
                     push(&mut stack, node.parent);
                     if let Some(file) = &node.source_file {
@@ -243,6 +249,57 @@ mod tests {
                 assert_eq!(n.text(), format!("n{i}"));
             }
             assert_eq!(a.text(), "a");
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    // A pack copies every list field of its nodes, also the ones that
+    // `for_each_child` skips: the modifiers that `set_node_modifiers` gives
+    // an enum member or a function type, and the type parameters of an
+    // index signature. The twin reads them and their nodes.
+    #[test]
+    fn print_pack_copies_every_list_field() {
+        std::thread::spawn(|| {
+            let f = NodeFactory::new();
+            let shared = share_synthetic_chunks();
+            let export = f.new_modifier(SyntaxKind::ExportKeyword);
+            let member = f.new_enum_member(f.new_identifier("a"), Node::NIL);
+            set_node_modifiers(member, f.new_modifier_list(&[export]));
+            let readonly = f.new_modifier(SyntaxKind::ReadonlyKeyword);
+            let any = f.new_keyword_type_node(SyntaxKind::AnyKeyword);
+            let function_type = f.new_function_type_node(NodeList::NIL, f.new_node_list(&[]), any);
+            set_node_modifiers(function_type, f.new_modifier_list(&[readonly]));
+            let t = f.new_type_parameter_declaration(
+                ModifierList::NIL,
+                f.new_identifier("T"),
+                Node::NIL,
+                Node::NIL,
+                Node::NIL,
+            );
+            let index =
+                f.new_index_signature_declaration(ModifierList::NIL, f.new_node_list(&[]), any);
+            let mut data = with_ast_data(index, Clone::clone);
+            let NodeData::IndexSignatureDeclaration(d) = &mut data else {
+                unreachable!("an index signature has its data")
+            };
+            d.type_parameters = synthetic_list_value(false, f.new_node_list(&[t]));
+            replace_node_data(index, data);
+            let pack = export_print_pack(&[member, function_type, index], |_, _| {});
+
+            std::thread::spawn(move || {
+                install_twin_synthetic_arena(shared);
+                install_print_pack(pack);
+                assert_eq!(member.modifiers().nodes().to_vec(), vec![export]);
+                assert_eq!(export.kind(), SyntaxKind::ExportKeyword);
+                assert_eq!(function_type.modifiers().nodes().to_vec(), vec![readonly]);
+                assert_eq!(readonly.kind(), SyntaxKind::ReadonlyKeyword);
+                assert_eq!(index.type_parameters().to_vec(), vec![t]);
+                assert_eq!(t.name().text(), "T");
+            })
+            .join()
+            .expect("twin thread panicked");
             free_synthetic_nodes();
         })
         .join()
