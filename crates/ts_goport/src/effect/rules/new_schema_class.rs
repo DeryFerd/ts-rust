@@ -50,16 +50,12 @@ pub fn analyze_new_schema_class(tp: &mut TypeParser<'_>, sf: Node) -> Vec<NewSch
 
     let mut matches = Vec::new();
 
-    fn walk(
+    fn visit(
         tp: &mut TypeParser<'_>,
         sf: Node,
         node: Node,
         matches: &mut Vec<NewSchemaClassMatch>,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    ) {
         if node.kind() == SyntaxKind::NewExpression {
             let new_expr = node;
             if new_expr.expression().is_some()
@@ -83,12 +79,13 @@ pub fn analyze_new_schema_class(tp: &mut TypeParser<'_>, sf: Node) -> Vec<NewSch
                 });
             }
         }
-
-        node.for_each_child(|child| walk(tp, sf, child, matches));
-        false
     }
 
-    walk(tp, sf, sf, &mut matches);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, n, &mut matches);
+    }
     matches
 }
 

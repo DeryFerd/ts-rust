@@ -67,16 +67,12 @@ pub struct FloatingEffectMatch {
 // Go: rules/floating_effect.go AnalyzeFloatingEffect
 pub fn analyze_floating_effect(tp: &mut TypeParser<'_>, sf: Node) -> Vec<FloatingEffectMatch> {
     let mut matches = Vec::new();
-    fn walk(
+    fn visit(
         tp: &mut TypeParser<'_>,
         sf: Node,
         node: Node,
         matches: &mut Vec<FloatingEffectMatch>,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    ) {
         if let Some(result) = detect_floating_effect(tp, node) {
             let expression = node.expression();
             matches.push(FloatingEffectMatch {
@@ -87,11 +83,12 @@ pub fn analyze_floating_effect(tp: &mut TypeParser<'_>, sf: Node) -> Vec<Floatin
                 expr_type: result.expr_type,
             });
         }
-
-        node.for_each_child(|child| walk(tp, sf, child, matches));
-        false
     }
-    walk(tp, sf, sf, &mut matches);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, n, &mut matches);
+    }
     matches
 }
 

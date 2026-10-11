@@ -51,6 +51,7 @@ mod layer_type;
 mod lazy_expression;
 mod module_export_reference;
 mod module_identifier;
+mod node_order;
 mod object_literal;
 mod option_type;
 mod packagejson;
@@ -113,6 +114,7 @@ pub use layer_type::*;
 pub use lazy_expression::*;
 pub use module_export_reference::*;
 pub use module_identifier::*;
+pub use node_order::*;
 pub use object_literal::*;
 pub use option_type::*;
 pub use packagejson::*;
@@ -137,6 +139,9 @@ pub use yieldable_error::*;
 pub struct TypeParser<'c> {
     pub program: &'static GoProgram,
     pub checker: &'c mut Checker,
+    /// PORT: the node order of the file the rules run on
+    /// (`TypeParser::node_order`, effperf4). Not in Go.
+    pub node_order: Option<Rc<NodeOrder>>,
 }
 
 /// Go `EffectLinks`: the per-checker caches. A present key with a `None`
@@ -329,7 +334,11 @@ impl<'c> TypeParser<'c> {
         if checker.effect_links.is_none() {
             checker.effect_links = Some(Box::default());
         }
-        TypeParser { program, checker }
+        TypeParser {
+            program,
+            checker,
+            node_order: None,
+        }
     }
 
     /// Go `tp.links`.
