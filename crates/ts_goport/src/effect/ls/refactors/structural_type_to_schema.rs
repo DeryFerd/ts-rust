@@ -49,6 +49,13 @@ fn run_structural_type_to_schema(ctx: &mut RefactorContext<'_, '_>) -> Vec<CodeA
     // the same hooks, the same synthetic arena). Nothing comes between the
     // two in Go, so the checker calls and the statements are the same; the
     // closure inserts the statements as Go does.
+    // The other context cannot change the output. The generator calls only
+    // the factory's `New*` constructors (structural.go uses no other tracker
+    // method, schemagen.rs no other factory or context call), and their one
+    // hook is onCreate, which sets `NodeFlagsSynthesized` and writes no side
+    // table (printer/emitcontext.go:50). So no context holds emit flags,
+    // original links or generated names for these nodes, in Go or here, and
+    // the tracker prints them with its own context as Go does.
     let emit_context = new_emit_context();
     let stmts = StructuralSchemaGen::new(
         &emit_context.factory().ast,

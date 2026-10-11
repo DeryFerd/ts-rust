@@ -25,6 +25,8 @@
 //                from an independent clone)
 // Writes <out>/summary.json (per case: same, diff or error) and, for each case that is not same,
 // <out>/<kind>/<version>/<case>.actual and .diff. Exit 0 when every case is same, 1 otherwise.
+// scripts/effect/ls-baselines/<kind>/<version>/ holds the baselines that effect-tsgo does not commit:
+// the answers of effect-tsgo 0.51.1 to the schemagen port cases (PORT_SCHEMAGEN_CASES).
 //
 // Go sources (effect-tsgo 47cb1ed7): internal/effecttest/runner.go (parseTestUnits, DefaultTsConfig),
 // quickfix_runner.go, quickfix_baseline.go, refactor_runner.go, refactor_baseline.go,
@@ -97,6 +99,7 @@ if (!fs.existsSync(path.join(effectRepo, "testdata/baselines/reference"))) {
 }
 const EFFECT_REPO = fs.realpathSync(effectRepo);
 const REFERENCE = path.join(EFFECT_REPO, "testdata/baselines/reference");
+const LS_BASELINES = path.join(root, "scripts/effect/ls-baselines");
 const TIMEOUT_MS = Number(args.timeout) * 1000;
 fs.mkdirSync(args.out, { recursive: true });
 const OUT = fs.realpathSync(args.out);
@@ -472,8 +475,9 @@ function openAll(server, project, files) {
 // ---------------------------------------------------------------------------
 
 // The fourslash text that RunEffectQuickFixTest and RunEffectRefactorTest build, and its files.
-function fourslashCase(file) {
-  const units = parseTestUnits(fs.readFileSync(file, "utf8"), path.basename(file));
+// `content` is the case text (a port case has no file).
+function fourslashCase(file, content = fs.readFileSync(file, "utf8")) {
+  const units = parseTestUnits(content, path.basename(file));
   let text = "";
   if (!units.some((u) => isConfig(absName(u.name)))) text += `// @filename: /.src/tsconfig.json\n${DEFAULT_TSCONFIG}\n`;
   const testFiles = [];
@@ -602,8 +606,9 @@ function parseRefactorComment(content) {
 }
 
 async function runRefactors(c) {
-  const { files, testFiles } = fourslashCase(c.file);
-  const ranges = parseRefactorComment(fs.readFileSync(c.file, "utf8"));
+  const content = c.content ?? fs.readFileSync(c.file, "utf8");
+  const { files, testFiles } = fourslashCase(c.file, content);
+  const ranges = parseRefactorComment(content);
   setupFourslash(c.dir, files);
   const project = new Project(c.dir);
   const texts = new Map(files.map((f) => [f.name, f.content]));
@@ -650,6 +655,29 @@ async function runRefactors(c) {
     await server.stop();
   }
 }
+
+// Schemagen refactor cases that the Go harness does not have (version `<profile>-port`, as the port
+// refactor cases): self-recursive types, which no effect-tsgo 0.51.1 baseline has. The structural
+// schemagen hoists a named type only after its members, so each self-reference processes the type
+// again until the depth limit, and the action inserts `undefined /* maximum depth exceeded */`
+// (structural.go processType, Process). The baseline of each is the answer of effect-tsgo 0.51.1
+// (TS 7.0.2, 7.1.0-dev.20261006.1 and E0 at pin N give the same text), in
+// ls-baselines/refactors/<profile>-port/<name>.refactors.txt.
+// A v3 case mounts effect-v3 through its `// @effect-v3` line (mountVersion).
+const recursiveSchemaContent = (marker, line) => `// refactor: ${line}:18-${line}:22, ${line + 5}:13-${line + 5}:17
+${marker}import * as Schema from "effect/Schema"
+
+export interface Tree {
+  value: number
+  children: Array<Tree>
+}
+
+export type Json = string | number | boolean | null | ReadonlyArray<Json> | { readonly [key: string]: Json }
+`;
+const PORT_SCHEMAGEN_CASES = [
+  { name: "structuralTypeToSchema_selfRecursive", profile: "effect-v4", content: recursiveSchemaContent("", 4) },
+  { name: "structuralTypeToSchema_selfRecursive", profile: "effect-v3", content: recursiveSchemaContent("// @effect-v3\n", 5) },
+];
 
 // ---------------------------------------------------------------------------
 // Document symbols
@@ -1317,6 +1345,13 @@ function collectCases() {
   if (kinds.includes("inlay")) for (const c of inlayCases()) add("inlay", "inlayHints", c.name, { content: c.content, baseline: path.join(REFERENCE, "inlayHints", c.name + ".baseline"), run: runInlay });
   if (kinds.includes("hover")) for (const c of hoverCases()) add("hover", "hover_test", c.name, { content: c.content, checks: c.checks, expected: hoverExpected(c), run: runHover });
   if (kinds.includes("completion")) for (const c of completionCases()) add("completion", c.file.replace(/\.go$/, ""), c.name, { ...c, expected: "ok\n", run: runCompletion });
+  if (kinds.includes("refactors")) {
+    for (const c of PORT_SCHEMAGEN_CASES) {
+      const version = c.profile + "-port";
+      const baseline = path.join(LS_BASELINES, "refactors", version, c.name + ".refactors.txt");
+      if (versions.includes(c.profile)) add("refactors", version, c.name, { file: c.name + ".ts", content: c.content, baseline, run: runRefactors });
+    }
+  }
   return cases;
 }
 
