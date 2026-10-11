@@ -7258,7 +7258,10 @@ mod tests {
         assert!(typed.has_no_type_arguments());
         let big = entry.with_typed(Some((SlotChildren::TYPED_TYPE, 1 << 28)), false);
         assert_eq!(big.typed_parts().0, SlotChildren::TYPED_UNKNOWN);
-        assert_eq!(std::mem::size_of::<SlotChildren>(), 12);
+        // perfP2 item 2: two words, so `store_node_children` returns it in
+        // two registers. The kids column keeps its 12 bytes in `NodeKids`.
+        assert_eq!(std::mem::size_of::<SlotChildren>(), 16);
+        assert_eq!(std::mem::size_of::<NodeKids>(), 16);
     }
 
     #[test]
