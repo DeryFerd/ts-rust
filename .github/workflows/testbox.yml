@@ -2,7 +2,7 @@
 # (scripts/goport/testbox.sh). `blacksmith testbox warmup` dispatches this workflow, `testbox run` syncs
 # the working tree to it and runs one command. The setup matches the Linux test job of ci.yml, with
 # zbook's toolchains. Sticky disks keep target/ and the cargo registry warm between testboxes.
-# A pull request that changes this file runs it in validation mode (no testbox_id).
+# A pull request that changes this file or testbox-remote.sh runs it in validation mode (no testbox_id).
 name: Blacksmith Testbox
 
 on:
@@ -15,6 +15,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/testbox.yml"
+      - "scripts/goport/testbox-remote.sh"
 
 permissions:
   contents: read

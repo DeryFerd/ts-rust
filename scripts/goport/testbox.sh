@@ -13,7 +13,10 @@
 #                                             do not commit after a cancelled step: the writes to target/ are lost
 #        testbox.sh release                   forget the saved testbox: it ends at its idle timeout (TESTBOX_IDLE
 #                                             minutes after the last command), and that end commits the sticky disks.
-#                                             Use it after a cold build or new oracles; the idle minutes cost the same
+#                                             Use it after a cold build or new oracles; the idle minutes cost the same.
+#                                             Do not stop a released testbox: the commit is applied at VM shutdown,
+#                                             and `list` shows it ready for minutes after its job ends (a stop then
+#                                             lost testbox C's commit on 2026-10-10). `status` shows when it completed
 #        testbox.sh pin [KEY...]              set up the zbook path mirror and each pin's Go checkout (default: the batch
 #                                             pin, which warmup sets up). KEY comes from this worktree's UPSTREAM.json
 #        testbox.sh oracles [KEY...]          seed the recorded oracle of each pin (default: the batch pin): upload the
@@ -23,6 +26,7 @@
 #                                             the protected test suite at HEAD: build-goport-tests.sh and
 #                                             goport-tests.sh on the testbox (seeds the oracle first), fetch results.json
 #                                             and the logs to OUT (must not exist), print compare-tests.py BASE OUT.
+#                                             After a failed build, print its compiler errors (OUT/testbin.new/logs).
 #                                             HEAD must be pushed; crates/, Cargo.toml and Cargo.lock must be clean
 #        testbox.sh np-suite [--pin KEY] LABEL [BASE]
 #                                             a stable release tsgo and np-suite.sh run LABEL on the testbox, fetched to
@@ -105,12 +109,17 @@ job() {
 }
 
 # fetch RUN DEST: copy RUN/out.tar.gz and RUN.log back, unpack them in DEST, then remove them on the testbox
-# (the test binaries would fill the sticky target/).
+# (the test binaries would fill the sticky target/). Without RUN/out.tar.gz (the job ended before it packed),
+# it keeps RUN.log on the testbox and returns 1.
 fetch() {
   local id t
   id=$(saved_id)
   t=$(mktemp -d)
-  blacksmith testbox download --id "$id" "$1/out.tar.gz" "$t/out.tar.gz" > /dev/null
+  blacksmith testbox download --id "$id" "$1/out.tar.gz" "$t/out.tar.gz" > /dev/null || {
+    rm -rf "$t"
+    echo "no $1/out.tar.gz on the testbox (the job log above has its error; $1.log stays there)" >&2
+    return 1
+  }
   blacksmith testbox download --id "$id" "$1.log" "$t/testbox.log" > /dev/null
   mkdir -p "$2"
   tar -xzf "$t/out.tar.gz" -C "$2"
@@ -163,7 +172,12 @@ case "$cmd" in
     rc=0
     job "$run" tests "$pin_key" "$head" "$run" || rc=$?
     fetch "$run" "$out"
-    [[ -f $out/tests-run/results.json ]] || { echo "no results.json (rc $rc): see $out/build.log and $out/tests.log" >&2; exit 1; }
+    if [[ ! -f $out/tests-run/results.json ]]; then
+      # A failed build: its compiler errors, from the cargo logs (without the colors).
+      sed 's/\x1b\[[0-9;]*m//g' "$out"/testbin.new/logs/build-*.log 2> /dev/null | grep -A 12 -m 10 '^error' | head -80 || true
+      echo "no results.json (rc $rc): see $out/build.log, $out/testbin.new/logs and $out/tests.log" >&2
+      exit 1
+    fi
     python3 scripts/goport/compare-tests.py "$base" "$out/tests-run/results.json" --out "$out/compare.json" || rc=$?
     echo "results $out/tests-run/results.json, compare $out/compare.json"
     exit "$rc"
@@ -193,7 +207,8 @@ case "$cmd" in
     if [[ $cmd == stop ]]; then
       blacksmith testbox stop --id "$id"
     else
-      echo "testbox $id: released; it ends and commits its sticky disks after its idle timeout"
+      echo "testbox $id: released; it ends and commits its sticky disks after its idle timeout. Do not stop it:"
+      echo "TESTBOX_ID=$id scripts/goport/testbox.sh status shows when it completed"
     fi
     # Keep the saved ID when TESTBOX_ID named another testbox.
     [[ "$(cat "$id_file" 2>/dev/null || true)" != "$id" ]] || rm -f "$id_file"

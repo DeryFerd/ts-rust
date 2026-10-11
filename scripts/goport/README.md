@@ -313,13 +313,19 @@ scripts/goport/testbox.sh stop                                  # or release (se
 - Git: the sync sends files, not git state. `tests` needs HEAD on origin: the testbox fetches it and resets
   its index to it, so `build-goport-tests.sh` sees a clean tree at HEAD.
 - Other pins: `testbox.sh pin KEY` sets up a pin of this worktree's UPSTREAM.json (microsoft/TypeScript
-  pins only), for example bump D fed0bf24149f from a bump D worktree. Then `tests --pin KEY`.
+  pins only), for example bump D fed0bf24149f from a bump D worktree. Then
+  `testbox.sh tests --pin KEY <out-dir> <base results.json>` or `testbox.sh np-suite --pin KEY <label>`.
 - Output: `tests` writes `<out-dir>/tests-run` (results.json, logs, tsv, track), `<out-dir>/testbin` (the
-  metadata, no binaries) and `<out-dir>/compare.json`. `np-suite` writes the label dir in the main
+  metadata, no binaries) and `<out-dir>/compare.json`. After a failed build it writes the cargo logs to
+  `<out-dir>/testbin.new/logs` and prints the compiler errors. `np-suite` writes the label dir in the main
   checkout's np-suite dir. Neither replaces an existing dir.
 - Sticky disks: `target/` and the cargo registry. A sticky disk commits only when the job ends with no
   failed or cancelled step. `stop` cancels the job, so its writes are lost. `release` forgets the testbox,
-  which ends at its idle timeout (`TESTBOX_IDLE`, default 15 minutes) and commits. The last commit wins.
+  which ends at its idle timeout (`TESTBOX_IDLE`, default 15 minutes) and commits.
+  - Do not stop a released testbox. The commit is applied at VM shutdown, and `list` shows the testbox
+    ready for minutes after its job ends. A stop in that time lost testbox C's 2.1 GB commit on 2026-10-10.
+    `TESTBOX_ID=<id> testbox.sh status` shows when it completed.
+  - The last commit wins, across branches too: every branch uses the same disk keys.
 - Times (2026-10-10, cold target): `tests` 502 s (test bins 3.6 min, suite 4.7 min), `np-suite` 112 s.
 - Not on testboxes yet: the gate, the LSP and API oracle batteries, `candidate.sh side` and `perf.sh`.
   Revision evidence stays on dbook-lan and timing on mini-743d.

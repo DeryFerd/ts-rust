@@ -11,9 +11,10 @@
 #                                                  output in RUN.log, then its exit code in RUN.rc. The job counts as
 #                                                  testbox activity (the idle timer does not end the testbox under it)
 #        testbox-remote.sh tests KEY COMMIT RUN    build-goport-tests.sh at COMMIT, goport-tests.sh at pin KEY,
-#                                                  pack the results and logs in RUN/out.tar.gz
+#                                                  pack the results and logs in RUN/out.tar.gz (after a failed build,
+#                                                  its cargo logs in testbin.new/logs)
 #        testbox-remote.sh np-suite KEY LABEL RUN  a stable release tsgo, np-suite.sh run LABEL at pin KEY, pack
-#                                                  the label dir in RUN/out.tar.gz
+#                                                  the label dir in RUN/out.tar.gz, then remove the label dir
 # The zbook path mirror (UPSTREAM.json, pin.py and the protected scripts use zbook's absolute paths):
 #   /home/theo/Code/sandbox/ts-rust                the workspace (a symlink)
 #   <pin goCheckout>/..                            the whole pin checkout (depth 1) with npm ci node_modules
@@ -115,14 +116,15 @@ case $cmd in
     # run-testbox resets its idle timer when this file is newer than the last activity.
     (while sleep 30; do touch ~/.testbox-last-activity; done) &
     keep=$!
-    rc=0
-    "$0" "$@" > "$run.log" 2>&1 < /dev/null || rc=$?
-    kill "$keep"
-    echo "$rc" > "$run.rc"
+    # RUN.rc is written on every exit. It stays 1 when the job shell itself is killed.
+    rc=1
+    trap 'kill "$keep" 2> /dev/null || true; echo "$rc" > "$run.rc"' EXIT
+    if "$0" "$@" > "$run.log" 2>&1 < /dev/null; then rc=0; else rc=$?; fi
     ;;
   setup)
     mirror
-    (($#)) || set -- "$(batch_pin)"
+    (($#)) || { k=$(batch_pin); [[ -z $k ]] || set -- "$k"; }
+    (($#)) || echo "no batch pin in docs/typechecker-state/current.json: no pin checkout (testbox.sh pin KEY sets one up)"
     for k in "$@"; do checkout "$k"; done
     install_oracles
     ;;
@@ -150,8 +152,9 @@ case $cmd in
     (($# == 3)) || die "usage: tests KEY COMMIT RUN"
     key=$1 commit=$2 run=$3
     [[ ! -e $run ]] || die "$run exists"
-    at_commit "$commit"
+    # mirror first: it refuses to run on zbook (a real dir at $ZBOOK_REPO) before at_commit moves HEAD.
     mirror
+    at_commit "$commit"
     checkout "$key"
     install_oracles
     mkdir -p "$run"
@@ -165,8 +168,9 @@ case $cmd in
       grep -E '^[a-z_0-9-]+: [0-9]+ names|^incomplete:' "$run/tests.log" || true
       tail -1 "$run/tests.log"
     fi
-    # Not the test binaries, the release bins, the crates archive (tests-run/src) or the runner temp.
-    (cd "$run" && for f in build.log tests.log testbin/* tests-run/*; do
+    # Not the test binaries, the release bins, the crates archive (tests-run/src) or the runner temp. A failed
+    # build leaves its cargo logs (the compiler errors) in testbin.new/logs.
+    (cd "$run" && for f in build.log tests.log testbin/* testbin.new/logs tests-run/*; do
       case $f in testbin/relbin | tests-run/src | tests-run/tmp) continue ;; esac
       if [[ -d $f || (-f $f && ! -x $f) ]]; then echo "$f"; fi
     done) > "$run/pack.list"
@@ -188,6 +192,8 @@ case $cmd in
     rc=0
     NP_GO_DIR=$(pin path goCheckout "$key") scripts/goport/np-suite.sh run "$label" "$PWD/target/release/tsgo" || rc=$?
     tar -czf "$run/out.tar.gz" -C "$run" build.log -C "$PWD/$np" "$label"
+    # The local copy is the record: the sticky target/ keeps no label dirs.
+    rm -rf "${np:?}/${label:?}"
     exit "$rc"
     ;;
   *) die "unknown command $cmd (testbox-remote.sh help)" ;;
