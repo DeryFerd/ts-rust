@@ -36,7 +36,7 @@ case "$1" in
       else mkdir -p "$(dirname "$src")" "$(dirname "$dest")"; touch "$src" "$dest"; fi
       sudo mount --bind "$src" "$dest"
     done < <(paths)
-    # The workflow checks out only the pin's Go subdir, at ~/go-pin.
+    # The workflow checks out the whole Go repo at ~/go-pin (np-suite needs packages/ and node_modules).
     go=$(jq -r '(.subdir // "") as $s | .goCheckout | if $s == "" then . else rtrimstr("/" + $s) end' <<<"$pin")
     mkdir -p "$go" "$REPO"
     sudo mount --bind "$HOME/go-pin" "$go"
