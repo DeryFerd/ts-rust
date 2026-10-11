@@ -185,6 +185,9 @@ Edit loop on alvin (24 cores, 16 jobs, sccache off, 2026-10-10, `ts_goport` 566k
   incremental dep graph run on the whole crate each time (`-Ztime-passes`). So an edit in
   `ls/hover.rs` costs the same as one in the checker.
 - Peak memory of a whole build is at most 6.1 GB, except `test --no-run` (10 to 11 GB clean).
+- The nightly links with rust-lld. mold (`-C link-arg=-fuse-ld=mold`) used about 25% less CPU per
+  edit, but dev `--bins` and `test --no-run` edits took the same wall time (21 to 31 s, two runs
+  each), so the script keeps rust-lld.
 - With 1 job (the default on every host but zbook until 2026-10-10), `check` took 228 s clean and
   17 s for an edit, and a dev `--bin tsgo` build 301 s clean and 29 s for an edit.
 
