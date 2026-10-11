@@ -1302,11 +1302,14 @@ fn test_node_module_package_root() {
             true,
             "/a/node_modules/@scope/b",
         ),
+        // bump D apicb2: Go N' fed0bf24149f module/resolver_test.go:1510
+        // expects "/a/node_modules" (parseNodeModulePackageRoot normalizes
+        // the root with tspath.RootedDirectoryPathFromAbsolute, util.go:47).
         (
             "package root interpreted as file",
             "/a/node_modules/b",
             false,
-            "/a/node_modules/",
+            "/a/node_modules",
         ),
         (
             "scoped package root interpreted as file",
