@@ -108,10 +108,20 @@ goes away when the port moves to a newer pin.
 - **Real projects.** On 120 open-source repos, the command-line output differs from Go's only in
   the problems below and where Go's own output changes from run to run.
 
-`GOPORT_FAST_NEVER_ORDER=1` (off by default) checks some intersection types in a faster order
-(mongodb's test project: 8.9 s to 1.6 s). The `--extendedDiagnostics` counts are then lower than Go's.
-Diagnostics and emit stay the same as Go's, except near the TS2589 limit (5,000,000 type
-instantiations): there, a TS2589 that Go reports can go away.
+Three switches make some projects faster or use less memory. They are off by default.
+
+- **`--checkers 8`** (Go's option; the default is 4) runs 8 checkers. On an 8-core host, VS Code
+  checks in 30% less time and mui in 23% less, but T3 Code server gains nothing. CPU time goes
+  up 13% to 51% and peak memory 7% to 34%. The output is the same as Go's with `--checkers 8`.
+  Go's own output can change from 4 to 8 checkers (on zod, a TS5115 moves).
+- **`GOPORT_LAZY_MEMBERS=1`** makes a member of an instantiated class or interface only when the
+  checker needs it, as microsoft/TypeScript#64475 does (open, not in the pin). Peak memory goes
+  down (zod 15%, T3 Code server 6.5%, Effect 4%). The time stays about the same. Diagnostics and
+  emit stay the same as Go's. The `--extendedDiagnostics` Symbols count is then lower than Go's.
+- **`GOPORT_FAST_NEVER_ORDER=1`** checks some intersection types in a faster order (mongodb's
+  test project: 8.9 s to 1.6 s). The `--extendedDiagnostics` counts are then lower than Go's.
+  Diagnostics and emit stay the same as Go's, except near the TS2589 limit (5,000,000 type
+  instantiations): there, a TS2589 that Go reports can go away.
 
 ## Benchmark: T3 Code
 
@@ -231,7 +241,8 @@ The lead of `bun check` is all in the check step. Its checkers share one type st
 `tsc` 7 runs 4 checkers, and each one makes its own copies of the types it needs: on T3 Code
 `apps/server`, 57% of the types. `tsc-rs` keeps the `tsc` 7 model, because its goal is output that
 is identical to `tsc` 7. More checkers or one shared store would change that output, so `tsc-rs`
-does not copy them.
+does not copy them. `--checkers 8` uses more cores with output identical to `tsc` 7 at
+`--checkers 8` (see [Status](#status)).
 
 Per thread, `tsc-rs` is not slower. On T3 Code it was 1.5× to 7× faster per thread than
 `bun check`, and on 28 other open-source repos the two did about the same check work per thread.
