@@ -243,12 +243,14 @@ Root decision of 2026-10-11 (state note `tbxperf0-result-2026-10-11`; data in `t
 |---|---|---|---|---|
 | instructions:u, `--singleThreaded` | 1% | a testbox, both sides on one testbox | `testbox.sh perf <label> <bin>...` | 0.005% or less |
 | peak RSS, default 4 checkers | 5% | a testbox | the same call, median of 3 | query up to 2%, the others 0.6% |
-| wall, default 4 checkers | 2% | mini-743d, every side in one run | `perf.sh <label> <bin>...` through `remote.sh` (5 rounds) | query 1.9%, the others 0.4% |
+| wall, default 4 checkers | 2% | mini-743d, every side in one run | `perf.sh <label> <bin>...` through `remote.sh` (5 rounds) | zod and effect 0.35%, hono 0.4%; query up to 6.4% |
 
 - `perf.sh` runs `perf stat -e instructions:u,cycles:u,task-clock` and `/usr/bin/time` (max RSS) on each run. Wall
   is perf's own elapsed time in microseconds. `/usr/bin/time %e` had 10 ms steps (about a quarter of a Query run), and the
   sudo and perf start add 24 ms on mini-743d. `--mode st` runs `--singleThreaded`, `both` runs st and the
   default 4 checkers. `PERF_ROUNDS` or `--rounds` sets the rounds: 5 by default, 3 on a testbox.
+- Query runs for 45 ms, and its wall moves about 5% from run to run on mini-743d: use zod and effect for a wall
+  claim.
 - At 4 checkers the instruction counts include waits that depend on timing (A/A: query up to 0.21%, hono 0.09%,
   zod and effect 0.02%). Use the st counts for an instruction claim. Do not use cycles:u for a 1% claim on any
   host (it is in `runs.tsv` only), and do not use minor faults on a testbox.

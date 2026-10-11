@@ -18,7 +18,8 @@
 # metric on any host (tbxperf0).
 # A/A (tbxperf1, testbox and mini-743d): st instructions:u within 0.005 percent on every project. At 4 checkers
 # the counts include waits that depend on timing: query up to 0.21, hono 0.09, zod and effect 0.02 percent, so
-# use st for an instruction claim. RSS at median of 3: query (100 MiB) up to 2 percent, the others 0.6.
+# use st for an instruction claim. RSS at median of 3: query (100 MiB) up to 2 percent, the others 0.6. Wall on
+# mini-743d at median of 5: zod and effect 0.35, hono 0.4, query (45 ms) up to 6.4 percent.
 # Host line: CPU family/model and name, microcode, kernel, perf version, THP and the virtio balloon free page
 # reporting state. `compare` (bin0 of BASE against each bin of NEW, instructions:u and RSS only) refuses two
 # runs with different host lines or tsgo args. Instruction counts and RSS differ a little between host types.
