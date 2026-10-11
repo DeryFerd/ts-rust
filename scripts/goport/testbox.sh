@@ -56,11 +56,12 @@ push_paths() {
   # shellcheck disable=SC2064 # expand now: keep is local, and the trap runs after the function returns
   trap "kill $keep 2>/dev/null || true" EXIT
   for p in "$@"; do
-    p="$(realpath "$p")"
+    # -s: a symlink keeps its own path on the testbox; rsync copies what it points to.
+    p="$(realpath -s "$p")"
     echo "push $p"
     # A file of testbox-data.txt is a bind mount there: write it in place, not by rename.
     if [[ -d "$p" ]]; then rsync -aH --mkpath --compress --compress-choice=zstd -e "$ssh" "$p/" "runner@$host:$p/"
-    else rsync -aH --mkpath --inplace --compress --compress-choice=zstd -e "$ssh" "$p" "runner@$host:$p"; fi
+    else rsync -aHL --mkpath --inplace --compress --compress-choice=zstd -e "$ssh" "$p" "runner@$host:$p"; fi
   done
 }
 
@@ -96,7 +97,10 @@ case "$cmd" in
     push_paths "$@"
     ;;
   seed)
-    mapfile -t paths < <(scripts/goport/testbox-data.sh paths | awk -v want=" ${*:-inputs pin} " 'index(want, " " $1 " ") {print $2}')
+    # Read the list first: a failure inside < <(...) would not stop the script.
+    manifest="$(scripts/goport/testbox-data.sh paths)"
+    mapfile -t paths < <(awk -v want=" ${*:-inputs pin} " 'index(want, " " $1 " ") {print $2}' <<<"$manifest")
+    ((${#paths[@]})) || { echo "no seed paths for: ${*:-inputs pin}" >&2; exit 2; }
     push_paths "${paths[@]}"
     ;;
   status) blacksmith testbox status --id "$(saved_id)" "$@" ;;
