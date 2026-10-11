@@ -145,7 +145,20 @@ job() {
   local run=$1 host ssh t size=0 fails=0 rc
   # exit, not return: callers run job in a || list (no set -e there), and then fetch RUN, which must not
   # take another job's run.
-  remote scripts/goport/testbox-remote.sh start "$@" || exit
+  # Exit 255 is the SSH session of the CLI, not the step (a side run on 2026-10-11 lost its testbox run this way
+  # with the testbox up): start once more, unless the first start made RUN.log.
+  remote scripts/goport/testbox-remote.sh start "$@" || {
+    rc=$?
+    ((rc == 255)) || exit "$rc"
+    ssh_route
+    sleep 5
+    if $ssh "runner@$host" test -e "$remote_root/$run.log" < /dev/null; then
+      echo "testbox $(saved_id): $run started (SSH rc 255)" >&2
+    else
+      echo "testbox $(saved_id): SSH rc 255 at the start of $run; start again" >&2
+      remote scripts/goport/testbox-remote.sh start "$@" || exit
+    fi
+  }
   ssh_route
   t=$(mktemp -d)
   while :; do
