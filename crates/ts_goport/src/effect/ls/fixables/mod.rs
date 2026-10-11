@@ -11,16 +11,31 @@ use crate::effect::ls::fixable::Fixable;
 
 pub mod all_of_map_to_for_each;
 pub mod catch_to_ignore;
+pub mod class_self_mismatch;
+pub mod deterministic_keys;
 pub mod disable;
 mod effect_module;
 pub mod flat_map_conditional_to_filter_or_fail;
 pub mod flat_map_ignored_param_to_and_then;
 pub mod flat_map_to_map;
+pub mod instance_of_schema;
+pub mod layer_merge_all_with_dependencies;
 pub mod map_some_to_as_some;
+pub mod multiple_effect_provide;
+pub mod new_schema_class;
 pub mod option_match_to_from_option;
+pub mod overridden_schema_constructor;
+pub mod prefer_schema_type_property;
 pub mod prefer_succeed_some_or_none;
+pub mod prefer_typed_schema_decoder;
+pub mod prefer_unsafe_constructor;
 pub mod provide_layer_succeed_to_provide_service;
+pub mod redundant_schema_tag_identifier;
 pub mod schema_number;
+pub mod schema_struct_with_tag;
+pub mod schema_union_of_literals;
+pub mod scope_in_layer_effect;
+pub mod service_not_as_class;
 pub mod sync_to_succeed;
 pub mod timeout_catch_tag_to_timeout_or_else;
 
@@ -64,30 +79,30 @@ pub static ALL: LazyLock<Vec<&'static Fixable>> = LazyLock::new(|| {
         // E5: UnnecessaryEffectGenFix,
         // E5: UnnecessaryArrowBlockFix,
         // E5: UnnecessaryTypeofTypeFix,
-        // E5: PreferSchemaTypePropertyFix,
+        &prefer_schema_type_property::PREFER_SCHEMA_TYPE_PROPERTY_FIX,
         // E5: EffectMapVoidFix,
         // E5: UnnecessaryFailYieldableErrorFix,
-        // E5: ClassSelfMismatchFix,
+        &class_self_mismatch::CLASS_SELF_MISMATCH_FIX,
         // E5: EffectFnOpportunityFix,
-        // E5: DeterministicKeysFix,
-        // E5: ScopeInLayerEffectScopedFix,
-        // E5: OverriddenSchemaConstructorFix,
-        // E5: InstanceOfSchemaFix,
-        // E5: LayerMergeAllWithDependenciesFix,
+        &deterministic_keys::DETERMINISTIC_KEYS_FIX,
+        &scope_in_layer_effect::SCOPE_IN_LAYER_EFFECT_SCOPED_FIX,
+        &overridden_schema_constructor::OVERRIDDEN_SCHEMA_CONSTRUCTOR_FIX,
+        &instance_of_schema::INSTANCE_OF_SCHEMA_FIX,
+        &layer_merge_all_with_dependencies::LAYER_MERGE_ALL_WITH_DEPENDENCIES_FIX,
         // E5: UnsafeEffectTypeAssertionFix,
         // E5: MissingEffectErrorCatchFix,
-        // E5: MultipleEffectProvideFix,
+        &multiple_effect_provide::MULTIPLE_EFFECT_PROVIDE_FIX,
         &provide_layer_succeed_to_provide_service::PROVIDE_LAYER_SUCCEED_TO_PROVIDE_SERVICE_FIX,
-        // E5: SchemaStructWithTagFix,
+        &schema_struct_with_tag::SCHEMA_STRUCT_WITH_TAG_FIX,
         &schema_number::SCHEMA_NUMBER_FIX,
-        // E5: RedundantSchemaTagIdentifierRemoveIdentifierFix,
+        &redundant_schema_tag_identifier::REDUNDANT_SCHEMA_TAG_IDENTIFIER_REMOVE_IDENTIFIER_FIX,
         // E5: RunEffectInsideEffectFix,
-        // E5: SchemaUnionOfLiteralsFix,
+        &schema_union_of_literals::SCHEMA_UNION_OF_LITERALS_FIX,
         // E5: MissedPipeableOpportunityFix,
-        // E5: NewSchemaClassFix,
-        // E5: ServiceNotAsClassFix,
-        // E5: PreferUnsafeConstructorFix,
-        // E5: PreferTypedSchemaDecoderFix,
+        &new_schema_class::NEW_SCHEMA_CLASS_FIX,
+        &service_not_as_class::SERVICE_NOT_AS_CLASS_FIX,
+        &prefer_unsafe_constructor::PREFER_UNSAFE_CONSTRUCTOR_FIX,
+        &prefer_typed_schema_decoder::PREFER_TYPED_SCHEMA_DECODER_FIX,
         // E5: AcquireReleaseDisposableFix,
         // E5: RunOfExitToRunExitFix,
     ]
