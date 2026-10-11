@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "status": "active",
   "decision": "REVIEW",
-  "updated": "2026-10-11T16:20:37.705724+00:00",
-  "reason": "Batch recovery-continuation-go-checker-port-73 accepted at R191. Batch recovery-continuation-go-checker-port-74 opened at R192.",
+  "updated": "2026-10-11T16:59:34.328348+00:00",
+  "reason": "R193 bound in batch recovery-continuation-go-checker-port-74.",
   "goalAuthorization": {
     "date": "2026-09-07T23:13:28.547569+00:00",
     "instruction": "Continue working toward the active thread goal. Keep iterating on the ts-rust port until it is Able to properly type-check Tanstack Core and Hono.",
@@ -961,12 +961,12 @@
     "ordinaryQuery": null,
     "localCheck": null,
     "acceptance": null,
-    "recoveryRevision": 192,
-    "hypothesis": "int60 integrates 16 lanes on the accepted R191 (pin N prime fed0bf24149f), each with a passed skeptic: compat: gopanicout3 (with gopanicout2, gopanicout1, noeediag1, emitretry1: Go panic output, signal lines, the LSP recover, the API flush), followups41, targs1, apisig4 (--api --async signal handling as Go), r190fix1 (Effect build info recheck, ported Go unit tests), effgotests1 (1,060 Effect cases from effect-tsgo 0.51.1); perf: noderef1 (AST walk and NodeRef reads, intern id compares), perfP1 item 1 (child link chain walk), perfP2 item 2 (parser node store build), perfP3 item 7 (mapped-type name-type node), effperf1 and effcache1 (Effect plugin caches), lspage1 (sparse link pages), lazymem1 (behind GOPORT_LAZY_MEMBERS, off), nevfast1 (behind GOPORT_FAST_NEVER_ORDER, off), n1free, arenabind1 with jemarena1 (no shared jemalloc arenas); output equal to Go N prime with no lost protected item, and default wall lower (effect -12 to -13 percent, query -3 to -4, hono -5, zod -2.4 to -3 at 4 checkers in the pre-integration).",
-    "sourceFingerprint": "3a8c7bbd84ffae78a05bc5c9cddbe58d2b67dc31412ec46c18fac3ae3c6910ca",
-    "beforeEditingSourceFingerprint": "1226ec084a6217d76555e52ea8bf67c9da2f6fed6e1182a1638fde704c3b8382",
+    "recoveryRevision": 193,
+    "hypothesis": "int60 integrates 16 lanes on the accepted R191 (pin N prime fed0bf24149f), each with a passed skeptic: compat: gopanicout3 (with gopanicout2, gopanicout1, noeediag1, emitretry1: Go panic output, signal lines, the LSP recover, the API flush), followups41, targs1, apisig4 (--api --async signal handling as Go), r190fix1 (Effect build info recheck, ported Go unit tests), effgotests1 (1,060 Effect cases from effect-tsgo 0.51.1); perf: noderef1 (AST walk and NodeRef reads, intern id compares), perfP1 item 1 (child link chain walk), perfP2 item 2 (parser node store build), perfP3 item 7 (mapped-type name-type node), effperf1 and effcache1 (Effect plugin caches), lspage1 (sparse link pages), lazymem1 (behind GOPORT_LAZY_MEMBERS, off), nevfast1 (behind GOPORT_FAST_NEVER_ORDER, off), n1free, arenabind1 with jemarena1 (no shared jemalloc arenas); output equal to Go N prime with no lost protected item, and default wall lower (effect -12 to -13 percent, query -3 to -4, hono -5, zod -2.4 to -3 at 4 checkers in the pre-integration). R193 is R192 (withdrawn: reviewer B1) without effperf1 F3 (24a676449), so Effect plugin-on counts equal effect-tsgo 0.51.1 again.",
+    "sourceFingerprint": "db1635d131e645256675c11859ffc37d290336ec22e3dffd0178799e9ab41404",
+    "beforeEditingSourceFingerprint": "3a8c7bbd84ffae78a05bc5c9cddbe58d2b67dc31412ec46c18fac3ae3c6910ca",
     "sourceBindingStatus": "SOURCE_BOUND",
-    "commit": "86f3eb832",
+    "commit": "6ffd7d6f0",
     "completedRuns": [],
     "compilerAccepted": false,
     "passingCredit": false,
@@ -980,7 +980,7 @@
       "agent": "a7c809b687905fac7",
       "verdict": "PENDING"
     },
-    "nextPermittedAction": "Run the R192 pipeline (candidate.sh side)."
+    "nextPermittedAction": "Run the R193 pipeline (candidate.sh side)."
   },
   "parallelModelPreference": {
     "model": "GPT-6 Astra",
