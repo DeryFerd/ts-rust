@@ -3737,27 +3737,6 @@ impl Node {
 // PORT: the per-struct Go methods are merged into one match. The order of
 // each arm follows the generated Go code.
 fn for_each_child_dyn(n: Node, v: &mut dyn FnMut(Node) -> bool) -> bool {
-    for_each_child_impl(n, v, None)
-}
-
-/// A list slot seen by `for_each_child_and_lists`: the list and whether it
-/// is a modifier list.
-pub type ListHook<'a> = &'a mut dyn FnMut(NodeList, bool);
-
-impl Node {
-    /// `for_each_child` that also reports each non-nil NodeList and
-    /// ModifierList slot to `lists` before its nodes are visited. Used by the
-    /// `astdump` parity tool.
-    pub fn for_each_child_and_lists(
-        self,
-        v: &mut dyn FnMut(Node) -> bool,
-        lists: ListHook,
-    ) -> bool {
-        for_each_child_impl(self, v, Some(lists))
-    }
-}
-
-fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<ListHook>) -> bool {
     // Go `switch n.Kind`: a kind with no case returns false and never reads
     // `n.data`.
     // PERF: noderef1 W1. 35 to 48% of the walk entries are tokens and
@@ -3782,11 +3761,33 @@ fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<L
                 id_map: f.ids(),
                 file: n.file_index(),
                 v,
-                lists,
             };
             return walk_children(data, &mut visit);
         }
     }
+    for_each_child_impl(n, v, None)
+}
+
+/// A list slot seen by `for_each_child_and_lists`: the list and whether it
+/// is a modifier list.
+pub type ListHook<'a> = &'a mut dyn FnMut(NodeList, bool);
+
+impl Node {
+    /// `for_each_child` that also reports each non-nil NodeList and
+    /// ModifierList slot to `lists` before its nodes are visited. Used by the
+    /// `astdump` parity tool.
+    pub fn for_each_child_and_lists(
+        self,
+        v: &mut dyn FnMut(Node) -> bool,
+        lists: ListHook,
+    ) -> bool {
+        for_each_child_impl(self, v, Some(lists))
+    }
+}
+
+/// The walk of `for_each_child_dyn` for a node that is not a published
+/// store node with node data, and the walk of `for_each_child_and_lists`.
+fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<ListHook>) -> bool {
     let Some(data) = static_ast_node(n) else {
         return for_each_scoped_child(n, v, lists);
     };
@@ -3873,7 +3874,8 @@ trait ChildVisit<'d> {
     }
 }
 
-/// The generic walk of `for_each_child_impl`.
+/// The generic walk of `for_each_child_impl`: the nodes that are not
+/// published store nodes, and the list hook of `for_each_child_and_lists`.
 // PERF: the methods are always inlined, so each arm of `walk_children`
 // compiles to the same code as the macros of the old single match.
 struct NodeChildVisit<'a, 'b> {
@@ -3939,42 +3941,34 @@ impl ChildVisit<'static> for NodeChildVisit<'_, '_> {
     }
 }
 
-/// The walk of `for_each_child_impl` over the data of a published store
+/// The walk of `for_each_child_dyn` over the data of a published store
 /// node (`FrozenNode`). It visits like `NodeChildVisit`, and makes each
 /// child handle from the id map of the store (`FrozenIds`) that the node
-/// lookup read.
+/// lookup read. It has no list hook: `for_each_child_and_lists` walks with
+/// `NodeChildVisit`.
 // PERF: noderef1 W2. `NodeChildVisit` makes each child with an out-of-line
 // `req` or `opt` call, a registry lookup each (about 25 instructions per
 // field, Go 7, getsym1 report), and each list with a third lookup
 // (`NodeSlice::iter`).
-struct FrozenChildVisit<'a, 'b> {
+// PERF: noderef1 W3. Without the hook, the walk has no run-time hook test
+// and no `NodeList` handles on the stack (Go: one `ForEachChild`, no hook).
+struct FrozenChildVisit<'a> {
     /// Go `n.Kind` (`case_expression`).
     kind: SyntaxKind,
     id_map: FrozenIds,
     file: usize,
     v: &'a mut dyn FnMut(Node) -> bool,
-    lists: Option<ListHook<'b>>,
 }
 
-impl FrozenChildVisit<'_, '_> {
-    #[inline(always)]
-    fn report(&mut self, l: NodeList, is_mod: bool) {
-        if let Some(h) = self.lists.as_mut() {
-            if l.is_some() {
-                h(l, is_mod);
-            }
-        }
-    }
-
+impl FrozenChildVisit<'_> {
     /// Go `visitNodeList` of a list field.
     #[inline(always)]
     fn visit_list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
-        self.report(list(self.file, l), false);
         !is_nil_list_marker(l) && self.ids(&l.nodes)
     }
 }
 
-impl ChildVisit<'static> for FrozenChildVisit<'_, '_> {
+impl ChildVisit<'static> for FrozenChildVisit<'_> {
     #[inline(always)]
     fn node(&mut self, id: crate::astdata::NodeId) -> bool {
         let child = self.id_map.node(id);
@@ -4000,7 +3994,6 @@ impl ChildVisit<'static> for FrozenChildVisit<'_, '_> {
     // Go `visitModifiers`: `ModifierList::is_some` has no nil marker.
     #[inline(always)]
     fn mods(&mut self, m: &'static Option<crate::astdata::ModifierList>) -> bool {
-        self.report(mods(self.file, m).node_list(), true);
         m.as_ref().is_some_and(|m| self.ids(&m.list.nodes))
     }
 
