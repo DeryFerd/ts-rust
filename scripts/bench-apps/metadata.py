@@ -15,7 +15,10 @@ results.mkdir(parents=True, exist_ok=True)
 
 
 def command(*args: str, cwd: Path | None = None) -> str:
-    run = subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False)
+    try:
+        run = subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False)
+    except OSError:
+        return 'unavailable (failed to launch)'
     return run.stdout.strip() if run.returncode == 0 else f'unavailable (exit {run.returncode})'
 
 
