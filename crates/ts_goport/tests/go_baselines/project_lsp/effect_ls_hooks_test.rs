@@ -228,14 +228,15 @@ child_test! {
 }
 
 child_test! {
-    // Patches 011, 022 and 024: until the fixables (E4), refactors (E9),
-    // completions (E6) and document symbols (E8) are ported, the code
-    // action, completion and document symbol answers with the plugin are the
-    // answers without it.
+    // Patches 011, 022 and 024: until the fixables (E4), completions (E6) and
+    // document symbols (E8) are ported, the code action, completion and
+    // document symbol answers with the plugin are the answers without it,
+    // except for the Effect refactors (E9a), which come after the other code
+    // actions. Their edits are in `effect_refactors_test.rs`.
     fn code_actions_completions_and_symbols_are_unchanged() {
         let answers = |service: &LanguageService| {
             let ctx = projecttestutil::with_request_id(&bg());
-            let actions = service
+            let mut actions = service
                 .provide_code_actions(
                     &ctx,
                     &lsproto::CodeActionParams {
@@ -248,20 +249,46 @@ child_test! {
                         ..Default::default()
                     },
                 )
-                .unwrap_or_else(|err| panic!("{}", err.error()));
+                .unwrap_or_else(|err| panic!("{}", err.error()))
+                .command_or_code_action_array
+                .unwrap_or_default();
+            let kind = |action: &lsproto::CommandOrCodeAction| {
+                action
+                    .code_action
+                    .as_ref()
+                    .and_then(|action| action.kind.as_ref())
+                    .map(|kind| kind.0.to_string())
+                    .unwrap_or_default()
+            };
+            let first_refactor = actions
+                .iter()
+                .position(|action| kind(action).starts_with("refactor.rewrite.effect."))
+                .unwrap_or(actions.len());
+            let refactors: Vec<String> =
+                actions.split_off(first_refactor).iter().map(kind).collect();
             let completion = service
                 .provide_completion(&ctx, &uri(MAIN_URI), position(4, 26), None)
                 .unwrap_or_else(|err| panic!("{}", err.error()));
             let symbols = service
                 .provide_document_symbols(&ctx, &uri(MAIN_URI))
                 .unwrap_or_else(|err| panic!("{}", err.error()));
-            format!("{actions:?}\n{completion:?}\n{symbols:?}")
+            (format!("{actions:?}\n{completion:?}\n{symbols:?}"), refactors)
         };
         let (_session, on) = service(PLUGIN, None);
         let (_session, off) = service("", None);
-        let on = answers(&on);
+        let (on, on_refactors) = answers(&on);
+        let (off, off_refactors) = answers(&off);
         assert!(on.contains("succeed"), "completion after Effect. has succeed: {on}");
-        assert_eq!(on, answers(&off));
+        assert_eq!(on, off);
+        assert_eq!(off_refactors, Vec::<String>::new());
+        assert_eq!(
+            on_refactors,
+            [
+                "refactor.rewrite.effect.wrapWithPipe",
+                "refactor.rewrite.effect.toggleTypeAnnotation",
+                "refactor.rewrite.effect.toggleLazyConst",
+            ]
+        );
     }
 }
 
