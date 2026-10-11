@@ -25,3 +25,11 @@ pin /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/pins/@PIN@/
 pin /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/battery/golden/@ORACLE@/
 pin /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/tests2/api/golden/@ORACLE@/
 pin /home/theo/.local/bin/tsgo-oracle-@PIN@
+# The Effect LSP battery e1 (scripts/goport/lsp_battery_effect.py): its traces, the E0 goldens of each E0 sha,
+# the E0 oracle copies, the T3 Code copy of e1-t3code and the effect-tsgo 0.51.1 repo (E0's source).
+# Not ls-oracle/effect/results: check writes its results there (the target disk).
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/effect/traces/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/effect/golden/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/ls-oracle/effect/oracle/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/effectlsp1/t3code/
+inputs /home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/effect051/effect-tsgo-0511/
