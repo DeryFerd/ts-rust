@@ -208,14 +208,17 @@ impl NameResolver {
         // `isSelfReferenceLocation`) read the kind about 8 times per scope.
         // It is read again each time `location` changes.
         // PERF: chkA. The step to the parent at the end of the loop reads
-        // the parent's kind with it (`node_parent_and_kind`, one store
-        // lookup); `next_kind` holds it for the next pass.
-        let mut next_kind: Option<SyntaxKind> = None;
+        // the parent's kind with it; `next` holds the parent for the next
+        // pass. noderef1 G1: `location_ref` is the view (`NodeRef`) of
+        // `location`, so a step to a parent in the same store does no
+        // registry lookup.
+        let mut next: Option<NodeRef> = None;
         'loop_: while location.is_some() {
-            let mut kind = match next_kind.take() {
-                Some(kind) => kind,
-                None => location.kind(),
+            let location_ref = match next.take() {
+                Some(location_ref) => location_ref,
+                None => NodeRef::new(location),
             };
+            let mut kind = location_ref.kind();
             if name_is_const && is_const_assertion(location) {
                 // `const` in an `as const` has no symbol, but issues no error because there is no *actual* lookup of the type
                 // (it refers to the constant type of the expression instead)
@@ -679,9 +682,14 @@ impl NameResolver {
             // getEffectiveContainerForJSDocTemplateTag/getHostSignatureFromJSDoc instead of location.parent.
             // This is a no-op currently because JSDoc nodes have no locals and getEffectiveJSDocHost is not
             // fully ported for JS assignment patterns.
-            let (parent, parent_kind) = node_parent_and_kind(location);
-            location = parent;
-            next_kind = Some(parent_kind);
+            // The switch above can move `location`.
+            let parent = if location_ref.node() == location {
+                location_ref.parent()
+            } else {
+                NodeRef::new(location).parent()
+            };
+            location = parent.node();
+            next = Some(parent);
         }
         // We just climbed up parents looking for the name, meaning that we started in a descendant node of `lastLocation`.
         // If `result === lastSelfReferenceLocation.symbol`, that means that we are somewhere inside `lastSelfReferenceLocation` looking up a name, and resolving to `lastLocation` itself.

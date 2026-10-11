@@ -5892,7 +5892,23 @@ fn reverse_access_kind(a: AccessKind) -> AccessKind {
 /// `DeclarationBase`.
 #[must_use]
 pub fn is_declaration_node(node: Node) -> bool {
-    with_data!(node, |d| matches!(
+    with_data!(node, |d| is_declaration_data(d))
+}
+
+/// `is_declaration_node` on the view of a node (`NodeRef`): a published
+/// store node reads its data with no second registry lookup.
+#[inline]
+#[must_use]
+pub fn is_declaration_node_ref(node: NodeRef) -> bool {
+    match node.data() {
+        Some(d) => is_declaration_data(d),
+        None => is_declaration_node(node.node()),
+    }
+}
+
+/// `is_declaration_node` on the data of the node.
+fn is_declaration_data(d: &NodeData) -> bool {
+    matches!(
         d,
         NodeData::ArrowFunction(_)
             | NodeData::BinaryExpression(_)
@@ -5950,7 +5966,7 @@ pub fn is_declaration_node(node: Node) -> bool {
             | NodeData::TypeLiteralNode(_)
             | NodeData::TypeParameterDeclaration(_)
             | NodeData::VariableDeclaration(_)
-    ))
+    )
 }
 
 // Go: ast.go:1532 IsLocalsContainer

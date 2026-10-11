@@ -552,11 +552,15 @@ pub fn get_locals(
 
 // Determines if a node is missing (either `nil` or empty)
 // Go: ast/utilities.go:66 NodeIsMissing
+// PERF: noderef1 G1. The loc and the kind are read through one view
+// (`NodeRef`).
 pub fn node_is_missing(node: Node) -> bool {
-    node.is_nil()
-        || node.loc().pos() == node.loc().end()
-            && node.loc().pos() >= 0
-            && node.kind() != SyntaxKind::EndOfFile
+    if node.is_nil() {
+        return true;
+    }
+    let node = NodeRef::new(node);
+    let loc = node.loc();
+    loc.pos() == loc.end() && loc.pos() >= 0 && node.kind() != SyntaxKind::EndOfFile
 }
 
 // Determines if a node is present
@@ -756,9 +760,13 @@ pub fn is_array_binding_or_assignment_element(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:166 IsBindingPattern
+// PERF: noderef1 G3. One kind read, inline.
+#[inline]
 pub fn is_binding_pattern(node: Node) -> bool {
-    node.kind() == SyntaxKind::ObjectBindingPattern
-        || node.kind() == SyntaxKind::ArrayBindingPattern
+    matches!(
+        node.kind(),
+        SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern
+    )
 }
 
 // Go: ast/utilities.go:170 IsForInOrOfStatement
@@ -906,8 +914,13 @@ pub fn is_member_name(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:275 IsEntityName
+// PERF: noderef1 G3. One kind read, inline.
+#[inline]
 pub fn is_entity_name(node: Node) -> bool {
-    node.kind() == SyntaxKind::Identifier || node.kind() == SyntaxKind::QualifiedName
+    matches!(
+        node.kind(),
+        SyntaxKind::Identifier | SyntaxKind::QualifiedName
+    )
 }
 
 // Go: ast/utilities.go:279 IsPropertyName

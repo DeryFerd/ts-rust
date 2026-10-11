@@ -1223,37 +1223,49 @@ impl Checker {
     // and aim to just return *some* symbol for the node. To obtain the symbol associated with a node for type checking
     // purposes, use appropriate function for the context, e.g. `getResolvedSymbol` for an expression identifier,
     // `getSymbolOfDeclaration` for a declaration, etc.
+    // PERF: noderef1 G1. `node_ref`, `parent_ref` and `grand_parent_ref` are
+    // views (`NodeRef`): the kind, parent and flags reads of this function
+    // and its predicates do one registry lookup for the node, none for a
+    // parent in its store.
     pub fn get_symbol_at_location(&mut self, node: Node, ignore_errors: bool) -> SymbolId {
-        if is_source_file(node) {
+        let node_ref = NodeRef::new(node);
+        let kind = node_ref.kind();
+        if kind == SyntaxKind::SourceFile {
             if is_external_or_common_js_module(node) {
                 return self.get_merged_symbol(node.symbol());
             }
             return SymbolId::NIL;
         }
-        let parent = node.parent();
-        let grand_parent = parent.parent();
+        let parent_ref = node_ref.parent();
+        let grand_parent_ref = parent_ref.parent();
+        let parent = parent_ref.node();
+        let grand_parent = grand_parent_ref.node();
 
-        if node.flags().intersects(NodeFlags::IN_WITH_STATEMENT) {
+        if node_ref.flags().intersects(NodeFlags::IN_WITH_STATEMENT) {
             // We cannot answer semantic questions within a with block, do not proceed any further
             return SymbolId::NIL;
         }
 
-        if is_declaration_name_or_import_property_name(node) {
+        if is_declaration_name_or_import_property_name_ref(node_ref) {
             // This is a declaration, call getSymbolOfNode
             let parent_symbol = self.get_symbol_of_declaration(parent);
-            if is_import_or_export_specifier(parent) && parent.property_name() == node {
+            if matches!(
+                parent_ref.kind(),
+                SyntaxKind::ImportSpecifier | SyntaxKind::ExportSpecifier
+            ) && parent.property_name() == node
+            {
                 return self.get_immediate_aliased_symbol(parent_symbol);
             }
             return parent_symbol;
-        } else if is_literal_computed_property_declaration_name(node) {
+        } else if is_literal_computed_property_declaration_name_ref(node_ref) {
             return self.get_symbol_of_declaration(grand_parent);
         }
 
-        if is_identifier(node) {
-            if is_in_right_side_of_import_or_export_assignment(node) {
+        if kind == SyntaxKind::Identifier {
+            if is_in_right_side_of_import_or_export_assignment_ref(node_ref) {
                 return self.get_symbol_of_name_or_property_access_expression(node);
-            } else if is_binding_element(parent)
-                && is_object_binding_pattern(grand_parent)
+            } else if parent_ref.kind() == SyntaxKind::BindingElement
+                && grand_parent_ref.kind() == SyntaxKind::ObjectBindingPattern
                 && node == parent.property_name()
             {
                 let type_of_pattern = self.get_type_of_node(grand_parent);
@@ -1261,7 +1273,7 @@ impl Checker {
                 if property_declaration.is_some() {
                     return property_declaration;
                 }
-            } else if is_meta_property(parent) && parent.name() == node {
+            } else if parent_ref.kind() == SyntaxKind::MetaProperty && parent_ref.name() == node {
                 let keyword_token = parent.keyword_token();
                 if keyword_token == SyntaxKind::NewKeyword && node.text() == "target" {
                     // `target` in `new.target`
@@ -1279,7 +1291,9 @@ impl Checker {
                 }
                 // no other meta properties are valid syntax, thus no others should have symbols
                 return SymbolId::NIL;
-            } else if is_js_doc_parameter_tag(parent) && parent.name() == node {
+            } else if parent_ref.kind() == SyntaxKind::JsDocParameterTag
+                && parent_ref.name() == node
+            {
                 let fn_ = get_node_at_position(get_source_file_of_node(node), node.pos(), false);
                 if fn_.is_some() && is_function_like(fn_) {
                     for param in fn_.parameters() {
@@ -1291,7 +1305,6 @@ impl Checker {
             }
         }
 
-        let kind = node.kind();
         match kind {
             SyntaxKind::Identifier
             | SyntaxKind::PrivateIdentifier
