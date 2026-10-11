@@ -79,11 +79,13 @@ pub fn analyze_catch_tag_to_catch_reason(
             if transformation.callee.is_nil() {
                 continue;
             }
-            if tp.is_node_reference_to_effect_module_api(transformation.callee, "catchTag") {
+            if tp.is_node_reference_to_effect_module_api(transformation.callee, member!("catchTag"))
+            {
                 if let Some(m) = analyze_catch_tag_transformation(tp, sf, Some(transformation)) {
                     matches.push(m);
                 }
-            } else if tp.is_node_reference_to_effect_module_api(transformation.callee, "catchTags")
+            } else if tp
+                .is_node_reference_to_effect_module_api(transformation.callee, member!("catchTags"))
             {
                 if let Some(m) = analyze_catch_tags_transformation(tp, sf, Some(transformation)) {
                     matches.push(m);
@@ -388,7 +390,7 @@ pub fn catch_tag_re_fail_parameter(
         if call.expression().is_some()
             && call.argument_list().is_some()
             && call.arguments().len() == 1
-            && tp.is_node_reference_to_effect_module_api(call.expression(), "fail")
+            && tp.is_node_reference_to_effect_module_api(call.expression(), member!("fail"))
         {
             let argument = unwrap_transparent_expression(call.arguments().get(0));
             if argument.is_some()

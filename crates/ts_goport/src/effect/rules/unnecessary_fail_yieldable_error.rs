@@ -76,7 +76,7 @@ pub fn analyze_unnecessary_fail_yieldable_error(
             {
                 let call = yield_.expression();
                 if call.expression().is_some()
-                    && tp.is_node_reference_to_effect_module_api(call.expression(), "fail")
+                    && tp.is_node_reference_to_effect_module_api(call.expression(), member!("fail"))
                 {
                     if !call.arguments().is_empty() {
                         let arg = call.arguments().get(0);

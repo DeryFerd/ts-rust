@@ -3,6 +3,7 @@
 use crate::effect::typeparser::*;
 use crate::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 /// Go `func(*TypeParser, *checker.Checker, *ast.SourceFile) bool`. The
 /// checker is `tp.checker`.
@@ -25,14 +26,77 @@ static NEXT_PACKAGE_SOURCE_FILE_DESCRIPTOR_CACHE_KEY: AtomicU32 = AtomicU32::new
 
 /// Go `moduleExportReferenceCacheKey`.
 /// PORT: Go keys by the member name. Here `member` is the descriptor id
-/// (low 8 bits) and the id of the member name in
-/// `EffectLinks::module_export_members` (high 24 bits), so an entry with
-/// its value is 12 bytes and no key holds a string.
+/// (low 8 bits) and the `ExportMember::id` of the member name (high 24
+/// bits), so an entry with its value is 12 bytes and no key holds a string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ModuleExportReferenceCacheKey {
     pub symbol: SymbolId,
     pub member: u32,
 }
+
+/// A member name that a rule asks about (the `memberName` argument of Go
+/// `IsNodeReferenceToModuleExport`). Make one per call site with
+/// `member!("name")`, or keep them in a static table.
+// PERF: the static keeps the id of its name, so a module-export check reads
+// one number for its cache key and does not hash the name (effperf3 item 2).
+#[derive(Debug)]
+pub struct ExportMember {
+    pub name: &'static str,
+    /// `id()`, or 0 before the first call.
+    id: AtomicU32,
+}
+
+impl ExportMember {
+    #[must_use]
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            id: AtomicU32::new(0),
+        }
+    }
+
+    /// The id of the name, the same for every `ExportMember` with that name
+    /// in this process. Ids count from 1.
+    #[inline]
+    pub fn id(&self) -> u32 {
+        match self.id.load(Ordering::Relaxed) {
+            0 => self.first_id(),
+            id => id,
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn first_id(&self) -> u32 {
+        static IDS: LazyLock<Mutex<FxHashMap<&'static str, u32>>> = LazyLock::new(Mutex::default);
+        let mut ids = IDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next = u32::try_from(ids.len() + 1).unwrap_or(u32::MAX);
+        let id = *ids.entry(self.name).or_insert(next);
+        self.id.store(id, Ordering::Relaxed);
+        id
+    }
+}
+
+/// Go's zero value of a member name, "".
+impl Default for &'static ExportMember {
+    fn default() -> Self {
+        member!("")
+    }
+}
+
+/// `&'static ExportMember` of a string literal: `member!("succeed")`.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! effect_export_member {
+    ($name:literal) => {{
+        static MEMBER: $crate::effect::typeparser::ExportMember =
+            $crate::effect::typeparser::ExportMember::new($name);
+        &MEMBER
+    }};
+}
+pub use crate::effect_export_member as member;
 
 // Go: newPackageSourceFileDescriptor
 /// Descriptors are package-level values (`LazyLock` statics in the port).
@@ -114,18 +178,20 @@ impl TypeParser<'_> {
         if sf.is_nil() {
             return false;
         }
-        let Some(pkg) = self.package_json_for_source_file(sf) else {
-            return false;
-        };
-        let (name, ok) = pkg.fields.name.get_value();
-        ok && crate::frontend::vfs::vfsmatch::equal_fold(name.as_bytes(), package_name.as_bytes())
+        // PERF: a cached entry is read in place. `package_json_for_source_file`
+        // would clone its `Arc`, and `get_value` the name (effperf3 item 5).
+        if let Some(pkg) = self.links().package_json_for_source_file.get(&sf) {
+            return package_name_is(pkg.as_deref(), package_name);
+        }
+        let pkg = self.package_json_for_source_file(sf);
+        package_name_is(pkg.as_deref(), package_name)
     }
 
     pub fn is_node_reference_to_module_export(
         &mut self,
         node: Node,
         desc: &PackageSourceFileDescriptor,
-        member_name: &str,
+        member: &ExportMember,
     ) -> bool {
         let sym = self.reference_symbol_at_node(node);
         if sym.is_nil() {
@@ -133,40 +199,19 @@ impl TypeParser<'_> {
         }
         // Exported descriptors built as struct literals have no stable matcher identity.
         let Some(cache_key) = desc.cache_key else {
-            return self.is_symbol_reference_to_module_export(sym, desc, member_name);
+            return self.is_symbol_reference_to_module_export(sym, desc, member.name);
         };
 
-        let Some(member) = self.module_export_member_key(cache_key, member_name) else {
-            return self.is_symbol_reference_to_module_export(sym, desc, member_name);
+        let Some(member_key) = module_export_member_key(cache_key, member) else {
+            return self.is_symbol_reference_to_module_export(sym, desc, member.name);
         };
         let key = ModuleExportReferenceCacheKey {
             symbol: sym,
-            member,
+            member: member_key,
         };
         cached!(self, module_export_reference, key, {
-            self.is_symbol_reference_to_module_export(sym, desc, member_name)
+            self.is_symbol_reference_to_module_export(sym, desc, member.name)
         })
-    }
-
-    /// The `member` of a `ModuleExportReferenceCacheKey`, or `None` when the
-    /// descriptor id or the member name id does not fit (then the caller
-    /// does not cache, as for a descriptor with no cache key).
-    fn module_export_member_key(
-        &mut self,
-        descriptor: PackageSourceFileDescriptorCacheKey,
-        member_name: &str,
-    ) -> Option<u32> {
-        let descriptor = u8::try_from(descriptor.0).ok()?;
-        let members = &mut self.links().module_export_members;
-        let id = match members.get(member_name) {
-            Some(&id) => id,
-            None => {
-                let id = u32::try_from(members.len()).ok()?;
-                members.insert(member_name.into(), id);
-                id
-            }
-        };
-        (id < 1 << 24).then_some((id << 8) | u32::from(descriptor))
     }
 
     pub fn is_symbol_reference_to_module_export(
@@ -240,4 +285,32 @@ impl TypeParser<'_> {
 
         false
     }
+}
+
+/// The `member` of a `ModuleExportReferenceCacheKey`, or `None` when the
+/// descriptor id or the member id does not fit (then the caller does not
+/// cache, as for a descriptor with no cache key).
+fn module_export_member_key(
+    descriptor: PackageSourceFileDescriptorCacheKey,
+    member: &ExportMember,
+) -> Option<u32> {
+    let descriptor = u8::try_from(descriptor.0).ok()?;
+    let id = member.id();
+    (id < 1 << 24).then_some((id << 8) | u32::from(descriptor))
+}
+
+/// Go `name, ok := pkg.Fields.Name.GetValue(); ok && strings.EqualFold(name, packageName)`
+/// for a nil-able package.json.
+fn package_name_is(
+    pkg: Option<&crate::modulespecifiers::packagejson::PackageJson>,
+    package_name: &str,
+) -> bool {
+    pkg.is_some_and(|pkg| {
+        let name = &pkg.fields.name;
+        name.valid
+            && crate::frontend::vfs::vfsmatch::equal_fold(
+                name.value.as_bytes(),
+                package_name.as_bytes(),
+            )
+    })
 }

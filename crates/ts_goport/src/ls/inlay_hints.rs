@@ -47,7 +47,17 @@ impl LanguageService {
                 result: Vec::new(),
             };
             inlay_hint_state.visit(projection);
-            result.extend(inlay_hint_state.result);
+            let mut hints = inlay_hint_state.result;
+            // EFFECT HOOK (Effect-TS/tsgo patch 015): Allow Effect to filter inlay hints.
+            hints = crate::effect::ls::inlay_hints::after_inlay_hints(
+                c,
+                projection,
+                mapped.span,
+                &inlay_hint_preferences,
+                hints,
+                &self.converters,
+            );
+            result.extend(hints);
         }
         Ok(lsproto::InlayHintsOrNull {
             inlay_hints: Some(result),

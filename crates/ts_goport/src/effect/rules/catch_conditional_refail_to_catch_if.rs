@@ -51,7 +51,7 @@ pub struct CatchConditionalRefailToCatchIfMatch {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ConditionalRefailCatchMethods {
     pub catch_method_name: &'static str,
-    pub fail_method_name: &'static str,
+    pub fail_method_name: &'static ExportMember,
     pub preferred_method_name: &'static str,
 }
 
@@ -98,7 +98,7 @@ pub fn analyze_catch_conditional_refail_to_catch_if(
                 source_file: sf,
                 location: get_error_range_for_node(sf, transformation.callee),
                 catch_method_name: methods.catch_method_name.to_string(),
-                fail_method_name: methods.fail_method_name.to_string(),
+                fail_method_name: methods.fail_method_name.name.to_string(),
                 preferred_method_name,
             });
         }
@@ -112,20 +112,20 @@ fn conditional_refail_methods(
     tp: &mut TypeParser<'_>,
     callee: Node,
 ) -> (ConditionalRefailCatchMethods, bool) {
-    if tp.is_node_reference_to_effect_module_api(callee, "catch") {
+    if tp.is_node_reference_to_effect_module_api(callee, member!("catch")) {
         (
             ConditionalRefailCatchMethods {
                 catch_method_name: "catch",
-                fail_method_name: "fail",
+                fail_method_name: member!("fail"),
                 preferred_method_name: "catchIf",
             },
             true,
         )
-    } else if tp.is_node_reference_to_effect_module_api(callee, "catchCause") {
+    } else if tp.is_node_reference_to_effect_module_api(callee, member!("catchCause")) {
         (
             ConditionalRefailCatchMethods {
                 catch_method_name: "catchCause",
-                fail_method_name: "failCause",
+                fail_method_name: member!("failCause"),
                 preferred_method_name: "catchCauseIf",
             },
             true,
@@ -255,7 +255,7 @@ fn is_conditional_refail_expression(
     tp: &mut TypeParser<'_>,
     expression: Node,
     parameter_symbol: SymbolId,
-    fail_method_name: &str,
+    fail_method_name: &ExportMember,
 ) -> bool {
     let expression = skip_parentheses(expression);
     if expression.is_nil() || expression.kind() != SyntaxKind::CallExpression {

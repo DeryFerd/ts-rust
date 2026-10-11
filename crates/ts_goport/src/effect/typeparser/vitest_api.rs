@@ -18,20 +18,14 @@ impl TypeParser<'_> {
     /// Vitest re-exports most test APIs from @vitest/runner, while global APIs are
     /// declared directly by the vitest package. The package fallback handles globals
     /// and Vitest 4 exports whose public names alias minified runner symbols.
-    pub fn is_node_reference_to_vitest_api(&mut self, node: Node, member_name: &str) -> bool {
-        if self.is_node_reference_to_module_export(
-            node,
-            &VITEST_RUNNER_PACKAGE_DESCRIPTOR,
-            member_name,
-        ) || self.is_node_reference_to_module_export(
-            node,
-            &VITEST_PACKAGE_DESCRIPTOR,
-            member_name,
-        ) {
+    pub fn is_node_reference_to_vitest_api(&mut self, node: Node, member: &ExportMember) -> bool {
+        if self.is_node_reference_to_module_export(node, &VITEST_RUNNER_PACKAGE_DESCRIPTOR, member)
+            || self.is_node_reference_to_module_export(node, &VITEST_PACKAGE_DESCRIPTOR, member)
+        {
             return true;
         }
 
-        if reference_node_name(node) != member_name {
+        if reference_node_name(node) != member.name {
             return false;
         }
         self.is_node_reference_to_module(node, &VITEST_RUNNER_PACKAGE_DESCRIPTOR)
@@ -43,13 +37,9 @@ impl TypeParser<'_> {
     pub fn is_node_reference_to_effect_vitest_api(
         &mut self,
         node: Node,
-        member_name: &str,
+        member: &ExportMember,
     ) -> bool {
-        self.is_node_reference_to_module_export(
-            node,
-            &EFFECT_VITEST_PACKAGE_DESCRIPTOR,
-            member_name,
-        )
+        self.is_node_reference_to_module_export(node, &EFFECT_VITEST_PACKAGE_DESCRIPTOR, member)
     }
 }
 

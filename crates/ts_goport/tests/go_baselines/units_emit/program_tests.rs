@@ -13,6 +13,7 @@ use super::childprog::{
     in_child, install_map_fs, new_program, new_program_with_config, source_file,
 };
 use crate::support::vfstest::{MapFile, MapFs};
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use ts_goport::ast::{MappedDiagnosticDirective, MappedDiagnosticDirectivePolicy, TextRange};
 use ts_goport::contentmapper;
@@ -26,7 +27,7 @@ use ts_goport::frontend::json::json_unmarshal;
 use ts_goport::frontend::json_ext::LspAny;
 use ts_goport::frontend::tsoptions::{ParseConfigHost, get_parsed_command_line_of_config_file};
 use ts_goport::frontend::tsoptions::{ParsedCommandLine, ParsedOptions};
-use ts_goport::frontend::vfs::{FileMode, Fs, os_override_installed};
+use ts_goport::frontend::vfs::{FileMode, Fs, Replacements, os_override_installed, wrapvfs_wrap};
 use ts_goport::gostd::context;
 use ts_goport::gostd::{GoError, errors};
 use ts_goport::locale;
@@ -323,6 +324,86 @@ fn test_include_processor_diagnostics_with_missing_file_casing() {
                     crate::astnav_api::panic_message(payload.as_ref())
                 );
             }
+        },
+    );
+}
+
+/// `collectPackageNames` looks up the package scope of the directory of each
+/// resolved file (`49614e16e`, ts#64159): Go N' fed0bf24149f passes
+/// `ResolvedFileName.Directory()` (compiler/program.go:2280, :2298), so its
+/// ancestor walk never asks `directoryExists` for the file itself. `pkg` has
+/// no version, so its package ID has no name and the name comes from the
+/// scope; `pkg/sub` is a deep import, which looks up the scope again.
+// PORT: no Go counterpart.
+#[test]
+fn test_collect_package_names_looks_up_the_scope_of_the_file_directory() {
+    in_child(
+        module_path!(),
+        "test_collect_package_names_looks_up_the_scope_of_the_file_directory",
+        || {
+            let map_fs = MapFs::from_map(
+                Vec::<(String, MapFile)>::new(),
+                true, /*useCaseSensitiveFileNames*/
+            );
+            install_map_fs(&map_fs, "/src");
+            for (file_name, contents) in [
+                (
+                    "/src/index.ts",
+                    "import { x } from \"pkg\";\nimport { y } from \"pkg/sub\";\n",
+                ),
+                (
+                    "/src/node_modules/pkg/package.json",
+                    r#"{"name":"pkg","types":"index.d.ts"}"#,
+                ),
+                (
+                    "/src/node_modules/pkg/index.d.ts",
+                    "export declare const x: number;\n",
+                ),
+                (
+                    "/src/node_modules/pkg/sub.d.ts",
+                    "export declare const y: number;\n",
+                ),
+            ] {
+                let _ = map_fs.fs().write_file(file_name, contents);
+            }
+            let recording = Rc::new(Cell::new(false));
+            let calls: Rc<RefCell<Vec<String>>> = Rc::default();
+            let fs = {
+                let inner = map_fs.fs();
+                let recording = Rc::clone(&recording);
+                let calls = Rc::clone(&calls);
+                wrapvfs_wrap(
+                    map_fs.fs(),
+                    Replacements {
+                        directory_exists: Some(Box::new(move |path: &str| {
+                            if recording.get() {
+                                calls.borrow_mut().push(path.to_string());
+                            }
+                            inner.directory_exists(path)
+                        })),
+                        ..Default::default()
+                    },
+                )
+            };
+            let program = new_program(
+                fs,
+                "/src",
+                &["/src/index.ts"],
+                CompilerOptions {
+                    module: ModuleKind::ES_NEXT,
+                    module_resolution: ModuleResolutionKind::BUNDLER,
+                    ..Default::default()
+                },
+            );
+
+            recording.set(true);
+            assert!(program.resolved_package_names().contains("pkg"));
+            assert!(program.deep_import_package_names().contains("pkg"));
+            let calls = calls.borrow();
+            assert!(
+                !calls.iter().any(|path| path.ends_with(".d.ts")),
+                "directoryExists of a resolved file: {calls:?}"
+            );
         },
     );
 }

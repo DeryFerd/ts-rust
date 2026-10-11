@@ -68,7 +68,7 @@ pub fn analyze_run_of_exit_to_run_exit(
         let mut is_exit = |tp: &mut TypeParser<'_>, transformation: &PipingFlowTransformation| {
             transformation.callee.is_some()
                 && transformation.args.is_empty()
-                && tp.is_node_reference_to_effect_module_api(transformation.callee, "exit")
+                && tp.is_node_reference_to_effect_module_api(transformation.callee, member!("exit"))
         };
         let mut is_runner = |tp: &mut TypeParser<'_>, transformation: &PipingFlowTransformation| {
             let (_, _, runner_name, _) = run_of_exit_runner(tp, transformation.callee);
@@ -136,7 +136,7 @@ pub fn analyze_run_of_exit_to_run_exit(
                             && exit_transformation.args.is_empty()
                             && tp.is_node_reference_to_effect_module_api(
                                 exit_transformation.callee,
-                                "exit",
+                                member!("exit"),
                             )
                         {
                             append_run_of_exit_match(
@@ -217,8 +217,8 @@ fn run_of_exit_runner(
     }
 
     for (runner, replacement) in [
-        ("runPromise", "runPromiseExit"),
-        ("runPromiseWith", "runPromiseExitWith"),
+        (member!("runPromise"), "runPromiseExit"),
+        (member!("runPromiseWith"), "runPromiseExitWith"),
     ] {
         if !tp.is_node_reference_to_effect_module_api(target, runner) {
             continue;
@@ -227,7 +227,7 @@ fn run_of_exit_runner(
         if target.kind() == SyntaxKind::PropertyAccessExpression {
             name_node = target.name();
         }
-        return (target, name_node, runner, replacement);
+        return (target, name_node, runner.name, replacement);
     }
 
     (Node::NIL, Node::NIL, "", "")

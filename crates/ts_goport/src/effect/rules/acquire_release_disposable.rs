@@ -137,7 +137,7 @@ fn analyze_acquire_release_disposable_call(
         || call.question_dot_token().is_some()
         || args.len() != 2
         || contains_spread_element(&args)
-        || !tp.is_node_reference_to_effect_module_api(call.expression(), "acquireRelease")
+        || !tp.is_node_reference_to_effect_module_api(call.expression(), member!("acquireRelease"))
     {
         return None;
     }
@@ -225,9 +225,11 @@ fn is_disposal_release(tp: &mut TypeParser<'_>, node: Node, global_symbol: Symbo
         return false;
     }
 
-    let wrapper_name = if tp.is_node_reference_to_effect_module_api(wrapper.expression(), "sync") {
+    let wrapper_name = if tp
+        .is_node_reference_to_effect_module_api(wrapper.expression(), member!("sync"))
+    {
         "sync"
-    } else if tp.is_node_reference_to_effect_module_api(wrapper.expression(), "promise") {
+    } else if tp.is_node_reference_to_effect_module_api(wrapper.expression(), member!("promise")) {
         "promise"
     } else {
         return false;

@@ -23,7 +23,7 @@ use ts_goport::api::{
     GetSymbolOfDeclarationParams, ReleaseSourceFileParams, RetainSourceFileParams,
     SourceFileDescriptor, SourceFileLeaseID, SymbolOwnerKind,
 };
-use ts_goport::ast;
+use ts_goport::ast::{self, TextRange};
 use ts_goport::flags::ScriptKind;
 use ts_goport::lsp::lsproto;
 use ts_goport::project;
@@ -424,6 +424,38 @@ child_test! {
             ),
             "fileName must not be empty",
         );
+        session.close();
+        project_session.close();
+    }
+}
+
+// PORT: no Go test. Issue #49: a `// @ts-ignore` inside a JSDoc type
+// expression is dropped, and the file keeps its 2 earlier directives (Go
+// parser/jsdoc.go:153-181: the JSDoc scan appends to a new slice). The port
+// wrote it over them, and the parse panicked.
+child_test! {
+    fn directive_in_jsdoc_type_keeps_file_directives() {
+        let (project_session, session) = setup();
+        let lease = nil_error(session.create_source_file(
+            "/virtual/a.js",
+            concat!(
+                "// @ts-ignore\nlet a = 1; a();\n// @ts-ignore\nlet c = 1; c();\n",
+                "/**\n * @typedef {{\n *   id: string, // @ts-ignore legacy field\n",
+                " *   n: number\n * }} Row\n */\n",
+                "/** @type {Row} */\nexport const r = { id: \"a\", n: 1 };\n",
+            ),
+            &CreateSourceFileOptions::default(),
+        ));
+        let directives: Vec<TextRange> = ast::source_file_info(lease.source_file())
+            .comment_directives
+            .iter()
+            .map(|directive| directive.loc)
+            .collect();
+        assert_eq!(
+            directives,
+            [TextRange::new(0, 13), TextRange::new(30, 43)]
+        );
+        lease.release();
         session.close();
         project_session.close();
     }

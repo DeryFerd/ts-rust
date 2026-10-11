@@ -171,9 +171,9 @@ pub struct Parser<'a> {
     pub not_parenthesized_arrow: FxHashSet<i32>,
     pub jsdoc_infos: Vec<JsDocInfo>,
     pub possible_await_spans: Vec<i32>,
-    pub jsdoc_comments_space: Vec<String>,
+    pub jsdoc_comments_space: Vec<std::borrow::Cow<'a, str>>,
     pub jsdoc_comment_ranges_space: Vec<CommentRange>,
-    pub jsdoc_tag_comments_space: Vec<String>,
+    pub jsdoc_tag_comments_space: Vec<std::borrow::Cow<'a, str>>,
     pub jsdoc_tag_comments_parts_space: Vec<Node>,
     pub reparse_list: Vec<Node>,
 

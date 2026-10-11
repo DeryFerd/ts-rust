@@ -104,7 +104,7 @@ fn analyze_layer_merge_all_call(
     let call = node;
 
     // Check if this is Layer.mergeAll
-    if !tp.is_node_reference_to_effect_layer_module_api(call.expression(), "mergeAll") {
+    if !tp.is_node_reference_to_effect_layer_module_api(call.expression(), member!("mergeAll")) {
         return Vec::new();
     }
 

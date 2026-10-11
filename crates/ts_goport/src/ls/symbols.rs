@@ -95,7 +95,9 @@ impl LanguageService {
             expando_targets: FxHashSet::default(),
         };
         node.for_each_child(|child| visitor.visit(child));
-        merge_expandos(visitor.symbols)
+        let symbols = merge_expandos(visitor.symbols);
+        // EFFECT HOOK (Effect-TS/tsgo patch 024): Allow Effect to augment the symbol tree.
+        crate::effect::ls::after_document_symbols(ctx, file, symbols, self.get_program(), self)
     }
 }
 
@@ -141,19 +143,20 @@ pub fn flatten_document_symbols(
 }
 
 // PORT: Go `*lsproto.DocumentSymbol` while the tree is built and merged (see
-// the module comment).
-type DocSymbol = Rc<RefCell<DocumentSymbolNode>>;
+// the module comment). The Effect hook (`effect::ls::after_document_symbols`)
+// takes and returns these.
+pub(crate) type DocSymbol = Rc<RefCell<DocumentSymbolNode>>;
 
 // PORT: the fields of `lsproto::DocumentSymbol`, with shared children.
-struct DocumentSymbolNode {
-    name: String,
-    detail: Option<String>,
-    kind: lsproto::SymbolKind,
-    tags: Option<Vec<lsproto::SymbolTag>>,
-    deprecated: Option<bool>,
-    range: lsproto::Range,
-    selection_range: lsproto::Range,
-    children: Option<Vec<DocSymbol>>,
+pub(crate) struct DocumentSymbolNode {
+    pub(crate) name: String,
+    pub(crate) detail: Option<String>,
+    pub(crate) kind: lsproto::SymbolKind,
+    pub(crate) tags: Option<Vec<lsproto::SymbolTag>>,
+    pub(crate) deprecated: Option<bool>,
+    pub(crate) range: lsproto::Range,
+    pub(crate) selection_range: lsproto::Range,
+    pub(crate) children: Option<Vec<DocSymbol>>,
 }
 
 // PORT: copies the finished `DocSymbol` tree into lsproto values (the JSON

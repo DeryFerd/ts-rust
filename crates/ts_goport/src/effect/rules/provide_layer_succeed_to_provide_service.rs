@@ -57,7 +57,7 @@ pub fn analyze_provide_layer_succeed_to_provide_service(
     for flow in flows.iter() {
         for provide in &flow.transformations {
             if provide.callee.is_nil()
-                || !tp.is_node_reference_to_effect_module_api(provide.callee, "provide")
+                || !tp.is_node_reference_to_effect_module_api(provide.callee, member!("provide"))
                 || provide.args.len() != 1
             {
                 continue;
@@ -117,9 +117,11 @@ fn inline_single_service_layer(
     }
     let transformation = &flow.transformations[0];
     let replacement;
-    if tp.is_node_reference_to_effect_layer_module_api(transformation.callee, "succeed") {
+    if tp.is_node_reference_to_effect_layer_module_api(transformation.callee, member!("succeed")) {
         replacement = "provideService".to_string();
-    } else if tp.is_node_reference_to_effect_layer_module_api(transformation.callee, "effect") {
+    } else if tp
+        .is_node_reference_to_effect_layer_module_api(transformation.callee, member!("effect"))
+    {
         replacement = "provideServiceEffect".to_string();
     } else {
         return None;

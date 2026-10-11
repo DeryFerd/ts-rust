@@ -153,7 +153,7 @@ fn check_effect_try_simple(tp: &mut TypeParser<'_>, node: Node, is_v4: bool) -> 
     let call = node;
 
     // Check callee is Effect.try
-    if !tp.is_node_reference_to_effect_module_api(call.expression(), "try") {
+    if !tp.is_node_reference_to_effect_module_api(call.expression(), member!("try")) {
         return Node::NIL;
     }
 
@@ -179,7 +179,7 @@ fn check_effect_try_object(tp: &mut TypeParser<'_>, node: Node) -> Node {
     let call = node;
 
     // Check callee is Effect.try
-    if !tp.is_node_reference_to_effect_module_api(call.expression(), "try") {
+    if !tp.is_node_reference_to_effect_module_api(call.expression(), member!("try")) {
         return Node::NIL;
     }
 

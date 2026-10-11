@@ -276,17 +276,17 @@ pub fn effect_context_walk(tp: &mut TypeParser<'_>, w: &mut EffectContextWalk, n
         if !arguments.is_empty() {
             let effect_thunk_arg = arguments.get(0);
             let callee = call.expression();
-            if tp.is_node_reference_to_effect_module_api(callee, "sync")
-                || tp.is_node_reference_to_effect_module_api(callee, "promise")
-                || tp.is_node_reference_to_effect_module_api(callee, "callback")
-                || tp.is_node_reference_to_effect_module_api(callee, "suspend")
+            if tp.is_node_reference_to_effect_module_api(callee, member!("sync"))
+                || tp.is_node_reference_to_effect_module_api(callee, member!("promise"))
+                || tp.is_node_reference_to_effect_module_api(callee, member!("callback"))
+                || tp.is_node_reference_to_effect_module_api(callee, member!("suspend"))
             {
                 w.set_pending_enable_flags(
                     effect_thunk_arg,
                     EffectContextFlags::PENDING_NEXT_FUNCTION_IS_EFFECT_THUNK,
                 );
-            } else if tp.is_node_reference_to_effect_module_api(callee, "try")
-                || tp.is_node_reference_to_effect_module_api(callee, "tryPromise")
+            } else if tp.is_node_reference_to_effect_module_api(callee, member!("try"))
+                || tp.is_node_reference_to_effect_module_api(callee, member!("tryPromise"))
             {
                 w.set_pending_enable_flags(
                     effect_thunk_arg,

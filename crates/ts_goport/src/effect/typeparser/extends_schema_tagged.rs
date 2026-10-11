@@ -33,7 +33,7 @@ impl TypeParser<'_> {
     pub fn extends_schema_tagged(
         &mut self,
         class_node: Node,
-        member_name: &str,
+        member: &ExportMember,
     ) -> Option<Rc<SchemaTaggedResult>> {
         if class_node.is_nil() {
             return None;
@@ -89,8 +89,7 @@ impl TypeParser<'_> {
             if inner_call.expression().is_nil() {
                 continue;
             }
-            if !self
-                .is_node_reference_to_effect_schema_module_api(inner_call.expression(), member_name)
+            if !self.is_node_reference_to_effect_schema_module_api(inner_call.expression(), member)
             {
                 continue;
             }
@@ -136,7 +135,7 @@ impl TypeParser<'_> {
             return None;
         }
         cached!(self, extends_schema_tagged_class, class_node, {
-            self.extends_schema_tagged(class_node, "TaggedClass")
+            self.extends_schema_tagged(class_node, member!("TaggedClass"))
         })
     }
 
@@ -150,7 +149,7 @@ impl TypeParser<'_> {
             return None;
         }
         cached!(self, extends_schema_tagged_error, class_node, {
-            self.extends_schema_tagged(class_node, "TaggedError")
+            self.extends_schema_tagged(class_node, member!("TaggedError"))
         })
     }
 
@@ -164,7 +163,7 @@ impl TypeParser<'_> {
             return None;
         }
         cached!(self, extends_schema_tagged_request, class_node, {
-            self.extends_schema_tagged(class_node, "TaggedRequest")
+            self.extends_schema_tagged(class_node, member!("TaggedRequest"))
         })
     }
 }

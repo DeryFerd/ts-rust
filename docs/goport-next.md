@@ -6,9 +6,37 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
-- **Now (2026-10-11):** R191 = bump D accepted (main at microsoft/TypeScript fed0bf24149f; note r191 accept). Next revision R192 = goport-int60p f0d8c2df8 (note int60p-r2-2026-10-11): merge main (R191 accepted head), perfP2 d620bef7d (item 2), then the side run. Before the R192 verdicts (R191 reviewer item 9): record N prime goldens for the 5 extra LSP batteries and run them on the R191 bins. Then R193 = int61 goport-effint1 b38ba8de8 (merge main at N prime first). Running lanes: astshrink1, jsdocstr1, effperf3 (on int60p plus perfP2), invokeonce1 and chk4split (R191 reviewer item 3: also time Go N and N prime; likely cause Go checkerpool.go:437). Queued: apicb follow-ups (R191 reviewer item 7), the tree-wide Go line reference refresh (ruling 18), T3 web +1.38 to measure again.
+- **Now (2026-10-11):** R193 accepted (int60 without effperf1 F3; main 3323eeb9f; notes r193-side, timing-r193). Running after the accept: extrabatR193 and followups42 (workflow after-r193). Next: int61 = R194 on main: effint1 b38ba8de8 (Effect editor features, D1 stays out), effperf3 bc6cd8b72, invokeonce1 75866d18c, jsdocstr1 e9c2aff12, astshrink1 b5611fa68, apicbfu1 1b7532c48, i50 (PR #54); then main's light-path PRs #55 (CI fix) and #53 (#49).
 
-- **int61 = goport-effint1 b38ba8de8 (all Effect editor features of effect-tsgo 0.51.1; note effint3-result-2026-10-11).** After bump D and int60: merge the accepted head, then a revision. D1 (refactor.rewrite in initialize codeActionKinds) needs Theo.
+- **Public issues 2026-10-11 (note issues52-result-2026-10-11):** #52 replied (effect-tsgo 0.51.1 parity, workaround, upstream Effect-TS/tsgo#820, labeled; port the upstream fix when it lands). #49: PR #53 merged (ef82c3e59, light path). #50: PR #54 (loader: into int61; macOS CI runs realpath_case.rs).
+
+- **R192 withdrawn (reviewer B1: effperf1 F3 changed Effect plugin-on counts; note effperf1-f3-dropped-2026-10-11). R193 = goport-int60p 24a676449 (int60 without F3): side running, then np-suite, timing-r193 (running), extrabatNp, verdict request.** Follow-ups: a count-preserving F3 lane; plugin-on counts in the gate's Effect items (tool path in a batch).
+
+- **Was (R192 side):** np-r192 done (954 of 954, changes {}); timing-r192 stopped (release timing of int60 against R191, method of bumpD w6 timing.md; covers R191 reviewer item 4, T3 web +1.38%); apicbfu1 (R191 reviewer item 7: apicb tests and Go cites, goport-apicbfu1).
+
+- **effperf3 bc6cd8b72 (not the head 91ad83a5e): skeptic PASS, into int61 (note effperf3-result-2026-10-11).** Effect st instructions -2.0%, tests -2.0%, T3 server -1.4%; output equal. Items 9 and 10 dropped as below the bar. Base is int60p f0d8c2df8 + perfP2: merge after R192.
+
+- **effperf4 b553fc3d5: skeptic PASS, g4 reverted (note effperf4-result-2026-10-11): effect st -6.4 percent, T3 server -6.8, output equal. Into int62.**
+
+- **astshrink1 f56430d3b skeptic PASS (note astshrink1-result-2026-10-11): default peak RSS -2.2 to -6.7 percent, output equal. Running: astshrink2 (round 2: the 2 latent list-owner and print-pack defects). Then into int61 with its 2 protected expectation changes for the reviewer.**
+
+- **apicbfu1 1b7532c48 (R191 reviewer item 7): done, root comment fix after the skeptic (note apicbfu1-result-2026-10-11). Into int61.**
+
+- **jsdocstr1 e9c2aff12: skeptic PASS, kept below the bar (note jsdocstr1-result-2026-10-11; parse mallocs -9 to -30 percent, Go substring model). Into int61.**
+
+- **sweepgap1 done: 0 port gaps in the LSP sweep battery (303 diffs: Go nondeterminism or the Effect class; note sweepgap1-result-2026-10-11).**
+
+- **invokeonce1 75866d18c: skeptic PASS (T3 server st -5.1 percent, T3 web -1.5 to -2; output and counts equal). Into int61. chk4split: the 4-checker split is Go's (lib updates moved it); hono 4-checker wall is a named Go-parity cost (note invokeonce1-result-2026-10-11).**
+
+- **gatecounts1 0e55cd1db: skeptic PASS, WAITS FOR THEO (note gatecounts1-result-2026-10-11): Effect gate items compare plugin-on counts (R192 fails, R191 and R193 pass); candidate.sh clippy target per checkout. Protected paths sweep-wide.sh and candidate.sh, and a change to the effect-gate-rule.**
+
+- **perfscan3 (note perfscan3-result-2026-10-11): R193 default mode is 2x Go N prime or better on all 7 projects; single-threaded query 1.91, effect-off 1.91, t3-web 1.96. Running: jemtune1 (jemalloc tcache and extent conf) and portonly1 (perfscan3 items 3, 5, 6, 9, 10). Next after int61 merges: a parse lane on the int61 head (perfscan3 items 1 and 7 with astchunks step 2; parse is the weakest phase, 1.15 to 1.21x Go).**
+
+- **GitHub 2026-10-11 18:51 check:** #43 closed (effect_cases on main since R193). #51 (outside PR, WASM language server): review running (workflow pr51review; its code runs on testboxes only). #39 (clean-builds.py, not protected): main merged in, CI again; land when green. #41, #42 (protected paths: run-cargo-capped.sh, AGENTS.md, candidate.sh, build-goport-tests.sh) and #48 (crate split step 2, needs a batch with its name map): wait for Theo.
+
+- **After R193: extrabatR193 done (equal to R191, 0 port changes); followups42 5df09027d skeptic PASS, into int62 (note after-r193-result-2026-10-11).**
+
+- **int61 (R194) = goport-effint1 b38ba8de8 (all Effect editor features of effect-tsgo 0.51.1; note effint3-result-2026-10-11).** After bump D and int60: merge the accepted head, then a revision. D1 (refactor.rewrite in initialize codeActionKinds) needs Theo.
 
 - **Running 2026-10-11 (after the R190 accept; all heavy work on testboxes):** bumpD-int4b2 (merge main into goport-bumpD-int4 through the a41381218 temp branch, N prime references, Effect gate files at N prime, tests, np-suite and the full gate at N prime); effectE3 717704745 and effectE4 673ccdf5e done (skeptic PASS; note effectE3E4-result-2026-10-11); running E5a, E5b, E5c (on E4), E6, E7, E8 (on E2b); noderef1 (W1 to W3, then G1 with intern1 fixes, G2, G4); arenabind1 (per-pool arena claims, on main plus jemarena1); effperf1 (F1 message map, F3 symbol reuse); tbxside1 (candidate.sh side on testboxes, protected); tbxperf0 (timing on testboxes). Bump D freeze: no other revision until bump D is accepted; these lanes go into int60 or the integration after it.
 

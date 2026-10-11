@@ -7,7 +7,12 @@ use crate::effect::typeparser::*;
 use crate::prelude::*;
 
 /// unknownCatchApis lists the Effect module APIs that have a catch callback parameter.
-static UNKNOWN_CATCH_APIS: &[&str] = &["tryPromise", "try", "tryMap", "tryMapPromise"];
+static UNKNOWN_CATCH_APIS: [ExportMember; 4] = [
+    ExportMember::new("tryPromise"),
+    ExportMember::new("try"),
+    ExportMember::new("tryMap"),
+    ExportMember::new("tryMapPromise"),
+];
 
 /// UnknownInEffectCatch detects when catch callbacks in Effect APIs return 'unknown' or 'any'
 /// instead of providing typed errors.
@@ -132,7 +137,7 @@ fn check_unknown_in_effect_catch(ctx: &mut RuleContext<'_, '_>, node: Node) -> O
 
 /// isUnknownCatchCallee checks if a node references one of the Effect module catch APIs.
 fn is_unknown_catch_callee(tp: &mut TypeParser<'_>, node: Node) -> bool {
-    for name in UNKNOWN_CATCH_APIS {
+    for name in &UNKNOWN_CATCH_APIS {
         if tp.is_node_reference_to_effect_module_api(node, name) {
             return true;
         }

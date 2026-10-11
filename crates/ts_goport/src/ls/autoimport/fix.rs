@@ -140,10 +140,16 @@ impl Fix {
                 } else {
                     None
                 };
+                // Effect-TS/tsgo patch 018: a barrel rewrite imports the
+                // prefix (`import { Effect } from "effect"`).
+                let mut named_binding_name = &f.name;
+                if f.import_kind == lsproto::ImportKind::NAMED && !f.namespace_prefix.is_empty() {
+                    named_binding_name = &f.namespace_prefix;
+                }
                 let named_imports: Vec<NewImportBinding> =
                     if f.import_kind == lsproto::ImportKind::NAMED {
                         vec![NewImportBinding {
-                            name: f.name.clone(),
+                            name: named_binding_name.clone(),
                             add_as_type_only: f.add_as_type_only,
                             ..Default::default()
                         }]
@@ -151,18 +157,19 @@ impl Fix {
                         Vec::new()
                     };
                 let mut namespace_like_import: Option<NewImportBinding> = None;
-                // qualification := f.qualification()
                 if f.import_kind == lsproto::ImportKind::NAMESPACE
                     || f.import_kind == lsproto::ImportKind::COMMON_JS
                 {
+                    // Effect-TS/tsgo patch 018: the binding takes the prefix.
+                    let mut ns_name = &f.name;
+                    if !f.namespace_prefix.is_empty() {
+                        ns_name = &f.namespace_prefix;
+                    }
                     namespace_like_import = Some(NewImportBinding {
                         kind: f.import_kind,
-                        name: f.name.clone(),
+                        name: ns_name.clone(),
                         ..Default::default()
                     });
-                    // if qualification != nil && qualification.namespacePref != "" {
-                    // 	namespaceLikeImport.name = qualification.namespacePref
-                    // }
                 }
 
                 let quote_preference = lsutil::get_quote_preference(file, preferences);
@@ -196,9 +203,12 @@ impl Fix {
                     /*blankLineBetween*/ true,
                     preferences,
                 );
-                // if qualification != nil {
-                // 	addNamespaceQualifier(tracker, file, qualification)
-                // }
+                // Effect-TS/tsgo patch 018:
+                // When a style rewrite introduced a qualifier requirement (for example,
+                // a namespace or barrel), apply the usage-site prefix in the shared fix pipeline.
+                if !f.namespace_prefix.is_empty() {
+                    add_namespace_qualifier(f, &mut tracker, file, &locale);
+                }
                 let (edits, safe) = file_edits(&mut tracker, file);
                 (
                     edits,
@@ -981,6 +991,10 @@ impl View {
     // Go: ls/autoimport/fix.go:554 GetFixes
     // PORT: `ch` is the request checker (see the file header). Go
     // `usagePosition *lsproto.Position` is `Option<lsproto::Position>`.
+    // Effect-TS/tsgo patch 018 runs the style transformer at each return
+    // (`apply_style_policy`) and sets `UsagePosition` on the AddNew and
+    // AddToExisting fixes. PORT: the port sets that field only with the
+    // Effect plugin on (`fix_usage_position`, see `new_view`).
     pub fn get_fixes(
         &self,
         ch: &mut Checker,
@@ -996,10 +1010,11 @@ impl View {
             fixes.push(namespace_fix);
         }
 
-        if let Some(fix) = self.try_add_to_existing_import(ch, export, is_valid_type_only_use_site)
+        if let Some(fix) =
+            self.try_add_to_existing_import(ch, export, is_valid_type_only_use_site, usage_position)
         {
             fixes.push(fix);
-            return fixes;
+            return self.apply_style_policy(export, fixes);
         }
 
         // !!! getNewImportFromExistingSpecifier - even worth it?
@@ -1008,7 +1023,7 @@ impl View {
             self.get_module_specifier(export, &self.preferences);
         if module_specifier.is_empty() {
             if !fixes.is_empty() {
-                return fixes;
+                return self.apply_style_policy(export, fixes);
             }
             return Vec::new();
         }
@@ -1019,19 +1034,22 @@ impl View {
             export.flags.intersects(SymbolFlags::VALUE) || export.is_unresolved_alias();
         if !imported_symbol_has_value_meaning && is_js && usage_position.is_some() {
             // For pure types in JS files, use JSDoc import type syntax
-            return vec![Rc::new(Fix {
-                auto_import_fix: lsproto::AutoImportFix {
-                    kind: lsproto::AutoImportFixKind::JSDOC_TYPE_IMPORT,
-                    module_specifier,
-                    name: export.name(),
-                    usage_position,
+            return self.apply_style_policy(
+                export,
+                vec![Rc::new(Fix {
+                    auto_import_fix: lsproto::AutoImportFix {
+                        kind: lsproto::AutoImportFixKind::JSDOC_TYPE_IMPORT,
+                        module_specifier,
+                        name: export.name(),
+                        usage_position,
+                        ..Default::default()
+                    },
+                    module_specifier_kind,
+                    is_re_export: export.target.module_id != export.module_id,
+                    module_file_name: export.module_file_name.clone(),
                     ..Default::default()
-                },
-                module_specifier_kind,
-                is_re_export: export.target.module_id != export.module_id,
-                module_file_name: export.module_file_name.clone(),
-                ..Default::default()
-            })];
+                })],
+            );
         }
 
         let import_kind = get_import_kind(
@@ -1068,6 +1086,7 @@ impl View {
                 name,
                 use_require: self.should_use_require(),
                 add_as_type_only,
+                usage_position: self.fix_usage_position(usage_position),
                 ..Default::default()
             },
             module_specifier_kind,
@@ -1075,7 +1094,28 @@ impl View {
             module_file_name: export.module_file_name.clone(),
             ..Default::default()
         }));
-        fixes
+        self.apply_style_policy(export, fixes)
+    }
+
+    // Go: ls/autoimport/fix.go:647 applyStylePolicy (Effect-TS/tsgo patch 018)
+    fn apply_style_policy(&self, export: &Export, fixes: Vec<Rc<Fix>>) -> Vec<Rc<Fix>> {
+        let Some(fix_transformer) = &self.fix_transformer else {
+            return fixes;
+        };
+        if fixes.is_empty() {
+            return fixes;
+        }
+        fix_transformer.transform(export, fixes)
+    }
+
+    /// The `UsagePosition` of an AddNew or AddToExisting fix.
+    // PORT: Effect-TS/tsgo patch 018 sets it in every project; the port only
+    // with the Effect plugin on (see `new_view`).
+    fn fix_usage_position(
+        &self,
+        usage_position: Option<lsproto::Position>,
+    ) -> Option<lsproto::Position> {
+        usage_position.filter(|_| self.effect_usage_position)
     }
 }
 
@@ -1179,11 +1219,14 @@ fn get_namespace_like_import_text(declaration: Node) -> String {
 
 impl View {
     // Go: ls/autoimport/fix.go:690 tryAddToExistingImport
+    // Effect-TS/tsgo patch 018 adds `usagePosition` and sets it on both
+    // AddToExisting fixes (the port only with the Effect plugin on).
     pub fn try_add_to_existing_import(
         &self,
         ch: &mut Checker,
         export: &Export,
         is_valid_type_only_use_site: bool,
+        usage_position: Option<lsproto::Position>,
     ) -> Option<Rc<Fix>> {
         let existing_imports = self.get_existing_imports(ch);
         let matching_declarations = existing_imports
@@ -1238,6 +1281,7 @@ impl View {
                             import_index: existing_import.index,
                             module_specifier: existing_import.module_specifier.clone(),
                             add_as_type_only,
+                            usage_position: self.fix_usage_position(usage_position),
                             ..Default::default()
                         },
                         ..Default::default()
@@ -1301,6 +1345,7 @@ impl View {
                     import_index: existing_import.index,
                     module_specifier: existing_import.module_specifier.clone(),
                     add_as_type_only,
+                    usage_position: self.fix_usage_position(usage_position),
                     ..Default::default()
                 },
                 ..Default::default()
