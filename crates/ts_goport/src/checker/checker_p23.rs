@@ -892,7 +892,9 @@ impl Checker {
                         // String enum members from separate enums with identical values
                         // are distinct types with the same property name. Make the resulting
                         // property symbol's name type be the union of those enum member types.
-                        let existing_prop = c.symbols.get(members, &prop_name);
+                        // PERF: intern1 fix 3. Lookups by `Name`: an id
+                        // compare with the hash the interner keeps.
+                        let existing_prop = c.symbols.get_name(members, &prop_name);
                         if existing_prop.is_some() {
                             let existing_name_type = c
                                 .value_symbol_links
@@ -911,7 +913,8 @@ impl Checker {
                             let mut modifiers_prop = SymbolId::NIL;
                             if c.is_type_usable_as_property_name(key_type) {
                                 let key_name = c.get_property_name_from_type_as_name(key_type);
-                                modifiers_prop = c.get_property_of_type(modifiers_type, &key_name);
+                                modifiers_prop =
+                                    c.get_property_of_type_name(modifiers_type, &key_name);
                             }
                             let is_optional = template_modifiers
                                 .intersects(MappedTypeModifiers::INCLUDE_OPTIONAL)

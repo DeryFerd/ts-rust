@@ -270,7 +270,12 @@ impl Checker {
         // of `name` for each constituent that lacks the property. Here the
         // test is made once, and the type at the first such constituent,
         // where Go first makes it; later constituents use it.
-        let late_bound_name = is_late_bound_name(name.text());
+        // PERF: intern1 fix 1. A `Name` that is not internal is not late
+        // bound, with no text read.
+        let late_bound_name = match name {
+            TableKey::Name(name) if !name.is_internal() => false,
+            _ => is_late_bound_name(name.text()),
+        };
         let mut name_literal_type = TypeId::NIL;
         for &current in types.iter() {
             let t = self.get_apparent_type(current);

@@ -95,15 +95,17 @@ impl Checker {
                 }
             }
         }
-        let text = right.text();
+        // PERF: intern1 fix 9. The export lookups by the identifier's `Name`
+        // compare ids; the text is read only for a diagnostic.
+        let right_name = right.text_name();
         let exports = self.get_exports_of_symbol(namespace);
-        let s = self.get_symbol(exports, text, meaning);
+        let s = self.get_symbol_key(exports, TableKey::Name(&right_name), meaning);
         let mut symbol = self.get_merged_symbol(s);
         if symbol.is_nil() && self.sym(namespace).flags.intersects(SymbolFlags::ALIAS) {
             // `namespace` can be resolved further if there was a symbol merge with a re-export
             let resolved = self.resolve_alias(namespace);
             let exports = self.get_exports_of_symbol(resolved);
-            let s = self.get_symbol(exports, text, meaning);
+            let s = self.get_symbol_key(exports, TableKey::Name(&right_name), meaning);
             symbol = self.get_merged_symbol(s);
         }
         if symbol.is_nil() {
@@ -144,7 +146,11 @@ impl Checker {
                 if meaning.intersects(SymbolFlags::NAMESPACE) {
                     if is_qualified_name(name.parent()) {
                         let exports = self.get_exports_of_symbol(namespace);
-                        let s = self.get_symbol(exports, text, SymbolFlags::TYPE);
+                        let s = self.get_symbol_key(
+                            exports,
+                            TableKey::Name(&right_name),
+                            SymbolFlags::TYPE,
+                        );
                         let exported_type_symbol = self.get_merged_symbol(s);
                         if exported_type_symbol.is_some() {
                             let qualified_right = name.parent().right();

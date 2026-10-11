@@ -121,6 +121,11 @@ pub struct NameResolver {
     pub on_successfully_resolved_symbol: Option<NameResolverOnSuccessfullyResolvedSymbolFn>,
 }
 
+/// The names that `NameResolver::resolve_name` compares by id.
+static CONST_NAME: std::sync::LazyLock<Name> = std::sync::LazyLock::new(|| Name::from("const"));
+static ARGUMENTS_NAME: std::sync::LazyLock<Name> =
+    std::sync::LazyLock::new(|| Name::from("arguments"));
+
 thread_local! {
     /// U1 (a): the text and name of the last `resolver_name_text` call on
     /// this thread, for the next `NameResolver::resolve`.
@@ -190,7 +195,6 @@ impl NameResolver {
         exclude_globals: bool,
     ) -> SymbolId {
         let name_key = name_key.clone();
-        let name: &'static str = name_key.as_str();
         let mut location = location;
         let mut result = SymbolId::NIL;
         let mut last_location = Node::NIL;
@@ -200,7 +204,9 @@ impl NameResolver {
         let mut within_deferred_context = false;
         let mut grandparent: Node;
         let original_location = location; // needed for did-you-mean error reporting, which gathers candidates starting from the original location
-        let name_is_const = name == "const";
+        // PERF: intern1 fix 4. The name is compared by id here and below;
+        // its text is read only for a diagnostic.
+        let name_is_const = name_key == *CONST_NAME;
         // PERF: `kind` is `location.kind()`, read once per scope. Each
         // `kind()` call reads the file's kind table, and the Go tests below
         // (`IsModuleOrEnumDeclaration`, `IsGlobalSourceFile`,
@@ -392,7 +398,7 @@ impl NameResolver {
                                 break 'switch_;
                             }
                         }
-                        if name != INTERNAL_SYMBOL_NAME_DEFAULT {
+                        if !name_key.is_default_symbol_name() {
                             result = self.lookup(
                                 c,
                                 module_exports,
@@ -447,13 +453,18 @@ impl NameResolver {
                                     } else {
                                         "isolatedModules"
                                     };
-                                let qualified =
-                                    c.symbol_arena().sym(enum_symbol).name.to_string() + "." + name;
+                                let qualified = c.symbol_arena().sym(enum_symbol).name.to_string()
+                                    + "."
+                                    + name_key.as_str();
                                 self.error(
                                     c,
                                     original_location,
                                     diag::Cannot_access_0_from_another_file_without_qualification_when_1_is_enabled_Use_2_instead,
-                                    args![name, isolated_modules_like_flag_name, qualified],
+                                    args![
+                                        name_key.as_str(),
+                                        isolated_modules_like_flag_name,
+                                        qualified
+                                    ],
                                 );
                             }
                             break 'loop_;
@@ -514,7 +525,7 @@ impl NameResolver {
                             && meaning.intersects(SymbolFlags::CLASS)
                         {
                             let class_name = location.name();
-                            if class_name.is_some() && name == class_name.text() {
+                            if class_name.is_some() && class_name.text_is(&name_key) {
                                 result = location.symbol();
                                 break 'loop_;
                             }
@@ -573,19 +584,21 @@ impl NameResolver {
                     | SyntaxKind::GetAccessor
                     | SyntaxKind::SetAccessor
                     | SyntaxKind::FunctionDeclaration => {
-                        if meaning.intersects(SymbolFlags::VARIABLE) && name == "arguments" {
+                        if meaning.intersects(SymbolFlags::VARIABLE) && name_key == *ARGUMENTS_NAME
+                        {
                             result = self.arguments_symbol(c);
                             break 'loop_;
                         }
                     }
                     SyntaxKind::FunctionExpression => {
-                        if meaning.intersects(SymbolFlags::VARIABLE) && name == "arguments" {
+                        if meaning.intersects(SymbolFlags::VARIABLE) && name_key == *ARGUMENTS_NAME
+                        {
                             result = self.arguments_symbol(c);
                             break 'loop_;
                         }
                         if meaning.intersects(SymbolFlags::FUNCTION) {
                             let function_name = location.name();
-                            if function_name.is_some() && name == function_name.text() {
+                            if function_name.is_some() && function_name.text_is(&name_key) {
                                 result = location.symbol();
                                 break 'loop_;
                             }
@@ -656,7 +669,7 @@ impl NameResolver {
                     SyntaxKind::InferType => {
                         if meaning.intersects(SymbolFlags::TYPE_PARAMETER) {
                             let parameter_name = location.type_parameter().name();
-                            if parameter_name.is_some() && name == parameter_name.text() {
+                            if parameter_name.is_some() && parameter_name.text_is(&name_key) {
                                 result = location.type_parameter().symbol();
                                 break 'loop_;
                             }
@@ -732,7 +745,7 @@ impl NameResolver {
                     if on_property_with_invalid_initializer(
                         c.hook_checker(),
                         original_location,
-                        name,
+                        name_key.as_str(),
                         property_with_invalid_initializer,
                         result,
                     ) {
@@ -746,7 +759,7 @@ impl NameResolver {
                     on_failed_to_resolve_symbol(
                         c.hook_checker(),
                         original_location,
-                        name,
+                        name_key.as_str(),
                         meaning,
                         name_not_found_message,
                     );

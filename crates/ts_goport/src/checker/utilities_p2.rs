@@ -74,8 +74,11 @@ pub fn is_variable_declaration_in_variable_statement(node: Node) -> bool {
 
 impl Checker {
     // Go: checker/utilities.go:1018 IsKnownSymbol
+    // PERF: intern1 fix 2. A name that is not internal is not late bound,
+    // with no text read.
     pub fn is_known_symbol(&self, symbol: SymbolId) -> bool {
-        is_late_bound_name(&self.sym(symbol).name)
+        let name = &self.sym(symbol).name;
+        name.is_internal() && is_late_bound_name(name)
     }
 
     // Go: checker/utilities.go:1022 IsPrivateIdentifierSymbol
