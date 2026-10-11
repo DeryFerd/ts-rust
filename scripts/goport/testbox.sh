@@ -65,7 +65,10 @@ batch_pin() { jq -r '.batch.upstreamPin.to // empty' docs/typechecker-state/curr
 remote() {
   local remote_cmd
   printf -v remote_cmd '%q ' "$@"
-  blacksmith testbox run --id "$(saved_id)" ". ~/testbox.env && $remote_cmd"
+  # A subshell: the CLI touches ~/.testbox-last-activity after the command in this shell, and testbox.env sets
+  # HOME=/home/theo. Outside the subshell that touch would miss the marker, and the idle time would count from
+  # the start of a long command.
+  blacksmith testbox run --id "$(saved_id)" "(. ~/testbox.env && $remote_cmd)"
 }
 
 # ssh_route: sets host and ssh for rsync over the CLI's own SSH route (port 64000 and the key that warmup

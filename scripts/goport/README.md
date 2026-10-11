@@ -332,8 +332,11 @@ scripts/goport/testbox.sh stop                                  # or release (se
   metadata, no binaries) and `<out-dir>/compare.json`. After a failed build it writes the cargo logs to
   `<out-dir>/testbin.new/logs` and prints the compiler errors. `np-suite` writes the label dir in the main
   checkout's np-suite dir. Neither replaces an existing dir.
-- Activity: the idle timer does not see the SSH route of `push`, `get` and the `tests` poll. `push` and
-  `seed` touch the activity marker every minute, and the `tests` and `np-suite` jobs every 30 s.
+- Activity: the idle timer reads the marker `/home/runner/.testbox-last-activity`. The CLI touches it at
+  the start and the end of each `run`. `testbox.sh` runs the command in a subshell, so the
+  `HOME=/home/theo` of the testbox env does not move the end touch. The timer does not see the SSH route
+  of `push`, `get` and the `tests` poll. So `push` and `seed` touch the marker every minute, and the
+  `tests` and `np-suite` jobs every 30 s.
 - Sticky disks: `target/` and the cargo registry, and the inputs and pin disks. The inputs and pin disks
   commit only when a file changed (`commit: on-change`), so a testbox that only reads them does not commit an
   older copy. A sticky disk commits only when the job ends with no failed or cancelled step. `stop` cancels the
