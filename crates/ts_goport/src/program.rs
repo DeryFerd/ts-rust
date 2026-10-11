@@ -1439,7 +1439,7 @@ impl Drop for AliasResolverProgramScope {
 /// Go `checker.NewChecker(aliasResolver, nil)` (ls/autoimport): makes the
 /// program that the checker reads and makes it current until the scope
 /// drops. `root_files` are Go `aliasResolver.SourceFiles()`. `files` are
-/// every file that the checker can read (the root files too); they must be
+/// the files that the program keeps live (the root files too); they must be
 /// published, and they are bound here if they are not yet. `options` are Go
 /// `aliasResolver.Options()`, `current_directory` and
 /// `use_case_sensitive_file_names` come from the resolver's host, and
@@ -1447,8 +1447,9 @@ impl Drop for AliasResolverProgramScope {
 // PORT: Go needs no program: the resolver is the `checker.Program`. A
 // checker here reads its program version (`prog()`), and it copies the
 // binder lineage when it is made (`SymbolArena::for_checker`). So the
-// program copies the lineage after `files` are bound, and a file bound
-// later is not in its checkers' arenas. Go `GetResolvedModules` is nil, so
+// program copies the lineage after `files` are bound. A file that the
+// resolver binds later reaches a checker through its catch-up
+// (`catch_up_alias_resolver_checker`). Go `GetResolvedModules` is nil, so
 // the program has no resolved modules. The program shell stays leaked like
 // other program versions (multi-program M2, M3); the scope frees its
 // tables, with its copy of the lineage.
