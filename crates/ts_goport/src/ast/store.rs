@@ -4698,6 +4698,29 @@ impl FrozenNode {
     pub fn ids(self) -> FrozenIds {
         block_ids(self.block, self.file)
     }
+
+    /// `frozen_store_lacks_type_arguments` of this node.
+    // PERF: perfP1 item 4. No second registry lookup.
+    #[inline]
+    #[must_use]
+    pub fn lacks_type_arguments(self) -> bool {
+        self.block
+            .kids
+            .get(self.index)
+            .is_some_and(|kids| SlotChildren::has_no_type_arguments_in(kids.typed()))
+    }
+
+    /// `frozen_store_bind_and_file` of this node: its bind word and the
+    /// `GoFile` of a static publish. Panics as `check_block_owner`.
+    // PERF: perfP1 item 4. No second registry lookup.
+    #[inline]
+    #[must_use]
+    pub fn bind_and_file(self) -> (u32, Option<&'static GoFile>) {
+        let r = &self.block.records[self.index];
+        check_block_owner(self.block, self.file);
+        debug_assert!(r.is_node(), "store handle does not name a node slot");
+        (r.bind_word(), self.block.file.go_file.as_ref())
+    }
 }
 
 /// The `FrozenNode` of `n`. `None` as for `frozen_store_kind`: nil,
@@ -5559,6 +5582,15 @@ pub enum FrozenIds {
 }
 
 impl FrozenIds {
+    /// The file of the store this value was read for.
+    #[inline]
+    #[must_use]
+    pub fn file(self) -> usize {
+        match self {
+            FrozenIds::Records { base, .. } | FrozenIds::Direct { base } => (base >> 32) as usize,
+        }
+    }
+
     /// `Node::new(file, id)` for the store this value was read for.
     #[inline]
     #[must_use]

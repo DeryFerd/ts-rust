@@ -24,16 +24,44 @@
 
 // Node data is read with `with_data!` (Go reads node fields without a
 // context; we reach the parsed arena through the installed program).
+use crate::ast::node::{ChildIds, cold_read};
 use crate::ast::synthetic::{list_of, with_data};
 use crate::astdata::NodeData;
 use crate::prelude::*;
 
 /// Go `nil` for an optional child.
-fn opt_node(file: usize, id: Option<crate::astdata::NodeId>) -> Node {
+#[inline]
+fn opt_node(file: impl ChildIds, id: Option<crate::astdata::NodeId>) -> Node {
     match id {
-        Some(id) => Node::new(file, id),
+        Some(id) => file.node(id),
         None => Node::NIL,
     }
+}
+
+/// `with_data!` for an accessor that makes child nodes: `$file` makes them
+/// from the child ids of `$d` (`ChildIds`). A published static store node
+/// reads its data and the id map of its store with one registry lookup; any
+/// other node takes `with_data!` with its file id, out of line.
+// PERF: perfP1 item 4 (perfscan2). The data read and each `Node::new` were
+// a registry lookup each (`node.rs` `ChildIds`). Go reads `n.data` and the
+// field. A hand edit: keep it when this file is made again.
+macro_rules! child_data {
+    ($n:expr, |$file:ident, $d:ident| $body:expr) => {{
+        let n__: Node = $n;
+        'read: {
+            if let Some(f) = frozen_store_node(n__)
+                && let Some(data__) = f.data()
+            {
+                let $file = f.ids();
+                let $d: &NodeData = data__;
+                break 'read $body;
+            }
+            cold_read(|| {
+                let $file = n__.file_index();
+                with_data!(n__, |$d| $body)
+            })
+        }
+    }};
 }
 
 /// Go panics with a failed type assertion when `AsX()` gets the wrong kind.
@@ -54,8 +82,7 @@ impl Node {
     /// Go `node.AsX().FullSignature` for: FunctionDeclaration, CallSignatureDeclaration, ConstructSignatureDeclaration, ConstructorDeclaration, GetAccessorDeclaration, SetAccessorDeclaration, IndexSignatureDeclaration, MethodSignatureDeclaration, MethodDeclaration, ArrowFunction, FunctionExpression, FunctionTypeNode, ConstructorTypeNode, JSDocSignature.
     #[must_use]
     pub fn full_signature(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::FunctionDeclaration(d) => opt_node(file, d.full_signature),
             NodeData::CallSignatureDeclaration(d) => opt_node(file, d.full_signature),
             NodeData::ConstructSignatureDeclaration(d) => opt_node(file, d.full_signature),
@@ -78,8 +105,7 @@ impl Node {
     /// Go `node.AsX().AsteriskToken` for: FunctionDeclaration, ConstructorDeclaration, GetAccessorDeclaration, SetAccessorDeclaration, MethodDeclaration, YieldExpression, ArrowFunction, FunctionExpression, ModuleDeclaration.
     #[must_use]
     pub fn asterisk_token(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::FunctionDeclaration(d) => opt_node(file, d.asterisk_token),
             NodeData::ConstructorDeclaration(d) => opt_node(file, d.asterisk_token),
             NodeData::GetAccessorDeclaration(d) => opt_node(file, d.asterisk_token),
@@ -188,10 +214,9 @@ impl Node {
     /// Go `node.AsX().Left` for: QualifiedName, BinaryExpression.
     #[must_use]
     pub fn left(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::QualifiedName(d) => Node::new(file, d.left),
-            NodeData::BinaryExpression(d) => Node::new(file, d.left),
+        child_data!(self, |file, d| match d {
+            NodeData::QualifiedName(d) => file.node(d.left),
+            NodeData::BinaryExpression(d) => file.node(d.left),
             _ => field_panic(self, "Left"),
         })
     }
@@ -200,10 +225,9 @@ impl Node {
     /// Go `node.AsX().Right` for: QualifiedName, BinaryExpression.
     #[must_use]
     pub fn right(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::QualifiedName(d) => Node::new(file, d.right),
-            NodeData::BinaryExpression(d) => Node::new(file, d.right),
+        child_data!(self, |file, d| match d {
+            NodeData::QualifiedName(d) => file.node(d.right),
+            NodeData::BinaryExpression(d) => file.node(d.right),
             _ => field_panic(self, "Right"),
         })
     }
@@ -212,9 +236,8 @@ impl Node {
     /// Go `node.AsX().ThenStatement` for: IfStatement.
     #[must_use]
     pub fn then_statement(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::IfStatement(d) => Node::new(file, d.then_statement),
+        child_data!(self, |file, d| match d {
+            NodeData::IfStatement(d) => file.node(d.then_statement),
             _ => field_panic(self, "ThenStatement"),
         })
     }
@@ -223,8 +246,7 @@ impl Node {
     /// Go `node.AsX().ElseStatement` for: IfStatement.
     #[must_use]
     pub fn else_statement(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::IfStatement(d) => opt_node(file, d.else_statement),
             _ => field_panic(self, "ElseStatement"),
         })
@@ -234,10 +256,9 @@ impl Node {
     /// Go `node.AsX().Condition` for: ForStatement, ConditionalExpression.
     #[must_use]
     pub fn condition(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::ForStatement(d) => opt_node(file, d.condition),
-            NodeData::ConditionalExpression(d) => Node::new(file, d.condition),
+            NodeData::ConditionalExpression(d) => file.node(d.condition),
             _ => field_panic(self, "Condition"),
         })
     }
@@ -246,8 +267,7 @@ impl Node {
     /// Go `node.AsX().Incrementor` for: ForStatement.
     #[must_use]
     pub fn incrementor(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::ForStatement(d) => opt_node(file, d.incrementor),
             _ => field_panic(self, "Incrementor"),
         })
@@ -257,8 +277,7 @@ impl Node {
     /// Go `node.AsX().AwaitModifier` for: ForInOrOfStatement.
     #[must_use]
     pub fn await_modifier(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::ForInOrOfStatement(d) => opt_node(file, d.await_modifier),
             _ => field_panic(self, "AwaitModifier"),
         })
@@ -268,9 +287,8 @@ impl Node {
     /// Go `node.AsX().CaseBlock` for: SwitchStatement.
     #[must_use]
     pub fn case_block(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::SwitchStatement(d) => Node::new(file, d.case_block),
+        child_data!(self, |file, d| match d {
+            NodeData::SwitchStatement(d) => file.node(d.case_block),
             _ => field_panic(self, "CaseBlock"),
         })
     }
@@ -304,9 +322,8 @@ impl Node {
     /// Go `node.AsX().TryBlock` for: TryStatement.
     #[must_use]
     pub fn try_block(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::TryStatement(d) => Node::new(file, d.try_block),
+        child_data!(self, |file, d| match d {
+            NodeData::TryStatement(d) => file.node(d.try_block),
             _ => field_panic(self, "TryBlock"),
         })
     }
@@ -315,8 +332,7 @@ impl Node {
     /// Go `node.AsX().CatchClause` for: TryStatement.
     #[must_use]
     pub fn catch_clause(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::TryStatement(d) => opt_node(file, d.catch_clause),
             _ => field_panic(self, "CatchClause"),
         })
@@ -326,8 +342,7 @@ impl Node {
     /// Go `node.AsX().FinallyBlock` for: TryStatement.
     #[must_use]
     pub fn finally_block(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::TryStatement(d) => opt_node(file, d.finally_block),
             _ => field_panic(self, "FinallyBlock"),
         })
@@ -337,8 +352,7 @@ impl Node {
     /// Go `node.AsX().VariableDeclaration` for: CatchClause.
     #[must_use]
     pub fn variable_declaration(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::CatchClause(d) => opt_node(file, d.variable_declaration),
             _ => field_panic(self, "VariableDeclaration"),
         })
@@ -348,9 +362,8 @@ impl Node {
     /// Go `node.AsX().Block` for: CatchClause.
     #[must_use]
     pub fn block(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::CatchClause(d) => Node::new(file, d.block),
+        child_data!(self, |file, d| match d {
+            NodeData::CatchClause(d) => file.node(d.block),
             _ => field_panic(self, "Block"),
         })
     }
@@ -372,9 +385,8 @@ impl Node {
     /// Go `node.AsX().DeclarationList` for: VariableStatement.
     #[must_use]
     pub fn declaration_list(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::VariableStatement(d) => Node::new(file, d.declaration_list),
+        child_data!(self, |file, d| match d {
+            NodeData::VariableStatement(d) => file.node(d.declaration_list),
             _ => field_panic(self, "DeclarationList"),
         })
     }
@@ -383,8 +395,7 @@ impl Node {
     /// Go `node.AsX().ExclamationToken` for: VariableDeclaration.
     #[must_use]
     pub fn exclamation_token(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::VariableDeclaration(d) => opt_node(file, d.exclamation_token),
             _ => field_panic(self, "ExclamationToken"),
         })
@@ -405,8 +416,7 @@ impl Node {
     /// Go `node.AsX().DotDotDotToken` for: ParameterDeclaration, BindingElement, NamedTupleMember, JsxExpression.
     #[must_use]
     pub fn dot_dot_dot_token(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::ParameterDeclaration(d) => opt_node(file, d.dot_dot_dot_token),
             NodeData::BindingElement(d) => opt_node(file, d.dot_dot_dot_token),
             // PORT: an array binding hole, Go `BindingElement` with nil fields.
@@ -444,9 +454,8 @@ impl Node {
     /// Go `node.AsX().OperatorToken` for: BinaryExpression.
     #[must_use]
     pub fn operator_token(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::BinaryExpression(d) => Node::new(file, d.operator_token),
+        child_data!(self, |file, d| match d {
+            NodeData::BinaryExpression(d) => file.node(d.operator_token),
             _ => field_panic(self, "OperatorToken"),
         })
     }
@@ -467,10 +476,9 @@ impl Node {
     /// Go `node.AsX().Operand` for: PrefixUnaryExpression, PostfixUnaryExpression.
     #[must_use]
     pub fn operand(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::PrefixUnaryExpression(d) => Node::new(file, d.operand),
-            NodeData::PostfixUnaryExpression(d) => Node::new(file, d.operand),
+        child_data!(self, |file, d| match d {
+            NodeData::PrefixUnaryExpression(d) => file.node(d.operand),
+            NodeData::PostfixUnaryExpression(d) => file.node(d.operand),
             _ => field_panic(self, "Operand"),
         })
     }
@@ -479,9 +487,8 @@ impl Node {
     /// Go `node.AsX().EqualsGreaterThanToken` for: ArrowFunction.
     #[must_use]
     pub fn equals_greater_than_token(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ArrowFunction(d) => Node::new(file, d.equals_greater_than_token),
+        child_data!(self, |file, d| match d {
+            NodeData::ArrowFunction(d) => file.node(d.equals_greater_than_token),
             _ => field_panic(self, "EqualsGreaterThanToken"),
         })
     }
@@ -490,9 +497,8 @@ impl Node {
     /// Go `node.AsX().WhenTrue` for: ConditionalExpression.
     #[must_use]
     pub fn when_true(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ConditionalExpression(d) => Node::new(file, d.when_true),
+        child_data!(self, |file, d| match d {
+            NodeData::ConditionalExpression(d) => file.node(d.when_true),
             _ => field_panic(self, "WhenTrue"),
         })
     }
@@ -501,9 +507,8 @@ impl Node {
     /// Go `node.AsX().ColonToken` for: ConditionalExpression.
     #[must_use]
     pub fn colon_token(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ConditionalExpression(d) => Node::new(file, d.colon_token),
+        child_data!(self, |file, d| match d {
+            NodeData::ConditionalExpression(d) => file.node(d.colon_token),
             _ => field_panic(self, "ColonToken"),
         })
     }
@@ -512,9 +517,8 @@ impl Node {
     /// Go `node.AsX().WhenFalse` for: ConditionalExpression.
     #[must_use]
     pub fn when_false(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ConditionalExpression(d) => Node::new(file, d.when_false),
+        child_data!(self, |file, d| match d {
+            NodeData::ConditionalExpression(d) => file.node(d.when_false),
             _ => field_panic(self, "WhenFalse"),
         })
     }
@@ -523,9 +527,8 @@ impl Node {
     /// Go `node.AsX().ArgumentExpression` for: ElementAccessExpression.
     #[must_use]
     pub fn argument_expression(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ElementAccessExpression(d) => Node::new(file, d.argument_expression),
+        child_data!(self, |file, d| match d {
+            NodeData::ElementAccessExpression(d) => file.node(d.argument_expression),
             _ => field_panic(self, "ArgumentExpression"),
         })
     }
@@ -544,10 +547,9 @@ impl Node {
     /// Go `node.AsX().Head` for: TemplateExpression, TemplateLiteralTypeNode.
     #[must_use]
     pub fn head(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::TemplateExpression(d) => Node::new(file, d.head),
-            NodeData::TemplateLiteralTypeNode(d) => Node::new(file, d.head),
+        child_data!(self, |file, d| match d {
+            NodeData::TemplateExpression(d) => file.node(d.head),
+            NodeData::TemplateLiteralTypeNode(d) => file.node(d.head),
             _ => field_panic(self, "Head"),
         })
     }
@@ -568,11 +570,10 @@ impl Node {
     /// Go `node.AsX().Literal` for: TemplateSpan, LiteralTypeNode, TemplateLiteralTypeSpan.
     #[must_use]
     pub fn literal(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::TemplateSpan(d) => Node::new(file, d.literal),
-            NodeData::LiteralTypeNode(d) => Node::new(file, d.literal),
-            NodeData::TemplateLiteralTypeSpan(d) => Node::new(file, d.literal),
+        child_data!(self, |file, d| match d {
+            NodeData::TemplateSpan(d) => file.node(d.literal),
+            NodeData::LiteralTypeNode(d) => file.node(d.literal),
+            NodeData::TemplateLiteralTypeSpan(d) => file.node(d.literal),
             _ => field_panic(self, "Literal"),
         })
     }
@@ -581,9 +582,8 @@ impl Node {
     /// Go `node.AsX().Tag` for: TaggedTemplateExpression.
     #[must_use]
     pub fn tag(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::TaggedTemplateExpression(d) => Node::new(file, d.tag),
+        child_data!(self, |file, d| match d {
+            NodeData::TaggedTemplateExpression(d) => file.node(d.tag),
             _ => field_panic(self, "Tag"),
         })
     }
@@ -592,9 +592,8 @@ impl Node {
     /// Go `node.AsX().Template` for: TaggedTemplateExpression.
     #[must_use]
     pub fn template(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::TaggedTemplateExpression(d) => Node::new(file, d.template),
+        child_data!(self, |file, d| match d {
+            NodeData::TaggedTemplateExpression(d) => file.node(d.template),
             _ => field_panic(self, "Template"),
         })
     }
@@ -603,8 +602,7 @@ impl Node {
     /// Go `node.AsX().EqualsToken` for: ShorthandPropertyAssignment.
     #[must_use]
     pub fn equals_token(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::ShorthandPropertyAssignment(d) => opt_node(file, d.equals_token),
             _ => field_panic(self, "EqualsToken"),
         })
@@ -614,8 +612,7 @@ impl Node {
     /// Go `node.AsX().ObjectAssignmentInitializer` for: ShorthandPropertyAssignment.
     #[must_use]
     pub fn object_assignment_initializer(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::ShorthandPropertyAssignment(d) => {
                 opt_node(file, d.object_assignment_initializer)
             }
@@ -627,9 +624,8 @@ impl Node {
     /// Go `node.AsX().CheckType` for: ConditionalTypeNode.
     #[must_use]
     pub fn check_type(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ConditionalTypeNode(d) => Node::new(file, d.check_type),
+        child_data!(self, |file, d| match d {
+            NodeData::ConditionalTypeNode(d) => file.node(d.check_type),
             _ => field_panic(self, "CheckType"),
         })
     }
@@ -638,9 +634,8 @@ impl Node {
     /// Go `node.AsX().ExtendsType` for: ConditionalTypeNode.
     #[must_use]
     pub fn extends_type(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ConditionalTypeNode(d) => Node::new(file, d.extends_type),
+        child_data!(self, |file, d| match d {
+            NodeData::ConditionalTypeNode(d) => file.node(d.extends_type),
             _ => field_panic(self, "ExtendsType"),
         })
     }
@@ -649,9 +644,8 @@ impl Node {
     /// Go `node.AsX().TrueType` for: ConditionalTypeNode.
     #[must_use]
     pub fn true_type(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ConditionalTypeNode(d) => Node::new(file, d.true_type),
+        child_data!(self, |file, d| match d {
+            NodeData::ConditionalTypeNode(d) => file.node(d.true_type),
             _ => field_panic(self, "TrueType"),
         })
     }
@@ -660,9 +654,8 @@ impl Node {
     /// Go `node.AsX().FalseType` for: ConditionalTypeNode.
     #[must_use]
     pub fn false_type(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ConditionalTypeNode(d) => Node::new(file, d.false_type),
+        child_data!(self, |file, d| match d {
+            NodeData::ConditionalTypeNode(d) => file.node(d.false_type),
             _ => field_panic(self, "FalseType"),
         })
     }
@@ -671,10 +664,9 @@ impl Node {
     /// Go `node.AsX().TypeParameter` for: InferTypeNode, MappedTypeNode.
     #[must_use]
     pub fn type_parameter(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::InferTypeNode(d) => Node::new(file, d.type_parameter),
-            NodeData::MappedTypeNode(d) => Node::new(file, d.type_parameter),
+        child_data!(self, |file, d| match d {
+            NodeData::InferTypeNode(d) => file.node(d.type_parameter),
+            NodeData::MappedTypeNode(d) => file.node(d.type_parameter),
             _ => field_panic(self, "TypeParameter"),
         })
     }
@@ -683,9 +675,8 @@ impl Node {
     /// Go `node.AsX().ElementType` for: ArrayTypeNode.
     #[must_use]
     pub fn element_type(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ArrayTypeNode(d) => Node::new(file, d.element_type),
+        child_data!(self, |file, d| match d {
+            NodeData::ArrayTypeNode(d) => file.node(d.element_type),
             _ => field_panic(self, "ElementType"),
         })
     }
@@ -694,9 +685,8 @@ impl Node {
     /// Go `node.AsX().ObjectType` for: IndexedAccessTypeNode.
     #[must_use]
     pub fn object_type(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::IndexedAccessTypeNode(d) => Node::new(file, d.object_type),
+        child_data!(self, |file, d| match d {
+            NodeData::IndexedAccessTypeNode(d) => file.node(d.object_type),
             _ => field_panic(self, "ObjectType"),
         })
     }
@@ -705,9 +695,8 @@ impl Node {
     /// Go `node.AsX().IndexType` for: IndexedAccessTypeNode.
     #[must_use]
     pub fn index_type(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::IndexedAccessTypeNode(d) => Node::new(file, d.index_type),
+        child_data!(self, |file, d| match d {
+            NodeData::IndexedAccessTypeNode(d) => file.node(d.index_type),
             _ => field_panic(self, "IndexType"),
         })
     }
@@ -728,9 +717,8 @@ impl Node {
             );
             return type_name;
         }
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::TypeReferenceNode(d) => Node::new(file, d.type_name),
+        child_data!(self, |file, d| match d {
+            NodeData::TypeReferenceNode(d) => file.node(d.type_name),
             _ => field_panic(self, "TypeName"),
         })
     }
@@ -739,8 +727,7 @@ impl Node {
     /// Go `node.AsX().AssertsModifier` for: TypePredicateNode.
     #[must_use]
     pub fn asserts_modifier(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::TypePredicateNode(d) => opt_node(file, d.asserts_modifier),
             _ => field_panic(self, "AssertsModifier"),
         })
@@ -750,9 +737,8 @@ impl Node {
     /// Go `node.AsX().ParameterName` for: TypePredicateNode.
     #[must_use]
     pub fn parameter_name(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::TypePredicateNode(d) => Node::new(file, d.parameter_name),
+        child_data!(self, |file, d| match d {
+            NodeData::TypePredicateNode(d) => file.node(d.parameter_name),
             _ => field_panic(self, "ParameterName"),
         })
     }
@@ -761,9 +747,8 @@ impl Node {
     /// Go `node.AsX().Value` for: ImportAttribute.
     #[must_use]
     pub fn value(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ImportAttribute(d) => Node::new(file, d.value),
+        child_data!(self, |file, d| match d {
+            NodeData::ImportAttribute(d) => file.node(d.value),
             _ => field_panic(self, "Value"),
         })
     }
@@ -772,9 +757,8 @@ impl Node {
     /// Go `node.AsX().ExprName` for: TypeQueryNode.
     #[must_use]
     pub fn expr_name(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::TypeQueryNode(d) => Node::new(file, d.expr_name),
+        child_data!(self, |file, d| match d {
+            NodeData::TypeQueryNode(d) => file.node(d.expr_name),
             _ => field_panic(self, "ExprName"),
         })
     }
@@ -783,8 +767,7 @@ impl Node {
     /// Go `node.AsX().ReadonlyToken` for: MappedTypeNode.
     #[must_use]
     pub fn readonly_token(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::MappedTypeNode(d) => opt_node(file, d.readonly_token),
             _ => field_panic(self, "ReadonlyToken"),
         })
@@ -794,8 +777,7 @@ impl Node {
     /// Go `node.AsX().NameType` for: MappedTypeNode.
     #[must_use]
     pub fn name_type(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::MappedTypeNode(d) => opt_node(file, d.name_type),
             _ => field_panic(self, "NameType"),
         })
@@ -815,8 +797,7 @@ impl Node {
     /// Go `node.AsX().TupleNameSource` for: SyntheticExpression.
     #[must_use]
     pub fn tuple_name_source(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::SyntheticExpression(d) => opt_node(file, d.tuple_name_source),
             _ => field_panic(self, "TupleNameSource"),
         })
@@ -826,9 +807,8 @@ impl Node {
     /// Go `node.AsX().OpeningElement` for: JsxElement.
     #[must_use]
     pub fn opening_element(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::JsxElement(d) => Node::new(file, d.opening_element),
+        child_data!(self, |file, d| match d {
+            NodeData::JsxElement(d) => file.node(d.opening_element),
             _ => field_panic(self, "OpeningElement"),
         })
     }
@@ -837,9 +817,8 @@ impl Node {
     /// Go `node.AsX().ClosingElement` for: JsxElement.
     #[must_use]
     pub fn closing_element(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::JsxElement(d) => Node::new(file, d.closing_element),
+        child_data!(self, |file, d| match d {
+            NodeData::JsxElement(d) => file.node(d.closing_element),
             _ => field_panic(self, "ClosingElement"),
         })
     }
@@ -848,9 +827,8 @@ impl Node {
     /// Go `node.AsX().Namespace` for: JsxNamespacedName.
     #[must_use]
     pub fn namespace(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::JsxNamespacedName(d) => Node::new(file, d.namespace),
+        child_data!(self, |file, d| match d {
+            NodeData::JsxNamespacedName(d) => file.node(d.namespace),
             _ => field_panic(self, "Namespace"),
         })
     }
@@ -859,9 +837,8 @@ impl Node {
     /// Go `node.AsX().OpeningFragment` for: JsxFragment.
     #[must_use]
     pub fn opening_fragment(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::JsxFragment(d) => Node::new(file, d.opening_fragment),
+        child_data!(self, |file, d| match d {
+            NodeData::JsxFragment(d) => file.node(d.opening_fragment),
             _ => field_panic(self, "OpeningFragment"),
         })
     }
@@ -870,9 +847,8 @@ impl Node {
     /// Go `node.AsX().ClosingFragment` for: JsxFragment.
     #[must_use]
     pub fn closing_fragment(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::JsxFragment(d) => Node::new(file, d.closing_fragment),
+        child_data!(self, |file, d| match d {
+            NodeData::JsxFragment(d) => file.node(d.closing_fragment),
             _ => field_panic(self, "ClosingFragment"),
         })
     }
@@ -902,9 +878,8 @@ impl Node {
     /// Go `node.AsX().Constraint` for: JSDocTemplateTag, TypeParameterDeclaration.
     #[must_use]
     pub fn constraint(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::JsDocTemplateTag(d) => Node::new(file, d.constraint),
+        child_data!(self, |file, d| match d {
+            NodeData::JsDocTemplateTag(d) => file.node(d.constraint),
             NodeData::TypeParameterDeclaration(d) => opt_node(file, d.constraint),
             _ => field_panic(self, "Constraint"),
         })
@@ -914,9 +889,8 @@ impl Node {
     /// Go `node.AsX().NameExpression` for: JSDocSeeTag.
     #[must_use]
     pub fn name_expression(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::JsDocSeeTag(d) => Node::new(file, d.name_expression),
+        child_data!(self, |file, d| match d {
+            NodeData::JsDocSeeTag(d) => file.node(d.name_expression),
             _ => field_panic(self, "NameExpression"),
         })
     }
@@ -935,9 +909,8 @@ impl Node {
     /// Go `node.AsX().ModuleReference` for: ImportEqualsDeclaration.
     #[must_use]
     pub fn module_reference(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ImportEqualsDeclaration(d) => Node::new(file, d.module_reference),
+        child_data!(self, |file, d| match d {
+            NodeData::ImportEqualsDeclaration(d) => file.node(d.module_reference),
             _ => field_panic(self, "ModuleReference"),
         })
     }
@@ -946,8 +919,7 @@ impl Node {
     /// Go `node.AsX().ExportClause` for: ExportDeclaration.
     #[must_use]
     pub fn export_clause(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::ExportDeclaration(d) => opt_node(file, d.export_clause),
             _ => field_panic(self, "ExportClause"),
         })
@@ -967,9 +939,8 @@ impl Node {
     /// Go `node.AsX().Argument` for: ImportTypeNode.
     #[must_use]
     pub fn argument(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::ImportTypeNode(d) => Node::new(file, d.argument),
+        child_data!(self, |file, d| match d {
+            NodeData::ImportTypeNode(d) => file.node(d.argument),
             _ => field_panic(self, "Argument"),
         })
     }
@@ -978,8 +949,7 @@ impl Node {
     /// Go `node.AsX().Qualifier` for: ImportTypeNode.
     #[must_use]
     pub fn qualifier(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::ImportTypeNode(d) => opt_node(file, d.qualifier),
             _ => field_panic(self, "Qualifier"),
         })
@@ -999,8 +969,7 @@ impl Node {
     /// Go `node.AsX().NamedBindings` for: ImportClause.
     #[must_use]
     pub fn named_bindings(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::ImportClause(d) => opt_node(file, d.named_bindings),
             _ => field_panic(self, "NamedBindings"),
         })
@@ -1010,8 +979,7 @@ impl Node {
     /// Go `node.AsX().DefaultType` for: TypeParameterDeclaration.
     #[must_use]
     pub fn default_type(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::TypeParameterDeclaration(d) => opt_node(file, d.default_type),
             _ => field_panic(self, "DefaultType"),
         })
@@ -1021,9 +989,8 @@ impl Node {
     /// Go `node.AsX().ThisArg` for: SyntheticReferenceExpression.
     #[must_use]
     pub fn this_arg(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::SyntheticReferenceExpression(d) => Node::new(file, d.this_arg),
+        child_data!(self, |file, d| match d {
+            NodeData::SyntheticReferenceExpression(d) => file.node(d.this_arg),
             _ => field_panic(self, "ThisArg"),
         })
     }
@@ -1032,13 +999,12 @@ impl Node {
     /// Go `node.AsX().JSDocPropertyTags` for: JSDocTypeLiteral.
     #[must_use]
     pub fn js_doc_property_tags(self) -> Vec<Node> {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
+        child_data!(self, |file, d| match d {
             NodeData::JsDocTypeLiteral(d) => d
                 .js_doc_property_tags
                 .as_ref()
                 .map_or_else(Vec::new, |ids| {
-                    ids.iter().map(|&id| Node::new(file, id)).collect()
+                    ids.iter().map(|&id| file.node(id)).collect()
                 }),
             _ => field_panic(self, "JSDocPropertyTags"),
         })
@@ -1078,9 +1044,8 @@ impl Node {
     /// Go `node.AsX().EndOfFileToken` for: SourceFile.
     #[must_use]
     pub fn end_of_file_token(self) -> Node {
-        let file = self.file_index();
-        with_data!(self, |d| match d {
-            NodeData::SourceFile(d) => Node::new(file, d.end_of_file_token),
+        child_data!(self, |file, d| match d {
+            NodeData::SourceFile(d) => file.node(d.end_of_file_token),
             _ => field_panic(self, "EndOfFileToken"),
         })
     }

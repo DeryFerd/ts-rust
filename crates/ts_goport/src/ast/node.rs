@@ -48,32 +48,87 @@ macro_rules! sel_field {
     };
 }
 
+/// How a field read makes child nodes from the child ids of node data: the
+/// file id (`Node::new`, a registry lookup per child), or the id map of a
+/// published store that the read already looked up (`FrozenIds`, no
+/// lookup). Both give the same nodes.
+// PERF: perfP1 item 4 (perfscan2). A `by_data!` read looked up the block of
+// the file three times (the kind test, the data, the child id), and a
+// `fields.rs` read two times. Each lookup is an `OnceLock` acquire load, so
+// LLVM does not merge them. Go reads `n.data` and one field.
+pub(crate) trait ChildIds: Copy {
+    /// The file of the node data.
+    fn file(self) -> usize;
+    /// `Node::new(file, id)`.
+    fn node(self, id: crate::astdata::NodeId) -> Node;
+}
+
+impl ChildIds for usize {
+    #[inline]
+    fn file(self) -> usize {
+        self
+    }
+
+    #[inline]
+    fn node(self, id: crate::astdata::NodeId) -> Node {
+        Node::new(self, id)
+    }
+}
+
+impl ChildIds for FrozenIds {
+    #[inline]
+    fn file(self) -> usize {
+        FrozenIds::file(self)
+    }
+
+    #[inline]
+    fn node(self, id: crate::astdata::NodeId) -> Node {
+        let n = FrozenIds::node(self, id);
+        debug_assert_eq!(n, Node::new(self.file(), id));
+        n
+    }
+}
+
+/// Runs `read` out of line, as a cold call: the read of a node that is not a
+/// published static store node (synthetic, unpublished, or a node that a
+/// freeable parse owns), next to the inline fast path of an accessor.
+#[cold]
+#[inline(never)]
+pub(crate) fn cold_read<R>(read: impl FnOnce() -> R) -> R {
+    read()
+}
+
 /// Go `nil` for an optional child.
-fn opt(file: usize, id: Option<crate::astdata::NodeId>) -> Node {
+#[inline]
+fn opt(file: impl ChildIds, id: Option<crate::astdata::NodeId>) -> Node {
     match id {
-        Some(id) => Node::new(file, id),
+        Some(id) => file.node(id),
         None => Node::NIL,
     }
 }
 
 /// A required child.
-fn req(file: usize, id: crate::astdata::NodeId) -> Node {
-    Node::new(file, id)
+#[inline]
+fn req(file: impl ChildIds, id: crate::astdata::NodeId) -> Node {
+    file.node(id)
 }
 
 /// A required list.
-fn list(file: usize, l: &'static crate::astdata::NodeList) -> NodeList {
-    NodeList::from_ts(file, Some(l))
+#[inline]
+fn list(file: impl ChildIds, l: &'static crate::astdata::NodeList) -> NodeList {
+    NodeList::from_ts(file.file(), Some(l))
 }
 
 /// An optional list. `None` is Go `nil`.
-fn opt_list(file: usize, l: &'static Option<crate::astdata::NodeList>) -> NodeList {
-    NodeList::from_ts(file, l.as_ref())
+#[inline]
+fn opt_list(file: impl ChildIds, l: &'static Option<crate::astdata::NodeList>) -> NodeList {
+    NodeList::from_ts(file.file(), l.as_ref())
 }
 
 /// An optional modifier list. `None` is Go `nil`.
-fn mods(file: usize, m: &'static Option<crate::astdata::ModifierList>) -> ModifierList {
-    ModifierList::from_ts(file, m.as_ref())
+#[inline]
+fn mods(file: impl ChildIds, m: &'static Option<crate::astdata::ModifierList>) -> ModifierList {
+    ModifierList::from_ts(file.file(), m.as_ref())
 }
 
 /// A list read in place from the data of a node of `file`, parsed or
@@ -290,26 +345,36 @@ macro_rules! variant_has_kind {
     };
 }
 
-/// True when `n` is a published store node whose kind fits none of the listed
+/// True when kind `$kind` of a published store node fits none of the listed
 /// data variants. Such a node cannot hold the field, so the accessor gives
 /// its default without loading the node data.
 // Store data always fits the header kind (`alloc_store_node`). `Unknown` is
 // also the kind of nil and alias slots, so it takes the data path, which
 // keeps its panics.
+macro_rules! kind_lacks {
+    ($kind:expr, [$($v:ident),+]) => {{
+        let kind: SyntaxKind = $kind;
+        kind != SyntaxKind::Unknown $(&& !variant_has_kind!($v, kind))+
+    }};
+}
+
+/// True when `n` is a published store node whose kind fits none of the listed
+/// data variants (`kind_lacks!`).
 macro_rules! kind_lacks_data {
     ($n:expr, [$($v:ident),+]) => {
         match frozen_store_kind($n) {
-            Some(kind) => kind != SyntaxKind::Unknown $(&& !variant_has_kind!($v, kind))+,
+            Some(kind) => kind_lacks!(kind, [$($v),+]),
             None => false,
         }
     };
 }
 
-/// The data match of `by_data!`: `$data` is the loaded data of a node of
-/// file `$file_in`. The arms are those of `by_data!`.
+/// The data match of `by_data!`: `$data` is the loaded data of a node, and
+/// `$file_in` makes its children (`ChildIds`: the file id, or the id map of
+/// its store). The arms are those of `by_data!`.
 macro_rules! match_data {
     ($file_in:expr, $data:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$file:ident, $d:ident| $e:expr),+ $(,)?) => {{
-        let file: usize = $file_in;
+        let file = $file_in;
         match $data {
             $($(NodeData::$v($d) => {
                 let $file = file;
@@ -321,21 +386,37 @@ macro_rules! match_data {
 }
 
 /// Go field read by node data variant. Each arm lists `NodeData` variants,
-/// binds the variant data to `$d` and the node's file to `$file`, and
-/// evaluates `$e`. Other variants give `$def`.
+/// binds the variant data to `$d` and the node's children (`ChildIds`) to
+/// `$file`, and evaluates `$e`. Other variants give `$def`.
 ///
 /// PERF: a published store node whose kind fits no listed variant gives `$def`
-/// from its node record (`kind_lacks_data!`), without the pointer
+/// from its node record (`kind_lacks!`), without the pointer
 /// chase to its astdata node and data.
+// PERF: perfP1 item 4. A published static store node does one registry
+// lookup (`frozen_store_node`) for the kind test, the data and its child
+// ids (`ChildIds` for `FrozenIds`). Any other node takes the old path out
+// of line (`cold_read`).
 macro_rules! by_data {
     ($n:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$file:ident, $d:ident| $e:expr),+ $(,)?) => {{
         let node: Node = $n;
-        if kind_lacks_data!(node, [$($($v),+),+]) {
-            debug_assert!(!with_data!(node, |d| matches!(d, $($(NodeData::$v(_))|+)|+)));
-            $def
-        } else {
-            with_data!(node, |d| {
-                match_data!(node.file_index(), d, $def, $([$($v),+] => |$file, $d| $e),+)
+        'read: {
+            if let Some(f) = frozen_store_node(node) {
+                if kind_lacks!(f.kind(), [$($($v),+),+]) {
+                    debug_assert!(!with_data!(node, |d| matches!(d, $($(NodeData::$v(_))|+)|+)));
+                    break 'read $def;
+                }
+                if let Some(data) = f.data() {
+                    break 'read match_data!(f.ids(), data, $def, $([$($v),+] => |$file, $d| $e),+);
+                }
+            }
+            cold_read(|| {
+                if kind_lacks_data!(node, [$($($v),+),+]) {
+                    $def
+                } else {
+                    with_data!(node, |d| {
+                        match_data!(node.file_index(), d, $def, $([$($v),+] => |$file, $d| $e),+)
+                    })
+                }
             })
         }
     }};
@@ -344,20 +425,49 @@ macro_rules! by_data {
 /// Go list field read by node data variant: each arm lists `NodeData`
 /// variants and the field (`req`, `opt` or `mods`, see `sel_field!`).
 /// `$of` is `list_of` or `modifiers_of`. Other variants give `$def`. The
-/// `kind_lacks_data!` shortcut is the same as in `by_data!`.
+/// `kind_lacks!` shortcut is the same as in `by_data!`.
+// PERF: perfP1 item 4. As `by_data!`: one registry lookup for a published
+// static store node (`list_handle!` makes the handle from the data).
 macro_rules! list_by_data {
     ($n:expr, $of:ident, $def:expr, $([$($v:ident),+ $(,)?] => $how:ident $field:ident),+ $(,)?) => {{
         let node: Node = $n;
-        if kind_lacks_data!(node, [$($($v),+),+]) {
-            $def
-        } else {
-            $of!(node, |d| match d {
-                $($(NodeData::$v(d) => Some(sel_field!($how, d.$field)),)+)+
-                _ => None,
+        'read: {
+            if let Some(f) = frozen_store_node(node) {
+                if kind_lacks!(f.kind(), [$($($v),+),+]) {
+                    break 'read $def;
+                }
+                if let Some(data) = f.data() {
+                    break 'read match data {
+                        $($(NodeData::$v(d) => list_handle!($of, node.file_index(), sel_field!($how, d.$field)),)+)+
+                        _ => $def,
+                    };
+                }
+            }
+            cold_read(|| {
+                if kind_lacks_data!(node, [$($($v),+),+]) {
+                    $def
+                } else {
+                    $of!(node, |d| match d {
+                        $($(NodeData::$v(d) => Some(sel_field!($how, d.$field)),)+)+
+                        _ => None,
+                    })
+                    .unwrap_or($def)
+                }
             })
-            .unwrap_or($def)
         }
     }};
+}
+
+/// The handle that `list_of!` (a `NodeList`) or `modifiers_of!` (a
+/// `ModifierList`) makes from a list of the `'static` data of a node of
+/// file `$file` (`None` is Go `nil`).
+macro_rules! list_handle {
+    (list_of, $file:expr, $l:expr) => {
+        NodeList::from_ts($file, $l.map(AnyList::nodes))
+    };
+    (modifiers_of, $file:expr, $l:expr) => {
+        ModifierList::from_ts($file, $l.map(AnyList::modifiers))
+    };
 }
 
 /// True when `d` is the data of parsed node `n` (the `_in` debug checks).
@@ -854,12 +964,12 @@ macro_rules! own_question_token_accessor {
 }
 
 /// `Some(opt(file, id))`, for `own_question_token`.
-fn some_opt(file: usize, id: Option<crate::astdata::NodeId>) -> Option<Node> {
+fn some_opt(file: impl ChildIds, id: Option<crate::astdata::NodeId>) -> Option<Node> {
     Some(opt(file, id))
 }
 
 /// `Some(req(file, id))`, for `own_question_token`.
-fn some_req(file: usize, id: crate::astdata::NodeId) -> Option<Node> {
+fn some_req(file: impl ChildIds, id: crate::astdata::NodeId) -> Option<Node> {
     Some(req(file, id))
 }
 
@@ -2593,24 +2703,36 @@ impl Node {
     // A frozen store node whose kind is no locals container gives nil from
     // the kind table, without the binder data lookup. The binder sets locals
     // only on locals containers (debug_asserts in binder_p1 and binder_p2).
+    // PERF: perfP1 item 4. A published store node reads its kind and its
+    // bind word with one registry lookup (`frozen_bind_extra`).
     #[must_use]
     pub fn locals(self) -> SymbolTable {
-        if locals_container_variants!(kind_lacks_data! { self, }) {
-            debug_assert!(self.bind_extra(|e| e.locals.is_nil()));
-            return SymbolTable::NIL;
+        match frozen_store_node(self) {
+            Some(f) => {
+                if locals_container_variants!(kind_lacks! { f.kind(), }) {
+                    debug_assert!(self.bind_extra(|e| e.locals.is_nil()));
+                    return SymbolTable::NIL;
+                }
+                self.frozen_bind_extra(f, |e| e.locals)
+            }
+            None => self.bind_extra(|e| e.locals),
         }
-        self.bind_extra(|e| e.locals)
     }
 
     /// Go `LocalsContainerData().NextContainer`.
-    // PERF: U1 (d), as `locals`.
+    // PERF: U1 (d) and perfP1 item 4, as `locals`.
     #[must_use]
     pub fn next_container(self) -> Node {
-        if locals_container_variants!(kind_lacks_data! { self, }) {
-            debug_assert!(self.bind_extra(|e| e.next_container.is_nil()));
-            return Node::NIL;
+        match frozen_store_node(self) {
+            Some(f) => {
+                if locals_container_variants!(kind_lacks! { f.kind(), }) {
+                    debug_assert!(self.bind_extra(|e| e.next_container.is_nil()));
+                    return Node::NIL;
+                }
+                self.frozen_bind_extra(f, |e| e.next_container)
+            }
+            None => self.bind_extra(|e| e.next_container),
         }
-        self.bind_extra(|e| e.next_container)
     }
 
     /// Go `FlowNodeData().FlowNode`.
@@ -2651,15 +2773,34 @@ impl Node {
     #[inline]
     fn bind_extra<T>(self, field: impl FnOnce(&NodeBindExtra) -> T) -> T {
         match frozen_store_bind_and_file(self) {
-            Some((word, go_file)) if word & BIND_EXTRA != 0 => {
-                let extra = word & !BIND_EXTRA;
-                match go_file {
-                    Some(go_file) => field(node_extra_in(go_file, extra)),
-                    None => self.bind_extra_slow(extra, field),
-                }
-            }
-            Some(_) => field(&NodeBindExtra::NONE),
+            Some((word, go_file)) => self.bind_extra_of_word(word, go_file, field),
             None => field(&NodeBindExtra::of(&self.bind_miss())),
+        }
+    }
+
+    /// `bind_extra` of this node, whose view `f` the caller already read.
+    #[inline]
+    fn frozen_bind_extra<T>(self, f: FrozenNode, field: impl FnOnce(&NodeBindExtra) -> T) -> T {
+        let (word, go_file) = f.bind_and_file();
+        self.bind_extra_of_word(word, go_file, field)
+    }
+
+    /// `bind_extra` from the bind word of this node and the `GoFile` of a
+    /// static publish (`frozen_store_bind_and_file`).
+    #[inline]
+    fn bind_extra_of_word<T>(
+        self,
+        word: u32,
+        go_file: Option<&'static GoFile>,
+        field: impl FnOnce(&NodeBindExtra) -> T,
+    ) -> T {
+        if word & BIND_EXTRA == 0 {
+            return field(&NodeBindExtra::NONE);
+        }
+        let extra = word & !BIND_EXTRA;
+        match go_file {
+            Some(go_file) => field(node_extra_in(go_file, extra)),
+            None => self.bind_extra_slow(extra, field),
         }
     }
 
@@ -2858,7 +2999,7 @@ pub fn file_bind_data(file: Node) -> FileRef<FileBindData> {
 /// Go `AsCaseOrDefaultClause().Expression`. Nil for a default clause.
 // PORT: astdata stores a required expression id on both clause kinds. Go
 // leaves it nil for `default:`, so the kind decides.
-fn case_expression(n: Node, file: usize, id: crate::astdata::NodeId) -> Node {
+fn case_expression(n: Node, file: impl ChildIds, id: crate::astdata::NodeId) -> Node {
     if n.kind() == SyntaxKind::CaseClause {
         req(file, id)
     } else {
@@ -3122,16 +3263,32 @@ impl Node {
     // PERF: C2. A published store node whose data has no list gives nil from
     // the store column (`frozen_store_lacks_type_arguments`), without its
     // node data. A node with a list reads it from the data.
+    // PERF: perfP1 item 4. A published static store node reads the column
+    // and its data with one registry lookup.
     #[must_use]
     pub fn type_argument_list(self) -> NodeList {
-        if frozen_store_lacks_type_arguments(self) {
-            debug_assert!(
-                matches!(self.type_argument_list_data().0, ListRef::Nil),
-                "C2 type arguments column"
-            );
-            return NodeList::NIL;
+        if let Some(f) = frozen_store_node(self) {
+            if f.lacks_type_arguments() {
+                debug_assert!(
+                    matches!(self.type_argument_list_data().0, ListRef::Nil),
+                    "C2 type arguments column"
+                );
+                return NodeList::NIL;
+            }
+            if let Some(d) = f.data() {
+                let file = self.file_index();
+                return type_arguments_arms!(match_data!(file, d, None,), sel_type_arguments)
+                    .map_or(NodeList::NIL, |l| {
+                        NodeList::from_ts(file, l.map(AnyList::nodes))
+                    });
+            }
         }
-        self.type_argument_list_data()
+        cold_read(|| {
+            if frozen_store_lacks_type_arguments(self) {
+                return NodeList::NIL;
+            }
+            self.type_argument_list_data()
+        })
     }
 
     /// Go `TypeArgumentList()` from the node data (`type_arguments_arms!`).
