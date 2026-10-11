@@ -16,6 +16,9 @@ Parts (project roots are only read; edits are didChange overlays):
               12th .ts file of apps/server, packages/client-runtime and
               packages/shared, and every file where effect-tsgo 0.51.1 reports
               an Effect diagnostic (T3_EFFECT_FILES)
+  e1-effect-ce, e1-t3code-ce
+              the same files with only the ce requests (below). New parts keep
+              the traces and goldens of the parts above as they were.
 
 Requests per file:
   hover       declaration names, namespace members, yield* (at the keyword
@@ -34,13 +37,28 @@ Requests per file:
   symbols     documentSymbol
   inlay       inlayHint over the file with return type and variable type
               hints on
+  ce          (the -ce parts) completion where Effect adds comment and class
+              items: in an appended `// @` (trigger "@") and after
+              `extends Data.` in an appended class (trigger "."). One resolve
+              each. The completion probes above end at `// @effect-` and at
+              `extends `, where neither server gives Effect items (effectE6).
 
 Usage:
   lsp_battery_effect.py build [--out-root R] [--parts e1-effect,e1-t3code] [--t3code DIR]
-  lsp_battery_effect.py record [--out-root R] [--oracle E0] [--jobs N] [--only S] [--force]
-  lsp_battery_effect.py selfcheck [--out-root R] [--oracle E0] [--jobs N] [--runs N (16)]
-  lsp_battery_effect.py check --server BIN --label L [--out-root R] [--oracle E0] [--jobs N] [--only S]
+  lsp_battery_effect.py record [--out-root R] [--oracle E0] [--parts P] [--jobs N] [--only S] [--force]
+  lsp_battery_effect.py selfcheck [--out-root R] [--oracle E0] [--parts P] [--jobs N] [--runs N (16)]
+  lsp_battery_effect.py check --server BIN --label L [--out-root R] [--oracle E0] [--parts P] [--jobs N] [--only S]
   lsp_battery_effect.py list
+
+--parts (a comma list) limits record, selfcheck and check to those parts; the
+default is every part (lsp_oracle.py --battery e1). --only matches the file
+path in a part, not the part name.
+
+build reads the battery config from lsp-battery/b1.json beside lsp_battery.py.
+main has lsp_battery.py but no lsp-battery dir: run build with
+LSP_BATTERY_PY=<a checkout that has it, e.g. goport-int7>/scripts/goport/lsp_battery.py
+(the same file). A build that adds parts writes the old traces with the same
+bytes, so their goldens stay valid; record then records only the new ones.
 
 Defaults are in the main checkout's target/continuation-r97-goport: the parent
 of the git common dir from the main checkout or any worktree, or the main
@@ -255,11 +273,11 @@ def flow_refactor(tr, doc: be.Doc):
                    {**doc.td(), "range": doc.rng(t.start, t.end), "context": {"diagnostics": [], "triggerKind": 1}})
 
 
-def appended(tr, doc: be.Doc, text: bytes, at: int):
+def appended(tr, doc: be.Doc, text: bytes, at: int, trigger: str | None = None):
     """Append `text` at the end, complete at `at` bytes into it, then remove it."""
     end = len(doc.text)
     doc.change(tr, [(end, end, text)])
-    be.completion(tr, doc, end + at)
+    be.completion(tr, doc, end + at, trigger)
     doc.change(tr, [(end, end + len(text), b"")])
 
 
@@ -276,6 +294,14 @@ def flow_completion(tr, doc: be.Doc):
     if effect:
         sleep = f'\nvoid {effect}.sleep("10 ")'.encode()
         appended(tr, doc, sleep, len(sleep) - 2)
+
+
+def flow_comment_extends(tr, doc: be.Doc):
+    """The ce requests: Effect's comment items need `@` as the last character (`// @`), and its class
+    items need the accessed module (`extends Data.`). FindModuleIdentifier gives "Data" when the file
+    has no Data import, so every file gets the Data items."""
+    for text, trigger in ((b"\n// @", "@"), (b"\nclass __GoportEffect extends Data.", ".")):
+        appended(tr, doc, text, len(text), trigger)
 
 
 def flow_autoimport(tr, doc: be.Doc):
@@ -311,12 +337,16 @@ def flow_symbols_inlay(tr, doc: be.Doc):
     be.configure(tr, None)
 
 
-def file_trace(rel: str, text: bytes) -> "lb.Trace":
+FLOWS = (flow_hover, flow_quickfix, flow_refactor, flow_completion, flow_autoimport, flow_symbols_inlay)
+CE_FLOWS = (flow_comment_extends,)
+
+
+def file_trace(rel: str, text: bytes, flows) -> "lb.Trace":
     tr = lb.Trace()
     tr.request("initialize", be.initialize_params(be.UTF16))
     doc = be.Doc(rel, text, be.UTF16)
     doc.open(tr)
-    for flow in (flow_hover, flow_quickfix, flow_refactor, flow_completion, flow_autoimport, flow_symbols_inlay):
+    for flow in flows:
         flow(tr, doc)
     assert doc.text == text, rel
     return tr
@@ -352,7 +382,9 @@ def t3code_files(args) -> tuple[Path, list[str]]:
     return root, sorted(picked)
 
 
-PARTS = {f"{BATTERY}-effect": effect_files, f"{BATTERY}-t3code": t3code_files}
+# part name: (files, flows)
+PARTS = {f"{BATTERY}-effect": (effect_files, FLOWS), f"{BATTERY}-t3code": (t3code_files, FLOWS),
+         f"{BATTERY}-effect-ce": (effect_files, CE_FLOWS), f"{BATTERY}-t3code-ce": (t3code_files, CE_FLOWS)}
 
 
 def cmd_build(args) -> int:
@@ -364,12 +396,13 @@ def cmd_build(args) -> int:
     for name in names:
         if name not in PARTS:
             raise SystemExit(f"unknown part {name}; parts: {', '.join(PARTS)}")
-        root, rels = PARTS[name](args)
+        files, flows = PARTS[name]
+        root, rels = files(args)
         lb.guard_out(traces, [root, be.INPUTS])
         entries = []
         for rel in rels:
             text = lb.read_source(root / rel)
-            tr = file_trace(rel, text)
+            tr = file_trace(rel, text, flows)
             src = {"kind": "effect", "part": name, "file": rel, "complete": True,
                    "sha256": hashlib.sha256(text).hexdigest()}
             header = be.header(f"{name}/{rel}", src, {"kind": "project", "dir": str(root)}, be.UTF16)
@@ -406,7 +439,7 @@ def oracle(cmd: str, args, extra: list[str]) -> int:
                          "and pass --oracle BIN")
     if not (Path(args.out_root) / "traces" / f"{BATTERY}.index.json").is_file():
         raise SystemExit(f"no e1 traces in {args.out_root}/traces; run build, or pass --out-root R")
-    argv = [sys.executable, str(LSP_ORACLE), cmd, "--out-root", str(args.out_root), "--battery", BATTERY,
+    argv = [sys.executable, str(LSP_ORACLE), cmd, "--out-root", str(args.out_root), "--battery", args.parts or BATTERY,
             "--oracle", str(args.oracle), "--jobs", str(args.jobs)]
     if args.only:
         argv += ["--only", args.only]
@@ -417,9 +450,12 @@ def same_title_unmarked(args) -> tuple[int, list[str]]:
     """Counts the codeAction answers in the goldens with two actions of one title, and lists the ones
     that selfcheck has not marked multiset at the top array (pattern "") or unstable."""
     groot = Path(args.out_root) / "golden" / lb.file_sha(Path(args.oracle))[:12]
+    parts = args.parts.split(",") if args.parts else None
     total, unmarked = 0, []
     for gpath in sorted(groot.glob(f"{BATTERY}-*/**/*.golden.jsonl.gz")):
         name = str(gpath.relative_to(groot)).removesuffix(".golden.jsonl.gz")
+        if parts and name.split("/", 1)[0] not in parts:
+            continue
         if args.only and args.only not in name.split("/", 1)[1]:
             continue
         fpath = gpath.with_name(gpath.name.removesuffix(".golden.jsonl.gz") + ".flaky.json")
@@ -483,6 +519,7 @@ def main() -> int:
         p.add_argument("--out-root", default=str(DEFAULT_OUT_ROOT), help=f"default {DEFAULT_OUT_ROOT}")
         if oracle_args:
             p.add_argument("--oracle", default=str(DEFAULT_ORACLE), help="the E0 oracle (scripts/effect/build-oracle.sh)")
+            p.add_argument("--parts", help="comma list of parts (default: all)")
             p.add_argument("--jobs", type=int, default=4)
             p.add_argument("--only", help="only traces whose name contains this text")
 
