@@ -68,8 +68,8 @@ use std::time::{Duration, Instant};
 /// Go `chan *Message` with capacity 1 for one pending server-to-client call.
 /// PORT: with the instant at which the reader thread read the response
 /// (`read_on_thread`; `None` without it), for the Go clock, and whether it
-/// read it after the `ctx` of `run` was done (the late reply of
-/// `end_read_loop`).
+/// read it after the `ctx` of `run` was done (the late reply, from
+/// `end_read_loop` or from a nested wait, `next_for_call`).
 type ResponseChan = Rc<RefCell<Option<(Message, Option<Instant>, bool)>>>;
 
 // Go: ipc/conn_async.go:20 AsyncConn
@@ -263,7 +263,9 @@ impl AsyncConn {
             let Some((msg, read_at)) = reader.inbox.next_for_run() else {
                 break;
             };
-            self.dispatch_read(reader, msg, read_at, entered);
+            // No call waits while `run` dispatches, so a late reply here
+            // finds no call.
+            self.dispatch_read(reader, msg, read_at, entered, false);
         }
         self.end_read_loop(reader);
         if let Some(payload) = self.read_panic.take() {
@@ -358,17 +360,19 @@ impl AsyncConn {
     /// request or a notification runs as a frame of the Go clock (file
     /// header). Its lag starts with the time that it waited for the
     /// dispatch thread, which was busy from before `read_at` until
-    /// `entered`: Go started its goroutine at once. Returns whether a frame
-    /// ran.
+    /// `entered`: Go started its goroutine at once. `late`: the message was
+    /// read after the `ctx` of `run` was done (`after_cancel`); a response
+    /// goes to its call as the late reply. Returns whether a frame ran.
     fn dispatch_read(
         &self,
         reader: &RunReader,
         msg: Message,
         read_at: Instant,
         entered: Instant,
+        late: bool,
     ) -> bool {
         if msg.is_response() {
-            self.handle_response(msg, Some(read_at), false);
+            self.handle_response(msg, Some(read_at), late);
             return false;
         }
         let _frame = Frame::push(self, entered.saturating_duration_since(read_at));
@@ -683,10 +687,10 @@ impl AsyncConn {
     /// the call waits until its response comes, its channel closes or
     /// `ctx` is done, and dispatches the messages that come meanwhile (file
     /// header). It returns what wakes Go's `select` first
-    /// (`Inbox::next_for_call`; a late reply loses to a done `ctx`,
-    /// `end_read_loop`). A call made when `ctx` is already done returns
-    /// `ctx.Err()` right after its write. `wrote`: when the call wrote its
-    /// request.
+    /// (`Inbox::next_for_call`; a late reply loses to a done `ctx`, also
+    /// when a nested wait or `end_read_loop` gave it). A call made when
+    /// `ctx` is already done returns `ctx.Err()` right after its write.
+    /// `wrote`: when the call wrote its request.
     fn wait_on_reader(
         &self,
         ctx: &Context,
@@ -729,8 +733,8 @@ impl AsyncConn {
             }
             let entered = Instant::now();
             match reader.inbox.next_for_call(ctx) {
-                CallStep::Message(msg, read_at) => {
-                    if self.dispatch_read(reader, msg, read_at, entered) {
+                CallStep::Message(msg, (read_at, late)) => {
+                    if self.dispatch_read(reader, msg, read_at, entered, late) {
                         held_until = Some(Instant::now());
                     }
                 }
@@ -961,8 +965,9 @@ enum ReadEnd {
 
 /// What a waiting `call` does next (`Inbox::next_for_call`).
 enum CallStep {
-    /// Dispatch this message, read then.
-    Message(Message, Instant),
+    /// Dispatch this message, read then. `true` when it is the message read
+    /// after the `ctx` of `run` was done (`after_cancel`, the late reply).
+    Message(Message, (Instant, bool)),
     /// Return this error of the call's `ctx`.
     Canceled(GoError),
     /// The read loop ended: run `end_read_loop`, which closes the call.
@@ -1003,8 +1008,10 @@ impl Inbox {
     ///   (`after_cancel`), when the call's `ctx` is not done: Go's `Run`
     ///   dispatched it (:94-110) before it returned and its deferred
     ///   `closePendingCalls` ran. It can be any message: a response goes to
-    ///   its call (:96), and a request or a notification runs nested in the
-    ///   call's wait, where Go started its goroutine (:98, :108).
+    ///   its call (:96) as the late reply, and a request or a notification
+    ///   runs nested in the call's wait, where Go started its goroutine
+    ///   (:98, :108). The late reply can be for an outer call whose `ctx`
+    ///   is done: its `select` took `ctx.Done()` at the signal (:290).
     /// - The end of a loop that ended before `ctx` was done (EOF, a read
     ///   error): Go's `closePendingCalls` runs before `cancelHandlers`.
     /// - `ctx` done. After a signal the loop ends only at its next read (1
@@ -1018,7 +1025,7 @@ impl Inbox {
                 .iter()
                 .position(|(msg, _)| canceled.is_none() || msg.is_response());
             if let Some((msg, read_at)) = next.and_then(|i| state.messages.remove(i)) {
-                return CallStep::Message(msg, read_at);
+                return CallStep::Message(msg, (read_at, false));
             }
             // PORT: a call whose `ctx` is not the `ctx` of `run` (nor made
             // from it). A call with a `ctx` that is done takes no
@@ -1028,7 +1035,7 @@ impl Inbox {
             if canceled.is_none()
                 && let Some((msg, read_at)) = state.after_cancel.take()
             {
-                return CallStep::Message(msg, read_at);
+                return CallStep::Message(msg, (read_at, true));
             }
             if state.ended && !state.ended_after_cancel {
                 return CallStep::Ended;
@@ -2594,6 +2601,70 @@ pub(crate) mod tests {
             assert_eq!(
                 late_reply("hcall", nested),
                 [after, "hcall | context canceled".to_string()]
+            );
+        }
+    }
+
+    /// Runs `outer` (id 1), which calls the client back (api1), and in its
+    /// wait `inner` (id 2), which calls it back too (api2). Then cancels
+    /// the `ctx` of `run` and answers `late_id`: the 1 message read after
+    /// the signal, which ends the read loop. Returns the notes of `inner`
+    /// and `outer`.
+    fn nested_late_reply(outer: &str, inner: &str, late_id: &str) -> [String; 2] {
+        let (ctx, cancel) = context::with_cancel(&context::background());
+        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        for (id, method, api) in [(1, outer, "api1"), (2, inner, "api2")] {
+            let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}"}}"#);
+            write_framed(&client, &body);
+            let call = read_framed(&client);
+            assert!(call.contains(&format!(r#""id":"{api}""#)), "{call}");
+        }
+        // The reader thread waits in its next read.
+        std::thread::sleep(Duration::from_millis(50));
+        cancel();
+        let body = format!(r#"{{"jsonrpc":"2.0","id":"{late_id}","result":true}}"#);
+        write_framed(&client, &body);
+        let note = |what: &str| notes.recv_timeout(Duration::from_secs(5)).expect(what);
+        let both = [note("inner returned"), note("outer returned")];
+        let result = run_done
+            .recv_timeout(Duration::from_secs(5))
+            .expect("run returned");
+        assert_eq!(result, Err("context canceled".to_string()));
+        runner.join().expect("run thread");
+        both
+    }
+
+    // PORT: no Go test; Go `Run` and `Call` (ipc/conn_async.go:87-96,
+    // :289-303). Two calls wait at a signal (the port runs the second
+    // request nested in the first call's wait), then `Run` reads the late
+    // reply. A call whose `ctx` was done at the signal returns `context
+    // canceled`, also when the nested wait takes the reply for it: Go's
+    // `select` took `ctx.Done()` before `Run` read the reply. A call whose
+    // `ctx` is not done returns its reply, or `terminal` when the reply is
+    // for the other call.
+    #[test]
+    fn test_async_conn_reader_nested_wait_gives_the_late_reply_to_its_call() {
+        let closed = "ipc: connection closed\ncontext canceled";
+        let canceled = "context canceled";
+        // (outer, inner, late reply, Go inner result, Go outer result)
+        let shapes = [
+            ("hcall", "bgcall", "api1", closed, canceled),
+            ("bgcall", "bgcall", "api1", closed, "ok"),
+            ("bgcall", "bgcall", "api2", "ok", closed),
+            ("hcall", "hcall", "api1", canceled, canceled),
+            ("bgcall", "hcall", "api1", canceled, "ok"),
+            ("bgcall", "hcall", "api2", canceled, closed),
+            ("hcall", "bgcall", "api2", "ok", canceled),
+            ("hcall", "hcall", "api2", canceled, canceled),
+        ];
+        for (outer, inner, late_id, go_inner, go_outer) in shapes {
+            assert_eq!(
+                nested_late_reply(outer, inner, late_id),
+                [
+                    format!("{inner} | {go_inner}"),
+                    format!("{outer} | {go_outer}")
+                ],
+                "outer {outer}, inner {inner}, late reply {late_id}"
             );
         }
     }
