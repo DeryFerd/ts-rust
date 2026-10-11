@@ -85,6 +85,7 @@ mod contentmapper_test;
 mod customconfigfilename_test;
 mod dirty_syncmap_test;
 mod effect_autoimport_style_test;
+mod effect_document_symbols_test;
 mod effect_fixables_test;
 mod effect_ls_hooks_test;
 mod effect_ls_layer_hover_test;
