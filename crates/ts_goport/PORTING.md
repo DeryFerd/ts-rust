@@ -783,9 +783,18 @@ goroutine trace. A site that knows Go's fault address uses
 `core::go_nil_dereference_at(address)`, and the port prints the line with
 `pc=0x0`: Go's `pc` is an instruction of its own binary (0xc5efe9 in
 tsgo-oracle-fed0bf24149f). The d.ts signature site
-(`diagnostic_to_string_builder`) has it (0x68). The other
-`go_nil_dereference()` sites still print no signal line: each needs its
-fault address from the pinned Go. The signal stays with the goroutine
+(`diagnostic_to_string_builder`) has it (0x68). gopanicout2 gave 39 more
+sites their address: the CLI, build, checker, transformer, API and IPC
+sites, and the LSP sites that a client message reaches (a nil element in
+`changes` or `files`, a code lens without `data`). Each address is the
+first load through the nil pointer in Go's compiled code, read from
+`go tool objdump` of the pinned oracle; 6 of them are checked against
+Go's own output (tests/go_nil_signal.rs). The other `go_nil_dereference()`
+sites print no signal line: the `checker::types` accessors (Go returns a
+nil pointer there, and the fault address is the field that each caller
+reads) and LSP and project sites that no known input reaches (Go N'
+answers a request or notification whose `params` is null with
+InvalidParams, so the `params` sites are not reached). The signal stays with the goroutine
 until a recovery completes, so a panic in the deferred function that
 recovered a nil dereference keeps the line (`core::go_after_recover`).
 
@@ -796,10 +805,21 @@ gave in repeated runs (gopanicout1 `go-model.md`): in the CLI modes, and
 in the API build without the `writeFile` callback or single-threaded,
 every other file in full (the flush leaves out only the panicking d.ts).
 In the API build with the callback each write waits for a client answer,
-so the panic mostly wins: after the failed write, `flush_client_writes`
-makes the other outputs before the declarations and no other file's
-declaration (`--async`), or only the panicking file's own outputs before
-its d.ts (sync msgpack, whose calls go one at a time).
+so the panic mostly wins. Both the client's calls and the written files
+are one of Go's results (gopanicout2 `go-model.md`). After the failed
+write, `flush_client_writes` makes the other outputs before the
+declarations and, for a failed declaration output, the rest of its round,
+and no other declaration (`--async`). With sync msgpack, whose calls go
+one at a time, every file's first output is called; a failure there
+writes the next file's first output too, and a later failure calls the
+next file's output of its round without its write
+(`flush_serialized_client_writes`).
+
+The LSP request recover (`Server::recover_guard`) and the API session
+recover are `core::go_recover`: a Go `recover()` sees only its own
+goroutine, so a Go panic in a work group task under a request ends the
+process. The recover logs the port site of a Go panic in place of Go's
+`debug.Stack()` text.
 
 ## Process start
 
