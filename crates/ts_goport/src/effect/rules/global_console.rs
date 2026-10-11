@@ -58,16 +58,13 @@ fn run_global_console(ctx: &mut RuleContext<'_, '_>, check_in_effect: bool) -> V
     }
 
     let mut diags: Vec<Diagnostic> = Vec::new();
-    fn walk(
+    fn visit(
         ctx: &mut RuleContext<'_, '_>,
         diags: &mut Vec<Diagnostic>,
         message: &'static Message,
         check_in_effect: bool,
         node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
+    ) {
         if node.kind() == SyntaxKind::CallExpression {
             let in_effect = ctx
                 .tp
@@ -93,13 +90,14 @@ fn run_global_console(ctx: &mut RuleContext<'_, '_>, check_in_effect: bool) -> V
                 }
             }
         }
-
-        node.for_each_child(|child| walk(ctx, diags, message, check_in_effect, child));
-        false
     }
 
     let sf = ctx.source_file;
-    walk(ctx, &mut diags, message, check_in_effect, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diags, message, check_in_effect, n);
+    }
 
     diags
 }

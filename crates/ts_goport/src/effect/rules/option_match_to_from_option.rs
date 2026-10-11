@@ -244,25 +244,16 @@ fn analyze_option_conditionals(
     sf: Node,
 ) -> Vec<OptionMatchToFromOptionMatch> {
     let mut matches = Vec::new();
-    fn visit(
-        tp: &mut TypeParser<'_>,
-        sf: Node,
-        node: Node,
-        matches: &mut Vec<OptionMatchToFromOptionMatch>,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
+    // PERF: Go walks the tree under the file; the node order has the same
+    // nodes in the same order after the file node (effperf4).
+    for &node in tp.node_order(sf).nodes().iter().skip(1) {
         if node.kind() == SyntaxKind::ConditionalExpression {
             let (m, ok) = analyze_option_conditional(tp, sf, node);
             if ok {
                 matches.push(m);
             }
         }
-        node.for_each_child(|child| visit(tp, sf, child, matches));
-        false
     }
-    sf.for_each_child(|child| visit(tp, sf, child, &mut matches));
     matches
 }
 

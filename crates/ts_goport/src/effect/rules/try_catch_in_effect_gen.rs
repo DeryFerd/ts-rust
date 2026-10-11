@@ -19,11 +19,7 @@ pub static TRY_CATCH_IN_EFFECT_GEN: Rule = Rule {
 };
 
 fn run_try_catch_in_effect_gen(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
-    fn walk(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, n: Node) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    fn visit(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, n: Node) {
         if n.kind() == SyntaxKind::TryStatement {
             let try_stmt = n;
             if try_stmt.catch_clause().is_some() {
@@ -32,14 +28,15 @@ fn run_try_catch_in_effect_gen(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic>
                 }
             }
         }
-
-        n.for_each_child(|child| walk(ctx, diags, child));
-        false
     }
 
     let mut diags = Vec::new();
     let sf = ctx.source_file;
-    walk(ctx, &mut diags, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diags, n);
+    }
     diags
 }
 

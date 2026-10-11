@@ -49,16 +49,7 @@ pub struct UnnecessaryPipeMatch {
 /// AnalyzeUnnecessaryPipe finds all pipe() and .pipe() calls with no transformation
 /// arguments, returning matches with both the diagnostic and the parsed result.
 pub fn analyze_unnecessary_pipe(tp: &mut TypeParser<'_>, sf: Node) -> Vec<UnnecessaryPipeMatch> {
-    fn walk(
-        tp: &mut TypeParser<'_>,
-        sf: Node,
-        matches: &mut Vec<UnnecessaryPipeMatch>,
-        n: Node,
-    ) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    fn visit(tp: &mut TypeParser<'_>, sf: Node, matches: &mut Vec<UnnecessaryPipeMatch>, n: Node) {
         if n.kind() == SyntaxKind::CallExpression {
             if let Some(result) = tp.parse_pipe_call(n) {
                 if result.args.is_empty() {
@@ -70,12 +61,13 @@ pub fn analyze_unnecessary_pipe(tp: &mut TypeParser<'_>, sf: Node) -> Vec<Unnece
                 }
             }
         }
-
-        n.for_each_child(|child| walk(tp, sf, matches, child));
-        false
     }
 
     let mut matches = Vec::new();
-    walk(tp, sf, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, n);
+    }
     matches
 }

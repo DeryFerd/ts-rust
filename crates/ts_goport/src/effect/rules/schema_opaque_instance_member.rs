@@ -20,7 +20,7 @@ pub static SCHEMA_OPAQUE_INSTANCE_MEMBER: Rule = Rule {
 fn run_schema_opaque_instance_member(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    fn walk(ctx: &mut RuleContext<'_, '_>, diagnostics: &mut Vec<Diagnostic>, node: Node) -> bool {
+    fn visit(ctx: &mut RuleContext<'_, '_>, diagnostics: &mut Vec<Diagnostic>, node: Node) {
         if (node.kind() == SyntaxKind::ClassDeclaration
             || node.kind() == SyntaxKind::ClassExpression)
             && ctx.tp.extends_schema_opaque(node).is_some()
@@ -38,12 +38,14 @@ fn run_schema_opaque_instance_member(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagn
                 }
             }
         }
-        node.for_each_child(|child| walk(ctx, diagnostics, child));
-        false
     }
 
     let sf = ctx.source_file;
-    walk(ctx, &mut diagnostics, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diagnostics, n);
+    }
     diagnostics
 }
 
