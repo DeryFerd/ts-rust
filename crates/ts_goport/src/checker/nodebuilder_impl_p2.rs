@@ -849,7 +849,7 @@ impl Checker {
         let e = nb_e(b);
         let (declaration, mapped_mapper) = {
             let mapped = self.ty(t).as_mapped_type();
-            (mapped.declaration, mapped.object.mapper)
+            (mapped.declaration(), mapped.object.mapper)
         };
         let mut readonly_token = Node::NIL;
         if declaration.readonly_token().is_some() {
