@@ -550,8 +550,8 @@ fn api_sync_signal_while_a_callback_waits() {
     tsgo.signal(Signal::INT);
     tsgo.expect_alive(what);
     let start = Instant::now();
-    // [CallResponse, "readFile", null]
-    tsgo.send(b"\x93\x02\xc4\x08readFile\xc4\x04null");
+    // [CallResponse, "readFile", {"kind":"useOS"}]
+    tsgo.send(b"\x93\x02\xc4\x08readFile\xc4\x10{\"kind\":\"useOS\"}");
     tsgo.expect_end_with_stderr(start, what, 2, REPANICKED_CANCELED);
 }
 
@@ -1281,9 +1281,13 @@ impl Tsgo {
         }
     }
 
-    /// Answers the callback request `id` with null (the real file system).
+    /// Answers the callback request `id` with `useOS` (the real file
+    /// system). Go N' `decodeCallbackResponse` (api/callbackfs.go:132)
+    /// panics on a response with no kind, such as null.
     fn reply(&mut self, id: &str) {
-        self.send_json(&format!(r#"{{"jsonrpc":"2.0","id":"{id}","result":null}}"#));
+        self.send_json(&format!(
+            r#"{{"jsonrpc":"2.0","id":"{id}","result":{{"kind":"useOS"}}}}"#
+        ));
     }
 
     /// Makes build orchestrator 1 for the project in `dir`.
