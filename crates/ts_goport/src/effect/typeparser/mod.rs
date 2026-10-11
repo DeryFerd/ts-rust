@@ -333,9 +333,22 @@ impl<'c> TypeParser<'c> {
     }
 
     /// Go `tp.links`.
+    // PERF: inlined, so a `cached!` reads the links with no call. `new` makes
+    // them, so the cold path that builds them (60 maps) stays out of line
+    // (effperf3 item 4).
+    #[inline]
     pub fn links(&mut self) -> &mut EffectLinks {
-        self.checker.effect_links.get_or_insert_with(Box::default)
+        match self.checker.effect_links {
+            Some(ref mut links) => links,
+            None => new_links(&mut self.checker.effect_links),
+        }
     }
+}
+
+#[cold]
+#[inline(never)]
+fn new_links(links: &mut Option<Box<EffectLinks>>) -> &mut EffectLinks {
+    links.insert(Box::default())
 }
 
 // PORT: no Go counterpart. The small cache slots of `EffectLinks` keep Go's
