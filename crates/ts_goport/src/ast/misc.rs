@@ -1650,38 +1650,141 @@ pub fn new_flow_reduce_label_data(
 // functionflags.go (FunctionFlags consts are in `crate::flags`)
 // ---------------------------------------------------------------------------
 
+/// Go `*ast.BodyBase` of a node (`body_data`), with the node's kind.
+#[derive(Clone, Copy, Debug)]
+pub struct BodyData {
+    pub kind: SyntaxKind,
+    pub asterisk_token: Node,
+    pub body: Node,
+}
+
+/// The fields of Go `*ast.ParameterDeclaration` that the grammar and arity
+/// checks read (`parameter_parts`).
+#[derive(Clone, Copy, Debug)]
+pub struct ParameterParts {
+    pub dot_dot_dot_token: Node,
+    pub question_token: Node,
+    pub initializer: Node,
+}
+
+/// Go `nil` for an optional child id of the node data of a node in `file`.
+fn child_node(file: usize, id: Option<crate::astdata::NodeId>) -> Node {
+    id.map_or(Node::NIL, |id| Node::new(file, id))
+}
+
+// Go: ast.go:220 BodyData (read by ast/functionflags.go:17 GetFunctionFlags)
+/// Go `node.BodyData()`: the kind, `AsteriskToken` and `Body` of a node that
+/// embeds `BodyBase`, from one node data load. `None` for any other node (Go
+/// `BodyData()` is nil).
+// PERF: portonly1 item 3. `get_function_flags` read the kind, the asterisk
+// and the body with one lookup each. Go reads one struct.
+// PORT: here, not in `node.rs`: `node.rs` is a key source of the lib blobs.
+#[must_use]
+pub fn body_data(node: Node) -> Option<BodyData> {
+    use crate::ast::synthetic::with_data;
+    use crate::astdata::NodeData;
+    let file = node.file_index();
+    let parts = |kind, asterisk, body| {
+        Some(BodyData {
+            kind,
+            asterisk_token: child_node(file, asterisk),
+            body: child_node(file, body),
+        })
+    };
+    let data = with_data!(node, |d| match d {
+        NodeData::FunctionDeclaration(d) => {
+            parts(SyntaxKind::FunctionDeclaration, d.asterisk_token, d.body)
+        }
+        NodeData::MethodDeclaration(d) => {
+            parts(SyntaxKind::MethodDeclaration, d.asterisk_token, d.body)
+        }
+        NodeData::ConstructorDeclaration(d) => {
+            parts(SyntaxKind::Constructor, d.asterisk_token, d.body)
+        }
+        NodeData::GetAccessorDeclaration(d) => {
+            parts(SyntaxKind::GetAccessor, d.asterisk_token, d.body)
+        }
+        NodeData::SetAccessorDeclaration(d) => {
+            parts(SyntaxKind::SetAccessor, d.asterisk_token, d.body)
+        }
+        NodeData::FunctionExpression(d) => {
+            parts(
+                SyntaxKind::FunctionExpression,
+                d.asterisk_token,
+                Some(d.body),
+            )
+        }
+        NodeData::ArrowFunction(d) => {
+            parts(SyntaxKind::ArrowFunction, d.asterisk_token, Some(d.body))
+        }
+        NodeData::ModuleDeclaration(d) => {
+            parts(SyntaxKind::ModuleDeclaration, d.asterisk_token, d.body)
+        }
+        _ => None,
+    });
+    debug_assert!(
+        data.is_none_or(|d| d.kind == node.kind()
+            && d.body == node.body()
+            && d.asterisk_token == node.asterisk_token()),
+        "body data"
+    );
+    data
+}
+
+// Go: ast/ast_generated.go:9158 AsParameterDeclaration (its DotDotDotToken,
+// QuestionToken and Initializer fields)
+/// Go `node.AsParameterDeclaration()`: its `DotDotDotToken`, `QuestionToken`
+/// and `Initializer`, from one node data load. `None` when the node data is
+/// not a parameter declaration.
+// PERF: portonly1 item 3. `check_grammar_parameter_list` and
+// `is_arity_smaller` read the three fields of each parameter with one lookup
+// each. Go reads one struct.
+// PORT: here, not in `node.rs`: `node.rs` is a key source of the lib blobs.
+#[must_use]
+pub fn parameter_parts(node: Node) -> Option<ParameterParts> {
+    use crate::ast::synthetic::with_data;
+    use crate::astdata::NodeData;
+    let file = node.file_index();
+    let parts = with_data!(node, |d| match d {
+        NodeData::ParameterDeclaration(d) => Some(ParameterParts {
+            dot_dot_dot_token: child_node(file, d.dot_dot_dot_token),
+            question_token: child_node(file, d.question_token),
+            initializer: child_node(file, d.initializer),
+        }),
+        _ => None,
+    });
+    debug_assert!(
+        parts.is_none_or(|p| p.dot_dot_dot_token == node.dot_dot_dot_token()
+            && p.question_token == node.question_token()
+            && p.initializer == node.initializer()),
+        "parameter parts"
+    );
+    parts
+}
+
 // Go: ast/functionflags.go:13 GetFunctionFlags
+// PERF: portonly1 item 3. Go reads `node.BodyData()` once (functionflags.go:17)
+// and then its `AsteriskToken` and `Body` fields. `body_data` reads the kind,
+// the asterisk and the body with one node data load, not one lookup each.
 #[must_use]
 pub fn get_function_flags(node: Node) -> FunctionFlags {
     if node.is_nil() {
         return FunctionFlags::INVALID;
     }
-    // PORT: Go `node.BodyData()` is non-nil exactly for the kinds that embed
+    // Go `node.BodyData()` is non-nil exactly for the kinds that embed
     // `BodyBase` (FunctionDeclaration, MethodDeclaration, Constructor,
     // Get/SetAccessor, FunctionExpression, ArrowFunction, ModuleDeclaration).
-    // `data.AsteriskToken` / `data.Body` are read with the field accessors.
-    let has_body_data = matches!(
-        node.kind(),
-        SyntaxKind::FunctionDeclaration
-            | SyntaxKind::MethodDeclaration
-            | SyntaxKind::Constructor
-            | SyntaxKind::GetAccessor
-            | SyntaxKind::SetAccessor
-            | SyntaxKind::FunctionExpression
-            | SyntaxKind::ArrowFunction
-            | SyntaxKind::ModuleDeclaration
-    );
-    if !has_body_data {
+    let Some(data) = body_data(node) else {
         return FunctionFlags::INVALID;
-    }
+    };
     let mut flags = FunctionFlags::NORMAL;
-    match node.kind() {
+    match data.kind {
         SyntaxKind::FunctionDeclaration
         | SyntaxKind::FunctionExpression
         | SyntaxKind::MethodDeclaration
         | SyntaxKind::ArrowFunction => {
             // Go: generator check, then `fallthrough` to the ArrowFunction case.
-            if node.kind() != SyntaxKind::ArrowFunction && node.asterisk_token().is_some() {
+            if data.kind != SyntaxKind::ArrowFunction && data.asterisk_token.is_some() {
                 flags |= FunctionFlags::GENERATOR;
             }
             if has_syntactic_modifier(node, ModifierFlags::ASYNC) {
@@ -1690,7 +1793,7 @@ pub fn get_function_flags(node: Node) -> FunctionFlags {
         }
         _ => {}
     }
-    if node.body().is_nil() {
+    if data.body.is_nil() {
         flags |= FunctionFlags::INVALID;
     }
     flags
