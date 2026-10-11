@@ -299,19 +299,10 @@ macro_rules! variant_has_kind {
 macro_rules! kind_lacks_data {
     ($n:expr, [$($v:ident),+]) => {
         match frozen_store_kind($n) {
-            Some(kind) => kind_lacks!(kind, [$($v),+]),
+            Some(kind) => kind != SyntaxKind::Unknown $(&& !variant_has_kind!($v, kind))+,
             None => false,
         }
     };
-}
-
-/// `kind_lacks_data!` for kind `$kind` of a published store node: true when
-/// the kind fits none of the listed data variants.
-macro_rules! kind_lacks {
-    ($kind:expr, [$($v:ident),+]) => {{
-        let kind: SyntaxKind = $kind;
-        kind != SyntaxKind::Unknown $(&& !variant_has_kind!($v, kind))+
-    }};
 }
 
 /// The data match of `by_data!`: `$data` is the loaded data of a node of
@@ -5904,129 +5895,78 @@ pub fn is_declaration_node(node: Node) -> bool {
     with_data!(node, |d| is_declaration_data(d))
 }
 
-/// Expands `$mac! { $($args)* [variants] }` with the `NodeData` variants
-/// of the Go node types that embed `DeclarationBase` (`is_declaration_data`,
-/// `declaration_by_kind`).
-macro_rules! declaration_variants {
-    ($mac:ident! { $($args:tt)* }) => {
-        $mac! {
-            $($args)*
-            [
-                ArrowFunction,
-                BinaryExpression,
-                BindingElement,
-                CallExpression,
-                CallSignatureDeclaration,
-                ClassDeclaration,
-                ClassExpression,
-                ClassStaticBlockDeclaration,
-                ConstructSignatureDeclaration,
-                ConstructorDeclaration,
-                ConstructorTypeNode,
-                EnumDeclaration,
-                EnumMember,
-                ExportAssignment,
-                ExportDeclaration,
-                ExportSpecifier,
-                FunctionDeclaration,
-                FunctionExpression,
-                FunctionTypeNode,
-                GetAccessorDeclaration,
-                ImportClause,
-                ImportDeclaration,
-                ImportEqualsDeclaration,
-                ImportSpecifier,
-                IndexSignatureDeclaration,
-                InterfaceDeclaration,
-                JsDocSignature,
-                JsDocTypeLiteral,
-                JsxAttribute,
-                JsxAttributes,
-                JsxSpreadAttribute,
-                MappedTypeNode,
-                MethodDeclaration,
-                MethodSignatureDeclaration,
-                MissingDeclaration,
-                ModuleDeclaration,
-                NamedTupleMember,
-                NamespaceExport,
-                NamespaceExportDeclaration,
-                NamespaceImport,
-                NoSubstitutionTemplateLiteral,
-                NotEmittedTypeElement,
-                ObjectLiteralExpression,
-                ParameterDeclaration,
-                PropertyAssignment,
-                PropertyDeclaration,
-                PropertySignatureDeclaration,
-                SemicolonClassElement,
-                SetAccessorDeclaration,
-                ShorthandPropertyAssignment,
-                SourceFile,
-                SpreadAssignment,
-                TypeAliasDeclaration,
-                TypeLiteralNode,
-                TypeParameterDeclaration,
-                VariableDeclaration
-            ]
-        }
-    };
-}
-
 /// `is_declaration_node` on the view of a node (`NodeRef`): a published
-/// store node answers from its kind when the kind decides it
-/// (`declaration_by_kind`), else from its data with no second registry
-/// lookup.
-// PERF: perfP1 item 5 (perfscan2). Go `DeclarationData() != nil` reads
-// `n.data`. Here the kind column is next to the parent and kind reads of
-// the predicates, and the node data is a pointer chase to a separate box.
+/// store node reads its data with no second registry lookup.
 #[inline]
 #[must_use]
 pub fn is_declaration_node_ref(node: NodeRef) -> bool {
-    if node.has_block()
-        && let Some(answer) = declaration_by_kind(node.kind())
-    {
-        debug_assert_eq!(
-            answer,
-            is_declaration_node(node.node()),
-            "{:?}",
-            node.kind()
-        );
-        return answer;
-    }
     match node.data() {
         Some(d) => is_declaration_data(d),
         None => is_declaration_node(node.node()),
     }
 }
 
-/// `is_declaration_data` of a store node of kind `kind`, when the kind
-/// decides it, else `None`. Store data always fits the kind of its slot
-/// (`NodeData::matches_syntax_kind`): a kind that fits no listed variant
-/// gives false. A kind that fits a listed variant gives true when no other
-/// variant fits it: each kind outside the token and keyword ranges fits one
-/// variant only (its own, or the one `variant_has_kind!` names). A token
-/// or keyword kind can also hold `Token`, `KeywordExpression` or
-/// `KeywordTypeNode` data, and `Unknown` is the kind of nil and alias
-/// slots: those read the data.
-#[inline]
-fn declaration_by_kind(kind: SyntaxKind) -> Option<bool> {
-    if declaration_variants!(kind_lacks! { kind, }) {
-        return Some(false);
-    }
-    if matches!(kind, SyntaxKind::Unknown)
-        || kind.is_token()
-        || kind.is_keyword_expression()
-        || kind.is_keyword_type()
-    {
-        return None;
-    }
-    Some(true)
-}
-
 /// `is_declaration_node` on the data of the node.
 fn is_declaration_data(d: &NodeData) -> bool {
-    declaration_variants!(data_is_variant! { d, })
+    matches!(
+        d,
+        NodeData::ArrowFunction(_)
+            | NodeData::BinaryExpression(_)
+            | NodeData::BindingElement(_)
+            | NodeData::CallExpression(_)
+            | NodeData::CallSignatureDeclaration(_)
+            | NodeData::ClassDeclaration(_)
+            | NodeData::ClassExpression(_)
+            | NodeData::ClassStaticBlockDeclaration(_)
+            | NodeData::ConstructSignatureDeclaration(_)
+            | NodeData::ConstructorDeclaration(_)
+            | NodeData::ConstructorTypeNode(_)
+            | NodeData::EnumDeclaration(_)
+            | NodeData::EnumMember(_)
+            | NodeData::ExportAssignment(_)
+            | NodeData::ExportDeclaration(_)
+            | NodeData::ExportSpecifier(_)
+            | NodeData::FunctionDeclaration(_)
+            | NodeData::FunctionExpression(_)
+            | NodeData::FunctionTypeNode(_)
+            | NodeData::GetAccessorDeclaration(_)
+            | NodeData::ImportClause(_)
+            | NodeData::ImportDeclaration(_)
+            | NodeData::ImportEqualsDeclaration(_)
+            | NodeData::ImportSpecifier(_)
+            | NodeData::IndexSignatureDeclaration(_)
+            | NodeData::InterfaceDeclaration(_)
+            | NodeData::JsDocSignature(_)
+            | NodeData::JsDocTypeLiteral(_)
+            | NodeData::JsxAttribute(_)
+            | NodeData::JsxAttributes(_)
+            | NodeData::JsxSpreadAttribute(_)
+            | NodeData::MappedTypeNode(_)
+            | NodeData::MethodDeclaration(_)
+            | NodeData::MethodSignatureDeclaration(_)
+            | NodeData::MissingDeclaration(_)
+            | NodeData::ModuleDeclaration(_)
+            | NodeData::NamedTupleMember(_)
+            | NodeData::NamespaceExport(_)
+            | NodeData::NamespaceExportDeclaration(_)
+            | NodeData::NamespaceImport(_)
+            | NodeData::NoSubstitutionTemplateLiteral(_)
+            | NodeData::NotEmittedTypeElement(_)
+            | NodeData::ObjectLiteralExpression(_)
+            | NodeData::ParameterDeclaration(_)
+            | NodeData::PropertyAssignment(_)
+            | NodeData::PropertyDeclaration(_)
+            | NodeData::PropertySignatureDeclaration(_)
+            | NodeData::SemicolonClassElement(_)
+            | NodeData::SetAccessorDeclaration(_)
+            | NodeData::ShorthandPropertyAssignment(_)
+            | NodeData::SourceFile(_)
+            | NodeData::SpreadAssignment(_)
+            | NodeData::TypeAliasDeclaration(_)
+            | NodeData::TypeLiteralNode(_)
+            | NodeData::TypeParameterDeclaration(_)
+            | NodeData::VariableDeclaration(_)
+    )
 }
 
 // Go: ast.go:1532 IsLocalsContainer
