@@ -895,7 +895,7 @@ impl Checker {
         self.node_links.get(node).declaration_requires_scope_change = value;
     }
 
-    // Go: checker/checker.go:1555 checkAndReportErrorForInvalidInitializer
+    // Go: checker/checker.go:1558 checkAndReportErrorForInvalidInitializer
     // The invalid initializer error is needed in two situation:
     // 1. When result is undefined, after checking for a missing "this."
     // 2. When result is defined

@@ -4470,7 +4470,7 @@ impl Server {
         // decode to a URI (server.go:2161). ts#64159: it is rooted and
         // normalized first (TryRootedFilePathFromAbsolute), and
         // ResolveCompletionItem finds the file by the normalized name
-        // (server.go:2178).
+        // (server.go:2179).
         let Some(file_name) = lsproto::try_rooted_path_from_absolute(&data.file_name) else {
             return Err(errors::new(
                 "completion item data fileName must be absolute",

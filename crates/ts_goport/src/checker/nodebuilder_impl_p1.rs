@@ -370,7 +370,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/nodebuilderimpl.go:175 isExpandableType
+    // Go: checker/nodebuilderimpl.go:176 isExpandableType
     // isExpandableType reports whether t has a named representation that could be inlined
     // as its structural form during hover expansion. Filters out lib types.
     // When isAlias is true, checks whether t's alias symbol is from user code (not lib).
@@ -409,7 +409,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/nodebuilderimpl.go:197 isTypeOnStack
+    // Go: checker/nodebuilderimpl.go:198 isTypeOnStack
     // isTypeOnStack reports whether t is already being processed in the current expansion,
     // excluding the last element (which is the type currently being serialized by typeToTypeNode).
     pub fn is_type_on_stack(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>, t: TypeId) -> bool {
@@ -1060,7 +1060,7 @@ impl Checker {
         identifier
     }
 
-    // Go: checker/nodebuilderimpl.go:642 symbolToEntityNameNode
+    // Go: checker/nodebuilderimpl.go:643 symbolToEntityNameNode
     // TODO: Audit usages of symbolToEntityNameNode - they should probably all be symbolToName
     pub fn symbol_to_entity_name_node(
         &mut self,
@@ -1654,7 +1654,7 @@ impl Checker {
         escape_internal_symbol_name(self.sym(symbol).name.as_str())
     }
 
-    // Go: checker/nodebuilderimpl.go:1029 getTypeParametersOfClassOrInterface
+    // Go: checker/nodebuilderimpl.go:1030 getTypeParametersOfClassOrInterface
     // The full set of type parameters for a generic class or interface type consists of its outer type parameters plus
     // its locally declared type parameters.
     pub fn get_type_parameters_of_class_or_interface(

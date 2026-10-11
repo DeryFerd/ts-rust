@@ -313,7 +313,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:10680 checkCollisionWithGlobalObjectInGeneratedCode
+    // Go: checker/checker.go:10714 checkCollisionWithGlobalObjectInGeneratedCode
     pub fn check_collision_with_global_object_in_generated_code(&mut self, node: Node, name: Node) {
         if name.is_nil()
             || is_class_like(node)

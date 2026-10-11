@@ -12,7 +12,7 @@ impl LanguageService {
     // it; Rust takes and returns the item by value. `data` is Go's nil-able
     // `*lsproto.CompletionItemData`. `file_name` is Go's
     // `tspath.RootedFilePath`: the server's rooted, normalized form of
-    // `data.file_name` (server.go:2178). The file is found by it, and the
+    // `data.file_name` (server.go:2179). The file is found by it, and the
     // error text keeps `data.file_name` as Go does.
     pub fn resolve_completion_item(
         &self,

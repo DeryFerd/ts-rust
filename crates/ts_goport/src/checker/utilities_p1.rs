@@ -2611,7 +2611,7 @@ type U1 = (A | SvelteProgram) & (B | Box<string>) & ({ p: 1 } | SvelteShorthandA
     /// Go's sort that have an effect, in Go's order. The one effect of
     /// `compare_types` is a lazy symbol id: `compare_symbols_worker` falls
     /// back to ids for two symbols with no declaration and one name (Go
-    /// makes such symbols for import attributes, checker.go:5582). So the
+    /// makes such symbols for import attributes, checker.go:5604). So the
     /// `LARGE_SOURCE` types get 24 anonymous types of such symbols, and the
     /// intersections of each with `A`, and the two sorts of one shuffle,
     /// each on its own checker, give the same list and the same ids to the

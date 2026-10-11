@@ -817,7 +817,7 @@ child_test! {
 child_test! {
     // Server skeptic probe srvskp/resolve-more-names (bump D round 2). Go N'
     // handleCompletionItemResolve passes the rooted, normalized file name to
-    // ResolveCompletionItem (server.go:2178), which finds the file by it
+    // ResolveCompletionItem (server.go:2179), which finds the file by it
     // (completions.go:5498), so a `data.fileName` with a trailing separator
     // or extra segments still resolves. Go answers the item, not "file not
     // found".

@@ -161,7 +161,7 @@ impl Checker {
         NodeList::NIL
     }
 
-    // Go: checker/nodebuilderimpl.go:1061 lookupSymbolChain
+    // Go: checker/nodebuilderimpl.go:1062 lookupSymbolChain
     pub fn lookup_symbol_chain(
         &mut self,
         b: &Nb,
@@ -216,7 +216,7 @@ impl Checker {
         chain
     }
 
-    // Go: checker/nodebuilderimpl.go:1087 getSymbolChain
+    // Go: checker/nodebuilderimpl.go:1088 getSymbolChain
     /// `end_of_chain` is false for recursive calls. Non-recursive calls always output something.
     fn get_symbol_chain(
         &mut self,

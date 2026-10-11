@@ -286,7 +286,7 @@ impl Checker {
         self.check_object_type_for_duplicate_declarations(node, false /*checkPrivateNames*/);
     }
 
-    // Go: checker/checker.go:3190 checkObjectTypeForDuplicateDeclarations
+    // Go: checker/checker.go:3193 checkObjectTypeForDuplicateDeclarations
     pub fn check_object_type_for_duplicate_declarations(
         &mut self,
         node: Node,
@@ -1382,7 +1382,7 @@ impl Checker {
         self.check_testing_known_truthy_types(cond_expr, cond_type, body);
     }
 
-    // Go: checker/checker.go:3849 checkTestingKnownTruthyTypes
+    // Go: checker/checker.go:3852 checkTestingKnownTruthyTypes
     pub fn check_testing_known_truthy_types(
         &mut self,
         cond_expr: Node,

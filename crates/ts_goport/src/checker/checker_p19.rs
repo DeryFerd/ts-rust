@@ -720,7 +720,7 @@ impl Checker {
         Vec::new()
     }
 
-    // Go: checker/checker.go:17532 getEffectiveTypeArgumentAtIndex
+    // Go: checker/checker.go:17599 getEffectiveTypeArgumentAtIndex
     pub fn get_effective_type_argument_at_index(
         &mut self,
         node: Node,
@@ -1410,7 +1410,7 @@ impl KeyBuilder {
         self.write_uint32(t.0);
     }
 
-    // Go: checker/checker.go:17770 keyBuilder.writeTypes
+    // Go: checker/checker.go:17837 keyBuilder.writeTypes
     // PERF: when the whole list fits in the inline buffer, it is written with
     // one room test. The bytes are the same as `write_int(len)` and then
     // `write_type` for each type.

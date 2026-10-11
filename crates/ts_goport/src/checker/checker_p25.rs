@@ -256,7 +256,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:22823 isTypeParameterPossiblyReferenced
+    // Go: checker/checker.go:22891 isTypeParameterPossiblyReferenced
     pub fn is_type_parameter_possibly_referenced(&mut self, tp: TypeId, node: Node) -> bool {
         // If the type parameter doesn't have exactly one declaration, if there are intervening statement blocks
         // between the node and the type parameter declaration, if the node contains actual references to the

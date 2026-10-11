@@ -1036,7 +1036,7 @@ impl Checker {
             .collect()
     }
 
-    // Go: checker/checker.go:4501 areTypeParametersIdentical
+    // Go: checker/checker.go:4517 areTypeParametersIdentical
     // PORT: Go `getTypeParameterDeclarations func(node *ast.Node) []*ast.Node`
     // is `&dyn Fn(Node) -> Vec<Node>`.
     pub fn are_type_parameters_identical(
