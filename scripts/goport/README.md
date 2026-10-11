@@ -148,10 +148,11 @@ with the pinned `nightly-2026-06-17` and `-Zthreads=8` (the job count, at most 8
 - Output does not change. `tsgo -p` with emit and `goport -p` on Query core, Hono, zod and effect
   are byte-equal to 1.93.0 bins, the quick gate is equal item for item, and `perf.sh` run time is
   equal within 1%.
-- The default toolchain (CI pins 1.93.0) stays for `--profile goport`, `fmt`, `clippy`, any command
-  with `RUSTUP_TOOLCHAIN` or a `+toolchain` argument, and the candidate evidence builds (see below).
-  `build-release.sh` and `build-pgo.sh` (shipped and timing bins) set 1.95.0. For timing, build every
-  side with the same toolchain.
+- 1.95.0 is the shipped toolchain: `build-release.sh` and `build-pgo.sh` (shipped and timing bins),
+  `release.yml`, CI (`fmt`, `clippy`, tests) and the candidate evidence builds (see below) set it.
+  `--profile goport` through `run-cargo-capped.sh` and `fmt` or `clippy` there use the default
+  toolchain, as does any command with `RUSTUP_TOOLCHAIN` or a `+toolchain` argument. For timing,
+  build every side with the same toolchain.
 - `TS_CARGO_NIGHTLY=0` uses the default toolchain. `TS_CARGO_INCREMENTAL=0` turns incremental off;
   `1` turns it on for every workspace crate. After an internal compiler error, build again with both
   set to 0 and report the error.
@@ -188,7 +189,15 @@ Edit loop on alvin (24 cores, 16 jobs, sccache off, 2026-10-10, `ts_goport` 566k
 - With 1 job (the default on every host but zbook until 2026-10-10), `check` took 228 s clean and
   17 s for an edit, and a dev `--bin tsgo` build 301 s clean and 29 s for an edit.
 
-Revision evidence is the exception: `candidate.sh side` builds its release bins and its test bins with `TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0`, so the goport tests, gate, bound runs and oracles test bins from the shipped toolchain with no incremental cache (the evidence key records the toolchain).
+Revision evidence is the exception: `candidate.sh side` builds its release bins and its test bins with `TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0` and `RUSTUP_TOOLCHAIN=1.95.0`, so the goport tests, gate, bound runs and oracles test bins from the shipped toolchain with no incremental cache (the evidence key records the toolchain). Until 2026-10-10 it took the host's default toolchain (1.93.0 on zbook and in CI). With these settings on alvin (`buildbench-plan.sh` session `toolchains`, one run each):
+
+| toolchain | clean | touch | one-line edit |
+|---|---|---|---|
+| 1.93.0 | 284 s | 340 s | 263-303 s |
+| 1.95.0 | 163 s | 139 s | 130-135 s |
+| 1.99.0 | 144 s | 115 s | 134 s |
+
+The time goes to the compiler frontend: 192 to 272 s of each 1.93.0 build, 64 to 72 s on the newer ones. `bin-identity.sh` gave equal output for 1.95.0 and 1.99.0 against 1.93.0 on Query core, Hono, zod and effect.
 
 ## Editor sessions: `ls_edit_bench.py`
 

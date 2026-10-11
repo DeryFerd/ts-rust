@@ -49,6 +49,12 @@
 #   until grep -qE '^SIDE (DONE|FAIL)' LOG || ! systemctl --user is-active -q UNIT; do sleep 30; done
 set -euo pipefail
 
+# Evidence builds (release bins, test bins, the evidence key and the quality step's rustfmt and
+# clippy) use the shipped toolchain of build-release.sh and release.yml, not the host default. On
+# alvin, 1.93.0 took about twice as long and gave the same output (scripts/goport/README.md,
+# "Build toolchain"). Install it with: rustup toolchain install 1.95.0 --profile minimal -c rustfmt,clippy
+export RUSTUP_TOOLCHAIN=1.95.0
+
 ROOT=/home/theo/Code/sandbox/ts-rust
 R=$ROOT/target/continuation-r97-goport
 SELF=$(realpath "${BASH_SOURCE[0]}")
@@ -353,7 +359,8 @@ side_unit() {
     [[ $(realpath "$wt") == "$(realpath "$CHECKER_PORT")" ]] || target=$wt/target/candidate-side
     say "$(date -u +%FT%TZ) build release bins in $target"
     if [[ $DRY == 0 ]]; then exec 8> /tmp/ts-rust-candidate-target.lock; flock 8; fi
-    # Evidence bins: the shipped toolchain (not the nightly edit-loop default) and no incremental cache.
+    # Evidence bins: the shipped toolchain (RUSTUP_TOOLCHAIN above, not the nightly edit-loop default) and
+    # no incremental cache.
     # Units whose dep-info names another checkout's files (a crate with sources outside its package dir,
     # like goport_util) are removed first, so cargo builds them again from this checkout.
     run_sh "python3 $G/purge-foreign-fingerprints.py $target $wt > $C/purge.log 2>&1"
