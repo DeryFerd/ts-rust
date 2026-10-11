@@ -88,6 +88,7 @@ mod effect_autoimport_style_test;
 mod effect_document_symbols_test;
 mod effect_fixables_e5c_test;
 mod effect_fixables_test;
+mod effect_layer_magic_test;
 mod effect_ls_completions_test;
 mod effect_ls_hooks_test;
 mod effect_ls_layer_hover_test;

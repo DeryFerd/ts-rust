@@ -21,6 +21,7 @@ pub mod async_await_to_gen;
 pub mod async_await_to_gen_try_promise;
 pub mod effect_gen_to_fn;
 pub mod function_to_arrow;
+pub mod layer_magic;
 pub mod make_schema_opaque;
 pub mod make_schema_opaque_with_ns;
 pub mod pipeable_to_datafirst;
@@ -34,6 +35,7 @@ pub mod type_to_effect_schema;
 pub mod type_to_effect_schema_class;
 pub mod wrap_with_effect_gen;
 pub mod wrap_with_pipe;
+pub mod write_tag_class_accessors;
 
 // Go: refactors/refactors.go:9 All
 /// All is the list of all refactor providers.
@@ -53,8 +55,8 @@ pub static ALL: &[&Refactor] = &[
     &toggle_return_type_annotation::TOGGLE_RETURN_TYPE_ANNOTATION,
     &toggle_lazy_const::TOGGLE_LAZY_CONST,
     &function_to_arrow::FUNCTION_TO_ARROW,
-    // E9d: LayerMagic,
-    // E9d: WriteTagClassAccessors,
+    &layer_magic::LAYER_MAGIC,
+    &write_tag_class_accessors::WRITE_TAG_CLASS_ACCESSORS,
     &type_to_effect_schema::TYPE_TO_EFFECT_SCHEMA,
     &type_to_effect_schema_class::TYPE_TO_EFFECT_SCHEMA_CLASS,
     &make_schema_opaque::MAKE_SCHEMA_OPAQUE,
