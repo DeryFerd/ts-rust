@@ -4,10 +4,21 @@
 // and inlay hints (inlayHints/*.baseline). Each case starts `<server> --lsp --stdio` on a small
 // project made as the Go harness makes it, sends the requests the Go runner sends, formats the
 // answers as the Go baseline writers do, and compares the text with the committed baseline.
+// Hover cases have no baseline file: the expected text is the VerifyQuickInfoAt arguments of
+// internal/effecttest/hover_test.go (one case per Go test, one block per marker). Hover compares
+// inflate the `pako:` payload of each Mermaid link on both sides (root decision D3: tsc-rs deflates
+// with other bytes than Go's compress/zlib); nothing else is normalized.
+// Completion cases have no baseline file either: each is one Go test of
+// internal/effecttest/completion_test.go or of the 10 unit test files of internal/completions,
+// ported by hand (source, cursor, the label filter of the fourslash_test.go helper, the Go
+// assertions). The answer is "ok" when every assertion holds.
 //
 // usage: node scripts/effect/ls-cases.mjs --server <tsc> [--effect-repo DIR] [--kinds K,...]
 //          [--versions effect-v4,effect-v3] [--filter SUBSTR] [--out DIR] [--jobs N] [--timeout S]
-//   --kinds      quickfixes,refactors,symbols,inlay (default: all)
+//          [--dump DIR]
+//   --kinds      quickfixes,refactors,symbols,inlay,hover,completion (default: all)
+//   --dump       completion cases also write each whole answer (sorted as the Go client sorts it)
+//                to DIR/<case>.json, to compare two servers beyond the Go assertions
 //   --effect-repo  effect-tsgo checkout with `pnpm install` done in testdata/tests/effect-v4 and
 //                effect-v3 (default target/continuation-r97-goport/effect051/effect-tsgo-0511 in the
 //                main checkout: the parent of the git common dir, or /home/theo/Code/sandbox/ts-rust
@@ -22,7 +33,8 @@
 // internal/bundledeffect/effect.go (MountEffect), _patches/typescript/010-fourslash-fourslash.patch
 // (GetQuickFixesForDiagnostics, ApplyQuickFix, GetRefactorActionsForRange, ApplyRefactorAction), and
 // TypeScript tsc/internal/fourslash (getCapabilitiesWithDefaults, openFile, applyTextEdits) and
-// tsc/internal/testrunner/test_case_parser.go (unit split).
+// tsc/internal/testrunner/test_case_parser.go (unit split), tsc/internal/fourslash/test_parser.go
+// (parseFileContent: markers) and fourslash.go (VerifyQuickInfoAt, verifyHoverMarkdown).
 //
 // Differences from the Go harness, by design:
 // - Real files in <out>/projects/<kind>/<version>/<case>/ stand for the Go test VFS root "/". The Go
@@ -40,6 +52,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
+import zlib from "node:zlib";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 if (["help", "-h", "--help"].includes(process.argv[2])) {
@@ -51,12 +64,13 @@ const { values: args } = parseArgs({
   options: {
     server: { type: "string" },
     "effect-repo": { type: "string" },
-    kinds: { type: "string", default: "quickfixes,refactors,symbols,inlay" },
+    kinds: { type: "string", default: "quickfixes,refactors,symbols,inlay,hover,completion" },
     versions: { type: "string", default: "effect-v4,effect-v3" },
     filter: { type: "string", default: "" },
     out: { type: "string", default: path.join(os.tmpdir(), "effect-ls-cases") },
     jobs: { type: "string", default: String(Math.max(1, Math.min(8, os.availableParallelism() - 2))) },
     timeout: { type: "string", default: "120" },
+    dump: { type: "string" },
   },
 });
 if (!args.server) {
@@ -795,6 +809,490 @@ async function runInlay(c) {
 }
 
 // ---------------------------------------------------------------------------
+// Hover (cases are the Go tests in internal/effecttest/hover_test.go)
+// ---------------------------------------------------------------------------
+
+// A Go string expression: interpreted literals joined by `+` (the only forms hover_test.go uses).
+function goStringExpr(src, i) {
+  let out = "";
+  for (;;) {
+    while (/\s/.test(src[i])) i++;
+    if (src[i] !== '"') throw new Error(`hover_test.go: string literal expected at ${src.slice(i, i + 40)}`);
+    let j = i + 1;
+    while (src[j] !== '"') j += src[j] === "\\" ? 2 : 1;
+    out += JSON.parse(src.slice(i, j + 1));
+    i = j + 1;
+    let k = i;
+    while (/\s/.test(src[k])) k++;
+    if (src[k] !== "+") return { value: out, end: i };
+    i = k + 1;
+  }
+}
+
+// Each Go test: its fourslash content and its VerifyQuickInfoAt calls (marker, text, documentation).
+// A call inside `for _, marker := range []string{...}` runs once per marker of the list.
+function hoverCases() {
+  const src = fs.readFileSync(path.join(EFFECT_REPO, "internal/effecttest/hover_test.go"), "utf8");
+  const cases = [];
+  for (const chunk of src.split(/\nfunc Test/).slice(1)) {
+    const m = /^(\w+)\(t \*testing\.T\) \{([\s\S]*)$/.exec(chunk);
+    if (!m) continue;
+    const body = m[2];
+    const content = /const content = `([\s\S]*?)`/.exec(body);
+    if (!content) continue;
+    if (!/fourslash\.NewFourslash\(t, nil \/\*capabilities\*\/, content\)/.test(body)) {
+      throw new Error(`hover case Test${m[1]} has a setup this tool does not know`);
+    }
+    const checks = [];
+    const call = "f.VerifyQuickInfoAt(t,";
+    for (let at = body.indexOf(call); at >= 0; at = body.indexOf(call, at + 1)) {
+      let i = at + call.length;
+      while (/\s/.test(body[i])) i++;
+      let markers;
+      if (body[i] === '"') {
+        const name = goStringExpr(body, i);
+        markers = [name.value];
+        i = name.end;
+      } else {
+        const ident = /^\w+/.exec(body.slice(i))[0];
+        const loop = new RegExp(`for _, ${ident} := range \\[\\]string\\{([^}]*)\\}`).exec(body.slice(0, at));
+        if (!loop) throw new Error(`hover case Test${m[1]}: no marker list for ${ident}`);
+        markers = [...loop[1].matchAll(/"([^"]*)"/g)].map((x) => x[1]);
+        i += ident.length;
+      }
+      i = body.indexOf(",", i) + 1;
+      const text = goStringExpr(body, i);
+      i = body.indexOf(",", text.end) + 1;
+      const doc = goStringExpr(body, i);
+      for (const marker of markers) checks.push({ marker, text: text.value, doc: doc.value });
+    }
+    if (!checks.length) continue;
+    const name = m[1][0].toLowerCase() + m[1].slice(1);
+    cases.push({ name, content: content[1], checks });
+  }
+  return cases;
+}
+
+// Go fourslash parseFileContent (test_parser.go): the file text without its markers, and the
+// marker offsets (bytes in the Go text; the cases are ASCII, so string offsets here).
+function stripMarkers(raw) {
+  const lines = raw.split("\n");
+  const content = lines.every((l) => !l.length || l[0] === " ") ? lines.map((l) => l.slice(1)).join("\n") : raw;
+  let out = "";
+  const markers = {};
+  let diff = 0;
+  let last = 0;
+  let open = null;
+  let state = "none";
+  let prev = content[0];
+  const flush = (end) => { out += content.slice(last, end === -1 ? undefined : end); };
+  for (let i = 1; i < content.length; i++) {
+    const cur = content[i];
+    if (state === "none") {
+      if ((prev === "[" && cur === "|") || (prev === "|" && cur === "]")) {
+        flush(i - 1);
+        last = i + 1;
+        diff += 2;
+      } else if (prev === "/" && cur === "*" && content[i + 1] !== "/") {
+        state = "slashStar";
+        open = { position: i - 1 - diff, source: i - 1 };
+      } else if (prev === "{" && cur === "|") {
+        state = "object";
+        open = { position: i - 1 - diff, source: i - 1 };
+        flush(i - 1);
+      }
+    } else if (state === "object") {
+      if (prev === "|" && cur === "}") {
+        last = i + 1;
+        diff += i + 1 - open.source;
+        open = null;
+        state = "none";
+      }
+    } else if (state === "slashStar") {
+      if (prev === "*" && cur === "/") {
+        markers[content.slice(open.source + 2, i - 1).trim()] = open.position;
+        flush(open.source);
+        last = i + 1;
+        diff += i + 1 - open.source;
+        open = null;
+        state = "none";
+      } else if (!/[0-9A-Za-z$_]/.test(cur) && !(cur === "*" && content[i + 1] === "/")) {
+        flush(i);
+        last = i;
+        open = null;
+        state = "none";
+      }
+    }
+    // Go keeps the previous character across a line break.
+    if (cur === "\n" || cur === "\r") continue;
+    prev = i >= last ? cur : "\uFFFD"; // Go utf8.RuneError
+  }
+  flush(-1);
+  return { text: out, markers };
+}
+
+async function runHover(c) {
+  const files = fourslashFiles(c.content).map((f) => {
+    const { text, markers } = stripMarkers(f.content);
+    return { name: f.name, content: text, markers };
+  });
+  fs.rmSync(c.dir, { recursive: true, force: true });
+  fs.mkdirSync(c.dir, { recursive: true });
+  const m = mountVersion(files.map((f) => f.content));
+  if (m) mount(c.dir, m.version, m.vitest);
+  writeFiles(c.dir, files);
+  const project = new Project(c.dir);
+  const server = new Server(c.dir, capabilities(), null);
+  const out = [];
+  try {
+    await server.start(c.dir);
+    openAll(server, project, files);
+    for (const check of c.checks) {
+      const file = files.find((f) => check.marker in f.markers);
+      if (!file) throw new Error(`no marker ${check.marker}`);
+      const before = file.content.slice(0, file.markers[check.marker]);
+      const line = before.split("\n").length - 1;
+      const col = before.slice(before.lastIndexOf("\n") + 1);
+      const character = server.encoding === "utf-8" ? Buffer.byteLength(col) : col.length;
+      const hover = await server.request("textDocument/hover", { textDocument: { uri: project.uri(file.name) }, position: { line, character } });
+      const contents = hover?.contents;
+      const value = hover === null || hover === undefined ? "(no hover)" : typeof contents?.value === "string" && contents.kind !== undefined ? contents.value : `(not markup content) ${JSON.stringify(contents)}`;
+      out.push(`=== marker ${check.marker} ===\n${value}\n`);
+    }
+    return project.normalize(out.join("\n"));
+  } finally {
+    await server.stop();
+  }
+}
+
+// Root decision D3: each Mermaid link's `pako:<base64url>` becomes `pako:<inflated payload>`.
+const inflateMermaid = (text) =>
+  text.replace(/pako:([A-Za-z0-9_-]+)/g, (_, b64) => `pako:<${zlib.inflateSync(Buffer.from(b64, "base64url")).toString("utf8")}>`);
+
+// Go fourslash verifyHoverMarkdown: the markdown each VerifyQuickInfoAt expects.
+const hoverExpected = (c) => c.checks.map((check) => `=== marker ${check.marker} ===\n\`\`\`typescript\n${check.text}\n\`\`\`\n${check.doc}\n`).join("\n");
+
+// ---------------------------------------------------------------------------
+// Completion (cases are the Go tests of internal/effecttest/completion_test.go and of the 10 unit
+// test files of internal/completions, ported by hand: source, cursor, the label filter of the
+// fourslash_test.go helper and the Go assertions)
+// ---------------------------------------------------------------------------
+
+// fourslash_test.go completionTestTsConfig.
+const COMPLETION_TSCONFIG = `{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ESNext",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "plugins": [
+      {
+        "name": "@effect/language-service"
+      }
+    ]
+  }
+}`;
+// fourslash_test.go contextSelfInClassesItemsWithPackageJSON.
+const HARNESS_PACKAGE_JSON = `{
+	  "name": "@effect/harness-effect-v4"
+	}`;
+
+// The fourslash_test.go filters (`<name>Items` helpers).
+const DURATION_UNITS = ["nanos", "micros", "millis", "seconds", "minutes", "hours", "days", "weeks"];
+const COMPLETION_FILTERS = {
+  fnFunctionStar: (l) => l.startsWith('fn("') || l === "fn(function*(){})" || l === "fnUntraced(function*(){})",
+  effectJsdocComment: (l) => l === "@effect-identifier",
+  effectCodegensComment: (l) => l === "@effect-codegens",
+  effectDiagnosticsComment: (l) => l === "@effect-diagnostics" || l === "@effect-diagnostics-next-line",
+  durationInput: (l) => DURATION_UNITS.includes(l),
+  effectSelfInClasses: (l) => l.startsWith("Service<") || l.startsWith('Tag("'),
+  contextSelfInClasses: (l) => l.startsWith('Tag("'),
+  contextSelfInClassesWithPackageJSON: (l) => l.startsWith('Tag("') || l.startsWith("Service<"),
+  effectSQLModelSelfInClasses: (l) => l.startsWith("Class<"),
+  rpcMakeClasses: (l) => l.startsWith('make("'),
+  schemaBrand: (l) => l.startsWith('brand("'),
+  all: () => true,
+};
+
+// Go stringutil.CompareStringsCaseInsensitiveThenSensitive, as ls.CompareCompletionEntries uses it.
+function compareCaseInsensitiveThenSensitive(a, b) {
+  const ca = [...a], cb = [...b];
+  for (let i = 0; i < Math.min(ca.length, cb.length); i++) {
+    const la = ca[i].toLowerCase().codePointAt(0), lb = cb[i].toLowerCase().codePointAt(0);
+    if (la !== lb) return la < lb ? -1 : 1;
+  }
+  if (ca.length !== cb.length) return ca.length < cb.length ? -1 : 1;
+  const ba = Buffer.from(a), bb = Buffer.from(b);
+  return Buffer.compare(ba, bb);
+}
+
+// Names of rules.All and codegens.All in the Go tree, sorted (sort.Strings) and joined with ",".
+function goSortedNames(kind) {
+  if (kind === "codegens") {
+    const src = fs.readFileSync(path.join(EFFECT_REPO, "internal/codegens/codegens.go"), "utf8");
+    return [...src.matchAll(/Name:\s+"([^"]+)"/g)].map((m) => m[1]).sort().join(",");
+  }
+  const dir = path.join(EFFECT_REPO, "internal/rules");
+  const all = /var All = \[\]rule\.Rule\{([\s\S]*?)\n\}/.exec(fs.readFileSync(path.join(dir, "rules.go"), "utf8"))[1];
+  const idents = [...all.matchAll(/^\s*(\w+),/gm)].map((m) => m[1]);
+  const names = new Map();
+  for (const f of fs.readdirSync(dir).filter((n) => n.endsWith(".go") && !n.endsWith("_test.go"))) {
+    for (const m of fs.readFileSync(path.join(dir, f), "utf8").matchAll(/var (\w+) = rule\.Rule\{\s*Name:\s+"([^"]+)"/g)) names.set(m[1], m[2]);
+  }
+  return idents.map((id) => {
+    if (!names.has(id)) throw new Error(`rules.All entry ${id}: no Name found`);
+    return names.get(id);
+  }).sort().join(",");
+}
+
+// Assertion helpers: each returns the Go t.Errorf/t.Fatalf texts, empty when it holds. `nil` is Go
+// `items != nil` failing (the filter keeps nothing, so Go has nil).
+const C = {
+  nil: () => (items) => (items.length ? [`expected nil, got ${items.length} items`] : []),
+  len: (n) => (items) => (items.length !== n ? [`FATAL expected ${n} items, got ${items.length}`] : []),
+  label: (i, want) => (items) => (items[i]?.label !== want ? [`item[${i}].Label = ${JSON.stringify(items[i]?.label)}, want ${JSON.stringify(want)}`] : []),
+  hasLabel: (want) => (items) => (items.some((it) => it.label === want) ? [] : [`expected completion label ${JSON.stringify(want)}`]),
+  noLabel: (label) => (items) => (items.some((it) => it.label === label) ? [`did not expect ${JSON.stringify(label)}`] : []),
+  text: (i, want) => (items) => (newText(items[i]) !== want ? [`item[${i}] insert text = ${JSON.stringify(newText(items[i]))}, want ${JSON.stringify(want)}`] : []),
+  textAffix: (i, prefix, suffix) => (items) => {
+    const t = newText(items[i]);
+    return typeof t === "string" && t.startsWith(prefix) && t.endsWith(suffix) ? [] : [`item[${i}].insertText = ${JSON.stringify(t)}`];
+  },
+  textHas: (i, sub) => (items) => (typeof newText(items[i]) === "string" && newText(items[i]).includes(sub) ? [] : [`item[${i}] insert text does not contain ${JSON.stringify(sub)}: ${JSON.stringify(newText(items[i]))}`]),
+  allTextHas: (sub) => (items) => items.flatMap((it, i) => (newText(it)?.includes(sub) ? [] : [`item[${i}].insertText = ${JSON.stringify(newText(it))}, want ${sub}`])),
+  start: (i, line, character) => (items) => {
+    const s = items[i]?.textEdit?.range?.start;
+    return s?.line === line && s?.character === character ? [] : [`replacement range start = ${JSON.stringify(s)}, want ${line}:${character}`];
+  },
+};
+const newText = (item) => item?.textEdit?.newText;
+
+// One case per Go test. pos: a number, or [needle, extra] for strings.Index(source, needle) + extra.
+// setup: "unit" (completionItemsAt), "pkg" (completionItemsAtWithPackageJSON with the harness
+// package.json), or a fourslash content with a /*1*/ marker (effecttest/completion_test.go).
+function completionCases() {
+  const end = (s) => s.length;
+  const T = (file, name, source, pos, filter, ...checks) => ({ file, name, source, pos: pos ?? end(source), filter, checks, setup: "unit" });
+  const P = (file, name, source, pos, filter, ...checks) => ({ ...T(file, name, source, pos, filter, ...checks), setup: "pkg" });
+  const sortedRules = () => goSortedNames("rules");
+  const sortedCodegens = () => goSortedNames("codegens");
+  const cases = [];
+  const comment = (file, prefix, filter, n, extra) => {
+    const first = prefix === "EffectDiagnosticsComment" ? "@effect-diagnostics" : prefix === "EffectCodegensComment" ? "@effect-codegens" : "@effect-identifier";
+    cases.push(
+      T(file, `Test${prefix}_DoubleSlash`, "// @", null, filter, C.len(n), C.label(0, first), ...(n === 2 ? [C.label(1, "@effect-diagnostics-next-line")] : [])),
+      T(file, `Test${prefix}_SlashStar`, "/* @", null, filter, C.len(n), ...(prefix === "EffectCodegensComment" ? [] : [C.label(0, first)]), ...(n === 2 ? [C.label(1, "@effect-diagnostics-next-line")] : [])),
+      T(file, `Test${prefix}_JSDocComment`, "/** @", null, filter, C.len(n)),
+      T(file, `Test${prefix}_ExtraWhitespace`, "//  @  ", null, filter, C.len(n)),
+      T(file, `Test${prefix}_NoAtSymbol`, prefix === "EffectJsdocComment" ? "// some comment" : "// some comment without at", null, filter, C.nil()),
+      T(file, `Test${prefix}_AtOutsideComment`, "const x = @", null, filter, C.nil()),
+      ...extra,
+      T(file, `Test${prefix}_ReplacementSpanStartsAtAt`, "// @", null, filter, C.len(n), C.start(0, 0, 3)),
+      T(file, `Test${prefix}_MultilineWithCommentOnSecondLine`, "const x = 1\n// @", null, filter, C.len(n), C.start(0, 1, 3)),
+    );
+  };
+
+  // context_self_in_classes_test.go
+  {
+    const f = "context_self_in_classes_test.go";
+    cases.push(
+      T(f, "TestContextSelfInClasses_NotInExtendsClause", 'import * as Context from "effect/Context"\nconst x = Context.Tag', null, "contextSelfInClasses", C.nil()),
+      T(f, "TestContextSelfInClasses_NotInClass", 'import * as Context from "effect/Context"\nconst x = Context.', null, "contextSelfInClasses", C.nil()),
+      T(f, "TestContextSelfInClasses_EmptySource", "", 0, "contextSelfInClasses", C.nil()),
+      T(f, "TestContextSelfInClasses_InsideImportDeclaration", 'import { Context } from "effect"', end("import { Context"), "contextSelfInClasses", C.nil()),
+      T(f, "TestContextSelfInClasses_InterfaceNotClass", "interface Foo extends Bar", null, "contextSelfInClasses", C.nil()),
+      T(f, "TestContextSelfInClasses_AnonymousClass", "const x = class extends Context.Tag", null, "contextSelfInClasses", C.nil()),
+      P(f, "TestContextSelfInClasses_V4NamespaceImport", 'import * as Context from "effect/Context"\n\nexport class MyService extends Context.', null, "contextSelfInClassesWithPackageJSON",
+        C.len(2), C.label(0, "Service<MyService, {}>"), C.textAffix(0, 'Context.Service<MyService, {${0}}>()("', '"){}'),
+        C.label(1, "Service<MyService>({ make })"), C.text(1, 'Context.Service<MyService>()("@effect/harness-effect-v4/test/MyService", { make: ${0} }){}')),
+      P(f, "TestContextSelfInClasses_V4DirectImport", 'import { Service } from "effect/Context"\n\nexport class MyService extends Service', null, "contextSelfInClassesWithPackageJSON",
+        C.len(2), C.textAffix(0, 'Service<MyService, {${0}}>()("', '"){}'), C.text(1, 'Service<MyService>()("@effect/harness-effect-v4/test/MyService", { make: ${0} }){}')),
+      P(f, "TestContextSelfInClasses_V4IdentifierKeyPattern",
+        '// @test-config { "keyPatterns": [ { "pattern": "package-identifier", "target": "service" } ] }\nimport * as Context from "effect/Context"\n\nexport class MyService extends Context.', null,
+        "contextSelfInClassesWithPackageJSON", C.len(2), C.allTextHas('"@effect/harness-effect-v4/test/MyService"')),
+    );
+    const src = 'import { Effect, Stream } from "effect"\nimport * as Context from "effect/Context"\n\nclass Foo extends Context.S\n\nStream.unwrap(Effect.gen(function*() {\n\tconst a = yield* Foo\n\n\treturn Stream.succeed(a.count)\n}))';
+    cases.push(P(f, "TestContextSelfInClasses_V4MiddleOfIdentifier", src, src.indexOf("Context.S") + "Context.S".length, "contextSelfInClassesWithPackageJSON",
+      C.len(2), C.label(0, "Service<Foo, {}>"), C.label(1, "Service<Foo>({ make })"), C.textAffix(0, 'Context.Service<Foo, {${0}}>()("', '"){}')));
+  }
+
+  // duration_input_test.go
+  {
+    const f = "duration_input_test.go";
+    const decl = "type D = `${number} nanos` | `${number} micros` | `${number} millis` | `${number} seconds` | `${number} minutes` | `${number} hours` | `${number} days` | `${number} weeks`\nconst value: D = \"";
+    cases.push(
+      T(f, "TestDurationInput_CursorOutsideString", "const x = 123", null, "durationInput", C.nil()),
+      T(f, "TestDurationInput_CursorOnIdentifier", "const foo = bar", null, "durationInput", C.nil()),
+      T(f, "TestDurationInput_CursorAtOpeningQuote", 'const x: string = "hello"', end("const x: string = "), "durationInput", C.nil()),
+      T(f, "TestDurationInput_CursorAtClosingQuote", 'const x: string = "hello"', end('const x: string = "hello"'), "durationInput", C.nil()),
+      T(f, "TestDurationInput_EmptySource", "", 0, "durationInput", C.nil()),
+      T(f, "TestDurationInput_CursorInComment", "// some comment", null, "durationInput", C.nil()),
+      T(f, "TestDurationInput_CursorBeforeString", 'const x = "hello"', end("const x ="), "durationInput", C.nil()),
+      T(f, "TestDurationInput_DurationUnitsCount", decl + '"', end(decl), "durationInput", C.len(8), ...DURATION_UNITS.map((u) => C.hasLabel(u))),
+    );
+  }
+
+  // effect_codegens_comment_test.go, effect_diagnostics_comment_test.go, effect_jsdoc_comment_test.go
+  comment("effect_codegens_comment_test.go", "EffectCodegensComment", "effectCodegensComment", 1, [
+    T("effect_codegens_comment_test.go", "TestEffectCodegensComment_SnippetContainsSortedCodegenNames", "// @", null, "effectCodegensComment", C.len(1), (items) => C.textHas(0, sortedCodegens())(items)),
+  ]);
+  comment("effect_diagnostics_comment_test.go", "EffectDiagnosticsComment", "effectDiagnosticsComment", 2, [
+    T("effect_diagnostics_comment_test.go", "TestEffectDiagnosticsComment_SnippetContainsSortedRuleNames", "// @", null, "effectDiagnosticsComment", C.len(2), (items) => C.textHas(0, sortedRules())(items)),
+    T("effect_diagnostics_comment_test.go", "TestEffectDiagnosticsComment_SnippetContainsSeverityChoices", "// @", null, "effectDiagnosticsComment", C.len(2), C.textHas(0, "off,warning,error,message,suggestion")),
+  ]);
+  comment("effect_jsdoc_comment_test.go", "EffectJsdocComment", "effectJsdocComment", 1, [
+    T("effect_jsdoc_comment_test.go", "TestEffectJsdocComment_InsertText", "// @", null, "effectJsdocComment", C.len(1), C.text(0, "@effect-identifier")),
+  ]);
+
+  // The four files of v3-only extends completions: the same six nil cases each.
+  const extendsNil = (file, prefix, filter, mod, accessed, importLine) => [
+    T(file, `Test${prefix}_NotInExtendsClause`, `${importLine}\nconst x = ${mod}.${accessed}`, null, filter, C.nil()),
+    T(file, `Test${prefix}_NotInClass`, `${importLine}\nconst x = ${mod}.`, null, filter, C.nil()),
+    T(file, `Test${prefix}_EmptySource`, "", 0, filter, C.nil()),
+    T(file, `Test${prefix}_InterfaceNotClass`, "interface Foo extends Bar", null, filter, C.nil()),
+    T(file, `Test${prefix}_AnonymousClass`, `const x = class extends ${mod}.${accessed}`, null, filter, C.nil()),
+  ];
+  cases.push(
+    ...extendsNil("effect_rpc_make_classes_test.go", "RpcMakeClasses", "rpcMakeClasses", "Rpc", "make", 'import * as Rpc from "@effect/rpc"'),
+    T("effect_rpc_make_classes_test.go", "TestRpcMakeClasses_InsideImportDeclaration", 'import { Rpc } from "@effect/rpc"', end("import { Rpc"), "rpcMakeClasses", C.nil()),
+    ...extendsNil("effect_self_in_classes_test.go", "EffectSelfInClasses", "effectSelfInClasses", "Effect", "Service", 'import * as Effect from "effect/Effect"'),
+    T("effect_self_in_classes_test.go", "TestEffectSelfInClasses_InsideImportDeclaration", 'import { Effect } from "effect"', end("import { Effect"), "effectSelfInClasses", C.nil()),
+    ...extendsNil("effect_sql_model_self_in_classes_test.go", "EffectSqlModelSelfInClasses", "effectSQLModelSelfInClasses", "Model", "Class", 'import * as Model from "@effect/sql/Model"'),
+    T("effect_sql_model_self_in_classes_test.go", "TestEffectSqlModelSelfInClasses_InsideImportDeclaration", 'import { Model } from "@effect/sql"', end("import { Model"), "effectSQLModelSelfInClasses", C.nil()),
+  );
+
+  // fn_function_star_test.go
+  {
+    const f = "fn_function_star_test.go";
+    const ns = 'import * as Effect from "effect/Effect"\nconst myFn = Effect.fn';
+    cases.push(
+      T(f, "TestFnFunctionStar_NotEffectModule", 'import * as Foo from "some-lib"\nconst x = Foo.fn', null, "fnFunctionStar", C.nil()),
+      T(f, "TestFnFunctionStar_NamespaceImport_InVarDecl", ns, null, "fnFunctionStar", C.len(3), C.label(0, 'fn("myFn")'), C.label(1, "fn(function*(){})"), C.label(2, "fnUntraced(function*(){})")),
+      T(f, "TestFnFunctionStar_NamedImport_InVarDecl", 'import { Effect } from "effect"\nconst myFn = Effect.fn', null, "fnFunctionStar", C.len(3), C.label(0, 'fn("myFn")')),
+      T(f, "TestFnFunctionStar_NotInVarDecl", 'import * as Effect from "effect/Effect"\nEffect.fn', null, "fnFunctionStar", C.len(2), C.label(0, "fn(function*(){})"), C.label(1, "fnUntraced(function*(){})")),
+      T(f, "TestFnFunctionStar_AliasedImport", 'import * as Fx from "effect/Effect"\nconst myFn = Fx.fn', null, "fnFunctionStar", C.len(3), C.label(0, 'fn("myFn")')),
+      T(f, "TestFnFunctionStar_CursorAfterDot", 'import * as Effect from "effect/Effect"\nconst myFn = Effect.', null, "fnFunctionStar", C.len(3)),
+      T(f, "TestFnFunctionStar_SnippetInsertText", ns, null, "fnFunctionStar", C.len(3), C.text(0, 'fn("myFn")(function*(${1}){${0}})'), C.text(1, "fn(function*(${1}){${0}})"), C.text(2, "fnUntraced(function*(${1}){${0}})")),
+    );
+  }
+
+  // schema_brand_test.go
+  {
+    const f = "schema_brand_test.go";
+    cases.push(
+      T(f, "TestSchemaBrand_EmptySource", "", 0, "schemaBrand", C.nil()),
+      T(f, "TestSchemaBrand_CursorAtStartOfFile", "const x = 1", 0, "schemaBrand", C.nil()),
+      T(f, "TestSchemaBrand_InsideImportDeclaration", 'import { Schema } from "effect"', end("import { Schema"), "schemaBrand", C.nil()),
+      T(f, "TestSchemaBrand_CursorAfterNumber", "const x = 42", null, "schemaBrand", C.nil()),
+      T(f, "TestSchemaBrand_CursorAfterString", 'const x = "hello"', null, "schemaBrand", C.nil()),
+    );
+  }
+
+  // internal/effecttest/completion_test.go: own fourslash content, all items.
+  {
+    const f = "effecttest/completion_test.go";
+    const content = (plugin, file) => `// @Filename: /tsconfig.json
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ESNext",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "plugins": [
+      {
+        ${plugin}
+      }
+    ]
+  }
+}
+// @Filename: /test.ts
+${file}`;
+    const plain = '"name": "@effect/language-service"';
+    const off = '"name": "@effect/language-service",\n        "completions": false';
+    cases.push(
+      { file: f, name: "TestEffectCompletionExtendsServiceMap", setup: content(plain, 'import * as Context from "effect/Context"\nclass MyService extends Context./*1*/'), filter: "all", nilFatal: true, checks: [C.hasLabel("Service<MyService, {}>"), C.hasLabel("Service<MyService>({ make })")] },
+      { file: f, name: "TestEffectCompletionExtendsSchema", setup: content(plain, 'import { Schema } from "effect"\nclass Foo extends Schema./*1*/'), filter: "all", nilFatal: true, checks: [C.hasLabel("Class<Foo>"), C.hasLabel("TaggedClass<Foo>"), C.hasLabel("TaggedError<Foo>"), C.hasLabel("Error<Foo>")] },
+      { file: f, name: "TestEffectCompletionDisabled", setup: content(off, 'import * as Context from "effect/Context"\nclass MyService extends Context./*1*/'), filter: "all", nilFatal: true, checks: [C.noLabel("Service<MyService, {}>"), C.noLabel("Service<MyService>({ make })")] },
+    );
+  }
+  // Port-only cases (not Go tests): positive paths of the v3-only completions and of the v4 Model,
+  // Data, Duration and non-qualified paths, which the Go tests do not reach. The label checks were
+  // confirmed on E0; with --dump, two servers' whole answers can be compared.
+  {
+    const f = "port-only";
+    const v3 = "// @effect-v3\n";
+    cases.push(
+      T(f, "V3EffectServiceAndTag", v3 + 'import * as Effect from "effect/Effect"\nclass MyService extends Effect.', null, "all", C.hasLabel("Service<MyService>"), C.hasLabel('Tag("MyService")'), C.hasLabel("gen(function*(){})"), C.hasLabel("fn(function*(){})")),
+      T(f, "V3EffectTagNotQualified", v3 + 'import { Tag } from "effect/Effect"\nclass MyTag extends Tag', null, "all", C.hasLabel('Tag("MyTag")'), C.noLabel("Service<MyTag>")),
+      T(f, "V3ContextTag", v3 + 'import * as Context from "effect/Context"\nclass MyTag extends Context.', null, "all", C.hasLabel('Tag("MyTag")'), C.noLabel("Service<MyTag, {}>")),
+      T(f, "V3SchemaClasses", v3 + 'import { Schema } from "effect"\nclass Foo extends Schema.', null, "all", C.hasLabel("Class<Foo>"), C.hasLabel("TaggedError<Foo>"), C.hasLabel("TaggedClass<Foo>"), C.hasLabel("TaggedRequest<Foo>"), C.noLabel("Error<Foo>")),
+      T(f, "V3SchemaBrand", v3 + 'import { Schema } from "effect"\nconst UserId = Schema.', null, "all", C.hasLabel('brand("UserId")')),
+      T(f, "V3SqlModel", v3 + 'import { Model } from "@effect/sql"\nclass User extends Model.', null, "all", C.hasLabel("Class<User>")),
+      T(f, "V3RpcMake", v3 + 'import { Rpc } from "@effect/rpc"\nclass GetUser extends Rpc.', null, "all", C.hasLabel('make("GetUser")')),
+      T(f, "V4ModelClass", 'import { Effect } from "effect"\nclass User extends Model.', null, "all", C.hasLabel("Class<User>")),
+      T(f, "V4DataClasses", 'import { Data } from "effect"\nclass MyError extends Data.', null, "all", C.hasLabel('TaggedError("MyError")'), C.hasLabel('TaggedClass("MyError")')),
+      T(f, "V4SchemaNotQualified", 'import { Class } from "effect/Schema"\nclass Foo extends Class', null, "all", C.hasLabel("Class<Foo>"), C.noLabel("TaggedError<Foo>")),
+      T(f, "V4DurationInEffectSleep", 'import { Effect } from "effect"\nconst program = Effect.sleep("1 ")', end('import { Effect } from "effect"\nconst program = Effect.sleep("1 '), "durationInput", C.len(8)),
+      T(f, "V4GenOnLocalObject", 'import { Effect } from "effect"\nconst M = { gen: Effect.gen }\nconst x = M.', null, "all", C.hasLabel("gen(function*(){})"), C.noLabel("fn(function*(){})")),
+      T(f, "V4CommentInsideBlock", 'import { Effect } from "effect"\nfunction f() {\n  /** @', null, "all", C.hasLabel("@effect-diagnostics"), C.hasLabel("@effect-codegens"), C.hasLabel("@effect-identifier")),
+    );
+  }
+  return cases.map((c) => ({ ...c, name: c.name[0].toLowerCase() + c.name.slice(1) }));
+}
+
+async function runCompletion(c) {
+  let text;
+  if (c.setup === "unit" || c.setup === "pkg") {
+    const marked = c.source.slice(0, c.pos) + "/*1*/" + c.source.slice(c.pos);
+    text = "// @Filename: /tsconfig.json\n" + COMPLETION_TSCONFIG + "\n" + (c.setup === "pkg" ? "// @Filename: /package.json\n" + HARNESS_PACKAGE_JSON + "\n" : "") + "// @Filename: /test.ts\n" + marked;
+  } else {
+    text = c.setup;
+  }
+  const files = fourslashFiles(text).map((f) => {
+    const { text: content, markers } = stripMarkers(f.content);
+    return { name: f.name, content, markers };
+  });
+  fs.rmSync(c.dir, { recursive: true, force: true });
+  fs.mkdirSync(c.dir, { recursive: true });
+  const m = mountVersion(files.map((f) => f.content));
+  if (m) mount(c.dir, m.version, m.vitest);
+  writeFiles(c.dir, files);
+  const project = new Project(c.dir);
+  const server = new Server(c.dir, capabilities(), null);
+  try {
+    await server.start(c.dir);
+    openAll(server, project, files);
+    const file = files.find((f) => "1" in f.markers);
+    if (!file) throw new Error("no marker 1");
+    const before = file.content.slice(0, file.markers["1"]);
+    const line = before.split("\n").length - 1;
+    const col = before.slice(before.lastIndexOf("\n") + 1);
+    const character = server.encoding === "utf-8" ? Buffer.byteLength(col) : col.length;
+    // Go fourslash getCompletions: an empty context (triggerKind is required, so Go sends 0), then the client sort (ls.CompareCompletionEntries).
+    const result = await server.request("textDocument/completion", { textDocument: { uri: project.uri(file.name) }, position: { line, character }, context: { triggerKind: 0 } });
+    const list = result && !Array.isArray(result) ? result : null;
+    const all = [...(list?.items ?? [])].sort((a, b) => compareCaseInsensitiveThenSensitive(a.sortText ?? "", b.sortText ?? "") || compareCaseInsensitiveThenSensitive(a.label, b.label));
+    const items = all.filter((it) => COMPLETION_FILTERS[c.filter](it.label));
+    if (args.dump) {
+      fs.mkdirSync(args.dump, { recursive: true });
+      fs.writeFileSync(path.join(args.dump, c.name + ".json"), project.normalize(JSON.stringify(list === null ? null : { ...list, items: all }, null, 1)) + "\n");
+    }
+    const errors = [];
+    if (c.nilFatal && list === null) errors.push("completions is nil");
+    else
+      for (const check of c.checks) {
+        const e = check(items);
+        errors.push(...e);
+        if (e.some((x) => x.startsWith("FATAL"))) break;
+      }
+    if (!errors.length) return "ok\n";
+    return project.normalize(errors.join("\n") + "\n--- filtered items\n" + JSON.stringify(items, null, 1) + "\n");
+  } finally {
+    await server.stop();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
 
@@ -817,6 +1315,8 @@ function collectCases() {
     if (kinds.includes("symbols")) for (const f of listTs(path.join(tests, v + "-document-symbols"))) add("symbols", v, path.basename(f, ".ts"), { file: f, baseline: path.join(REFERENCE, v, path.basename(f, ".ts") + ".symbols.txt"), run: runSymbols });
   }
   if (kinds.includes("inlay")) for (const c of inlayCases()) add("inlay", "inlayHints", c.name, { content: c.content, baseline: path.join(REFERENCE, "inlayHints", c.name + ".baseline"), run: runInlay });
+  if (kinds.includes("hover")) for (const c of hoverCases()) add("hover", "hover_test", c.name, { content: c.content, checks: c.checks, expected: hoverExpected(c), run: runHover });
+  if (kinds.includes("completion")) for (const c of completionCases()) add("completion", c.file.replace(/\.go$/, ""), c.name, { ...c, expected: "ok\n", run: runCompletion });
   return cases;
 }
 
@@ -840,14 +1340,15 @@ async function runCase(c) {
   const started = Date.now();
   let status, detail;
   try {
-    if (!fs.existsSync(c.baseline)) throw new Error(`no baseline ${path.relative(EFFECT_REPO, c.baseline)}`);
+    if (c.expected === undefined && !fs.existsSync(c.baseline)) throw new Error(`no baseline ${path.relative(EFFECT_REPO, c.baseline)}`);
     const actual = await c.run(c);
-    const expected = fs.readFileSync(c.baseline, "utf8");
-    status = actual === expected ? "same" : "diff";
+    const expected = c.expected ?? fs.readFileSync(c.baseline, "utf8");
+    const norm = c.kind === "hover" ? inflateMermaid : (text) => text;
+    status = norm(actual) === norm(expected) ? "same" : "diff";
     if (status === "diff") {
       fs.mkdirSync(resultDir, { recursive: true });
       fs.writeFileSync(path.join(resultDir, c.name + ".actual"), actual);
-      fs.writeFileSync(path.join(resultDir, c.name + ".diff"), lineDiff(expected, actual));
+      fs.writeFileSync(path.join(resultDir, c.name + ".diff"), lineDiff(norm(expected), norm(actual)));
     }
   } catch (e) {
     status = "error";

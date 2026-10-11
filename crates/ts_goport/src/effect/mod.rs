@@ -9,11 +9,16 @@
 //! diagnostics enabled. A standalone API process (`tsgo --api`) runs nothing
 //! unless `TSGO_EFFECT_API=1` (`rulerunner::set_api_process`).
 //!
+//! `effect::ls` ports the language service hooks of effect-tsgo 0.51.1
+//! (`etslshooks`): hover, the inlay hint filter and the hook sites that the
+//! later editor lanes fill.
+//!
 //! Read `crates/ts_goport/src/effect/PORTING.md` before editing.
 
 use crate::gostd::Context;
 use crate::prelude::*;
 
+pub mod codegens;
 pub mod configcheck;
 pub mod configraw;
 pub mod diag;
@@ -22,6 +27,7 @@ pub mod etscore;
 pub mod graph;
 pub mod keybuilder;
 pub mod layergraph;
+pub mod ls;
 pub mod pluginoptions;
 pub mod rule;
 pub mod rulerunner;

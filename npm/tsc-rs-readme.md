@@ -29,8 +29,11 @@ the plugin, as with `@effect/language-service`:
 ```
 
 The rules, options and `@effect-diagnostics` comments are a port of
-[Effect-TS/tsgo](https://github.com/Effect-TS/tsgo) 0.51.1. The editor features of the language
-service (quick fixes, refactors, hover, completions) are not ported.
+[Effect-TS/tsgo](https://github.com/Effect-TS/tsgo) 0.51.1. The language server also has its editor
+features: the Effect hover (with the Layer summary), inlay hints, the auto-import style, quick fixes,
+document symbols, completions and refactors. All the editor features of 0.51.1 are ported. The lightbulb
+and the quick fix menu show the Effect refactors. The editor's Refactor menu does not show them yet: it
+needs `refactor.rewrite` in the server's code action kinds, which waits for a decision.
 
 The API stability rules of 0.51.1 read the `@stability` JSDoc tags of Effect 4.
 `unstableApiUsage` (TS377136) and `experimentalApiUsage` (TS377135) report each use of an

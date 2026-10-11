@@ -107,6 +107,7 @@ fn get_import_code_actions(
                     &locale::from_context(ctx),
                     &args![],
                 ),
+                ..Default::default()
             });
         }
     }
