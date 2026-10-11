@@ -6,7 +6,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
-- **Now (2026-10-11):** R191 = bump D (batch 73) side run on dbook-lan; pre-verdict items running (bumpD-w6: per-class table, release timing with the mongodb cost); np-suite at N prime on the side bins on a testbox after the side run. Then R192 = goport-int60p f0d8c2df8 (note int60p-r2-2026-10-11) plus the accepted bump D head plus perfP2 d620bef7d (item 2). Then R193 = int61 goport-effint1 b38ba8de8 (all Effect editor features). Studies running: astchunks0 (typed node chunks), effperf2 (Effect plugin per rule).
+- **Now (2026-10-11):** R191 = bump D accepted (main at microsoft/TypeScript fed0bf24149f; note r191 accept). Next revision R192 = goport-int60p f0d8c2df8 (note int60p-r2-2026-10-11): merge main (R191 accepted head), perfP2 d620bef7d (item 2), then the side run. Before the R192 verdicts (R191 reviewer item 9): record N prime goldens for the 5 extra LSP batteries and run them on the R191 bins. Then R193 = int61 goport-effint1 b38ba8de8 (merge main at N prime first). Running lanes: astshrink1, jsdocstr1, effperf3 (on int60p plus perfP2), invokeonce1 and chk4split (R191 reviewer item 3: also time Go N and N prime; likely cause Go checkerpool.go:437). Queued: apicb follow-ups (R191 reviewer item 7), the tree-wide Go line reference refresh (ruling 18), T3 web +1.38 to measure again.
 
 - **int61 = goport-effint1 b38ba8de8 (all Effect editor features of effect-tsgo 0.51.1; note effint3-result-2026-10-11).** After bump D and int60: merge the accepted head, then a revision. D1 (refactor.rewrite in initialize codeActionKinds) needs Theo.
 
