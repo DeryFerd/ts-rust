@@ -980,7 +980,7 @@ impl CodeActionKind {
     }
 }
 
-// Go: lsp.go:316
+// Go: lsp.go:403
 impl CodeActionKind {
     // Go: CodeActionKindSourceFixAll + ".ts"
     pub const SOURCE_FIX_ALL_TS: CodeActionKind = CodeActionKind(Cow::Borrowed("source.fixAll.ts"));

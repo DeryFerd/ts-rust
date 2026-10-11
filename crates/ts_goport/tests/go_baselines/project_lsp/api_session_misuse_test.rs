@@ -199,7 +199,7 @@ fn signature_id_of_f(before: impl FnOnce(&Api)) -> String {
 
 child_test! {
     // optapifuzz1 E1 (d030): Go `declaration.Parameters()` dereferences nil
-    // on a node that is not function-like (checker.go:20192). The port read
+    // on a node that is not function-like (checker.go:20259). The port read
     // the nil list as empty and made and registered a signature, so the
     // next signature had another id.
     fn get_signature_from_declaration_of_a_node_that_is_not_function_like() {
@@ -220,7 +220,7 @@ child_test! {
 child_test! {
     // optapifuzz1 E2 (d026): from the SourceFile, Go's walk in
     // getConditionalFlowTypeOfType reads the nil parent of the SourceFile
-    // (checker.go:25424). The port's shortcut for a store with no
+    // (checker.go:25493). The port's shortcut for a store with no
     // conditional or mapped type skipped the walk and answered a type.
     fn get_type_from_type_node_of_the_source_file() {
         let api = api_a();
@@ -242,7 +242,7 @@ child_test! {
 child_test! {
     // optapifuzz1 E3 (d035): typeToTypeNode with no location builds an
     // import type into node_modules under nodenext, and Go reads the file
-    // name of the nil context file (nodebuilderimpl.go:686,
+    // name of the nil context file (nodebuilderimpl.go:687,
     // compiler/program.go:1744). The port read nil as a file and answered
     // null.
     fn type_to_type_node_of_a_node_modules_type_with_no_location() {
@@ -351,7 +351,7 @@ child_test! {
     // optapifuzz1 D: a type getter on the wrong type kind. A cast to a
     // concrete struct (`t.data.(*ConditionalType)`, types.go:709-727) panics
     // with Go's runtime text. A cast to an embedded struct returns nil, and
-    // the caller dereferences it (checker.go:22285 for getTypeArguments).
+    // the caller dereferences it (checker.go:22353 for getTypeArguments).
     // The port panicked with its own text for both.
     fn type_getters_on_the_wrong_type_kind() {
         let api = api_a();
@@ -389,12 +389,12 @@ child_test! {
 child_test! {
     // optapifuzz1 F: other requests where Go panics, each with Go's text.
     // F1: getContextualType reads the nil parent of the SourceFile
-    // (checker.go:29839). F2: getImmediateAliasedSymbol asserts an alias
-    // (checker.go:2197); the port's assert was off in release. F3: argument
+    // (checker.go:29903). F2: getImmediateAliasedSymbol asserts an alias
+    // (checker.go:2200); the port's assert was off in release. F3: argument
     // index -1 (relater.go:1801). F4: a position of 2^31, which Go keeps as
     // an int, past the text in the JSDoc snippet slice (jsdoc_snippet.go:77);
     // the port wrapped it to a negative i32. F5: a kind that is no syntax
-    // kind (nodebuilderimpl.go:1972).
+    // kind (nodebuilderimpl.go:1973).
     fn misuse_panics_with_go_texts() {
         let api = api_a();
         let text = go_panic_text(|| {

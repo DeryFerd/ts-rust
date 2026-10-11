@@ -1385,7 +1385,7 @@ impl Checker {
     /// early, so the result and the lazy symbol ids are Go's. Longer lists
     /// go to `sort_large_union_types` (one table entry per distinct type,
     /// with its key and the key of its second member).
-    // Go: checker/checker.go:26275 slices.SortStableFunc(types, CompareTypes)
+    // Go: checker/checker.go:26344 slices.SortStableFunc(types, CompareTypes)
     pub(crate) fn sort_union_types(&self, types: &mut [TypeId]) {
         if types.len() > KEYED_SORT_MAX {
             self.sort_large_union_types(types);

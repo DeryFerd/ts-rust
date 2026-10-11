@@ -1678,7 +1678,7 @@ impl DefaultResolver {
     /// cache, as the first read of the load made it
     /// (`PackageJsonLookup::read`), unless the cache has the entry: Go
     /// `InfoCache.Set` keeps the first. In Go the loader finds the metadata
-    /// (fileloader.go:391 `loadSourceFileMetaData`) with the program's
+    /// (fileloader.go:389 `loadSourceFileMetaData`) with the program's
     /// resolver, so a later lookup on the loading thread (the loader's own
     /// resolutions, Go `Program.GetPackageJsonInfo`) finds what the load
     /// read and does not read the file again. The cache parses a text only

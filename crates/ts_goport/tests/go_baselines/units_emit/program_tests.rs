@@ -398,7 +398,7 @@ foo.bar;";
 // parse (`resolveJSDoc`, ast.go:2745) added. The parser defers a TS comment
 // whose `{@link}` its prefilter misses (`{@link<form feed>Foo}`). The call
 // `f()` before `f` reads that comment lazily (the `@deprecated` check), so
-// `checkSourceElementWorker` (checker.go:2296) sees the link and marks `Foo`
+// `checkSourceElementWorker` (checker.go:2299) sees the link and marks `Foo`
 // used. Go N reports nothing; before 6472f970b the port reported TS6133
 // "'Foo' is declared but its value is never read".
 #[test]
@@ -452,7 +452,7 @@ fn test_lazy_js_doc_link_marks_its_target_used() {
 // list that `SharedList::detach` does not read in place. This one installs
 // its program as `tsc` does (`program::load`, one program in the process),
 // so such a list is in the checker arena, and the `has_base_type` walk reads
-// it in place. The answers must be Go `hasBaseType`'s (checker.go:19888).
+// it in place. The answers must be Go `hasBaseType`'s (checker.go:19955).
 #[test]
 fn test_has_base_type_reads_arena_base_types_in_place() {
     in_child(
@@ -513,9 +513,9 @@ fn test_has_base_type_reads_arena_base_types_in_place() {
 }
 
 // PORT: no Go test (basetype1). `has_base_type` (Go `hasBaseType`,
-// checker.go:19888) reads resolved base types in place with
+// checker.go:19955) reads resolved base types in place with
 // `Type::resolved_base_types` and calls `get_base_types_shared` (Go
-// `getBaseTypes`, checker.go:19504) only for a type whose base types are
+// `getBaseTypes`, checker.go:19571) only for a type whose base types are
 // not resolved yet. The in-place read must be `None` before resolution, so
 // the walk still runs `getBaseTypes` and its side effects in Go's order,
 // and must equal `get_base_types_shared` after it.
@@ -589,7 +589,7 @@ fn test_has_base_type_reads_resolved_base_types_in_place() {
 
                 // C -> B -> A. The walk resolves C's base types; the
                 // circularity check in Go `resolveBaseTypesOfClass`
-                // (`hasBaseType(B, C)`, checker.go:19597) resolves B's and A's,
+                // (`hasBaseType(B, C)`, checker.go:19664) resolves B's and A's,
                 // so the walk then reads B's in place.
                 assert!(c.has_base_type(cc, a));
                 assert_eq!(resolved(c, cc), Some(vec![b]));

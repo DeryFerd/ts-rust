@@ -810,7 +810,7 @@ impl Session {
         // PORT: Go converts any int32 to `ast.Kind` (int16). A value that is
         // no SyntaxKind has no Rust value. Go's node builder builds the parts
         // and then panics in the default case of its kind switch
-        // (nodebuilderimpl.go:1972). `Unknown` takes the same path: the
+        // (nodebuilderimpl.go:1973). `Unknown` takes the same path: the
         // builder compares the kind only with signature kinds.
         let kind = SyntaxKind::try_from(params.kind as u16).unwrap_or(SyntaxKind::Unknown);
         let node = setup
@@ -2081,7 +2081,7 @@ impl Session {
         let symbol = checker_symbol(&setup.checker, &owner, symbol);
 
         // PORT: Go's getImmediateAliasedSymbol asserts that the symbol is an
-        // alias (checker.go:2197). The checker's assert is a debug_assert!,
+        // alias (checker.go:2200). The checker's assert is a debug_assert!,
         // so that no Go assert panic is new on a CLI path; this request can
         // name any symbol, so it asserts here.
         go_assert!(

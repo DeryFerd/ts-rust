@@ -2991,7 +2991,7 @@ pub fn get_emit_module_format_of_file(source_file: Node) -> ModuleKind {
     }
     // PORT: Go `sourceFile.FileName()` dereferences a nil file, for example
     // the context file of a node builder with no enclosing declaration
-    // (checker/nodebuilderimpl.go:686). The port's file info of nil has no
+    // (checker/nodebuilderimpl.go:687). The port's file info of nil has no
     // name.
     if source_file.is_nil() {
         go_nil_dereference();

@@ -2123,7 +2123,7 @@ impl ProjectCollectionBuilder {
     //   (tsoptions/parsedcommandline.go:181). Only
     //   `(*ParsedCommandLine).CommonSourceDirectory` (:157) calls it. Its
     //   callers:
-    //   - checker.go:15547, on `redirect`, the command line of a project
+    //   - checker.go:15605, on `redirect`, the command line of a project
     //     reference (compiler/projectreferencefilemapper.go:90);
     //   - outputpaths (outputpaths.go:141, :167, :191), with the command
     //     line as its `OutputPathsHost` (parsedcommandline.go:117), from
@@ -2133,7 +2133,7 @@ impl ProjectCollectionBuilder {
     //     (compiler/projectreferenceparser.go:28, ls/autoimport/util.go:189).
     //     Only tsc -b calls the second, on the command line of a config
     //     file (execute/build/buildtask.go:290, :520, :782, :797, :824,
-    //     orchestrator.go:398).
+    //     orchestrator.go:399).
     // - An inferred or synthetic command line comes from
     //   `newInferredProjectCommandLine` (project/project.go:258), not from a
     //   config file, so it is never a reference of a program. Its `Errors`

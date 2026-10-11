@@ -692,7 +692,7 @@ impl Server {
     }
 }
 
-// Go: server.go:323 content mapper registration IDs (tsgo#4712)
+// Go: server.go:359 content mapper registration IDs (tsgo#4712)
 const CONTENT_MAPPER_DID_OPEN_REGISTRATION_ID: &str = "content-mapper-did-open";
 const CONTENT_MAPPER_DID_CHANGE_REGISTRATION_ID: &str = "content-mapper-did-change";
 const CONTENT_MAPPER_DID_CLOSE_REGISTRATION_ID: &str = "content-mapper-did-close";
@@ -1880,7 +1880,7 @@ fn cancels_warm_auto_import(method: &lsproto::Method) -> bool {
 /// PORT: the LSP messages that the wait of a call to the client from an
 /// API request serves (`wait_during_api_call`). Their Go handlers queue
 /// file changes and timers and do not build a snapshot (session.go:363
-/// DidCloseFile, :375 DidChangeFile, :410 DidSaveFile; server.go:1834
+/// DidCloseFile, :375 DidChangeFile, :410 DidSaveFile; server.go:1874
 /// handleSetTrace does nothing). Go's DidChangeFile reads the session's
 /// snapshot (`isContentMapperFile`), so it waits while an API request
 /// builds the session's next snapshot (project/api.go:18 APIUpdate holds
@@ -2016,7 +2016,7 @@ impl ServerShared {
     /// (`ApiConnProtocol`). Returns when a message is in `inbox` or `ctx`
     /// is done, or with an LSP message to serve now, which it takes out of
     /// the request queue. Go serves LSP messages on its dispatch goroutine
-    /// while the API goroutine waits (server.go:968 dispatchLoop), and its
+    /// while the API goroutine waits (server.go:1004 dispatchLoop), and its
     /// process exits when the dispatch loop ends. Here the API request is
     /// in the middle of its work on the session, so the wait serves, in
     /// arrival order, only the messages that do not need the session
@@ -2448,14 +2448,14 @@ impl ServerShared {
 pub struct UserFacingRequestFailedError(pub String);
 
 impl std::fmt::Display for UserFacingRequestFailedError {
-    // Go: server.go:1105 Error
+    // Go: server.go:1141 Error
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
 /// Go `userFacingRequestFailedError(msg)` as an `error`.
-/// Go: server.go:1106 Unwrap returns `lsproto.ErrorCodeRequestFailed`.
+/// Go: server.go:1142 Unwrap returns `lsproto.ErrorCodeRequestFailed`.
 pub fn user_facing_request_failed_error(msg: String) -> GoError {
     errors::from_value_with_unwrap(
         UserFacingRequestFailedError(msg),
@@ -3227,7 +3227,7 @@ pub struct CrossProjectOrchestrator {
     pub all_projects: Vec<Rc<dyn ls::Project>>,
 }
 
-// Go: server.go:1438 `var _ ls.CrossProjectOrchestrator = (*crossProjectOrchestrator)(nil)`: the impl below.
+// Go: server.go:1474 `var _ ls.CrossProjectOrchestrator = (*crossProjectOrchestrator)(nil)`: the impl below.
 
 impl ls::CrossProjectOrchestrator for CrossProjectOrchestrator {
     // Go: server.go:1476 GetDefaultProject

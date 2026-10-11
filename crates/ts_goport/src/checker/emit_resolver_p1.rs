@@ -95,7 +95,7 @@ impl Checker {
         Rc::new(new_emit_resolver(self, emit_context))
     }
 
-    // Go: checker/checker.go:32651 GetEmitResolver (removed upstream by ts#64649)
+    // Go: checker/checker.go:32651 GetEmitResolver (at 673a5f17d713; removed upstream by ts#64649)
     // PORT: not in Go N'. ts#64649 replaced it with `NewEmitResolver`. The
     // declarations symbol tracker and declaration diagnostics use it to
     // reach the unsafe resolver methods with the checker in hand (they read

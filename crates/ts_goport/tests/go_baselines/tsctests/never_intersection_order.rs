@@ -1,5 +1,5 @@
 //! Port-only test of the name order of `some_property_reduces_to_never`
-//! (Go `checker/checker.go:22216 somePropertyReducesToNever`).
+//! (Go `checker/checker.go:22283 somePropertyReducesToNever`).
 //!
 //! PORT: no Go counterpart. Since ts#64521 (Go N' checker.go:22283) Go
 //! tests the shared names of an intersection in first-seen order and stops

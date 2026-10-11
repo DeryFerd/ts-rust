@@ -684,7 +684,7 @@ pub struct CompilerCheckerPool {
 // Checker association (Go compiler/checkerpool.go, #4313)
 // ---------------------------------------------------------------------------
 
-// Go: compiler/checkerpool.go:38
+// Go: compiler/checkerpool.go:40
 //
 // Checker association is a balanced graph-partitioning problem:
 //
@@ -708,7 +708,7 @@ pub struct CompilerCheckerPool {
 // stream order is part of the policy below, rather than an incidental
 // implementation detail.
 //
-// Go: compiler/checkerpool.go:74
+// Go: compiler/checkerpool.go:76
 // The constants below are empirical safety factors for a work proxy that cannot
 // observe future semantic cache construction. They were swept across representative
 // projects including VS Code, TypeScript, MUI docs, XState, and Bluesky, with 2, 4,
@@ -716,7 +716,7 @@ pub struct CompilerCheckerPool {
 // operating points, not formulas derived by FENNEL.
 // PORT: Go `int` is `i64` for weights and multipliers.
 
-// Go: compiler/checkerpool.go:100 const(
+// Go: compiler/checkerpool.go:102 const(
 pub const CHECKER_ASSOCIATION_TEXT_WEIGHT_DIVISOR: i64 = 100;
 pub const CHECKER_ASSOCIATION_SOURCE_FILE_WEIGHT_MULTIPLIER: i64 = 4;
 pub const CHECKER_ASSOCIATION_BALANCE_PENALTY_MULTIPLIER: i64 = 16;

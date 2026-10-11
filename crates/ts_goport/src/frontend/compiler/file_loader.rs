@@ -1760,7 +1760,7 @@ impl FileLoader {
                         _ => (entry.text(), import_usage(entry), None),
                     };
                 // ts#63915: a source phase import is not resolved
-                // (fileloader.go:884).
+                // (fileloader.go:875).
                 if module_name.is_empty() || is_source_phase_import(entry.parent()) {
                     continue;
                 }
@@ -1921,7 +1921,7 @@ impl FileLoader {
     /// metadata (`take_prefetched_meta`). The cache parses a read only when
     /// a lookup asks for it.
     // PORT: not in Go (loadpar1). Go finds the metadata with the program's
-    // resolver (fileloader.go:391).
+    // resolver (fileloader.go:389).
     pub(crate) fn adopt_worker_package_jsons(&self, package_jsons: &[PackageJsonLookup]) {
         if let Some(resolver) = self
             .resolver
@@ -2050,7 +2050,7 @@ impl FileLoader {
 }
 
 /// Whether Go `loadSourceFileMetaData` takes the package.json `type` of the
-/// scope of `file_name` (fileloader.go:398 to :401): for node16 to nodenext
+/// scope of `file_name` (fileloader.go:397 to :400): for node16 to nodenext
 /// module resolution (not for `.mts`, `.cts`, `.mjs` and `.cjs` files), or
 /// for a path under `/node_modules/`.
 pub(crate) fn package_json_type_applies(
@@ -2318,7 +2318,7 @@ fn mode_for_import_usage(
 /// tells (Go `resolveImportsAndModuleAugmentations`: a JSDoc import of a TS
 /// file adds no file).
 // Go: fileloader.go (*fileLoader).resolveImportsAndModuleAugmentations, the
-// importIndex condition (pin 673a5f17d713: fileloader.go:926)
+// importIndex condition (pin fed0bf24149f: fileloader.go:917)
 fn import_adds_file(import: Node) -> bool {
     is_in_js_file(import) || !import.flags().intersects(NodeFlags::JS_DOC)
 }
@@ -2506,7 +2506,7 @@ pub(crate) fn guess_import_mode(
 /// The synthetic imports of a file (Go `resolveImportsAndModuleAugmentations`,
 /// before its imports): `tslib` for `importHelpers`, then the JSX runtime
 /// import. The parse worker of the file resolves them too (`FilePrep`).
-// Go: fileloader.go:835 to :853 (resolveImportsAndModuleAugmentations)
+// Go: fileloader.go:826 to :844 (resolveImportsAndModuleAugmentations)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SyntheticImports {
     /// The file gets the `tslib` import (`EXTERNAL_HELPERS_MODULE_NAME_TEXT`).
@@ -3004,7 +3004,7 @@ export const a: T | Dep | number = x + (h as never);
     // loadcrit2: with project references, the parse workers resolve each
     // file of a reference with the reference's options, from its source
     // file, as the loader does (Go `getRedirectForResolution`,
-    // fileloader.go:842): the output `.d.ts` files and a `.d.ts` source.
+    // fileloader.go:833): the output `.d.ts` files and a `.d.ts` source.
     // The loader takes their preps (`FilePrep::fits`), and the load finds
     // what a load that resolves every name itself finds, and what a single
     // threaded load finds.
@@ -3097,7 +3097,7 @@ export const a: T | Dep | number = x + (h as never);
         assert!(names.iter().any(|name| name == "lib.es6.d.ts"), "{names:?}");
     }
 
-    // Go fileloader.go:839 adds the implicit jsx-runtime import only to a
+    // Go fileloader.go:830 adds the implicit jsx-runtime import only to a
     // JS or JSX file (IsSourceFileJS reads the script kind) or a TSX file.
     // A JSON file also has the JAVA_SCRIPT_FILE flag, but gets no import.
     #[test]
@@ -3218,7 +3218,7 @@ export const a: T | Dep | number = x + (h as never);
     // metadata, and the loader keeps the package.json reads of that walk
     // in the program resolver's cache when it takes the metadata
     // (`Caches::adopt_worker_package_jsons`), as the Go loader finds the
-    // metadata with the program's resolver (fileloader.go:391,
+    // metadata with the program's resolver (fileloader.go:389,
     // module/resolver.go:1755 getPackageJsonInfo, packagejson/cache.go:190
     // Set keeps the first). A lookup on the loading thread after the load
     // (Go `Program.GetPackageJsonInfo`, compiler/program.go:157) finds what
@@ -3299,7 +3299,7 @@ export const a: T | Dep | number = x + (h as never);
     // walk in the program resolver's cache (`Caches::adopt_worker_package_jsons`),
     // so its own lookups later in the load find them and do not read the
     // files again, as the Go loader finds the metadata with the program's
-    // resolver (fileloader.go:391, module/resolver.go:1755
+    // resolver (fileloader.go:389, module/resolver.go:1755
     // getPackageJsonInfo, packagejson/cache.go:190 Set). No worker resolves
     // the module augmentation "aug" (the workers resolve imports), so the
     // loader resolves it while it loads `src/a.ts`, after it took that
@@ -3372,7 +3372,7 @@ export const a: T | Dep | number = x + (h as never);
     // parses the file itself, and the load ends with the file. The loader
     // waits for the worker of each file (`set_meta_wait`), so without the
     // guard it would wait forever: the test fails after 60 s. Go has no
-    // parse worker; its loader finds the metadata (fileloader.go:391).
+    // parse worker; its loader finds the metadata (fileloader.go:389).
     #[test]
     fn a_worker_panic_leaves_no_loader_waiting() {
         use super::super::files_parser::{PANIC_IN_JOB, parse_workers_enabled};

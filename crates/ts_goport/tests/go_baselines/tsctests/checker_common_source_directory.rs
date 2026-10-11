@@ -1,5 +1,5 @@
 //! Port-only test of the TS6059 errors that a checker records on a
-//! referenced project (Go `checker/checker.go:15547`
+//! referenced project (Go `checker/checker.go:15605`
 //! `redirect.CommonSourceDirectory()`).
 //!
 //! PORT: no Go counterpart (projfix1 skeptic case t11). With

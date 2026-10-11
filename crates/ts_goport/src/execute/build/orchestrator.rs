@@ -884,7 +884,7 @@ impl Orchestrator {
 
     // Go: build/orchestrator.go:917 (*Orchestrator).rangeTasks over `order`
     // with build/orchestrator.go:951 (*Orchestrator).buildOrCleanProject, and
-    // the reporting goroutine of build/orchestrator.go:873 buildOrCleanOrder
+    // the reporting goroutine of build/orchestrator.go:869 buildOrCleanOrder
     // (ts#64220, ts#64158).
     // PORT: see the top comment for the schedule. Go `numRoutines <= 0`
     // starts no builder, so no task runs; that is kept.

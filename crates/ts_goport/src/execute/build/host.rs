@@ -93,7 +93,7 @@ pub struct WatchSource {
 /// the detection kind, and with `auto` only, whether `jsx` is react-jsx or
 /// react-jsxdev and whether the module resolution is in Node16..NodeNext,
 /// which reads the package.json `type` (`loadSourceFileMetaData`,
-/// fileloader.go:384). `module` has an effect only through the two
+/// fileloader.go:382). `module` has an effect only through the two
 /// default kinds here: with no `moduleDetection`, a module kind in
 /// Node16..NodeNext gives `force` (`GetEmitModuleDetectionKind`,
 /// compileroptions.go:243), and with no `moduleResolution` (or classic or
@@ -132,7 +132,7 @@ impl ModuleIndicatorInputs {
     /// (Go `GetExternalModuleIndicatorOptions`), or `None` when they take
     /// the package.json `type`, which is not read here: with `auto`, for a
     /// file that is not .mts, .cts, .mjs or .cjs, under a Node16..NodeNext
-    /// resolution or in node_modules (fileloader.go:384).
+    /// resolution or in node_modules (fileloader.go:382).
     #[must_use]
     pub fn options_of(self, file_name: &str) -> Option<ExternalModuleIndicatorOptions> {
         if is_declaration_file_name(file_name) {
@@ -172,7 +172,7 @@ impl Hash for SourceFileCacheKey {
 }
 
 // Go: vfs/cachedvfs/cachedvfs.go FS, the file system of the build host
-// (`cachedvfs.From(sys.FS())`, orchestrator.go:1004).
+// (`cachedvfs.From(sys.FS())`, orchestrator.go:996).
 // PORT: the same cache as `CachedFs` (always enabled: the build host
 // never disables it), but the `FileExists`, `DirectoryExists`,
 // `Realpath` and `GetAccessibleEntries` lookups live in a
@@ -361,7 +361,7 @@ impl WrittenPaths {
 
 impl BuildHost {
     // PORT: Go builds the host inline in `NewOrchestrator`
-    // (orchestrator.go:1004): `compiler.NewCachedFSCompilerHost(cwd, sys.FS(),
+    // (orchestrator.go:996): `compiler.NewCachedFSCompilerHost(cwd, sys.FS(),
     // sys.DefaultLibraryPath(), nil, nil, nil)` and an empty mTimes map.
     // `NewCachedFSCompilerHost` is written out (compiler/host.go:44) to keep
     // the cached file system.

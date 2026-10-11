@@ -1367,9 +1367,10 @@ impl GoSharedState {
         };
         let source_to_project_reference = copy_map(&mapper.source_to_project_reference);
         let output_dts_to_project_reference = copy_map(&mapper.output_dts_to_project_reference);
-        // The load released the mapper's loader (Go fileloader.go:223), so
-        // no entry is added after it (`getSourceToDtsIfSymlink`, :163), and
-        // an entry with no source finds nothing.
+        // The load released the mapper's loader, so no entry is added after
+        // it (Go ts#64519: only the load's builder adds entries,
+        // projectreferencefilemapper.go:197 resolveSymlink), and an entry
+        // with no source finds nothing.
         let realpath_dts_to_source: FxHashMap<_, _> = mapper
             .realpath_dts_to_source
             .borrow()

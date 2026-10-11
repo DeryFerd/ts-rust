@@ -481,12 +481,12 @@ impl compiler::CompilerHost for CompilerHost {
     //   depends on the file's package.json scope, which the load finds later
     //   (ast/parseoptions.go:46 isFileForcedToBeModuleByFormat). Only a
     //   `"type": "module"` scope can set force, and the load reads the type
-    //   only where Go does (fileloader.go:398 to :401, node16 to nodenext
+    //   only where Go does (fileloader.go:397 to :400, node16 to nodenext
     //   resolution or a `/node_modules/` path): there both values pass, and
     //   elsewhere only the value with no scope. A project with references parses
     //   their source files with the reference's own options (Go
-    //   projectreferencefilemapper.go:80 getCompilerOptionsForFile, from
-    //   fileloader.go:418), which the host does not have yet, so then any
+    //   projectreferencefilemapper.go:90 getCompilerOptionsForFile, from
+    //   fileloader.go:416), which the host does not have yet, so then any
     //   jsx and force pass.
     //
     // A wrong guess costs only time or memory: the output always comes from
