@@ -53,7 +53,8 @@ push_paths() {
   # The idle loop of run-testbox does not see this SSH route: touch its activity marker while we copy.
   while :; do $ssh "runner@$host" touch .testbox-last-activity || true; sleep 60; done &
   keep=$!
-  trap 'kill "$keep" 2>/dev/null' EXIT
+  # shellcheck disable=SC2064 # expand now: keep is local, and the trap runs after the function returns
+  trap "kill $keep 2>/dev/null || true" EXIT
   for p in "$@"; do
     p="$(realpath "$p")"
     echo "push $p"
