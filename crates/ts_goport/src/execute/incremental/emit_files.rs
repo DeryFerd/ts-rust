@@ -960,19 +960,26 @@ fn is_declaration_output(write: &BufferedWrite) -> bool {
 /// each file's outputs in Go's order. Go's emit goroutines make the calls
 /// in parallel. A d.ts signature that reads the TS5033 of an earlier
 /// failed write of its file (`signature_read_diagnostics`) panics and ends
-/// the process during the other goroutines' calls, so Go writes some of
-/// their outputs, by timing. This makes the writes that Go N' mostly
-/// makes (gopanicout1 `go-model.md` section 5, 50 runs per shape):
+/// the process during the other goroutines' calls, so Go makes some of
+/// their calls and writes some of their outputs, by timing. This makes
+/// calls and writes that Go N' often makes (gopanicout1 and gopanicout2
+/// `go-model.md`, the client's call set and the written files are one of
+/// Go's results in 30 to 160 runs per shape):
 /// - The outputs go in rounds: the first output of each file that comes
 ///   before its declarations, then the second..., then the declaration
 ///   outputs in rounds. A file's goroutine writes its JS and maps before
 ///   its declarations.
 /// - After a failed write of a file whose d.ts then panics (doomed), with
-///   `Concurrent` calls: the other outputs before the declarations, then
-///   the doomed file's declaration map. Go's panic needs no more answers,
-///   and another file's d.ts needs one more.
-/// - With `Serialized` calls: only the doomed file's outputs before its
-///   d.ts. The goroutine that got its answer takes the call mutex again.
+///   `Concurrent` calls: the rest of the outputs before the declarations
+///   and, for a failed declaration output, the rest of its round (the
+///   other files' calls are in flight), then the doomed file's own
+///   outputs. Go's panic needs no more answers, and another file's next
+///   output needs one more.
+/// - With `Serialized` calls (`flush_serialized_client_writes`): every
+///   file's first output is called, then the doomed file's own outputs.
+///   Of the other files' first outputs, only the next file's (after the
+///   doomed one, in file order, the first after the last) is written; the
+///   process ends before the others' writes.
 /// - No other write is made: the replay panics at the doomed d.ts, and the
 ///   process ends (`program_emit::wait_emit_jobs`).
 ///
@@ -1001,51 +1008,188 @@ fn flush_client_writes(
         place[usize::from(declaration)] += 1;
     }
     crate::gostd::slices::stable_sort_by(&mut rounds, |a, b| a.0.cmp(&b.0));
-    // The files whose d.ts signature reads `data.diagnostics`.
-    let reads_diagnostics: FxHashSet<usize> = rounds
-        .iter()
-        .filter(|(_, write)| write.signature_read_diagnostics)
-        .map(|&((.., file), _)| file)
-        .collect();
-    let mut failed = FxHashSet::default();
-    let mut doomed = None;
-    let mut failures = FlushFailures::default();
-    for ((declaration, _, file), mut write) in rounds {
-        let made = match (doomed, calls) {
-            (None, _) => true,
-            (Some(doomed), ClientWrites::Concurrent) => !declaration || file == doomed,
-            (Some(doomed), ClientWrites::Serialized) => file == doomed,
-        };
-        if !made {
-            continue;
+    let mut flush = ClientFlush {
+        // The files whose d.ts signature reads `data.diagnostics`.
+        reads_diagnostics: rounds
+            .iter()
+            .filter(|(_, write)| write.signature_read_diagnostics)
+            .map(|&((.., file), _)| file)
+            .collect(),
+        write_file,
+        failed: FxHashSet::default(),
+        doomed: None,
+        failures: FlushFailures::default(),
+    };
+    match calls {
+        ClientWrites::Concurrent => {
+            let mut doomed_round = None;
+            for ((declaration, place, file), write) in rounds {
+                let made = match (flush.doomed, doomed_round) {
+                    (Some(doomed), Some(round)) => {
+                        !declaration || file == doomed || (declaration, place) == round
+                    }
+                    _ => true,
+                };
+                if made && flush.write(file, write) {
+                    doomed_round = Some((declaration, place));
+                }
+            }
         }
-        let result = if failed.contains(&file) && write.signature_read_diagnostics {
+        ClientWrites::Serialized => flush_serialized_client_writes(rounds, &mut flush),
+    }
+    (!flush.failures.is_empty()).then_some(flush.failures)
+}
+
+/// The state of `flush_client_writes`.
+struct ClientFlush<'a> {
+    reads_diagnostics: FxHashSet<usize>,
+    write_file: Option<&'a WriteFile>,
+    /// The files with a failed output.
+    failed: FxHashSet<usize>,
+    /// The file whose d.ts panics.
+    doomed: Option<usize>,
+    failures: FlushFailures,
+}
+
+impl ClientFlush<'_> {
+    /// Makes the write of an output of `file` and records a failure. True
+    /// when this failure dooms the file: a failed output before the file's
+    /// d.ts (not the d.ts itself, whose signature comes before its write).
+    fn write(&mut self, file: usize, mut write: BufferedWrite) -> bool {
+        let result = if self.failed.contains(&file) && write.signature_read_diagnostics {
             None
         } else {
             match write_output(
-                write_file,
+                self.write_file,
                 &write.file_name,
                 &write.text,
                 &mut write.data,
                 write.differs_only_in_map,
             ) {
-                Ok(()) => continue,
+                Ok(()) => return false,
                 Err(err) => Some(err),
             }
         };
-        // A failed output before the file's d.ts (not the d.ts itself,
-        // whose signature comes before its write).
-        if doomed.is_none()
+        let dooms = self.doomed.is_none()
             && result.is_some()
             && !write.signature_read_diagnostics
-            && reads_diagnostics.contains(&file)
-        {
-            doomed = Some(file);
+            && self.reads_diagnostics.contains(&file);
+        if dooms {
+            self.doomed = Some(file);
         }
-        failed.insert(file);
-        failures.insert(write.file_name, result);
+        self.failed.insert(file);
+        self.failures.insert(write.file_name, result);
+        dooms
     }
-    (!failures.is_empty()).then_some(failures)
+}
+
+/// `flush_client_writes` with `Serialized` calls. Go `SyncConn.Call` takes
+/// one mutex for each call (ipc/conn_sync.go:170): each emit goroutine's
+/// first call gets its turn before the panic. The OS writes of that first
+/// round wait until it is known whether a file is doomed
+/// (`defer_os_writes`):
+/// - A doomed file in the first round: the doomed file's and the next
+///   file's first outputs are written (the next file after the doomed one,
+///   in file order, the first after the last), then the doomed file's own
+///   outputs.
+/// - Else every first output is written, and the rounds go on. After a
+///   failure that dooms a file, the next file's output of that round (if
+///   it comes later) is called and not written (the process ends first),
+///   then the doomed file's own outputs.
+fn flush_serialized_client_writes(
+    rounds: Vec<((bool, usize, usize), BufferedWrite)>,
+    flush: &mut ClientFlush<'_>,
+) {
+    let files = rounds
+        .iter()
+        .map(|&((.., file), _)| file + 1)
+        .max()
+        .unwrap_or(0);
+    let mut rest = rounds.into_iter().peekable();
+    let mut first = Vec::new();
+    while let Some(&((false, 0, file), _)) = rest.peek() {
+        let (_, write) = rest.next().expect("peeked");
+        let name = write.file_name.clone();
+        let deferred = defer_os_writes(|| flush.write(file, write));
+        first.extend(
+            deferred
+                .into_iter()
+                .map(|os_write| (file, name.clone(), os_write)),
+        );
+    }
+    let first_doomed = flush.doomed;
+    for (file, name, os_write) in first {
+        let written =
+            first_doomed.is_none_or(|doomed| file == doomed || file == (doomed + 1) % files);
+        if !written {
+            continue;
+        }
+        if let Err(err) = os_write() {
+            flush.failed.insert(file);
+            flush.failures.insert(name, Some(fs_error_text(&err)));
+        }
+    }
+    let mut doomed_round = None;
+    for ((declaration, place, file), write) in rest {
+        match (flush.doomed, doomed_round) {
+            (None, _) => {
+                if flush.write(file, write) {
+                    doomed_round = Some((declaration, place));
+                }
+            }
+            (Some(doomed), _) if file == doomed => {
+                flush.write(file, write);
+            }
+            (Some(doomed), Some(round))
+                if (declaration, place) == round && file == (doomed + 1) % files =>
+            {
+                // The call is made; its OS write is not.
+                drop(defer_os_writes(|| flush.write(file, write)));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// An OS write that `defer_os_writes` holds back.
+pub type DeferredOsWrite = Box<dyn FnOnce() -> Result<(), FsError>>;
+
+thread_local! {
+    /// The OS writes that the running `defer_os_writes` holds back.
+    static DEFERRED_OS_WRITES: std::cell::RefCell<Option<Vec<DeferredOsWrite>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// PORT: not in Go. Runs `f`, a client `writeFile` call, and returns the
+/// OS write that the client asked for (`useOS`) instead of making it
+/// (`os_write_or_defer`): `flush_serialized_client_writes` makes it only
+/// when Go's goroutine would have written before the panic ends the
+/// process.
+fn defer_os_writes(f: impl FnOnce() -> bool) -> Vec<DeferredOsWrite> {
+    DEFERRED_OS_WRITES.with(|deferred| *deferred.borrow_mut() = Some(Vec::new()));
+    f();
+    DEFERRED_OS_WRITES
+        .with(|deferred| deferred.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// The OS write of a `writeFile` call that the client answered with
+/// `useOS` (api/callbackfs.go:415 `WriteFile`): made now, or held back
+/// while `defer_os_writes` runs (then `Ok`).
+pub fn os_write_or_defer(
+    os_write: impl FnOnce() -> Result<(), FsError> + 'static,
+) -> Result<(), FsError> {
+    let os_write = DEFERRED_OS_WRITES.with(|deferred| match deferred.borrow_mut().as_mut() {
+        Some(writes) => {
+            writes.push(Box::new(os_write));
+            None
+        }
+        None => Some(os_write),
+    });
+    match os_write {
+        Some(os_write) => os_write(),
+        None => Ok(()),
+    }
 }
 
 // Go: incremental/emitfileshandler.go:252 skipDtsOutputOfComposite
