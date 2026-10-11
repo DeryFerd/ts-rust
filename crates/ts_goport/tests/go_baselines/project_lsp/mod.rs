@@ -84,6 +84,7 @@ mod configfilechanges_test;
 mod contentmapper_test;
 mod customconfigfilename_test;
 mod dirty_syncmap_test;
+mod effect_document_symbols_test;
 mod effect_ls_hooks_test;
 mod extendedconfigcache_test;
 mod file_version_test;

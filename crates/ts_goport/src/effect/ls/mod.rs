@@ -30,6 +30,7 @@ use std::sync::LazyLock;
 use crate::effect::rulerunner::enabled_options;
 use crate::ls::prelude::*;
 
+pub mod document_symbols;
 pub mod hover;
 pub mod inlay_hints;
 
@@ -116,22 +117,7 @@ pub fn after_completion(
     items
 }
 
-// Go: etslshooks/document_symbols.go:20 afterDocumentSymbols
-/// Called by `ls/symbols.rs` after the document symbols of a file are
-/// collected and their expandos merged (Effect-TS/tsgo patch 024).
-// PORT: lane E8 ports this function (`etslshooks/document_symbols.go`): with
-// the plugin it puts a synthetic `Effect` symbol (Layers, Services, Errors,
-// Schemas) first. Until then the symbols come back unchanged, as Go returns
-// them without the plugin.
-pub(crate) fn after_document_symbols(
-    _ctx: &Context,
-    _sf: Node,
-    symbols: Vec<DocSymbol>,
-    program: &compiler::NewProgram,
-    _lang_service: &LanguageService,
-) -> Vec<DocSymbol> {
-    if enabled_options(program.options()).is_none() {
-        return symbols;
-    }
-    symbols
-}
+// Go: etslshooks/document_symbols.go:20 afterDocumentSymbols, which
+// `ls/symbols.rs` calls (patch 024). It lives in `document_symbols.rs`, as in
+// Go.
+pub(crate) use document_symbols::after_document_symbols;
