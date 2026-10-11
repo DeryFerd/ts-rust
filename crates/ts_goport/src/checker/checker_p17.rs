@@ -557,6 +557,11 @@ impl Checker {
         {
             source_file =
                 get_source_file_for_resolved_module(&resolved_module.unwrap().resolved_file_name);
+            // PORT: an autoimport alias resolver reads and binds the file
+            // now; the checker's arena then adds its symbols.
+            if source_file.is_some() {
+                crate::program::catch_up_alias_resolver_checker(&mut self.symbols);
+            }
         }
 
         if source_file.is_some() {

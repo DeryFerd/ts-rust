@@ -37,17 +37,10 @@ pub fn node_module_package_root_for_directory(resolved: &str) -> String {
     parse_node_module_package_root(resolved, true /*isDirectory*/)
 }
 
-// Go: module/util.go:28 ParseNodeModuleFromPath (removed by ts#64544, which
-// splits it into NodeModulePackageRootForFile and
-// NodeModulePackageRootForDirectory)
-// PORT: kept for the ls callers (ls/rename.rs, ls/autoimport/util.rs) until
-// the ls lane ports their ts#64544 parts.
-#[must_use]
-pub fn parse_node_module_from_path(resolved: &str, is_folder: bool) -> String {
-    parse_node_module_package_root(resolved, is_folder)
-}
-
 // Go: module/util.go:36 parseNodeModulePackageRoot (ts#64544)
+// PORT: Go takes a typed rooted path, which is absolute and normalized. Here
+// the string is normalized first, as Go `ParseNodeModuleFromPath` did before
+// ts#64544.
 fn parse_node_module_package_root(path: &str, is_directory: bool) -> String {
     let path = normalize_path(path);
     let Some(idx) = path.rfind("/node_modules/") else {
@@ -68,7 +61,16 @@ fn parse_node_module_package_root(path: &str, is_directory: bool) -> String {
             is_directory,
         );
     }
-    path[..index_after_package_name as usize].to_string()
+    // Go: tspath.RootedDirectoryPathFromAbsolute(path[:indexAfterPackageName])
+    // (tspath/rooted_path.go:161): normalized, with no trailing separator; a
+    // root keeps its separator.
+    // PORT: Go's panic for a path that is not absolute is not ported: a Go
+    // rooted path is always absolute.
+    let root = get_normalized_absolute_path(&path[..index_after_package_name as usize], "");
+    if get_root_length(&root) == root.len() {
+        return ensure_trailing_directory_separator(&root);
+    }
+    root
 }
 
 // Go: module/util.go:50 ParsePackageName

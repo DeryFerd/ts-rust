@@ -1460,14 +1460,12 @@ child_test! {
 }
 
 child_test! {
-    // followups4 (R153 reviewer): the registry extracts a package first with
-    // the narrow walk of lspreg1 (`AliasResolver::new_narrow_checker`), which
-    // does not read the imports of a .ts source. This entrypoint exports a
-    // binding that it imports, so the checker asks for other.ts, which the
-    // narrow walk did not read. That is a miss: the narrow results are
-    // dropped, and the full walk extracts the package again. The export `y`
-    // then has its target in other.ts, as Go gives (Go reads the files that
-    // the checker asks for).
+    // followups4 (R153 reviewer): this entrypoint exports a binding that it
+    // imports, so the checker asks for other.ts, which is not an entrypoint.
+    // The alias resolver reads it then (`AliasResolver::get_source_file`),
+    // as Go does (aliasresolver.go:137), and the export `y` has its target
+    // in other.ts. (The name is from the narrow and full walks of lspreg1,
+    // which bump D apicb1 and apicb2 replaced.)
     fn narrow_walk_miss_extracts_the_package_with_the_full_walk() {
         let root = "/home/src/narrow-miss";
         let pkg = format!("{root}/node_modules/src-pkg");
@@ -1515,5 +1513,66 @@ child_test! {
             format!("{pkg}/other.ts")
         );
         assert_eq!(from_index[0].target.export_name, "y");
+    }
+}
+
+child_test! {
+    // bump D apicb2 (repro aug1 of the apicb1 skeptic): the entrypoint of
+    // aug-pkg is a .ts file that augments the .d.ts package base-pkg. Go's
+    // `initializeChecker` merges the augmentation (checker.go:1458), so the
+    // checker reads base-pkg inside `NewChecker`, through the alias resolver
+    // (aliasresolver.go:137). apicb1 gave the checker nil there, and the
+    // checker reached `GetProjectReferenceFromSource` (aliasresolver.go:205,
+    // panic "unimplemented"). Go N' fed0bf24149f extracts `augValue`.
+    fn module_augmentation_in_a_ts_entrypoint_reads_its_target() {
+        let root = "/home/src/aug-entrypoint";
+        let aug = format!("{root}/node_modules/aug-pkg");
+        let base = format!("{root}/node_modules/base-pkg");
+        let index_text = "import type { BaseThing } from \"base-pkg\";\nexport const t: BaseThing | undefined = undefined;\naugV\n";
+        let mut files = FileMap::new();
+        let mut add = |path: String, text: &str| {
+            files.insert(path, text.into());
+        };
+        add(
+            format!("{root}/tsconfig.json"),
+            r#"{"compilerOptions":{"module":"nodenext","strict":true,"noEmit":true},"include":["src"]}"#,
+        );
+        add(
+            format!("{root}/package.json"),
+            r#"{"name":"repro","version":"1.0.0","dependencies":{"aug-pkg":"1.0.0","base-pkg":"1.0.0"}}"#,
+        );
+        add(format!("{root}/src/index.ts"), index_text);
+        add(
+            format!("{aug}/package.json"),
+            r#"{"name":"aug-pkg","version":"1.0.0","types":"./index.ts"}"#,
+        );
+        add(
+            format!("{aug}/index.ts"),
+            "export const augValue = 1;\ndeclare module \"base-pkg\" {\n  interface BaseThing { extra: string }\n}\n",
+        );
+        add(
+            format!("{base}/package.json"),
+            r#"{"name":"base-pkg","version":"1.0.0","types":"./index.d.ts"}"#,
+        );
+        add(
+            format!("{base}/index.d.ts"),
+            "export interface BaseThing { x: number }\nexport declare const baseValue: number;\n",
+        );
+        let (session, _) = projecttestutil::setup(files);
+        let index_uri = uri(&format!("file://{root}/src/index.ts"));
+        open_uri(&session, &index_uri, index_text, lsproto::LanguageKind::TYPE_SCRIPT);
+
+        with_auto_imports(&session, &index_uri);
+
+        let registry = session
+            .snapshot()
+            .auto_import_registry()
+            .expect("auto import registry not initialized");
+        assert_eq!(registry.node_modules.len(), 1);
+        let bucket = registry.node_modules.values().next().unwrap();
+        let index = bucket.index.as_ref().expect("an indexed bucket").borrow();
+        let exports = index.find("augValue", true);
+        assert_eq!(exports.len(), 1, "{exports:?}");
+        assert_eq!(exports[0].module_file_name, format!("{aug}/index.ts"));
     }
 }

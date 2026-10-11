@@ -8,8 +8,11 @@ use super::tspath::Path;
 // Go: symlinks/knownsymlinks.go:13 KnownDirectoryLink
 #[derive(Clone, Debug, Default)]
 pub struct KnownDirectoryLink {
-    /// Matches the spelling used to reach the symlink.
-    /// Always has trailing directory separator. (ts#64544)
+    /// Matches the spelling used to reach the symlink. Used to preserve the
+    /// spelling of child paths when substituting the real directory.
+    // Go N' (ts#64159, symlinks/knownsymlinks.go:16): a
+    // `tspath.RootedDirectoryPath`, stored as `SetDirectory` gets it, with no
+    // trailing directory separator (ts#64544 added one).
     pub symlink: String,
     /// Matches the casing returned by `realpath`. Used to compute the `realpath` of children.
     /// Always has trailing directory separator
@@ -40,13 +43,22 @@ impl KnownDirectoryLink {
     // ResolveFileName; ts#64159 renames it)
     // The real path of `file_name`, a path under the symlink, or `None` when
     // `file_name` is not under the symlink.
+    // Go N': `RelativeFilePathFromDirectory(link.Symlink, fileName)` (tspath
+    // rooted_path.go:563, `trimContainedPath` :575) takes the rest of
+    // `file_name` after a separator below `symlink`, then
+    // `link.Real.ResolveRelativeFile` (:746) joins it to `real`.
+    // PORT: `real` keeps the trailing separator of the 673a5f17d713 port, so
+    // the join is a plain append (Go `appendPathToDirectory`, :853).
     pub fn resolve_file_name(
         &self,
         file_name: &str,
         use_case_sensitive_file_names: bool,
     ) -> Option<String> {
-        let relative =
-            tspath::trim_file_path_prefix(file_name, &self.symlink, use_case_sensitive_file_names)?;
+        let relative = tspath::relative_path_within_directory(
+            &self.symlink,
+            file_name,
+            use_case_sensitive_file_names,
+        )?;
         Some(format!("{}{relative}", self.real))
     }
 }
@@ -92,7 +104,8 @@ impl KnownSymlinks {
     }
 
     // Go: symlinks/knownsymlinks.go:55 SetDirectory
-    // ts#64544: the stored link keeps the spelling of `symlink`.
+    // ts#64544: the stored link keeps the spelling of `symlink`. Go N'
+    // (ts#64159, :58 `link.Symlink = symlink`) stores it unchanged.
     pub fn set_directory(
         &mut self,
         symlink: &str,
@@ -100,7 +113,7 @@ impl KnownSymlinks {
         real_directory: Option<KnownDirectoryLink>,
     ) {
         let real_directory = real_directory.map(|mut link| {
-            link.symlink = tspath::ensure_trailing_directory_separator(symlink);
+            link.symlink = symlink.to_string();
             link
         });
         if let Some(real_directory) = &real_directory {
