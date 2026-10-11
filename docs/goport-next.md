@@ -28,7 +28,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 - **invokeonce1 75866d18c: skeptic PASS (T3 server st -5.1 percent, T3 web -1.5 to -2; output and counts equal). Into int61. chk4split: the 4-checker split is Go's (lib updates moved it); hono 4-checker wall is a named Go-parity cost (note invokeonce1-result-2026-10-11).**
 
-- **Running: gatecounts1 (tool lane, protected paths, needs Theo's approval to list in a batch): gate Effect items also compare plugin-on counts with effect-tsgo 0.51.1 (would have caught R192 B1); candidate.sh clippy target per checkout.**
+- **gatecounts1 0e55cd1db: skeptic PASS, WAITS FOR THEO (note gatecounts1-result-2026-10-11): Effect gate items compare plugin-on counts (R192 fails, R191 and R193 pass); candidate.sh clippy target per checkout. Protected paths sweep-wide.sh and candidate.sh, and a change to the effect-gate-rule.**
 
 - **perfscan3 (note perfscan3-result-2026-10-11): R193 default mode is 2x Go N prime or better on all 7 projects; single-threaded query 1.91, effect-off 1.91, t3-web 1.96. Running: jemtune1 (jemalloc tcache and extent conf) and portonly1 (perfscan3 items 3, 5, 6, 9, 10). Next after int61 merges: a parse lane on the int61 head (perfscan3 items 1 and 7 with astchunks step 2; parse is the weakest phase, 1.15 to 1.21x Go).**
 
