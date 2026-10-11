@@ -9,20 +9,34 @@ use std::sync::LazyLock;
 
 use crate::effect::ls::fixable::Fixable;
 
+pub mod acquire_release_disposable;
 pub mod all_of_map_to_for_each;
 pub mod catch_to_ignore;
 pub mod disable;
+pub mod effect_fn_iife;
+pub mod effect_fn_opportunity;
+pub mod effect_map_void;
 mod effect_module;
 pub mod flat_map_conditional_to_filter_or_fail;
 pub mod flat_map_ignored_param_to_and_then;
 pub mod flat_map_to_map;
 pub mod map_some_to_as_some;
+pub mod missed_pipeable_opportunity;
 pub mod option_match_to_from_option;
 pub mod prefer_succeed_some_or_none;
 pub mod provide_layer_succeed_to_provide_service;
+pub mod run_effect_inside_effect;
+pub mod run_of_exit_to_run_exit;
 pub mod schema_number;
 pub mod sync_to_succeed;
 pub mod timeout_catch_tag_to_timeout_or_else;
+pub mod unnecessary_arrow_block;
+pub mod unnecessary_effect_gen;
+pub mod unnecessary_fail_yieldable_error;
+pub mod unnecessary_pipe;
+pub mod unnecessary_pipe_chain;
+pub mod unnecessary_typeof_type;
+pub mod unsafe_effect_type_assertion;
 
 // Go: fixables/fixables.go:9 All
 /// All is the list of all code fix providers.
@@ -55,41 +69,41 @@ pub static ALL: LazyLock<Vec<&'static Fixable>> = LazyLock::new(|| {
         &sync_to_succeed::SYNC_TO_SUCCEED_FIX,
         // E5: CatchToOrElseSucceedFix,
         &catch_to_ignore::CATCH_TO_IGNORE_FIX,
-        // E5: EffectFnIifeFix,
-        // E5: UnnecessaryPipeFix,
-        // E5: UnnecessaryPipeChainFix,
+        &effect_fn_iife::EFFECT_FN_IIFE_FIX,
+        &unnecessary_pipe::UNNECESSARY_PIPE_FIX,
+        &unnecessary_pipe_chain::UNNECESSARY_PIPE_CHAIN_FIX,
         // E5: ReturnEffectInGenFix,
         // E5: EffectSucceedWithVoidFix,
         &prefer_succeed_some_or_none::PREFER_SUCCEED_SOME_OR_NONE_FIX,
-        // E5: UnnecessaryEffectGenFix,
-        // E5: UnnecessaryArrowBlockFix,
-        // E5: UnnecessaryTypeofTypeFix,
+        &unnecessary_effect_gen::UNNECESSARY_EFFECT_GEN_FIX,
+        &unnecessary_arrow_block::UNNECESSARY_ARROW_BLOCK_FIX,
+        &unnecessary_typeof_type::UNNECESSARY_TYPEOF_TYPE_FIX,
         // E5: PreferSchemaTypePropertyFix,
-        // E5: EffectMapVoidFix,
-        // E5: UnnecessaryFailYieldableErrorFix,
+        &effect_map_void::EFFECT_MAP_VOID_FIX,
+        &unnecessary_fail_yieldable_error::UNNECESSARY_FAIL_YIELDABLE_ERROR_FIX,
         // E5: ClassSelfMismatchFix,
-        // E5: EffectFnOpportunityFix,
+        &effect_fn_opportunity::EFFECT_FN_OPPORTUNITY_FIX,
         // E5: DeterministicKeysFix,
         // E5: ScopeInLayerEffectScopedFix,
         // E5: OverriddenSchemaConstructorFix,
         // E5: InstanceOfSchemaFix,
         // E5: LayerMergeAllWithDependenciesFix,
-        // E5: UnsafeEffectTypeAssertionFix,
+        &unsafe_effect_type_assertion::UNSAFE_EFFECT_TYPE_ASSERTION_FIX,
         // E5: MissingEffectErrorCatchFix,
         // E5: MultipleEffectProvideFix,
         &provide_layer_succeed_to_provide_service::PROVIDE_LAYER_SUCCEED_TO_PROVIDE_SERVICE_FIX,
         // E5: SchemaStructWithTagFix,
         &schema_number::SCHEMA_NUMBER_FIX,
         // E5: RedundantSchemaTagIdentifierRemoveIdentifierFix,
-        // E5: RunEffectInsideEffectFix,
+        &run_effect_inside_effect::RUN_EFFECT_INSIDE_EFFECT_FIX,
         // E5: SchemaUnionOfLiteralsFix,
-        // E5: MissedPipeableOpportunityFix,
+        &missed_pipeable_opportunity::MISSED_PIPEABLE_OPPORTUNITY_FIX,
         // E5: NewSchemaClassFix,
         // E5: ServiceNotAsClassFix,
         // E5: PreferUnsafeConstructorFix,
         // E5: PreferTypedSchemaDecoderFix,
-        // E5: AcquireReleaseDisposableFix,
-        // E5: RunOfExitToRunExitFix,
+        &acquire_release_disposable::ACQUIRE_RELEASE_DISPOSABLE_FIX,
+        &run_of_exit_to_run_exit::RUN_OF_EXIT_TO_RUN_EXIT_FIX,
     ]
 });
 
