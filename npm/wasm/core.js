@@ -344,6 +344,11 @@ export function memoryFileSystem(files = new Map()) {
         },
         realpath: path => (map.has(path) || isDir(path) ? path : undefined),
         writeFile(path, data, append) {
+            if (isDir(path)) return `open ${path}: is a directory`;
+            for (let slash = path.indexOf("/"); slash >= 0; slash = path.indexOf("/", slash + 1)) {
+                const parent = path.slice(0, slash);
+                if (map.has(parent)) return `mkdir ${parent}: not a directory`;
+            }
             const text = fileDecoder.decode(data);
             map.set(path, append ? (map.get(path) ?? "") + text : text);
         },
