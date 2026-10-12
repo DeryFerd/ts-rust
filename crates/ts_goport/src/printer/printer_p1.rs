@@ -1930,6 +1930,9 @@ impl Printer {
                 || self.current_source_file.is_nil()
                 || source_file_file_name(f) == source_file_file_name(self.current_source_file)
         });
+        if is_synthetic_node(node) && self.write_factory_name_text(node) {
+            return;
+        }
         let text = self.get_text_of_node_cow(node, false /*includeTrivia*/);
 
         let symbol = self
@@ -1941,6 +1944,50 @@ impl Printer {
             return;
         }
         self.write(&text);
+    }
+
+    /// `emitIdentifierText` of factory name `node` when Go `getTextOfNode`
+    /// (printer.go:230) gives `node.Text()`: the name has no auto-generate
+    /// record and Go `canUseSourceFile` is false. Writes the text of its
+    /// node data. False, with nothing written, in any other case.
+    // PERF: printfast1. `Node::text` of a factory name interns the text of
+    // its node data at each read (`scoped_node_text`). Go reads a field.
+    // Type text (`typeToString`) prints its names here.
+    fn write_factory_name_text(&mut self, node: Node) -> bool {
+        if !matches!(
+            node.kind(),
+            SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier
+        ) || self.emit_context.has_auto_generate_info(node)
+        {
+            return false;
+        }
+        // Go `canUseSourceFile`: then the text can come from the source file.
+        if self.current_source_file.is_some()
+            && node.parent().is_some()
+            && !node_is_synthesized(node)
+        {
+            return false;
+        }
+        let symbol = self
+            .id_to_symbol
+            .as_ref()
+            .and_then(|id_to_symbol| id_to_symbol.get(&node).copied());
+        with_ast_data(node, |data| {
+            let text = match data {
+                crate::astdata::NodeData::Identifier(d) => d.text.as_str(),
+                crate::astdata::NodeData::PrivateIdentifier(d) => d.text.as_str(),
+                _ => return false,
+            };
+            // `Node::text` of an empty data text reads the store name.
+            if text.is_empty() {
+                return false;
+            }
+            match symbol {
+                Some(symbol) => self.write_symbol(text, symbol),
+                None => self.write(text),
+            }
+            true
+        })
     }
 
     // Go: printer/printer.go:1132 emitIdentifierName
