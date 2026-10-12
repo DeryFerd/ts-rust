@@ -7,8 +7,12 @@ use std::sync::LazyLock;
 /// strictEffectTypeNames are the type symbol names that StrictEffectType can
 /// match. couldBeNamed takes a set so future prefilters for other wrapper
 /// types (Stream, Layer, ...) can reuse the same conservative walk.
-pub static STRICT_EFFECT_TYPE_NAMES: LazyLock<FxHashMap<&'static str, bool>> =
-    LazyLock::new(|| FxHashMap::from_iter([("Effect", true)]));
+// PORT: Go `map[string]bool`. The port keeps interned names, so a test
+// compares ids and reads no text (effperf3 item 6).
+pub static STRICT_EFFECT_TYPE_NAMES: LazyLock<[Name; 1]> = LazyLock::new(|| [EFFECT_NAME.clone()]);
+
+/// The symbol name "Effect".
+pub static EFFECT_NAME: LazyLock<Name> = LazyLock::new(|| Name::from("Effect"));
 
 impl TypeParser<'_> {
     /// NodeCouldBeStrictEffect reports whether node's flow type could possibly be
@@ -61,7 +65,7 @@ impl TypeParser<'_> {
                 return true;
             }
             let return_type = checker.get_return_type_of_signature_exported(signature);
-            could_be_named(checker, return_type, &STRICT_EFFECT_TYPE_NAMES, 0)
+            could_be_named(checker, return_type, &*STRICT_EFFECT_TYPE_NAMES, 0)
         });
         result.unwrap_or(true)
     }
@@ -91,14 +95,14 @@ impl TypeParser<'_> {
     /// name is not "Effect"). Any/unknown, type variables, unions, intersections
     /// and symbol-less types all return true.
     pub fn could_be_strict_effect(&mut self, t: TypeId) -> bool {
-        could_be_named(self.checker, t, &STRICT_EFFECT_TYPE_NAMES, 0)
+        could_be_named(self.checker, t, &*STRICT_EFFECT_TYPE_NAMES, 0)
     }
 }
 
 /// couldBeNamed reports whether flow narrowing starting from declared type t
 /// could ever produce a type whose symbol name is in names. False only on a
 /// conclusive negative.
-pub fn could_be_named(c: &Checker, t: TypeId, names: &FxHashMap<&str, bool>, depth: i32) -> bool {
+pub fn could_be_named(c: &Checker, t: TypeId, names: &[Name], depth: i32) -> bool {
     if t.is_nil() {
         return true;
     }
@@ -135,8 +139,5 @@ pub fn could_be_named(c: &Checker, t: TypeId, names: &FxHashMap<&str, bool>, dep
     if sym.is_nil() {
         return true;
     }
-    names
-        .get(c.sym(sym).name.as_str())
-        .copied()
-        .unwrap_or(false)
+    names.contains(&c.sym(sym).name)
 }

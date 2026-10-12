@@ -72,7 +72,7 @@ pub fn analyze_flat_map_conditional_to_filter_or_fail(
             let args = &transformation.args;
             if callee.is_nil()
                 || args.len() != 1
-                || !tp.is_node_reference_to_effect_module_api(callee, "flatMap")
+                || !tp.is_node_reference_to_effect_module_api(callee, member!("flatMap"))
             {
                 continue;
             }
@@ -169,7 +169,7 @@ fn is_identity_succeed(
         || call.argument_list().is_nil()
         || call.arguments().len() != 1
         || call.type_argument_list().is_some() && !call.type_arguments().is_empty()
-        || !tp.is_node_reference_to_effect_module_api(call.expression(), "succeed")
+        || !tp.is_node_reference_to_effect_module_api(call.expression(), member!("succeed"))
     {
         return false;
     }
@@ -197,7 +197,7 @@ fn effect_fail_argument(tp: &mut TypeParser<'_>, expression: Node) -> Node {
         || call.argument_list().is_nil()
         || call.arguments().len() != 1
         || call.type_argument_list().is_some() && !call.type_arguments().is_empty()
-        || !tp.is_node_reference_to_effect_module_api(call.expression(), "fail")
+        || !tp.is_node_reference_to_effect_module_api(call.expression(), member!("fail"))
     {
         return Node::NIL;
     }

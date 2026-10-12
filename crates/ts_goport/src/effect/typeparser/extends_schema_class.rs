@@ -31,7 +31,7 @@ impl TypeParser<'_> {
             return None;
         }
         cached!(self, extends_schema_class, class_node, {
-            self.extends_schema_class_like(class_node, "Class")
+            self.extends_schema_class_like(class_node, member!("Class"))
         })
     }
 
@@ -48,7 +48,7 @@ impl TypeParser<'_> {
             return None;
         }
         cached!(self, extends_schema_request_class, class_node, {
-            self.extends_schema_class_like(class_node, "RequestClass")
+            self.extends_schema_class_like(class_node, member!("RequestClass"))
         })
     }
 
@@ -57,7 +57,7 @@ impl TypeParser<'_> {
     pub fn extends_schema_class_like(
         &mut self,
         class_node: Node,
-        member_name: &str,
+        member: &ExportMember,
     ) -> Option<Rc<SchemaClassResult>> {
         if class_node.is_nil() {
             return None;
@@ -113,8 +113,7 @@ impl TypeParser<'_> {
             if inner_call.expression().is_nil() {
                 continue;
             }
-            if !self
-                .is_node_reference_to_effect_schema_module_api(inner_call.expression(), member_name)
+            if !self.is_node_reference_to_effect_schema_module_api(inner_call.expression(), member)
             {
                 continue;
             }

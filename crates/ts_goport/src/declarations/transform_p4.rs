@@ -384,7 +384,7 @@ impl DeclarationTransformer {
     pub(crate) fn ensure_type_params(&mut self, node: Node, params: NodeList) -> NodeList {
         let ec = self.emit_context.clone();
         if !self
-            .host
+            .resolver
             .get_effective_declaration_flags(ec.parse_node(node), ModifierFlags::PRIVATE)
             .is_empty()
         {
@@ -415,7 +415,6 @@ impl DeclarationTransformer {
             let nodes = self
                 .resolver
                 .create_type_parameters_of_signature_declaration(
-                    &ec,
                     node,
                     self.enclosing_declaration,
                     DECLARATION_EMIT_NODE_BUILDER_FLAGS,
@@ -441,7 +440,7 @@ impl DeclarationTransformer {
     pub(crate) fn update_param_list(&mut self, node: Node, params: NodeList) -> NodeList {
         let ec = self.emit_context.clone();
         if !self
-            .host
+            .resolver
             .get_effective_declaration_flags(ec.parse_node(node), ModifierFlags::PRIVATE)
             .is_empty()
             || params.nodes().is_empty()
@@ -502,11 +501,9 @@ impl DeclarationTransformer {
                 self.tracker.report_inference_fallback(node);
             }
             let ec = self.emit_context.clone();
-            return self.resolver.create_literal_const_value(
-                &ec,
-                ec.parse_node(node),
-                emit_tracker(self),
-            );
+            return self
+                .resolver
+                .create_literal_const_value(ec.parse_node(node), emit_tracker(self));
         }
         Node::NIL
     }
@@ -959,7 +956,15 @@ impl DeclarationTransformer {
 
         let (_, cleanup) = self.setup_diagnostic_context(node);
 
+        let preexisting_expando_has_export = self
+            .expando_members
+            .get(&host_id)
+            .is_some_and(|members| members.iter().any(|&m| is_export_declaration(m)));
+
         if is_identifier(node.right()) {
+            if !preexisting_expando_has_export {
+                self.add_export_modifier_to_expando_members(host_id);
+            }
             // alias-like, emit an `export {name}` or `export {name as alias}`
             let result = self.transform_binary_expression_to_export_declaration(node, export_name);
             self.expando_members
@@ -970,10 +975,6 @@ impl DeclarationTransformer {
             return;
         }
 
-        let preexisting_expando_has_export = self
-            .expando_members
-            .get(&host_id)
-            .is_some_and(|members| members.iter().any(|&m| is_export_declaration(m)));
         let mut var_modifiers = ModifierList::NIL;
 
         if preexisting_expando_has_export {
@@ -1028,24 +1029,12 @@ impl DeclarationTransformer {
                 Node::NIL, /*moduleSpecifier*/
                 Node::NIL, /*attributes*/
             ));
-        }
-
-        if statements.len() > 1 && !preexisting_expando_has_export {
-            // Add an `export` modifier to all existing expando members so they remain exported after the `export {}` is added
-            let existing = self
-                .expando_members
-                .get(&host_id)
-                .cloned()
-                .unwrap_or_default();
-            for decl in existing {
-                let modifier_flags = ModifierFlags::EXPORT | get_combined_modifier_flags(decl);
-                let modifiers = f.new_modifier_list(&create_modifiers_from_modifier_flags(
-                    modifier_flags,
-                    &mut |k| f.new_modifier(k),
-                ));
-                set_node_modifiers(decl, modifiers);
+            if !preexisting_expando_has_export {
+                // Done before adding statements to expando members to keep the initial variable statement, before we rename anything, private
+                self.add_export_modifier_to_expando_members(host_id);
             }
         }
+
         self.expando_members
             .entry(host_id)
             .or_default()
@@ -1056,7 +1045,30 @@ impl DeclarationTransformer {
         cleanup.run(self);
     }
 
-    // Go: transformers/declarations/transform.go:2861 DeclarationTransformer.getExpandoHostId
+    // Go: transformers/declarations/transform.go:2862 DeclarationTransformer.addExportModifierToExpandoMembers
+    // PORT: Go keys the members by `ast.NodeId`; the Rust maps are keyed by
+    // the host node (`get_expando_host_id`).
+    pub(crate) fn add_export_modifier_to_expando_members(&mut self, host_id: Node) {
+        let ec = self.emit_context.clone();
+        let f = ec.factory();
+        // Add an `export` modifier to all existing expando members so they remain exported after the `export {}` is added
+        let existing = self
+            .expando_members
+            .get(&host_id)
+            .cloned()
+            .unwrap_or_default();
+        for decl in existing {
+            // only invoked when `tx.expandoMembers` does not *yet* contain an `export` declaration, so no need to skip one here to prevent `export export {}`
+            let modifier_flags = ModifierFlags::EXPORT | get_combined_modifier_flags(decl);
+            let modifiers = f.new_modifier_list(&create_modifiers_from_modifier_flags(
+                modifier_flags,
+                &mut |k| f.new_modifier(k),
+            ));
+            set_node_modifiers(decl, modifiers);
+        }
+    }
+
+    // Go: transformers/declarations/transform.go:2871 DeclarationTransformer.getExpandoHostId
     // PORT: Go returns `ast.GetNodeId(mostOriginal)`. The Rust maps are keyed
     // by `Node`, so this returns the node. `get_node_id` still runs for its
     // id assignment side effect.
@@ -1071,7 +1083,7 @@ impl DeclarationTransformer {
         original
     }
 
-    // Go: transformers/declarations/transform.go:2867 DeclarationTransformer.transformExpandoHost
+    // Go: transformers/declarations/transform.go:2877 DeclarationTransformer.transformExpandoHost
     pub(crate) fn transform_expando_host(&mut self, name: Node, declaration: Node) {
         let root = if is_variable_declaration(declaration) {
             declaration.parent().parent()
@@ -1191,7 +1203,7 @@ impl DeclarationTransformer {
         cleanup.run(self);
     }
 
-    // Go: transformers/declarations/transform.go:2924 DeclarationTransformer.createFullExpandoBlock
+    // Go: transformers/declarations/transform.go:2934 DeclarationTransformer.createFullExpandoBlock
     pub(crate) fn create_full_expando_block(&mut self, id: Node) -> Node {
         // Process any expando assignments on this host that were skipped because it wasn't
         // visible when they were collected - if it's still not visible, they simply get
@@ -1243,7 +1255,7 @@ impl DeclarationTransformer {
         n
     }
 
-    // Go: transformers/declarations/transform.go:2987 DeclarationTransformer.tryGetPropertyName
+    // Go: transformers/declarations/transform.go:2997 DeclarationTransformer.tryGetPropertyName
     pub(crate) fn try_get_property_name(&mut self, node: Node) -> String {
         if is_element_access_expression(node) {
             return self.resolver.get_element_access_expression_name(node);
@@ -1260,7 +1272,7 @@ fn is_not_declare_modifier(m: Node) -> bool {
     m.kind() != SyntaxKind::DeclareKeyword
 }
 
-// Go: transformers/declarations/transform.go:2973 extractExpandoHostParams
+// Go: transformers/declarations/transform.go:2983 extractExpandoHostParams
 // Returns (typeParameters, parameters, asteriskToken).
 fn extract_expando_host_params(node: Node) -> (NodeList, NodeList, Node) {
     // PORT: Go switches on FunctionExpression, ArrowFunction and (default)

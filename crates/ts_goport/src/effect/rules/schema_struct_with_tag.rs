@@ -63,13 +63,13 @@ pub fn analyze_schema_struct_with_tag(
     let mut matches: Vec<SchemaStructWithTagMatch> = Vec::new();
 
     // Stack-based traversal
-    let mut node_to_visit: Vec<Node> = Vec::new();
-    sf.for_each_child(|child| {
-        node_to_visit.push(child);
-        false
-    });
+    // PERF: Go walks the tree with a stack of nodes; this stack holds node
+    // order indexes and pushes and pops at the same points (effperf4).
+    let order = tp.node_order(sf);
+    let mut node_to_visit: Vec<u32> = order.children(0).collect();
 
-    while let Some(node) = node_to_visit.pop() {
+    while let Some(i) = node_to_visit.pop() {
+        let node = order.node(i);
         if node.kind() == SyntaxKind::CallExpression {
             if let (m, true) = analyze_schema_struct_with_tag_node(tp, sf, node) {
                 matches.push(m);
@@ -77,10 +77,7 @@ pub fn analyze_schema_struct_with_tag(
         }
 
         // Enqueue children
-        node.for_each_child(|child| {
-            node_to_visit.push(child);
-            false
-        });
+        node_to_visit.extend(order.children(i));
     }
 
     matches
@@ -99,7 +96,7 @@ fn analyze_schema_struct_with_tag_node(
     let call = node;
 
     // Check if this is Schema.Struct
-    if !tp.is_node_reference_to_effect_schema_module_api(call.expression(), "Struct") {
+    if !tp.is_node_reference_to_effect_schema_module_api(call.expression(), member!("Struct")) {
         return (SchemaStructWithTagMatch::default(), false);
     }
 
@@ -138,7 +135,10 @@ fn analyze_schema_struct_with_tag_node(
         }
 
         let literal_call = init;
-        if !tp.is_node_reference_to_effect_schema_module_api(literal_call.expression(), "Literal") {
+        if !tp.is_node_reference_to_effect_schema_module_api(
+            literal_call.expression(),
+            member!("Literal"),
+        ) {
             return (SchemaStructWithTagMatch::default(), false);
         }
 

@@ -20,9 +20,7 @@ impl NodeFactory {
             SyntaxKind::DoStatement,
             D::DoStatement(Box::new(crate::astdata::DoStatementData {
                 expression: self.id(expression),
-                flow_node: None,
                 statement: self.id(statement),
-                facts: 0,
             })),
         )
     }
@@ -33,9 +31,7 @@ impl NodeFactory {
             SyntaxKind::WhileStatement,
             D::WhileStatement(Box::new(crate::astdata::WhileStatementData {
                 expression: self.id(expression),
-                flow_node: None,
                 statement: self.id(statement),
-                facts: 0,
             })),
         )
     }
@@ -52,13 +48,9 @@ impl NodeFactory {
             SyntaxKind::ForStatement,
             D::ForStatement(Box::new(crate::astdata::ForStatementData {
                 condition: self.oid(condition),
-                flow_node: None,
                 incrementor: self.oid(incrementor),
                 initializer: self.oid(initializer),
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
                 statement: self.id(statement),
-                facts: 0,
             })),
         )
     }
@@ -77,12 +69,8 @@ impl NodeFactory {
             D::ForInOrOfStatement(Box::new(crate::astdata::ForInOrOfStatementData {
                 await_modifier: self.oid(await_modifier),
                 expression: self.id(expression),
-                flow_node: None,
                 initializer: self.id(initializer),
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
                 statement: self.id(statement),
-                facts: 0,
             })),
         )
     }
@@ -92,7 +80,6 @@ impl NodeFactory {
         self.new_node(
             SyntaxKind::BreakStatement,
             D::BreakStatement(Box::new(crate::astdata::BreakStatementData {
-                flow_node: None,
                 label: self.oid(label),
             })),
         )
@@ -103,7 +90,6 @@ impl NodeFactory {
         self.new_node(
             SyntaxKind::ContinueStatement,
             D::ContinueStatement(Box::new(crate::astdata::ContinueStatementData {
-                flow_node: None,
                 label: self.oid(label),
             })),
         )
@@ -115,9 +101,7 @@ impl NodeFactory {
             SyntaxKind::WithStatement,
             D::WithStatement(Box::new(crate::astdata::WithStatementData {
                 expression: self.id(expression),
-                flow_node: None,
                 statement: self.id(statement),
-                facts: 0,
             })),
         )
     }
@@ -129,8 +113,6 @@ impl NodeFactory {
             D::SwitchStatement(Box::new(crate::astdata::SwitchStatementData {
                 case_block: self.id(case_block),
                 expression: self.id(expression),
-                flow_node: None,
-                facts: 0,
             })),
         )
     }
@@ -141,9 +123,6 @@ impl NodeFactory {
             SyntaxKind::CaseBlock,
             D::CaseBlock(Box::new(crate::astdata::CaseBlockData {
                 clauses: self.req_list(clauses),
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
-                facts: 0,
             })),
         )
     }
@@ -159,9 +138,7 @@ impl NodeFactory {
             kind,
             D::CaseOrDefaultClause(Box::new(crate::astdata::CaseOrDefaultClauseData {
                 expression: self.id(expression),
-                fallthrough_flow_node: None,
                 statements: self.req_list(statements),
-                facts: 0,
             })),
         )
     }
@@ -172,8 +149,6 @@ impl NodeFactory {
             SyntaxKind::ThrowStatement,
             D::ThrowStatement(Box::new(crate::astdata::ThrowStatementData {
                 expression: self.id(expression),
-                flow_node: None,
-                facts: 0,
             })),
         )
     }
@@ -190,9 +165,7 @@ impl NodeFactory {
             D::TryStatement(Box::new(crate::astdata::TryStatementData {
                 catch_clause: self.oid(catch_clause),
                 finally_block: self.oid(finally_block),
-                flow_node: None,
                 try_block: self.id(try_block),
-                facts: 0,
             })),
         )
     }
@@ -203,10 +176,7 @@ impl NodeFactory {
             SyntaxKind::CatchClause,
             D::CatchClause(Box::new(crate::astdata::CatchClauseData {
                 block: self.id(block),
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
                 variable_declaration: self.oid(variable_declaration),
-                facts: 0,
             })),
         )
     }
@@ -215,9 +185,7 @@ impl NodeFactory {
     pub fn new_debugger_statement(&self) -> Node {
         self.new_node(
             SyntaxKind::DebuggerStatement,
-            D::DebuggerStatement(Box::new(crate::astdata::DebuggerStatementData {
-                flow_node: None,
-            })),
+            D::DebuggerStatement(Box::new(crate::astdata::DebuggerStatementData)),
         )
     }
 
@@ -226,7 +194,6 @@ impl NodeFactory {
         self.new_node(
             SyntaxKind::LabeledStatement,
             D::LabeledStatement(Box::new(crate::astdata::LabeledStatementData {
-                flow_node: None,
                 label: self.id(label),
                 statement: self.id(statement),
             })),
@@ -239,7 +206,6 @@ impl NodeFactory {
             kind,
             D::BindingPattern(Box::new(crate::astdata::BindingPatternData {
                 elements: self.req_list(elements),
-                facts: 0,
             })),
         )
     }
@@ -256,12 +222,8 @@ impl NodeFactory {
             SyntaxKind::BindingElement,
             D::BindingElement(Box::new(crate::astdata::BindingElementData {
                 dot_dot_dot_token: self.oid(dot_dot_dot_token),
-                flow_node: None,
                 initializer: self.oid(initializer),
-                local_symbol: None,
                 property_name: self.oid(property_name),
-                symbol: None,
-                facts: 0,
                 name: self.oid(name),
             })),
         )
@@ -272,8 +234,6 @@ impl NodeFactory {
         self.new_node(
             SyntaxKind::MissingDeclaration,
             D::MissingDeclaration(Box::new(crate::astdata::MissingDeclarationData {
-                flow_node: None,
-                symbol: None,
                 modifiers: self.mods(modifiers),
             })),
         )
@@ -290,11 +250,6 @@ impl NodeFactory {
         self.new_node(
             SyntaxKind::JsTypeAliasDeclaration,
             D::TypeAliasDeclaration(Box::new(crate::astdata::TypeAliasDeclarationData {
-                flow_node: None,
-                local_symbol: None,
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
-                symbol: None,
                 type_: self.id(type_node),
                 type_parameters: self.opt_list(type_parameters),
                 modifiers: self.mods(modifiers),
@@ -315,11 +270,8 @@ impl NodeFactory {
             SyntaxKind::JsImportDeclaration,
             D::ImportDeclaration(Box::new(crate::astdata::ImportDeclarationData {
                 attributes: self.oid(attributes),
-                flow_node: None,
                 import_clause: self.oid(import_clause),
                 module_specifier: self.id(module_specifier),
-                symbol: None,
-                facts: 0,
                 modifiers: self.mods(modifiers),
             })),
         )
@@ -330,8 +282,6 @@ impl NodeFactory {
         self.new_node(
             SyntaxKind::NamespaceImport,
             D::NamespaceImport(Box::new(crate::astdata::NamespaceImportData {
-                local_symbol: None,
-                symbol: None,
                 name: self.id(name),
             })),
         )
@@ -343,8 +293,6 @@ impl NodeFactory {
             SyntaxKind::NamespaceExportDeclaration,
             D::NamespaceExportDeclaration(Box::new(
                 crate::astdata::NamespaceExportDeclarationData {
-                    flow_node: None,
-                    symbol: None,
                     modifiers: self.mods(modifiers),
                     name: self.id(name),
                 },
@@ -357,7 +305,6 @@ impl NodeFactory {
         self.new_node(
             SyntaxKind::NamespaceExport,
             D::NamespaceExport(Box::new(crate::astdata::NamespaceExportData {
-                symbol: None,
                 name: self.id(name),
             })),
         )
@@ -367,9 +314,7 @@ impl NodeFactory {
     pub fn new_semicolon_class_element(&self) -> Node {
         self.new_node(
             SyntaxKind::SemicolonClassElement,
-            D::SemicolonClassElement(Box::new(crate::astdata::SemicolonClassElementData {
-                symbol: None,
-            })),
+            D::SemicolonClassElement(Box::new(crate::astdata::SemicolonClassElementData)),
         )
     }
 
@@ -380,11 +325,6 @@ impl NodeFactory {
             D::ClassStaticBlockDeclaration(Box::new(
                 crate::astdata::ClassStaticBlockDeclarationData {
                     body: self.id(body),
-                    locals: crate::astdata::SymbolTable,
-                    next_container: None,
-                    return_flow_node: None,
-                    symbol: None,
-                    facts: 0,
                     modifiers: self.mods(modifiers),
                 },
             )),
@@ -415,9 +355,7 @@ impl NodeFactory {
         self.new_node(
             SyntaxKind::MetaProperty,
             D::MetaProperty(Box::new(crate::astdata::MetaPropertyData {
-                flow_node: None,
                 keyword_token,
-                facts: 0,
                 name: self.id(name),
             })),
         )
@@ -430,7 +368,6 @@ impl NodeFactory {
             D::TemplateExpression(Box::new(crate::astdata::TemplateExpressionData {
                 head: self.id(head),
                 template_spans: self.req_list(template_spans),
-                facts: 0,
             })),
         )
     }
@@ -452,7 +389,6 @@ impl NodeFactory {
             SyntaxKind::SpreadAssignment,
             D::SpreadAssignment(Box::new(crate::astdata::SpreadAssignmentData {
                 expression: self.id(expression),
-                symbol: None,
             })),
         )
     }
@@ -474,9 +410,7 @@ impl NodeFactory {
                     equals_token: self.oid(equals_token),
                     object_assignment_initializer: self.oid(object_assignment_initializer),
                     postfix_token: self.oid(postfix_token),
-                    symbol: None,
                     type_: self.oid(type_node),
-                    facts: 0,
                     modifiers: self.mods(modifiers),
                     name: self.id(name),
                 },
@@ -509,7 +443,6 @@ impl NodeFactory {
                 children: self.req_list(children),
                 closing_element: self.id(closing_element),
                 opening_element: self.id(opening_element),
-                facts: 0,
             })),
         )
     }
@@ -520,8 +453,6 @@ impl NodeFactory {
             SyntaxKind::JsxAttributes,
             D::JsxAttributes(Box::new(crate::astdata::JsxAttributesData {
                 properties: self.req_list(properties),
-                symbol: None,
-                facts: 0,
             })),
         )
     }
@@ -532,7 +463,6 @@ impl NodeFactory {
             SyntaxKind::JsxNamespacedName,
             D::JsxNamespacedName(Box::new(crate::astdata::JsxNamespacedNameData {
                 namespace: self.id(namespace),
-                facts: 0,
                 name: self.id(name),
             })),
         )
@@ -551,7 +481,6 @@ impl NodeFactory {
                 attributes: self.id(attributes),
                 tag_name: self.id(tag_name),
                 type_arguments: self.opt_list(type_arguments),
-                facts: 0,
             })),
         )
     }
@@ -569,7 +498,6 @@ impl NodeFactory {
                 attributes: self.id(attributes),
                 tag_name: self.id(tag_name),
                 type_arguments: self.opt_list(type_arguments),
-                facts: 0,
             })),
         )
     }
@@ -587,7 +515,6 @@ impl NodeFactory {
                 children: self.req_list(children),
                 closing_fragment: self.id(closing_fragment),
                 opening_fragment: self.id(opening_fragment),
-                facts: 0,
             })),
         )
     }
@@ -614,8 +541,6 @@ impl NodeFactory {
             SyntaxKind::JsxAttribute,
             D::JsxAttribute(Box::new(crate::astdata::JsxAttributeData {
                 initializer: self.oid(initializer),
-                symbol: None,
-                facts: 0,
                 name: self.id(name),
             })),
         )
@@ -1056,10 +981,7 @@ impl NodeFactory {
             SyntaxKind::JsDocSignature,
             D::JsDocSignature(Box::new(crate::astdata::JsDocSignatureData {
                 full_signature: None,
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
                 parameters: self.req_list(parameters),
-                symbol: None,
                 type_: self.oid(type_node),
                 type_parameters: self.opt_list(type_parameters),
             })),
@@ -1143,7 +1065,6 @@ impl NodeFactory {
                 is_array_type,
                 js_doc_property_tags: (!jsdoc_property_tags.is_empty())
                     .then(|| jsdoc_property_tags.iter().map(|&t| self.id(t)).collect()),
-                symbol: None,
             })),
         )
     }

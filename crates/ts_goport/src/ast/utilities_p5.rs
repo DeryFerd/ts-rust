@@ -113,10 +113,18 @@ pub fn is_callee_worker(
 }
 
 // Go: ast/utilities.go:3735 IsRightSideOfQualifiedNameOrPropertyAccess
+// PERF: noderef1 G1. The parent and its kind and name are read through
+// one view (`NodeRef`).
 pub fn is_right_side_of_qualified_name_or_property_access(node: Node) -> bool {
-    let parent = node.parent();
+    is_right_side_of_qualified_name_or_property_access_of(node, NodeRef::new(node).parent())
+}
+
+/// `is_right_side_of_qualified_name_or_property_access(node)`, where
+/// `parent` is the view of the parent of `node`.
+#[inline]
+pub fn is_right_side_of_qualified_name_or_property_access_of(node: Node, parent: NodeRef) -> bool {
     match parent.kind() {
-        SyntaxKind::QualifiedName => return parent.right() == node,
+        SyntaxKind::QualifiedName => return parent.node().right() == node,
         SyntaxKind::PropertyAccessExpression => return parent.name() == node,
         SyntaxKind::MetaProperty => return parent.name() == node,
         _ => {}
@@ -228,7 +236,7 @@ pub struct HasFileNameImpl {
     pub path: String,
 }
 
-// Go: ast/utilities.go:3819 NewHasFileName
+// Go: ast/utilities.go:3850 NewHasFileName
 pub fn new_has_file_name(file_name: &str, path: &str) -> HasFileNameImpl {
     HasFileNameImpl {
         file_name: file_name.to_string(),
@@ -237,12 +245,13 @@ pub fn new_has_file_name(file_name: &str, path: &str) -> HasFileNameImpl {
 }
 
 impl HasFileNameImpl {
-    // Go: ast/utilities.go:3765 (*hasFileNameImpl).FileName
+    // Go: ast/utilities.go:3857 (*hasFileNameImpl).FileName
     pub fn file_name(&self) -> String {
         self.file_name.clone()
     }
 
-    // Go: ast/utilities.go:3769 (*hasFileNameImpl).Path
+    // Go: ast/utilities.go:3830 (*hasFileNameImpl).Path (at 673a5f17d713; ts#64159 renames it
+    // PathKey, ast/utilities.go:3861)
     pub fn path(&self) -> String {
         self.path.clone()
     }

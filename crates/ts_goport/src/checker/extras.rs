@@ -63,7 +63,7 @@ impl Checker {
     }
 }
 
-// Go: checker/nodebuilderimpl.go:1193 TryGetModuleSpecifierFromDeclaration
+// Go: checker/nodebuilderimpl.go:1194 TryGetModuleSpecifierFromDeclaration
 pub fn try_get_module_specifier_from_declaration(node: Node) -> Node {
     let res = try_get_module_specifier_from_declaration_worker(node);
     if res.is_nil() || !is_string_literal(res) {
@@ -72,7 +72,7 @@ pub fn try_get_module_specifier_from_declaration(node: Node) -> Node {
     res
 }
 
-// Go: checker/nodebuilderimpl.go:1201 tryGetModuleSpecifierFromDeclarationWorker
+// Go: checker/nodebuilderimpl.go:1202 tryGetModuleSpecifierFromDeclarationWorker
 fn try_get_module_specifier_from_declaration_worker(node: Node) -> Node {
     match node.kind() {
         SyntaxKind::VariableDeclaration | SyntaxKind::BindingElement => {

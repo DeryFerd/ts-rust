@@ -56,7 +56,10 @@ pub fn analyze_match_effect_to_map_both(
         for transformation in &flow.transformations {
             if transformation.args.len() != 1
                 || transformation.callee.is_nil()
-                || !tp.is_node_reference_to_effect_module_api(transformation.callee, "matchEffect")
+                || !tp.is_node_reference_to_effect_module_api(
+                    transformation.callee,
+                    member!("matchEffect"),
+                )
             {
                 continue;
             }
@@ -70,14 +73,18 @@ pub fn analyze_match_effect_to_map_both(
             }
             let (failure_result, failure_argument, ok) =
                 super::match_effect_to_match::match_effect_constructor_handler(
-                    tp, on_failure, "fail",
+                    tp,
+                    on_failure,
+                    member!("fail"),
                 );
             if !ok {
                 continue;
             }
             let (success_result, success_argument, ok) =
                 super::match_effect_to_match::match_effect_constructor_handler(
-                    tp, on_success, "succeed",
+                    tp,
+                    on_success,
+                    member!("succeed"),
                 );
             if !ok {
                 continue;

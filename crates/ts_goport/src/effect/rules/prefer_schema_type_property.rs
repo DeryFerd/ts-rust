@@ -45,25 +45,17 @@ pub fn analyze_prefer_schema_type_property(
     sf: Node,
 ) -> Vec<PreferSchemaTypePropertyMatch> {
     let mut matches = Vec::new();
-    fn walk(
-        tp: &mut TypeParser<'_>,
-        sf: Node,
-        node: Node,
-        matches: &mut Vec<PreferSchemaTypePropertyMatch>,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4). A match is not walked into.
+    tp.node_order(sf).walk_preorder(|node| {
         if node.kind() == SyntaxKind::TypeReference
             && let Some(m) = analyze_prefer_schema_type_property_node(tp, sf, node)
         {
             matches.push(m);
-            return false;
+            return Walk::SkipChildren;
         }
-        node.for_each_child(|child| walk(tp, sf, child, matches));
-        false
-    }
-    walk(tp, sf, sf, &mut matches);
+        Walk::Descend
+    });
     matches
 }
 
@@ -98,7 +90,7 @@ fn analyze_prefer_schema_type_property_node(
     }
     let schema_export = middle_name.right();
     if schema_export.is_nil()
-        || !tp.is_node_reference_to_effect_schema_module_api(schema_export, "Schema")
+        || !tp.is_node_reference_to_effect_schema_module_api(schema_export, member!("Schema"))
     {
         return None;
     }

@@ -53,8 +53,8 @@ impl TypeParser<'_> {
     pub fn is_node_reference_to_effect_sql_model_module_api(
         &mut self,
         node: Node,
-        member_name: &str,
+        member: &ExportMember,
     ) -> bool {
-        self.is_node_reference_to_module_export(node, &SQL_MODEL_MODULE_DESCRIPTOR, member_name)
+        self.is_node_reference_to_module_export(node, &SQL_MODEL_MODULE_DESCRIPTOR, member)
     }
 }

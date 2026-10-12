@@ -53,21 +53,12 @@ pub struct SyncToSucceedMatch {
 pub fn analyze_sync_to_succeed(tp: &mut TypeParser<'_>, sf: Node) -> Vec<SyncToSucceedMatch> {
     let mut matches = Vec::new();
 
-    // PORT: Go's recursive `walk` closure.
-    fn walk(
-        tp: &mut TypeParser<'_>,
-        sf: Node,
-        matches: &mut Vec<SyncToSucceedMatch>,
-        node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    // PORT: the body of Go's recursive `walk` closure, for one node.
+    fn visit(tp: &mut TypeParser<'_>, sf: Node, matches: &mut Vec<SyncToSucceedMatch>, node: Node) {
         if node.kind() == SyntaxKind::CallExpression {
             let call = node;
             if call.expression().is_some()
-                && tp.is_node_reference_to_effect_module_api(call.expression(), "sync")
+                && tp.is_node_reference_to_effect_module_api(call.expression(), member!("sync"))
                 && call.argument_list().is_some()
                 && call.arguments().len() == 1
             {
@@ -91,11 +82,12 @@ pub fn analyze_sync_to_succeed(tp: &mut TypeParser<'_>, sf: Node) -> Vec<SyncToS
                 }
             }
         }
-
-        node.for_each_child(|child| walk(tp, sf, matches, child));
-        false
     }
 
-    walk(tp, sf, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, n);
+    }
     matches
 }

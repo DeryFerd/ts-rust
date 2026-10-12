@@ -93,8 +93,10 @@ impl TypeParser<'_> {
                 if inner_call.expression().is_nil() {
                     continue;
                 }
-                if !self.is_node_reference_to_effect_module_api(inner_call.expression(), "Service")
-                {
+                if !self.is_node_reference_to_effect_module_api(
+                    inner_call.expression(),
+                    member!("Service"),
+                ) {
                     continue;
                 }
 

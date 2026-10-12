@@ -55,6 +55,8 @@ pub struct CodeAction {
     pub description: String,
     pub changes: Vec<lsproto::TextEdit>,
     pub fix_id: String,
+    // Effect-TS/tsgo patch 011: CodeAction.Kind
+    pub kind: lsproto::CodeActionKind, // optional; used by refactors to specify the code action kind
     pub fix_all_description: String,
 }
 
@@ -102,6 +104,37 @@ fn code_fix_providers() -> [&'static CodeFixProvider; 3] {
         &*FIX_CLASS_INCORRECTLY_IMPLEMENTS_INTERFACE_PROVIDER,
         // Add more code fix providers here as they are implemented
     ]
+}
+
+// Go: ls/codeactions.go (Effect-TS/tsgo patch 011) externalCodeFixProviders
+// externalCodeFixProviders holds providers registered by external packages (e.g., etslshooks).
+// These are appended to the built-in providers when iterating.
+// PORT: Go fills the list from `init()` (`RegisterCodeFixProvider`); the
+// port has one external provider, Effect's (`effect::ls`).
+fn external_code_fix_providers() -> [&'static CodeFixProvider; 1] {
+    [&*crate::effect::ls::EFFECT_FIX_PROVIDER]
+}
+
+// Go: ls/codeactions.go (Effect-TS/tsgo patch 011) RefactorProvider
+// RefactorProvider represents a provider for selection-based refactoring actions.
+// Unlike CodeFixProvider, refactors are not tied to a specific diagnostic error code.
+// PORT: the Go func field is a plain `fn` pointer, as in `CodeFixProvider`.
+pub struct RefactorProvider {
+    pub get_refactor_actions: fn(
+        ctx: &Context,
+        file: Node,
+        span: TextRange,
+        program: &compiler::NewProgram,
+        ls: &LanguageService,
+    ) -> Result<Vec<CodeAction>, GoError>,
+}
+
+// Go: ls/codeactions.go (Effect-TS/tsgo patch 011) externalRefactorProviders
+// externalRefactorProviders holds providers registered by external packages (e.g., etslshooks).
+// PORT: Go fills the list from `init()` (`RegisterRefactorProvider`); the
+// port has one external provider, Effect's (`effect::ls`).
+fn external_refactor_providers() -> [&'static RefactorProvider; 1] {
+    [&crate::effect::ls::EFFECT_REFACTOR_PROVIDER]
 }
 
 impl LanguageService {
@@ -160,7 +193,12 @@ impl LanguageService {
                     continue;
                 };
 
-                for provider in code_fix_providers() {
+                // Check all code fix providers (built-in + external).
+                // Effect-TS/tsgo patch 011: the external providers follow the built-in ones.
+                for provider in code_fix_providers()
+                    .into_iter()
+                    .chain(external_code_fix_providers())
+                {
                     if !code_fix_provider_matches_lsp_diagnostic(provider, diag) {
                         continue;
                     }
@@ -213,6 +251,33 @@ impl LanguageService {
                 &fix_id_seen,
             )?;
             actions.extend(fix_all_actions);
+        }
+
+        // Effect-TS/tsgo patch 011: the refactor loop.
+        // Run refactor providers when the request includes refactor.* kinds or no filter
+        if should_run_refactors(params) {
+            for mapped in lsconv::from_lsp_range_for_source_file(
+                &self.converters,
+                file,
+                params.range,
+                Feature::CODE_ACTIONS,
+            ) {
+                for provider in external_refactor_providers() {
+                    let refactor_actions = (provider.get_refactor_actions)(
+                        ctx,
+                        mapped.script,
+                        mapped.span,
+                        program,
+                        self,
+                    )?;
+                    for action in &refactor_actions {
+                        actions.push(convert_refactor_to_lsp_code_action(
+                            action,
+                            &params.text_document.uri,
+                        ));
+                    }
+                }
+            }
         }
 
         Ok(lsproto::CommandOrCodeActionArrayOrNull {
@@ -527,6 +592,55 @@ pub fn contains_error_code(codes: &[i32], code: i32) -> bool {
     codes.contains(&code)
 }
 
+// Go: ls/codeactions.go (Effect-TS/tsgo patch 011) shouldRunRefactors
+// shouldRunRefactors returns true when refactor providers should be invoked.
+// Refactors run when no filter is specified or when the filter includes a refactor.* kind.
+fn should_run_refactors(params: &lsproto::CodeActionParams) -> bool {
+    let Some(only) = params
+        .context
+        .as_ref()
+        .and_then(|context| context.only.as_ref())
+    else {
+        return true;
+    };
+    for kind in only {
+        if kind.0.starts_with("refactor") {
+            return true;
+        }
+    }
+    false
+}
+
+// Go: ls/codeactions.go (Effect-TS/tsgo patch 011) convertRefactorToLSPCodeAction
+// convertRefactorToLSPCodeAction converts a refactor CodeAction to an LSP CommandOrCodeAction.
+fn convert_refactor_to_lsp_code_action(
+    action: &CodeAction,
+    uri: &lsproto::DocumentUri,
+) -> lsproto::CommandOrCodeAction {
+    let mut kind = action.kind.clone();
+    if kind == lsproto::CodeActionKind::EMPTY {
+        kind = lsproto::CodeActionKind::REFACTOR_REWRITE;
+    }
+    let mut changes: IndexMap<lsproto::DocumentUri, Vec<Option<lsproto::TextEdit>>> =
+        IndexMap::new();
+    changes.insert(
+        uri.clone(),
+        action.changes.iter().cloned().map(Some).collect(),
+    );
+    lsproto::CommandOrCodeAction {
+        code_action: Some(lsproto::CodeAction {
+            title: action.description.clone(),
+            kind: Some(kind),
+            edit: Some(lsproto::WorkspaceEdit {
+                changes: Some(changes),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 // Go: ls/codeactions.go:387 convertToLSPCodeAction
 // convertToLSPCodeAction converts an internal CodeAction to an LSP CodeAction
 fn convert_to_lsp_code_action(
@@ -555,5 +669,80 @@ fn convert_to_lsp_code_action(
             ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(only: Option<&[&'static str]>) -> lsproto::CodeActionParams {
+        lsproto::CodeActionParams {
+            context: Some(lsproto::CodeActionContext {
+                only: only.map(|kinds| {
+                    kinds
+                        .iter()
+                        .map(|kind| lsproto::CodeActionKind(std::borrow::Cow::Borrowed(*kind)))
+                        .collect()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    // Effect-TS/tsgo patch 011 shouldRunRefactors: no context or no `only`
+    // filter runs the refactors; a filter runs them when one kind starts
+    // with "refactor" (a plain string prefix).
+    #[test]
+    fn should_run_refactors_follows_the_only_filter() {
+        assert!(should_run_refactors(&lsproto::CodeActionParams::default()));
+        assert!(should_run_refactors(&params(None)));
+        assert!(!should_run_refactors(&params(Some(&[]))));
+        assert!(!should_run_refactors(&params(Some(&[
+            "quickfix", "source"
+        ]))));
+        assert!(should_run_refactors(&params(Some(&[
+            "quickfix", "refactor"
+        ]))));
+        assert!(should_run_refactors(&params(Some(&["refactor.rewrite"]))));
+        assert!(should_run_refactors(&params(Some(&["refactorx"]))));
+    }
+
+    // Effect-TS/tsgo patch 011 convertRefactorToLSPCodeAction: an action
+    // without a kind is refactor.rewrite; the edit holds the action's changes
+    // for the request's document, with no diagnostics.
+    #[test]
+    fn refactor_action_kind_defaults_to_refactor_rewrite() {
+        let uri = lsproto::DocumentUri("file:///a.ts".to_string());
+        let mut action = CodeAction {
+            description: "Toggle".to_string(),
+            changes: vec![lsproto::TextEdit::default()],
+            ..Default::default()
+        };
+        let converted = convert_refactor_to_lsp_code_action(&action, &uri)
+            .code_action
+            .expect("a code action");
+        assert_eq!(converted.title, "Toggle");
+        assert_eq!(
+            converted.kind,
+            Some(lsproto::CodeActionKind::REFACTOR_REWRITE)
+        );
+        assert_eq!(converted.diagnostics, None);
+        let changes = converted
+            .edit
+            .and_then(|edit| edit.changes)
+            .expect("changes");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[&uri], vec![Some(lsproto::TextEdit::default())]);
+
+        action.kind = lsproto::CodeActionKind::REFACTOR_EXTRACT;
+        let converted = convert_refactor_to_lsp_code_action(&action, &uri)
+            .code_action
+            .expect("a code action");
+        assert_eq!(
+            converted.kind,
+            Some(lsproto::CodeActionKind::REFACTOR_EXTRACT)
+        );
     }
 }

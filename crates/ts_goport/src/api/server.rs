@@ -5,6 +5,7 @@ use crate::api::prelude::*;
 use crate::api::callbackfs::{CallbackFS, new_callback_fs};
 use crate::api::protocol_msgpack::new_message_pack_protocol;
 use crate::contentmapper;
+use crate::execute::incremental::emit_files::ClientWrites;
 use crate::frontend::bundled;
 use crate::frontend::json_ext::{AnyValue, JsonValue};
 use crate::frontend::vfs::{self, Fs};
@@ -19,7 +20,7 @@ use std::cell::Cell;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-// Go: server.go:17 StdioServerOptions
+// Go: server.go:18 StdioServerOptions
 // StdioServerOptions configures the STDIO-based API server.
 // PORT: Go `io.ReadCloser` / `io.WriteCloser` / `io.Writer` are boxed
 // `Read` / `Write` values; a nil one is `None`. `In` and `Async` are Rust
@@ -39,6 +40,9 @@ pub struct StdioServerOptions {
     // Callbacks specifies which filesystem operations should be delegated
     // to the client (e.g., "readFile", "fileExists"). Empty means no callbacks.
     pub callbacks: Vec<String>,
+    // UseCaseSensitiveFileNames overrides the base filesystem's case sensitivity.
+    // PORT: the Go `*bool` is `Option<bool>` (ts#64447).
+    pub use_case_sensitive_file_names: Option<bool>,
     // Async enables JSON-RPC protocol with async connection handling.
     // When false (default), uses MessagePack protocol with sync connection.
     pub async_: bool,
@@ -53,7 +57,7 @@ pub struct StdioServerOptions {
     pub content_mapper_spawner: Option<Rc<dyn contentmapper::Spawner>>,
 }
 
-// Go: server.go:46 StdioServer
+// Go: server.go:49 StdioServer
 // StdioServer runs an API session over STDIO using MessagePack protocol.
 // This is the entry point for the synchronous STDIO-based API used by
 // native TypeScript tooling integration.
@@ -61,7 +65,7 @@ pub struct StdioServer {
     options: StdioServerOptions,
 }
 
-// Go: server.go:51 NewStdioServer
+// Go: server.go:54 NewStdioServer
 // NewStdioServer creates a new STDIO-based API server.
 // PORT: Go keeps the `*StdioServerOptions` pointer; the server owns the
 // options here (they hold the stdin and stdout handles).
@@ -134,7 +138,7 @@ impl<F: FnMut()> Drop for Defer<F> {
 }
 
 impl StdioServer {
-    // Go: server.go:62 Run
+    // Go: server.go:65 Run
     // Run starts the server and blocks until the connection closes.
     // PORT: `&mut self` because Accept moves the stdin and stdout handles
     // out of the options.
@@ -162,10 +166,17 @@ impl StdioServer {
 
         let mut fs: Rc<dyn Fs> = bundled::wrap_fs_exported(vfs::osvfs_fs());
 
-        // Wrap the base FS with callbackFS if callbacks are requested
+        // Wrap the base FS when callbacks or an explicit case-sensitivity setting are requested.
+        // ts#64447
         let mut callback_fs: Option<Rc<CallbackFS>> = None;
-        if !self.options.callbacks.is_empty() {
-            let cfs = new_callback_fs(fs.clone(), &self.options.callbacks);
+        if !self.options.callbacks.is_empty()
+            || self.options.use_case_sensitive_file_names.is_some()
+        {
+            let cfs = new_callback_fs(
+                fs.clone(),
+                &self.options.callbacks,
+                self.options.use_case_sensitive_file_names,
+            );
             fs = cfs.clone();
             callback_fs = Some(cfs);
         }
@@ -236,7 +247,9 @@ impl StdioServer {
         let conn: Rc<dyn Conn>;
         if self.options.async_ {
             let protocol = new_jsonrpc_protocol(rwc.clone());
-            let async_conn = new_async_conn_with_protocol(rwc, Box::new(protocol), handler);
+            let async_conn = new_async_conn_with_protocol(rwc.clone(), Box::new(protocol), handler);
+            // PORT: Go's `Run` reads on its own goroutine (`read_on_thread`).
+            async_conn.read_on_thread(Box::new(new_jsonrpc_protocol(rwc)));
             async_conn.set_collect_timing(self.options.collect_timing);
             conn = async_conn;
         } else {
@@ -252,6 +265,20 @@ impl StdioServer {
         }
         // ts#64299
         session.set_connection(conn.clone());
+        // PORT: not in Go. Each build write is a client call with the
+        // `writeFile` callback (`Session::client_writes`).
+        if self
+            .options
+            .callbacks
+            .iter()
+            .any(|name| name == "writeFile")
+        {
+            session.client_writes.set(Some(if self.options.async_ {
+                ClientWrites::Concurrent
+            } else {
+                ClientWrites::Serialized
+            }));
+        }
 
         // ts#64276
         server_run_error(ctx, conn.run(ctx))

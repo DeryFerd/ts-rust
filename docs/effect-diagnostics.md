@@ -7,7 +7,7 @@ binary, patch or second pass is needed.
 
 The code is `crates/ts_goport/src/effect`, a port of
 [Effect-TS/tsgo](https://github.com/Effect-TS/tsgo) at the
-`@effect/tsgo@0.46.1` release commit `f1a7cad0`. Read
+`@effect/tsgo@0.51.1` release commit `47cb1ed7`. Read
 `crates/ts_goport/src/effect/PORTING.md` before you change it.
 
 ## What it does
@@ -20,7 +20,7 @@ The code is `crates/ts_goport/src/effect`, a port of
   replaces the plugin list but keeps the base's Effect options, so Effect
   still runs. To turn the rules off in a child, list the plugin with
   `"diagnostics": false`.
-- Runs all 116 rules after the checker has checked each project file
+- Runs all 119 rules after the checker has checked each project file
   (not declaration files and not files from `node_modules`). Rule
   severities come from `diagnosticSeverity`, matching `overrides`, and
   `@effect-diagnostics` / `@effect-diagnostics-next-line` comments.
@@ -36,7 +36,7 @@ The code is `crates/ts_goport/src/effect`, a port of
   `@ts-ignore` does not hide Effect diagnostics.
 - Effect options are stored in `.tsbuildinfo`, so a change to them
   invalidates the cached diagnostics. With the plugin on, `.tsbuildinfo`
-  records the version `<version>+effect-tsgo.0.46.1`, as effect-tsgo does.
+  records the version `<version>+effect-tsgo.0.51.1`, as effect-tsgo does.
   Plain tsgo and tsc-rs without the plugin then check the project again
   instead of reading Effect diagnostics (plain tsgo panics on those:
   "Unknown diagnostic message"). tsc-rs from Theo PR #4, before this
@@ -45,10 +45,46 @@ The code is `crates/ts_goport/src/effect`, a port of
   still panics on it until one tsc-rs run writes it again. The language
   server shows the same diagnostics. `tsc -v`, `tsc --help` and the
   language server's `serverInfo` print the plain version; effect-tsgo
-  prints `<version>+effect-tsgo.0.46.1` there.
+  prints `<version>+effect-tsgo.0.51.1` there.
 - With no plugin entry, nothing runs. An entry with only a `name` runs every
   rule at its default severity. `"diagnostics": false` or
   `"diagnosticSeverity": null` turns the rules off.
+
+## API stability rules
+
+Effect marks APIs with a JSDoc tag: `@stability unstable` or
+`@stability experimental` (`@stability stable` is the default). Three rules
+read the tags:
+
+- `unstableApiUsage` (TS377136, warning by default) and
+  `experimentalApiUsage` (TS377135, warning by default) report each use of a
+  tagged API. A call uses the tag of its selected overload first, then the tag
+  of the symbol. The message names the API as `module#export`, where the
+  module is the declaring package name plus its path (without `src/`,
+  `dist/`, `dist/dts/`, `dist/esm/`, `dist/cjs/`, the extension and a final
+  `index`), for example `effect/cli/Command#make`.
+- `allowedUnstableApis` and `allowedExperimentalApis` (string arrays, at the
+  root of the plugin entry and in `overrides[].options`) turn the report off
+  for listed APIs. An entry `module` allows that module and every module under
+  it (`module/...`); an entry `module#export` allows one export (the same
+  symbol, or the same one after aliases). In `overrides` and through
+  `extends`, a list that a config sets replaces the inherited list; `[]`
+  clears it.
+- `apiStabilityLeak` (TS377137, off by default, group `maintainers`) is for
+  library maintainers. It reports an export whose public surface (members,
+  signatures, type arguments, bases, namespace members) exposes a type with a
+  less stable tag than the export itself: a stable export may not expose an
+  unstable or experimental type, and an unstable export may not expose an
+  experimental type. A tag on an `export ... from` declaration sets the
+  ceiling of the exports it forwards. `@internal` exports are skipped. The
+  related location (TS377138) names the tagged declaration. effect-tsgo also
+  has a `maintainers` preset for its `setup` command; the tsconfig entry has
+  no preset key, so turn the rule on with `diagnosticSeverity`.
+
+Effect 4 tags many modules, so a project on `effect@4` gets TS377136
+warnings for its unstable imports (for example `effect/cli`), as with
+effect-tsgo 0.48 and later. Turn the rule off, or allow the modules, to keep
+the earlier output.
 
 ## Where it hooks in
 
@@ -68,8 +104,10 @@ The messages are generated from
 
 All take the reference Effect-patched `tsc` as `--ref`:
 
-- `scripts/effect/reference-cases.mjs`: the reference's own 529 test cases
+- `scripts/effect/reference-cases.mjs`: the reference's own 542 test cases
   (Effect v3 and v4), compiler against compiler.
+- `scripts/effect/go-unit-cases.mjs`: the inline sources of the reference's
+  API stability Go unit tests, with the 3 stability rules on.
 - `scripts/effect/focused-fixtures.mjs`: `crates/ts_goport/tests/effect_fixtures`,
   each with expected codes and exit status.
 - `scripts/effect/incremental-check.mjs`: `--incremental` and `--watch`
@@ -79,8 +117,48 @@ All take the reference Effect-patched `tsc` as `--ref`:
 - `scripts/effect/t3-parity.mjs` and `scripts/effect/bench-t3.mjs`: T3 Code
   parity and timing.
 
+## Editor features
+
+The language server (`--lsp`) has these editor features of effect-tsgo
+0.51.1, each only with the plugin (`crates/ts_goport/src/effect/ls`):
+
+- Hover: the Effect type parameters, `yield*`, and the Layer summary with
+  its Mermaid links.
+- The inlay hint filter (`inlays`).
+- The auto-import style (`namespaceImportPackages`,
+  `barrelImportPackages`, `importAliases`, `topLevelNamedReexports`).
+- Quick fixes: the 2 disable actions and all 55 fixes.
+- Document symbols: the `Effect` symbol with Layers, Services, Errors and
+  Schemas, and Flows with the `debug` option.
+- Completions (`completions`): the 13 providers. They add class snippets
+  after `extends` (Schema, Model, Data, Context, v3 Effect, `@effect/sql`
+  Model, `@effect/rpc`), `gen(function*(){})`, `fn` and `fnUntraced`
+  items, the `@effect-diagnostics`, `@effect-codegens` and
+  `@effect-identifier` comment directives, Duration units and the v3
+  Schema `brand`. They come after the plain items.
+- Refactors (`refactors`): all 21, after the other code actions, each with
+  the kind `refactor.rewrite.effect.<name>`. Pipe: `wrapWithPipe`,
+  `togglePipeStyle`, `pipeableToDatafirst`. `Effect.gen` and `Effect.fn`:
+  `wrapWithEffectGen`, `removeUnnecessaryEffectGen`, `asyncAwaitToGen`,
+  `asyncAwaitToGenTryPromise`, `asyncAwaitToFn`,
+  `asyncAwaitToFnTryPromise`, `effectGenToFn`. Types and functions:
+  `toggleTypeAnnotation`, `toggleReturnTypeAnnotation`, `toggleLazyConst`,
+  `functionToArrow`. Layers and services: `layerMagic` (build and
+  prepare), `writeTagClassAccessors`. Schema: `typeToEffectSchema`,
+  `typeToEffectSchemaClass`, `makeSchemaOpaque`, `makeSchemaOpaqueWithNs`,
+  `structuralTypeToSchema`. When more than one Schema in scope matches a
+  type, `structuralTypeToSchema` in effect-tsgo picks one in Go map order
+  (it can change from run to run). tsc-rs picks the first in scope order.
+
+tsc mode never runs them.
+
 ## Not ported
 
-Editor features of the language service: quick fixes, refactors, hover,
-completions, inlay hints, document symbols and goto. tsc mode never runs
-them.
+Editor features: none. One server change is not ported: effect-tsgo adds
+`refactor.rewrite` to the code action kinds of the `initialize` answer
+(patch 017). Without it, the lightbulb and the quick fix menu show the
+Effect refactors, because they ask for all code actions. The editor
+"Refactor..." menu asks only servers that list a `refactor` kind, so it
+does not show them. This waits for a decision (D1), because it changes the
+`initialize` answer that the LSP oracle compares. The `goto` and `renames`
+options are read, but effect-tsgo does not use them either.

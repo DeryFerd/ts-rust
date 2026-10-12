@@ -49,11 +49,14 @@ pub fn analyze_effect_map_flatten(tp: &mut TypeParser<'_>, sf: Node) -> Vec<Effe
     for flow in flows.iter() {
         let is_map: &mut PipingFlowTransformationPredicate<'_> = &mut |tp, transformation| {
             !transformation.args.is_empty()
-                && tp.is_node_reference_to_effect_module_api(transformation.callee, "map")
+                && tp.is_node_reference_to_effect_module_api(transformation.callee, member!("map"))
         };
         let is_flatten: &mut PipingFlowTransformationPredicate<'_> = &mut |tp, transformation| {
             transformation.args.is_empty()
-                && tp.is_node_reference_to_effect_module_api(transformation.callee, "flatten")
+                && tp.is_node_reference_to_effect_module_api(
+                    transformation.callee,
+                    member!("flatten"),
+                )
         };
         let sequences = flow.find_transformation_sequences(tp, &mut [is_map, is_flatten]);
         for sequence in sequences {

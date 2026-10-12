@@ -38,7 +38,12 @@ static VITEST_TEST_MODIFIERS: &[&str] = &[
 ];
 
 // Go: rules/floating_effect_in_vitest.go vitestHookNames
-static VITEST_HOOK_NAMES: &[&str] = &["afterAll", "afterEach", "beforeAll", "beforeEach"];
+static VITEST_HOOK_NAMES: [ExportMember; 4] = [
+    ExportMember::new("afterAll"),
+    ExportMember::new("afterEach"),
+    ExportMember::new("beforeAll"),
+    ExportMember::new("beforeEach"),
+];
 
 // Go: rules/floating_effect_in_vitest.go effectAwareVitestMethods
 static EFFECT_AWARE_VITEST_METHODS: &[&str] = &["effect", "live", "scoped", "scopedLive"];
@@ -59,11 +64,7 @@ pub static FLOATING_EFFECT_IN_VITEST: Rule = Rule {
 fn run_floating_effect_in_vitest(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
-    fn walk(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, node: Node) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    fn visit(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, node: Node) {
         if node.kind() == SyntaxKind::CallExpression {
             let callback = floating_effect_vitest_callback(ctx, node);
             if callback.is_some() {
@@ -84,13 +85,14 @@ fn run_floating_effect_in_vitest(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnosti
                 ));
             }
         }
-
-        node.for_each_child(|child| walk(ctx, diags, child));
-        false
     }
 
     let sf = ctx.source_file;
-    walk(ctx, &mut diags, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diags, n);
+    }
     diags
 }
 
@@ -161,15 +163,15 @@ fn match_vitest_callee(tp: &mut TypeParser<'_>, mut node: Node) -> (VitestRoot, 
 
 // Go: rules/floating_effect_in_vitest.go matchVitestRoot
 fn match_vitest_root(tp: &mut TypeParser<'_>, node: Node) -> VitestRoot {
-    for name in ["it", "test"] {
+    for name in [member!("it"), member!("test")] {
         if tp.is_node_reference_to_vitest_api(node, name) {
             return VitestRoot {
-                name,
+                name: name.name,
                 effect_vitest: false,
             };
         }
     }
-    if tp.is_node_reference_to_effect_vitest_api(node, "it") {
+    if tp.is_node_reference_to_effect_vitest_api(node, member!("it")) {
         return VitestRoot {
             name: "it",
             effect_vitest: true,
@@ -177,10 +179,10 @@ fn match_vitest_root(tp: &mut TypeParser<'_>, node: Node) -> VitestRoot {
     }
     // PORT: Go ranges over a map (random order); a node references at most
     // one of these exports, so the order does not change the result.
-    for &name in VITEST_HOOK_NAMES {
+    for name in &VITEST_HOOK_NAMES {
         if tp.is_node_reference_to_vitest_api(node, name) {
             return VitestRoot {
-                name,
+                name: name.name,
                 effect_vitest: false,
             };
         }
@@ -193,7 +195,7 @@ fn classify_vitest_callback(root: VitestRoot, members: &[String]) -> VitestCallb
     if root.name.is_empty() {
         return VitestCallbackKind::None;
     }
-    if VITEST_HOOK_NAMES.contains(&root.name) {
+    if VITEST_HOOK_NAMES.iter().any(|hook| hook.name == root.name) {
         if members.is_empty() {
             return VitestCallbackKind::Hook;
         }
@@ -206,7 +208,7 @@ fn classify_vitest_callback(root: VitestRoot, members: &[String]) -> VitestCallb
     {
         return VitestCallbackKind::None;
     }
-    if members.len() == 1 && VITEST_HOOK_NAMES.contains(&members[0].as_str()) {
+    if members.len() == 1 && VITEST_HOOK_NAMES.iter().any(|hook| hook.name == members[0]) {
         return VitestCallbackKind::Hook;
     }
     for member in members {

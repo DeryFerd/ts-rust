@@ -6,9 +6,10 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
 - `gate.sh <label>`: full regression gate. Run it before any goport merge.
 - `bound2.sh <round>`: bound parity run with a manifest (Query, Hono, error copies, sweeps, emit).
 - `measure.sh`, `measure-extra.sh`, `sweep.sh`: the project comparisons that `bound2.sh` and `gate.sh` use.
-- `perf.sh <label> <bin>...`: median of 3 wall time and peak RSS on Query, Hono, zod and effect,
-  runs interleaved across the binaries. It refuses to start above load 1.5 (`PERF_WAIT=1` waits
-  for a quiet host). zbook is rarely quiet: run it on mini-743d.
+- `perf.sh [--mode default|st|both] <label> <bin>... [-- <tsgo arg>...]`: medians of wall, peak RSS and
+  instructions:u on Query, Hono, zod and effect, runs interleaved across the binaries; `perf.sh compare`
+  compares two runs with the same host line, tsgo args and env. Wall on mini-743d, instructions and RSS on a
+  testbox (`testbox.sh perf`). See "Timing".
 - `facts [section...]`: in one call, the paths and versions agents look up before their first edit: main
   against origin, the accepted revision (commit, bins checked against the gate manifest, gate, evidence),
   the Go pins with checkouts and oracles, the project tsconfigs, the newest lane bins, active `goport-*`
@@ -17,6 +18,9 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
   running labels, age). `wfstatus <run-id>` prints that run's agent results. Use it instead of
   parsing `journal.jsonl` by hand.
 - `prune-worktrees.py`: lists stale worktrees and merged branches. `--apply` removes them.
+- `clean-builds.py`: lists the Cargo build dirs and private Go caches of worktrees idle for 3 days, and the
+  Go build cache when it is over 40 GB. `--apply` removes them (logs, reports and evidence stay). On zbook the
+  `ts-rust-clean-builds` systemd user timer runs `--apply` daily (`clean-builds.py timer` installs it).
 - `fp.py <checkout>`: the source fingerprint recorded in the saved state. `fpcommit.py <checkout> <commit>`
   gives the same value for the checkout as it was at a commit.
 - `gate.sh` also runs an editor stage (memory and answers limits of `ls_edit_bench.py` on Query
@@ -186,6 +190,9 @@ Edit loop on alvin (24 cores, 16 jobs, sccache off, 2026-10-10, `ts_goport` 566k
   incremental dep graph run on the whole crate each time (`-Ztime-passes`). So an edit in
   `ls/hover.rs` costs the same as one in the checker.
 - Peak memory of a whole build is at most 6.1 GB, except `test --no-run` (10 to 11 GB clean).
+- The nightly links with rust-lld. mold (`-C link-arg=-fuse-ld=mold`) used about 25% less CPU per
+  edit, but dev `--bins` and `test --no-run` edits took the same wall time (21 to 31 s, two runs
+  each), so the script keeps rust-lld.
 - With 1 job (the default on every host but zbook until 2026-10-10), `check` took 228 s clean and
   17 s for an edit, and a dev `--bin tsgo` build 301 s clean and 29 s for an edit.
 
@@ -266,6 +273,51 @@ How to read the result:
   Go against Go passes all 15. R123 also fails typing-paced and errfix-paced on Query core (rss and
   all latency limits); it passes them on Hono. Go against Go passes all 4 paced sessions.
 
+## Timing
+
+Root decision of 2026-10-11 (state note `tbxperf0-result-2026-10-11`; data in `tbxperf0/report.md` and
+`tbxperf1/summary.md` under `target/continuation-r97-goport/`):
+
+| metric | bar | where | how | A/A |
+|---|---|---|---|---|
+| instructions:u, `--singleThreaded` | 1% | a testbox, both sides on one testbox | `testbox.sh perf <label> <bin>...` | 0.005% or less |
+| peak RSS, default 4 checkers | 5% | a testbox | the same call, median of 3 | query up to 2%, the others 0.6% |
+| wall, default 4 checkers | 2% | mini-743d, every side in one run | `perf.sh <label> <bin>...` through `remote.sh` (5 rounds) | zod and effect up to 1.1% (tbxperf0: 1.5 to 1.8% at the 95th percentile), hono 0.4%; query up to 6.4% |
+
+- `perf.sh` runs `perf stat -e instructions:u,cycles:u,task-clock` and `/usr/bin/time` (max RSS) on each run. Wall
+  is perf's own elapsed time in microseconds. `/usr/bin/time %e` had 10 ms steps (about a quarter of a Query run), and the
+  sudo and perf start add 24 ms on mini-743d. `--mode st` runs `--singleThreaded`, `both` runs st and the
+  default 4 checkers. `PERF_ROUNDS` or `--rounds` sets the rounds: 5 by default, 3 on a testbox.
+- Query runs for 45 ms, and its wall moves about 5% from run to run on mini-743d: use zod and effect for a wall
+  claim.
+- mini-743d is the only wall host. cup2 is not one: an A/A at median of 5 gave zod 3.0%, effect 1.8% and query
+  11.5% (`perf/tbxperf1-r2-cup2-aa`; its virtio balloon has free page reporting on). alvin has no perf.
+- At 4 checkers the instruction counts include waits that depend on timing (A/A: query up to 0.42% at median of
+  3 on a testbox, hono 0.09%, zod and effect 0.03%). Use the st counts for an instruction claim. Do not use cycles:u for a 1% claim on any
+  host (it is in `runs.tsv` only), and do not use minor faults on a testbox.
+- Emit: `perf.sh` runs `tsgo -p` with emit, and the read-only inputs refuse the writes. The emit is about 25% of
+  the effect instructions. For checker work add `-- --noEmit`: R190 against R189 on effect, st, is +9.39% with
+  emit and +12.80% with `--noEmit` (+4.17 G instructions both ways).
+- Host line: CPU family/model and name, microcode, kernel, perf version, THP and the virtio balloon free page
+  reporting state (`perf.sh host`). `perf.sh compare <base> <new>` (bin0 of base against each bin of new;
+  instructions and RSS, no wall) refuses two runs with different host lines, tsgo args or env. Fresh testboxes gave
+  the same R190 counts within 0.002%. Do not compare a testbox number with a mini-743d number.
+- Testbox wall is not valid: the guest clock moves about 1.8% per run, and free page reporting gives host page
+  faults that steal and load do not show (tbxperf0 skeptic). A testbox summary leaves wall out.
+- perf: `perf.sh` takes the first perf that runs (`PERF_BIN`, `perf`, `/usr/lib/linux-tools/*/perf`: the
+  testbox's `/usr/bin/perf` wants tools for its kernel). At perf_event_paranoid 3 or more (mini-743d, dbook-lan:
+  4; cup2: 3) perf runs under `sudo -n` and the binary under `setpriv` as the user.
+- Env: tsgo runs under `env -i` on every host, so sudo's env reset does not change what it sees. It gets HOME,
+  `PATH=/usr/local/bin:/usr/bin:/bin`, `LC_ALL=C`, `GOPORT_LAUNCH=0` and the caller's `GOPORT_*` (not
+  `GOPORT_PIN*`), `_RJEM_MALLOC_CONF`, `MALLOC_*`, `GLIBC_TUNABLES`, `GOMAXPROCS`, `GOGC`, `GOMEMLIMIT` and
+  `GODEBUG`. `perf.sh env` prints the ones set. host.txt records them on its `env` line (`none` when no one is
+  set), and `compare` refuses two runs with a different env. `testbox.sh perf` passes them on to the testbox.
+  For an A/B of a variable (for example `GOPORT_LIB_SNAPSHOT=0`), put both sides in one run: one side is a
+  wrapper script that sets the variable and execs the bin (the start of bash counts on that side).
+- Time like against like: every Rust side is a stable build. On a testbox, build with
+  `TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 TS_CARGO_JOBS=32 scripts/run-cargo-capped.sh build --release ...`.
+  PGO and BOLT builds (`build-release.sh`) stay off testboxes: the guest has no branch stack sampling.
+
 ## Remote runners
 
 `remote.sh` copies binaries and scripts to a remote host, runs a command there in the repo root and
@@ -321,3 +373,96 @@ revision evidence (`remote.sh help`, "Reserved"): timing that needs zbook-class 
 - mini-abf9 is Theo's own machine again since 2026-10-04. `remote.sh` refuses every command on it.
 - dbook-lan and mini-743d: `sudo -n`, perf_event_paranoid 4 (use `sudo perf`), THP madvise, and
   perf, bpftrace and strace installed.
+
+## Blacksmith testboxes
+
+`testbox.sh` runs builds, the protected suites, the gate and the oracle batteries on a warm Blacksmith
+runner (32 vCPU, 124 GB RAM), not on zbook or the SSH hosts. `.github/workflows/testbox.yml` sets up the
+testbox, `testbox-data.sh` makes zbook's paths there, and `testbox-remote.sh` holds the steps of `tests`,
+`np-suite` and `pin`. `testbox.sh help` gives the usage.
+
+```sh
+scripts/goport/testbox.sh warmup                                # about 1 min; TESTBOX_REF=<branch> for a workflow change
+scripts/goport/testbox.sh tests <out-dir> <base results.json>   # build-goport-tests.sh, goport-tests.sh, compare-tests.py
+scripts/goport/testbox.sh np-suite <label> [<base label>]       # np-suite.sh run, then np-suite.sh diff
+scripts/goport/testbox.sh perf <label> <bin>... [-- --noEmit]   # perf.sh: instructions:u and RSS (see "Timing")
+scripts/goport/testbox.sh push <bins dir>                       # then run gate.sh, lsp_oracle.py or api_oracle.py as on zbook,
+                                                                 # from the zbook path, so the manifest names the same scripts:
+                                                                 # run bash -c 'cd /home/theo/Code/sandbox/ts-rust && GOPORT_PIN=<pin> bash scripts/goport/gate.sh ...'
+scripts/goport/testbox.sh get <remote> [<local>]                # rsync a result back
+scripts/goport/testbox.sh stop                                  # or release (see "Sticky disks")
+```
+
+- Warmup: bubblewrap, psutil, Node 24, Go, Rust 1.93.0 and the nightly, and zbook's paths
+  (`testbox-data.sh mount`):
+  - The workspace is bound on `/home/theo/Code/sandbox/ts-rust`, and the testbox env sets
+    `HOME=/home/theo`.
+  - The whole checkout of the batch pin, with `npm ci` node_modules, is bound on its zbook path.
+  - Each path of `testbox-data.txt` is bound from its sticky disk.
+  - `pin.py exec` binds the pin over the default oracle and goCheckout paths. bwrap makes those bind targets.
+- Data: `testbox-data.txt` lists the zbook files that the gate and the LSP and API oracles read and git does
+  not hold. Disk `ts-rust-testbox-inputs` holds the files that are the same for every pin: the project inputs,
+  the runner trees, the corpus and the Effect e1 data (below). Disk `ts-rust-testbox-pin-<key>` holds the pin
+  cache, the LSP and API goldens and the pin oracle. `testbox.sh seed [inputs|pin]` copies them from zbook (30
+  to 35 minutes; a rerun copies only what is missing). Then `release`. A testbox reads the list of the ref
+  that it warmed up from: to seed a new path, warm up with `TESTBOX_REF=<your pushed branch>`. With main's
+  list, the copy goes to the target disk, not the inputs disk.
+- Effect e1 (`lsp_battery_effect.py`): the inputs disk holds its traces, the E0 goldens and flaky files, the
+  E0 copies, the T3 Code copy of e1-t3code and the effect-tsgo 0.51.1 repo (3.4 GiB). A lane pushes only its
+  bins: `push <bins dir>`, then
+  `run bash -c 'cd /home/theo/Code/sandbox/ts-rust && GOPORT_LAUNCH=0 python3 scripts/goport/lsp_battery_effect.py check --server <bins>/tsgo --label <label> --jobs 16'`
+  and `get` `ls-oracle/effect/results/<label>/` (the results are on the target disk). New e1 goldens (a new
+  part or a new E0) reach the disk with another `seed inputs` and a release. `--parts` limits a run to some
+  parts: e1-effect and e1-t3code, and e1-effect-ce and e1-t3code-ce (completion at `// @` and after
+  `extends Data.`). On a fresh testbox (2026-10-11) the R190 check took 20 s for the first two parts and
+  33 s for all four; the push of tsgo took 4 s.
+- Oracles: `pin.py` checks the sha256 of the pin oracle, and a build on the runner has another sha256 (Go
+  puts absolute paths in the binary). So the testbox uses zbook's recorded binary from the pin disk.
+  `tests` compares the testbox's copy with UPSTREAM.json and pushes zbook's binary when they differ.
+- Git: the sync sends files, not git state. `tests` needs HEAD on origin: the testbox fetches it and resets
+  its index to it, so `build-goport-tests.sh` sees a clean tree at HEAD. Before a gate, fetch the commit
+  that the bins name (`run git fetch --depth=1 origin <sha>`).
+- Other pins: `testbox.sh pin KEY` checks out a pin of this worktree's UPSTREAM.json (microsoft/TypeScript
+  pins only), for example bump D fed0bf24149f from a bump D worktree. Then
+  `testbox.sh tests --pin KEY <out-dir> <base results.json>` or `testbox.sh np-suite --pin KEY <label>`.
+  The pin disk holds only the batch pin's files. `tests --pin` pushes the other pin's oracle to that
+  testbox only.
+- Output: `tests` writes `<out-dir>/tests-run` (results.json, logs, tsv, track), `<out-dir>/testbin` (the
+  metadata, no binaries) and `<out-dir>/compare.json`. After a failed build it writes the cargo logs to
+  `<out-dir>/testbin.new/logs` and prints the compiler errors. `np-suite` writes the label dir in the main
+  checkout's np-suite dir, and `perf` in the main checkout's perf dir. None replaces an existing dir.
+- `perf`: pushes the bins to their zbook paths, runs `perf.sh --mode both` (3 rounds; `--mode` and `--rounds`
+  pass through, and so do `-- <tsgo arg>...` and the variables of `perf.sh env`) and fetches the label dir. Without a saved testbox it warms one up
+  (`TESTBOX_IDLE` 30) and stops it at the end. Read the instructions and the RSS: wall is not valid there.
+- Activity: the idle timer reads the marker `/home/runner/.testbox-last-activity`. The CLI touches it at
+  the start and the end of each `run`. `testbox.sh` runs the command in a subshell, so the
+  `HOME=/home/theo` of the testbox env does not move the end touch. The timer does not see the SSH route
+  of `push`, `get` and the `tests` poll. So `push` and `seed` touch the marker every minute, and the
+  `tests` and `np-suite` jobs every 30 s.
+- Sticky disks: `target/` and the cargo registry, and the inputs and pin disks. The inputs and pin disks
+  commit only when a file changed (`commit: on-change`), so a testbox that only reads them does not commit an
+  older copy. A sticky disk commits only when the job ends with no failed or cancelled step. `stop` cancels the
+  job, so its writes are lost. `release` forgets the testbox, which ends at its idle timeout
+  (`TESTBOX_IDLE`, default 15 minutes) and requests a commit.
+  - Not every requested commit lands. On 2026-10-10, five testboxes that lived 2 to 13 minutes committed,
+    up to 2.1 GiB (a warm target after `tests` and `np-suite`). One that lived 27 minutes (10 to 15 idle
+    minutes at the end, no `stop`) requested a 2 GiB commit that never landed. The cause is not known: a
+    39-minute testbox of another session probably did commit.
+  - `TESTBOX_IDLE=1` with a release right after the last command gave commits that landed. Only `tests`,
+    `np-suite`, `push` and `seed` keep a testbox alive: with a short idle timeout, a `run` or `pin` command
+    longer than about 6 minutes is cut off (the VM waits at most 290 s for SSH sessions, then shuts down).
+    `TESTBOX_ID=<id> testbox.sh status` shows the end.
+  - The last commit wins, across branches too: every branch uses the same disk keys.
+  - `on-change` compares the disk usage, not the files: a change of 4096 bytes or less (for example a file
+    written again at the same size) does not commit.
+  - The idle loop keeps the time of the last activity in memory and only moves it forward, so an older
+    marker time does not end a testbox sooner. A released testbox with `TESTBOX_IDLE=60` lives 60 more
+    minutes. `seed` keeps the testbox alive itself, so a short `TESTBOX_IDLE` is safe for a seed. On
+    2026-10-11 both seed commits landed: `TESTBOX_IDLE=60` (78 minutes, 3.4 GiB) and `TESTBOX_IDLE=5`
+    (21 minutes, 2.6 MB). The first took 18 minutes; the second 15, almost all of it the scan of the files
+    that were there.
+- Times (2026-10-10, cold target): `tests` 502 s (test bins 3.6 min, suite 4.7 min), `np-suite` 112 s. With
+  the R189 bins: the full gate 8.4 min, the LSP batteries 3 min, the API batteries 1 min. `perf` with two bins
+  (2026-10-11): 2 minutes with the warmup (perf.sh itself 47 s at 3 rounds, 76 s at 5).
+- Not on testboxes yet: `candidate.sh side`, wall timing and PGO and BOLT builds. Revision evidence stays on
+  dbook-lan, wall on mini-743d.

@@ -435,7 +435,9 @@ impl TypeParser<'_> {
                 }
 
                 // Check if this is Function.pipe from "effect" package
-                if self.is_node_reference_to_effect_package_export(call.expression(), "pipe") {
+                if self
+                    .is_node_reference_to_effect_package_export(call.expression(), member!("pipe"))
+                {
                     // This is pipe(subject, f1, f2, ...) via namespace access (e.g., Function.pipe)
                     if call.argument_list().is_nil() || call.arguments().is_empty() {
                         break 'compute None;
@@ -469,7 +471,9 @@ impl TypeParser<'_> {
 
             // Case 2: Identifier — bare pipe(subject, f1, f2, ...)
             if call.expression().kind() == SyntaxKind::Identifier {
-                if !self.is_node_reference_to_effect_package_export(call.expression(), "pipe") {
+                if !self
+                    .is_node_reference_to_effect_package_export(call.expression(), member!("pipe"))
+                {
                     break 'compute None;
                 }
 
@@ -1262,7 +1266,10 @@ pub fn piping_flow_type_arguments(node: Node, callee: Node) -> NodeList {
 /// Returns nil if the signature has no mapper.
 // PORT: the Rust checker has no port of this patched export, so its body is
 // here.
-fn get_type_arguments_for_resolved_signature(c: &mut Checker, sig: SignatureId) -> Vec<TypeId> {
+pub(crate) fn get_type_arguments_for_resolved_signature(
+    c: &mut Checker,
+    sig: SignatureId,
+) -> Vec<TypeId> {
     if sig.is_nil() || c.sig(sig).mapper.is_nil() {
         return Vec::new();
     }

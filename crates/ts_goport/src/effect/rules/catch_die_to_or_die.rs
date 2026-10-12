@@ -61,7 +61,7 @@ pub fn analyze_catch_die_to_or_die(tp: &mut TypeParser<'_>, sf: Node) -> Vec<Cat
             let (method_name, effect_module, ok) = catch_die_method(tp, callee);
             if ok && args.len() == 1 {
                 let (handler, _, _) = tp.unwrap_identity_forwarder(args[0]);
-                if tp.is_node_reference_to_effect_module_api(handler, "die") {
+                if tp.is_node_reference_to_effect_module_api(handler, member!("die")) {
                     let input_effect = tp.strict_effect_type(input_type);
                     if let Some(input_effect) = input_effect
                         && input_effect.e.is_some()
@@ -96,9 +96,9 @@ fn catch_die_method(tp: &mut TypeParser<'_>, callee: Node) -> (String, Node, boo
         return (String::new(), Node::NIL, false);
     }
 
-    let mut name = "catchAll";
+    let mut name = member!("catchAll");
     if tp.supported_effect_version() == EffectMajorVersion::V4 {
-        name = "catch";
+        name = member!("catch");
     }
     if !tp.is_node_reference_to_effect_module_api(callee, name) {
         return (String::new(), Node::NIL, false);
@@ -108,7 +108,7 @@ fn catch_die_method(tp: &mut TypeParser<'_>, callee: Node) -> (String, Node, boo
     if callee.kind() == SyntaxKind::PropertyAccessExpression {
         effect_module = callee.expression();
     }
-    (name.to_string(), effect_module, true)
+    (name.name.to_string(), effect_module, true)
 }
 
 // Go: rules/catch_die_to_or_die.go catchDieHasTypeArguments

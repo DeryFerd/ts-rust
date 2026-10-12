@@ -643,14 +643,26 @@ impl<'a> Parser<'a> {
             flags |= NodeFlags::THIS_NODE_HAS_ERROR;
             self.set_has_parse_error(false);
         }
-        // PORT: one store write for the Go `Loc` and `Flags` writes. A node
-        // of the parse store has no binder flags yet, so `Flags |= flags`
-        // equals Go `node.Flags = node.Flags | flags`.
-        if !finish_store_node(node, loc, flags) {
-            set_node_loc(node, loc);
-            set_node_flags(node, node.flags() | flags);
+        // PORT: one store access for the Go `Loc` and `Flags` writes and
+        // `overrideParentInImmediateChildren` (see there). A node of the
+        // parse store has no binder flags yet, so `Flags |= flags` equals Go
+        // `node.Flags = node.Flags | flags`.
+        match finish_store_node_and_parents(node, loc, flags) {
+            FinishedStoreNode::All => {
+                #[cfg(debug_assertions)]
+                debug_check_store_parents(node);
+            }
+            FinishedStoreNode::LocAndFlags => {
+                self.current_parent = node;
+                set_parent_in_children_generic(node, node);
+                self.current_parent = Node::NIL;
+            }
+            FinishedStoreNode::NotStore => {
+                set_node_loc(node, loc);
+                set_node_flags(node, node.flags() | flags);
+                self.override_parent_in_immediate_children(node);
+            }
         }
-        self.override_parent_in_immediate_children(node);
         node
     }
 
@@ -672,15 +684,7 @@ impl<'a> Parser<'a> {
         let parent = self.current_parent;
         if set_parent_in_store_children(parent) {
             #[cfg(debug_assertions)]
-            {
-                let fast = debug_store_child_link_state(parent);
-                set_parent_in_children_generic(node, parent);
-                debug_assert_eq!(
-                    fast,
-                    debug_store_child_link_state(parent),
-                    "R3-2: the store walk differs from the generic walk"
-                );
-            }
+            debug_check_store_parents(parent);
         } else {
             set_parent_in_children_generic(node, parent);
         }
@@ -831,7 +835,7 @@ impl<'a> Parser<'a> {
             || self.token == SyntaxKind::BigIntLiteral
     }
 
-    // Go: parser/parser.go:6096 isStartOfStatement
+    // Go: parser/parser.go:6127 isStartOfStatement
     pub fn is_start_of_statement(&mut self) -> bool {
         match self.token {
             // 'catch' and 'finally' do not actually indicate that the code is part of a statement,
@@ -871,7 +875,8 @@ impl<'a> Parser<'a> {
             | SyntaxKind::NamespaceKeyword
             | SyntaxKind::TypeKeyword
             | SyntaxKind::GlobalKeyword
-            | SyntaxKind::DeferKeyword => {
+            | SyntaxKind::DeferKeyword
+            | SyntaxKind::SourceKeyword => {
                 // When these don't start a declaration, they're an identifier in an expression statement
                 true
             }
@@ -895,7 +900,7 @@ impl<'a> Parser<'a> {
         self.look_ahead(Parser::scan_start_of_declaration)
     }
 
-    // Go: parser/parser.go:6129 scanStartOfDeclaration
+    // Go: parser/parser.go:6160 scanStartOfDeclaration
     pub fn scan_start_of_declaration(&mut self) -> bool {
         loop {
             match self.token {
@@ -930,7 +935,8 @@ impl<'a> Parser<'a> {
                 // could be legal, it would add complexity for very little gain.
                 SyntaxKind::InterfaceKeyword
                 | SyntaxKind::TypeKeyword
-                | SyntaxKind::DeferKeyword => {
+                | SyntaxKind::DeferKeyword
+                | SyntaxKind::SourceKeyword => {
                     return self.next_token_is_identifier_on_same_line();
                 }
                 SyntaxKind::ModuleKeyword | SyntaxKind::NamespaceKeyword => {
@@ -968,6 +974,7 @@ impl<'a> Parser<'a> {
                 SyntaxKind::ImportKeyword => {
                     self.next_token();
                     return self.token == SyntaxKind::DeferKeyword
+                        || self.token == SyntaxKind::SourceKeyword
                         || self.token == SyntaxKind::StringLiteral
                         || self.token == SyntaxKind::AsteriskToken
                         || self.token == SyntaxKind::OpenBraceToken
@@ -1378,6 +1385,20 @@ impl<'a> Parser<'a> {
             text_range.end(),
         )
     }
+}
+
+/// R3-2, debug builds: runs the generic walk after the store walk set the
+/// parents of the children of `parent`, and checks that it writes the same
+/// parents and links.
+#[cfg(debug_assertions)]
+fn debug_check_store_parents(parent: Node) {
+    let fast = debug_store_child_link_state(parent);
+    set_parent_in_children_generic(parent, parent);
+    debug_assert_eq!(
+        fast,
+        debug_store_child_link_state(parent),
+        "R3-2: the store walk differs from the generic walk"
+    );
 }
 
 /// The body of `override_parent_in_immediate_children` through the node

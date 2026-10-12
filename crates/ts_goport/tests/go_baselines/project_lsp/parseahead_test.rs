@@ -16,7 +16,7 @@ use super::resolveahead_test::{os_session, write};
 use super::util::{edit, open, open_kind};
 
 /// The `file:` URI of `name` in `root`. A Windows root (`C:/a/b`) has no
-/// leading slash, so the URI needs the third one (Go lsp.go:57
+/// leading slash, so the URI needs the third one (Go lsproto/lsp.go:144
 /// fixWindowsURIPath strips it).
 fn file_uri(root: &str, name: &str) -> String {
     let slash = if root.starts_with('/') { "" } else { "/" };
@@ -214,7 +214,7 @@ os_child_test! {
 
 os_child_test! {
     // Go reads the package.json `type` only for node16 to nodenext
-    // resolution or a `/node_modules/` path (fileloader.go:398 to :401).
+    // resolution or a `/node_modules/` path (fileloader.go:397 to :400).
     // With bundler resolution a `"type": "module"` scope sets no `force`,
     // so the build project's keys (`moduleDetection` force) do not fit the
     // spec project's load, and its workers parse ahead. A guess that let
@@ -304,8 +304,8 @@ os_child_test! {
 
 os_child_test! {
     // The app project uses the sources of its lib reference, which it parses
-    // with lib's options (Go compiler/fileloader.go:418,
-    // projectreferencefilemapper.go:80 getCompilerOptionsForFile), not its
+    // with lib's options (Go compiler/fileloader.go:416,
+    // projectreferencefilemapper.go:90 getCompilerOptionsForFile), not its
     // own jsx. The lib project loads first, so the app load takes every
     // file from the cache.
     fn a_project_with_references_takes_their_sources_from_the_cache() {
