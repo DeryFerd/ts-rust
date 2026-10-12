@@ -3624,10 +3624,10 @@ fn start_checkers(count: usize) -> CheckerPool {
                     if let Some(arena) = arena {
                         set_jemalloc_thread_arena(arena);
                     }
+                    // A manual arena of fast mode goes back to the process's
+                    // list when this thread ends (`ManualArena`).
                     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
-                    if let Some(claims) = claims {
-                        claims.claim();
-                    }
+                    let _manual_arena = claims.and_then(|claims| claims.claim());
                     seed.install();
                     let checker = new_pool_checker(index, count);
                     WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
