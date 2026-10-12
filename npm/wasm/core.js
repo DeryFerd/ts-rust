@@ -222,7 +222,8 @@ function prepareRun(module, options) {
             if (diagnosticsJson) flags |= FLAG_DIAGNOSTICS_JSON;
             if (caseInsensitive) flags |= FLAG_CASE_INSENSITIVE;
             const request = encoder.encode([cwd, String(flags), ...args].join("\0"));
-            u8().set(request, exports.ts_input(request.length));
+            const input = exports.ts_input(request.length);
+            u8().set(request, input);
             return exports.ts_run;
         },
         /** The result of a `ts_run` call that returned `exitCode` or threw `error`. */
