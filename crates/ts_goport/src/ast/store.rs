@@ -252,11 +252,11 @@ struct FileStore {
     build_facts: BuildFacts,
     /// The identifier name cache of the parsing thread (`identifier_name`)
     /// while the parse runs: the store takes it from the thread
-    /// (`IDENTIFIER_NAMES`) when it is made or on its first name, and
-    /// `end_parse` gives it back.
+    /// (`IDENTIFIER_NAMES`) on its first name, and `end_parse` or the drop
+    /// of the store gives it back (`StoreIdents`).
     // PERF: identparse1. A name slot reads the cache with no thread-local
     // access and no `RefCell` borrow.
-    idents: Option<Box<IdentNames>>,
+    idents: StoreIdents,
 }
 
 /// storefast1: the parts of `StoreFacts` and `BindCounts` that the slots of
@@ -2417,7 +2417,7 @@ impl FileStore {
         if !is_name_kind(kind) {
             return (Name::default(), false);
         }
-        let idents = self.idents.get_or_insert_with(take_thread_idents);
+        let idents = self.idents.0.get_or_insert_with(take_thread_idents);
         identifier_name(idents, text.unwrap_or_else(|| identifier_text(data)))
     }
 
@@ -2776,9 +2776,9 @@ fn take_thread_idents() -> Box<IdentNames> {
         .unwrap_or_default()
 }
 
-/// Gives the identifier name cache `idents` of a store whose parse ended
-/// back to this thread. When the thread has one already (two stores of the
-/// thread parsed at once), the larger stays.
+/// Gives the identifier name cache `idents` of a store whose parse ended,
+/// or that dropped, back to this thread. When the thread has one already
+/// (two stores of the thread parsed at once), the larger stays.
 fn give_back_thread_idents(idents: Box<IdentNames>) {
     let _ = IDENTIFIER_NAMES.try_with(|spare| {
         let keep = match spare.take() {
@@ -2787,6 +2787,21 @@ fn give_back_thread_idents(idents: Box<IdentNames>) {
         };
         spare.set(Some(keep));
     });
+}
+
+/// The identifier name cache that a store took from its thread
+/// (`FileStore::idents`). It goes back to the thread of the drop when it
+/// drops: at `end_parse`, or with a store whose parse never ended (a parse
+/// that panicked, whose detached store a parse worker drops).
+#[derive(Default)]
+struct StoreIdents(Option<Box<IdentNames>>);
+
+impl Drop for StoreIdents {
+    fn drop(&mut self) {
+        if let Some(idents) = self.0.take() {
+            give_back_thread_idents(idents);
+        }
+    }
 }
 
 /// `FileStore::unlink_children` on the link column `links`.
@@ -4539,9 +4554,8 @@ impl FileStore {
     /// Marks the store finished and marks its source file roots.
     fn end_parse(&mut self) {
         self.frozen = true;
-        if let Some(idents) = self.idents.take() {
-            give_back_thread_idents(idents);
-        }
+        // Gives the identifier name cache back (`StoreIdents::drop`).
+        drop(std::mem::take(&mut self.idents));
         self.records.shrink_to_fit();
         self.kinds.shrink_to_fit();
         self.kids.shrink_to_fit();
@@ -7127,7 +7141,7 @@ pub(crate) fn reset_file_store(file: usize) {
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot reset a finished store");
         let owns_nodes = s.owned.is_some();
-        let idents = s.idents.take();
+        let idents = std::mem::take(&mut s.idents);
         *s = FileStore::new(s.file_name, s.text.clone());
         s.idents = idents;
         if owns_nodes {
@@ -9465,5 +9479,34 @@ mod tests {
         let (_b1, other, _) = version("/later/b.ts", 4);
         assert!(!other.is_empty(), "the first shell of another file");
         assert_eq!(later_bytes(), LATER_KINDS_BUDGET);
+    }
+
+    /// followups55 item 3: a store whose parse never ends (a parse worker
+    /// drops the detached store of a parse that panicked) gives the
+    /// identifier name cache of its thread back when it drops.
+    #[test]
+    fn unfinished_store_gives_the_identifier_cache_back_on_drop() {
+        // Its own thread, so it has its own cache and no detached store.
+        std::thread::spawn(|| {
+            let thread_has_cache = || {
+                IDENTIFIER_NAMES.with(|spare| {
+                    let idents = spare.take();
+                    let has = idents
+                        .as_ref()
+                        .is_some_and(|idents| !idents.sets.is_empty());
+                    spare.set(idents);
+                    has
+                })
+            };
+            let file = new_detached_file_store(0, "/idents-drop.ts", "a");
+            NodeFactory::for_file(file).new_identifier("a");
+            assert!(!thread_has_cache(), "the store holds the cache");
+            let store = take_detached_file_store().expect("the detached store");
+            assert!(!store.store.frozen);
+            drop(store);
+            assert!(thread_has_cache(), "the drop gives the cache back");
+        })
+        .join()
+        .expect("the test thread");
     }
 }
