@@ -745,13 +745,20 @@ impl Checker {
                 && node.expression().kind() == SyntaxKind::SuperKeyword)
             && kind != SyntaxKind::JsxOpeningFragment
         {
-            s.type_arguments = node.type_arguments().iter().collect();
-            // We already perform checking on the type arguments on the class declaration itself.
-            if is_tagged_template
-                || is_jsx_opening_or_self_closing_element
-                || node.expression().kind() != SyntaxKind::SuperKeyword
-            {
-                self.check_source_elements(node.type_arguments());
+            // PERF: deferbody1. Go assigns the list and passes it on, with no
+            // copy. Here the copy and the check of an empty list are skipped:
+            // `check_source_elements` of no nodes does nothing, so the test of
+            // the callee's kind before it has no effect either.
+            let type_arguments = node.type_arguments();
+            if !type_arguments.is_empty() {
+                s.type_arguments = type_arguments.iter().collect();
+                // We already perform checking on the type arguments on the class declaration itself.
+                if is_tagged_template
+                    || is_jsx_opening_or_self_closing_element
+                    || node.expression().kind() != SyntaxKind::SuperKeyword
+                {
+                    self.check_source_elements(type_arguments);
+                }
             }
         }
         s.candidates = self.reorder_candidates(signatures, call_chain_flags);
