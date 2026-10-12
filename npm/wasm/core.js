@@ -110,6 +110,14 @@ function prepareRun(module, options) {
         caseInsensitive = false,
         tty = false,
     } = options;
+    // The request and the environment are NUL-separated, so a NUL in one
+    // value would turn it into more values (`["a.ts\0--outDir", "/x"]`).
+    // child_process refuses such values too.
+    for (const value of [cwd, ...args, ...Object.entries(env).flat()]) {
+        if (typeof value === "string" && value.includes("\0")) {
+            throw new TypeError(`ts-rust: cwd, args and env must not contain NUL bytes: ${JSON.stringify(value)}`);
+        }
+    }
     let memory;
     let staged;
     let stderrText = "";

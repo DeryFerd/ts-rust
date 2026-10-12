@@ -689,15 +689,32 @@ pub fn get_new_target_container(node: Node) -> Node {
 }
 
 // Go: ast/utilities.go:2220 GetEnclosingBlockScopeContainer
+// PERF: checkid1. Each node and its parent are read through views
+// (`find_ancestor_ref`); the parent is read only for a `Block`, the one
+// kind whose test reads it. Same tests as `is_block_scope`.
 pub fn get_enclosing_block_scope_container(node: Node) -> Node {
-    find_ancestor(node.parent(), &mut |current: Node| {
-        is_block_scope(current, current.parent())
+    find_ancestor_ref(node.parent(), |current: NodeRef| {
+        is_block_scope_kind(current.kind(), || current.parent().kind_or_unknown())
     })
 }
 
 // Go: ast/utilities.go:2226 IsBlockScope
 pub fn is_block_scope(node: Node, parent_node: Node) -> bool {
-    match node.kind() {
+    is_block_scope_kind(node.kind(), || {
+        if parent_node.is_nil() {
+            SyntaxKind::Unknown
+        } else {
+            parent_node.kind()
+        }
+    })
+}
+
+/// `is_block_scope` of a node of kind `kind`. `parent_kind` gives the kind
+/// of its parent (`SyntaxKind::Unknown` for nil); it is called only for a
+/// `Block`.
+#[inline]
+fn is_block_scope_kind(kind: SyntaxKind, parent_kind: impl FnOnce() -> SyntaxKind) -> bool {
+    match kind {
         SyntaxKind::SourceFile
         | SyntaxKind::CaseBlock
         | SyntaxKind::CatchClause
@@ -719,7 +736,11 @@ pub fn is_block_scope(node: Node, parent_node: Node) -> bool {
         SyntaxKind::Block => {
             // function block is not considered block-scope container
             // see comment in binder.ts: bind(...), case for SyntaxKind.Block
-            return !is_function_like_or_class_static_block_declaration(parent_node);
+            // `is_function_like_or_class_static_block_declaration(parent)`
+            // on the parent's kind: a nil parent (`Unknown`) is neither.
+            let parent_kind = parent_kind();
+            return !(is_function_like_kind(parent_kind)
+                || parent_kind == SyntaxKind::ClassStaticBlockDeclaration);
         }
         _ => {}
     }
