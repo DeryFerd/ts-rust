@@ -5330,9 +5330,11 @@ impl NodeRef {
             "parser_flags mask {:#x} has binder bits",
             mask.bits()
         );
-        // PERF: checkid1. A node that is not a published store node reads
-        // through `Node::parser_flags`, which needs no binder data (a node
-        // of a file this thread parses or binds). Same value.
+        // checkid1, neutral: a node that is not a published store node
+        // reads through `Node::parser_flags`. That is the same read as the
+        // old path (`Node::flags`: the frozen record, then `flags_slow`),
+        // and neither needs binder data, so the value and the cost do not
+        // change. It keeps this fallback in the shape of `modifier_flags`.
         match self.block {
             Some(_) => self.flags() & mask,
             None => node_ref_parser_flags(self.node, mask),
