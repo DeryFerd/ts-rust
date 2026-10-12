@@ -645,10 +645,10 @@ impl SlotChildren {
 // block (`BlockPool`) can take the records of another file through a shared
 // borrow, with no `unsafe`. The kind of a slot never changes after the slot
 // is made (`replace_store_node_data` keeps it), so it is in a plain column
-// of its own (`FileStore::kinds`). edleak1: a node shell copies it into an
+// of its own (`FileStore::kinds`). edleak1: a node shell whose plain
+// column would pass a budget (`plain_kinds`) copies its kinds into an
 // atomic column of its pooled block (`BlockFile::shell_kinds`), so a later
-// version reuses it. A static publish keeps the plain column, so its kind
-// reads cost what they did.
+// version reuses it.
 // PERF: step 4 first had an `AtomicU16` kind in the record, read through a
 // 512-entry table (safe Rust has no cheaper `u16` to `SyntaxKind`):
 // `goport -p` +1.3% to +2.1% instructions against step 7, and a plain
@@ -1516,8 +1516,9 @@ fn is_storeless_id(file: usize) -> bool {
 // and 4 MiB more `.data`, and cost 0.1% fewer `goport -p` instructions.
 struct FileBlock {
     /// AST node records, step 4: `FileStore::kinds`. A `Node::kind` read
-    /// reads only this (`FileBlock::kind`). Empty in a node shell, whose
-    /// kinds are in its pooled block (`BlockFile::shell_kinds`).
+    /// reads only this (`FileBlock::kind`). Empty in a node shell whose
+    /// kinds are in its pooled block (`plain_kinds`,
+    /// `BlockFile::shell_kinds`).
     kinds: &'static [SyntaxKind],
     /// `FileStore::records`. The header reads (`Node::kind`, `parent`,
     /// `loc`, `flags`) and the binder fields in the records read only
@@ -1551,14 +1552,10 @@ struct BlockFile {
     /// R2-5: `FileStore::links`. Empty in a node shell: the store of the
     /// version keeps it (`version_child_links`).
     links: &'static [SlotLinks],
-    /// edleak1: the kinds of a node shell, in its pooled block
-    /// (`PoolBlock::kinds`), so a later version reuses them with the
-    /// block. Empty in a static publish, whose plain column
-    /// `FileBlock::kinds` has them.
-    // PORT: Go frees the kinds with the file. A shell leaked a plain column
-    // of its kinds before (shared only by equal columns): on the editor
-    // long plan about 0.4 columns per edit, 5.8 MiB at edit 2,000 on
-    // query-core (edleak1).
+    /// edleak1: the kinds of a node shell that has no plain column
+    /// (`plain_kinds`), in its pooled block (`PoolBlock::kinds`), so a
+    /// later version reuses them with the block. Empty in a static
+    /// publish, whose plain column `FileBlock::kinds` has them.
     shell_kinds: &'static [AtomicU16],
     /// The store of a static publish. `None` in a node shell: the freeable
     /// file version owns the store (`with_published_store`).
@@ -1589,11 +1586,11 @@ impl FileBlock {
         (!nodes.is_empty()).then_some(nodes)
     }
 
-    /// Go `node.Kind` of slot `index`: from the plain column of a static
-    /// publish, or from the pooled block of a node shell
-    /// (`BlockFile::shell_kinds`).
-    // PERF: edleak1. A static read is the compare, branch and load of
-    // `kinds[index]`: the branch to the shell read takes the place of the
+    /// Go `node.Kind` of slot `index`: from the plain column, or from the
+    /// pooled block of a node shell that has none (`plain_kinds`,
+    /// `BlockFile::shell_kinds`).
+    // PERF: edleak1. A plain read is the compare, branch and load of
+    // `kinds[index]`: the branch to the pooled read takes the place of the
     // bounds-check panic.
     #[inline]
     fn kind(&self, index: usize) -> SyntaxKind {
@@ -1901,6 +1898,15 @@ struct BlockPool {
     /// The given-back blocks with the pin epoch from which they are free,
     /// in the order they came back (the epochs only grow).
     quarantine: VecDeque<(usize, PoolBlock)>,
+    /// Each plain kind column of a node shell (`plain_kinds`), by the hash
+    /// of its kinds.
+    kind_columns: FxHashMap<u64, Vec<&'static [SyntaxKind]>>,
+    /// The hashes of the file names whose node shells have a plain kind
+    /// column.
+    kind_names: FxHashSet<u64>,
+    /// The bytes of the plain kind columns of later versions of files
+    /// (`LATER_KINDS_BUDGET`).
+    later_kind_bytes: usize,
 }
 
 /// The number of pin releases a given-back block waits (`BlockPool`). A
@@ -1913,7 +1919,68 @@ const QUARANTINE_RELEASES: usize = 2;
 static POOL: Mutex<BlockPool> = Mutex::new(BlockPool {
     free: Vec::new(),
     quarantine: VecDeque::new(),
+    kind_columns: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
+    kind_names: FxHashSet::with_hasher(rustc_hash::FxBuildHasher),
+    later_kind_bytes: 0,
 });
+
+/// The bytes of the plain kind columns that `plain_kinds` leaks for later
+/// versions of files. Past it, the new kinds of a later version go in its
+/// pooled block.
+// PERF: edleak1 round 2. A plain column read is the compare, branch and
+// load of a static file. A pooled column read is one cold call
+// (`FileBlock::kind`), and an edit reads the nodes of the edited file
+// about 400,000 times: with the kinds of every node shell pooled, a
+// 400-edit query-core editor session cost +4.2% instructions:u, and with
+// those of later versions pooled (no budget, `SyntaxKind::try_from` inline
+// in the cold read) +2.75%. The pooled read
+// inline at each kind read cost +1.95% there, and +0.15% to +0.39% on the
+// 4 `--singleThreaded` gate projects. 4 MiB is about 2% of the server's
+// RSS on query-core; before edleak1 its shells leaked that in about 1,400
+// stock edits.
+const LATER_KINDS_BUDGET: usize = 4 << 20;
+
+/// The plain kind column (`FileBlock::kinds`) of a node shell of file
+/// `name` whose store has kinds `kinds`, or `None` when its kinds go in its
+/// pooled block (`BlockFile::shell_kinds`):
+/// - an equal column that an earlier shell leaked (a column never changes,
+///   so shells can share it). An edit inside a token or a literal keeps
+///   every kind of the file, and a file parsed again with the same text (a
+///   `tsc --watch` build after a config change) has the same kinds;
+/// - else `kinds`, leaked (it takes the vector), for the first shell of
+///   `name`, and for a later one while the columns of later versions stay
+///   in `LATER_KINDS_BUDGET`.
+// PORT: Go frees the kinds with the file. A plain column is not atomic, so
+// a later file cannot reuse it: before edleak1 each new column leaked, about
+// 0.4 columns per edit in a long editor session. The first columns grow
+// only with the files the process reads.
+// PERF: watchfree1. A column is hashed and compared once, about the cost
+// of the compare with the last column before.
+fn plain_kinds(name: &str, kinds: &mut Vec<SyntaxKind>) -> Option<&'static [SyntaxKind]> {
+    use std::hash::BuildHasher;
+    let hash = rustc_hash::FxBuildHasher.hash_one(kinds.as_slice());
+    let name_hash = rustc_hash::FxBuildHasher.hash_one(name);
+    let mut pool = lock_pool();
+    let pool = &mut *pool;
+    if let Some(column) = pool
+        .kind_columns
+        .get(&hash)
+        .and_then(|columns| columns.iter().find(|column| ***column == **kinds))
+    {
+        return Some(column);
+    }
+    if !pool.kind_names.insert(name_hash) {
+        // A later version of the file, with new kinds.
+        let bytes = pool.later_kind_bytes + std::mem::size_of_val(kinds.as_slice());
+        if bytes > LATER_KINDS_BUDGET {
+            return None;
+        }
+        pool.later_kind_bytes = bytes;
+    }
+    let column: &'static [SyntaxKind] = Vec::leak(std::mem::take(kinds));
+    pool.kind_columns.entry(hash).or_default().push(column);
+    Some(column)
+}
 
 fn lock_pool() -> std::sync::MutexGuard<'static, BlockPool> {
     POOL.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1929,7 +1996,9 @@ fn pool_class(cap: usize) -> usize {
 fn take_pool_block(len: usize) -> PoolBlock {
     let most = 2 * len + 64;
     let mut pool = lock_pool();
-    let BlockPool { free, quarantine } = &mut *pool;
+    let BlockPool {
+        free, quarantine, ..
+    } = &mut *pool;
     let epoch = super::file_version::pin_epoch();
     let ready = quarantine
         .iter()
@@ -1984,6 +2053,9 @@ fn clear_block_pool() {
     let mut pool = lock_pool();
     pool.free.clear();
     pool.quarantine.clear();
+    pool.kind_columns.clear();
+    pool.kind_names.clear();
+    pool.later_kind_bytes = 0;
 }
 
 /// Test hook (AST node records, step 4): the address of the records of the
@@ -4525,10 +4597,11 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
 }
 
 /// The node shell of freeable file version `file`, whose store is `store`:
-/// the block of its id, with the node columns of the store: its records,
-/// kids and kinds, copied into a pooled block (`BlockPool`, AST node
-/// records, step 4; the kinds since edleak1), which the caller gives to the
-/// version, and its foreign parents, moved out of `store` and leaked. Its
+/// the block of its id, with the node columns of the store: its records and
+/// kids, copied into a pooled block (`BlockPool`, AST node records, step
+/// 4), which the caller gives to the version, its kinds (a plain column,
+/// or the pooled block past a budget: `plain_kinds`, edleak1), and its
+/// foreign parents, moved out of `store` and leaked. Its
 /// `BlockFile` has no store, no `GoFile` and no child link column: the
 /// `BlockFile` of the pooled block (`PoolBlock::file`, edleak1 part 2), or
 /// a leaked one when the shell has foreign parents or a node column. A store
@@ -4548,8 +4621,9 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
 // (lsshells/m3/repair/prof): an edit reads the nodes of the edited file
 // about 400,000 times. The node columns that the header and child reads
 // need (42 bytes per node: 24 + 16 + 2 with the node records and the kind
-// column) are read inline, as a static file, from a pooled block (step 4;
-// the kinds since edleak1, through one cold call: `FileBlock::kind`).
+// column) are read inline, as a static file, from a pooled block (step 4)
+// and a plain kind column (a pooled one past a budget takes one cold call,
+// edleak1: `plain_kinds`).
 // Without the children and modifier columns, the child reads of the edited
 // file read the node data, and edits were about 0.3 ms slower
 // (lsshells/m3/repair/r4). The store maps and lists, the node column, the
@@ -4603,9 +4677,13 @@ fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
     for (to, from) in kids.iter().zip(&store.kids) {
         to.store_from(from);
     }
+    debug_assert_eq!(store.kinds.len(), len);
     let shell_kinds: &'static [AtomicU16] = &block.kinds[..len];
-    for (to, &from) in shell_kinds.iter().zip(&store.kinds) {
-        to.store(from as u16, Ordering::Relaxed);
+    let plain = plain_kinds(store.file_name, &mut store.kinds);
+    if plain.is_none() {
+        for (to, &from) in shell_kinds.iter().zip(&store.kinds) {
+            to.store(from as u16, Ordering::Relaxed);
+        }
     }
     store.records = Vec::new();
     store.kids = Vec::new();
@@ -4633,7 +4711,7 @@ fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
         })),
     };
     let shell = FileBlock {
-        kinds: &[],
+        kinds: plain.unwrap_or(&[]),
         records,
         kids,
         file,
@@ -6053,7 +6131,7 @@ pub fn frozen_find_ancestor(
     let b = file_block(file)?;
     let index = slot_index(n);
     if b.kinds.is_empty() {
-        // A node shell (`BlockFile::shell_kinds`).
+        // A node shell with pooled kinds (`BlockFile::shell_kinds`).
         return Some(store_find_ancestor(
             file,
             b.records,
@@ -8796,9 +8874,10 @@ mod tests {
     // store does: a binder field read (the symbol, the flags, the flow node
     // and the extras) in every build (`check_block_owner`), every other
     // read with debug assertions. Without them a header read gives the new
-    // owner's data, its kind too (the kinds are in the block since
-    // edleak1). It publishes, so no other test may build or publish
-    // stores while it runs (the runner uses one thread).
+    // owner's data (these shells have plain kind columns, which are not
+    // pooled; shells with equal kinds share one: `plain_kinds`). It
+    // publishes, so no other test may build or publish stores while it
+    // runs (the runner uses one thread).
     #[test]
     fn pooled_node_blocks_wait_two_releases_and_check_their_owner() {
         use super::super::file_version::{FileVersion, release_file_version_pins};
@@ -8836,14 +8915,14 @@ mod tests {
         // Its block waits for two pin releases.
         let (d, d_nodes) = identifiers("/pool/d.ts", &["z", "w"]);
         assert_ne!(addr(d_nodes[0]), c_block, "no release yet");
-        // The kinds of a shell are in its block (`BlockFile::shell_kinds`),
-        // not in a plain column.
+        // Shells with equal kinds share one kind column (`plain_kinds`).
         let kinds_of = |n: Node| {
-            let b = registry_block(n.file_index()).expect("a published store node");
-            assert!(b.kinds.is_empty(), "a node shell has no plain kind column");
-            b.file.shell_kinds.as_ptr()
+            registry_block(n.file_index())
+                .expect("a published store node")
+                .kinds
+                .as_ptr()
         };
-        assert_ne!(kinds_of(d_nodes[0]), kinds_of(cy), "d has its own block");
+        assert_eq!(kinds_of(d_nodes[0]), kinds_of(cy), "one kind column");
         release_file_version_pins();
         let (d1, d1_nodes) = identifiers("/pool/d1.ts", &["u", "t"]);
         assert_ne!(addr(d1_nodes[0]), c_block, "one release");
@@ -8872,7 +8951,7 @@ mod tests {
         );
         assert_eq!(frozen_store_bind_word(statement), Some(0), "not bound");
 
-        assert_eq!(kinds_of(statement), kinds_of(cy), "e has c's kind column");
+        assert_ne!(kinds_of(statement), kinds_of(cy), "other kinds");
 
         // A stale read of c.
         let released = format!("file version {c_file} is released");
@@ -8917,10 +8996,10 @@ mod tests {
         if cfg!(debug_assertions) {
             assert_eq!(kind.as_deref(), Some(released.as_str()));
         } else {
-            // The kind column is pooled, so the kind is e's. A header
+            // The kind column is not pooled, so the kind is c's. A header
             // read gives the record of e: x has the parent of q, in c.
             assert_eq!(kind, None);
-            assert_eq!(cy.kind(), SyntaxKind::ExpressionStatement);
+            assert_eq!(cy.kind(), SyntaxKind::Identifier);
             assert_eq!(slot_index(c_nodes[0]), slot_index(q));
             assert_eq!(c_nodes[0].parent(), cy);
         }
@@ -8942,16 +9021,14 @@ mod tests {
         drop((e, f, g));
     }
 
-    // watchfree1: a node shell leaks no kind column for kinds that an
-    // earlier shell had: a `tsc --watch` build after a config change parses
-    // every file again. edleak1: no shell leaks one. Its kinds are in its
-    // pooled block (`BlockFile::shell_kinds`), and a later shell of the
-    // same size takes the block of a dead one, with its column. It
-    // publishes, so no other test may build or publish stores while it
+    // watchfree1: a node shell shares the kind column of any earlier shell
+    // with equal kinds, not only of the last few (`plain_kinds`): a
+    // `tsc --watch` build after a config change parses every file again.
+    // It publishes, so no other test may build or publish stores while it
     // runs (the runner uses one thread).
     #[test]
     fn node_shells_share_any_equal_kind_column() {
-        use super::super::file_version::{FileVersion, release_file_version_pins};
+        use super::super::file_version::FileVersion;
         clear_block_pool();
         // Publishes a freeable version of `count` identifiers, and gives
         // the address of its kind column.
@@ -8971,21 +9048,77 @@ mod tests {
             freeze_file_store(file);
             let version = FileVersion::new(file);
             crate::program::publish_parsed_files("/");
-            let b = registry_block(node.file_index()).expect("a published store node");
-            assert!(b.kinds.is_empty(), "a node shell has no plain kind column");
-            assert_eq!(node.kind(), SyntaxKind::Identifier);
-            (version, b.file.shell_kinds.as_ptr())
+            let kinds = registry_block(node.file_index())
+                .expect("a published store node")
+                .kinds
+                .as_ptr();
+            (version, kinds)
         };
-        let (first, first_column) = column(1);
+        let (_first, first) = column(1);
         let others: Vec<_> = (2..9).map(column).collect();
         assert!(
-            others.iter().all(|(_, kinds)| *kinds != first_column),
-            "live shells, other columns"
+            others.iter().all(|(_, kinds)| *kinds != first),
+            "other kinds, other columns"
         );
-        drop(first);
-        release_file_version_pins();
-        release_file_version_pins();
         let (_again, again) = column(1);
-        assert_eq!(again, first_column, "equal kinds take the dead column");
+        assert_eq!(again, first, "equal kinds share the first column");
+    }
+
+    // edleak1 round 2: the first node shell of a file gets a plain kind
+    // column. A later version with new kinds gets one while the columns of
+    // later versions stay in `LATER_KINDS_BUDGET`; past it, its kinds go
+    // in its pooled block (`BlockFile::shell_kinds`). Equal kinds share a
+    // plain column at any time. It publishes, so no other test may build or
+    // publish stores while it runs (the runner uses one thread).
+    #[test]
+    fn later_new_kinds_go_in_the_pooled_block_past_the_budget() {
+        use super::super::file_version::FileVersion;
+        clear_block_pool();
+        // Publishes a freeable version of file `name` with `count`
+        // identifiers, and gives its plain kind column (empty when its
+        // kinds are pooled) and its last node.
+        let version = |name: &'static str, count: usize| {
+            let names: Vec<String> = (0..count).map(|i| format!("n{i}")).collect();
+            let text: &'static str = Box::leak(names.join(";").into_boxed_str());
+            let file = new_file_store(name, text);
+            let factory = NodeFactory::for_file(file);
+            let node = names
+                .iter()
+                .map(|n| factory.new_identifier(n.as_str()))
+                .last()
+                .expect("one name");
+            freeze_file_store(file);
+            let version = FileVersion::new(file);
+            crate::program::publish_parsed_files("/");
+            let b = registry_block(node.file_index()).expect("a published store node");
+            assert_eq!(node.kind(), SyntaxKind::Identifier);
+            (version, b.kinds, node)
+        };
+        let later_bytes = || lock_pool().later_kind_bytes;
+
+        let (_v1, first, _) = version("/later/a.ts", 1);
+        assert!(!first.is_empty(), "the first shell of a file");
+        assert_eq!(later_bytes(), 0, "a first column is not in the budget");
+        let (_v2, second, _) = version("/later/a.ts", 2);
+        assert!(!second.is_empty(), "new kinds in the budget");
+        assert_eq!(later_bytes(), std::mem::size_of_val(second));
+
+        lock_pool().later_kind_bytes = LATER_KINDS_BUDGET;
+        let (_v3, third, node) = version("/later/a.ts", 3);
+        assert!(third.is_empty(), "new kinds past the budget are pooled");
+        let pooled = registry_block(node.file_index()).expect("a published store node");
+        assert_eq!(pooled.kind(slot_index(node)), SyntaxKind::Identifier);
+        assert_eq!(pooled.kind(NIL_SLOT as usize), first[NIL_SLOT as usize]);
+        assert_eq!(later_bytes(), LATER_KINDS_BUDGET);
+
+        let (_v4, again, _) = version("/later/a.ts", 2);
+        assert_eq!(
+            again.as_ptr(),
+            second.as_ptr(),
+            "equal kinds share a column"
+        );
+        let (_b1, other, _) = version("/later/b.ts", 4);
+        assert!(!other.is_empty(), "the first shell of another file");
+        assert_eq!(later_bytes(), LATER_KINDS_BUDGET);
     }
 }
