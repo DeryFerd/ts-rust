@@ -871,3 +871,21 @@ pub(crate) fn os_write_file() -> WriteFile {
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_build_flag;
+
+    /// Go `strings.ToLower` of the first argument (execute/tsc.go:55).
+    #[test]
+    fn build_flag_spellings_are_go_s() {
+        for arg in [
+            "-b", "--b", "-build", "--build", "-B", "--B", "-Build", "--BUILD", "-buİld",
+        ] {
+            assert!(is_build_flag(arg), "{arg}");
+        }
+        for arg in ["", "b", "build", "---b", "-bu", "--fast", "-b ", "--builds"] {
+            assert!(!is_build_flag(arg), "{arg}");
+        }
+    }
+}

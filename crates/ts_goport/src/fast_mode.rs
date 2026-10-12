@@ -287,7 +287,74 @@ pub fn cost_split(
 
 #[cfg(test)]
 mod tests {
-    use super::cost_split;
+    use super::{blank_flags, cost_split};
+
+    fn owned(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    /// `blank_flags` on `args`: the arguments after it, and whether it took
+    /// a `--fast`.
+    fn blank(args: &[&str], build: bool) -> (Vec<String>, bool) {
+        let mut args = owned(args);
+        let taken = blank_flags(&mut args, build);
+        (args, taken)
+    }
+
+    /// `--fast` is taken where Go's parser reads an option name, and kept
+    /// where an option takes it as its value (followups49: each case gives
+    /// Go's output at fed0bf24149f with the taken `--fast` as "").
+    #[test]
+    fn take_flag_reads_the_command_line_as_go() {
+        let taken = |args: &[&str]| (owned(args), true);
+        let kept = |args: &[&str]| (owned(args), false);
+        // An option name, also twice; other spellings are not the flag.
+        assert_eq!(blank(&["--fast", "a.ts"], false), taken(&["", "a.ts"]));
+        assert_eq!(
+            blank(&["--fast", "--noEmit", "--fast"], false),
+            taken(&["", "--noEmit", ""])
+        );
+        assert_eq!(
+            blank(&["--FAST", "-fast", "--fast"], false),
+            taken(&["--FAST", "-fast", ""])
+        );
+        // The value of a string (also by short name), number or enum option.
+        for args in [
+            ["--outDir", "--fast"],
+            ["-p", "--fast"],
+            ["--checkers", "--fast"],
+            ["--target", "--fast"],
+        ] {
+            assert_eq!(blank(&args, false), kept(&args));
+        }
+        // A boolean, a list and a tsconfig-only option do not take it, so
+        // the next argument stays a file name.
+        assert_eq!(
+            blank(&["--strict", "--fast", "true"], false),
+            taken(&["--strict", "", "true"])
+        );
+        assert_eq!(
+            blank(&["--lib", "--fast", "es5"], false),
+            taken(&["--lib", "", "es5"])
+        );
+        assert_eq!(
+            blank(&["--plugins", "--fast", "foo"], false),
+            taken(&["--plugins", "", "foo"])
+        );
+        // After an option and its value.
+        assert_eq!(
+            blank(&["--outDir", "out", "--fast"], false),
+            taken(&["--outDir", "out", ""])
+        );
+        // The build command line has its own options: `--generateTrace`
+        // takes a value there, `--outDir` is unknown.
+        let args = ["-b", "--generateTrace", "--fast"];
+        assert_eq!(blank(&args, true), kept(&args));
+        assert_eq!(
+            blank(&["-b", "--outDir", "--fast"], true),
+            taken(&["-b", "--outDir", ""])
+        );
+    }
 
     /// The most costly file goes first; a file that shares an import with a
     /// placed file joins its checker while that costs less; files without
