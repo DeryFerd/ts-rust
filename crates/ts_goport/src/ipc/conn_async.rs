@@ -708,6 +708,15 @@ impl AsyncConn {
             if let Some((resp, read_at, late)) = resp {
                 // Go :290: `ctx.Done()` came at the signal, before `Run`
                 // read the late reply.
+                // PORT: this checks the call's `ctx` now, not at the read of
+                // the late reply. The two agree for the `ctx` of `run` and a
+                // `ctx` made from it: it is done at the signal, before that
+                // read. The real caller uses the `ctx` of `run`
+                // (`callbackfs.rs:300`, set at `server.rs:264`). For another
+                // `ctx` that is done after the read, Go's `select` takes the
+                // reply and the port returns `ctx.Err()`. To follow Go here,
+                // `gostd::context` must keep when a `ctx` was done, as
+                // `next_for_call` notes for `after_cancel`.
                 if late && let Some(err) = ctx.err() {
                     break (Err(err), Some(Woke::Canceled(reader.inbox.canceled_at())));
                 }
