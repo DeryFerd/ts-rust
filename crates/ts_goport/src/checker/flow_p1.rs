@@ -975,7 +975,10 @@ impl Checker {
     ) -> TypeId {
         let mut t = t;
         let reference = f.reference;
-        match expr.operator_token().kind() {
+        // PERF: flowcost1. The operator kind is read once (Go reads the
+        // `OperatorToken.Kind` field for the switch and again for `operator`).
+        let operator = expr.operator_token().kind();
+        match operator {
             SyntaxKind::EqualsToken
             | SyntaxKind::BarBarEqualsToken
             | SyntaxKind::AmpersandAmpersandEqualsToken
@@ -987,19 +990,22 @@ impl Checker {
             | SyntaxKind::ExclamationEqualsToken
             | SyntaxKind::EqualsEqualsEqualsToken
             | SyntaxKind::ExclamationEqualsEqualsToken => {
-                let operator = expr.operator_token().kind();
                 let left = self.get_reference_candidate(expr.left());
                 let right = self.get_reference_candidate(expr.right());
-                if left.kind() == SyntaxKind::TypeOfExpression && is_string_literal_like(right) {
+                // PERF: flowcost1. The kinds of `left` and `right` are read
+                // once, for the `typeof` tests and the reference matches.
+                let (left_kind, right_kind) = (left.kind(), right.kind());
+                if left_kind == SyntaxKind::TypeOfExpression && is_string_literal_like(right) {
                     return self.narrow_type_by_typeof(f, t, left, operator, right, assume_true);
                 }
-                if right.kind() == SyntaxKind::TypeOfExpression && is_string_literal_like(left) {
+                if right_kind == SyntaxKind::TypeOfExpression && is_string_literal_like(left) {
                     return self.narrow_type_by_typeof(f, t, right, operator, left, assume_true);
                 }
-                if self.is_matching_flow_reference(f, left) {
+                if self.is_matching_reference_kinds(reference, f.reference_kind, left, left_kind) {
                     return self.narrow_type_by_equality(t, operator, right, assume_true);
                 }
-                if self.is_matching_flow_reference(f, right) {
+                if self.is_matching_reference_kinds(reference, f.reference_kind, right, right_kind)
+                {
                     return self.narrow_type_by_equality(t, operator, left, assume_true);
                 }
                 if self.strict_null_checks {
