@@ -6,6 +6,7 @@ use crate::frontend::prelude::*;
 use crate::gostd::slices::stable_sort_by;
 use crate::program::ThreadBudget;
 use std::cell::Cell;
+use std::rc::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -47,6 +48,12 @@ pub struct ParseTask {
 
     pub loaded_task: Option<ParseTaskRef>,
     pub all_include_reasons: Vec<Rc<FileIncludeReason>>,
+    /// The task data of the task's path (`task_data_by_path`), set when
+    /// `FilesParser::start` queues the task.
+    // PERF (parload1 step 4): Go looks the data up by path at each visit of
+    // `collectFiles`; the link saves the string hash per visit. A `Weak`
+    // link makes no `Rc` cycle (task, data, task).
+    pub data: Weak<RefCell<ParseTaskData>>,
 }
 
 /// Go `*parseTask`.
@@ -302,10 +309,10 @@ pub struct ResolvedRef {
     pub package_id: PackageId,
 }
 
-/// The path of a task that `FilesParser::start` queues: the one it came
-/// with (Go `task.path`, ts#64159), else the loader's `to_path` of its file
-/// name, which it keeps. `GOPORT_RESOLVED_PATH=0` makes every path here.
-fn task_path(loader: &FileLoader, task: &mut ParseTask) -> Path {
+/// Sets the path of a task that `FilesParser::start` queues: the one it
+/// came with (Go `task.path`, ts#64159), else the loader's `to_path` of its
+/// file name. `GOPORT_RESOLVED_PATH=0` makes every path here.
+fn set_task_path(loader: &FileLoader, task: &mut ParseTask) {
     if task.path.is_empty() || !crate::program::resolved_paths_enabled() {
         // PERF: Go `loader.toPath` asks the host for its current directory
         // and case sensitivity each time; the loader keeps the same values
@@ -327,7 +334,6 @@ fn task_path(loader: &FileLoader, task: &mut ParseTask) -> Path {
             task.normalized_file_path
         );
     }
-    task.path.clone()
 }
 
 /// One queued run of the closure that Go `filesParser.start` passes to
@@ -634,8 +640,9 @@ impl FilesParser {
             // path. PORT: the tasks that Go gives a path when it makes them
             // and the port does not (root, lib, automatic type directive
             // and redirect tasks) get it here.
-            let path = task_path(loader, &mut task.borrow_mut());
-            let (data, loaded) = match self.task_data_by_path.get(&path) {
+            set_task_path(loader, &mut task.borrow_mut());
+            let existing = self.task_data_by_path.get(&task.borrow().path).cloned();
+            let (data, loaded) = match existing {
                 Some(data) => {
                     // No queued task of this path ran yet, so the loader
                     // loads the file later (a job to move up).
@@ -646,6 +653,7 @@ impl FilesParser {
                 }
                 None => {
                     let candidate = get_parse_task_data(task);
+                    let path = task.borrow().path.clone();
                     self.task_data_by_path
                         .insert(path.clone(), candidate.clone());
                     if prefetch.is_some() {
@@ -659,6 +667,7 @@ impl FilesParser {
                     (candidate, false)
                 }
             };
+            task.borrow_mut().data = Rc::downgrade(&data);
 
             self.queue.push(QueuedParseTask {
                 task: task.clone(),
@@ -785,8 +794,11 @@ impl FilesParser {
 
         let mut start_subtasks = false;
         if loaded {
-            let name = task.borrow().normalized_file_path.clone();
-            let existing_task = data.borrow().tasks.get(&name).cloned();
+            let existing_task = data
+                .borrow()
+                .tasks
+                .get(&task.borrow().normalized_file_path)
+                .cloned();
             if let Some(existing_task) = existing_task {
                 // Go: tasks[i].loadedTask = existingTask (tasks[i] is task)
                 // PORT: a restart of started subtasks (see below) queues the
@@ -797,6 +809,7 @@ impl FilesParser {
                     task.borrow_mut().loaded_task = Some(existing_task);
                 }
             } else {
+                let name = task.borrow().normalized_file_path.clone();
                 let mut d = data.borrow_mut();
                 d.tasks.insert(name, task.clone());
                 // This is new task for file name - so load subtasks if there was loading for any other casing
@@ -835,10 +848,11 @@ impl FilesParser {
             return;
         }
 
-        // PORT: Go does not change `data.tasks` in this loop, so a copy of the
-        // values iterates the same tasks.
-        let tasks_by_file_name: Vec<ParseTaskRef> = data.borrow().tasks.values().cloned().collect();
-        for task_by_file_name in tasks_by_file_name {
+        // PORT: Go does not change `data.tasks` in this loop, so an index
+        // walks the same tasks. PERF (parload1 step 4): no copy of the list.
+        let count = data.borrow().tasks.len();
+        for index in 0..count {
+            let task_by_file_name = data.borrow().tasks[index].clone();
             let mut load_sub_tasks = start_subtasks;
             if !task_by_file_name.borrow().loaded {
                 task_by_file_name.borrow_mut().load(loader);
@@ -853,9 +867,11 @@ impl FilesParser {
             // lowest depth over all paths, in every run order.
             if load_sub_tasks && (lowered || !task_by_file_name.borrow().started_sub_tasks) {
                 task_by_file_name.borrow_mut().started_sub_tasks = true;
-                let sub_tasks = task_by_file_name.borrow().sub_tasks.clone();
                 let lowest_depth = data.borrow().lowest_depth;
-                self.start(loader, &sub_tasks, lowest_depth);
+                // PERF (parload1 step 4): no copy of the list. `start`
+                // borrows only the subtasks, which are tasks of their own.
+                let parent = task_by_file_name.borrow();
+                self.start(loader, &parent.sub_tasks, lowest_depth);
             }
         }
     }
@@ -1000,24 +1016,45 @@ impl FilesParser {
                             include_reason.clone(),
                         );
                     }
-                    let data = self
-                        .parser
-                        .task_data_by_path
-                        .get(&task.borrow().path)
-                        .cloned();
                     if !task.borrow().loaded {
                         continue;
                     }
-                    let data = data.expect("loaded parse task without task data");
+                    // PERF (parload1 step 4): the task's link to its data
+                    // (`ParseTask::data`), else the lookup by path.
+                    let data = {
+                        let t = task.borrow();
+                        let data = t.data.upgrade().unwrap_or_else(|| {
+                            self.parser
+                                .task_data_by_path
+                                .get(&t.path)
+                                .cloned()
+                                .expect("loaded parse task without task data")
+                        });
+                        debug_assert!(
+                            self.parser
+                                .task_data_by_path
+                                .get(&t.path)
+                                .is_some_and(|by_path| Rc::ptr_eq(by_path, &data))
+                        );
+                        data
+                    };
                     let data_key = Rc::as_ptr(&data);
 
-                    let normalized_file_path = task.borrow().normalized_file_path.clone();
-                    let task_path = task.borrow().path.clone();
-
                     // ensure we only walk each task once
-                    if let Some(checked_name) = self.seen.get(&data_key).cloned() {
-                        if let Some(file) = task.borrow().file.clone() {
-                            if checked_name != normalized_file_path
+                    // PERF (parload1 step 4): a visit of a walked task with
+                    // the same name (most visits) copies no name.
+                    if let Some(checked_name) = self.seen.get(&data_key) {
+                        if *checked_name != task.borrow().normalized_file_path {
+                            let checked_name = checked_name.clone();
+                            let (normalized_file_path, task_path, file) = {
+                                let t = task.borrow();
+                                (
+                                    t.normalized_file_path.clone(),
+                                    t.path.clone(),
+                                    t.file.clone(),
+                                )
+                            };
+                            if let Some(file) = file
                                 && self
                                     .recorded_duplicates
                                     .entry(data_key)
@@ -1037,42 +1074,43 @@ impl FilesParser {
                                         .is_content_mapper_failure_stub(),
                                 });
                             }
-                        }
-                        // PORT: equal names give equal absolute paths, so
-                        // the check below only runs for different names.
-                        if checked_name != normalized_file_path
-                            && !loader
+                            // PORT: equal names give equal absolute paths, so
+                            // the check below only runs for different names.
+                            if !loader
                                 .opts
                                 .config
                                 .compiler_options()
                                 .force_consistent_casing_in_file_names
                                 .is_false()
-                        {
-                            // Check if it differs only in drive letters its ok to ignore that error:
-                            let checked_absolute_path = get_normalized_absolute_path_without_root(
-                                &checked_name,
-                                &loader.compare_paths_options.current_directory,
-                            );
-                            let input_absolute_path = get_normalized_absolute_path_without_root(
-                                &normalized_file_path,
-                                &loader.compare_paths_options.current_directory,
-                            );
-                            if checked_absolute_path != input_absolute_path {
-                                self.include_processor
-                                    .add_processing_diagnostics_for_file_casing(
-                                        &task_path,
+                            {
+                                // Check if it differs only in drive letters its ok to ignore that error:
+                                let checked_absolute_path =
+                                    get_normalized_absolute_path_without_root(
                                         &checked_name,
-                                        &normalized_file_path,
-                                        include_reason
-                                            .clone()
-                                            .expect("nil pointer dereference: includeReason"),
+                                        &loader.compare_paths_options.current_directory,
                                     );
+                                let input_absolute_path = get_normalized_absolute_path_without_root(
+                                    &normalized_file_path,
+                                    &loader.compare_paths_options.current_directory,
+                                );
+                                if checked_absolute_path != input_absolute_path {
+                                    self.include_processor
+                                        .add_processing_diagnostics_for_file_casing(
+                                            &task_path,
+                                            &checked_name,
+                                            &normalized_file_path,
+                                            include_reason
+                                                .clone()
+                                                .expect("nil pointer dereference: includeReason"),
+                                        );
+                                }
                             }
                         }
                         continue;
-                    } else {
-                        self.seen.insert(data_key, normalized_file_path.clone());
                     }
+                    let normalized_file_path = task.borrow().normalized_file_path.clone();
+                    let task_path = task.borrow().path.clone();
+                    self.seen.insert(data_key, normalized_file_path.clone());
 
                     if let Some(tasks_seen_by_name_ignore_case) =
                         self.tasks_seen_by_name_ignore_case.as_mut()
