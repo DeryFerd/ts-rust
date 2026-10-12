@@ -1037,12 +1037,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "a77d43c98ced3f5b6",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "a9d29e6109fe72cfd",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R206 pipeline (candidate.sh side)."
