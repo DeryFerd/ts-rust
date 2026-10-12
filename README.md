@@ -2,7 +2,7 @@
 
 I wanted to see if LLMs could port the TypeScript compiler, checker and lsp to Rust. Turns out they can.
 
-It [cost over $420,000](#how-did-this-go) in tokens to do it, but you could probably have done it for ~$20k (see below)
+It [cost over $420,000](#how-did-this-go) in tokens to do it, but you could probably have done it for ~$20k (see below).
 
 ## Motivations
 
