@@ -880,6 +880,19 @@ impl NodeRecord {
         *word = (*word & Self::RECORD_BITS) | Self::checked_flags(flags);
     }
 
+    /// `set_bit(SOURCE_FILE_ROOT, on)` through a shared borrow:
+    /// `mark_roots` reads other records of the store while it writes.
+    #[inline]
+    fn set_root_bit(&self, on: bool) {
+        let word = self.flags.load(Ordering::Relaxed);
+        let word = if on {
+            word | Self::SOURCE_FILE_ROOT
+        } else {
+            word & !Self::SOURCE_FILE_ROOT
+        };
+        self.flags.store(word, Ordering::Relaxed);
+    }
+
     #[inline]
     fn set_bit(&mut self, bit: u32, on: bool) {
         debug_assert_eq!(bit & !Self::RECORD_BITS, 0);
@@ -4525,14 +4538,9 @@ fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
 /// the store (a synthetic or foreign parent) stays unmarked and is walked
 /// at read time.
 fn mark_source_file_roots(store: &mut FileStore) {
-    // PERF: step 4b. The walk reads the record and kind columns out of the
-    // store, cut to one length, so it has no bounds checks for them.
-    let mut records = std::mem::take(&mut store.records);
-    let kinds = std::mem::take(&mut store.kinds);
-    let slots = records.len();
-    store.root_slot = mark_roots(&mut records, &kinds[..slots]);
-    store.records = records;
-    store.kinds = kinds;
+    // PERF: step 4b, storefast1. The walk reads the record and kind columns
+    // through one iterator, so it has no bounds checks for them.
+    store.root_slot = mark_roots(&store.records, &store.kinds);
 }
 
 /// `mark_source_file_roots` on the columns of a store: the root slot (0 for
@@ -4546,9 +4554,11 @@ fn mark_source_file_roots(store: &mut FileStore) {
 // PERF: storefast1. The parser makes a parent after its children, so
 // nearly every node slot copies the bit of a node slot above it, with no
 // state vector. Only a parent at or below the slot (or a parent slot that
-// holds no node) takes `mark_root_walk`, which keeps the state of the walks
-// that R200 made for every slot.
-fn mark_roots(records: &mut [NodeRecord], kinds: &[SyntaxKind]) -> u32 {
+// holds no node) takes `RootWalk::mark`, which keeps the state of the walks
+// that R200 made for every slot. The bit goes in through the atomic flags
+// word, so the walk reads the columns through iterators, with one bounds
+// check per slot (the parent).
+fn mark_roots(records: &[NodeRecord], kinds: &[SyntaxKind]) -> u32 {
     assert_eq!(records.len(), kinds.len(), "one kind per record");
     // PORT: the parser makes the SourceFile node last, so the root is the
     // last SourceFile slot. Any other SourceFile node stays unmarked.
@@ -4559,23 +4569,25 @@ fn mark_roots(records: &mut [NodeRecord], kinds: &[SyntaxKind]) -> u32 {
         return 0;
     };
     let mut walk = RootWalk::default();
-    for start in (1..records.len()).rev() {
-        let record = &records[start];
+    let slots = records.iter().zip(kinds).enumerate().skip(1).rev();
+    for (start, (record, &kind)) in slots {
         if !record.is_node() {
             continue;
         }
-        let is_root = if kinds[start] == SyntaxKind::SourceFile {
+        let is_root = if kind == SyntaxKind::SourceFile {
             start == root
         } else {
             match record.local_parent() {
                 None => false,
-                Some(parent) if parent > start && records[parent].is_node() => {
-                    records[parent].has_bit(NodeRecord::SOURCE_FILE_ROOT)
-                }
-                Some(_) => walk.mark(records, kinds, root, start),
+                Some(parent) => match records.get(parent) {
+                    Some(up) if parent > start && up.is_node() => {
+                        up.has_bit(NodeRecord::SOURCE_FILE_ROOT)
+                    }
+                    _ => walk.mark(records, kinds, root, start),
+                },
             }
         };
-        records[start].set_bit(NodeRecord::SOURCE_FILE_ROOT, is_root);
+        record.set_root_bit(is_root);
     }
     root as u32
 }
@@ -4605,7 +4617,7 @@ impl RootWalk {
     #[inline(never)]
     fn mark(
         &mut self,
-        records: &mut [NodeRecord],
+        records: &[NodeRecord],
         kinds: &[SyntaxKind],
         root: usize,
         start: usize,
@@ -4637,7 +4649,7 @@ impl RootWalk {
         let result = if is_root { Self::ROOT } else { Self::NOT_ROOT };
         for i in self.path.drain(..) {
             state[i] = result;
-            records[i].set_bit(NodeRecord::SOURCE_FILE_ROOT, is_root);
+            records[i].set_root_bit(is_root);
         }
         is_root
     }
