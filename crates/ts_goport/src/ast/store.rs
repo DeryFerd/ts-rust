@@ -6064,8 +6064,10 @@ impl FileStore {
         let mut last = LINK_END;
         let mut linking = true;
         // The fields are borrowed apart, so the walk reads the list table
-        // while the records and the links change. A panic in the walk (a
-        // Go panic that an LSP request recovers) leaves the table in place.
+        // while the records and the links change. Go's walk cannot panic
+        // here; only a port bug can (a list or child id that is not in the
+        // store). When an LSP request recovers that panic, the table is
+        // still in place.
         let FileStore {
             lists,
             records,
@@ -7439,10 +7441,11 @@ mod tests {
         });
     }
 
-    // A panic in the child walk of `set_parent_in_store_children` (a Go
-    // panic that an LSP request recovers) leaves the list table of the store
-    // in place: the walk borrows the table, it does not move it out. Here
-    // the walk panics on a list field that names no list.
+    // The child walk of `set_parent_in_store_children` borrows the list
+    // table of the store and does not move it out, so a panic in the walk
+    // leaves the table in place. Go's walk cannot panic; only a port bug
+    // can (here a list field that names no list). An LSP request that
+    // recovers that panic must still find the other lists.
     #[test]
     fn set_parent_in_store_children_keeps_the_lists_after_a_panic() {
         let file = new_file_store("/walk-panic.ts", "a;");
