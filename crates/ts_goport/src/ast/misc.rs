@@ -117,13 +117,22 @@ pub const INTERNAL_SYMBOL_NAME_MODULE_EXPORTS: &str = "module.exports";
 // Go: ast/symbol.go:72 SymbolName
 #[must_use]
 pub fn symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
+    symbol_name_str(symbols, symbol).to_string()
+}
+
+/// `symbol_name` as the interned text, with no new String.
+// PERF: printfast1. Go `SymbolName` returns a string header; callers that
+// only read the text (the node builder's `len(ast.SymbolName(...))`) use
+// this.
+#[must_use]
+pub fn symbol_name_str(symbols: &SymbolArena, symbol: SymbolId) -> &'static str {
     let s = symbols.sym(symbol);
     if s.value_declaration.is_some()
         && is_private_identifier_class_element_declaration(s.value_declaration)
     {
-        return s.value_declaration.name().text().to_string();
+        return s.value_declaration.name().text();
     }
-    s.name.to_string()
+    s.name.as_str()
 }
 
 // Go: ast/symbol.go:80 EscapeAllInternalSymbolNames
@@ -1522,7 +1531,16 @@ pub fn get_leftmost_expression(mut node: Node, stop_at_call_expressions: bool) -
 // Gets the precedence of a TypeNode
 #[must_use]
 pub fn get_type_node_precedence(n: Node) -> TypePrecedence {
-    match n.kind() {
+    type_node_precedence_of_kind(n, n.kind())
+}
+
+/// `get_type_node_precedence` of `n`, whose kind `kind` the caller has read.
+// PERF: printfast1. A factory node reads its kind in the thread's arena;
+// `Printer::emit_type_node` reads it once for this and its switch.
+#[must_use]
+pub fn type_node_precedence_of_kind(n: Node, kind: SyntaxKind) -> TypePrecedence {
+    debug_assert_eq!(kind, n.kind());
+    match kind {
         SyntaxKind::ConditionalType => TypePrecedence::CONDITIONAL,
         SyntaxKind::JsDocOptionalType | SyntaxKind::JsDocVariadicType => TypePrecedence::JS_DOC,
         SyntaxKind::FunctionType | SyntaxKind::ConstructorType => TypePrecedence::FUNCTION,

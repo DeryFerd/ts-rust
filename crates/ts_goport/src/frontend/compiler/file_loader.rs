@@ -13,7 +13,6 @@ use crate::contentmapper::{
 use crate::frontend::prelude::*;
 use crate::gostd::{GoError, errors};
 use crate::spanmap::{MappingError, MappingErrorKind};
-use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -866,19 +865,16 @@ impl FileLoader {
         )
     }
 
-    /// Go `resolved.ResolvedPath` of a resolved module (ts#64159). PORT:
-    /// `GOPORT_RESOLVED_PATH=0` gets the loader's `to_path` of its name.
-    pub fn resolved_path<'r>(&self, resolved: &'r ResolvedModule) -> Cow<'r, Path> {
-        let Some(path) = resolved.path() else {
-            return Cow::Owned(self.to_path(&resolved.resolved_file_name));
-        };
+    /// Go `resolved.ResolvedPath` of a resolved module (ts#64159). Debug
+    /// builds check it against the loader's `to_path` of its name.
+    pub fn resolved_path<'r>(&self, resolved: &'r ResolvedModule) -> &'r Path {
         debug_assert_eq!(
-            *path,
+            resolved.resolved_path,
             self.to_path(&resolved.resolved_file_name),
             "resolved path of {}",
             resolved.resolved_file_name
         );
-        Cow::Borrowed(path)
+        &resolved.resolved_path
     }
 
     // Go: fileloader.go:242 (*fileLoader).addRootTask
@@ -1776,18 +1772,16 @@ impl FileLoader {
             // module augmentations of a parse that the loads keep
             // (`import_names`), or that the parse worker read (parload1,
             // `FilePrep::names`), and the file's emit format, once per file.
-            let mut named = false;
             let kept = if self.keeps_import_names {
                 Some(import_names(&file))
             } else {
                 prep.as_mut()
                     .and_then(|prep| prep.names.take())
-                    .map(|names| {
-                        named = true;
-                        Rc::new(*names)
-                    })
+                    .map(|names| Rc::new(*names))
             }
             .filter(|kept| kept.len() == module_names.len() - imports_start as usize);
+            // The load reads the worker's names (`preps_named`).
+            let named = !self.keeps_import_names && kept.is_some();
             let mut file_emit_mode = None;
 
             for (index, entry) in module_names.iter().copied().enumerate() {
@@ -1854,7 +1848,7 @@ impl FileLoader {
                 }
 
                 let resolved_file_name = &resolved_module.resolved_file_name;
-                // Made once: the JS file test and the subtask both read it.
+                // The JS file test and the subtask both read it.
                 let resolved_path = self.resolved_path(&resolved_module);
                 let is_from_node_modules_search = resolved_module.is_external_library_import;
                 // Don't treat redirected files as JS files.
@@ -1869,7 +1863,7 @@ impl FileLoader {
                         .borrow()
                         .get_redirect_parsed_command_line_for_resolution(&new_has_file_name(
                             resolved_file_name,
-                            &resolved_path,
+                            resolved_path,
                         ))
                         .is_none();
                 let is_js_file_from_node_modules = is_from_node_modules_search
@@ -1899,7 +1893,7 @@ impl FileLoader {
                     t.add_sub_task(
                         ResolvedRef {
                             file_name: resolved_file_name.clone(),
-                            path: resolved_path.into_owned(),
+                            path: resolved_path.clone(),
                             increase_depth: resolved_module.is_external_library_import,
                             elide_on_depth: is_js_file_from_node_modules,
                             include_reason: Some(new_file_include_reason(
@@ -2025,7 +2019,7 @@ impl FileLoader {
             let (resolution, trace) = self.resolve_library(&library_name, &resolve_from);
             if resolution.is_resolved() {
                 path = resolution.resolved_file_name.clone();
-                path_key = Some(self.resolved_path(&resolution).into_owned());
+                path_key = Some(self.resolved_path(&resolution).clone());
                 replaced = true;
             }
             self.path_for_lib_file_resolutions
@@ -2546,10 +2540,13 @@ fn emit_syntax_for_usage(
 
 /// Go `getModeForUsageLocation` (with `options`) for a plain `import ..
 /// from` or `export .. from` in `file_name`, the most common form. A parse
-/// worker resolves the synthetic imports with this mode, and the imports
-/// too when it did not read their usages (`GOPORT_LOAD_NAMES=0`). A wrong
-/// guess only resolves another cache key: the loader resolves each import
-/// with its real mode.
+/// worker resolves the synthetic imports with this mode. It resolves the
+/// imports with it too when it has no usages that fit them: a job without
+/// a prep (`GOPORT_LOAD_PREP=0`, a cached file, a bundled lib, or no
+/// metadata), `GOPORT_LOAD_NAMES=0`, or names that are not those of its
+/// references. A wrong guess only resolves another cache key: the loader
+/// resolves each import with its real mode, and takes a worker answer only
+/// when the answer has that mode (`FilePrep::answer`).
 pub(crate) fn guess_import_mode(
     file_name: &str,
     meta: &SourceFileMetaData,
@@ -3162,10 +3159,7 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
             }
             // Only the module augmentation of b.ts: the workers resolve the
             // synthetic imports and the imports.
-            assert!(
-                own <= 1,
-                "{own} names resolved on the loader:\n{with_names}"
-            );
+            assert_eq!(own, 1, "names resolved on the loader:\n{with_names}");
         }
     }
 

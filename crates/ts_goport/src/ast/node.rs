@@ -1726,6 +1726,25 @@ impl NodeList {
         }
     }
 
+    /// True for the Go `nil` handle (`NodeList::NIL`). Unlike `is_nil`,
+    /// false for a nil marker list (`store::NIL_LIST_POS`).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_nil_handle(self) -> bool {
+        matches!(self.0, ListRef::Nil)
+    }
+
+    /// The store id and the list of a list of a static store, else `None`
+    /// (`store::store_list_value`).
+    #[inline]
+    #[must_use]
+    pub(crate) fn static_parts(self) -> Option<(usize, &'static StaticList)> {
+        match self.0 {
+            ListRef::Ts { file, list } => Some((file as usize, list)),
+            _ => None,
+        }
+    }
+
     /// The synthetic list of the handle, else `None`.
     #[inline]
     #[must_use]
@@ -5711,16 +5730,24 @@ pub fn is_array_literal_or_object_literal_destructuring_pattern(node: Node) -> b
 
 // Go: ast.go:1430 accessKind
 fn access_kind(node: Node) -> AccessKind {
+    access_kind_ref(NodeRef::new(node))
+}
+
+/// `access_kind` of the view of a node.
+// PERF: checkid1. The parent, its kind and the parents of the recursive
+// steps are read through views (`NodeRef`): a parent in the same store
+// costs no registry lookup. Go reads struct fields. Same tests, same order.
+fn access_kind_ref(node: NodeRef) -> AccessKind {
     let parent = node.parent();
     if parent.is_nil() {
         return AccessKind::READ;
     }
     match parent.kind() {
         SyntaxKind::ParenthesizedExpression | SyntaxKind::ArrayLiteralExpression => {
-            access_kind(parent)
+            access_kind_ref(parent)
         }
         SyntaxKind::PrefixUnaryExpression | SyntaxKind::PostfixUnaryExpression => {
-            let operator = parent.operator();
+            let operator = parent.node().operator();
             if operator == SyntaxKind::PlusPlusToken || operator == SyntaxKind::MinusMinusToken {
                 AccessKind::READ_WRITE
             } else {
@@ -5728,7 +5755,8 @@ fn access_kind(node: Node) -> AccessKind {
             }
         }
         SyntaxKind::BinaryExpression => {
-            if parent.left() == node {
+            let parent = parent.node();
+            if parent.left() == node.node() {
                 let operator = parent.operator_token();
                 if is_assignment_operator(operator.kind()) {
                     if operator.kind() == SyntaxKind::EqualsToken {
@@ -5740,28 +5768,28 @@ fn access_kind(node: Node) -> AccessKind {
             AccessKind::READ
         }
         SyntaxKind::PropertyAccessExpression => {
-            if parent.name() != node {
+            if parent.name() != node.node() {
                 return AccessKind::READ;
             }
-            access_kind(parent)
+            access_kind_ref(parent)
         }
         SyntaxKind::PropertyAssignment => {
-            let parent_access = access_kind(parent.parent());
+            let parent_access = access_kind_ref(parent.parent());
             // In `({ x: varname }) = { x: 1 }`, the left `x` is a read, the right `x` is a write.
-            if node == parent.name() {
+            if node.node() == parent.name() {
                 return reverse_access_kind(parent_access);
             }
             parent_access
         }
         SyntaxKind::ShorthandPropertyAssignment => {
             // Assume it's the local variable being accessed, since we don't check public properties for --noUnusedLocals.
-            if node == parent.object_assignment_initializer() {
+            if node.node() == parent.node().object_assignment_initializer() {
                 return AccessKind::READ;
             }
-            access_kind(parent.parent())
+            access_kind_ref(parent.parent())
         }
         SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement => {
-            if node == parent.initializer() {
+            if node.node() == parent.initializer() {
                 AccessKind::WRITE
             } else {
                 AccessKind::READ

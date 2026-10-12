@@ -20,6 +20,23 @@ pub fn find_ancestor(mut node: Node, mut callback: impl FnMut(Node) -> bool) -> 
     Node::NIL
 }
 
+/// `find_ancestor` whose callback gets the view of each node (`NodeRef`):
+/// a parent in the same store, and the kind and parent reads of the
+/// callback, cost no registry lookup. Same nodes, same order.
+// PERF: checkid1. For the hot walks of the identifier and property access
+// checks, which go to the root or near it.
+#[inline]
+pub fn find_ancestor_ref(node: Node, mut callback: impl FnMut(NodeRef) -> bool) -> Node {
+    let mut node = NodeRef::new(node);
+    while node.is_some() {
+        if callback(node) {
+            return node.node();
+        }
+        node = node.parent();
+    }
+    Node::NIL
+}
+
 // Go: ast/utilities.go:921 FindManyAncestors
 /// Walks up the parents of `node` once. Slot `i` of the result is the nearest
 /// ancestor that `callbacks[i]` matches, or nil. A node fills at most one
@@ -111,10 +128,32 @@ pub fn find_ancestor_or_quit(
     Node::NIL
 }
 
-// Go: ast/utilities.go:980 IsNodeDescendantOf
-pub fn is_node_descendant_of(mut node: Node, ancestor: Node) -> bool {
+/// `find_ancestor_or_quit` whose callback gets the view of each node
+/// (`NodeRef`), as `find_ancestor_ref`.
+#[inline]
+pub fn find_ancestor_or_quit_ref(
+    node: Node,
+    mut callback: impl FnMut(NodeRef) -> FindAncestorResult,
+) -> Node {
+    let mut node = NodeRef::new(node);
     while node.is_some() {
-        if node == ancestor {
+        let result = callback(node);
+        if result == FindAncestorResult::FIND_ANCESTOR_QUIT {
+            return Node::NIL;
+        } else if result == FindAncestorResult::FIND_ANCESTOR_TRUE {
+            return node.node();
+        }
+        node = node.parent();
+    }
+    Node::NIL
+}
+
+// Go: ast/utilities.go:980 IsNodeDescendantOf
+// PERF: checkid1. Parent steps through views, as `find_ancestor_ref`.
+pub fn is_node_descendant_of(node: Node, ancestor: Node) -> bool {
+    let mut node = NodeRef::new(node);
+    while node.is_some() {
+        if node.node() == ancestor {
             return true;
         }
         node = node.parent();
@@ -392,7 +431,11 @@ pub fn get_root_declaration(mut node: Node) -> Node {
 // walk and the flag reads are the same as Go. A nil node fails the Go
 // `node != nil` tests, so it returns early. The same holds for
 // `get_combined_node_flags` and `get_combined_parser_flags`.
-pub fn get_combined_modifier_flags(mut node: Node) -> ModifierFlags {
+// PERF: checkid1. The nodes, kinds, parents and modifier flags are read
+// through views (`NodeRef`): a parent in the same store costs no registry
+// lookup. The same holds for `get_combined_parser_flags`.
+pub fn get_combined_modifier_flags(node: Node) -> ModifierFlags {
+    let mut node = NodeRef::new(node);
     let mut kind = node.kind();
     while kind == SyntaxKind::BindingElement {
         node = node.parent().parent();
@@ -454,7 +497,8 @@ pub fn get_combined_node_flags(mut node: Node) -> NodeFlags {
 // PERF: U4 (CH7). The same walk as `get_combined_node_flags`, without the
 // binder data of each node. `(a | b | c) & mask` is
 // `(a & mask) | (b & mask) | (c & mask)`.
-pub fn get_combined_parser_flags(mut node: Node, mask: NodeFlags) -> NodeFlags {
+pub fn get_combined_parser_flags(node: Node, mask: NodeFlags) -> NodeFlags {
+    let mut node = NodeRef::new(node);
     let mut kind = node.kind();
     while kind == SyntaxKind::BindingElement {
         node = node.parent().parent();

@@ -307,13 +307,10 @@ impl AliasResolver {
     // Go: ls/autoimport/aliasresolver.go:137 GetSourceFileForResolvedModule
     // GetSourceFileForResolvedModule implements checker.Program.
     pub fn get_source_file_for_resolved_module(&self, resolved: &ResolvedModule) -> Node {
-        match resolved.path() {
-            Some(path) => self.get_source_file_at(&resolved.resolved_file_name, path),
-            None => self.get_source_file(&resolved.resolved_file_name),
-        }
+        self.get_source_file_at(&resolved.resolved_file_name, &resolved.resolved_path)
     }
 
-    // Go: ls/autoimport/aliasresolver.go:135 GetResolvedModules
+    // Go: ls/autoimport/aliasresolver.go:142 GetResolvedModules
     // GetResolvedModules implements checker.Program.
     // PORT: the Go nil map is an empty map.
     pub fn get_resolved_modules(

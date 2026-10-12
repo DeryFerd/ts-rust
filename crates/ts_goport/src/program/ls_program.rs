@@ -1056,9 +1056,8 @@ struct SplitInputs {
 
 impl SplitInputs {
     /// `get_checker_associations` of the program that these inputs were
-    /// copied from, or None when an import needs the program to find its
-    /// file (`get_import_adjacency`'s `get_source_file_for_resolved_module`).
-    fn associations(&self) -> Option<Vec<usize>> {
+    /// copied from.
+    fn associations(&self) -> Vec<usize> {
         let mut index_by_path: FxHashMap<&str, Option<usize>> = FxHashMap::with_capacity_and_hasher(
             self.paths.len() + self.redirects.len(),
             Default::default(),
@@ -1079,10 +1078,11 @@ impl SplitInputs {
                 if !resolved.is_resolved() {
                     continue;
                 }
-                // A path that is not in `files_by_path` finds no file: the
-                // program has no project reference redirects
-                // (`start_checker_associations`).
-                let Some(&imported_index) = index_by_path.get(resolved.path()?.as_str()) else {
+                // A path that is not in `files_by_path` finds no file
+                // (`get_source_file_for_resolved_module`): the program has no
+                // project reference redirects (`start_checker_associations`).
+                let Some(&imported_index) = index_by_path.get(resolved.resolved_path.as_str())
+                else {
                     continue;
                 };
                 let Some(imported_index) = imported_index else {
@@ -1095,11 +1095,7 @@ impl SplitInputs {
                 adjacent_files[imported_index].push(file_index);
             }
         }
-        Some(checker_associations_of(
-            &self.sizes,
-            &adjacent_files,
-            self.checker_count,
-        ))
+        checker_associations_of(&self.sizes, &adjacent_files, self.checker_count)
     }
 }
 
@@ -1110,7 +1106,7 @@ struct PendingSplit {
     resolved_modules: Arc<FxHashMap<tspath::Path, module::ModeAwareCache<Arc<ResolvedModule>>>>,
     files: usize,
     checker_count: usize,
-    split: std::thread::JoinHandle<Option<Vec<usize>>>,
+    split: std::thread::JoinHandle<Vec<usize>>,
 }
 
 thread_local! {
@@ -1211,13 +1207,10 @@ pub fn take_checker_associations(program: &NewProgram, checker_count: usize) -> 
         && pending.files == program.files.len()
         && pending.checker_count == checker_count
     {
-        let split = pending
+        return pending
             .split
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        if let Some(split) = split {
-            return split;
-        }
     }
     get_checker_associations(program, checker_count)
 }
@@ -1254,7 +1247,7 @@ fn get_import_adjacency(program: &NewProgram) -> Vec<Vec<usize>> {
             if !resolved.is_resolved() {
                 continue;
             }
-            let imported_index = match resolved.path().and_then(|path| index_by_path.get(path)) {
+            let imported_index = match index_by_path.get(&resolved.resolved_path) {
                 Some(&imported_index) => imported_index,
                 None => program
                     .get_source_file_for_resolved_module(resolved)

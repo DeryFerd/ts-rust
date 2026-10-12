@@ -311,9 +311,9 @@ pub struct ResolvedRef {
 
 /// Sets the path of a task that `FilesParser::start` queues: the one it
 /// came with (Go `task.path`, ts#64159), else the loader's `to_path` of its
-/// file name. `GOPORT_RESOLVED_PATH=0` makes every path here.
+/// file name.
 fn set_task_path(loader: &FileLoader, task: &mut ParseTask) {
-    if task.path.is_empty() || !crate::program::resolved_paths_enabled() {
+    if task.path.is_empty() {
         // PERF: Go `loader.toPath` asks the host for its current directory
         // and case sensitivity each time; the loader keeps the same values
         // (`compare_paths_options`), so no copy of the directory is made.
@@ -3953,26 +3953,21 @@ impl WorkerResolver {
                 answers.push(None);
                 continue;
             }
+            // The worker's resolver is the default resolver, which never
+            // fails (Go resolver.go:469 gives a nil error). So no answer
+            // has an error for the loader to note (Go
+            // `moduleResolutionError`, fileloader.go:884).
             let (resolved, _, err) =
                 self.resolver
                     .resolve_module_name(specifier, containing_file, mode, redirect);
+            debug_assert!(err.is_none(), "the default resolver failed on {specifier}");
             if let Some((cache, directory, redirect_name)) = &answers_from {
-                // A resolution with an error gives the loader no answer: it
-                // resolves the name itself and notes the error (Go
-                // `moduleResolutionError`, fileloader.go:884). The default
-                // resolver gives none (resolver.go:469).
-                answers.push(
-                    err.is_none()
-                        .then(|| {
-                            cache.get_module(&(
-                                directory.as_str(),
-                                specifier,
-                                mode,
-                                redirect_name.as_str(),
-                            ))
-                        })
-                        .flatten(),
-                );
+                answers.push(cache.get_module(&(
+                    directory.as_str(),
+                    specifier,
+                    mode,
+                    redirect_name.as_str(),
+                )));
             }
             if !resolved.is_resolved() {
                 continue;
