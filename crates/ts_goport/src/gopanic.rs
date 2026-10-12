@@ -269,7 +269,7 @@ pub fn go_fatal_newosproc(err: &std::io::Error) -> ! {
     let location = std::panic::Location::caller();
     text.push_str(&format!(
         "fatal error: newosproc\n\n\t{}:{}\n",
-        location.file(),
+        go_site_file(location.file()),
         location.line()
     ));
     use std::io::Write;
@@ -488,6 +488,33 @@ pub fn resume_go_panic(payload: Box<dyn std::any::Any + Send>) -> Box<dyn std::a
     payload
 }
 
+/// The file of a port site (`Location::file`) as panic text prints it:
+/// without its `<dir>/..` pairs. The roots of the `parts/` crates are
+/// `../../src/<crate>_root.rs`, so their sites are
+/// `crates/ts_goport/parts/goport_core/../../src/...`. This gives
+/// `crates/ts_goport/src/...`, the text from before the crate split.
+#[must_use]
+pub fn go_site_file(file: &str) -> std::borrow::Cow<'_, str> {
+    if !file.contains("..") {
+        return std::borrow::Cow::Borrowed(file);
+    }
+    fn name(piece: &str) -> &str {
+        piece.trim_end_matches(['/', '\\'])
+    }
+    // Each piece is a path segment with the separator after it.
+    let mut pieces: Vec<&str> = Vec::new();
+    for piece in file.split_inclusive(['/', '\\']) {
+        let parent = pieces.last().map(|last| name(last));
+        if name(piece) == ".." && parent.is_some_and(|parent| !parent.is_empty() && parent != "..")
+        {
+            pieces.pop();
+        } else {
+            pieces.push(piece);
+        }
+    }
+    std::borrow::Cow::Owned(pieces.concat())
+}
+
 /// Prints a caught `go_panic` to stderr and returns true. The first lines
 /// are the Go runtime ones (Go `printpanics`): `panic: <value> [recovered]`
 /// for each earlier panic in `recovered_before`, each next line after a
@@ -504,7 +531,7 @@ pub fn print_go_panic(payload: &(dyn std::any::Any + Send)) -> bool {
     let text = format!(
         "{}\n{signal}\n\t{}:{}\n",
         go_panic_lines(panic),
-        panic.location.file(),
+        go_site_file(panic.location.file()),
         panic.location.line()
     );
     use std::io::Write;
@@ -516,9 +543,16 @@ pub fn print_go_panic(payload: &(dyn std::any::Any + Send)) -> bool {
 /// port site of a Go panic, which takes the place of the goroutine trace as
 /// in `print_go_panic` (`\t<file>:<line>` and a newline). For any other
 /// payload, the Rust backtrace when `RUST_BACKTRACE` enables it, else "".
+// PORT: a Rust backtrace names each function by its crate. Since crate
+// split step 2, the functions of goport_core files are `goport_core::...`,
+// not `ts_goport::...`.
 pub fn go_recovered_stack(r: &(dyn std::any::Any + Send)) -> String {
     if let Some(panic) = r.downcast_ref::<GoPanic>() {
-        return format!("\t{}:{}\n", panic.location.file(), panic.location.line());
+        return format!(
+            "\t{}:{}\n",
+            go_site_file(panic.location.file()),
+            panic.location.line()
+        );
     }
     let backtrace = std::backtrace::Backtrace::capture();
     if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
@@ -587,6 +621,20 @@ mod tests {
     // `WaitGroup.Go`. The texts are Go's stderr for ipc `AsyncConn` with a
     // handler that panics and a panic answer that panics (followups39
     // `go test -overlay`), with a handler value of one and of two lines.
+    // The parts/ crates' sites print as before the crate split.
+    #[test]
+    fn go_site_file_drops_dir_dot_dot_pairs() {
+        assert_eq!(
+            go_site_file("crates/ts_goport/parts/goport_core/../../src/checker/checker.rs"),
+            "crates/ts_goport/src/checker/checker.rs"
+        );
+        assert_eq!(
+            go_site_file(r"crates\ts_goport\parts\goport_util\..\..\src\gopanic.rs"),
+            r"crates\ts_goport\src\gopanic.rs"
+        );
+        assert_eq!(go_site_file("../x/src/a.rs"), "../x/src/a.rs");
+    }
+
     #[test]
     fn go_after_recover_prints_the_recovered_panic_first() {
         let write_panic = || {
