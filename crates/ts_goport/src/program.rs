@@ -4045,9 +4045,7 @@ fn start_checker_group_do(
 ) -> PendingCheckerGroup {
     let count = checker_count();
     let files: Arc<Vec<Node>> = Arc::new(files.to_vec());
-    if count > 1
-        && !cfg!(target_family = "wasm")
-        && crate::fast_mode::steal()
+    if stealing_check()
         && let Some(queues) = StealQueues::first_pass(&files, count)
     {
         return start_stealing_group_do(files, cb, queues);
@@ -4077,6 +4075,20 @@ fn start_checker_group_do(
         })
         .collect();
     PendingCheckerGroup { files, receivers }
+}
+
+/// True when the first check pass of the current program steals
+/// (`StealQueues`): fast mode with `GOPORT_FAST_STEAL=1`
+/// (`crate::fast_mode::steal`), more than one checker, and not `--noCheck`
+/// (that pass checks nothing). The early emit waits for the check then
+/// (`emitter::program_emit::early_emit_options_allow`): an emit job goes to
+/// the checker of its file when it is sent, and a stolen file moves to
+/// another checker. Loading thread only.
+pub(crate) fn stealing_check() -> bool {
+    crate::fast_mode::steal()
+        && !cfg!(target_family = "wasm")
+        && !options().no_check.is_true()
+        && checker_count() > 1
 }
 
 /// fastmode1: the queues of the work-stealing check pass of fast mode

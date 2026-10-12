@@ -9,27 +9,29 @@
 //!   (`checker_count`). An explicit `--checkers N` or `--singleThreaded`
 //!   still wins, and `tsc -b` keeps Go's 4 (it can check several projects
 //!   at once);
-//! - a work-stealing check pass (`program.rs` `start_checker_group_do`): each
-//!   checker starts with Go's split of its files and, when its own queue is
-//!   empty, takes the last unstarted file of the queue with the most work
-//!   left. A stolen file's later work (emit, declaration diagnostics) goes
-//!   to the checker that checked it;
 //! - lazy member tables (`GOPORT_LAZY_MEMBERS`, `checker/lazy_members.rs`);
 //! - the fast name order of `some_property_reduces_to_never`
 //!   (`GOPORT_FAST_NEVER_ORDER`, `checker/checker_p24.rs`);
 //! - one jemalloc arena per checker (`jemalloc_layout::ArenaClaims`).
 //!
 //! Each part also has its own switch: `GOPORT_LAZY_MEMBERS=0`,
-//! `GOPORT_FAST_NEVER_ORDER=0`, `GOPORT_FAST_STEAL=0` and
-//! `GOPORT_FAST_ARENAS=0` turn that part off in fast mode, and `=1` turns
-//! the first two on without it.
+//! `GOPORT_FAST_NEVER_ORDER=0` and `GOPORT_FAST_ARENAS=0` turn that part off
+//! in fast mode, and `=1` turns the first two on without it.
+//!
+//! Fast mode is deterministic: each file goes to the checker of Go's split
+//! for the chosen count, so the output is the same on every run and equals
+//! Go's `--checkers N` for that N, except where lazy members or the never
+//! order change the work. `GOPORT_FAST_STEAL=1` opts in to a work-stealing
+//! check pass (`steal`), which is faster on some projects but not
+//! deterministic.
 //!
 //! The default (no flag, no variable) does none of this, so its output,
 //! counts included, stays Go's. Fast mode changes the counts, and it can
-//! change the output where Go's output depends on which files share a
-//! checker or on the order a checker sees them (a work-stealing run can
-//! differ from run to run there), and where lazy members change the work
-//! (see the lane report, `target/continuation-r97-goport/fastmode1`).
+//! change the output where Go's output depends on the checker count (as Go
+//! with more checkers), where a stolen file changes which files share a
+//! checker (from run to run), and where lazy members change the work (see
+//! the lane reports, `target/continuation-r97-goport/fastmode1` and
+//! `fastmode2`).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -92,10 +94,17 @@ pub fn part(name: &str) -> bool {
     }
 }
 
-/// The work-stealing check pass (`GOPORT_FAST_STEAL`). Read once.
+/// The work-stealing check pass of fast mode, opt-in with
+/// `GOPORT_FAST_STEAL=1` (`program.rs` `stealing_check`). Each checker
+/// starts with Go's split of its files and, when its own queue is empty,
+/// takes the last unstarted file of the queue with the most work left. A
+/// stolen file's later work (emit, declaration diagnostics) goes to the
+/// checker that checked it. Which checker checks a file then depends on
+/// thread timing, so where Go's output depends on which files share a
+/// checker, the output can change from run to run. Read once.
 pub fn steal() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| enabled() && part("GOPORT_FAST_STEAL"))
+    *ON.get_or_init(|| enabled() && std::env::var("GOPORT_FAST_STEAL").as_deref() == Ok("1"))
 }
 
 /// One jemalloc arena per checker (`GOPORT_FAST_ARENAS`). Read once.
