@@ -3539,9 +3539,15 @@ fn checker_count() -> usize {
 // (`ls_program::get_checker_associations`), whose files are in
 // `source_file_order` order. An alias resolver program has no frontend, so
 // it keeps the round-robin order; Go gives it no checker pool.
+// Go makes the checkers (checkerpool.go:370), then the associations
+// (:382). PERF: the checker threads make their checkers while this thread
+// makes the associations. A checker reads them only in a job, and the jobs
+// come after this returns. Making the associations reads the program and
+// changes no state that the threads copied (`WorkerSeed`).
 fn create_checkers() -> CheckerPool {
     bind_all();
     let count = checker_count();
+    let pool = start_checkers(count);
     let program = prog();
     let source_file_order = program.source_file_order();
     let associations = match go_frontend_program() {
@@ -3563,7 +3569,7 @@ fn create_checkers() -> CheckerPool {
         with_tables(|tables| tables.file_associations.set(file_associations).is_ok()),
         "checker pool made twice"
     );
-    start_checkers(count)
+    pool
 }
 
 /// fastmode2: `crate::fast_mode::cost_split` for the files of `np` (file ids
