@@ -1056,8 +1056,9 @@ impl Checker {
                 return self.last_flow_node_reachable;
             }
             // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            // flowcost1: the walk's cached flow nodes (`FlowState::flow_data`).
             let mut flow_data_guard = None;
-            let flow_data = flow.get_flow_in(&mut flow_data_guard);
+            let flow_data = f.flow_data(flow, &mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
                 if !no_cache_check && f.reduce_labels.is_empty() {
@@ -1178,8 +1179,9 @@ impl Checker {
         let mut no_cache_check = no_cache_check;
         loop {
             // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            // flowcost1: the walk's cached flow nodes (`FlowState::flow_data`).
             let mut flow_data_guard = None;
-            let flow_data = flow.get_flow_in(&mut flow_data_guard);
+            let flow_data = f.flow_data(flow, &mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
                 if !no_cache_check {

@@ -90,6 +90,46 @@ pub struct FlowState {
     pub depth: i32,
     pub shared_flow_start: i32,
     pub reduce_labels: Vec<ReduceLabel>,
+    /// PERF: flowcost1. Not in Go. The flow nodes of the static file of the
+    /// last step (`flow_data`) and that file's index + 1 (0: none yet). A
+    /// walk stays in one file, so most steps read their flow node with one
+    /// compare and one index, as Go reads `*flow`.
+    pub flow_nodes: &'static [FlowNode],
+    pub flow_nodes_file: usize,
+}
+
+impl FlowState {
+    /// Go `*flow` for a step of this walk. A flow node of a static file is
+    /// read from the cached slice of its file; any other flow node (synthetic,
+    /// a freeable file version) through `guard`, as `FlowNodeId::get_flow_in`.
+    #[inline]
+    pub fn flow_data<'g>(
+        &mut self,
+        flow: FlowNodeId,
+        guard: &'g mut Option<FileRef<FlowNode>>,
+    ) -> &'g FlowNode {
+        let nodes = self.flow_nodes;
+        if flow.file_index() + 1 == self.flow_nodes_file {
+            return &nodes[flow.local_index()];
+        }
+        self.flow_data_slow(flow, guard)
+    }
+
+    #[inline(never)]
+    fn flow_data_slow<'g>(
+        &mut self,
+        flow: FlowNodeId,
+        guard: &'g mut Option<FileRef<FlowNode>>,
+    ) -> &'g FlowNode {
+        match flow.static_file_flow_nodes() {
+            Some(nodes) => {
+                self.flow_nodes = nodes;
+                self.flow_nodes_file = flow.file_index() + 1;
+                &nodes[flow.local_index()]
+            }
+            None => flow.get_flow_in(guard),
+        }
+    }
 }
 
 // Go: checker/flow.go:69 getFlowNodeOfNode
@@ -242,6 +282,8 @@ impl Checker {
         // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
         // lsshells M3 repair: one guard for the whole walk, so the steps in
         // one freeable file version share one pin (`get_flow_in`).
+        // flowcost1: a static file's flow nodes come from the walk's cache
+        // (`FlowState::flow_data`).
         let mut flow_data_guard = None;
         // flowskip1 verify mode: record each loop turn (read once per call;
         // a nested verify restores the recording before it returns).
@@ -251,7 +293,7 @@ impl Checker {
                 let depth = f.depth;
                 self.flow_skip_record(flow, depth);
             }
-            let flow_data = flow.get_flow_in(&mut flow_data_guard);
+            let flow_data = f.flow_data(flow, &mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
                 // We cache results of flow type resolution for shared nodes that were previously visited in

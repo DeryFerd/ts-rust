@@ -2601,6 +2601,17 @@ impl FlowNodeId {
         guard.as_deref().expect("the guard is set")
     }
 
+    /// All flow nodes of the file of this flow node when that file is in a
+    /// static publish, indexed by `local_index`; `None` for any other flow
+    /// node (synthetic, a freeable file version). A flow walk keeps the
+    /// slice of its file (`checker::FlowState::flow_data`).
+    #[inline]
+    #[must_use]
+    pub fn static_file_flow_nodes(self) -> Option<&'static [FlowNode]> {
+        let g = crate::ast::static_go_file(self.file_index())?;
+        Some(flow_nodes_of(g))
+    }
+
     /// The flow node of a static file (a static publish), or `None` for any
     /// other flow node (synthetic, a freeable file version).
     #[inline]

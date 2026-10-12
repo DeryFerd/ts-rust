@@ -482,8 +482,9 @@ impl Checker {
         let mut bypass_flow = FlowNodeId::NIL;
         for &antecedent in antecedents {
             // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            // flowcost1: the walk's cached flow nodes (`FlowState::flow_data`).
             let mut antecedent_node_guard = None;
-            let antecedent_node = antecedent.get_flow_in(&mut antecedent_node_guard);
+            let antecedent_node = f.flow_data(antecedent, &mut antecedent_node_guard);
             if bypass_flow.is_nil()
                 && antecedent_node.flags.intersects(FlowFlags::SWITCH_CLAUSE)
                 && antecedent_node.as_flow_switch_clause_data().is_empty()
