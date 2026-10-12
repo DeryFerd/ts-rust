@@ -533,16 +533,21 @@ impl Checker {
                 return nb_e(b).factory().deep_clone_node(decl_name);
             }
         }
-        let declarations = self.sym(symbol).declarations.clone();
-        let mut string_named = !declarations.is_empty();
-        for &d in &declarations {
+        // PERF: printfast1. Go ranges over `symbol.Declarations`; the port
+        // reads it by index, with no copy of the slice. Go `range` reads the
+        // length once, as `count` does here.
+        let count = self.sym(symbol).declarations.len();
+        let mut string_named = count != 0;
+        for i in 0..count {
+            let d = self.sym(symbol).declarations[i];
             if !self.is_string_named(b, d) {
                 string_named = false;
                 break;
             }
         }
-        let mut single_quote = !declarations.is_empty();
-        for &d in &declarations {
+        let mut single_quote = count != 0;
+        for i in 0..count {
+            let d = self.sym(symbol).declarations[i];
             if !self.is_single_quoted_string_named(b, d) {
                 single_quote = false;
                 break;
@@ -562,8 +567,12 @@ impl Checker {
         }
 
         let mut name = self.sym(symbol).name.clone();
-        let private_name_prefix = format!("{INTERNAL_SYMBOL_NAME_PREFIX}#");
-        if let Some(rest) = name.strip_prefix(private_name_prefix.as_str()) {
+        // Go `const privateNamePrefix = ast.InternalSymbolNamePrefix + "#"`.
+        // PERF: printfast1. Two prefix tests, not a new String per call.
+        if let Some(rest) = name
+            .strip_prefix(INTERNAL_SYMBOL_NAME_PREFIX)
+            .and_then(|rest| rest.strip_prefix('#'))
+        {
             // symbol IDs are unstable - replace #nnn# with #private#
             let rest = rest.trim_start_matches(is_digit);
             name = format!("__#private{rest}").into();
