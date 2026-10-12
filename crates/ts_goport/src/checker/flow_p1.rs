@@ -723,17 +723,34 @@ impl Checker {
         // for `a?.b`, we emulate a synthetic `a !== null && a !== undefined` condition for `a`
         // PERF: chkA. The parent, its kind and its operator are read once
         // (`node_parent_and_kind`), and the kind of `expr` once.
-        if is_expression_of_optional_chain_root(expr) || {
-            let (parent, parent_kind) = node_parent_and_kind(expr);
-            parent_kind == SyntaxKind::BinaryExpression
-                && matches!(
+        // flowcost1: Go `ast.IsExpressionOfOptionalChainRoot(expr)` on the
+        // same read of the parent: `IsOptionalChainRoot` is an optional
+        // chain flag, a property or element access or call kind (not a
+        // non-null expression) and a question dot token.
+        let (parent, parent_kind) = node_parent_and_kind(expr);
+        if match parent_kind {
+            SyntaxKind::PropertyAccessExpression
+            | SyntaxKind::ElementAccessExpression
+            | SyntaxKind::CallExpression => {
+                !parent.parser_flags(NodeFlags::OPTIONAL_CHAIN).is_empty()
+                    && parent.question_dot_token().is_some()
+                    && parent.expression() == expr
+            }
+            SyntaxKind::BinaryExpression => {
+                matches!(
                     parent.operator_token().kind(),
                     SyntaxKind::QuestionQuestionToken | SyntaxKind::QuestionQuestionEqualsToken
-                )
-                && parent.left() == expr
+                ) && parent.left() == expr
+            }
+            _ => false,
         } {
+            debug_assert!(
+                is_expression_of_optional_chain_root(expr)
+                    || parent_kind == SyntaxKind::BinaryExpression
+            );
             return self.narrow_type_by_optionality(f, t, expr, assume_true);
         }
+        debug_assert!(!is_expression_of_optional_chain_root(expr));
         let expr_kind = expr.kind();
         match expr_kind {
             SyntaxKind::Identifier
