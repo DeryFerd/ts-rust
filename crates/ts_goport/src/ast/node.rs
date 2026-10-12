@@ -2222,9 +2222,11 @@ impl Node {
     /// Go `node.Flags & mask` for a `mask` without a binder-added bit
     /// (`BINDER_ADDED_FLAGS`). For such a mask the binder bits do not
     /// matter, so a published store node reads only its record flags.
-    // PERF: U4 (CH7). `Node::flags` loads the binder data of the file
-    // (`Node::bind`) for every test, also of a parser-only bit such as
-    // `AMBIENT`, `OPTIONAL_CHAIN` or `HAS_JS_DOC`.
+    // PERF: U4 (CH7). When this was added, `Node::flags` loaded the binder
+    // data of the file (`Node::bind`) for every test, also of a parser-only
+    // bit such as `AMBIENT`, `OPTIONAL_CHAIN` or `HAS_JS_DOC`. Since AST
+    // node records step 2a the bind ORs its flags into the record, so this
+    // is now the same read as `Node::flags() & mask`.
     #[inline]
     #[must_use]
     pub fn parser_flags(self, mask: NodeFlags) -> NodeFlags {
