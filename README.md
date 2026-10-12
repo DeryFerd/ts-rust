@@ -2,7 +2,7 @@
 
 I wanted to see if LLMs could port the TypeScript compiler, checker and lsp to Rust. Turns out they can.
 
-It [cost over $420,000](#how-did-this-go) in tokens to do it, but you could probably have done it for ~$20k (see below)
+It [cost over $420,000](#how-did-this-go) in tokens to do it, but you could probably have done it for ~$20k (see below).
 
 ## Motivations
 
@@ -38,7 +38,7 @@ I assumed it kept using the code the Codex models wrote. I was wrong. **Opus 5.5
 
 I let it keep going, and it definitely did. Total token spend was **~$24,047 of API spend over 2 weeks**. I was using my Claude accounts, and it worked out to somewhere between **925% and 983% of my $200 plan weekly limits**.
 
-Expensive, for sure, but not that bad considering how much work has went into typescript-go.
+Expensive, for sure, but not that bad considering how much work has gone into typescript-go.
 
 # "The Slop Line"
 

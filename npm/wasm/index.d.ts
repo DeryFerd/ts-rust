@@ -17,7 +17,7 @@ export interface TscOptions {
      * it out to use the real file system.
      */
     files?: Map<string, string> | Record<string, string>;
-    /** The current directory. Default: `/`, or in Node without `files`, `$PWD` when it names the current directory (as tsgo does), else `process.cwd()`. */
+    /** The current directory. Default: `/`, or in Node without `files`, `$PWD` when it names the current directory (as tsgo does), else `process.cwd()`. In Node without `files`, a relative path is resolved against that directory. */
     cwd?: string;
     /** `"json"`: return the diagnostics as objects instead of printing them. */
     diagnostics?: "text" | "json";

@@ -43,11 +43,15 @@ PGO and BOLT) in place of the cargo line.
 ## Linux libc
 
 The platform package has no `libc` field, as Go's has none, so npm installs it on glibc and musl
-systems alike. Go's tsc is static and starts on both. The default release tsc needs glibc 2.28 or
+systems alike. Go's tsc is static and starts on both. The published `tsc-rs` packages are static
+too: the release workflow builds the Linux tsc as static musl, non-PIE, so it starts on any x64 or
+arm64 Linux, Alpine included.
+
+build-release.sh is different. Its default is a dynamic glibc build, which needs glibc 2.28 or
 later: on Alpine, or on a distro with an older glibc, it does not start, and the JS launcher fails
-too. `RELEASE_LIBC=musl RELEASE_PIE=0` in front of the build-release.sh line builds a static tsc
-that starts on any x86-64 Linux. It is 0.5 to 1.9% slower (see the build-release.sh header), so it
-is not the default.
+too. `RELEASE_LIBC=musl RELEASE_PIE=0` in front of the build-release.sh line builds the static tsc
+that the release ships. It is 0.5 to 1.9% slower (see the build-release.sh header), which is why
+build-release.sh does not default to it.
 
 ## tsc-rs releases
 
