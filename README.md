@@ -298,9 +298,9 @@ with `tsc-rs` 0.1.0 and R179 on Linux.
   reverse. Often the only difference is the file hashes in the reading project's `.tsbuildinfo`.
   Sometimes it is an error, such as TS2305, TS2307 or TS2322. Add the reference to fix it.
 - In the editor, memory grows slowly during long edit sessions: about 4 to 5 MiB per 1,000 edits in
-  our 10,000-edit sessions, where `tsc` grows about 2 to 3. It starts within 10% of `tsc`'s, and from
-  about edit 20 it stays below `tsc`'s. After 10,000 edits it was 259 MiB against `tsc`'s 306 MiB on
-  Query core, and 336 MiB against 414 MiB on Hono.
+  our 10,000-edit sessions, where `tsc` grows about 2.5 to 3.5. It starts within 10% of `tsc`'s, and
+  from about edit 20 it stays below `tsc`'s. After 10,000 edits it was 262 MiB against `tsc`'s 297 MiB
+  on Query core, and 346 MiB against 562 MiB on Hono.
 - `tsc-rs --version` prints the TypeScript version that it ports (7.1.0-dev), not the npm
   version. The compiler matches `typesVersions` against it.
 
