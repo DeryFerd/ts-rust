@@ -32,9 +32,10 @@
 #      the relocations. They do not change the code.
 #      Dynamic build: check that no bin needs a GLIBC_ symbol version above
 #      the floor (objdump -T).
-#   5. BOLT: record each bin with perf branch sampling on training runs
-#      (for tsgo, also editor sessions: RELEASE_LSP_SESSIONS), convert with
-#      perf2bolt, merge with merge-fdata, rewrite with llvm-bolt.
+#   5. BOLT: profile each bin on training runs (for tsgo, also editor
+#      sessions: RELEASE_LSP_SESSIONS), merge with merge-fdata, rewrite with
+#      llvm-bolt. The profile comes from perf branch sampling and perf2bolt,
+#      or from a counting copy of the bin (RELEASE_BOLT_PROFILE).
 #      Then check the program headers of the shipped bins (check_headers).
 #   6. Run tsgo in qemu on a CPU without AVX. A dynamic tsgo runs there on the
 #      glibc 2.28 of the sysroot.
@@ -111,6 +112,25 @@
 #     check 2 to 4%, T3 Code 1 to 3%), runs without it -0.6 to +2.0%, peak
 #     RSS 0.3% less (query -0.5 to -1.1 MiB).
 #
+# Measured on R195 source (tbxrel1, target/continuation-r97-goport/tbxrel1):
+# RELEASE_BOLT_PROFILE=instrument, two builds on Blacksmith testboxes
+# (testbox.sh release-build), against two lbr builds on zbook. tsgo -p on the
+# gate projects, effect without the plugin and T3 Code (4 cells); every bin
+# gives the same output.
+#   - st instructions:u +0.04 to +0.30% (testbox), peak RSS the same or up to
+#     11% lower (query: 10 MiB), default wall -4.3 to +0.5% (mini-743d; 7 of
+#     9 cells lower in both builds, effectnp +0.5% within its noise). Editor
+#     sessions (ls_edit_bench long, mini-743d): edit medians the same or up
+#     to 4% lower, RSS 10 to 20 MiB lower.
+#   - The zbook build's PGO bins with an instrument profile in place of the
+#     lbr one: st instructions:u -0.04 to -0.03%, peak RSS 1.2 to 12% lower.
+#     So the profile gives the RSS: every block that ran is in the hot text
+#     (6.7 MiB, lbr 4.0 MiB), none in .text.cold, so a run maps fewer code
+#     pages. The instructions come from the PGO build on the testbox.
+#   - The editor sessions are 12% of the tsgo counts at the default weight;
+#     with lbr on zbook (sample rate cap 3000) they are about 42% of the
+#     samples.
+#
 # Environment:
 #   RUSTUP_TOOLCHAIN  default 1.95.0. Its LLVM 22 matches the system
 #                     llvm-profdata (LLVM 22).
@@ -166,8 +186,21 @@
 #                     plain x86-64. CachyOS builds them for its CPU level
 #                     (zbook: AVX-512), so there use the Arch core glibc and
 #                     gcc packages of the same versions, extracted.
-#   RELEASE_BOLT      1 (default). 0: skip step 5, for hosts without llvm-bolt
-#                     or perf branch sampling (Intel LBR, AMD LBR v2 or BRS).
+#   RELEASE_BOLT      1 (default). 0: skip step 5, for hosts without llvm-bolt.
+#   RELEASE_BOLT_PROFILE  where the BOLT profile comes from. lbr (default):
+#                     perf branch sampling (Intel LBR, AMD LBR v2 or BRS) of
+#                     the bin, then perf2bolt. instrument: llvm-bolt
+#                     -instrument makes a counting copy of the bin, which runs
+#                     the same training and writes exact branch counts at exit
+#                     (libbolt_rt_instr.a, in the lib dir next to llvm-bolt's
+#                     bin dir). For hosts without branch sampling: VMs such as
+#                     the Blacksmith testboxes (scripts/goport/testbox.sh
+#                     release-build).
+#   BOLT_LSP_WEIGHT   instrument: the weight of the editor sessions' counts
+#                     against the CLI runs' counts (default 0.125, the ratio of
+#                     the two lbr sample rates below when the kernel cap does
+#                     not cut them). BUILD.txt records the share of the tsgo
+#                     counts that the sessions have.
 #   PGO_CORPUS_STEP   train on every Nth corpus case (default 60, about 200)
 #   BOLT_PERF_FREQ    perf sample frequency for BOLT (default 20000)
 #   RELEASE_LSP_SESSIONS  editor sessions of the tsgo BOLT training, as
@@ -259,6 +292,11 @@ version="${RELEASE_VERSION:-${GOPORT_BUILD_VERSION:-}}"
 if [[ -n $version ]]; then export GOPORT_BUILD_VERSION="$version"; else unset GOPORT_BUILD_VERSION; fi
 glibc_floor="${RELEASE_GLIBC_FLOOR:-2.28}"
 bolt="${RELEASE_BOLT:-1}"
+bolt_profile="${RELEASE_BOLT_PROFILE:-lbr}"
+case $bolt_profile in
+  lbr | instrument) ;;
+  *) echo "error: RELEASE_BOLT_PROFILE is lbr or instrument, not $bolt_profile" >&2; exit 1 ;;
+esac
 corpus_step="${PGO_CORPUS_STEP:-60}"
 lsp_sessions="${RELEASE_LSP_SESSIONS-query-core:300 hono:200 effect:300}"
 export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-1.95.0}"
@@ -303,12 +341,19 @@ if ((profdata_llvm > rustc_llvm)); then
   echo "error: llvm-profdata (LLVM $profdata_llvm) is newer than rustc's LLVM $rustc_llvm" >&2
   exit 1
 fi
-if [[ $bolt == 1 ]]; then
+if [[ $bolt == 1 && $bolt_profile == lbr ]]; then
   for tool in llvm-bolt perf2bolt merge-fdata llvm-objcopy perf; do
     command -v "$tool" > /dev/null || { echo "error: $tool not found (or set RELEASE_BOLT=0)" >&2; exit 1; }
   done
   perf record -q -e cycles:u -j any,u -o /dev/null -- true 2> /dev/null \
-    || { echo "error: perf branch sampling (-j any,u) does not work here (or set RELEASE_BOLT=0)" >&2; exit 1; }
+    || { echo "error: perf branch sampling (-j any,u) does not work here (set RELEASE_BOLT_PROFILE=instrument, or RELEASE_BOLT=0)" >&2; exit 1; }
+elif [[ $bolt == 1 ]]; then
+  for tool in llvm-bolt merge-fdata llvm-objcopy; do
+    command -v "$tool" > /dev/null || { echo "error: $tool not found (or set RELEASE_BOLT=0)" >&2; exit 1; }
+  done
+  # llvm-bolt -instrument links this runtime into the counting copy. Check it here, not after the PGO builds.
+  instr_lib="$(dirname -- "$(readlink -f -- "$(command -v llvm-bolt)")")/../lib/libbolt_rt_instr.a"
+  [[ -f $instr_lib ]] || { echo "error: no $instr_lib for llvm-bolt -instrument" >&2; exit 1; }
 fi
 
 command -v qemu-x86_64 > /dev/null || { echo "error: qemu-x86_64 not found (package qemu-user); step 6 needs it" >&2; exit 1; }
@@ -638,39 +683,66 @@ fi
 
 # 5. BOLT. No -use-gnu-stack: it drops PT_GNU_STACK (see the rules above).
 bolt_opts=(-reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -split-eh)
-p2b_opts=()
+p2b_opts=() skip_opts=()
 if [[ $static == 1 && $libc == gnu ]]; then
   # The static libgcc unwinder has jump tables that point into ".cold" parts
   # that BOLT cannot tie to their parent (3 local copies of
   # read_encoded_value_with_base). perf2bolt is strict by default and stops on
   # them. Keep these functions where they are. They only run on a panic.
   p2b_opts=(--strict=0)
-  bolt_opts+=("-skip-funcs=read_encoded_value_with_base.*,linear_search_fdes.*,fde_single_encoding_extract.*,fde_mixed_encoding_extract.*")
+  skip_opts=("-skip-funcs=read_encoded_value_with_base.*,linear_search_fdes.*,fde_single_encoding_extract.*,fde_mixed_encoding_extract.*")
 fi
 bolt_dir="$out/bolt"
+# The dir of the training runs' .tsbuildinfo and emit output. A counting copy
+# that trains beside the others has its own.
+work="$tmp"
 declare -A reps=([query]=12 [hono]=6 [zod]=4 [effect]=3 [effectnp]=3) # about 5 s of work per recording
 
-# rec <name> <reps> <cmd...>: one perf recording of <reps> runs, each without
-# old .tsbuildinfo or emit output in $tmp. freq (default BOLT_PERF_FREQ) sets
-# the sample frequency.
+# rec <name> <reps> <cmd...>: one recording of <reps> runs, each without old
+# .tsbuildinfo or emit output in $work. lbr: perf samples them into
+# data/<name>.data, at freq (default BOLT_PERF_FREQ). instrument: each run of
+# the counting bin writes $counts.<pid>.fdata at exit; they merge into
+# data/<name>.fdata. Fewer files than runs means a run wrote no counts.
 rec() {
-  local name=$1 count=$2
+  local name=$1 count=$2 files
   shift 2
-  perf record -q -e cycles:u -j any,u -F "${freq:-${BOLT_PERF_FREQ:-20000}}" -o "$bolt_dir/data/$name.data" -- bash -c \
-    'n=$1; t=$2; shift 2; for ((i = 0; i < n; i++)); do rm -rf "$t"/*.tsbuildinfo "$t"/out-*; "$@"; done; true' \
-    _ "$count" "$tmp" "$@" > "$bolt_dir/data/$name.out" 2>&1 || true
-  [[ -s "$bolt_dir/data/$name.data" ]] || { echo "error: no perf data for $name" >&2; exit 1; }
+  local runs=(bash -c 'n=$1; t=$2; shift 2; for ((i = 0; i < n; i++)); do rm -rf "$t"/*.tsbuildinfo "$t"/out-*; "$@"; done; true' _ "$count" "$work")
+  if [[ $bolt_profile == lbr ]]; then
+    perf record -q -e cycles:u -j any,u -F "${freq:-${BOLT_PERF_FREQ:-20000}}" -o "$bolt_dir/data/$name.data" -- \
+      "${runs[@]}" "$@" > "$bolt_dir/data/$name.out" 2>&1 || true
+    [[ -s "$bolt_dir/data/$name.data" ]] || { echo "error: no perf data for $name" >&2; exit 1; }
+    return
+  fi
+  "${runs[@]}" "$@" > "$bolt_dir/data/$name.out" 2>&1 || true
+  files=("$counts".*.fdata)
+  if [[ ! -s ${files[0]} ]] || ((${#files[@]} < count)); then
+    echo "error: $([[ -s ${files[0]} ]] && echo "${#files[@]}" || echo no) count files for the $count runs of $name" >&2
+    exit 1
+  fi
+  merge-fdata "${files[@]}" > "$bolt_dir/data/$name.fdata" 2> "$bolt_dir/data/$name.merge.log" \
+    || { tail -5 "$bolt_dir/data/$name.merge.log" >&2; exit 1; }
+  rm -f "${files[@]}"
 }
 
 # lsp_rec <name> <bin> <inputs-dir> <session>...: one recording of editor
-# sessions (lsp-train.py) at the lower sample frequency.
+# sessions (lsp-train.py), at the lower sample frequency (lbr) or with the
+# counts scaled by BOLT_LSP_WEIGHT (instrument). A branch that ran keeps a
+# count of at least 1.
 lsp_rec() {
   local name=$1 b=$2
   shift 2
   freq=${BOLT_LSP_PERF_FREQ:-2500} rec "$name" 1 python3 "$script_dir/lsp-train.py" "$b" "$@"
   grep -qx 'lsp-train: ok' "$bolt_dir/data/$name.out" \
     || { tail -5 "$bolt_dir/data/$name.out" >&2; echo "error: the editor sessions of the BOLT training failed" >&2; exit 1; }
+  if [[ $bolt_profile == instrument ]]; then
+    awk -v w="${BOLT_LSP_WEIGHT:-0.125}" 'NF >= 8 && $NF ~ /^[0-9]+$/ { c = int($NF * w + 0.5); $NF = c < 1 ? 1 : c } { print }' \
+      "$bolt_dir/data/$name.fdata" > "$bolt_dir/data/$name.fdata.scaled"
+    mv "$bolt_dir/data/$name.fdata.scaled" "$bolt_dir/data/$name.fdata"
+  fi
 }
+
+# fdata_sum <fdata>...: the sum of the branch counts.
+fdata_sum() { awk 'NF >= 8 && $NF ~ /^[0-9]+$/ { s += $NF } END { printf "%.0f\n", s }' "$@"; }
 
 # bolt_train <bin> <path>: the training runs of one bin.
 bolt_train() {
@@ -678,10 +750,10 @@ bolt_train() {
   case $1 in
     tsgo)
       for name in query hono zod effect effectnp; do
-        rec "tsgo-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --noEmit --pretty false --tsBuildInfoFile "$tmp/$name.tsbuildinfo"
+        rec "tsgo-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --noEmit --pretty false --tsBuildInfoFile "$work/$name.tsbuildinfo"
       done
       for name in query hono; do
-        rec "tsgo-emit-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --pretty false --outDir "$tmp/out-$name" --tsBuildInfoFile "$tmp/emit-$name.tsbuildinfo"
+        rec "tsgo-emit-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --pretty false --outDir "$work/out-$name" --tsBuildInfoFile "$work/emit-$name.tsbuildinfo"
       done
       # The editor sessions, at a lower sample frequency. The effect sessions
       # run again without the plugin, in a second recording (tsgo-lsp-np).
@@ -695,12 +767,12 @@ bolt_train() {
     goport)
       for name in query hono zod effect effectnp; do rec "goport-$name" "${reps[$name]}" "$b" -p "${projects[$name]}"; done ;;
     goport_emit)
-      for name in query hono; do rec "goport_emit-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --outDir "$tmp/out-$name"; done ;;
+      for name in query hono; do rec "goport_emit-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" --outDir "$work/out-$name"; done ;;
     goport_typesyms)
-      for name in query hono; do rec "goport_typesyms-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" -o "$tmp/out-$name"; done ;;
+      for name in query hono; do rec "goport_typesyms-$name" "${reps[$name]}" "$b" -p "${projects[$name]}" -o "$work/out-$name"; done ;;
     goport_build)
       # Writable copy of the query monorepo; the top-level node_modules is a link.
-      src="$P/query/source" dst="$tmp/query-build"
+      src="$P/query/source" dst="$work/query-build"
       mkdir -p "$dst"
       for e in "$src"/* "$src"/.[!.]*; do
         [[ -e $e || -L $e ]] || continue
@@ -713,10 +785,20 @@ bolt_train() {
   esac
 }
 
+# bin_env <bin>: exports the malloc variable that <bin> sets before it execs
+# itself, so its training runs do not exec.
+bin_env() {
+  local v
+  unset GLIBC_TUNABLES _RJEM_MALLOC_CONF
+  v="$(malloc_env "$1")"
+  [[ -z $v ]] || export "${v?}"
+}
+
 if [[ $bolt == 1 ]]; then
   rm -rf "$bolt_dir"
-  mkdir -p "$bolt_dir/input" "$bolt_dir/data"
+  mkdir -p "$bolt_dir/input" "$bolt_dir/data" "$bolt_dir/instr" "$bolt_dir/counts"
   libs_to "$bolt_dir/input"
+  [[ $bolt_profile == lbr ]] || libs_to "$bolt_dir/instr"
   for b in "${shipped[@]}"; do
     # BOLT reads a symbol with ".cold" or ".warm" in it as a split fragment and
     # stops ("parent function not found"). Rust paths make such names
@@ -724,25 +806,55 @@ if [[ $bolt == 1 ]]; then
     # "..Warm" (same length, only .symtab changes).
     nm "$use/$b" | awk '$2 ~ /^[tT]$/ && $3 ~ /\.\.(cold|warm)/ {r = $3; gsub(/\.\.cold/, "..Cold", r); gsub(/\.\.warm/, "..Warm", r); print $3, r}' > "$bolt_dir/$b.rename.txt"
     llvm-objcopy --redefine-syms="$bolt_dir/$b.rename.txt" "$use/$b" "$bolt_dir/input/$b"
-    # The bin sets its malloc variable and execs itself unless the caller set it.
-    unset GLIBC_TUNABLES _RJEM_MALLOC_CONF
-    tunables="$(malloc_env "$b")"
-    [[ -n $tunables ]] && export "${tunables?}"
-    bolt_train "$b" "$bolt_dir/input/$b"
-    for d in "$bolt_dir/data/$b"-*.data; do
-      perf2bolt "${p2b_opts[@]}" -p "$d" -o "${d%.data}.fdata" "$bolt_dir/input/$b" > "${d%.data}.p2b.log" 2>&1 \
-        || { tail -5 "${d%.data}.p2b.log" >&2; exit 1; }
-      # Samples in the kernel (and, when dynamic, in libc) count as unknown:
-      # 10 to 25%. Most of them unknown means the samples did not map to the bin.
-      pct="$(sed -n 's/.*involving unknown regions: [0-9]* (\([0-9]*\)\..*/\1/p' "${d%.data}.p2b.log")"
-      [[ -n $pct ]] && ((pct < 50)) || { echo "error: the samples in $d do not map to $b" >&2; exit 1; }
+    [[ $bolt_profile == instrument ]] || continue
+    # The counting copy. Its counts use the addresses of the input, so
+    # llvm-bolt reads them as it reads perf2bolt's.
+    llvm-bolt "$bolt_dir/input/$b" -o "$bolt_dir/instr/$b" -instrument -instrumentation-file="$bolt_dir/counts/$b" \
+      -instrumentation-file-append-pid -instrumentation-binpath="$bolt_dir/instr/$b" "${skip_opts[@]}" \
+      > "$bolt_dir/$b.instr.log" 2>&1 || { tail -20 "$bolt_dir/$b.instr.log" >&2; exit 1; }
+  done
+  if [[ $bolt_profile == lbr ]]; then
+    for b in "${shipped[@]}"; do
+      bin_env "$b"
+      bolt_train "$b" "$bolt_dir/input/$b"
+      for d in "$bolt_dir/data/$b"-*.data; do
+        perf2bolt "${p2b_opts[@]}" -p "$d" -o "${d%.data}.fdata" "$bolt_dir/input/$b" > "${d%.data}.p2b.log" 2>&1 \
+          || { tail -5 "${d%.data}.p2b.log" >&2; exit 1; }
+        # Samples in the kernel (and, when dynamic, in libc) count as unknown:
+        # 10 to 25%. Most of them unknown means the samples did not map to the bin.
+        pct="$(sed -n 's/.*involving unknown regions: [0-9]* (\([0-9]*\)\..*/\1/p' "${d%.data}.p2b.log")"
+        [[ -n $pct ]] && ((pct < 50)) || { echo "error: the samples in $d do not map to $b" >&2; exit 1; }
+      done
     done
+    unset GLIBC_TUNABLES _RJEM_MALLOC_CONF
+  else
+    # The counting copies train at the same time, each in its own work dir:
+    # counts do not depend on timing, as samples do. The copies run 6 to 8
+    # times slower than the bins.
+    pids=()
+    for b in "${shipped[@]}"; do
+      (
+        bin_env "$b"
+        counts="$bolt_dir/counts/$b" work="$tmp/train-$b"
+        mkdir -p "$work"
+        bolt_train "$b" "$bolt_dir/instr/$b"
+      ) > "$bolt_dir/$b.train.log" 2>&1 &
+      pids+=("$!")
+    done
+    for i in "${!shipped[@]}"; do
+      wait "${pids[$i]}" && continue
+      kill "${pids[@]}" 2> /dev/null || true
+      tail -5 "$bolt_dir/${shipped[$i]}.train.log" >&2
+      echo "error: the BOLT training of ${shipped[$i]} failed" >&2
+      exit 1
+    done
+  fi
+  for b in "${shipped[@]}"; do
     merge-fdata "$bolt_dir/data/$b"-*.fdata > "$bolt_dir/$b.fdata" 2> "$bolt_dir/$b.merge.log"
-    llvm-bolt "$bolt_dir/input/$b" -o "$out/bin/$b" -data="$bolt_dir/$b.fdata" "${bolt_opts[@]}" > "$bolt_dir/$b.bolt.log" 2>&1 \
+    llvm-bolt "$bolt_dir/input/$b" -o "$out/bin/$b" -data="$bolt_dir/$b.fdata" "${bolt_opts[@]}" "${skip_opts[@]}" > "$bolt_dir/$b.bolt.log" 2>&1 \
       || { tail -20 "$bolt_dir/$b.bolt.log" >&2; exit 1; }
     echo "bolt $b: $(grep -m1 -o '[0-9]* out of [0-9]* functions in the binary ([0-9.]*%) have non-empty execution profile' "$bolt_dir/$b.bolt.log" || true)"
   done
-  unset GLIBC_TUNABLES _RJEM_MALLOC_CONF
 fi
 
 # check_headers <bin>: fails unless the bin has one PT_GNU_STACK and it is RW
@@ -777,10 +889,14 @@ echo "headers: all bins have a RW PT_GNU_STACK and a program header table that o
 # found") exits 1, which is also a tsgo exit code. The malloc variable is set
 # so the run stays in qemu: an exec would run the new image on the host CPU.
 # Any GLIBC_TUNABLES value stops the glibc re-exec.
+# LD_LIBRARY_PATH=/usr/lib (the sysroot's, through -L) comes before the
+# host's ld.so.cache, which can name other dirs that -L does not map: on
+# Ubuntu (a testbox) the 2.28 loader read /lib/x86_64-linux-gnu from it and
+# loaded the host's libc 2.39 (exit 127).
 tunables="$(malloc_env tsgo)"
 [[ $jemalloc == 1 ]] || tunables="GLIBC_TUNABLES=glibc.malloc.hugetlb=1"
 qemu=(qemu-x86_64 -cpu qemu64)
-[[ $static == 1 ]] || qemu+=(-L "$glibc_root")
+[[ $static == 1 ]] || qemu+=(-L "$glibc_root" -E LD_LIBRARY_PATH=/usr/lib)
 # check_run <name> <log> <cmd...>: runs tsgo on project <name>, prints the
 # exit code.
 check_run() {
@@ -830,10 +946,18 @@ done
   echo "version: $("$out/bin/tsgo" -v) (RELEASE_VERSION ${version:-unset})"
   echo "lib files: $([[ $noembed == 1 ]] && echo "next to the bins (noembed)" || echo "embedded")"
   if [[ $bolt == 1 ]]; then
-    echo "bolt: $(llvm-bolt --version | grep -m1 'LLVM version' | xargs), ${bolt_opts[*]}"
-    echo "bolt perf: -F ${BOLT_PERF_FREQ:-20000}, kernel.perf_event_max_sample_rate $(cat /proc/sys/kernel/perf_event_max_sample_rate 2> /dev/null || echo unknown) at the end"
+    echo "bolt: $(llvm-bolt --version | grep -m1 'LLVM version' | xargs), ${bolt_opts[*]}${skip_opts[*]:+ ${skip_opts[*]}}"
+    if [[ $bolt_profile == lbr ]]; then
+      echo "bolt perf: -F ${BOLT_PERF_FREQ:-20000}, kernel.perf_event_max_sample_rate $(cat /proc/sys/kernel/perf_event_max_sample_rate 2> /dev/null || echo unknown) at the end"
+    else
+      lsp_share=""
+      if [[ -n $lsp_sessions ]]; then
+        lsp_share=", the editor sessions $(awk -v a="$(fdata_sum "$bolt_dir/data"/tsgo-lsp*.fdata)" -v b="$(fdata_sum "$bolt_dir/data"/tsgo-*.fdata)" 'BEGIN { printf "%.1f", 100 * a / b }')% of the tsgo counts"
+      fi
+      echo "bolt profile: instrument (llvm-bolt -instrument)$lsp_share"
+    fi
     if [[ -n $lsp_sessions ]]; then
-      echo "bolt editor sessions (tsgo, ${BOLT_LSP_PERF_FREQ:-2500} Hz): $({ sed -n 's/^lsp-train: \(.*\): [0-9]* of .*/\1/p' "$bolt_dir/data/tsgo-lsp.out"; sed -n 's/^lsp-train: \(.*\): [0-9]* of .*/\1 (no plugin)/p' "$bolt_dir/data/tsgo-lsp-np.out"; } 2> /dev/null | paste -sd';' | sed 's/;/; /g'); ls_edit_bench.py sha256 $(sha256sum "$repo/scripts/goport/ls_edit_bench.py" | cut -c1-12)"
+      echo "bolt editor sessions (tsgo, $([[ $bolt_profile == lbr ]] && echo "${BOLT_LSP_PERF_FREQ:-2500} Hz" || echo "weight ${BOLT_LSP_WEIGHT:-0.125}")): $({ sed -n 's/^lsp-train: \(.*\): [0-9]* of .*/\1/p' "$bolt_dir/data/tsgo-lsp.out"; sed -n 's/^lsp-train: \(.*\): [0-9]* of .*/\1 (no plugin)/p' "$bolt_dir/data/tsgo-lsp-np.out"; } 2> /dev/null | paste -sd';' | sed 's/;/; /g'); ls_edit_bench.py sha256 $(sha256sum "$repo/scripts/goport/ls_edit_bench.py" | cut -c1-12)"
     fi
   else
     echo "bolt: off"
