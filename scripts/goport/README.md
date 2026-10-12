@@ -436,7 +436,9 @@ scripts/goport/testbox.sh stop                                  # or release (se
   come back to the same zbook paths; the compares and records stay on zbook, and the evidence key and cache are
   the same. The default host stays dbook-lan until a batch lists the change; it is also the fallback after a
   testbox failure (finished steps stay cached). R190 source, 2026-10-11: 27.9 min against 29.1 min for zbook and
-  dbook-lan, with the same results (target/continuation-r97-goport/tbxside1/summary.md).
+  dbook-lan, with the same results (target/continuation-r97-goport/tbxside1/summary.md). R195 source: 28.8 min
+  against 33.2 min (the int62 side run and R195's bound runs and quality), with the same results
+  (target/continuation-r97-goport/tbxside2).
   - Test bins of another checkout (an integration's side run) also run there: the testbox gets their commit
     (from origin, or from the checkout's bundle) and their two bind paths.
   - Host kinds: testbox, or ssh (zbook and the SSH hosts). With `batch.oracleRebase`, the rebase runs and the
