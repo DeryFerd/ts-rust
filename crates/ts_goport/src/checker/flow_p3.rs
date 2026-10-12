@@ -1032,9 +1032,11 @@ impl Checker {
     pub fn is_reachable_flow_node(&mut self, flow: FlowNodeId) -> bool {
         // flowskip1 verify: an effect site (flow_skip.rs).
         self.flow_skip.effects += 1;
-        let f = self.get_flow_state();
-        let result = self.is_reachable_flow_node_worker(&f, flow, false /*noCacheCheck*/);
-        self.put_flow_state(f);
+        let result = self.is_reachable_flow_node_worker(
+            &mut FlowState::default(),
+            flow,
+            false, /*noCacheCheck*/
+        );
         self.last_flow_node = flow;
         self.last_flow_node_reachable = result;
         result
@@ -1043,7 +1045,7 @@ impl Checker {
     // Go: checker/flow.go:2522 isReachableFlowNodeWorker
     pub fn is_reachable_flow_node_worker(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         flow: FlowNodeId,
         no_cache_check: bool,
     ) -> bool {
@@ -1054,11 +1056,12 @@ impl Checker {
                 return self.last_flow_node_reachable;
             }
             // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            // flowcost1: the walk's cached flow nodes (`FlowState::flow_data`).
             let mut flow_data_guard = None;
-            let flow_data = flow.get_flow_in(&mut flow_data_guard);
+            let flow_data = f.flow_data(flow, &mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
-                if !no_cache_check && f.borrow().reduce_labels.is_empty() {
+                if !no_cache_check && f.reduce_labels.is_empty() {
                     if let Some(&reachable) = self.flow_node_reachable.get(&flow) {
                         return reachable;
                     }
@@ -1098,8 +1101,7 @@ impl Checker {
                 flow = flow_data.antecedent;
             } else if flags.intersects(FlowFlags::BRANCH_LABEL) {
                 // A branching point is reachable if any branch is reachable.
-                let antecedents =
-                    get_branch_label_antecedents(flow, flow_data, &f.borrow().reduce_labels);
+                let antecedents = get_branch_label_antecedents(flow, flow_data, &f.reduce_labels);
                 for &antecedent in antecedents.iter() {
                     if self
                         .is_reachable_flow_node_worker(f, antecedent, false /*noCacheCheck*/)
@@ -1127,15 +1129,13 @@ impl Checker {
             } else if flags.intersects(FlowFlags::REDUCE_LABEL) {
                 // Cache is unreliable once we start adjusting labels
                 self.last_flow_node = FlowNodeId::NIL;
-                f.borrow_mut()
-                    .reduce_labels
-                    .push(ReduceLabel::of(flow_data));
+                f.reduce_labels.push(ReduceLabel::of(flow_data));
                 let result = self.is_reachable_flow_node_worker(
                     f,
                     flow_data.antecedent,
                     false, /*noCacheCheck*/
                 );
-                f.borrow_mut().reduce_labels.pop();
+                f.reduce_labels.pop();
                 return result;
             } else {
                 return !flags.intersects(FlowFlags::UNREACHABLE);
@@ -1165,16 +1165,13 @@ impl Checker {
     // leading to the node.
     // Go: checker/flow.go:2604 isPostSuperFlowNode
     pub fn is_post_super_flow_node(&mut self, flow: FlowNodeId, no_cache_check: bool) -> bool {
-        let f = self.get_flow_state();
-        let result = self.is_post_super_flow_node_worker(&f, flow, no_cache_check);
-        self.put_flow_state(f);
-        result
+        self.is_post_super_flow_node_worker(&mut FlowState::default(), flow, no_cache_check)
     }
 
     // Go: checker/flow.go:2611 isPostSuperFlowNodeWorker
     pub fn is_post_super_flow_node_worker(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         flow: FlowNodeId,
         no_cache_check: bool,
     ) -> bool {
@@ -1182,8 +1179,9 @@ impl Checker {
         let mut no_cache_check = no_cache_check;
         loop {
             // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            // flowcost1: the walk's cached flow nodes (`FlowState::flow_data`).
             let mut flow_data_guard = None;
-            let flow_data = flow.get_flow_in(&mut flow_data_guard);
+            let flow_data = f.flow_data(flow, &mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
                 if !no_cache_check {
@@ -1211,8 +1209,7 @@ impl Checker {
                 }
                 flow = flow_data.antecedent;
             } else if flags.intersects(FlowFlags::BRANCH_LABEL) {
-                let antecedents =
-                    get_branch_label_antecedents(flow, flow_data, &f.borrow().reduce_labels);
+                let antecedents = get_branch_label_antecedents(flow, flow_data, &f.reduce_labels);
                 for &antecedent in antecedents.iter() {
                     if !self
                         .is_post_super_flow_node_worker(f, antecedent, false /*noCacheCheck*/)
@@ -1225,15 +1222,13 @@ impl Checker {
                 // A loop is post-super if the control flow path that leads to the top is post-super.
                 flow = flow_data.antecedents[0];
             } else if flags.intersects(FlowFlags::REDUCE_LABEL) {
-                f.borrow_mut()
-                    .reduce_labels
-                    .push(ReduceLabel::of(flow_data));
+                f.reduce_labels.push(ReduceLabel::of(flow_data));
                 let result = self.is_post_super_flow_node_worker(
                     f,
                     flow_data.antecedent,
                     false, /*noCacheCheck*/
                 );
-                f.borrow_mut().reduce_labels.pop();
+                f.reduce_labels.pop();
                 return result;
             } else {
                 // Unreachable nodes are considered post-super to silence errors
