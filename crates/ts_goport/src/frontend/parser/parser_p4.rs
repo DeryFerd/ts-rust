@@ -1560,6 +1560,11 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:5301 tryParseTypeArgumentsInExpression
+    // PERF: parsefast2. The member and call expression loops call this for
+    // nearly every expression, and nearly every call returns at the first
+    // test. The test is inline and the speculative parse is out of line, so
+    // that return does not pay for the large frame of the parse.
+    #[inline]
     pub fn try_parse_type_arguments_in_expression(&mut self) -> NodeList {
         // TypeArguments must not be parsed in JavaScript files to avoid ambiguity with binary operators.
         // Check the cheap preconditions before saving the parser state: unless the current token is `<`
@@ -1571,6 +1576,13 @@ impl<'a> Parser<'a> {
         {
             return NodeList::NIL;
         }
+        self.try_parse_type_arguments_in_expression_at_less_than()
+    }
+
+    /// The part of `try_parse_type_arguments_in_expression` after its first
+    /// test.
+    #[inline(never)]
+    fn try_parse_type_arguments_in_expression_at_less_than(&mut self) -> NodeList {
         let state = self.mark();
         if self.re_scan_less_than_token() == SyntaxKind::LessThanToken {
             self.next_token();
