@@ -2597,14 +2597,16 @@ mod tests {
     use super::*;
 
     /// The candidate lists of an `InferenceInfo` against two plain lists:
-    /// the inline first candidate keeps the order of both lists.
+    /// the inline first candidate keeps the order of both lists. The clear
+    /// comes before any candidate, after the inline one only, after the
+    /// box is made, or not at all.
     #[test]
     fn inference_info_candidates_match_lists() {
-        for pattern in 0u32..64 {
+        for (pattern, clear_at) in (0u32..64).flat_map(|p| [0, 1, 2, 4, 6].map(|c| (p, c))) {
             let mut info = InferenceInfo::default();
             let (mut co, mut contra) = (Vec::new(), Vec::new());
             for i in 0..6u32 {
-                if i == 4 && pattern & 32 != 0 {
+                if i == clear_at {
                     info.clear_candidates();
                     co.clear();
                     contra.clear();
@@ -2663,6 +2665,39 @@ mod tests {
             assert_eq!(map.len(), 0);
             assert_ne!(map.generation, 0);
         }
+    }
+
+    /// The clear that wraps the generation to 0 must empty the old slots:
+    /// a slot of generation 1 would read as a key of the new generation 1.
+    /// The insert at the last generation can take the slot of one of the
+    /// three old keys, not of all of them.
+    #[test]
+    fn inference_visited_map_wrap_empties_old_slots() {
+        let key = |n: u32| InferenceKey {
+            source: TypeId(n),
+            target: TypeId(n),
+            priority: InferencePriority(0),
+            contravariant: false,
+            bivariant: false,
+        };
+        let mut map = InferenceVisitedMap::default();
+        for n in 1..=3 {
+            map.insert(key(n), InferencePriority(1));
+        }
+        map.clear();
+        map.generation = u32::MAX;
+        map.insert(key(4), InferencePriority(2));
+        map.clear();
+        assert_eq!(map.generation, 1);
+        for n in 1..=4 {
+            assert_eq!(map.get(&key(n)), None, "{n}");
+        }
+        map.insert(key(5), InferencePriority(3));
+        assert_eq!(map.len(), 1);
+        for n in 1..=4 {
+            assert_eq!(map.get(&key(n)), None, "{n}");
+        }
+        assert_eq!(map.get(&key(5)), Some(InferencePriority(3)));
     }
 
     #[test]

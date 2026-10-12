@@ -6,7 +6,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
-- **Now (2026-10-12):** R200 accepted (int67; note r200-accepted-2026-10-12; main f7e64e188). Running: after-r200 (int68b = inferfast1, instfast1, deferbody1, parsefast2, loadserial1, followups49 on R200 with checks and timing-r201, then R201; storefast1 = AST store parse costs; followups50 = R200 reviewer items). Parked: shared type store (note sharedstore-parked-2026-10-12), flowmemo (note flowmemo-parked-2026-10-12). Waiting for Theo: a v0.5.0 release (--fast and the R199 to R201 gains) and whether --fast becomes the default (decision C). Follow-ups: the accept_revision.py latestHono record (exit 0 and 0 diagnostics against the gate's exit 2 and 2 diagnostics); the UPSTREAM.json current switch in a quiet window; the parallel loader root files (parload1 next idea).
+- **Now (2026-10-12):** R201 accepted (int68b; note r201-accepted-2026-10-12; main 1c17c0b3d). v0.5.0 released (note release-v050-2026-10-12). Running: int69 (stacked on int68b: storefast1, followups50; becomes R202 after a main merge), perfwave4 (storefast2, checkid1), edleak1 (editor memory leak, note editorgrowth1-result-2026-10-12). Ready for int70: parload2 7ede33791. Waiting for Theo: the Hono record fix (note honorec1-result-2026-10-12). Parked: shared type store, flowmemo. Follow-ups: the UPSTREAM.json current switch in a quiet window; R201 reviewer items (followups51).
 
 - **Public issues 2026-10-11 (note issues52-result-2026-10-11):** #52 replied (effect-tsgo 0.51.1 parity, workaround, upstream Effect-TS/tsgo#820, labeled; port the upstream fix when it lands). #49: PR #53 merged (ef82c3e59, light path). #50: PR #54 (loader: into int61; macOS CI runs realpath_case.rs).
 

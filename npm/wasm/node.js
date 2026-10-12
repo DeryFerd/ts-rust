@@ -15,9 +15,12 @@ const STACK_SIZE_MB = 256;
 
 let modulePromise;
 
-/** The compiled module, compiled on first use. */
+/** The compiled module, compiled on first use. Failed loads can be retried. */
 export function loadModule() {
-    modulePromise ??= readFile(wasmUrl).then(bytes => WebAssembly.compile(bytes));
+    modulePromise ??= readFile(wasmUrl).then(bytes => WebAssembly.compile(bytes)).catch(error => {
+        modulePromise = undefined;
+        throw error;
+    });
     return modulePromise;
 }
 
@@ -60,6 +63,9 @@ export async function tsc(args, options = {}) {
     }
     const worker = new Worker(new URL("./node-worker.js", import.meta.url), {
         workerData: request,
+        execArgv: process.execArgv.filter((arg, index, args) =>
+            arg !== "--input-type" && !arg.startsWith("--input-type=") && args[index - 1] !== "--input-type"
+        ),
         resourceLimits: { stackSizeMb: options.stackSizeMb ?? STACK_SIZE_MB },
         stdout: !options.stream,
         stderr: !options.stream,

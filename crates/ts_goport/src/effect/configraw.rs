@@ -235,8 +235,10 @@ fn get_effect_plugin_raw(
 
 const CONFIG_DIR_TEMPLATE: &str = "${configDir}";
 
+// Go: effectconfigraw/hooks.go:323 startsWithConfigDirTemplate
+// PORT: Go `strings.ToLower` (`strings_to_lower`), not `to_lowercase`:
+// `${confİgDir}` (U+0130) starts with the template in Go.
 fn starts_with_config_dir_template(value: &str) -> bool {
-    value
-        .to_lowercase()
-        .starts_with(&CONFIG_DIR_TEMPLATE.to_lowercase())
+    crate::frontend::tsoptions::decls::strings_to_lower(value)
+        .starts_with(&CONFIG_DIR_TEMPLATE.to_ascii_lowercase())
 }

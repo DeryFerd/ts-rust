@@ -190,10 +190,6 @@ pub struct Parser<'a> {
     /// list or diagnostic that ends there or later may need a map to the
     /// file (`jsdoc_tail_pos`).
     pub jsdoc_tail_first: i32,
-    /// True when `source_text` holds no `GO_STRING_MARKER`; the scanner
-    /// then takes string token values as text slices
-    /// (`Scanner::set_text_has_no_go_string_marker`).
-    pub source_text_has_no_go_string_marker: bool,
 }
 
 // Go: parser.go:104 newParser
@@ -231,7 +227,6 @@ pub fn new_parser<'a>() -> Parser<'a> {
         store: 0,
         jsdoc_cut_text: None,
         jsdoc_tail_first: i32::MAX,
-        source_text_has_no_go_string_marker: false,
     };
     res.initialize_closures();
     res
@@ -301,7 +296,10 @@ pub fn parse_source_file(
         .and_then(|text| super::lib_parse_snapshot::load(p.store, opts, text, script_kind));
     let result = match loaded {
         Some(loaded) => loaded.file,
-        None => p.parse_into_store(),
+        None => {
+            p.skip_go_string_marker_scans();
+            p.parse_into_store()
+        }
     };
     // PORT: only the tsconfig parser reads this table, and it parses no
     // file of the parse cache. A freeable parse (an edited source file)
@@ -390,6 +388,7 @@ pub fn parse_source_file_detached_reading<R>(
         };
         return (parse, read);
     }
+    p.skip_go_string_marker_scans();
     let file = p.parse_into_store();
     let import_specifiers = file.imports.iter().map(|n| n.text().to_string()).collect();
     let read = read(&file);
@@ -648,11 +647,6 @@ impl<'a> Parser<'a> {
             _ => NodeFlags::NONE,
         };
         self.scanner.set_text(self.source_text);
-        // PERF: parsefast2. One scan of the text, not one per string token.
-        self.source_text_has_no_go_string_marker =
-            !crate::scanner_util::contains_go_string_marker(self.source_text);
-        self.scanner
-            .set_text_has_no_go_string_marker(self.source_text_has_no_go_string_marker);
         // Go: p.scanner.SetOnError(p.scanError)
         let diagnostics = Rc::clone(&self.diagnostics);
         let on_error: ErrorCallback = Box::new(move |message, pos, length, args| {
@@ -660,6 +654,21 @@ impl<'a> Parser<'a> {
         });
         self.scanner.set_on_error(Some(on_error));
         self.scanner.set_language_variant(self.language_variant);
+    }
+
+    /// Scans the whole text once for `GO_STRING_MARKER` and tells the
+    /// scanner, so string token values skip the scan of each value
+    /// (`Scanner::set_text_has_no_go_string_marker`). A whole-file parse
+    /// calls it right before `parse_into_store`, not for a lib that loads
+    /// from the snapshot: the scan would read the whole lib text, which
+    /// the snapshot load does not (2.3 MiB more RSS on query-core, mostly
+    /// lib.dom.d.ts). A lazy JSDoc parse (`parse_js_doc_for_node`) does not
+    /// call it either: it reads a few values of a file that it would scan
+    /// whole on each call.
+    // PERF: parsefast2. Go uses the slice as is.
+    fn skip_go_string_marker_scans(&mut self) {
+        let no_marker = !crate::scanner_util::contains_go_string_marker(self.source_text);
+        self.scanner.set_text_has_no_go_string_marker(no_marker);
     }
 
     // Go: parser.go:322 parseErrorAt
