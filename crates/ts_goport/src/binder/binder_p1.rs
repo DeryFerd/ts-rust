@@ -684,6 +684,9 @@ impl Binder {
         debug_assert!(is_computed_name || !has_dynamic_name_in(node, data));
         // PERF: parsefast1 item 2. The kind is read once (Go reads `Kind`).
         let kind = node.kind();
+        // Go `ast.IsExportSpecifier(node)` (binder.go:153), inline. Its kind
+        // at pin fed0bf24149f:
+        // Go: ast/ast_generated.go:2954 IsExportSpecifier
         let is_default_export = has_syntactic_modifier_in(node, data, ModifierFlags::DEFAULT)
             || kind == SyntaxKind::ExportSpecifier
                 && module_export_name_is_default(node.name_in(data));
@@ -925,8 +928,10 @@ impl Binder {
         let name = get_name_of_declaration_in(node, d);
         if name.is_some() {
             let name_kind = name.kind();
-            // Go `ast.IsAmbientModule(node)`: the name of a module
-            // declaration is `name`.
+            // Go `ast.IsAmbientModule(node)` (binder.go:306), inline: the
+            // name of a module declaration is `name`. Its kinds at pin
+            // fed0bf24149f:
+            // Go: ast/utilities.go:1658 IsAmbientModule
             if kind == SyntaxKind::ModuleDeclaration
                 && (name_kind == SyntaxKind::StringLiteral || is_global_scope_augmentation(node))
             {
@@ -961,7 +966,10 @@ impl Binder {
                 self.symbols.note_private_name(&private_name);
                 return private_name;
             }
-            // Go `ast.IsPropertyNameLiteral(name) || ast.IsJsxNamespacedName(name)`.
+            // Go `ast.IsPropertyNameLiteral(name) || ast.IsJsxNamespacedName(name)`
+            // (binder.go:327), inline. Their kinds at pin fed0bf24149f:
+            // Go: ast/utilities.go:260 IsPropertyNameLiteral
+            // Go: ast/ast_generated.go:6468 IsJsxNamespacedName
             if matches!(
                 name_kind,
                 SyntaxKind::Identifier

@@ -330,9 +330,19 @@ impl Checker {
         // PERF: portonly1 item 3. Go tests `node.Modifiers() == nil`
         // (grammarchecks.go:215). A published store node reads that from its
         // modifier bits column, without its node data: a parsed modifier list
-        // is never empty (Go parser.go:3967 makes no list for no modifiers, and
-        // reparser.go:564 and :705 make lists of one or more), and each
-        // modifier and decorator kind has a flag, so no bits means no list.
+        // is never empty, and each modifier and decorator kind has a flag, so
+        // no bits means no list. Go's parser makes a modifier list at 6 sites
+        // (pin fed0bf24149f), all through `newModifierList` (parser.go:5984),
+        // and each list has one or more nodes:
+        // - parser.go:2270 parseModuleOrNamespaceDeclaration: the implicit
+        //   `export` of a nested namespace (1 node);
+        // - parser.go:3876 parseModifiersForConstructorType: `abstract`
+        //   (1 node);
+        // - parser.go:3968 parseModifiersEx: only when `len(list) != 0`;
+        // - parser.go:4518 parseModifiersForArrowFunction: `async` (1 node);
+        // - reparser.go:564 reparseHosted: a JSDoc readonly, access or
+        //   override tag (the old nodes plus 1);
+        // - reparser.go:705 createExportModifier: `export` (1 node).
         if frozen_store_modifier_flags(node) == Some(ModifierFlags::NONE) {
             debug_assert!(node.modifiers().is_nil(), "modifier bits without a list");
             return false;
@@ -1334,8 +1344,16 @@ impl Checker {
             // PERF: portonly1 item 3. Go reads the fields of
             // `parameters.Nodes[i].AsParameterDeclaration()` (grammarchecks.go:692)
             // from one struct; `parameter_parts` reads them with one node data
-            // load. Go's `AsParameterDeclaration` panics on another kind, and
-            // so do the field accessors.
+            // load. A parameter list holds only ParameterDeclaration nodes.
+            // For another kind, Go panics too: `AsParameterDeclaration`
+            // (ast_generated.go:9158) is the type assertion
+            // `n.data.(*ParameterDeclaration)`. The fallback below keeps the
+            // old reads (3 field accessors at once). Of these, only
+            // `dot_dot_dot_token` panics (`field_panic`), for a kind other
+            // than Parameter, BindingElement, NamedTupleMember and
+            // JsxExpression; `question_token` and `initializer` return NIL.
+            // So the port panics for fewer kinds than Go here, but no such
+            // kind can be in a parameter list.
             let parts = parameter_parts(parameter).unwrap_or_else(|| ParameterParts {
                 dot_dot_dot_token: parameter.dot_dot_dot_token(),
                 question_token: parameter.question_token(),

@@ -397,8 +397,18 @@ fn effect_fn_comments(sf: Node, start: i32, end: i32, moved: Node) -> String {
         {
             return effect_fn_comments(sf, moved.end().min(end), end, moved);
         }
+        // Go's `default` case on that token: the token call, which can
+        // panic as Go's does. Its token does not change the result, because
+        // the next scan is EndOfFile.
+        get_token_at_position(sf, start);
         return String::new();
     }
+    // PORT: Go `sf.Text()[start:end]`. `start` is a char boundary here, and
+    // each caller's `end` is a node or token bound (`signature.pos()`,
+    // `body_start`, `arg.pos()`, `target.end()`), so this byte slice is Go's
+    // slice. A cut `end` would need the port form of `go_text_slice`, whose
+    // escape units are longer than Go's bytes and would move the scanner
+    // offsets below away from the file positions.
     let text = &file_text[start as usize..end as usize];
     let slice = |a: i32, b: i32| &text[a as usize..b as usize];
     let mut s = new_scanner();
