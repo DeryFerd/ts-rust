@@ -1506,6 +1506,12 @@ struct PrefetchJob {
     /// mapper's virtual text (`prefetch_mapped`).
     // PORT: not in Go, where the parse goroutines transform (tsgo#4712).
     mapped: Option<Arc<ConcurrentTransform>>,
+    /// When the job was queued, for the debug counts of a claim
+    /// (`GOPORT_PREFETCH_STATS`). `None` without them.
+    queued_at: Option<std::time::Instant>,
+    /// True when a loader batch put the job below the others
+    /// (`queue_batch`), for the debug counts.
+    under: AtomicBool,
 }
 
 enum PrefetchState {
@@ -1862,6 +1868,9 @@ struct PrefetchQueue {
     /// They wait on `ready` too (`PrefetchShared::wake`).
     // PORT: not in Go (see `PrefetchJob::mapped`).
     mapped_workers: bool,
+    /// True when the debug counts are kept (`GOPORT_PREFETCH_STATS`): jobs
+    /// note when they are queued.
+    timed: bool,
 }
 
 impl PrefetchQueue {
@@ -1897,6 +1906,8 @@ impl PrefetchQueue {
             done: Condvar::new(),
             prep: Mutex::new(None),
             mapped,
+            queued_at: self.timed.then(std::time::Instant::now),
+            under: AtomicBool::new(false),
         });
         self.next_job += 1;
         self.by_name.insert(job.opts.file_name.clone(), job.clone());
@@ -2142,6 +2153,13 @@ pub(crate) struct PrefetchStats {
     /// (another mode than the worker's).
     pub(crate) names_taken: usize,
     pub(crate) names_own: usize,
+    /// Per claimed job: how long it was queued, the jobs on the worker
+    /// stack then, and whether a loader batch put it below the others.
+    claims: Vec<(std::time::Duration, usize, bool)>,
+    /// When the pool started, the workers, and their time on jobs.
+    started: Option<std::time::Instant>,
+    workers: usize,
+    busy: std::time::Duration,
 }
 
 impl PrefetchStats {
@@ -2192,6 +2210,41 @@ impl PrefetchStats {
             self.preps_unfit,
             self.preps_missing,
         );
+        // parload1: why jobs were still queued when the loader came.
+        let bucket = |age: std::time::Duration| match age.as_micros() {
+            0..100 => 0,
+            100..1000 => 1,
+            1000..10000 => 2,
+            _ => 3,
+        };
+        let mut ages = [[0usize; 4]; 2];
+        let mut pending = [0usize; 2];
+        for &(age, stack, under) in &self.claims {
+            let side = usize::from(!under);
+            ages[side][bucket(age)] += 1;
+            pending[side] += stack;
+        }
+        for (side, label) in [(0, "under"), (1, "other")] {
+            let count: usize = ages[side].iter().sum();
+            eprintln!(
+                "goport prefetch: claims {label} {count}: age <0.1ms {} <1ms {} <10ms {} >=10ms {}; worker stack mean {:.0}",
+                ages[side][0],
+                ages[side][1],
+                ages[side][2],
+                ages[side][3],
+                pending[side] as f64 / count.max(1) as f64,
+            );
+        }
+        if let Some(started) = self.started {
+            let wall = started.elapsed();
+            eprintln!(
+                "goport prefetch: {} workers busy {:.1} ms of {:.1} ms ({:.0}%)",
+                self.workers,
+                self.busy.as_secs_f64() * 1e3,
+                wall.as_secs_f64() * 1e3,
+                100.0 * self.busy.as_secs_f64() / (wall.as_secs_f64() * self.workers.max(1) as f64),
+            );
+        }
     }
 }
 
@@ -2254,14 +2307,21 @@ thread_local! {
 impl PrefetchShared {
     fn new(config: PrefetchConfig) -> Self {
         Self {
-            queue: Mutex::new(PrefetchQueue::default()),
+            queue: Mutex::new(PrefetchQueue {
+                timed: std::env::var_os("GOPORT_PREFETCH_STATS").is_some(),
+                ..PrefetchQueue::default()
+            }),
             ready: Condvar::new(),
             closed: AtomicBool::new(false),
             config,
             stats: Arc::new(SharedStatCache::default()),
             resolve: OnceLock::new(),
-            counts: std::env::var_os("GOPORT_PREFETCH_STATS")
-                .map(|_| Mutex::new(PrefetchStats::default())),
+            counts: std::env::var_os("GOPORT_PREFETCH_STATS").map(|_| {
+                Mutex::new(PrefetchStats {
+                    started: Some(std::time::Instant::now()),
+                    ..PrefetchStats::default()
+                })
+            }),
         }
     }
 
@@ -2402,6 +2462,9 @@ impl PrefetchShared {
         }
         if let Some(newest) = jobs.pop() {
             woken += jobs.len();
+            if queue.timed {
+                newest.under.store(true, AtomicOrdering::Relaxed);
+            }
             queue.push_pending(newest);
             for job in jobs {
                 queue.push_pending(job);
@@ -2605,6 +2668,7 @@ impl Drop for PrefetchPool {
         self.shared.close();
         // A discarded pool has no threads here and prints no counts.
         let used = !self.threads.is_empty();
+        let workers = self.threads.len();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -2617,6 +2681,7 @@ impl Drop for PrefetchPool {
         self.shared.count(|c| {
             c.untaken = untaken;
             c.untaken_bytes = untaken_bytes;
+            c.workers = workers;
             c.print();
         });
     }
@@ -2877,6 +2942,7 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
     });
     let mut resolver: Option<WorkerResolver> = None;
     let mut resolver_failed = false;
+    let timed = shared.counts.is_some();
     loop {
         let job = {
             let mut queue = lock(&shared.queue);
@@ -2914,6 +2980,7 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
             }
             *state = PrefetchState::Running;
         }
+        let started = timed.then(std::time::Instant::now);
         let running = RunningJob(&job);
         #[cfg(test)]
         if lock(&PANIC_IN_JOB).as_deref() == Some(job.opts.file_name.as_str()) {
@@ -3046,6 +3113,10 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
         if queued.is_err() {
             resolver = None;
             resolver_failed = true;
+        }
+        if let Some(started) = started {
+            let busy = started.elapsed();
+            shared.count(|c| c.busy += busy);
         }
     }
 }
@@ -4014,16 +4085,30 @@ pub fn take_prefetched(
     let Some(shared) = PREFETCH.with(|p| p.borrow().clone()) else {
         return Prefetched::Nothing;
     };
-    let Some(job) = lock(&shared.queue).by_name.get(&opts.file_name).cloned() else {
-        shared.count(|c| c.not_queued.push(opts.file_name.clone()));
-        return Prefetched::Nothing;
+    let (job, stack) = {
+        let queue = lock(&shared.queue);
+        let Some(job) = queue.by_name.get(&opts.file_name).cloned() else {
+            drop(queue);
+            shared.count(|c| c.not_queued.push(opts.file_name.clone()));
+            return Prefetched::Nothing;
+        };
+        (job, queue.pending.len())
     };
     let mut state = lock(&job.state);
     let mut waited: Option<std::time::Instant> = None;
     let result = loop {
         match std::mem::replace(&mut *state, PrefetchState::Claimed) {
             PrefetchState::Queued | PrefetchState::Claimed => {
-                shared.count(|c| c.claimed.push(opts.file_name.clone()));
+                shared.count(|c| {
+                    c.claimed.push(opts.file_name.clone());
+                    if let Some(queued_at) = job.queued_at {
+                        c.claims.push((
+                            queued_at.elapsed(),
+                            stack,
+                            job.under.load(AtomicOrdering::Relaxed),
+                        ));
+                    }
+                });
                 return Prefetched::Nothing;
             }
             PrefetchState::Running => {
