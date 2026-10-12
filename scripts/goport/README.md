@@ -152,21 +152,48 @@ with the pinned `nightly-2026-06-17` and `-Zthreads=8` (the job count, at most 8
 - Output does not change. `tsgo -p` with emit and `goport -p` on Query core, Hono, zod and effect
   are byte-equal to 1.93.0 bins, the quick gate is equal item for item, and `perf.sh` run time is
   equal within 1%.
-- 1.93.0 stays for `--profile goport` (shipped and timing bins: `build-release.sh`, `build-pgo.sh`),
-  `fmt`, `clippy`, any command with `RUSTUP_TOOLCHAIN` or a `+toolchain` argument, and the candidate
-  evidence builds (see below). For timing, build every side with the same
-  toolchain.
+- The default toolchain (CI pins 1.93.0) stays for `--profile goport`, `fmt`, `clippy`, any command
+  with `RUSTUP_TOOLCHAIN` or a `+toolchain` argument, and the candidate evidence builds (see below).
+  `build-release.sh` and `build-pgo.sh` (shipped and timing bins) set 1.95.0. For timing, build every
+  side with the same toolchain.
 - `TS_CARGO_NIGHTLY=0` uses the default toolchain. `TS_CARGO_INCREMENTAL=0` turns incremental off;
   `1` turns it on for every workspace crate. After an internal compiler error, build again with both
   set to 0 and report the error.
-- A host without the toolchain uses the default one and prints a note. Install it with
+- On a host without the toolchain, edit-loop builds stop with the install command (a quiet fallback
+  to the default toolchain made them slower with no error). Install it with
   `rustup toolchain install nightly-2026-06-17 --profile minimal`.
 - The first build in each target dir after the switch rebuilds every crate once. The incremental
   cache of ts_goport takes about 1.7 GB per target dir. sccache does not cache an incremental crate, so only
   `ts_goport` is incremental: sccache still caches every other crate.
-- To measure a build change, run the `buildbench-plan.sh` session `defaults` before and after it on
-  one host: `buildbench-remote.sh dbook-lan defaults` from the worktree under test (the `setup`
-  session copies its source to the host first). `buildbench-report.py <runs-dir>...` makes the table.
+- To measure a build change, run the `buildbench-plan.sh` sessions `defaults` (release) and `devloop`
+  (dev: `check`, `--bin tsgo`, `--bins`, `test --no-run`) before and after it on one host:
+  `buildbench-remote.sh dbook-lan defaults` from the worktree under test (the `setup` session copies
+  its source to the host first), or `buildbench-plan.sh <session> <out-dir>` on the host you are on.
+  `buildbench-report.py <runs-dir>...` makes the table, with the peak memory of each build.
+
+Edit loop on alvin (24 cores, 16 jobs, sccache off, 2026-10-10, `ts_goport` 566k lines; two runs,
+`buildbench-plan.sh` sessions `devloop` and `defaults`):
+
+| command | clean | touch | one-line edit |
+|---|---|---|---|
+| `check -p ts_goport` | 67-70 s | 9-10 s | 12 s |
+| `build -p ts_goport --bin tsgo` | 80-88 s | 14-16 s | 20-21 s |
+| `build -p ts_goport --bins` | 84-87 s | 14 s | 18-19 s |
+| `test -p ts_goport --no-run` | 83-91 s | 16-17 s | 21-22 s |
+| `build --release -p ts_goport --bins` | 107-112 s | 14-15 s | 69-71 s |
+| `build --release -p ts_goport --bin tsgo` | 119-130 s | 16-19 s | 71-78 s |
+
+- Use `check` while you edit, and build bins only to run them. `--bin tsgo` saves no wall time: the 9
+  links run in parallel (dev `--bins` uses about 10 s more CPU per edit).
+- A touch with no change costs 9-10 s in `check`: macro expansion, name resolution and the
+  incremental dep graph run on the whole crate each time (`-Ztime-passes`). So an edit in
+  `ls/hover.rs` costs the same as one in the checker.
+- Peak memory of a whole build is at most 6.1 GB, except `test --no-run` (10 to 11 GB clean).
+- The nightly links with rust-lld. mold (`-C link-arg=-fuse-ld=mold`) used about 25% less CPU per
+  edit, but dev `--bins` and `test --no-run` edits took the same wall time (21 to 31 s, two runs
+  each), so the script keeps rust-lld.
+- With 1 job (the default on every host but zbook until 2026-10-10), `check` took 228 s clean and
+  17 s for an edit, and a dev `--bin tsgo` build 301 s clean and 29 s for an edit.
 
 Revision evidence is the exception: `candidate.sh side` builds its release bins and its test bins with `TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0`, so the goport tests, gate, bound runs and oracles test bins from the shipped toolchain with no incremental cache (the evidence key records the toolchain).
 
