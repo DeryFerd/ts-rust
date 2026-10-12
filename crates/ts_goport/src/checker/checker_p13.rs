@@ -614,16 +614,21 @@ impl Checker {
     /// the parameter `containingClassSymbol` too. Go puts the id of the
     /// symbol in the key (`ast.GetSymbolId`), so it gives the symbol its id
     /// here.
-    // PORT: the key holds the arena index of the symbol
-    // (`get_symbol_name_for_private_identifier`); the id is only given, as
-    // Go gives it. The binder gives no id (PORTING.md, Threads).
+    // PORT: the key holds the key of the class node, or the arena index of
+    // any other symbol (`get_symbol_name_for_private_identifier_of_symbol`);
+    // the id is only given, as Go gives it. The binder gives no id
+    // (PORTING.md, Threads).
     pub fn private_identifier_symbol_name(
         &self,
         containing_class_symbol: SymbolId,
         description: &str,
     ) -> String {
         get_symbol_id(&self.symbols, containing_class_symbol);
-        get_symbol_name_for_private_identifier(&self.symbols, containing_class_symbol, description)
+        get_symbol_name_for_private_identifier_of_symbol(
+            &self.symbols,
+            containing_class_symbol,
+            description,
+        )
     }
 
     // Go: checker/checker.go:11711 lookupSymbolForPrivateIdentifierDeclaration

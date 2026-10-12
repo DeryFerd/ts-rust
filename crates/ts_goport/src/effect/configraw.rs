@@ -233,12 +233,43 @@ fn get_effect_plugin_raw(
     })
 }
 
-const CONFIG_DIR_TEMPLATE: &str = "${configDir}";
+// Go: effectconfigraw/hooks.go:321 configDirTemplate, lowered (Go lowers it
+// on each call).
+const CONFIG_DIR_TEMPLATE_LOWER: &str = "${configdir}";
 
 // Go: effectconfigraw/hooks.go:323 startsWithConfigDirTemplate
 // PORT: Go `strings.ToLower` (`strings_to_lower`), not `to_lowercase`:
 // `${confİgDir}` (U+0130) starts with the template in Go.
 fn starts_with_config_dir_template(value: &str) -> bool {
     crate::frontend::tsoptions::decls::strings_to_lower(value)
-        .starts_with(&CONFIG_DIR_TEMPLATE.to_ascii_lowercase())
+        .starts_with(CONFIG_DIR_TEMPLATE_LOWER)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go hooks.go:167 keeps an override spec that starts with the template
+    // (hooks.go:323, `strings.ToLower`: U+0130 lowers to 'i') or is rooted,
+    // and puts the others below the relative dir of the declaring config.
+    // Rust `to_lowercase` lowers U+0130 to two chars, so `${confİgDir}`
+    // would not start with the template.
+    #[test]
+    fn override_specs_keep_the_config_dir_template() {
+        let specs = [
+            "${confİgDir}/src/**".to_string(),
+            "${CONFIGDIR}/test/**".to_string(),
+            "/abs/**".to_string(),
+            "src/**".to_string(),
+        ];
+        assert_eq!(
+            rewrite_specs(&specs, "../base"),
+            [
+                "${confİgDir}/src/**",
+                "${CONFIGDIR}/test/**",
+                "/abs/**",
+                "../base/src/**"
+            ]
+        );
+    }
 }

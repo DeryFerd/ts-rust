@@ -688,6 +688,8 @@ pub fn convert_json_option_of_list_type(
 
 // Go: tsoptions/tsconfigparsing.go:355 configDirTemplate
 pub const CONFIG_DIR_TEMPLATE: &str = "${configDir}";
+/// `CONFIG_DIR_TEMPLATE` lowered (Go lowers it on each call).
+const CONFIG_DIR_TEMPLATE_LOWER: &str = "${configdir}";
 
 // Go: tsoptions/tsconfigparsing.go:357 startsWithConfigDirTemplate
 // PORT: Go `strings.ToLower` (`strings_to_lower`), not `to_lowercase`:
@@ -696,7 +698,7 @@ pub fn starts_with_config_dir_template(value: &CompilerOptionsValue) -> bool {
     let CompilerOptionsValue::String(str) = value else {
         return false;
     };
-    super::decls::strings_to_lower(str).starts_with(&CONFIG_DIR_TEMPLATE.to_ascii_lowercase())
+    super::decls::strings_to_lower(str).starts_with(CONFIG_DIR_TEMPLATE_LOWER)
 }
 
 // Go: tsoptions/tsconfigparsing.go:361 normalizeNonListOptionValue

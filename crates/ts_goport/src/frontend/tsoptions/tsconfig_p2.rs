@@ -2204,7 +2204,10 @@ mod go_lower_tests {
     }
 
     // Go: `tsgo --noImplİcitReturns` reports TS7030 (the option is on), and
-    // `tsgo -p tsconfig.json --buİld` reports TS6369.
+    // `tsgo -p tsconfig.json --buİld` reports TS6369. Option names used
+    // `strings_to_lower` before the `${configDir}` fix too, so this passed
+    // there: it guards the name lookup (`NameMap::get`), and it fails when
+    // `strings_to_lower` is Rust `to_lowercase` (followups53).
     #[test]
     fn option_names_lower_like_go() {
         let parsed = command_line(&["--noImplİcitReturns"]);
