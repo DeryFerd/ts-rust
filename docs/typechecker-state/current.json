@@ -1007,12 +1007,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "ad961491c815f915f",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "a5ed6a44d072b95e0",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R200 pipeline (candidate.sh side)."
