@@ -1928,8 +1928,10 @@ enum PrefetchRequest {
 struct PrefetchQueue {
     /// Jobs no worker has taken yet. Workers take the newest first, like
     /// the loader's queue, but take `lib.dom.d.ts` before all others. A job
-    /// can be in the list twice (`rank_largest`, `queue_batch`); a worker
-    /// skips a job that is no longer queued.
+    /// that moves up is pushed again, so it can be in the list more than
+    /// once (`rank_largest`, `queue_batch`, and the move-up of a worker's
+    /// `PrefetchShared::queue`); a worker skips a job that is no longer
+    /// queued.
     pending: Vec<Arc<PrefetchJob>>,
     /// The content-mapped jobs no worker has taken yet, newest first too.
     /// The workers of `PrefetchPool::add_mapped_workers` take only these;
@@ -1972,6 +1974,8 @@ struct PrefetchQueue {
     /// True when the debug counts are kept (`GOPORT_PREFETCH_STATS`): jobs
     /// note when they are queued.
     timed: bool,
+    /// `move_up_enabled` of the thread that started the pool.
+    move_up: bool,
 }
 
 impl PrefetchQueue {
@@ -2269,8 +2273,11 @@ struct PrefetchShared {
     config: PrefetchConfig,
     /// The stat cache of the workers' file systems (`WorkerFs`).
     stats: Arc<SharedStatCache>,
-    /// Set when the loader takes the workers (`FilesParser::parse`). Until
-    /// then, and with `None` inside, the workers do not resolve.
+    /// Set when the loader takes the workers (`FilesParser::parse`), or
+    /// before the loader exists by an early pool with root jobs
+    /// (`start_default_lib_prefetch`), which the loader takes only with an
+    /// equal config (`early_shared_resolution`, `FilesParser::parse`).
+    /// Until it is set, and with `None` inside, the workers do not resolve.
     resolve: OnceLock<Option<WorkerResolveConfig>>,
     /// Debug counts of `take_prefetched`, kept when `GOPORT_PREFETCH_STATS`
     /// is set and printed to stderr when the pool stops.
@@ -2501,6 +2508,7 @@ impl PrefetchShared {
         Self {
             queue: Mutex::new(PrefetchQueue {
                 timed: std::env::var_os("GOPORT_PREFETCH_STATS").is_some(),
+                move_up: move_up_enabled(),
                 ..PrefetchQueue::default()
             }),
             ready: Condvar::new(),
@@ -2612,7 +2620,7 @@ impl PrefetchShared {
     fn queue(&self, opts: SourceFileParseOptions, script_kind: ScriptKind) {
         let mut queue = lock(&self.queue);
         if let Some(job) = queue.by_name.get(&opts.file_name) {
-            if move_up_enabled()
+            if queue.move_up
                 && !queue.is_first(job)
                 && matches!(*lock(&job.state), PrefetchState::Queued)
             {
@@ -2859,6 +2867,10 @@ struct PrefetchPool {
     /// True once the workers of content-mapped jobs started
     /// (`FilesParser::queue_mapped_prefetch`).
     mapped_workers: bool,
+    /// True when a loader took the shared resolution cache of this early
+    /// pool (`early_shared_resolution`). Its workers write that cache, so
+    /// `discard` waits for them.
+    handed: bool,
 }
 
 impl PrefetchPool {
@@ -2867,6 +2879,7 @@ impl PrefetchPool {
             shared: Arc::new(PrefetchShared::new(config)),
             threads: Vec::new(),
             mapped_workers: false,
+            handed: false,
         };
         pool.add_workers(workers);
         pool
@@ -2904,10 +2917,18 @@ impl PrefetchPool {
         }
     }
 
-    /// Stops an unused pool without waiting: each worker ends after its
-    /// current job.
+    /// Stops an unused pool: each worker ends after its current job. It
+    /// waits for the workers only when a loader reads their resolution
+    /// cache (`handed`), so that no worker writes that cache after the
+    /// load, as Go waits for every parse task of a load (filesparser.go:270
+    /// `w.wg.RunAndWait()`).
     fn discard(mut self) {
         self.shared.close();
+        if self.handed {
+            for thread in self.threads.drain(..) {
+                let _ = thread.join();
+            }
+        }
         // Dropping a join handle detaches its thread.
         self.threads.clear();
     }
@@ -3040,34 +3061,58 @@ fn early_roots_enabled() -> bool {
 
 /// False when `GOPORT_PREFETCH_MOVE_UP=0`: a worker does not move up the
 /// queued jobs of the files that a parse references (`PrefetchShared::queue`).
-/// An A/B switch.
+/// An A/B switch, read once, or a test's choice for the pools that start on
+/// its thread (`set_move_up`).
 fn move_up_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = MOVE_UP.with(Cell::get) {
+        return on;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GOPORT_PREFETCH_MOVE_UP").is_none_or(|value| value != "0"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's choice of `move_up_enabled` for the pools of this thread.
+    static MOVE_UP: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Sets `move_up_enabled` for the pools that start on this thread (tests).
+#[cfg(test)]
+pub(crate) fn set_move_up(on: Option<bool>) {
+    MOVE_UP.with(|move_up| move_up.set(on));
+}
+
 /// The shared resolution cache of the early pool of this thread, for the
 /// loader that makes its shared cache now (`process_all_program_files`),
-/// when the early workers resolve with this loader's config
-/// (`WorkerResolveConfig::same`). Else the early pool stops, so that no
-/// worker answers with another config, and the loader makes a new cache.
+/// when the early workers run with this loader's config: the same
+/// `PrefetchConfig` and `WorkerResolveConfig::same`, as
+/// `FilesParser::parse` checks before it takes the pool. Else the early
+/// pool stops, so that no worker answers with another config, and the
+/// loader makes a new cache. When `parse` stops a pool that gave its cache
+/// here, it waits for the workers (`PrefetchPool::discard`).
 // PORT: not in Go (see `start_default_lib_prefetch`).
 pub(crate) fn early_shared_resolution(loader: &FileLoader) -> Option<Arc<SharedResolutionCache>> {
     EARLY_POOL.with(|early| {
         let mut early = early.borrow_mut();
-        let fits = match early.as_ref()?.shared.resolve.get() {
+        let pool = early.as_ref()?;
+        let fits = match pool.shared.resolve.get() {
             Some(Some(config)) => config.shared.clone().filter(|shared| {
                 loader.host.stat_cache().is_none()
+                    && pool.shared.config == PrefetchConfig::of_loader(loader)
                     && WorkerResolveConfig::of_loader_with(loader, Some(shared.clone()))
                         .is_some_and(|loader_config| loader_config.same(config))
             }),
             // An early pool with no root jobs: the loader sets its config.
             _ => return None,
         };
-        if fits.is_none()
-            && let Some(pool) = early.take()
-        {
-            pool.discard();
+        if fits.is_none() {
+            if let Some(pool) = early.take() {
+                pool.discard();
+            }
+        } else if let Some(pool) = early.as_mut() {
+            pool.handed = true;
         }
         #[cfg(test)]
         if fits.is_some() {
@@ -4510,5 +4555,45 @@ pub fn take_prefetched(
     } else {
         unusable();
         Prefetched::Text(worker_text)
+    }
+}
+
+#[cfg(test)]
+mod move_up_tests {
+    use super::*;
+
+    // `GOPORT_PREFETCH_MOVE_UP` is read once per process, so a test chooses
+    // the switch per pool (`set_move_up`), and both run here. A job that no
+    // worker took moves up when a parse references its file again: it is
+    // pushed again, on top. With the switch off, it stays where it is.
+    #[test]
+    fn a_queued_job_moves_up_only_with_the_switch() {
+        let opts = |name: &str| SourceFileParseOptions {
+            file_name: format!("/p/{name}"),
+            path: Path(format!("/p/{name}")),
+            external_module_indicator_options: ExternalModuleIndicatorOptions::default(),
+        };
+        for (on, pending) in [
+            (false, ["/p/a.ts", "/p/b.ts"].as_slice()),
+            (true, ["/p/a.ts", "/p/b.ts", "/p/a.ts"].as_slice()),
+        ] {
+            set_move_up(Some(on));
+            let shared = PrefetchShared::new(PrefetchConfig {
+                current_directory: "/p".to_string(),
+                use_case_sensitive_file_names: true,
+                default_library_path: String::new(),
+            });
+            set_move_up(None);
+            for name in ["a.ts", "b.ts", "a.ts"] {
+                shared.queue(opts(name), ScriptKind::TS);
+            }
+            let queue = lock(&shared.queue);
+            let names: Vec<&str> = queue
+                .pending
+                .iter()
+                .map(|job| job.opts.file_name.as_str())
+                .collect();
+            assert_eq!(names, pending, "move-up {on}");
+        }
     }
 }

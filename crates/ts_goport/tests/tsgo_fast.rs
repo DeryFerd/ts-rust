@@ -211,9 +211,11 @@ fn split_go(checkers: usize) -> String {
 /// shows that the port's output also depends on the split.
 ///
 /// `skipLibCheck` keeps the lib files out of the check work, so the
-/// work-stealing pass moves some of these files to another checker. The
-/// test passes its own `GOPORT_FAST_STEAL` on to tsgo, so a run with
-/// `GOPORT_FAST_STEAL=1` fails: a check that the test sees the split.
+/// work-stealing pass (`GOPORT_FAST_STEAL=1`, not deterministic) would move
+/// some of these files to another checker. tsgo gets no `GOPORT_FAST_STEAL`
+/// of the caller (`run_bin`), so the result does not depend on it. Only the
+/// last run sets it, without `--fast`: the steal pass is part of fast mode,
+/// so the default keeps Go's split.
 #[test]
 fn same_output_on_every_run() {
     let mut files = vec![("deep.ts".to_string(), format!("{REC_TS}\n"))];
@@ -228,16 +230,13 @@ fn same_output_on_every_run() {
         r#"{ "compilerOptions": { "noEmit": true, "strict": true, "skipLibCheck": true, "types": [], "lib": ["es2015"] }, "files": ["deep.ts", "f1.ts", "f2.ts", "f3.ts", "f4.ts", "f5.ts", "f6.ts"] }"#.into(),
     ));
     let dir = scratch("same", &files);
-    let steal = std::env::var("GOPORT_FAST_STEAL").ok();
-    let vars: Vec<(&str, &str)> = steal
-        .iter()
-        .map(|steal| ("GOPORT_FAST_STEAL", steal.as_str()))
-        .collect();
-    let check = |args: &[&str], checkers: usize, label: &str| {
-        let output = tsgo(&dir, args, &vars);
+    let check_with = |args: &[&str], vars: &[(&str, &str)], checkers: usize, label: &str| {
+        let output = tsgo(&dir, args, vars);
         assert_eq!(stdout(&output), split_go(checkers), "{label}");
         assert_eq!(output.status.code(), Some(2), "{label}");
     };
+    let check =
+        |args: &[&str], checkers: usize, label: &str| check_with(args, &[], checkers, label);
     check(&["--checkers", "1"], 1, "--checkers 1");
     for run in 0..5 {
         check(&["--fast"], 4, &format!("--fast, run {run}"));
@@ -249,5 +248,7 @@ fn same_output_on_every_run() {
             check(&["--fast", "--checkers", &count], checkers, &label);
         }
     }
+    let steal = [("GOPORT_FAST_STEAL", "1")];
+    check_with(&[], &steal, 4, "GOPORT_FAST_STEAL=1 without --fast");
     fs::remove_dir_all(&dir).unwrap();
 }

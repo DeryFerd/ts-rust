@@ -1,5 +1,6 @@
 //! PORT: perf. Not in Go. A small open-addressing hash map for hot checker
-//! caches (`Relation::results`, `InferenceStack::top`).
+//! caches: `Relation::plain_wide` and `Relation::generic`,
+//! `ActiveMapperCache::plain`, `InstantiationMap` and `InferenceStack::top`.
 //! `InferenceState::visited` has its own map of this kind
 //! (`InferenceVisitedMap`).
 //!
