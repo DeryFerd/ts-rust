@@ -5,7 +5,8 @@
 //! server) turns on, together:
 //!
 //! - more checkers: one per core, up to `MAX_CHECKERS`, and at most one per
-//!   `FILES_PER_CHECKER` program files (`checker_count`). An explicit
+//!   `FILES_PER_CHECKER` program files that are not declaration files
+//!   (`checker_count`). An explicit
 //!   `--checkers N` or `--singleThreaded` still wins, and `tsc -b` keeps
 //!   Go's 4 (it can check several projects at once);
 //! - a work-stealing check pass (`program.rs` `start_checker_group_do`): each
@@ -40,9 +41,9 @@ pub const FLAG: &str = "--fast";
 /// runner, more than this gave no wall time on the app bench).
 pub const MAX_CHECKERS: usize = 16;
 
-/// Fast mode starts at most one checker per this many program files, and
-/// never fewer than Go's 4: a checker costs its start and a copy of the
-/// global types it reads.
+/// Fast mode starts at most one checker per this many program files that
+/// are not declaration files, and never fewer than Go's 4: a checker costs
+/// its start and a copy of the types it reads.
 pub const FILES_PER_CHECKER: usize = 32;
 
 /// 0: not read yet, 1: off, 2: on.
@@ -102,13 +103,14 @@ pub fn own_arenas() -> bool {
     *ON.get_or_init(|| enabled() && part("GOPORT_FAST_ARENAS"))
 }
 
-/// The checker count of fast mode for a program of `files` files, without
-/// an explicit `--checkers`: one per core (`available_parallelism`, which
-/// reads the CPU affinity and cgroup quota), at most `MAX_CHECKERS`, at most
-/// one per `FILES_PER_CHECKER` files, and at least Go's 4. Go's 4 in
+/// The checker count of fast mode for a program with `source_files` files
+/// that are not declaration files, without an explicit `--checkers`: one
+/// per core (`available_parallelism`, which reads the CPU affinity and
+/// cgroup quota), at most `MAX_CHECKERS`, at most one per
+/// `FILES_PER_CHECKER` of those files, and at least Go's 4. Go's 4 in
 /// `tsc -b`.
 #[must_use]
-pub fn checker_count(files: usize) -> usize {
+pub fn checker_count(source_files: usize) -> usize {
     if BUILD.load(Ordering::Relaxed) {
         return 4;
     }
@@ -116,6 +118,6 @@ pub fn checker_count(files: usize) -> usize {
     let cores = *CORES.get_or_init(|| std::thread::available_parallelism().map_or(4, Into::into));
     cores
         .min(MAX_CHECKERS)
-        .min(files.div_ceil(FILES_PER_CHECKER))
+        .min(source_files.div_ceil(FILES_PER_CHECKER))
         .max(4)
 }
