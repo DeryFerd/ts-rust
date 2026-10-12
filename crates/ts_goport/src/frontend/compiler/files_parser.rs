@@ -935,18 +935,14 @@ impl FilesParser {
             } else {
                 None
             };
-        let mut resolved_modules: FxHashMap<Path, ModeAwareCache<Arc<ResolvedModule>>> =
-            FxHashMap::default();
         let mut type_resolutions_in_file: FxHashMap<
             Path,
             ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>,
         > = FxHashMap::default();
-        let mut source_file_meta_datas: FxHashMap<Path, SourceFileMetaData> = FxHashMap::default();
         let mut jsx_runtime_import_specifiers: Option<
             FxHashMap<Path, Rc<JsxRuntimeImportSpecifier>>,
         > = None;
         let mut import_helpers_import_specifiers: Option<FxHashMap<Path, Node>> = None;
-        let mut source_files_found_searching_node_modules: FxHashSet<Path> = FxHashSet::default();
         let mut lib_files_map: FxHashMap<Path, Rc<LibFile>> =
             FxHashMap::with_capacity_and_hasher(lib_file_count, Default::default());
 
@@ -984,14 +980,12 @@ impl FilesParser {
             tasks_seen_by_name_ignore_case: &'a mut Option<FxHashMap<String, ParseTaskRef>>,
             include_processor: &'a mut IncludeProcessor,
             output_file_to_project_reference_source: &'a mut Option<FxHashMap<Path, String>>,
-            resolved_modules: &'a mut FxHashMap<Path, ModeAwareCache<Arc<ResolvedModule>>>,
+            file_maps: &'a mut FileMapSink,
             type_resolutions_in_file:
                 &'a mut FxHashMap<Path, ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>>,
-            source_file_meta_datas: &'a mut FxHashMap<Path, SourceFileMetaData>,
             jsx_runtime_import_specifiers:
                 &'a mut Option<FxHashMap<Path, Rc<JsxRuntimeImportSpecifier>>>,
             import_helpers_import_specifiers: &'a mut Option<FxHashMap<Path, Node>>,
-            source_files_found_searching_node_modules: &'a mut FxHashSet<Path>,
             lib_files_map: &'a mut FxHashMap<Path, Rc<LibFile>>,
             redirect_targets_map: &'a mut Option<FxHashMap<Path, Vec<String>>>,
             redirect_files_by_path: &'a mut Option<FxHashMap<Path, RedirectsFile>>,
@@ -1219,8 +1213,7 @@ impl FilesParser {
                                 self.files_by_path
                                     .insert(task_path.clone(), package_id_file);
                                 if data_lowest_depth > 0 {
-                                    self.source_files_found_searching_node_modules
-                                        .insert(task_path.clone());
+                                    self.file_maps.add(FileMapEntry::Found(task_path.clone()));
                                 }
                                 continue;
                             } else if let Some(file) = &file {
@@ -1292,14 +1285,12 @@ impl FilesParser {
                         self.files.push(file.clone());
                     }
                     self.files_by_path.insert(path.clone(), file);
-                    self.resolved_modules
-                        .insert(path.clone(), std::mem::take(&mut t.resolutions_in_file));
+                    let resolutions = std::mem::take(&mut t.resolutions_in_file);
                     self.type_resolutions_in_file.insert(
                         path.clone(),
                         std::mem::take(&mut t.type_resolutions_in_file),
                     );
-                    self.source_file_meta_datas
-                        .insert(path.clone(), std::mem::take(&mut t.metadata));
+                    let meta = std::mem::take(&mut t.metadata);
 
                     if let Some(jsx_runtime_import_specifier) = &t.jsx_runtime_import_specifier {
                         self.jsx_runtime_import_specifiers
@@ -1311,40 +1302,47 @@ impl FilesParser {
                             .get_or_insert_with(FxHashMap::default)
                             .insert(path.clone(), t.import_helpers_import_specifier);
                     }
-                    if data_lowest_depth > 0 {
-                        self.source_files_found_searching_node_modules.insert(path);
-                    }
+                    self.file_maps.add(FileMapEntry::File {
+                        path,
+                        resolutions,
+                        meta,
+                        found_searching_node_modules: data_lowest_depth > 0,
+                    });
                 }
             }
         }
 
-        let mut collector = Collector {
-            parser: self,
-            loader,
-            seen: &mut seen,
-            missing_files: &mut missing_files,
-            duplicate_source_files: &mut duplicate_source_files,
-            files: &mut files,
-            lib_files: &mut lib_files,
-            files_by_path: &mut files_by_path,
-            tasks_seen_by_name_ignore_case: &mut tasks_seen_by_name_ignore_case,
-            include_processor: &mut include_processor,
-            output_file_to_project_reference_source: &mut output_file_to_project_reference_source,
-            resolved_modules: &mut resolved_modules,
-            type_resolutions_in_file: &mut type_resolutions_in_file,
-            source_file_meta_datas: &mut source_file_meta_datas,
-            jsx_runtime_import_specifiers: &mut jsx_runtime_import_specifiers,
-            import_helpers_import_specifiers: &mut import_helpers_import_specifiers,
-            source_files_found_searching_node_modules:
-                &mut source_files_found_searching_node_modules,
-            lib_files_map: &mut lib_files_map,
-            redirect_targets_map: &mut redirect_targets_map,
-            redirect_files_by_path: &mut redirect_files_by_path,
-            package_id_to_source_file: &mut package_id_to_source_file,
-            recorded_duplicates: FxHashMap::default(),
-            total_file_count,
-        };
-        collector.collect_files(&loader.root_tasks);
+        let FileMaps {
+            mut resolved_modules,
+            source_file_meta_datas,
+            source_files_found_searching_node_modules,
+        } = FileMaps::collect(self.single_threaded, |file_maps| {
+            let mut collector = Collector {
+                parser: self,
+                loader,
+                seen: &mut seen,
+                missing_files: &mut missing_files,
+                duplicate_source_files: &mut duplicate_source_files,
+                files: &mut files,
+                lib_files: &mut lib_files,
+                files_by_path: &mut files_by_path,
+                tasks_seen_by_name_ignore_case: &mut tasks_seen_by_name_ignore_case,
+                include_processor: &mut include_processor,
+                output_file_to_project_reference_source:
+                    &mut output_file_to_project_reference_source,
+                file_maps,
+                type_resolutions_in_file: &mut type_resolutions_in_file,
+                jsx_runtime_import_specifiers: &mut jsx_runtime_import_specifiers,
+                import_helpers_import_specifiers: &mut import_helpers_import_specifiers,
+                lib_files_map: &mut lib_files_map,
+                redirect_targets_map: &mut redirect_targets_map,
+                redirect_files_by_path: &mut redirect_files_by_path,
+                package_id_to_source_file: &mut package_id_to_source_file,
+                recorded_duplicates: FxHashMap::default(),
+                total_file_count,
+            };
+            collector.collect_files(&loader.root_tasks);
+        });
         loader.sort_libs(&mut lib_files);
 
         let lib_files_len = lib_files.len() as i32;
@@ -1437,6 +1435,133 @@ impl FilesParser {
             } else {
                 reasons.insert(t.path.clone(), vec![reason]);
             }
+        }
+    }
+}
+
+/// What `collect_files` adds for one file to the maps of `FileMaps`.
+enum FileMapEntry {
+    /// A program file at `path`: its module resolutions and metadata, and
+    /// whether the load found it searching node_modules.
+    File {
+        path: Path,
+        resolutions: ModeAwareCache<Arc<ResolvedModule>>,
+        meta: SourceFileMetaData,
+        found_searching_node_modules: bool,
+    },
+    /// A package dedup redirect path that the load found searching
+    /// node_modules.
+    Found(Path),
+}
+
+/// The maps of `get_processed_files` that `collect_files` only adds to and
+/// that another thread can own: Go `resolvedModules`, `sourceFileMetaDatas`
+/// and `sourceFilesFoundSearchingNodeModules`.
+#[derive(Default)]
+struct FileMaps {
+    resolved_modules: FxHashMap<Path, ModeAwareCache<Arc<ResolvedModule>>>,
+    source_file_meta_datas: FxHashMap<Path, SourceFileMetaData>,
+    source_files_found_searching_node_modules: FxHashSet<Path>,
+}
+
+impl FileMaps {
+    /// Adds `entry` as Go `collectFiles` adds it (filesparser.go:467-524).
+    fn add(&mut self, entry: FileMapEntry) {
+        match entry {
+            FileMapEntry::File {
+                path,
+                resolutions,
+                meta,
+                found_searching_node_modules,
+            } => {
+                self.resolved_modules.insert(path.clone(), resolutions);
+                self.source_file_meta_datas.insert(path.clone(), meta);
+                if found_searching_node_modules {
+                    self.source_files_found_searching_node_modules.insert(path);
+                }
+            }
+            FileMapEntry::Found(path) => {
+                self.source_files_found_searching_node_modules.insert(path);
+            }
+        }
+    }
+
+    /// The maps that `walk` adds to through its sink. Each map gets its
+    /// entries in the order of the walk, so it is the map that the walk
+    /// would make itself. Unless `single_threaded`, another thread adds
+    /// them while the walk goes on.
+    // PERF (serialgap1): Go's walk is serial (filesparser.go:337), and so is
+    // this one; the map work of each file moves off it. VS Code: about 11k
+    // files, two path copies and up to three inserts each.
+    fn collect(single_threaded: bool, walk: impl FnOnce(&mut FileMapSink)) -> FileMaps {
+        if single_threaded || cfg!(target_family = "wasm") {
+            let mut sink = FileMapSink {
+                maps: FileMaps::default(),
+                batch: Vec::new(),
+                send: None,
+            };
+            walk(&mut sink);
+            return sink.maps;
+        }
+        let (send, receive) = std::sync::mpsc::channel::<Vec<FileMapEntry>>();
+        std::thread::scope(|scope| {
+            let maps = std::thread::Builder::new()
+                .name("goport-collect".to_string())
+                .spawn_scoped(scope, move || {
+                    let mut maps = FileMaps::default();
+                    for batch in receive {
+                        batch.into_iter().for_each(|entry| maps.add(entry));
+                    }
+                    maps
+                })
+                .expect("cannot start the collect thread");
+            let mut sink = FileMapSink {
+                maps: FileMaps::default(),
+                batch: Vec::with_capacity(FileMapSink::BATCH),
+                send: Some(send),
+            };
+            walk(&mut sink);
+            // Sends the last batch. Dropping the sender ends the thread's
+            // loop (also when the walk panics).
+            sink.flush();
+            drop(sink);
+            maps.join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+}
+
+/// Where `collect_files` puts the entries of `FileMaps`: `maps` on this
+/// thread, or batches sent to the thread of `FileMaps::collect`.
+struct FileMapSink {
+    maps: FileMaps,
+    batch: Vec<FileMapEntry>,
+    send: Option<std::sync::mpsc::Sender<Vec<FileMapEntry>>>,
+}
+
+impl FileMapSink {
+    /// Entries per batch: VS Code sends about 40.
+    const BATCH: usize = 256;
+
+    fn add(&mut self, entry: FileMapEntry) {
+        if self.send.is_none() {
+            self.maps.add(entry);
+            return;
+        }
+        self.batch.push(entry);
+        if self.batch.len() == Self::BATCH {
+            self.flush();
+        }
+    }
+
+    /// Sends the entries that are not sent yet.
+    fn flush(&mut self) {
+        if let Some(send) = &self.send
+            && !self.batch.is_empty()
+        {
+            let full = std::mem::replace(&mut self.batch, Vec::with_capacity(Self::BATCH));
+            // The thread receives until the sender drops.
+            let _ = send.send(full);
         }
     }
 }
