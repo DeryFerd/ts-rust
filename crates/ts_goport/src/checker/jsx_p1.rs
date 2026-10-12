@@ -443,8 +443,8 @@ impl Checker {
         let jsx_namespace = self.get_jsx_namespace_at(node);
         // PERF (jsxname1): the children name is interned once, so each member
         // compares name ids. The lookups below take each symbol's `Name`, so
-        // they compare name ids and hash no text, as Go's map lookups use the
-        // stored string hash.
+        // they compare name ids and use the hash that the interner keeps. Go
+        // stores no string hash: its map lookups hash the text each time.
         let jsx_children_property_name =
             Name::from(self.get_jsx_element_children_property_name(jsx_namespace));
         let mut discriminant_properties: Vec<Node> = Vec::new();
