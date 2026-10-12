@@ -23,7 +23,7 @@ use std::any::Any;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use ts_goport::execute::execute_tsc::tsc_build_compilation;
+use ts_goport::execute::execute_tsc::{is_build_flag, tsc_build_compilation};
 use ts_goport::execute::tsc::compile::{
     EXIT_UNPORTED, ExitStatus, System, new_os_system, write_go_output,
 };
@@ -119,13 +119,7 @@ fn run(args: &[String]) -> i32 {
     let sys: Rc<dyn System> = Rc::new(sys.with_writer(Rc::new(RefCell::new(StreamingStdout))));
 
     // Go: execute/tsc.go:53 CommandLine
-    let is_build = args.first().is_some_and(|arg| {
-        matches!(
-            arg.to_lowercase().as_str(),
-            "-b" | "--b" | "-build" | "--build"
-        )
-    });
-    if !is_build {
+    if !args.first().is_some_and(|arg| is_build_flag(arg)) {
         eprintln!("goport_build: only build mode (-b) is ported");
         return EXIT_UNPORTED;
     }

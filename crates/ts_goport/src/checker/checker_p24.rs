@@ -137,7 +137,7 @@ impl Checker {
     pub fn get_property_of_object_type_key(&mut self, t: TypeId, name: TableKey<'_>) -> SymbolId {
         if self.ty(t).flags.intersects(TypeFlags::OBJECT) {
             let members = self.resolve_structured_type_members(t).members;
-            let symbol = self.symbols.get_key(members, name);
+            let symbol = self.symbols.get(members, name);
             if symbol.is_some() && self.symbol_is_value(symbol) {
                 return symbol;
             }
@@ -214,7 +214,7 @@ impl Checker {
         skip_object_function_property_augment: bool,
     ) -> SymbolId {
         let cache = self.property_cache_table(t, skip_object_function_property_augment);
-        let prop = self.symbols.get_key(cache, name);
+        let prop = self.symbols.get(cache, name);
         if prop.is_some() {
             return prop;
         }

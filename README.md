@@ -114,10 +114,15 @@ goes away when the port moves to a newer pin.
 Four switches make some projects faster or use less memory. They are off by default.
 
 - **`--fast`** (or `GOPORT_FAST=1`) turns on the last two switches and more checkers. It runs one
-  checker per core, up to 16 and at most one per 32 source files (`--checkers N` still sets the
-  count). Each file goes to the checker that Go's split gives it, so the output of `--fast` is the
-  same on every run and equals `tsgo --checkers N` for the chosen N, except where lazy members or
-  the never order change the work (see their bullets above). On a 32 vCPU testbox limited
+  checker per core, up to 16 and at most one per 32 source files, but never fewer than Go's 4
+  (`--checkers N` still sets the count, and `tsc -b` keeps 4). The cores are the ones that the
+  process can use (CPU affinity and cgroup limits), so N can be different on another machine.
+  Each file goes to the checker that Go's split gives it, so the output of `--fast` is the same on
+  every run and equals `tsgo --checkers N` for the chosen N, except where lazy members or the never
+  order change the work (see their bullets below). Where Go's output depends on N (zod, below),
+  the output of `--fast` can be different on another machine. `--fast` is an option of the
+  compiler command line only (as in Go, `-b` must come first). `GOPORT_FAST=1` also turns on fast
+  mode in the language server (`--lsp`) and the API server (`--api`). On a 32 vCPU testbox limited
   to 16 vCPUs with `taskset` (a release build without PGO), VS Code checks in 2.6 s instead of
   5.3 s, Sentry in 2.7 s instead of 5.5 s and T3 Code `apps/server` in 2.6 s instead of 3.5 s. On
   those three and on Excalidraw and zod, CPU time went up as much as 2.4x and peak memory as much

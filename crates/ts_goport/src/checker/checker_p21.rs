@@ -509,7 +509,7 @@ impl Checker {
                 );
             };
             let members = resolved.members;
-            let mut symbol = self.symbols.get_key(members, name);
+            let mut symbol = self.symbols.get(members, name);
             if symbol.is_some() {
                 let t_symbol = self.ty(t).symbol;
                 if !include_type_only_members
