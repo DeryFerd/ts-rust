@@ -2112,6 +2112,26 @@ pub fn synthetic_list_len(list: SyntheticList) -> usize {
     })
 }
 
+/// The children of factory node `n` whose ids `pick` selects from its node
+/// data (`None` is Go `nil`), resolved in one arena borrow. `None` when
+/// `pick` gives `None` (a data shape the caller does not handle). `pick`
+/// only reads the data.
+// PERF: printfast1. A field accessor (`Node::name`, `Node::type_`) of a
+// factory node reads the arena twice per child: its node data, then the
+// child id (`resolve_synthetic_id`). The printer reads the children of a
+// node it emits at once (`Printer::emit_property_signature`).
+#[must_use]
+pub fn synthetic_children<const N: usize>(
+    n: Node,
+    pick: impl FnOnce(NodeData<'_>) -> Option<[Option<crate::astdata::NodeId>; N]>,
+) -> Option<[Node; N]> {
+    ARENA.with(|a| {
+        let a = a.borrow();
+        let ids = pick(a.data(a.node(n).data).data.view())?;
+        Some(ids.map(|id| id.map_or(Node::NIL, |id| a.resolve(id.index()))))
+    })
+}
+
 /// Go `list.Nodes` of `list`, copied in one arena borrow.
 // PERF: printfast1. `NodeSlice::to_vec` of a synthetic list reads the arena
 // once per node (`synthetic_list_node`); the printer copies each list it
