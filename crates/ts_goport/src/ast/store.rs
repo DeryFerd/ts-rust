@@ -95,7 +95,7 @@ use crate::leak_arena::LeakArena;
 use crate::prelude::*;
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// A map keyed by a `Name::text_hash` value, which is already a hash: the
@@ -340,6 +340,47 @@ impl StoreFacts {
             }
             _ => {}
         }
+    }
+
+    /// The facts as the bits of a `FactsCell`.
+    const fn bits(self) -> u8 {
+        (self.alias_free as u8)
+            | (self.parents_local as u8) << 1
+            | (self.has_export_alias_kind as u8) << 2
+            | (self.has_flow_constraint_kind as u8) << 3
+            | (self.has_deprecated_tag as u8) << 4
+    }
+
+    /// The facts of the bits of a `FactsCell`.
+    #[inline]
+    const fn from_bits(bits: u8) -> Self {
+        Self {
+            alias_free: bits & 1 != 0,
+            parents_local: bits & 1 << 1 != 0,
+            has_export_alias_kind: bits & 1 << 2 != 0,
+            has_flow_constraint_kind: bits & 1 << 3 != 0,
+            has_deprecated_tag: bits & 1 << 4 != 0,
+        }
+    }
+}
+
+/// edleak1: the `StoreFacts` of a `BlockFile` in one atomic byte, so the
+/// `BlockFile` of a pooled block takes the facts of each node shell that
+/// reuses the block (`PoolBlock::file`). A static publish sets it once.
+struct FactsCell(AtomicU8);
+
+impl FactsCell {
+    const fn new(facts: StoreFacts) -> Self {
+        Self(AtomicU8::new(facts.bits()))
+    }
+
+    #[inline]
+    fn get(&self) -> StoreFacts {
+        StoreFacts::from_bits(self.0.load(Ordering::Relaxed))
+    }
+
+    fn set(&self, facts: StoreFacts) {
+        self.0.store(facts.bits(), Ordering::Relaxed);
     }
 }
 
@@ -1389,10 +1430,11 @@ struct BlockFile {
     /// data. Empty in the node shell of a store that owns its astdata nodes.
     lists: &'static [&'static StaticList],
     /// `FileStore::facts`. The child reads load it next to the kids
-    /// (`block_resolve_slot`).
-    facts: StoreFacts,
-    /// `FileStore::root` (`frozen_source_file_of_node`).
-    root: Node,
+    /// (`block_resolve_slot`). Atomic for the `BlockFile` of a pooled
+    /// block, which each node shell that takes the block sets (edleak1).
+    facts: FactsCell,
+    /// `FileStore::root` (`frozen_source_file_of_node`), as `facts`.
+    root: AtomicU64,
     /// AST node records, step 2: `FileStore::foreign_parents`
     /// (`ParentCode`).
     foreign: &'static [Node],
@@ -1453,6 +1495,18 @@ impl FileBlock {
 }
 
 impl BlockFile {
+    /// `FileStore::facts` of the file.
+    #[inline]
+    fn facts(&self) -> StoreFacts {
+        self.facts.get()
+    }
+
+    /// `FileStore::root` of the file.
+    #[inline]
+    fn root(&self) -> Node {
+        Node(self.root.load(Ordering::Relaxed))
+    }
+
     /// `FileBlock::kind` of slot `index` of a node shell. Past the column it
     /// panics, as `kinds[index]` does.
     #[cold]
@@ -1607,7 +1661,7 @@ fn new_high_chunk() -> Box<[BlockEntry; HIGH_CHUNK]> {
 // per-slot table. A store with alias slots reads the record of the id.
 #[inline]
 fn block_resolve_slot(b: &FileBlock, file: usize, index: usize) -> Node {
-    if !b.file.facts.alias_free {
+    if !b.file.facts().alias_free {
         return record_resolve(file, index, b.records);
     }
     // Slot 0 always resolves to nil (its record never changes).
@@ -1668,15 +1722,33 @@ struct PoolBlock {
     kids: &'static [NodeKids],
     /// edleak1: the kind column of the node shell (`BlockFile::shell_kinds`).
     kinds: &'static [AtomicU16],
+    /// edleak1 part 2: the `BlockFile` of the node shells of this block,
+    /// leaked with it. Each node shell that takes the block sets its facts
+    /// and root (`node_shell`), so a shell leaks no `BlockFile`. Its
+    /// `shell_kinds` are all of `kinds`. `None` in the empty block.
+    file: Option<&'static BlockFile>,
 }
 
 impl PoolBlock {
     /// A fresh block of `cap` slots, all words 0, leaked.
     fn new(cap: usize) -> Self {
+        let kinds: &'static [AtomicU16] = Vec::leak((0..cap).map(|_| AtomicU16::new(0)).collect());
         Self {
             records: Vec::leak((0..cap).map(|_| NodeRecord::zero()).collect()),
             kids: Vec::leak((0..cap).map(|_| NodeKids::unknown()).collect()),
-            kinds: Vec::leak((0..cap).map(|_| AtomicU16::new(0)).collect()),
+            kinds,
+            file: Some(Box::leak(Box::new(BlockFile {
+                nodes: &[],
+                lists: &[],
+                facts: FactsCell::new(StoreFacts::ONLY_NIL_SLOT),
+                root: AtomicU64::new(Node::NIL.0),
+                foreign: &[],
+                links: &[],
+                shell_kinds: kinds,
+                store: None,
+                go_file: None,
+                subtree_facts: OnceLock::new(),
+            }))),
         }
     }
 
@@ -1704,7 +1776,8 @@ impl PoolBlock {
 /// - A node shell of `len` slots takes the first free block of `len` to
 ///   `2 * len + 64` slots (`take_pool_block`), or a fresh one of
 ///   `len + len / 8 + 64` slots, so a file that grows a little while it is
-///   edited still fits its old block.
+///   edited still fits its old block; `len + len / 2 + 64` when the pool has
+///   a block that the file outgrew (edleak1 part 2).
 // PORT: Go frees a dead `*ast.SourceFile` with the GC. Every holder of a
 // node of a version holds the version, so no read of it can follow its
 // death; the quarantine is a margin for a thread that keeps a node handle
@@ -1769,8 +1842,18 @@ fn take_pool_block(len: usize) -> PoolBlock {
                 .position(|block| (len..=most).contains(&block.cap()))?;
             Some(list.swap_remove(i))
         });
+    if let Some(block) = found {
+        return block;
+    }
+    // edleak1 part 2: a file that outgrew its blocks (a pooled block of 3/4
+    // of `len` to `len`) gets half its length as headroom, else an eighth.
+    // The outgrown blocks stay in the pool. A file that grows on each edit
+    // left about 4 / h times the size of its block there (h the headroom):
+    // 8.8 MiB of blocks in 10,000 query-core edits with an eighth.
+    let outgrown = |block: &PoolBlock| block.cap() < len && 4 * block.cap() >= 3 * len;
+    let grows = free.iter().flatten().any(outgrown) || quarantine.iter().any(|(_, b)| outgrown(b));
     drop(pool);
-    found.unwrap_or_else(|| PoolBlock::new(len + len / 8 + 64))
+    PoolBlock::new(len + if grows { len / 2 } else { len / 8 } + 64)
 }
 
 /// Puts the block of a dead version in the quarantine (`BlockPool`).
@@ -4256,8 +4339,8 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
             .map(|(s, go_file)| BlockFile {
                 nodes: &s.nodes,
                 lists: &s.lists,
-                facts: s.facts,
-                root: s.root,
+                facts: FactsCell::new(s.facts),
+                root: AtomicU64::new(s.root.0),
                 foreign: &s.foreign_parents,
                 links: &s.links,
                 shell_kinds: &[],
@@ -4289,7 +4372,9 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
 /// kids and kinds, copied into a pooled block (`BlockPool`, AST node
 /// records, step 4; the kinds since edleak1), which the caller gives to the
 /// version, and its foreign parents, moved out of `store` and leaked. Its
-/// `BlockFile` has no store, no `GoFile` and no child link column. A store
+/// `BlockFile` has no store, no `GoFile` and no child link column: the
+/// `BlockFile` of the pooled block (`PoolBlock::file`, edleak1 part 2), or
+/// a leaked one when the shell has foreign parents or a node column. A store
 /// that owns its astdata nodes (lsshells M3c) keeps its node column and its
 /// nodes, and the shell has none (`FileBlock::node_column`), so a node data
 /// read reads the version (`static_store_node`, `StaticNode::Scoped`); a
@@ -4368,23 +4453,33 @@ fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
     store.records = Vec::new();
     store.kids = Vec::new();
     store.kinds = Vec::new();
-    let foreign: &'static [Node] = Vec::leak(std::mem::take(&mut store.foreign_parents));
-    let shell = FileBlock {
-        kinds: &[],
-        records,
-        kids,
-        file: Box::leak(Box::new(BlockFile {
+    // edleak1 part 2: a shell with no leaked column takes the `BlockFile`
+    // of its block, so it leaks nothing. A store with leaked nodes or
+    // foreign parents leaks a `BlockFile` that names them, as before.
+    let file = match block.file {
+        Some(file) if nodes.is_empty() && store.foreign_parents.is_empty() => {
+            file.facts.set(store.facts);
+            file.root.store(store.root.0, Ordering::Relaxed);
+            file
+        }
+        _ => Box::leak(Box::new(BlockFile {
             nodes,
             lists,
-            facts: store.facts,
-            root: store.root,
-            foreign,
+            facts: FactsCell::new(store.facts),
+            root: AtomicU64::new(store.root.0),
+            foreign: Vec::leak(std::mem::take(&mut store.foreign_parents)),
             links: &[],
             shell_kinds,
             store: None,
             go_file: None,
             subtree_facts: OnceLock::new(),
         })),
+    };
+    let shell = FileBlock {
+        kinds: &[],
+        records,
+        kids,
+        file,
     };
     (shell, block)
 }
@@ -5123,7 +5218,7 @@ impl NodeRef {
         let b = self.block?;
         b.records[slot_index(self.node)]
             .has_bit(NodeRecord::SOURCE_FILE_ROOT)
-            .then(|| b.file.root)
+            .then(|| b.file.root())
     }
 
     /// The node data (`static_ast_node`), or `None` for a node with no
@@ -5382,7 +5477,7 @@ pub fn frozen_resolve_store_id(file: usize, id: crate::astdata::NodeId) -> Optio
 #[inline]
 #[must_use]
 pub fn frozen_store_facts(file: usize) -> Option<StoreFacts> {
-    file_block(file).map(|b| b.file.facts)
+    file_block(file).map(|b| b.file.facts())
 }
 
 /// The `StoreFacts` of the store of `n` when it is a published store node.
@@ -5449,7 +5544,7 @@ pub fn frozen_source_file_of_node(n: Node) -> Option<Node> {
     let b = file_block(n.file_index())?;
     b.records[slot_index(n)]
         .has_bit(NodeRecord::SOURCE_FILE_ROOT)
-        .then(|| b.file.root)
+        .then(|| b.file.root())
 }
 
 /// U1 (a): Go `node.Text()` of a published Identifier or PrivateIdentifier
@@ -5807,8 +5902,10 @@ pub fn frozen_store_lacks_deprecated_tag(n: Node) -> bool {
     if n.is_nil() {
         return false;
     }
-    file_block(n.file_index())
-        .is_some_and(|b| b.file.facts.parents_local && !b.file.facts.has_deprecated_tag)
+    file_block(n.file_index()).is_some_and(|b| {
+        let facts = b.file.facts();
+        facts.parents_local && !facts.has_deprecated_tag
+    })
 }
 
 /// U1 (c): how `Node::new(file, id)` maps the child ids of one published
@@ -5863,7 +5960,7 @@ pub fn frozen_store_ids(file: usize) -> Option<FrozenIds> {
 #[inline]
 fn block_ids(b: &FileBlock, file: usize) -> FrozenIds {
     let base = (file as u64) << 32;
-    if b.file.facts.alias_free {
+    if b.file.facts().alias_free {
         FrozenIds::Direct { base }
     } else {
         FrozenIds::Records {
@@ -8173,8 +8270,8 @@ mod tests {
                 file: Box::leak(Box::new(BlockFile {
                     nodes: &[],
                     lists: &[],
-                    facts: StoreFacts::ONLY_NIL_SLOT,
-                    root: Node::NIL,
+                    facts: FactsCell::new(StoreFacts::ONLY_NIL_SLOT),
+                    root: AtomicU64::new(Node::NIL.0),
                     foreign: &[],
                     links: &[],
                     shell_kinds: &[],
