@@ -1859,6 +1859,14 @@ impl<'a> Parser<'a> {
     // MethodDeclaration case (first switch) and from the class and function
     // case (second switch) is written as a shared follow-up block.
     pub fn check_js_syntax(&mut self, node: Node) -> Node {
+        // PERF: parsefast2. A node flag read is a store access here. A node
+        // gets JAVA_SCRIPT_FILE only from the context flags, which have it
+        // for the whole parse of a JS file (`initialize_state`) and never
+        // in another parse, so a non-JS parse returns with no read.
+        if !self.context_flags.intersects(NodeFlags::JAVA_SCRIPT_FILE) {
+            debug_assert!(!node.flags().intersects(NodeFlags::JAVA_SCRIPT_FILE));
+            return node;
+        }
         if !node.flags().intersects(NodeFlags::JAVA_SCRIPT_FILE)
             || node
                 .flags()
