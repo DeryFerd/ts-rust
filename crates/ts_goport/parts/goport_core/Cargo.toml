@@ -55,10 +55,12 @@ same-file = "=1.0.6"
 nix = { version = "=0.31.3", default-features = false, features = ["process", "signal"] }
 
 [features]
-# The defaults of ts_goport, so that `cargo test -p goport_core` runs the
-# jemalloc paths as ts_goport's lib tests did. ts_goport turns them on
-# through its own features.
-default = ["jemalloc"]
+# No defaults: ts_goport chooses the global allocator (its `jemalloc`
+# feature turns on this one), so the two crates cannot disagree about it.
+default = []
+# The binaries' global allocator is jemalloc: thread arenas
+# (`tikv-jemalloc-ctl`), `jemalloc_layout`, and the jemalloc thread budget
+# and glibc tunables in program.rs. Only ts_goport's `jemalloc` turns it on.
 jemalloc = ["dep:tikv-jemalloc-ctl"]
 noembed = ["goport_util/noembed"]
 
