@@ -7,9 +7,9 @@
 //! bits are the slot index + 1.
 //!
 //! Each slot has a header (Go kind plus the mutable Go `NodeBase` fields:
-//! parent, flags, loc) and, for a node slot, a leaked `NodeData` (the Go
-//! node data; the kind is in the header). A freeable parse owns the data
-//! instead (`OwnedAst`).
+//! parent, flags, loc) and, for a node slot, a `NodeData` view of its data
+//! in the AST arena (the Go node data; the kind is in the header). A
+//! freeable parse owns the data instead, boxed (`OwnedAst`).
 //! Child ids inside that data are slot indexes of the same store:
 //! - a child in the same file uses its own slot index;
 //! - a child from another file or a synthetic child (Go shares the pointer)
@@ -89,7 +89,7 @@
 //! (`bind_store_records`). The other binder fields stay in
 //! `GoFile::node_bind`, by the index in the record.
 
-use crate::astdata::{BoxedData, NodeData};
+use crate::astdata::{AstData, BoxedData, NodeData};
 use crate::frontend::parser::SourceFileParseOptions;
 use crate::leak_arena::LeakArena;
 use crate::prelude::*;
@@ -198,9 +198,11 @@ struct FileStore {
     /// The node data of each node slot (its kind is in `kinds`). `None` for
     /// the nil slot and alias slots. A node that a freeable parse owns has
     /// the marker data here (`owned_marker`); its data is in `owned`.
-    // PERF: astmem1 P1. An entry names a leaked `NodeData` (16 B), not a
-    // leaked astdata node (40 B) whose kind, flags, range and parent no
-    // read used: the header of a slot is in its record and `kinds`.
+    // PERF: astmem1 P1. An entry names the data, not a leaked astdata node
+    // (40 B) whose kind, flags, range and parent no read used: the header of
+    // a slot is in its record and `kinds`. astchunks2: the entry is the
+    // 16 B (tag, reference) view, as Go's `nodeData` word, and the data is
+    // in the AST arena, with no box and no 16 B `NodeData` value between.
     nodes: Vec<Option<ColumnData>>,
     /// astshrink1: the list table of a static store. Entry `i` is the list
     /// that astdata list field `NodeList::new(i)` names in the static node
@@ -2407,7 +2409,7 @@ pub fn is_freeable_parse() -> bool {
 }
 
 /// Cells per chunk of `OwnedAst::chunks`.
-// PERF: 256 cells of 16 bytes (`NodeData`, astmem1 P1) is a 4 KiB chunk,
+// PERF: 256 cells of 16 bytes (`BoxedData`, astmem1 P1) is a 4 KiB chunk,
 // one small size class of jemalloc.
 const OWNED_CHUNK: usize = 256;
 
@@ -2662,8 +2664,8 @@ fn owned_cell(chunk: usize, index: usize) -> u32 {
 /// The data that `FileStore::nodes` holds for a slot whose data a freeable
 /// parse owns (`OwnedAst`). It is never read as data.
 fn owned_marker() -> ColumnData {
-    static MARKER: OnceLock<ColumnData> = OnceLock::new();
-    MARKER.get_or_init(|| Box::leak(Box::new(hole_data())))
+    static MARKER: crate::astdata::TokenData = crate::astdata::TokenData;
+    NodeData::Token(&MARKER)
 }
 
 /// A list of a store that owns its nodes (a freeable parse): what
@@ -3413,7 +3415,7 @@ impl FileStore {
         let mut any_owned = false;
         for (slot, &cell) in owned.cell_of.iter().enumerate() {
             if cell != NO_CELL {
-                self.nodes[slot] = Some(&flat[cell as usize]);
+                self.nodes[slot] = Some(flat[cell as usize].view());
                 any_owned = true;
             }
         }
@@ -5259,13 +5261,16 @@ pub fn try_store_ast_node(n: Node) -> Option<NodeData<'static>> {
     }
 }
 
-/// A node column entry (`FileStore::nodes`): the leaked data of a node slot.
-type ColumnData = &'static BoxedData;
+/// A node column entry (`FileStore::nodes`): the data of a node slot, as
+/// Go's `nodeData` interface word (tag and reference, 16 B). A static parse
+/// moves the data into the AST arena (`alloc_store_slot`); the entry of a
+/// slot whose data a freeable parse owns is the marker (`owned_marker`).
+type ColumnData = NodeData<'static>;
 
 /// The node data of a node slot. Panics on the nil slot and alias slots.
 #[inline]
 fn slot_node(slot: Option<ColumnData>) -> NodeData<'static> {
-    slot.expect("store handle does not name a node slot").view()
+    slot.expect("store handle does not name a node slot")
 }
 
 /// `resolve_store_id(file, id)` when `file` has a store, in one lookup (see
@@ -5938,7 +5943,7 @@ pub fn finish_store_node_and_parents(
     s.set_slot_loc(index, loc);
     let flags = s.records[index].flags() | flags;
     s.set_slot_flags(index, flags);
-    if s.set_slot_child_parents(index, node.view()) {
+    if s.set_slot_child_parents(index, node) {
         FinishedStoreNode::All
     } else {
         FinishedStoreNode::LocAndFlags
@@ -6045,7 +6050,7 @@ pub fn set_parent_in_store_children(parent: Node) -> bool {
     let Some(node) = s.nodes[index] else {
         return false;
     };
-    s.set_slot_child_parents(index, node.view())
+    s.set_slot_child_parents(index, node)
 }
 
 impl FileStore {
@@ -6224,7 +6229,9 @@ pub fn replace_store_node_data(n: Node, data: BoxedData) {
                 owned.cell_of[index] = cell;
                 s.nodes[index] = Some(owned_marker());
             }
-            None => s.nodes[index] = Some(leak_in_ast_arena(data)),
+            // astchunks2: the box stays (leaked); the column views its
+            // payload. Rare: a reparser write.
+            None => s.nodes[index] = Some(leak_in_ast_arena(data).view()),
         }
         // R2-5: the children of the node can change, so its chain is freed
         // and unknown until the parser sets their parents again
@@ -6279,7 +6286,7 @@ pub(crate) struct LibParseSlot {
     pub(crate) next_sibling: u32,
     /// The node data. `None`: the slot points at the shared name data of
     /// `kind` (S1, `alloc_store_shared_name_node`).
-    pub(crate) data: Option<BoxedData>,
+    pub(crate) data: Option<NodeData<'static>>,
     /// The name word and the keyword bit (`slot_text_name`):
     /// `Name::default()` and false for a kind other than Identifier and
     /// PrivateIdentifier.
@@ -6349,7 +6356,7 @@ impl FileStore {
             text_is_keyword,
         } = slot;
         let node = match data {
-            Some(data) => leak_in_ast_arena(data),
+            Some(data) => data,
             None => shared_name_node(kind),
         };
         // The `ParentCode` of a parent in this store (nil for `NIL_SLOT`).
@@ -6367,7 +6374,7 @@ impl FileStore {
             .push(NodeRecord::new(bits, flags, loc, u64::from(parent)));
         self.kinds.push(kind);
         self.nodes.push(Some(node));
-        let (modifiers, children) = slot_kids_parts(kind, node.view());
+        let (modifiers, children) = slot_kids_parts(kind, node);
         let modifier_bits = self.static_modifier_bits(modifiers);
         self.kids.push(NodeKids::new(
             children,
@@ -6429,7 +6436,7 @@ pub(crate) fn lib_parse_slot_views(file: usize) -> Result<Vec<LibParseSlotView>,
             let record = &s.records[index];
             let kind = s.kinds[index];
             let data = s.nodes[index].ok_or_else(|| format!("slot {index} is not a node slot"))?;
-            if !data.view().matches_syntax_kind(kind) {
+            if !data.matches_syntax_kind(kind) {
                 return Err(format!("slot {index}: the node data does not fit {kind:?}"));
             }
             let parent = match (record.local_parent(), record.parent_code()) {
@@ -6437,7 +6444,7 @@ pub(crate) fn lib_parse_slot_views(file: usize) -> Result<Vec<LibParseSlotView>,
                 (Some(parent), _) => parent as u32,
                 _ => return Err(format!("slot {index}: a parent in another store")),
             };
-            let shared_name = is_name_kind(kind) && std::ptr::eq(data, shared_name_node(kind));
+            let shared_name = is_name_kind(kind) && data.same(shared_name_node(kind));
             let links = s.links[index];
             views.push(LibParseSlotView {
                 kind,
@@ -6446,7 +6453,7 @@ pub(crate) fn lib_parse_slot_views(file: usize) -> Result<Vec<LibParseSlotView>,
                 parent,
                 first_child: links.first_child,
                 next_sibling: links.next_sibling,
-                data: data.view(),
+                data,
                 shared_name,
                 name: s.kids[index].text_name(kind),
                 text_is_keyword: record.has_bit(NodeRecord::TEXT_IS_KEYWORD),
@@ -6543,7 +6550,7 @@ pub(crate) fn lib_parse_store_dump(file: usize) -> Vec<String> {
         for index in 0..s.records.len() {
             let kind = s.kinds[index];
             let shared = is_name_kind(kind)
-                && s.nodes[index].is_some_and(|data| std::ptr::eq(data, shared_name_node(kind)));
+                && s.nodes[index].is_some_and(|data| data.same(shared_name_node(kind)));
             let record = &s.records[index];
             let kids = &s.kids[index];
             lines.push(format!(
@@ -6592,25 +6599,19 @@ pub(crate) fn leak_in_ast_arena<T>(value: T) -> &'static T {
 /// PrivateIdentifier, by `kind`) made by `alloc_store_shared_name_node`
 /// points at. Its data is the Go factory payload with an empty text (the
 /// name column holds the text).
+// astchunks2: `static`, not `const`, so the data has one address (the
+// snapshot writer finds shared names by `NodeData::same`).
 fn shared_name_node(kind: SyntaxKind) -> ColumnData {
-    static IDENTIFIER: OnceLock<ColumnData> = OnceLock::new();
-    static PRIVATE_IDENTIFIER: OnceLock<ColumnData> = OnceLock::new();
-    let leak = |data| -> ColumnData { Box::leak(Box::new(data)) };
+    static IDENTIFIER: crate::astdata::IdentifierData = crate::astdata::IdentifierData {
+        text: String::new(),
+    };
+    static PRIVATE_IDENTIFIER: crate::astdata::PrivateIdentifierData =
+        crate::astdata::PrivateIdentifierData {
+            text: String::new(),
+        };
     match kind {
-        SyntaxKind::Identifier => *IDENTIFIER.get_or_init(|| {
-            leak(BoxedData::Identifier(Box::new(
-                crate::astdata::IdentifierData {
-                    text: String::new(),
-                },
-            )))
-        }),
-        SyntaxKind::PrivateIdentifier => *PRIVATE_IDENTIFIER.get_or_init(|| {
-            leak(BoxedData::PrivateIdentifier(Box::new(
-                crate::astdata::PrivateIdentifierData {
-                    text: String::new(),
-                },
-            )))
-        }),
+        SyntaxKind::Identifier => NodeData::Identifier(&IDENTIFIER),
+        SyntaxKind::PrivateIdentifier => NodeData::PrivateIdentifier(&PRIVATE_IDENTIFIER),
         _ => panic!("{kind:?} is not a name kind"),
     }
 }
@@ -6621,7 +6622,7 @@ fn shared_name_node(kind: SyntaxKind) -> ColumnData {
 /// does not compile here until it is checked.
 #[cfg(debug_assertions)]
 pub fn debug_assert_shared_name_data(kind: SyntaxKind, data: NodeData<'_>) {
-    let same = match (data, shared_name_node(kind).view()) {
+    let same = match (data, shared_name_node(kind)) {
         (NodeData::Identifier(a), NodeData::Identifier(b)) => {
             let crate::astdata::IdentifierData { text } = a;
             *text == b.text
@@ -6640,7 +6641,8 @@ pub fn debug_assert_shared_name_data(kind: SyntaxKind, data: NodeData<'_>) {
 
 /// Go `newNode(kind, data, hooks)` in store `file`: `Loc =
 /// UndefinedTextRange()`, nil parent, no flags.
-pub fn alloc_store_node(file: usize, kind: SyntaxKind, data: BoxedData) -> Node {
+#[inline]
+pub fn alloc_store_node<T: AstData>(file: usize, kind: SyntaxKind, data: T) -> Node {
     alloc_store_slot(file, kind, data, None)
 }
 
@@ -6648,7 +6650,12 @@ pub fn alloc_store_node(file: usize, kind: SyntaxKind, data: BoxedData) -> Node 
 /// `text`, whose `data` has an empty text: the name column of the slot
 /// holds the text (`store_identifier_name`).
 // PERF: U1 (d). The node data needs no `String` for the text.
-pub fn alloc_store_name_node(file: usize, kind: SyntaxKind, data: BoxedData, text: &str) -> Node {
+pub fn alloc_store_name_node<T: AstData>(
+    file: usize,
+    kind: SyntaxKind,
+    data: T,
+    text: &str,
+) -> Node {
     debug_assert!(
         matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier),
         "{kind:?} is not a name kind"
@@ -6676,16 +6683,36 @@ pub fn alloc_store_shared_name_node(file: usize, kind: SyntaxKind, text: &str) -
 // PERF: lsshells M3c. A static parse (every CLI parse) leaks the data first
 // and passes a reference, as before M3c: one thread-local load picks the
 // path, and the data value is not moved into the store closure.
+// PERF: astchunks2. The data goes by value into the AST arena, with no box
+// (Go: the typed arenas of `NodeFactory`). Only the arena bump and the view
+// are generic; the rest is `alloc_store_slot_node`.
 #[inline]
-fn alloc_store_slot(file: usize, kind: SyntaxKind, data: BoxedData, text: Option<&str>) -> Node {
+fn alloc_store_slot<T: AstData>(
+    file: usize,
+    kind: SyntaxKind,
+    data: T,
+    text: Option<&str>,
+) -> Node {
     debug_assert!(
         data.view().matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
     );
     if FREEABLE_PARSE.get() {
-        return alloc_store_owned_slot(file, kind, data, text);
+        return alloc_store_boxed_slot(file, kind, data, text);
     }
-    alloc_store_slot_node(file, kind, leak_in_ast_arena(data), text)
+    alloc_store_slot_node(file, kind, leak_in_ast_arena(data).view(), text)
+}
+
+/// `alloc_store_slot` inside a freeable parse: the data goes in a box
+/// (owned file versions keep boxed data, `OwnedAst`).
+#[inline(never)]
+fn alloc_store_boxed_slot<T: AstData>(
+    file: usize,
+    kind: SyntaxKind,
+    data: T,
+    text: Option<&str>,
+) -> Node {
+    alloc_store_owned_slot(file, kind, data.into_boxed(), text)
 }
 
 /// `alloc_store_slot` for node data that is already leaked (or the shared
@@ -6698,18 +6725,17 @@ fn alloc_store_slot_node(
     node: ColumnData,
     text: Option<&str>,
 ) -> Node {
-    let view = node.view();
     debug_assert!(
-        text.is_none() || identifier_text(view).is_empty(),
+        text.is_none() || identifier_text(node).is_empty(),
         "a name node keeps its text in the name column"
     );
     // PERF: U1 (b), U4. Read while the new data is hot, not at freeze.
-    let (modifiers, children) = slot_kids_parts(kind, view);
+    let (modifiers, children) = slot_kids_parts(kind, node);
     with_store_mut(file, |s| {
         let modifier_bits = s.static_modifier_bits(modifiers);
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.records.len() as u32;
-        let (name, text_is_keyword) = s.slot_text_name(kind, view, text);
+        let (name, text_is_keyword) = s.slot_text_name(kind, node, text);
         s.push_node_header(kind, text_is_keyword);
         s.nodes.push(Some(node));
         s.push_no_cell();
@@ -6755,7 +6781,7 @@ fn alloc_store_owned_slot(
     text: Option<&str>,
 ) -> Node {
     if !with_store(file, |s| s.owned.is_some()) {
-        return alloc_store_slot_node(file, kind, leak_in_ast_arena(node), text);
+        return alloc_store_slot_node(file, kind, leak_in_ast_arena(node).view(), text);
     }
     debug_assert!(
         text.is_none() || identifier_text(node.view()).is_empty(),
@@ -7159,6 +7185,15 @@ pub fn is_nil_list_range(range: &crate::astdata::text::TextRange) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// astchunks2: a node column entry is Go's 16 B interface word (tag and
+    /// reference), and the owning enum has the same layout (`view` is a copy).
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn node_column_entry_is_16_bytes() {
+        assert_eq!(std::mem::size_of::<Option<ColumnData>>(), 16);
+        assert_eq!(std::mem::size_of::<BoxedData>(), 16);
+    }
 
     #[test]
     fn parser_factory_writes_into_the_file_store() {
@@ -7631,10 +7666,8 @@ mod tests {
         assert!(identifier_text(store_ast_node(id)).is_empty());
         // S1: every store identifier points at one shared astdata node.
         assert!(store_ast_node(id).same(store_ast_node(missing)));
-        assert!(store_ast_node(id).same(shared_name_node(SyntaxKind::Identifier).view()));
-        assert!(
-            store_ast_node(private).same(shared_name_node(SyntaxKind::PrivateIdentifier).view())
-        );
+        assert!(store_ast_node(id).same(shared_name_node(SyntaxKind::Identifier)));
+        assert!(store_ast_node(private).same(shared_name_node(SyntaxKind::PrivateIdentifier)));
         assert_eq!(id.text(), "abc");
         assert_eq!(private.text(), "#p");
         assert_eq!(missing.text(), "");

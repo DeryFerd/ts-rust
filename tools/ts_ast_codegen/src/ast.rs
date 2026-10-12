@@ -696,7 +696,7 @@ impl BoxedData {
     fn generate_ast_data_impls(&self, output: &mut String) {
         output.push_str(
             "/// One node data struct: its view and its box.
-pub trait AstData: Sized {
+pub trait AstData: Sized + 'static {
     /// The view of this data.
     fn view(&self) -> NodeData<'_>;
     /// This data in a new box.

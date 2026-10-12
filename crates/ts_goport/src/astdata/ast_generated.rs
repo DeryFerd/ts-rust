@@ -3682,7 +3682,7 @@ impl<'a> NodeData<'a> {
 }
 
 /// One node data struct: its view and its box.
-pub trait AstData: Sized {
+pub trait AstData: Sized + 'static {
     /// The view of this data.
     fn view(&self) -> NodeData<'_>;
     /// This data in a new box.

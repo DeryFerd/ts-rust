@@ -59,7 +59,7 @@
 use crate::ast::store::{LibListTable, LibParseSlot, load_lib_parse_slots, reset_file_store};
 #[cfg(test)]
 use crate::ast::store::{lib_parse_slot_views, lib_parse_store_dump};
-use crate::astdata::{BoxedData, NodeData};
+use crate::astdata::NodeData;
 use crate::binder::lib_snapshot::{
     MIN_TEXT_LEN, Mode, SnapshotEntry, SnapshotReader, TEXT_BIT, const_hash, mix, read_entries,
     text_matches,
@@ -568,7 +568,7 @@ impl<'a> Decoder<'a> {
             None
         } else {
             let data = decode_payload(&mut PayloadDecoder { dec: self, lists }, variant)?;
-            if !data.view().matches_syntax_kind(kind) {
+            if !data.matches_syntax_kind(kind) {
                 return None;
             }
             Some(data)
@@ -915,10 +915,11 @@ macro_rules! payload_codec {
     ($($variant_tag:literal $variant:ident($data:ident) {
         $($field:ident: $codec:ident),* $(,)?
     })*) => {
-        /// The node data with variant tag `variant_tag`, from `dec`.
-        fn decode_payload(dec: &mut PayloadDecoder<'_, '_, '_, '_>, variant_tag: u8) -> Option<BoxedData> {
+        /// The node data with variant tag `variant_tag`, from `dec`, in the
+        /// AST arena of this thread (astchunks2: no box per node).
+        fn decode_payload(dec: &mut PayloadDecoder<'_, '_, '_, '_>, variant_tag: u8) -> Option<NodeData<'static>> {
             Some(match variant_tag {
-                $($variant_tag => BoxedData::$variant(Box::new(crate::astdata::$data {
+                $($variant_tag => NodeData::$variant(crate::ast::leak_in_ast_arena(crate::astdata::$data {
                     $($field: dec.$codec()?,)*
                 })),)*
                 _ => return None,
