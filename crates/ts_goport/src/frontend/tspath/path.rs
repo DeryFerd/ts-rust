@@ -1254,9 +1254,9 @@ fn relative_path_from_normalized_paths(
 
 // Go: tspath/rooted_path.go:106 hasRootedURLSuffix (ts#64159)
 /// A URL root with a query or a fragment after its scheme.
-// PORT: private in Go tspath. The Rust ports of the rooted path
-// constructors that use it are outside tspath (`transpile.rs`,
-// `contentmapper/hostimpl.rs`).
+// PORT: private in Go tspath. `to_rooted_path` and the Rust ports of the
+// rooted path constructors outside tspath (`transpile.rs`,
+// `contentmapper/hostimpl.rs`) use it.
 pub fn has_rooted_url_suffix(path: &str) -> bool {
     if !has_url_root(path) {
         return false;
@@ -1269,6 +1269,42 @@ pub fn has_rooted_url_suffix(path: &str) -> bool {
 // PORT: private in Go tspath (see `has_rooted_url_suffix`).
 pub fn has_url_root(path: &str) -> bool {
     get_encoded_root_length(path) < 0 && path.contains("://")
+}
+
+// Go: tspath/rooted_path.go:29 ToRootedPath (ts#64159)
+// ToRootedPath resolves path against currentDirectory and normalizes it.
+// Go `ToRootedFilePath` (:120) and `ToRootedDirectoryPath` (:154) are this
+// function with a typed result. An empty `path`, or a URL `path` with a
+// query or fragment, is a Go panic; a request handler answers it as
+// `panic: <message>`.
+// PORT: the API and the command line parser use it (the API's other
+// rooted path checks are in `api::session_p2`). Go normalizes with
+// `getNormalizedAbsolutePathFromDirectory` (path.go:409), which gives the
+// text of `get_normalized_absolute_path` for a rooted current directory.
+pub fn to_rooted_path(path: &str, current_directory: &str) -> String {
+    if path.is_empty() {
+        crate::core::go_panic("path must not be empty".to_string());
+    }
+    if has_rooted_url_suffix(path) {
+        crate::core::go_panic("path must not contain a URL query or fragment".to_string());
+    }
+    if get_encoded_root_length(path) == 0
+        && has_url_root(current_directory)
+        && path.contains(['?', '#'])
+    {
+        crate::core::go_panic("relative URL path must not contain a query or fragment".to_string());
+    }
+    let mut normalized = get_normalized_absolute_path(path, current_directory);
+    if get_encoded_root_length(&normalized) == 0 || has_rooted_url_suffix(&normalized) {
+        crate::core::go_panic("path must be rooted".to_string());
+    }
+    // Go: tspath/rooted_path.go:65 ensureRootedPathRootSeparator
+    if get_root_length(&normalized) == normalized.len()
+        && !has_trailing_directory_separator(&normalized)
+    {
+        normalized.push('/');
+    }
+    normalized
 }
 
 // Go: tspath/rooted_path.go:575 CaseSensitivity.trimContainedPath (ts#64159)
