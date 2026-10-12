@@ -20,8 +20,9 @@
 #                          or renamed tests); two bound runs; the full gate and gate-compare.py against the
 #                          base gate manifest; the LSP and API oracles, each compared per request with the
 #                          base results (oracle-compare.py); rustfmt and clippy on ts_goport and the kept
-#                          crates. The gate and the oracles run on --gate-host (default dbook-lan, which
-#                          remote.sh keeps for this; REMOTE_USE_RESERVED=1 is set below). The base
+#                          crates (clippy target: the checkout's target/candidate-clippy). The gate and the
+#                          oracles run on --gate-host (default dbook-lan, which remote.sh keeps for this;
+#                          REMOTE_USE_RESERVED=1 is set below). The base
 #                          is the last accepted revision (open_revision.py --base). Each step is cached by
 #                          source under evidence-cache/<key>/ and reused. The oracle compares use the answer
 #                          sets of the base (protectedBase.oracleAnswers) and of the batch (batch.oracleAnswers)
@@ -624,8 +625,12 @@ PY
   # Quality on the checkout: rustfmt and clippy (R114 and R124 were refused for quality alone).
   # Fingerprint before and after.
   # A record without .crates predates the kept crate check (R131 and older), so it runs again.
+  # Each checkout has its own clippy target, reused by its next runs and removed with its worktree. One shared
+  # dir let clippy check another checkout's goport_util (R190 side run 1, state note
+  # clippy-shared-target-2026-10-11), for the reason that the release build above names.
+  local clippy_target=$wt/target/candidate-clippy
   if [[ -f $C/quality.json ]] && jq -e .crates "$C/quality.json" > /dev/null; then say "reuse quality $(jq -c . "$C/quality.json")"; else
-    say "$(date -u +%FT%TZ) quality: rustfmt and clippy"
+    say "$(date -u +%FT%TZ) quality: rustfmt and clippy (clippy target $clippy_target)"
     if [[ $DRY == 0 ]]; then
       local fpa fpb fmt=0 cl=0 warn
       fpb=$(python3 "$G/fp.py" "$wt" | cut -d' ' -f1)
@@ -635,7 +640,7 @@ PY
       for p in goport_util goport_lsproto; do grep -q "\"crates/ts_goport/parts/$p\"" "$wt/Cargo.toml" && pkgs+=(-p "$p"); done
       for p in "${KEPT_CRATES[@]}"; do grep -q "\"crates/$p\"" "$wt/Cargo.toml" && pkgs+=(-p "$p") dirs+=("crates/$p"); done
       (cd "$wt" && rustfmt --edition 2024 --check $(git ls-files "${dirs[@]/%//**/*.rs}") > "$C/rustfmt.log" 2>&1) || fmt=$?
-      (cd "$wt" && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$R/runtime/cargo-r113-clippy \
+      (cd "$wt" && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$clippy_target \
         "$ROOT/scripts/run-cargo-capped.sh" clippy --locked "${pkgs[@]}" --all-targets > "$C/clippy.log" 2>&1) || cl=$?
       fpa=$(python3 "$G/fp.py" "$wt" | cut -d' ' -f1)
       local kept
