@@ -1550,6 +1550,21 @@ struct PrefetchJob {
     /// True when a loader batch put the job below the others
     /// (`queue_batch`), for the debug counts.
     under: AtomicBool,
+    /// Tests: set when the worker that parsed the file has stored its prep
+    /// or made none (`set_prep_wait`).
+    #[cfg(test)]
+    prep_settled: AtomicBool,
+}
+
+/// Sets `PrefetchJob::prep_settled` when the worker leaves the job.
+#[cfg(test)]
+struct PrepSettled<'j>(&'j PrefetchJob);
+
+#[cfg(test)]
+impl Drop for PrepSettled<'_> {
+    fn drop(&mut self) {
+        self.0.prep_settled.store(true, AtomicOrdering::Release);
+    }
 }
 
 enum PrefetchState {
@@ -1681,6 +1696,17 @@ impl TakenParse {
     /// has stored in the shared cache by then, so it is not later than the
     /// worker.
     pub(crate) fn take_prep(self) -> Option<Box<FilePrep>> {
+        // A test can make the loader wait (up to 60 s) until the worker has
+        // stored the prep or made none (`set_prep_wait`).
+        #[cfg(test)]
+        if PREP_WAIT.with(Cell::get) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+            while !self.0.prep_settled.load(AtomicOrdering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         let prep = lock(&self.0.prep).take();
         if prep.is_none() {
             count_prep(|c| c.preps_missing += 1);
@@ -1806,6 +1832,18 @@ thread_local! {
     /// A test's choice to make the loads on this thread wait in
     /// `take_prefetched_meta` for a job that is still queued.
     static META_WAIT: Cell<bool> = const { Cell::new(false) };
+    /// A test's choice to make the loads on this thread wait in
+    /// `TakenParse::take_prep` for the worker's prep.
+    static PREP_WAIT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the loads on this thread wait in `TakenParse::take_prep` until the
+/// worker that parsed the file has stored its prep or made none, so the
+/// loader takes each prep whatever the timing (tests). A worker stores the
+/// prep after the parse that the loader waits for.
+#[cfg(test)]
+pub(crate) fn set_prep_wait(on: bool) {
+    PREP_WAIT.with(|wait| wait.set(on));
 }
 
 /// Makes the loads on this thread wait for the parse worker of each file
@@ -1946,6 +1984,8 @@ impl PrefetchQueue {
             mapped,
             queued_at: self.timed.then(std::time::Instant::now),
             under: AtomicBool::new(false),
+            #[cfg(test)]
+            prep_settled: AtomicBool::new(false),
         });
         self.next_job += 1;
         self.by_name.insert(job.opts.file_name.clone(), job.clone());
@@ -3130,6 +3170,8 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
             }
         };
         running.finish(result);
+        #[cfg(test)]
+        let _settled = PrepSettled(&job);
         let Some(refs) = refs else {
             continue;
         };

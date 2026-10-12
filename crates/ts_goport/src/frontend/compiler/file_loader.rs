@@ -508,6 +508,10 @@ thread_local! {
     /// name and whether the loader could use it (`FilePrep::fits`).
     static PREP_FITS: std::cell::RefCell<Vec<(String, bool)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Each file whose taken prep gave the worker's import names
+    /// (`FilePrep::names`), in the loads on this thread.
+    static PREPS_NAMED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -1906,6 +1910,10 @@ impl FileLoader {
             }
 
             if prep.is_some() {
+                #[cfg(test)]
+                if named {
+                    PREPS_NAMED.with(|files| files.borrow_mut().push(file_name.to_string()));
+                }
                 note_prep_taken();
                 note_names_own(names_own);
                 count_prep(|c| {
@@ -2636,7 +2644,7 @@ pub(crate) fn get_jsx_implicit_import_base_of_file(
 #[cfg(test)]
 mod tests {
     use super::super::files_parser::{
-        names_own, preps_taken, set_load_names, set_load_prep, set_meta_wait,
+        names_own, preps_taken, set_load_names, set_load_prep, set_meta_wait, set_prep_wait,
     };
     use super::*;
     use crate::frontend::bundled;
@@ -3004,7 +3012,9 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
     // both ways, `export .. from`) in node16 CJS and ESM files, JSDoc imports
     // in TS and JS files, a source phase import, synthetic imports and a
     // module augmentation. With the names, the loader resolves no import of
-    // a file whose prep it took (only the module augmentation).
+    // a file whose prep it took (only the module augmentation). The load
+    // with names waits for each worker's metadata and prep, so a.ts and
+    // b.ts always take the worker's names.
     #[test]
     fn worker_names_give_the_same_load() {
         let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "allowJs": true,
@@ -3090,11 +3100,19 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
 "#,
             ),
         ];
+        // With no parse workers the loader reads every file itself.
+        let workers = super::super::files_parser::parse_workers_enabled();
         set_load_prep(Some(true));
         set_load_names(Some(true));
+        set_meta_wait(workers);
+        set_prep_wait(workers);
+        PREPS_NAMED.with(|files| files.borrow_mut().clear());
         let (taken, own) = (preps_taken(), names_own());
         let with_names = parallel_load("names_on", tsconfig, &files);
         let (taken, own) = (preps_taken() - taken, names_own() - own);
+        let named = PREPS_NAMED.with(|files| std::mem::take(&mut *files.borrow_mut()));
+        set_meta_wait(false);
+        set_prep_wait(false);
         set_load_names(Some(false));
         let without_names = parallel_load("names_off", tsconfig, &files);
         set_load_names(None);
@@ -3111,8 +3129,14 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
             with_names.contains(r#"module "lib" ModuleKind(99)"#),
             "{with_names}"
         );
-        if super::super::files_parser::parse_workers_enabled() {
+        if workers {
             assert!(taken > 0, "no prep taken:\n{with_names}");
+            for file in ["/src/esm/a.ts", "/src/b.ts"] {
+                assert!(
+                    named.iter().any(|name| name.ends_with(file)),
+                    "{file} took no named prep: {named:?}"
+                );
+            }
             // Only the module augmentation of b.ts: the workers resolve the
             // synthetic imports and the imports.
             assert!(
