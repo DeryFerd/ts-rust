@@ -321,19 +321,24 @@ fn is_default_binding_context(location: Node) -> bool {
 impl Checker {
     // Go: checker/nodebuilderimpl.go:135 saveRestoreFlags
     // PORT: the restore closure keeps its own handle to the context.
-    pub fn save_restore_flags(&mut self, b: &Rc<RefCell<NodeBuilderImpl>>) -> Box<dyn FnOnce()> {
+    // PERF: printfast1. The closure is returned by value, not boxed: each
+    // caller calls it once in the same function.
+    pub fn save_restore_flags(
+        &mut self,
+        b: &Rc<RefCell<NodeBuilderImpl>>,
+    ) -> impl FnOnce() + use<> {
         let ctx = p1_ctx(b);
         let (flags, internal_flags, depth) = {
             let c = ctx.borrow();
             (c.flags, c.internal_flags, c.depth)
         };
 
-        Box::new(move || {
+        move || {
             let mut c = ctx.borrow_mut();
             c.flags = flags;
             c.internal_flags = internal_flags;
             c.depth = depth;
-        })
+        }
     }
 
     // Go: checker/nodebuilderimpl.go:147 checkTruncationLength
