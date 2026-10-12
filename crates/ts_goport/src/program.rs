@@ -3525,6 +3525,10 @@ fn create_checkers() -> CheckerPool {
     let program = prog();
     let source_file_order = program.source_file_order();
     let associations = match go_frontend_program() {
+        // PORT: not in Go (fastmode2 experiment, `GOPORT_FAST_SPLIT=cost`).
+        Some(np) if count > 1 && crate::fast_mode::cost_split_enabled() => {
+            fast_cost_split(&np, &source_file_order, count)
+        }
         Some(np) => ls_program::get_checker_associations(&np, count),
         None => (0..source_file_order.len()).map(|i| i % count).collect(),
     };
@@ -3540,6 +3544,61 @@ fn create_checkers() -> CheckerPool {
         "checker pool made twice"
     );
     start_checkers(count)
+}
+
+/// fastmode2: `crate::fast_mode::cost_split` for the files of `np` (file ids
+/// `source_file_order`, in the same order), in that order. A file's cost is
+/// Go's base weight of the split, 0 when the check skips it; its imports
+/// are its resolved imports that are program files. Not in Go.
+fn fast_cost_split(
+    np: &crate::frontend::compiler::NewProgram,
+    source_file_order: &[usize],
+    count: usize,
+) -> Vec<usize> {
+    let nodes: FxHashMap<usize, Node> = source_files()
+        .into_iter()
+        .map(|file| (file.file_index(), file))
+        .collect();
+    let positions: FxHashMap<usize, usize> = np
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| (file.store, i))
+        .collect();
+    let mut weights = Vec::with_capacity(np.files.len());
+    let mut costs = Vec::with_capacity(np.files.len());
+    let mut imports = Vec::with_capacity(np.files.len());
+    for (position, (file, file_index)) in np.files.iter().zip(source_file_order).enumerate() {
+        let weight = ls_program::get_checker_association_base_weight(
+            file.node_count as i64,
+            file.text.len() as i64,
+        ) as u64;
+        let checked = nodes
+            .get(file_index)
+            .is_some_and(|&node| !skip_type_checking(node, false));
+        weights.push(weight);
+        costs.push(if checked { weight } else { 0 });
+        let mut targets: Vec<usize> = np
+            .processed_files
+            .resolved_modules
+            .get(file.path())
+            .into_iter()
+            .flat_map(|resolved_modules| resolved_modules.values())
+            .filter(|resolved| resolved.is_resolved())
+            .filter_map(|resolved| {
+                let target =
+                    np.get_source_file_for_resolved_module(&resolved.resolved_file_name)?;
+                positions
+                    .get(&target.store)
+                    .copied()
+                    .filter(|&target| target != position)
+            })
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        imports.push(targets);
+    }
+    crate::fast_mode::cost_split(&costs, &weights, &imports, count)
 }
 
 // Go: compiler/checkerpool.go:367 createCheckers (one `checker.NewChecker`)

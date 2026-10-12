@@ -14,6 +14,9 @@
 //!   (`GOPORT_FAST_NEVER_ORDER`, `checker/checker_p24.rs`);
 //! - one jemalloc arena per checker (`jemalloc_layout::ArenaClaims`).
 //!
+//! `GOPORT_FAST_SPLIT=cost` (an experiment, off by default) replaces Go's
+//! split with `cost_split`.
+//!
 //! Each part also has its own switch: `GOPORT_LAZY_MEMBERS=0`,
 //! `GOPORT_FAST_NEVER_ORDER=0` and `GOPORT_FAST_ARENAS=0` turn that part off
 //! in fast mode, and `=1` turns the first two on without it.
@@ -33,6 +36,7 @@
 //! the lane reports, `target/continuation-r97-goport/fastmode1` and
 //! `fastmode2`).
 
+use std::cmp::Reverse;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -130,4 +134,111 @@ pub fn checker_count(source_files: usize) -> usize {
         .min(MAX_CHECKERS)
         .min(source_files.div_ceil(FILES_PER_CHECKER))
         .max(4)
+}
+
+/// The experimental cost split (`GOPORT_FAST_SPLIT=cost`, `cost_split`) in
+/// fast mode. Read once.
+pub fn cost_split_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| enabled() && std::env::var("GOPORT_FAST_SPLIT").as_deref() == Ok("cost"))
+}
+
+/// The percent of an import's weight that `cost_split` adds to a checker
+/// that does not read that import yet: `GOPORT_FAST_SPLIT_DEP`, default
+/// `DEP_SHARE`. Read once.
+fn dep_share() -> u64 {
+    static SHARE: OnceLock<u64> = OnceLock::new();
+    *SHARE.get_or_init(|| {
+        std::env::var("GOPORT_FAST_SPLIT_DEP")
+            .ok()
+            .and_then(|share| share.parse().ok())
+            .unwrap_or(DEP_SHARE)
+    })
+}
+
+/// The default of `dep_share`. fastmode2 sweep (0 to 800, 3 rounds, VS Code
+/// and Sentry at 16 checkers): 50 and 100 were the fastest, 0 the slowest.
+const DEP_SHARE: u64 = 100;
+
+/// fastmode2 experiment: a static split of `costs.len()` files over `count`
+/// checkers that balances the work of the check pass. Not in Go.
+///
+/// - `costs[f]`: the check work of file `f`, 0 when the check skips it.
+/// - `weights[f]`: the size of file `f` (Go's base weight), checked or not.
+/// - `imports[f]`: the program files that `f` imports, sorted, no repeats.
+///
+/// The checked files go one by one, the most costly first (program order on
+/// a tie), to the checker whose load after the file is the lowest (the
+/// first on a tie). That load adds the file's cost and `dep_share` percent
+/// of the weight of each import that the checker does not read yet: a new
+/// checker must read the types of that import again. Files without cost go
+/// round robin in program order. The same inputs give the same split on
+/// every run. Returns the checker of each file.
+#[must_use]
+pub fn cost_split(
+    costs: &[u64],
+    weights: &[u64],
+    imports: &[Vec<usize>],
+    count: usize,
+) -> Vec<usize> {
+    let files = costs.len();
+    let words = files.div_ceil(64);
+    // Bit d of row c: checker c checks or imports file d.
+    let mut read = vec![0u64; count * words];
+    let mut load = vec![0u64; count];
+    let mut checker_of = vec![usize::MAX; files];
+    let mut order: Vec<usize> = (0..files).filter(|&f| costs[f] > 0).collect();
+    order.sort_by_key(|&f| (Reverse(costs[f]), f));
+    let share = dep_share();
+    for f in order {
+        let mut best = (u64::MAX, 0);
+        for (checker, &checker_load) in load.iter().enumerate() {
+            let row = &read[checker * words..][..words];
+            let new_reads: u64 = imports[f]
+                .iter()
+                .filter(|&&d| row[d / 64] >> (d % 64) & 1 == 0)
+                .map(|&d| weights[d])
+                .sum();
+            let after = checker_load + costs[f] + new_reads * share / 100;
+            if after < best.0 {
+                best = (after, checker);
+            }
+        }
+        let (after, checker) = best;
+        load[checker] = after;
+        checker_of[f] = checker;
+        let row = &mut read[checker * words..][..words];
+        for &d in imports[f].iter().chain(std::iter::once(&f)) {
+            row[d / 64] |= 1 << (d % 64);
+        }
+    }
+    let mut next = 0;
+    for checker in checker_of
+        .iter_mut()
+        .filter(|checker| **checker == usize::MAX)
+    {
+        *checker = next % count;
+        next += 1;
+    }
+    checker_of
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cost_split;
+
+    /// The most costly file goes first; a file that shares an import with a
+    /// placed file joins its checker while that costs less; files without
+    /// cost go round robin.
+    #[test]
+    fn cost_split_balances_and_keeps_imports_together() {
+        // 0 and 1 import 4 (weight 50); 2 imports nothing; 3 and 5 cost 0.
+        let costs = [40, 30, 60, 0, 10, 0];
+        let weights = [40, 30, 60, 5, 50, 5];
+        let imports = [vec![4], vec![4], vec![], vec![], vec![], vec![]];
+        let split = cost_split(&costs, &weights, &imports, 2);
+        // 2 (60) on 0; 0 (40 + 50) on 1; 1 (30, 4 read) on 1; 4 (10) on 0.
+        assert_eq!(split, [1, 1, 0, 0, 0, 1]);
+        assert_eq!(split, cost_split(&costs, &weights, &imports, 2));
+    }
 }
