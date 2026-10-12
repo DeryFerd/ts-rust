@@ -3543,8 +3543,8 @@ fn checker_count() -> usize {
 // PORT: binding runs first on this thread, so no worker binds and every
 // worker starts from the same bound program and thread-local state.
 // The file associations (#4313) come from the Go frontend program
-// (`ls_program::get_checker_associations`), whose files are in
-// `source_file_order` order. An alias resolver program has no frontend, so
+// (`ls_program::take_checker_associations`, which a thread may have made
+// ahead), whose files are in `source_file_order` order. An alias resolver program has no frontend, so
 // it keeps the round-robin order; Go gives it no checker pool.
 // Go makes the checkers (checkerpool.go:370), then the associations
 // (:382). PERF: the checker threads make their checkers while this thread
@@ -3562,7 +3562,7 @@ fn create_checkers() -> CheckerPool {
         Some(np) if count > 1 && crate::fast_mode::cost_split_enabled() => {
             fast_cost_split(&np, &source_file_order, count)
         }
-        Some(np) => ls_program::get_checker_associations(&np, count),
+        Some(np) => ls_program::take_checker_associations(&np, count),
         None => (0..source_file_order.len()).map(|i| i % count).collect(),
     };
     // One entry per file id up to the last program file.

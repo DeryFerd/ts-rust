@@ -690,6 +690,11 @@ fn build_program(
             .map(|file| (file.store, file))
             .collect()
     }
+    // PERF (serialgap1): the checker split of a one-program process runs
+    // beside the build and the bind (`start_checker_associations`).
+    if matches!(entry, Entry::Only) {
+        super::ls_program::start_checker_associations(np);
+    }
     let parsed = match &replaced {
         Some(replaced) => new_files(replaced.iter().map(|r| r.file)),
         None => new_files(files.iter()),
