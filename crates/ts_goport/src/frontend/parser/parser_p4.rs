@@ -181,7 +181,33 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:4373 tryParseParenthesizedArrowFunctionExpression
+    // PERF: parsefast2. isParenthesizedArrowFunctionExpression is False at
+    // once for any token but `(`, `<`, `async` and `=>`, which is nearly
+    // every expression. That test is inline; the rest is out of line.
+    #[inline]
     pub fn try_parse_parenthesized_arrow_function_expression(
+        &mut self,
+        allow_return_type_in_arrow_function: bool,
+    ) -> Node {
+        if !matches!(
+            self.token,
+            SyntaxKind::OpenParenToken
+                | SyntaxKind::LessThanToken
+                | SyntaxKind::AsyncKeyword
+                | SyntaxKind::EqualsGreaterThanToken
+        ) {
+            debug_assert_eq!(self.is_parenthesized_arrow_function_expression(), Tristate::False);
+            return Node::NIL;
+        }
+        self.try_parse_parenthesized_arrow_function_expression_at_start(
+            allow_return_type_in_arrow_function,
+        )
+    }
+
+    /// `try_parse_parenthesized_arrow_function_expression` at a token that
+    /// can start one.
+    #[inline(never)]
+    fn try_parse_parenthesized_arrow_function_expression_at_start(
         &mut self,
         allow_return_type_in_arrow_function: bool,
     ) -> Node {
@@ -525,7 +551,29 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:4605 parseConditionalExpressionRest
+    // PERF: parsefast2. Most expressions are not conditional: the test of
+    // the token is inline (parseOptionalToken takes nothing at another
+    // token), and the rest is out of line.
+    #[inline]
     pub fn parse_conditional_expression_rest(
+        &mut self,
+        left_operand: Node,
+        pos: i32,
+        allow_return_type_in_arrow_function: bool,
+    ) -> Node {
+        if self.token != SyntaxKind::QuestionToken {
+            return left_operand;
+        }
+        self.parse_conditional_expression_rest_at_question(
+            left_operand,
+            pos,
+            allow_return_type_in_arrow_function,
+        )
+    }
+
+    /// `parse_conditional_expression_rest` at a `?` token.
+    #[inline(never)]
+    fn parse_conditional_expression_rest_at_question(
         &mut self,
         left_operand: Node,
         pos: i32,

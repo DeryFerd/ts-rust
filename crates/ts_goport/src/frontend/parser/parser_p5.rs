@@ -1858,15 +1858,23 @@ impl<'a> Parser<'a> {
     // PORT: Go `fallthrough` from the Parameter, PropertyDeclaration and
     // MethodDeclaration case (first switch) and from the class and function
     // case (second switch) is written as a shared follow-up block.
+    // PERF: parsefast2. A node flag read is a store access here. A node
+    // gets JAVA_SCRIPT_FILE only from the context flags, which have it for
+    // the whole parse of a JS file (`initialize_state`) and never in another
+    // parse, so a non-JS parse returns with no read. That test is inline;
+    // the rest of the check is out of line.
+    #[inline]
     pub fn check_js_syntax(&mut self, node: Node) -> Node {
-        // PERF: parsefast2. A node flag read is a store access here. A node
-        // gets JAVA_SCRIPT_FILE only from the context flags, which have it
-        // for the whole parse of a JS file (`initialize_state`) and never
-        // in another parse, so a non-JS parse returns with no read.
         if !self.context_flags.intersects(NodeFlags::JAVA_SCRIPT_FILE) {
             debug_assert!(!node.flags().intersects(NodeFlags::JAVA_SCRIPT_FILE));
             return node;
         }
+        self.check_js_syntax_in_js_file(node)
+    }
+
+    /// `check_js_syntax` in the parse of a JS file.
+    #[inline(never)]
+    fn check_js_syntax_in_js_file(&mut self, node: Node) -> Node {
         if !node.flags().intersects(NodeFlags::JAVA_SCRIPT_FILE)
             || node
                 .flags()

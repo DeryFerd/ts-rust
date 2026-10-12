@@ -1900,7 +1900,16 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser/parser.go:4203 isYieldExpression
+    // PERF: parsefast2. The token test is inline; the rest (yield is rare)
+    // is out of line.
+    #[inline]
     pub fn is_yield_expression(&mut self) -> bool {
+        self.token == SyntaxKind::YieldKeyword && self.is_yield_expression_at_yield()
+    }
+
+    /// `is_yield_expression` at a `yield` token.
+    #[inline(never)]
+    fn is_yield_expression_at_yield(&mut self) -> bool {
         if self.token == SyntaxKind::YieldKeyword {
             // If we have a 'yield' keyword, and this is a context where yield expressions are
             // allowed, then definitely parse out a yield expression.

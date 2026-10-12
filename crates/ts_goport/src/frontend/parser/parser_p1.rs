@@ -1597,6 +1597,9 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:1005 parseExpectedWithDiagnostic
+    // PERF: parsefast2. The matched token is inline; the error is out of
+    // line (`parse_expected_failed`).
+    #[inline]
     pub fn parse_expected_with_diagnostic(
         &mut self,
         kind: SyntaxKind,
@@ -1609,6 +1612,16 @@ impl<'a> Parser<'a> {
             }
             return true;
         }
+        self.parse_expected_failed(kind, message)
+    }
+
+    /// The error of `parse_expected_with_diagnostic`.
+    #[inline(never)]
+    fn parse_expected_failed(
+        &mut self,
+        kind: SyntaxKind,
+        message: Option<&'static crate::diagnostics::Message>,
+    ) -> bool {
         // Report specific message if provided with one.  Otherwise, report generic fallback message.
         match message {
             Some(message) => {
