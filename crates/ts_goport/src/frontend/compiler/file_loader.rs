@@ -1808,8 +1808,11 @@ impl FileLoader {
                     Some(&options_for_file),
                     &mut file_emit_mode,
                 );
-                // The worker resolved name `index` with one mode for the
-                // whole file (`guess_import_mode`): most names have it.
+                // The worker resolved name `index` with the mode of the
+                // usage it read (`FilePrep::names`), or with the mode of a
+                // plain import (`guess_import_mode`) for a synthetic import
+                // or without the names. `answer` gives it only when that
+                // mode is `mode`.
                 let taken = prep
                     .as_ref()
                     .and_then(|prep| prep.answer(index, mode))
@@ -2538,9 +2541,10 @@ fn emit_syntax_for_usage(
 
 /// Go `getModeForUsageLocation` (with `options`) for a plain `import ..
 /// from` or `export .. from` in `file_name`, the most common form. A parse
-/// worker has no import nodes after the parse, so it resolves each import
-/// with this mode. A wrong guess only resolves another cache key: the
-/// loader resolves each import with its real mode.
+/// worker resolves the synthetic imports with this mode, and the imports
+/// too when it did not read their usages (`GOPORT_LOAD_NAMES=0`). A wrong
+/// guess only resolves another cache key: the loader resolves each import
+/// with its real mode.
 pub(crate) fn guess_import_mode(
     file_name: &str,
     meta: &SourceFileMetaData,

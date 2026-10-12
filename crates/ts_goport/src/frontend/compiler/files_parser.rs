@@ -3389,7 +3389,9 @@ impl WorkerResolver {
     ///
     /// With `prep` (the file's metadata and synthetic imports), the
     /// synthetic imports resolve too, and the answers go to the loader
-    /// (`FilePrep`). The module names have no import nodes here, so each
+    /// (`FilePrep`). Each import resolves with the mode of the usage that
+    /// the worker read with the parse (`PrepInput::names`, parload1). A
+    /// synthetic import, or an import whose usage the worker did not read,
     /// resolves with the mode of a plain import (`guess_import_mode`).
     fn resolve(
         &self,
