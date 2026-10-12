@@ -318,6 +318,7 @@ export function memoryFileSystem(files = new Map()) {
     const map = files instanceof Map ? files : new Map(Object.entries(files));
     const dirPrefix = path => (path.endsWith("/") ? path : `${path}/`);
     const isDir = path => {
+        if (path === "/") return true;
         const prefix = dirPrefix(path);
         for (const key of map.keys()) if (key.startsWith(prefix)) return true;
         return false;
