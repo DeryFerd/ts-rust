@@ -604,38 +604,18 @@ impl Checker {
                 return symbol;
             }
         }
-        if self
-            .sym(symbol)
-            .check_flags
-            .intersects(CheckFlags::INSTANTIATED)
-        {
+        // PERF (instfast1): the source symbol is read once for the test and
+        // the copy when it is not an instantiation itself (99% of the calls).
+        let source = self.sym(symbol);
+        let full = if source.check_flags.intersects(CheckFlags::INSTANTIATED) {
             // If symbol being instantiated is itself a instantiation, fetch the original target and combine the
             // type mappers. This ensures that original type identities are properly preserved and that aliases
             // always reference a non-aliases.
             symbol = links_target;
             m = self.combine_type_mappers(links_mapper, m);
-        }
-        // Keep the flags from the symbol we're instantiating.  Mark that is instantiated, and
-        // also transient so that we can just store data on it directly.
-        // PORT: Go calls newSymbol and then sets the fields. This builds the
-        // full symbol and pushes it once; `symbol_count` and TRANSIENT match
-        // `Checker::new_symbol`.
-        let full = {
-            let s = self.sym(symbol);
-            Symbol {
-                flags: s.flags | SymbolFlags::TRANSIENT,
-                name: s.name.clone(),
-                check_flags: CheckFlags::INSTANTIATED
-                    | s.check_flags
-                        & (CheckFlags::READONLY
-                            | CheckFlags::LATE
-                            | CheckFlags::OPTIONAL_PARAMETER
-                            | CheckFlags::REST_PARAMETER),
-                declarations: s.declarations.clone(),
-                parent: s.parent,
-                value_declaration: s.value_declaration,
-                ..Symbol::default()
-            }
+            instantiated_symbol_of(self.sym(symbol))
+        } else {
+            instantiated_symbol_of(source)
         };
         self.symbol_count += 1;
         let result = self.symbols.push_symbol(full);
@@ -684,6 +664,28 @@ impl Checker {
             }
         }
         false
+    }
+}
+
+/// The new symbol of Go `instantiateSymbol` for source `s`: its flags with
+/// TRANSIENT, its name, declarations, parent and value declaration, and the
+/// check flags it keeps with INSTANTIATED. Go calls newSymbol and then sets
+/// the fields; the port builds the full symbol and pushes it once.
+#[inline(always)]
+fn instantiated_symbol_of(s: &Symbol) -> Symbol {
+    Symbol {
+        flags: s.flags | SymbolFlags::TRANSIENT,
+        name: s.name.clone(),
+        check_flags: CheckFlags::INSTANTIATED
+            | s.check_flags
+                & (CheckFlags::READONLY
+                    | CheckFlags::LATE
+                    | CheckFlags::OPTIONAL_PARAMETER
+                    | CheckFlags::REST_PARAMETER),
+        declarations: s.declarations.clone(),
+        parent: s.parent,
+        value_declaration: s.value_declaration,
+        ..Symbol::default()
     }
 }
 
