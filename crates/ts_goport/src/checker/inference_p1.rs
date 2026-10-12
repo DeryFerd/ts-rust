@@ -790,7 +790,7 @@ impl Checker {
                     {
                         let info = &mut self.inference_context_mut(ctx).inferences[inference];
                         if priority < info.priority {
-                            info.candidate_lists = None;
+                            info.clear_candidates();
                             info.top_level = true;
                             info.priority = priority;
                         }
@@ -804,9 +804,7 @@ impl Checker {
                                 .contains(&candidate)
                             {
                                 self.inference_context_mut(ctx).inferences[inference]
-                                    .candidate_lists_mut()
-                                    .contra_candidates
-                                    .push(candidate);
+                                    .push_candidate(candidate, true /*contra*/);
                                 self.clear_cached_inferences(ctx);
                             }
                         } else if !self.inference_context(ctx).inferences[inference]
@@ -814,9 +812,7 @@ impl Checker {
                             .contains(&candidate)
                         {
                             self.inference_context_mut(ctx).inferences[inference]
-                                .candidate_lists_mut()
-                                .candidates
-                                .push(candidate);
+                                .push_candidate(candidate, false /*contra*/);
                             self.clear_cached_inferences(ctx);
                         }
                     }
@@ -2599,6 +2595,36 @@ impl Checker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The candidate lists of an `InferenceInfo` against two plain lists:
+    /// the inline first candidate keeps the order of both lists.
+    #[test]
+    fn inference_info_candidates_match_lists() {
+        for pattern in 0u32..64 {
+            let mut info = InferenceInfo::default();
+            let (mut co, mut contra) = (Vec::new(), Vec::new());
+            for i in 0..6u32 {
+                if i == 4 && pattern & 32 != 0 {
+                    info.clear_candidates();
+                    co.clear();
+                    contra.clear();
+                }
+                let t = TypeId(100 + i);
+                if pattern >> i & 1 != 0 {
+                    info.push_candidate(t, true);
+                    contra.push(t);
+                } else {
+                    info.push_candidate(t, false);
+                    co.push(t);
+                }
+                assert_eq!(info.candidates(), &co[..]);
+                assert_eq!(info.contra_candidates(), &contra[..]);
+                let copy = clone_inference_info(&info);
+                assert_eq!(copy.candidates(), &co[..]);
+                assert_eq!(copy.contra_candidates(), &contra[..]);
+            }
+        }
+    }
 
     /// The visited map against a `HashMap` over many clears, with growth and a
     /// generation wrap: a clear must hide every key of the earlier inference.
