@@ -2327,98 +2327,106 @@ fn bind_files_parallel(lineage: &mut Lineage) {
         files.iter().map(|&(_, freeable)| freeable).collect(),
         lineage.symbols.next_file_offsets(),
     );
+    // The work of one bind thread, after it installed its seed. `sender`
+    // takes its files to the loading thread.
+    let run = |sender: std::sync::mpsc::Sender<ParallelBind>| {
+        // The files bound on this thread that wait for their offsets, by file
+        // index.
+        let mut waiting: std::collections::BTreeMap<usize, (BoundFile, SymbolArena)> =
+            std::collections::BTreeMap::new();
+        // Set when a bind here made thread-local state or panicked: this
+        // thread binds no more files, as they could read that state, but it
+        // still moves the files it bound before.
+        let mut failed = false;
+        let mut state = queue.lock();
+        loop {
+            if state.stop {
+                break;
+            }
+            // Moving ids first: the loading thread waits for it.
+            if let Some(entry) = waiting.first_entry()
+                && let Some(&offsets) = state.offsets.get(*entry.key())
+            {
+                drop(state);
+                let (i, (mut bound, file_symbols)) = entry.remove_entry();
+                bound.remap(offsets);
+                // A ready file is always joined: every earlier file has its
+                // counts, so it was bound and reaches the loading thread.
+                bound.install();
+                let prepared = file_symbols.prepare_file_arena(offsets, files[i].1);
+                let _ = sender.send((i, Some(prepared)));
+                state = queue.lock();
+                continue;
+            }
+            if !failed && let Some(&i) = order.get(state.next) {
+                let (file, _) = files[i];
+                state.next += 1;
+                state.binding += 1;
+                drop(state);
+                let before = bind_thread_fingerprint();
+                let result = std::panic::catch_unwind(|| {
+                    let _trace = trace_bind_source_file(file);
+                    let mut file_symbols = SymbolArena::new_file();
+                    let bound = bind_source_file_detached(file, &mut file_symbols);
+                    (bound, file_symbols)
+                })
+                .ok()
+                .filter(|_| bind_thread_fingerprint() == before);
+                state = queue.lock();
+                state.binding -= 1;
+                let Some((bound, file_symbols)) = result else {
+                    // Later files never get offsets now; waiting threads
+                    // check whether to stay. The earlier files bound here
+                    // still join.
+                    failed = true;
+                    queue.changed.notify_all();
+                    let _ = sender.send((i, None));
+                    continue;
+                };
+                let more = state.record(i, file_symbols.mark());
+                waiting.insert(i, (bound, file_symbols));
+                if more || state.binding == 0 {
+                    queue.changed.notify_all();
+                }
+                continue;
+            }
+            // Nothing to bind here. Stay while a file bound here can still
+            // get its offsets from a bind in progress.
+            if waiting.is_empty() || state.binding == 0 {
+                break;
+            }
+            state = queue
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        // The scope ends when the thread's closure returns, but thread-locals
+        // drop only at thread exit. Let go of the program tables now, so a
+        // release after the bind frees them (`WorkerSeed`).
+        drop(waiting);
+        drop(TABLES.with(|cache| cache.borrow_mut().take()));
+    };
     let (sender, receiver) = std::sync::mpsc::channel::<ParallelBind>();
     let complete = std::thread::scope(|scope| {
-        for _ in 0..threads {
-            let seed = WorkerSeed::take_unbuilt();
-            let (files, order, queue, sender) = (&files, &order, &queue, sender.clone());
-            // Go starts its threads on demand and fails the same way.
-            crate::core::GoThread::new()
-                .stack_size(crate::gostd::stack::max_stack_size())
-                .spawn_scoped(scope, move || {
+        // PERF (bindonce1): a seed copies the synthetic nodes of this thread,
+        // 0.13 to 1.9 ms each on TypeORM, so 16 seeds took 3.9 ms of this
+        // thread before it built the lazy state below. This thread now takes
+        // one, and the first bind thread takes the seeds of the others from
+        // its own copy, which is the same state, and starts them.
+        let seed = WorkerSeed::take_unbuilt();
+        let run = &run;
+        spawn_bind_thread(scope, move || {
+            seed.install();
+            for _ in 1..threads {
+                let seed = WorkerSeed::take_unbuilt();
+                let sender = sender.clone();
+                spawn_bind_thread(scope, move || {
                     seed.install();
-                    // The files bound on this thread that wait for their
-                    // offsets, by file index.
-                    let mut waiting: std::collections::BTreeMap<usize, (BoundFile, SymbolArena)> =
-                        std::collections::BTreeMap::new();
-                    // Set when a bind here made thread-local state or
-                    // panicked: this thread binds no more files, as that
-                    // state would be read by them, but it still moves the
-                    // files it bound before.
-                    let mut failed = false;
-                    let mut state = queue.lock();
-                    loop {
-                        if state.stop {
-                            break;
-                        }
-                        // Moving ids first: the loading thread waits for it.
-                        if let Some(entry) = waiting.first_entry()
-                            && let Some(&offsets) = state.offsets.get(*entry.key())
-                        {
-                            drop(state);
-                            let (i, (mut bound, file_symbols)) = entry.remove_entry();
-                            bound.remap(offsets);
-                            // A ready file is always joined: every earlier
-                            // file has its counts, so it was bound and
-                            // reaches the loading thread.
-                            bound.install();
-                            let prepared = file_symbols.prepare_file_arena(offsets, files[i].1);
-                            let _ = sender.send((i, Some(prepared)));
-                            state = queue.lock();
-                            continue;
-                        }
-                        if !failed && let Some(&i) = order.get(state.next) {
-                            let (file, _) = files[i];
-                            state.next += 1;
-                            state.binding += 1;
-                            drop(state);
-                            let before = bind_thread_fingerprint();
-                            let result = std::panic::catch_unwind(|| {
-                                let _trace = trace_bind_source_file(file);
-                                let mut file_symbols = SymbolArena::new_file();
-                                let bound = bind_source_file_detached(file, &mut file_symbols);
-                                (bound, file_symbols)
-                            })
-                            .ok()
-                            .filter(|_| bind_thread_fingerprint() == before);
-                            state = queue.lock();
-                            state.binding -= 1;
-                            let Some((bound, file_symbols)) = result else {
-                                // Later files never get offsets now; waiting
-                                // threads check whether to stay. The earlier
-                                // files bound here still join.
-                                failed = true;
-                                queue.changed.notify_all();
-                                let _ = sender.send((i, None));
-                                continue;
-                            };
-                            let more = state.record(i, file_symbols.mark());
-                            waiting.insert(i, (bound, file_symbols));
-                            if more || state.binding == 0 {
-                                queue.changed.notify_all();
-                            }
-                            continue;
-                        }
-                        // Nothing to bind here. Stay while a file bound
-                        // here can still get its offsets from a bind in
-                        // progress.
-                        if waiting.is_empty() || state.binding == 0 {
-                            break;
-                        }
-                        state = queue
-                            .changed
-                            .wait(state)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    }
-                    // The scope ends when this closure returns, but
-                    // thread-locals drop only at thread exit. Let go of the
-                    // program tables now, so a release after the bind frees
-                    // them (`WorkerSeed`).
-                    drop(waiting);
-                    drop(TABLES.with(|cache| cache.borrow_mut().take()));
+                    run(sender);
                 });
-        }
-        drop(sender);
+            }
+            run(sender);
+        });
         // PERF (progstart1): the bind threads do not read the shared state
         // that the program makes on first use (the symlink cache), so this
         // thread builds it while they bind, not before they start. A later
@@ -2449,6 +2457,17 @@ fn bind_files_parallel(lineage: &mut Lineage) {
         // The serial bind counts the hits of the file that stopped here.
         restore_unported(&unported);
     }
+}
+
+/// Starts bind thread `f` in `scope`, with the Go stack size.
+fn spawn_bind_thread<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    f: impl FnOnce() + Send + 'scope,
+) {
+    // Go starts its threads on demand and fails the same way.
+    crate::core::GoThread::new()
+        .stack_size(crate::gostd::stack::max_stack_size())
+        .spawn_scoped(scope, f);
 }
 
 // ---------------------------------------------------------------------------
