@@ -644,7 +644,11 @@ fn get_text_of_node_worker(
     include_trivia: bool,
 ) -> Cow<'static, str> {
     let emit_context = state.emit_context;
-    if is_member_name(node) {
+    // PERF: printfast1. Go reads `node.Kind` for `IsMemberName`,
+    // `IsStringLiteral` and the switch. A factory node reads its kind in
+    // the thread's arena, so the port reads it once.
+    let kind = node.kind();
+    if matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier) {
         // PERF: no hash lookup while the map is empty.
         let auto_generated = {
             let auto_generate = emit_context.auto_generate.borrow();
@@ -655,7 +659,7 @@ fn get_text_of_node_worker(
         }
     }
 
-    if is_string_literal(node) {
+    if kind == SyntaxKind::StringLiteral {
         let text_source_node = text_source_of(emit_context, node);
         if text_source_node.is_some() {
             return get_text_of_node_worker(generator, state, text_source_node, include_trivia);
@@ -666,7 +670,7 @@ fn get_text_of_node_worker(
     let can_use_source_file =
         current_source_file.is_some() && node.parent().is_some() && !node_is_synthesized(node);
 
-    match node.kind() {
+    match kind {
         SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::JsxNamespacedName => {
             if !can_use_source_file || get_source_file_of_node(node) != state.current_original {
                 return Cow::Borrowed(node.text());
@@ -1917,12 +1921,15 @@ impl Printer {
 
     // Go: printer/printer.go:1118 emitIdentifierText
     pub(crate) fn emit_identifier_text(&mut self, node: Node) {
-        let f = get_source_file_of_node(node);
-        debug_assert!(
+        // PERF: printfast1. Go evaluates `GetSourceFileOfNode` for its
+        // `debug.Assert` in every build. It only reads, so a release build
+        // skips the parent walk.
+        debug_assert!({
+            let f = get_source_file_of_node(node);
             f.is_nil()
                 || self.current_source_file.is_nil()
                 || source_file_file_name(f) == source_file_file_name(self.current_source_file)
-        );
+        });
         let text = self.get_text_of_node_cow(node, false /*includeTrivia*/);
 
         let symbol = self
