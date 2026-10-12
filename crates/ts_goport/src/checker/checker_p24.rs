@@ -7,9 +7,10 @@ use crate::prelude::*;
 use smallvec::SmallVec;
 use std::sync::OnceLock;
 
-/// `GOPORT_FAST_NEVER_ORDER`, read once per process. Only `1` turns on the
+/// `GOPORT_FAST_NEVER_ORDER`, read once per process. `1` turns on the
 /// faster name order of `some_property_reduces_to_never`
-/// (`some_property_reduces_to_never_fast`). `Checker::new` stores it in
+/// (`some_property_reduces_to_never_fast`), `0` turns it off; else it
+/// follows fast mode (`crate::fast_mode`). `Checker::new` stores it in
 /// `Checker::fast_never_order`. Off by default, so the output, counts
 /// included, equals Go.
 // PORT: not in Go. An environment variable, not a tsconfig option: the
@@ -24,7 +25,7 @@ use std::sync::OnceLock;
 // (nevfast1 skeptic repro r02-ts2589-count).
 pub fn fast_never_order_from_env() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GOPORT_FAST_NEVER_ORDER").as_deref() == Ok("1"))
+    *ON.get_or_init(|| crate::fast_mode::part("GOPORT_FAST_NEVER_ORDER"))
 }
 
 /// Reusable buffers of `get_named_members` (the `Checker` field

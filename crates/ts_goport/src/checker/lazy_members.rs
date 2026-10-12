@@ -9,8 +9,8 @@
 //! declared member is instantiated only when a lookup asks for it, and the
 //! full table (`resolve_lazy_members`) reuses it.
 //!
-//! `GOPORT_LAZY_MEMBERS=1` turns it on (`Checker::lazy_members`). Go has no
-//! switch. With the switch off, nothing here runs and the checker does what
+//! `GOPORT_LAZY_MEMBERS=1` or fast mode (`crate::fast_mode`) turns it on
+//! (`Checker::lazy_members`). Go has no switch. With the switch off, nothing here runs and the checker does what
 //! it did before. With it on, the output must equal Go at the pin with
 //! #64475 applied.
 //!
@@ -37,11 +37,12 @@ use smallvec::SmallVec;
 use std::cell::OnceCell;
 use std::sync::OnceLock;
 
-/// `GOPORT_LAZY_MEMBERS`, read once per process. Only `1` turns lazy member
-/// tables on. `Checker::new` stores it in `Checker::lazy_members`.
+/// `GOPORT_LAZY_MEMBERS`, read once per process. `1` turns lazy member
+/// tables on, `0` off; else they follow fast mode (`crate::fast_mode`), off
+/// by default. `Checker::new` stores it in `Checker::lazy_members`.
 pub fn lazy_members_from_env() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GOPORT_LAZY_MEMBERS").as_deref() == Ok("1"))
+    *ON.get_or_init(|| crate::fast_mode::part("GOPORT_LAZY_MEMBERS"))
 }
 
 // Go: Checker.lazyMemberTables (#64475)

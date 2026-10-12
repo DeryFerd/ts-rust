@@ -23,6 +23,7 @@ use crate::gostd::{Context, context};
 use crate::prelude::*;
 use std::borrow::Cow;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 mod go_frontend;
@@ -883,8 +884,12 @@ pub(crate) struct VersionTables {
     /// file, by slot. Versions share it while it is equal.
     file_meta: Arc<Vec<FileProgramMeta>>,
     /// Checker index for each file index (Go `fileAssociations`). Set when
-    /// the checker pool is made.
-    file_associations: OnceLock<Vec<usize>>,
+    /// the checker pool is made. Only the work-stealing check pass of fast
+    /// mode changes an entry (`StealQueues`); Go never does.
+    file_associations: OnceLock<Vec<AtomicUsize>>,
+    /// fastmode1: set by the first check pass of the pool, which is the
+    /// only one that steals (`start_stealing_group_do`). Not in Go.
+    steal_pass_done: AtomicBool,
     /// Go `Program.declarationDiagnosticCache`.
     declaration_diagnostic_cache: Mutex<FxHashMap<Node, Vec<Diagnostic>>>,
     /// The file system answers of Go `p.Host().FS()`, a `cachedvfs.FS`
@@ -958,6 +963,7 @@ impl VersionTables {
             file_by_path,
             file_meta,
             file_associations: OnceLock::new(),
+            steal_pass_done: AtomicBool::new(false),
             declaration_diagnostic_cache: Mutex::new(FxHashMap::default()),
             host_fs_cache: Default::default(),
             package_json_cache: Arc::default(),
@@ -3486,16 +3492,24 @@ pub fn spawn_seeded_thread<R: Send + 'static>(
 // Go: compiler/checkerpool.go:309 newCheckerPoolWithTracing (the count)
 fn checker_count() -> usize {
     let program = prog();
+    let files = program.source_file_order().len();
     let mut checker_count: i64 = 4;
     if single_threaded() {
         checker_count = 1;
     } else if let Some(count) = program.options.checkers {
         checker_count = i64::from(count);
+    } else if crate::fast_mode::enabled() {
+        // PORT: not in Go (fastmode1): fast mode's count, from the files
+        // that are not declaration files.
+        let source_files = go_frontend_program().map_or(files, |np| {
+            np.files
+                .iter()
+                .filter(|file| !file.is_declaration_file)
+                .count()
+        });
+        checker_count = crate::fast_mode::checker_count(source_files) as i64;
     }
-    checker_count
-        .min(program.source_file_order().len() as i64)
-        .min(256)
-        .max(1) as usize
+    checker_count.min(files as i64).min(256).max(1) as usize
 }
 
 // Go: compiler/checkerpool.go:367 createCheckers
@@ -3511,14 +3525,18 @@ fn create_checkers() -> CheckerPool {
     let program = prog();
     let source_file_order = program.source_file_order();
     let associations = match go_frontend_program() {
+        // PORT: not in Go (fastmode2 experiment, `GOPORT_FAST_SPLIT=cost`).
+        Some(np) if count > 1 && crate::fast_mode::cost_split_enabled() => {
+            fast_cost_split(&np, &source_file_order, count)
+        }
         Some(np) => ls_program::get_checker_associations(&np, count),
         None => (0..source_file_order.len()).map(|i| i % count).collect(),
     };
     // One entry per file id up to the last program file.
     let len = source_file_order.iter().max().map_or(0, |&last| last + 1);
-    let mut file_associations = vec![0; len];
+    let mut file_associations: Vec<AtomicUsize> = (0..len).map(|_| AtomicUsize::new(0)).collect();
     for (i, &file_index) in source_file_order.iter().enumerate() {
-        file_associations[file_index] = associations[i];
+        file_associations[file_index] = AtomicUsize::new(associations[i]);
     }
     drop(source_file_order);
     assert!(
@@ -3526,6 +3544,61 @@ fn create_checkers() -> CheckerPool {
         "checker pool made twice"
     );
     start_checkers(count)
+}
+
+/// fastmode2: `crate::fast_mode::cost_split` for the files of `np` (file ids
+/// `source_file_order`, in the same order), in that order. A file's cost is
+/// Go's base weight of the split, 0 when the check skips it; its imports
+/// are its resolved imports that are program files. Not in Go.
+fn fast_cost_split(
+    np: &crate::frontend::compiler::NewProgram,
+    source_file_order: &[usize],
+    count: usize,
+) -> Vec<usize> {
+    let nodes: FxHashMap<usize, Node> = source_files()
+        .into_iter()
+        .map(|file| (file.file_index(), file))
+        .collect();
+    let positions: FxHashMap<usize, usize> = np
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| (file.store, i))
+        .collect();
+    let mut weights = Vec::with_capacity(np.files.len());
+    let mut costs = Vec::with_capacity(np.files.len());
+    let mut imports = Vec::with_capacity(np.files.len());
+    for (position, (file, file_index)) in np.files.iter().zip(source_file_order).enumerate() {
+        let weight = ls_program::get_checker_association_base_weight(
+            file.node_count as i64,
+            file.text.len() as i64,
+        ) as u64;
+        let checked = nodes
+            .get(file_index)
+            .is_some_and(|&node| !skip_type_checking(node, false));
+        weights.push(weight);
+        costs.push(if checked { weight } else { 0 });
+        let mut targets: Vec<usize> = np
+            .processed_files
+            .resolved_modules
+            .get(file.path())
+            .into_iter()
+            .flat_map(|resolved_modules| resolved_modules.values())
+            .filter(|resolved| resolved.is_resolved())
+            .filter_map(|resolved| {
+                let target =
+                    np.get_source_file_for_resolved_module(&resolved.resolved_file_name)?;
+                positions
+                    .get(&target.store)
+                    .copied()
+                    .filter(|&target| target != position)
+            })
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        imports.push(targets);
+    }
+    crate::fast_mode::cost_split(&costs, &weights, &imports, count)
 }
 
 // Go: compiler/checkerpool.go:367 createCheckers (one `checker.NewChecker`)
@@ -3610,10 +3683,10 @@ fn start_checkers(count: usize) -> CheckerPool {
                     if let Some(arena) = arena {
                         set_jemalloc_thread_arena(arena);
                     }
+                    // A manual arena of fast mode goes back to the process's
+                    // list when this thread ends (`ManualArena`).
                     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
-                    if let Some(claims) = claims {
-                        claims.claim();
-                    }
+                    let _manual_arena = claims.and_then(|claims| claims.claim());
                     seed.install();
                     let checker = new_pool_checker(index, count);
                     WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
@@ -3904,7 +3977,9 @@ fn worker_index() -> Option<usize> {
 
 /// The checker index of `file` (Go `fileAssociations[file]`).
 fn checker_index_for_file(file: Node) -> usize {
-    let index = |tables: &VersionTables| Some(tables.file_associations.get()?[file.file_index()]);
+    let index = |tables: &VersionTables| {
+        Some(tables.file_associations.get()?[file.file_index()].load(Ordering::Relaxed))
+    };
     if let Some(index) = with_tables(index) {
         return index;
     }
@@ -4029,6 +4104,11 @@ fn start_checker_group_do(
 ) -> PendingCheckerGroup {
     let count = checker_count();
     let files: Arc<Vec<Node>> = Arc::new(files.to_vec());
+    if stealing_check()
+        && let Some(queues) = StealQueues::first_pass(&files, count)
+    {
+        return start_stealing_group_do(files, cb, queues);
+    }
     let receivers = (0..count)
         .map(|checker_index| {
             let files = Arc::clone(&files);
@@ -4042,12 +4122,152 @@ fn start_checker_group_do(
                         .iter()
                         .copied()
                         .enumerate()
-                        .filter(|(_, file)| associations[file.file_index()] == checker_index)
+                        .filter(|(_, file)| {
+                            associations[file.file_index()].load(Ordering::Relaxed) == checker_index
+                        })
                         .collect()
                 });
                 mine.into_iter()
                     .map(|(i, file)| (i, cb(checker, file)))
                     .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    PendingCheckerGroup { files, receivers }
+}
+
+/// True when the first check pass of the current program steals
+/// (`StealQueues`): fast mode with `GOPORT_FAST_STEAL=1`
+/// (`crate::fast_mode::steal`), more than one checker, and not `--noCheck`
+/// (that pass checks nothing). The early emit waits for the check then
+/// (`emitter::program_emit::early_emit_options_allow`): an emit job goes to
+/// the checker of its file when it is sent, and a stolen file moves to
+/// another checker. Loading thread only.
+pub(crate) fn stealing_check() -> bool {
+    crate::fast_mode::steal()
+        && !cfg!(target_family = "wasm")
+        && !options().no_check.is_true()
+        && checker_count() > 1
+}
+
+/// fastmode1: the queues of the work-stealing check pass of fast mode
+/// (`crate::fast_mode::steal`). Not in Go: Go checks each file on the
+/// checker of its static split, so a checker that ends early waits.
+// PERF (fastmode1, tsrs model): each checker starts with the files that
+// Go's split gives it, in the given order, and then takes the last file of
+// the queue with the most weight left. The stolen file moves to the taker
+// (`file_associations`), so its later work (emit, declaration diagnostics)
+// runs on the checker that has its types. Which checker checks a file then
+// depends on thread timing, and so can the output where Go's output depends
+// on the split. At 16 checkers on a 16 vCPU testbox, stealing took VS Code
+// from 2.61 to 2.20 s and Sentry from 2.68 to 2.28 s. The tsrs order (heavy
+// files first in each queue) gave the same times (fastmode1 ab2).
+struct StealQueues(Mutex<StealState>);
+
+struct StealState {
+    /// Positions in the pass's `files`, by checker, in the given order.
+    queues: Vec<std::collections::VecDeque<usize>>,
+    /// The weight of each queue.
+    left: Vec<u64>,
+    /// The weight of each file, by position.
+    weights: Vec<u64>,
+}
+
+impl StealQueues {
+    /// The queues of the first check pass of the current program's pool, or
+    /// None for any later pass: those keep the files where the first pass
+    /// put them.
+    fn first_pass(files: &[Node], count: usize) -> Option<Arc<Self>> {
+        // Makes the pool (and its split) when there is none yet.
+        let _ = checker_index_for_file(*files.first()?);
+        if with_tables(|tables| tables.steal_pass_done.swap(true, Ordering::Relaxed)) {
+            return None;
+        }
+        let file_weight = steal_file_weights();
+        let mut queues = vec![std::collections::VecDeque::new(); count];
+        let mut left = vec![0; count];
+        let mut weights = Vec::with_capacity(files.len());
+        for (i, &file) in files.iter().enumerate() {
+            let checker = checker_index_for_file(file);
+            let weight = if skip_type_checking(file, false) {
+                0
+            } else {
+                file_weight(file)
+            };
+            queues[checker].push_back(i);
+            left[checker] += weight;
+            weights.push(weight);
+        }
+        Some(Arc::new(StealQueues(Mutex::new(StealState {
+            queues,
+            left,
+            weights,
+        }))))
+    }
+
+    /// The position of the next file for checker `me`: the first of its own
+    /// queue, else the last of the queue with the most weight left, which
+    /// then moves to `me`. None when every queue is empty.
+    fn next(&self, me: usize, files: &[Node]) -> Option<usize> {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let state = &mut *state;
+        if let Some(i) = state.queues[me].pop_front() {
+            state.left[me] -= state.weights[i];
+            return Some(i);
+        }
+        let from = (0..state.queues.len())
+            .filter(|&q| !state.queues[q].is_empty())
+            .max_by_key(|&q| (state.left[q], std::cmp::Reverse(q)))?;
+        let i = state.queues[from].pop_back()?;
+        state.left[from] -= state.weights[i];
+        with_tables(|tables| {
+            tables
+                .file_associations
+                .get()
+                .expect("checker pool not made")[files[i].file_index()]
+            .store(me, Ordering::Relaxed);
+        });
+        Some(i)
+    }
+}
+
+/// fastmode1: the weight of each file for `StealQueues`, Go's base weight of
+/// the split (`ls_program::get_checker_association_base_weight`): its node
+/// count plus a part of its text length. 1 without a frontend program.
+fn steal_file_weights() -> impl Fn(Node) -> u64 {
+    let program = prog();
+    let source_file_order = program.source_file_order();
+    let len = source_file_order.iter().max().map_or(0, |&last| last + 1);
+    let mut weights = vec![1u64; len];
+    if let Some(np) = go_frontend_program() {
+        for (file, &file_index) in np.files.iter().zip(source_file_order.iter()) {
+            weights[file_index] = ls_program::get_checker_association_base_weight(
+                file.node_count as i64,
+                file.text.len() as i64,
+            ) as u64;
+        }
+    }
+    move |file: Node| weights.get(file.file_index()).copied().unwrap_or(1)
+}
+
+/// `start_checker_group_do` with `StealQueues`: each checker takes files
+/// from the queues until all are empty.
+fn start_stealing_group_do(
+    files: Arc<Vec<Node>>,
+    cb: fn(&mut Checker, Node) -> Vec<Diagnostic>,
+    queues: Arc<StealQueues>,
+) -> PendingCheckerGroup {
+    let count = checker_count();
+    let receivers = (0..count)
+        .map(|me| {
+            let files = Arc::clone(&files);
+            let queues = Arc::clone(&queues);
+            send_job(me, move |checker| {
+                let mut results = Vec::new();
+                while let Some(i) = queues.next(me, &files) {
+                    results.push((i, cb(checker, files[i])));
+                }
+                results
             })
         })
         .collect();
