@@ -1348,8 +1348,12 @@ impl Checker {
             // For another kind, Go panics too: `AsParameterDeclaration`
             // (ast_generated.go:9158) is the type assertion
             // `n.data.(*ParameterDeclaration)`. The fallback below keeps the
-            // old reads (3 field accessors at once); each accessor panics
-            // for a kind that does not have its field (`field_panic`).
+            // old reads (3 field accessors at once). Of these, only
+            // `dot_dot_dot_token` panics (`field_panic`), for a kind other
+            // than Parameter, BindingElement, NamedTupleMember and
+            // JsxExpression; `question_token` and `initializer` return NIL.
+            // So the port panics for fewer kinds than Go here, but no such
+            // kind can be in a parameter list.
             let parts = parameter_parts(parameter).unwrap_or_else(|| ParameterParts {
                 dot_dot_dot_token: parameter.dot_dot_dot_token(),
                 question_token: parameter.question_token(),
