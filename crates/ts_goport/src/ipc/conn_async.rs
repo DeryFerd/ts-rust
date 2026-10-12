@@ -32,12 +32,13 @@
 //!   after `Run` returned: the deferred function waits for the handlers
 //!   (:74). Here a request that waits in a call while a nested request
 //!   runs is held until that request returns, and a request read while
-//!   another one runs starts when it returns. So each request and notification that
-//!   the dispatch thread runs is a frame with a lag: the time that the port
-//!   held it while Go ran it. Its Go time is the port time less the lag. A
-//!   `Call` or `Notify` whose Go time is before the end of the read loop
-//!   finds Go's `terminal` nil: it writes, and a call returns what Go's
-//!   `select` gave (`call_before_the_end`). Without a hold the lag is 0.
+//!   another one runs starts when it returns. So each request and
+//!   notification that the dispatch thread runs is a frame with a lag: the
+//!   time that the port held it while Go ran it. Its Go time is the port
+//!   time less the lag. A `Call` or `Notify` whose Go time is before the
+//!   end of the read loop finds Go's `terminal` nil: it writes, and a call
+//!   returns what Go's `select` gave (`call_before_the_end`). Without a
+//!   hold the lag is 0.
 //! - Without it, `run` and `call` read on the dispatch thread, and `Call`
 //!   reads messages itself until its response arrives. A blocked read does
 //!   not wake when `ctx` is done. When a read in `call` fails, the read
@@ -715,7 +716,7 @@ impl AsyncConn {
                 // `ctx` made from it: it is done at the signal, before that
                 // read. Both production callers use such a `ctx`.
                 // `callbackfs.rs:300` uses the `ctx` of `run` (set at
-                // `server.rs:264`). `api/module_resolution.rs:256` uses the
+                // `server.rs:264`). `api/module_resolution.rs:260` uses the
                 // builder's `ctx` (`project.rs:778`) or the `ctx` of a
                 // `resolveModuleName` request: both come from the request's
                 // `handler_ctx`, which `run` makes from its `ctx`. For another
@@ -2481,8 +2482,8 @@ pub(crate) mod tests {
         );
 
         // The reader thread read id 1 and waits in its second read, past
-        // its check of `ctx` (Go :83). A cancel before that check ends the
-        // read loop with no read, in Go too: then no Phase A.
+        // its check of `ctx` (Go :83), so the cancel comes after that
+        // check.
         wait_for_reads(&reads, 2);
         cancel();
         let call = read_framed(&client);
@@ -2822,14 +2823,17 @@ pub(crate) mod tests {
 
     /// Starts a request of `method` (id 1) that calls the client back, then
     /// a request of `hold` (id 2: `hold` or `holdcall`) that runs nested in
-    /// that call's wait, and returns 50 ms into the hold.
-    fn hold_a_call(client: &UnixStream, method: &str, hold: &str) {
+    /// that call's wait, and returns about 50 ms into the hold: the reader
+    /// thread has read id 2 (`reads` of `run_on_reader_with_reads`, which
+    /// no read took yet) and waits in its third read.
+    fn hold_a_call(client: &UnixStream, reads: &Receiver<()>, method: &str, hold: &str) {
         let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}"}}"#);
         write_framed(client, &body);
         let call = read_framed(client);
         assert!(call.contains(r#""id":"api1""#), "{call}");
         let body = format!(r#"{{"jsonrpc":"2.0","id":2,"method":"{hold}"}}"#);
         write_framed(client, &body);
+        wait_for_reads(reads, 3);
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -2850,8 +2854,8 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_held_call_keeps_phase_a() {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
-        hold_a_call(&client, "calls", "hold");
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
+        hold_a_call(&client, &reads, "calls", "hold");
         cancel();
         std::thread::sleep(Duration::from_millis(100));
         client
@@ -2880,8 +2884,8 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_held_call_passes_the_end() {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
-        hold_a_call(&client, "slowcalls", "hold");
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
+        hold_a_call(&client, &reads, "slowcalls", "hold");
         cancel();
         std::thread::sleep(Duration::from_millis(100));
         client
@@ -2909,8 +2913,8 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_held_reply_without_a_signal() {
         let ctx = context::background();
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
-        hold_a_call(&client, "calls", "hold");
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
+        hold_a_call(&client, &reads, "calls", "hold");
         write_framed(&client, r#"{"jsonrpc":"2.0","id":"api1","result":null}"#);
         std::thread::sleep(Duration::from_millis(100));
         client
@@ -2939,8 +2943,8 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_held_call_keeps_its_reply_at_the_end() {
         let ctx = context::background();
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
-        hold_a_call(&client, "calls", "holdcall");
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
+        hold_a_call(&client, &reads, "calls", "holdcall");
         write_framed(&client, r#"{"jsonrpc":"2.0","id":"api1","result":null}"#);
         std::thread::sleep(Duration::from_millis(100));
         client
@@ -2974,8 +2978,8 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_held_call_end_before_a_signal() {
         let ctx = context::background();
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
-        hold_a_call(&client, "hcall", "hold");
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
+        hold_a_call(&client, &reads, "hcall", "hold");
         client
             .shutdown(std::net::Shutdown::Write)
             .expect("shutdown");
@@ -2995,8 +2999,8 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_held_call_read_error_after_a_signal() {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
-        hold_a_call(&client, "calls", "hold");
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
+        hold_a_call(&client, &reads, "calls", "hold");
         cancel();
         std::thread::sleep(Duration::from_millis(100));
         (&client)

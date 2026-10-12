@@ -2539,10 +2539,10 @@ impl RegistryBuilder {
         }
 
         // Discard entrypoints for non-module files and empty modules.
-        // Go: slices.DeleteFunc
+        // Go: slices.DeleteFunc, by `ResolvedPath` (registry.go:1569)
         result
             .entrypoints
-            .retain(|ep| !non_module_files.contains(&(self.base.to_path)(&ep.resolved_file_name)));
+            .retain(|ep| !non_module_files.contains(&ep.resolved_path));
 
         let stats = extractor.stats();
         result.stats_exports = stats.exports.get();
@@ -2734,10 +2734,10 @@ impl RegistryBuilder {
         }
         for entrypoint_set in &extraction.entrypoints {
             for entrypoint in entrypoint_set {
-                let path = (self.base.to_path)(&entrypoint.resolved_file_name);
+                // ts#64159 (registry.go:1687): Go keys by `ResolvedPath`.
                 result
                     .entrypoints
-                    .entry(path)
+                    .entry(entrypoint.resolved_path.clone())
                     .or_default()
                     .push(entrypoint.clone());
             }
@@ -2894,9 +2894,9 @@ impl RegistryBuilder {
             FxHashMap::default();
         for entrypoint_set in &extraction.entrypoints {
             for entrypoint in entrypoint_set {
-                let path = (self.base.to_path)(&entrypoint.resolved_file_name);
+                // ts#64159 (registry.go:1800): Go keys by `ResolvedPath`.
                 new_entrypoints
-                    .entry(path)
+                    .entry(entrypoint.resolved_path.clone())
                     .or_default()
                     .push(entrypoint.clone());
             }
