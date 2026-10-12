@@ -42,7 +42,7 @@ impl Checker {
     ) -> TypeId {
         let target = self.get_reference_candidate(expr.right());
         let reference = f.reference;
-        if !self.is_matching_reference(reference, target) {
+        if !self.is_matching_flow_reference(f, target) {
             return t;
         }
         let symbol = self.get_symbol_for_private_identifier_expression(expr.left());
@@ -171,10 +171,10 @@ impl Checker {
         let flow_type = self.get_type_at_flow_node(f, flow_node.antecedent);
         let mut t = flow_type.t;
         let reference = f.reference;
-        if self.is_matching_reference(reference, expr) {
+        if self.is_matching_flow_reference(f, expr) {
             t = self.narrow_type_by_switch_on_discriminant(t, &data);
         } else if expr.kind() == SyntaxKind::TypeOfExpression
-            && self.is_matching_reference(reference, expr.expression())
+            && self.is_matching_flow_reference(f, expr.expression())
         {
             t = self.narrow_type_by_switch_on_type_of(t, &data);
         } else if expr.kind() == SyntaxKind::TrueKeyword {
@@ -752,7 +752,7 @@ impl Checker {
             };
             let reference = f.reference;
             let candidate = self.get_reference_candidate(expr);
-            if self.is_matching_reference(reference, candidate) {
+            if self.is_matching_flow_reference(f, candidate) {
                 let flow_type = self.get_type_at_flow_node(f, flow_node.antecedent);
                 if self
                     .ty(flow_type.t)
@@ -824,9 +824,17 @@ impl Checker {
         expr: Node,
     ) -> Node {
         let reference = f.reference;
-        if is_binding_pattern(reference)
-            || is_function_expression_or_arrow_function(reference)
-            || is_object_literal_method(reference)
+        // PERF: flowcost1. Go `IsBindingPattern`, `IsFunctionExpressionOrArrowFunction`
+        // and `IsObjectLiteralMethod` of the reference on the kind that the
+        // walk has read (`FlowState::reference_kind`).
+        if matches!(
+            f.reference_kind,
+            SyntaxKind::ObjectBindingPattern
+                | SyntaxKind::ArrayBindingPattern
+                | SyntaxKind::FunctionExpression
+                | SyntaxKind::ArrowFunction
+        ) || f.reference_kind == SyntaxKind::MethodDeclaration
+            && reference.parent().kind() == SyntaxKind::ObjectLiteralExpression
         {
             // When the reference is a binding pattern or function or arrow expression, we are narrowing a pseudo-reference in
             // getNarrowedTypeOfSymbol. An identifier for a destructuring variable declared in the same binding pattern or
@@ -846,7 +854,7 @@ impl Checker {
             }
         } else if is_access_expression(expr) {
             // An access expression is a candidate if the reference matches the left hand expression.
-            if self.is_matching_reference(reference, expr.expression()) {
+            if self.is_matching_flow_reference(f, expr.expression()) {
                 return expr;
             }
         } else if is_identifier(expr) {
@@ -857,7 +865,7 @@ impl Checker {
                 // Given 'const x = obj.kind', allow 'x' as an alias for 'obj.kind'
                 if initializer.is_some()
                     && is_access_expression(initializer)
-                    && self.is_matching_reference(reference, initializer.expression())
+                    && self.is_matching_flow_reference(f, initializer.expression())
                 {
                     return initializer;
                 }
@@ -868,7 +876,7 @@ impl Checker {
                     );
                     if initializer.is_some()
                         && (is_identifier(initializer) || is_access_expression(initializer))
-                        && self.is_matching_reference(reference, initializer)
+                        && self.is_matching_flow_reference(f, initializer)
                     {
                         return declaration;
                     }
@@ -1143,12 +1151,35 @@ impl Checker {
 
     /// `is_matching_reference` for a caller that has read `target_kind`
     /// (`target.kind()`).
+    #[inline]
     pub fn is_matching_reference_kind(
         &mut self,
         source: Node,
         target: Node,
         target_kind: SyntaxKind,
     ) -> bool {
+        self.is_matching_reference_kinds(source, source.kind(), target, target_kind)
+    }
+
+    /// Go `c.isMatchingReference(f.reference, target)` with the reference
+    /// kind that the walk has read (`FlowState::reference_kind`).
+    #[inline]
+    pub fn is_matching_flow_reference(&mut self, f: &FlowState, target: Node) -> bool {
+        self.is_matching_reference_kinds(f.reference, f.reference_kind, target, target.kind())
+    }
+
+    /// `is_matching_reference` for a caller that has read `source_kind`
+    /// (`source.kind()`) and `target_kind` (`target.kind()`).
+    // PERF: flowcost1. A flow walk compares its one reference with each
+    // flow node on its path; the walk reads the reference kind once.
+    pub fn is_matching_reference_kinds(
+        &mut self,
+        source: Node,
+        source_kind: SyntaxKind,
+        target: Node,
+        target_kind: SyntaxKind,
+    ) -> bool {
+        debug_assert_eq!(source_kind, source.kind());
         match target_kind {
             SyntaxKind::ParenthesizedExpression | SyntaxKind::NonNullExpression => {
                 return self.is_matching_reference(source, target.expression());
@@ -1162,7 +1193,7 @@ impl Checker {
             }
             _ => {}
         }
-        match source.kind() {
+        match source_kind {
             SyntaxKind::MetaProperty => {
                 return is_meta_property(target)
                     && source.keyword_token() == target.keyword_token()

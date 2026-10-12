@@ -77,12 +77,13 @@ impl ReduceLabel {
 // Go `[]*ast.FlowReduceLabelData` is a list of `ReduceLabel`.
 // PERF: flowcost1. The `Rc<RefCell<FlowState>>` before it paid a borrow
 // flag test at each field read of each flow step and the free list moves.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FlowState {
     pub reference: Node,
-    /// PERF: chkA. Go `ast.IsAccessExpression(reference)`, read once per
-    /// walk (`get_flow_type_of_reference_ex`) for `get_type_at_flow_assignment`.
-    pub reference_is_access: bool,
+    /// PERF: flowcost1. Not in Go. `reference.kind()`, read once per walk
+    /// (`flow_walk`) for the kind tests of the reference in each step
+    /// (`is_matching_flow_reference`). `Unknown` for a nil reference.
+    pub reference_kind: SyntaxKind,
     pub declared_type: TypeId,
     pub initial_type: TypeId,
     pub flow_container: Node,
@@ -96,6 +97,25 @@ pub struct FlowState {
     /// compare and one index, as Go reads `*flow`.
     pub flow_nodes: &'static [FlowNode],
     pub flow_nodes_file: usize,
+}
+
+impl Default for FlowState {
+    /// Go `FlowState{}`.
+    fn default() -> Self {
+        Self {
+            reference: Node::NIL,
+            reference_kind: SyntaxKind::Unknown,
+            declared_type: TypeId::NIL,
+            initial_type: TypeId::NIL,
+            flow_container: Node::NIL,
+            ref_key: CacheHashKey::default(),
+            depth: 0,
+            shared_flow_start: 0,
+            reduce_labels: Vec::new(),
+            flow_nodes: &[],
+            flow_nodes_file: 0,
+        }
+    }
 }
 
 impl FlowState {
@@ -239,7 +259,7 @@ impl Checker {
     ) -> TypeId {
         let mut f = FlowState {
             reference,
-            reference_is_access: is_access_expression(reference),
+            reference_kind: reference.kind(),
             declared_type,
             initial_type: if initial_type.is_some() {
                 initial_type
@@ -352,13 +372,12 @@ impl Checker {
             } else if flags.intersects(FlowFlags::START) {
                 // Check if we should continue with the control flow of the containing function.
                 let container = flow_data.node;
-                let (reference, flow_container, initial_type) =
-                    (f.reference, f.flow_container, f.initial_type);
+                let (reference_kind, flow_container, initial_type) =
+                    (f.reference_kind, f.flow_container, f.initial_type);
                 // PERF: Go `IsPropertyAccessExpression`,
                 // `IsElementAccessExpression` and the `KindThisKeyword` test
-                // on one read of the reference kind.
+                // on the reference kind of the walk (`FlowState::reference_kind`).
                 if container.is_some() && container != flow_container && {
-                    let reference_kind = reference.kind();
                     reference_kind != SyntaxKind::PropertyAccessExpression
                         && reference_kind != SyntaxKind::ElementAccessExpression
                         && !(reference_kind == SyntaxKind::ThisKeyword
@@ -428,8 +447,8 @@ impl Checker {
         flow_data: &FlowNode,
     ) -> FlowType {
         let node = flow_data.node;
-        let (reference, declared_type, reference_is_access) =
-            (f.reference, f.declared_type, f.reference_is_access);
+        let (reference, reference_kind, declared_type) =
+            (f.reference, f.reference_kind, f.declared_type);
         // PERF: chkA. The kind of `node` is read once, for the match and the
         // `for ... in` test below. noderef1 G2: through a view (`NodeRef`),
         // which the `for ... in` test reads the grandparent with.
@@ -438,7 +457,7 @@ impl Checker {
         // Assignments only narrow the computed type if the declared type is a union type. Thus, we
         // only need to evaluate the assigned type if the declared type is a union type.
         if !self.matching_reference_memo_says_no(reference, node, node_kind)
-            && self.is_matching_reference_kind(reference, node, node_kind)
+            && self.is_matching_reference_kinds(reference, reference_kind, node, node_kind)
         {
             if !self.is_reachable_flow_node(flow) {
                 return FlowType {
@@ -493,8 +512,13 @@ impl Checker {
         // reference 'x.y.z', we may be at an assignment to 'x.y' or 'x'. In that case,
         // return the declared type.
         // PERF: chkA. `contains_matching_reference` is false at once for a
-        // reference that is not an access expression (read once per walk).
-        if reference_is_access && self.contains_matching_reference(reference, node) {
+        // reference that is not an access expression (its kind is read once
+        // per walk).
+        if matches!(
+            reference_kind,
+            SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression
+        ) && self.contains_matching_reference(reference, node)
+        {
             if !self.is_reachable_flow_node(flow) {
                 return FlowType {
                     t: self.unreachable_never_type,
@@ -518,7 +542,7 @@ impl Checker {
         if node_kind == SyntaxKind::VariableDeclaration && {
             let grand_parent = node_ref.parent().parent();
             grand_parent.kind() == SyntaxKind::ForInStatement
-                && (self.is_matching_reference(reference, grand_parent.expression())
+                && (self.is_matching_flow_reference(f, grand_parent.expression())
                     || self.optional_chain_contains_reference(grand_parent.expression(), reference))
         } {
             let antecedent_type = self.get_type_at_flow_node(f, flow_data.antecedent).t;
@@ -631,7 +655,7 @@ impl Checker {
             let predicate_argument = self.get_type_predicate_argument(predicate, call_expression);
             if predicate_argument.is_some() {
                 let reference = f.reference;
-                if self.is_matching_reference(reference, predicate_argument) {
+                if self.is_matching_flow_reference(f, predicate_argument) {
                     return self.get_narrowed_type(
                         t,
                         predicate_t,
@@ -762,7 +786,7 @@ impl Checker {
                     // When narrowing a reference to a const variable, non-assigned parameter, or readonly property, we inline
                     // up to five levels of aliased conditional expressions that are themselves declared as const variables.
                     let reference = f.reference;
-                    if !self.is_matching_reference(reference, expr) && self.inline_level < 5 {
+                    if !self.is_matching_flow_reference(f, expr) && self.inline_level < 5 {
                         let symbol = self.get_resolved_symbol(expr);
                         if self.is_constant_variable(symbol) {
                             let declaration = self.sym(symbol).value_declaration;
@@ -814,7 +838,7 @@ impl Checker {
         assume_present: bool,
     ) -> TypeId {
         let reference = f.reference;
-        if self.is_matching_reference(reference, expr) {
+        if self.is_matching_flow_reference(f, expr) {
             return self.get_adjusted_type_with_facts(
                 t,
                 if assume_present {
@@ -850,7 +874,7 @@ impl Checker {
     ) -> TypeId {
         let mut t = t;
         let reference = f.reference;
-        if self.is_matching_reference(reference, expr) {
+        if self.is_matching_flow_reference(f, expr) {
             return self.get_adjusted_type_with_facts(
                 t,
                 if assume_true {
@@ -972,10 +996,10 @@ impl Checker {
                 if right.kind() == SyntaxKind::TypeOfExpression && is_string_literal_like(left) {
                     return self.narrow_type_by_typeof(f, t, right, operator, left, assume_true);
                 }
-                if self.is_matching_reference(reference, left) {
+                if self.is_matching_flow_reference(f, left) {
                     return self.narrow_type_by_equality(t, operator, right, assume_true);
                 }
-                if self.is_matching_reference(reference, right) {
+                if self.is_matching_flow_reference(f, right) {
                     return self.narrow_type_by_equality(t, operator, left, assume_true);
                 }
                 if self.strict_null_checks {
@@ -1076,7 +1100,7 @@ impl Checker {
                         }
                     }
                 }
-                if self.is_matching_reference(reference, target) {
+                if self.is_matching_flow_reference(f, target) {
                     let left_type = self.get_type_of_expression(expr.left());
                     if self.is_type_usable_as_property_name(left_type) {
                         return self.narrow_type_by_in_keyword(f, t, left_type, assume_true);
@@ -1223,7 +1247,7 @@ impl Checker {
         }
         let reference = f.reference;
         let target = self.get_reference_candidate(type_of_expr.expression());
-        if !self.is_matching_reference(reference, target) {
+        if !self.is_matching_flow_reference(f, target) {
             if self.strict_null_checks
                 && self.optional_chain_contains_reference(target, reference)
                 && assume_true == (literal.text() != "undefined")
@@ -1444,7 +1468,7 @@ impl Checker {
         let reference = f.reference;
         name.is_some()
             && name.text() == "constructor"
-            && self.is_matching_reference(reference, expr.expression())
+            && self.is_matching_flow_reference(f, expr.expression())
     }
 
     // Go: checker/flow.go:760 narrowTypeByConstructor
@@ -1547,7 +1571,7 @@ impl Checker {
     ) -> TypeId {
         let reference = f.reference;
         let left = self.get_reference_candidate(expr.left());
-        if !self.is_matching_reference(reference, left) {
+        if !self.is_matching_flow_reference(f, left) {
             if assume_true
                 && self.strict_null_checks
                 && self.optional_chain_contains_reference(left, reference)
