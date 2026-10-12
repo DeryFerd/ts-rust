@@ -616,11 +616,6 @@ mod tests {
         go_panic_lines(panic)
     }
 
-    // Go `printpanics` (go1.27.1 runtime/panic.go:734) for a panic in the
-    // deferred function that recovered another one, raised again by
-    // `WaitGroup.Go`. The texts are Go's stderr for ipc `AsyncConn` with a
-    // handler that panics and a panic answer that panics (followups39
-    // `go test -overlay`), with a handler value of one and of two lines.
     // The parts/ crates' sites print as before the crate split.
     #[test]
     fn go_site_file_drops_dir_dot_dot_pairs() {
@@ -635,6 +630,11 @@ mod tests {
         assert_eq!(go_site_file("../x/src/a.rs"), "../x/src/a.rs");
     }
 
+    // Go `printpanics` (go1.27.1 runtime/panic.go:734) for a panic in the
+    // deferred function that recovered another one, raised again by
+    // `WaitGroup.Go`. The texts are Go's stderr for ipc `AsyncConn` with a
+    // handler that panics and a panic answer that panics (followups39
+    // `go test -overlay`), with a handler value of one and of two lines.
     #[test]
     fn go_after_recover_prints_the_recovered_panic_first() {
         let write_panic = || {
