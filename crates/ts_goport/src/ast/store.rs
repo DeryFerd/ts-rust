@@ -250,6 +250,13 @@ struct FileStore {
     /// What `make_facts` needs from the slots, kept as they are made and
     /// written (`BuildFacts`).
     build_facts: BuildFacts,
+    /// The identifier name cache of the parsing thread (`identifier_name`)
+    /// while the parse runs: the store takes it from the thread
+    /// (`IDENTIFIER_NAMES`) when it is made or on its first name, and
+    /// `end_parse` gives it back.
+    // PERF: identparse1. A name slot reads the cache with no thread-local
+    // access and no `RefCell` borrow.
+    idents: Option<Box<IdentNames>>,
 }
 
 /// storefast1: the parts of `StoreFacts` and `BindCounts` that the slots of
@@ -2229,11 +2236,17 @@ impl FileStore {
     // PERF: storefast1. The kind test is inline, so the other two thirds of
     // the slots make no call.
     #[inline]
-    fn slot_text_name(kind: SyntaxKind, data: NodeData<'_>, text: Option<&str>) -> (Name, bool) {
+    fn slot_text_name(
+        &mut self,
+        kind: SyntaxKind,
+        data: NodeData<'_>,
+        text: Option<&str>,
+    ) -> (Name, bool) {
         if !is_name_kind(kind) {
             return (Name::default(), false);
         }
-        identifier_name(text.unwrap_or_else(|| identifier_text(data)))
+        let idents = self.idents.get_or_insert_with(take_thread_idents);
+        identifier_name(idents, text.unwrap_or_else(|| identifier_text(data)))
     }
 
     /// The record, kind, kids and link vectors have one entry per slot.
@@ -2341,7 +2354,7 @@ impl FileStore {
 
 /// The process-wide intern of identifier text `text` (`Name::from`) and Go
 /// `scanner.GetIdentifierToken(text) != KindIdentifier`, through the
-/// thread's cache (`IDENTIFIER_NAMES`).
+/// parsing thread's cache `names` (`FileStore::idents`).
 // Port only: Go stopped interning parser texts (`internIdentifier`) in
 // tsgo#4731.
 // PERF: storefast1: the cache lives for the thread, not for one file, so
@@ -2354,22 +2367,19 @@ impl FileStore {
 // so the cache does not change which call interns a text first: name ids
 // and their order stay as without it.
 #[inline(never)]
-fn identifier_name(text: &str) -> (Name, bool) {
+fn identifier_name(names: &mut IdentNames, text: &str) -> (Name, bool) {
     // `Name::from("")` is `Name::default()`, and "" is no keyword. Only a
     // missing identifier has no text.
     if text.is_empty() {
         return (Name::default(), false);
     }
     let key = IdentKey::new(text.as_bytes());
-    IDENTIFIER_NAMES.with(|names| {
-        let mut names = names.borrow_mut();
-        if let Some(found) = names.find(key, text) {
-            return found;
-        }
-        let found = intern_identifier(text);
-        names.insert(key, found.0.id(), found.1);
-        found
-    })
+    if let Some(found) = names.find(key, text) {
+        return found;
+    }
+    let found = intern_identifier(text);
+    names.insert(key, found.0.id(), found.1);
+    found
 }
 
 /// `identifier_name` of a text that is not in the thread's cache.
@@ -2497,9 +2507,13 @@ struct IdentSet([IdentEntry; 2]);
 /// taken as many texts as it has entries, up to `IDENT_MAX_SETS` (2 MiB, 64K
 /// texts). A text that comes into a full set drops the less recently used
 /// entry, so a language server that parses for days keeps a bounded table.
+/// The default table is empty: it finds nothing, and its first insert
+/// makes the sets.
+#[derive(Default)]
 struct IdentNames {
     sets: Vec<IdentSet>,
-    /// `64 - log2(sets.len())`: `set_hash >> shift` is the set index.
+    /// `64 - log2(sets.len())`: `set_hash >> shift` is the set index (0,
+    /// and no set, before the first insert).
     shift: u32,
     /// Texts put in since the table last grew.
     inserts: usize,
@@ -2571,14 +2585,28 @@ impl IdentNames {
 }
 
 thread_local! {
-    /// `identifier_name`: the identifier texts this thread interned lately.
-    static IDENTIFIER_NAMES: RefCell<IdentNames> = const {
-        RefCell::new(IdentNames {
-            sets: Vec::new(),
-            shift: 63,
-            inserts: 0,
-        })
-    };
+    /// The `identifier_name` cache of this thread while no store of the
+    /// thread holds it (`FileStore::idents`).
+    static IDENTIFIER_NAMES: Cell<Option<Box<IdentNames>>> = const { Cell::new(None) };
+}
+
+/// The identifier name cache of this thread, for a store that parses (an
+/// empty one when another store of the thread has it).
+fn take_thread_idents() -> Box<IdentNames> {
+    IDENTIFIER_NAMES.take().unwrap_or_default()
+}
+
+/// Gives the identifier name cache `idents` of a store whose parse ended
+/// back to this thread. When the thread has one already (two stores of the
+/// thread parsed at once), the larger stays.
+fn give_back_thread_idents(idents: Box<IdentNames>) {
+    let _ = IDENTIFIER_NAMES.try_with(|spare| {
+        let keep = match spare.take() {
+            Some(other) if other.sets.len() > idents.sets.len() => other,
+            _ => idents,
+        };
+        spare.set(Some(keep));
+    });
 }
 
 /// `FileStore::unlink_children` on the link column `links`.
@@ -4328,6 +4356,9 @@ impl FileStore {
     /// Marks the store finished and marks its source file roots.
     fn end_parse(&mut self) {
         self.frozen = true;
+        if let Some(idents) = self.idents.take() {
+            give_back_thread_idents(idents);
+        }
         self.records.shrink_to_fit();
         self.kinds.shrink_to_fit();
         self.kids.shrink_to_fit();
@@ -6657,7 +6688,7 @@ pub fn replace_store_node_data(n: Node, data: BoxedData) {
         let modifier_bits =
             super::node::store_node_modifier_bits(kind, view, |m| s.modifier_list_bits(owned, m));
         if !keeps_name {
-            let (name, text_is_keyword) = FileStore::slot_text_name(kind, view, None);
+            let (name, text_is_keyword) = s.slot_text_name(kind, view, None);
             s.records[index].set_bit(NodeRecord::TEXT_IS_KEYWORD, text_is_keyword);
             s.kids[index].set_word(NodeKids::word_of(kind, &name, modifier_bits));
         }
@@ -6838,7 +6869,9 @@ pub(crate) fn reset_file_store(file: usize) {
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot reset a finished store");
         let owns_nodes = s.owned.is_some();
+        let idents = s.idents.take();
         *s = FileStore::new(s.file_name, s.text.clone());
+        s.idents = idents;
         if owns_nodes {
             s.owned = Some(Box::new(OwnedAst::new(s.records.capacity())));
         }
@@ -7178,7 +7211,7 @@ fn alloc_store_slot_node(
         let modifier_bits = s.static_modifier_bits(modifiers);
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.records.len() as u32;
-        let (name, text_is_keyword) = FileStore::slot_text_name(kind, node, text);
+        let (name, text_is_keyword) = s.slot_text_name(kind, node, text);
         s.push_node_header(kind, text_is_keyword);
         s.nodes.push(Some(node));
         s.push_no_cell();
@@ -7237,7 +7270,7 @@ fn alloc_store_owned_slot(
         });
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.records.len() as u32;
-        let (name, text_is_keyword) = FileStore::slot_text_name(kind, node.view(), text);
+        let (name, text_is_keyword) = s.slot_text_name(kind, node.view(), text);
         s.push_node_header(kind, text_is_keyword);
         let owned = s.owned_mut();
         let cell = owned.push(node);
@@ -9035,8 +9068,9 @@ mod tests {
     /// and dropped entries.
     #[test]
     fn identifier_name_cache_gives_the_interned_name() {
-        let check = |text: &str| {
-            let (name, keyword) = identifier_name(text);
+        let mut names = IdentNames::default();
+        let mut check = |text: &str| {
+            let (name, keyword) = identifier_name(&mut names, text);
             assert_eq!(name, Name::from(text), "{text:?}");
             assert_eq!(name.as_str(), text);
             assert_eq!(
