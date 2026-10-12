@@ -69,8 +69,14 @@ impl ReduceLabel {
 }
 
 // Go: checker/flow.go:40 FlowState
-// PORT: Go `*FlowState` is `Rc<RefCell<FlowState>>` (see `Checker::free_flow_state`).
+// PORT: Go `*FlowState` is `&mut FlowState`. Go `getFlowState` and
+// `putFlowState` (flow.go:52-66) keep a free list so that a walk does not
+// allocate its state on the heap; here each walk keeps its state on the
+// stack (`flow_walk`, `is_reachable_flow_node`, `is_post_super_flow_node`),
+// which starts as Go's reset state, so there is no free list and no `next`.
 // Go `[]*ast.FlowReduceLabelData` is a list of `ReduceLabel`.
+// PERF: flowcost1. The `Rc<RefCell<FlowState>>` before it paid a borrow
+// flag test at each field read of each flow step and the free list moves.
 #[derive(Clone, Debug, Default)]
 pub struct FlowState {
     pub reference: Node,
@@ -84,39 +90,6 @@ pub struct FlowState {
     pub depth: i32,
     pub shared_flow_start: i32,
     pub reduce_labels: Vec<ReduceLabel>,
-    pub next: Option<Rc<RefCell<FlowState>>>,
-}
-
-impl Checker {
-    // Go: checker/flow.go:52 getFlowState
-    // PERF: chkA. The free list moves its links (`take`), so no reference
-    // count changes. Go leaves `f.next` set, but only `put_flow_state` uses
-    // it, and it sets it again.
-    pub fn get_flow_state(&mut self) -> Rc<RefCell<FlowState>> {
-        match self.free_flow_state.take() {
-            Some(f) => {
-                self.free_flow_state = f.borrow_mut().next.take();
-                f
-            }
-            None => Rc::new(RefCell::new(FlowState::default())),
-        }
-    }
-
-    // Go: checker/flow.go:61 putFlowState
-    // PORT: takes the state by value: the caller is done with it.
-    pub fn put_flow_state(&mut self, f: Rc<RefCell<FlowState>>) {
-        {
-            let mut fb = f.borrow_mut();
-            let mut reduce_labels = std::mem::take(&mut fb.reduce_labels);
-            reduce_labels.clear();
-            *fb = FlowState {
-                reduce_labels,
-                next: self.free_flow_state.take(),
-                ..FlowState::default()
-            };
-        }
-        self.free_flow_state = Some(f);
-    }
 }
 
 // Go: checker/flow.go:69 getFlowNodeOfNode
@@ -224,39 +197,32 @@ impl Checker {
         flow_container: Node,
         flow_node: FlowNodeId,
     ) -> TypeId {
-        let f = self.get_flow_state();
-        {
-            let mut fb = f.borrow_mut();
-            fb.reference = reference;
-            fb.reference_is_access = is_access_expression(reference);
-            fb.declared_type = declared_type;
-            fb.initial_type = if initial_type.is_some() {
+        let mut f = FlowState {
+            reference,
+            reference_is_access: is_access_expression(reference),
+            declared_type,
+            initial_type: if initial_type.is_some() {
                 initial_type
             } else {
                 declared_type
-            };
-            fb.flow_container = flow_container;
-            fb.shared_flow_start = self.shared_flows.len() as i32;
-        }
-        let evolved_type = self.get_type_at_flow_node(&f, flow_node).t;
-        let shared_flow_start = f.borrow().shared_flow_start as usize;
-        self.shared_flows.truncate(shared_flow_start);
-        self.put_flow_state(f);
+            },
+            flow_container,
+            shared_flow_start: self.shared_flows.len() as i32,
+            ..FlowState::default()
+        };
+        let evolved_type = self.get_type_at_flow_node(&mut f, flow_node).t;
+        self.shared_flows.truncate(f.shared_flow_start as usize);
         evolved_type
     }
 
     // Go: checker/flow.go:117 getTypeAtFlowNode
-    pub fn get_type_at_flow_node(
-        &mut self,
-        f: &Rc<RefCell<FlowState>>,
-        flow: FlowNodeId,
-    ) -> FlowType {
+    pub fn get_type_at_flow_node(&mut self, f: &mut FlowState, flow: FlowNodeId) -> FlowType {
         let mut flow = flow;
-        if f.borrow().depth == 2000 {
+        if f.depth == 2000 {
             // We have made 2000 recursive invocations. To avoid overflowing the call stack we report an error
             // and disable further control flow analysis in the containing function or module body.
             if let Some(tr) = self.tracer {
-                let depth = f.borrow().depth;
+                let depth = f.depth;
                 tr.instant(
                     crate::tracing::Phase::CheckTypes,
                     "getTypeAtFlowNode_DepthLimit",
@@ -264,14 +230,14 @@ impl Checker {
                 );
             }
             self.flow_analysis_disabled = true;
-            let reference = f.borrow().reference;
+            let reference = f.reference;
             self.report_flow_control_error(reference);
             return FlowType {
                 t: self.error_type,
                 incomplete: false,
             };
         }
-        f.borrow_mut().depth += 1;
+        f.depth += 1;
         let mut shared_flow = FlowNodeId::NIL;
         // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
         // lsshells M3 repair: one guard for the whole walk, so the steps in
@@ -282,7 +248,7 @@ impl Checker {
         let recording = self.flow_skip.recording.is_some();
         loop {
             if recording {
-                let depth = f.borrow().depth;
+                let depth = f.depth;
                 self.flow_skip_record(flow, depth);
             }
             let flow_data = flow.get_flow_in(&mut flow_data_guard);
@@ -291,10 +257,10 @@ impl Checker {
                 // We cache results of flow type resolution for shared nodes that were previously visited in
                 // the same getFlowTypeOfReference invocation. A node is considered shared when it is the
                 // antecedent of more than one node.
-                let start = f.borrow().shared_flow_start as usize;
+                let start = f.shared_flow_start as usize;
                 for i in start..self.shared_flows.len() {
                     if self.shared_flows[i].flow == flow {
-                        f.borrow_mut().depth -= 1;
+                        f.depth -= 1;
                         return self.shared_flows[i].flow_type;
                     }
                 }
@@ -318,8 +284,7 @@ impl Checker {
             } else if flags.intersects(FlowFlags::SWITCH_CLAUSE) {
                 t = self.get_type_at_switch_clause(f, flow_data);
             } else if flags.intersects(FlowFlags::BRANCH_LABEL) {
-                let antecedents =
-                    get_branch_label_antecedents(flow, flow_data, &f.borrow().reduce_labels);
+                let antecedents = get_branch_label_antecedents(flow, flow_data, &f.reduce_labels);
                 // PORT: Go `antecedents.Next == nil` (a one-element FlowList).
                 if antecedents.len() <= 1 {
                     flow = antecedents[0];
@@ -339,18 +304,14 @@ impl Checker {
                     continue;
                 }
             } else if flags.intersects(FlowFlags::REDUCE_LABEL) {
-                f.borrow_mut()
-                    .reduce_labels
-                    .push(ReduceLabel::of(flow_data));
+                f.reduce_labels.push(ReduceLabel::of(flow_data));
                 t = self.get_type_at_flow_node(f, flow_data.antecedent);
-                f.borrow_mut().reduce_labels.pop();
+                f.reduce_labels.pop();
             } else if flags.intersects(FlowFlags::START) {
                 // Check if we should continue with the control flow of the containing function.
                 let container = flow_data.node;
-                let (reference, flow_container, initial_type) = {
-                    let fb = f.borrow();
-                    (fb.reference, fb.flow_container, fb.initial_type)
-                };
+                let (reference, flow_container, initial_type) =
+                    (f.reference, f.flow_container, f.initial_type);
                 // PERF: Go `IsPropertyAccessExpression`,
                 // `IsElementAccessExpression` and the `KindThisKeyword` test
                 // on one read of the reference kind.
@@ -372,7 +333,7 @@ impl Checker {
             } else {
                 // Unreachable code errors are reported in the binding phase. Here we
                 // simply return the non-auto declared type to reduce follow-on errors.
-                let declared_type = f.borrow().declared_type;
+                let declared_type = f.declared_type;
                 t = FlowType {
                     t: self.convert_auto_to_any(declared_type),
                     incomplete: false,
@@ -385,7 +346,7 @@ impl Checker {
                     flow_type: t,
                 });
             }
-            f.borrow_mut().depth -= 1;
+            f.depth -= 1;
             return t;
         }
     }
@@ -420,15 +381,13 @@ impl Checker {
     // repair).
     pub fn get_type_at_flow_assignment(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         flow: FlowNodeId,
         flow_data: &FlowNode,
     ) -> FlowType {
         let node = flow_data.node;
-        let (reference, declared_type, reference_is_access) = {
-            let fb = f.borrow();
-            (fb.reference, fb.declared_type, fb.reference_is_access)
-        };
+        let (reference, declared_type, reference_is_access) =
+            (f.reference, f.declared_type, f.reference_is_access);
         // PERF: chkA. The kind of `node` is read once, for the match and the
         // `for ... in` test below. noderef1 G2: through a view (`NodeRef`),
         // which the `for ... in` test reads the grandparent with.
@@ -533,12 +492,8 @@ impl Checker {
 
     // Go: checker/flow.go:276 getInitialOrAssignedType
     // PORT: takes `flow.Node` (`node`), the only part of the flow node it reads.
-    pub fn get_initial_or_assigned_type(
-        &mut self,
-        f: &Rc<RefCell<FlowState>>,
-        node: Node,
-    ) -> TypeId {
-        let reference = f.borrow().reference;
+    pub fn get_initial_or_assigned_type(&mut self, f: &mut FlowState, node: Node) -> TypeId {
+        let reference = f.reference;
         if is_variable_declaration(node) || is_binding_element(node) {
             let initial_type = self.get_initial_type(node);
             return self.get_narrowable_type_for_reference(
@@ -563,11 +518,7 @@ impl Checker {
 
     // Go: checker/flow.go:288 getTypeAtFlowCall
     // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
-    pub fn get_type_at_flow_call(
-        &mut self,
-        f: &Rc<RefCell<FlowState>>,
-        flow_data: &FlowNode,
-    ) -> FlowType {
+    pub fn get_type_at_flow_call(&mut self, f: &mut FlowState, flow_data: &FlowNode) -> FlowType {
         let signature = self.get_effects_signature(flow_data.node);
         if signature.is_some() {
             let predicate = self.get_type_predicate_of_signature(signature);
@@ -621,7 +572,7 @@ impl Checker {
     // Go: checker/flow.go:316 narrowTypeByTypePredicate
     pub fn narrow_type_by_type_predicate(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         predicate: TypePredicateId,
         call_expression: Node,
@@ -637,7 +588,7 @@ impl Checker {
         {
             let predicate_argument = self.get_type_predicate_argument(predicate, call_expression);
             if predicate_argument.is_some() {
-                let reference = f.borrow().reference;
+                let reference = f.reference;
                 if self.is_matching_reference(reference, predicate_argument) {
                     return self.get_narrowed_type(
                         t,
@@ -671,12 +622,7 @@ impl Checker {
     }
 
     // Go: checker/flow.go:338 narrowTypeByAssertion
-    pub fn narrow_type_by_assertion(
-        &mut self,
-        f: &Rc<RefCell<FlowState>>,
-        t: TypeId,
-        expr: Node,
-    ) -> TypeId {
+    pub fn narrow_type_by_assertion(&mut self, f: &mut FlowState, t: TypeId, expr: Node) -> TypeId {
         let node = skip_parentheses(expr);
         if node.kind() == SyntaxKind::FalseKeyword {
             return self.unreachable_never_type;
@@ -699,7 +645,7 @@ impl Checker {
     // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_flow_condition(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         flow_data: &FlowNode,
     ) -> FlowType {
         let flow_type = self.get_type_at_flow_node(f, flow_data.antecedent);
@@ -727,7 +673,7 @@ impl Checker {
     // will be a subtype or the same type as the argument.
     pub fn narrow_type(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         expr: Node,
         assume_true: bool,
@@ -756,7 +702,7 @@ impl Checker {
                 if expr_kind == SyntaxKind::Identifier {
                     // When narrowing a reference to a const variable, non-assigned parameter, or readonly property, we inline
                     // up to five levels of aliased conditional expressions that are themselves declared as const variables.
-                    let reference = f.borrow().reference;
+                    let reference = f.reference;
                     if !self.is_matching_reference(reference, expr) && self.inline_level < 5 {
                         let symbol = self.get_resolved_symbol(expr);
                         if self.is_constant_variable(symbol) {
@@ -803,12 +749,12 @@ impl Checker {
     // Go: checker/flow.go:415 narrowTypeByOptionality
     pub fn narrow_type_by_optionality(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         expr: Node,
         assume_present: bool,
     ) -> TypeId {
-        let reference = f.borrow().reference;
+        let reference = f.reference;
         if self.is_matching_reference(reference, expr) {
             return self.get_adjusted_type_with_facts(
                 t,
@@ -838,13 +784,13 @@ impl Checker {
     // Go: checker/flow.go:428 narrowTypeByTruthiness
     pub fn narrow_type_by_truthiness(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         expr: Node,
         assume_true: bool,
     ) -> TypeId {
         let mut t = t;
-        let reference = f.borrow().reference;
+        let reference = f.reference;
         if self.is_matching_reference(reference, expr) {
             return self.get_adjusted_type_with_facts(
                 t,
@@ -880,12 +826,12 @@ impl Checker {
     // Go: checker/flow.go:444 narrowTypeByCallExpression
     pub fn narrow_type_by_call_expression(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         call_expression: Node,
         assume_true: bool,
     ) -> TypeId {
-        let reference = f.borrow().reference;
+        let reference = f.reference;
         if self.has_matching_argument(call_expression, reference) {
             let mut predicate = TypePredicateId::NIL;
             if assume_true || !is_call_chain(call_expression) {
@@ -939,13 +885,13 @@ impl Checker {
     // PORT: Go takes `*ast.BinaryExpression`; this takes the node.
     pub fn narrow_type_by_binary_expression(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         expr: Node,
         assume_true: bool,
     ) -> TypeId {
         let mut t = t;
-        let reference = f.borrow().reference;
+        let reference = f.reference;
         match expr.operator_token().kind() {
             SyntaxKind::EqualsToken
             | SyntaxKind::BarBarEqualsToken
@@ -1201,7 +1147,7 @@ impl Checker {
     // PORT: Go takes `*ast.TypeOfExpression`; this takes the node.
     pub fn narrow_type_by_typeof(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         type_of_expr: Node,
         operator: SyntaxKind,
@@ -1216,7 +1162,7 @@ impl Checker {
         {
             assume_true = !assume_true;
         }
-        let reference = f.borrow().reference;
+        let reference = f.reference;
         let target = self.get_reference_candidate(type_of_expr.expression());
         if !self.is_matching_reference(reference, target) {
             if self.strict_null_checks
@@ -1427,11 +1373,7 @@ impl Checker {
     }
 
     // Go: checker/flow.go:750 isMatchingConstructorReference
-    pub fn is_matching_constructor_reference(
-        &mut self,
-        f: &Rc<RefCell<FlowState>>,
-        expr: Node,
-    ) -> bool {
+    pub fn is_matching_constructor_reference(&mut self, f: &mut FlowState, expr: Node) -> bool {
         let mut name = Node::NIL;
         if is_property_access_expression(expr) {
             name = expr.name();
@@ -1440,7 +1382,7 @@ impl Checker {
         {
             name = expr.argument_expression();
         }
-        let reference = f.borrow().reference;
+        let reference = f.reference;
         name.is_some()
             && name.text() == "constructor"
             && self.is_matching_reference(reference, expr.expression())
@@ -1522,7 +1464,7 @@ impl Checker {
     // Go: checker/flow.go:806 narrowTypeByBooleanComparison
     pub fn narrow_type_by_boolean_comparison(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         expr: Node,
         bool_value: Node,
@@ -1539,12 +1481,12 @@ impl Checker {
     // PORT: Go takes `*ast.BinaryExpression`; this takes the node.
     pub fn narrow_type_by_instanceof(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         expr: Node,
         assume_true: bool,
     ) -> TypeId {
-        let reference = f.borrow().reference;
+        let reference = f.reference;
         let left = self.get_reference_candidate(expr.left());
         if !self.is_matching_reference(reference, left) {
             if assume_true

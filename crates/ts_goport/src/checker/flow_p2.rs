@@ -1,9 +1,8 @@
 //! Port of typescript-go `internal/checker/flow.go` lines 953-1854
 //! (`getInstanceType` through `getReferenceCandidate`).
 //!
-//! PORT: Go `*FlowState` is `Rc<RefCell<FlowState>>` (see `Checker::free_flow_state`),
-//! so flow functions take `f: &Rc<RefCell<FlowState>>`. Borrows of `f` are never
-//! held across calls into the checker.
+//! PORT: Go `*FlowState` is `&mut FlowState` (see `FlowState`), so flow
+//! functions take `f: &mut FlowState`.
 
 use crate::prelude::*;
 use std::borrow::Cow;
@@ -36,13 +35,13 @@ impl Checker {
     // PORT: Go `*ast.BinaryExpression` is the binary expression `Node`.
     pub fn narrow_type_by_private_identifier_in_in_expression(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         expr: Node,
         assume_true: bool,
     ) -> TypeId {
         let target = self.get_reference_candidate(expr.right());
-        let reference = f.borrow().reference;
+        let reference = f.reference;
         if !self.is_matching_reference(reference, target) {
             return t;
         }
@@ -63,7 +62,7 @@ impl Checker {
     // Go: checker/flow.go:1001 narrowTypeByInKeyword
     pub fn narrow_type_by_in_keyword(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         name_type: TypeId,
         assume_true: bool,
@@ -118,7 +117,7 @@ impl Checker {
     // Go: checker/flow.go:1032 narrowTypeByOptionalChainContainment
     pub fn narrow_type_by_optional_chain_containment(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         t: TypeId,
         operator: SyntaxKind,
         value: Node,
@@ -164,14 +163,14 @@ impl Checker {
     // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_switch_clause(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         flow_node: &FlowNode,
     ) -> FlowType {
         let data = flow_node.as_flow_switch_clause_data();
         let expr = skip_parentheses(data.switch_statement.expression());
         let flow_type = self.get_type_at_flow_node(f, flow_node.antecedent);
         let mut t = flow_type.t;
-        let reference = f.borrow().reference;
+        let reference = f.reference;
         if self.is_matching_reference(reference, expr) {
             t = self.narrow_type_by_switch_on_discriminant(t, &data);
         } else if expr.kind() == SyntaxKind::TypeOfExpression
@@ -362,7 +361,7 @@ impl Checker {
     // Go: checker/flow.go:1187 narrowTypeBySwitchOnTrue
     pub fn narrow_type_by_switch_on_true(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         mut t: TypeId,
         data: &FlowSwitchClauseData,
     ) -> TypeId {
@@ -474,7 +473,7 @@ impl Checker {
     // `flow` parameter is not read, so it is left out.
     pub fn get_type_at_flow_branch_label(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         antecedents: &[FlowNodeId],
     ) -> FlowType {
         let antecedent_start = self.antecedent_types.len();
@@ -494,10 +493,7 @@ impl Checker {
                 continue;
             }
             let flow_type = self.get_type_at_flow_node(f, antecedent);
-            let (declared_type, initial_type) = {
-                let fs = f.borrow();
-                (fs.declared_type, fs.initial_type)
-            };
+            let (declared_type, initial_type) = (f.declared_type, f.initial_type);
             // If the type at a particular antecedent path is the declared type and the
             // reference is known to always be assigned (i.e. when declared and initial types
             // are the same), there is no reason to process more antecedents since the only
@@ -536,10 +532,7 @@ impl Checker {
                         .switch_statement,
                 )
             {
-                let (declared_type, initial_type) = {
-                    let fs = f.borrow();
-                    (fs.declared_type, fs.initial_type)
-                };
+                let (declared_type, initial_type) = (f.declared_type, f.initial_type);
                 if flow_type.t == declared_type && declared_type == initial_type {
                     self.antecedent_types.truncate(antecedent_start);
                     return FlowType {
@@ -577,7 +570,7 @@ impl Checker {
     // Go: checker/flow.go:1314 getUnionOrEvolvingArrayType
     pub fn get_union_or_evolving_array_type(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         types: &[TypeId],
         subtype_reduction: UnionReduction,
     ) -> TypeId {
@@ -595,7 +588,7 @@ impl Checker {
         }
         let union = self.get_union_type_ex(&finalized, subtype_reduction, None, TypeId::NIL);
         let result = self.recombine_unknown_type(union);
-        let declared_type = f.borrow().declared_type;
+        let declared_type = f.declared_type;
         if result != declared_type
             && (self.ty(result).flags & self.ty(declared_type).flags).intersects(TypeFlags::UNION)
             && self.ty(result).types() == self.ty(declared_type).types()
@@ -609,19 +602,19 @@ impl Checker {
     // PERF: `flow_data` is `flow.get_flow()`, which the caller has read.
     pub fn get_type_at_flow_loop_label(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         flow: FlowNodeId,
         flow_data: &FlowNode,
     ) -> FlowType {
-        if f.borrow().ref_key.is_zero() {
+        if f.ref_key.is_zero() {
             let ref_key = self.get_flow_reference_key(f);
-            f.borrow_mut().ref_key = ref_key;
+            f.ref_key = ref_key;
         }
-        let ref_key = f.borrow().ref_key;
+        let ref_key = f.ref_key;
         if ref_key == *NON_DOTTED_NAME_CACHE_KEY {
             // No cache key is generated when binding patterns are in unnarrowable situations
             return FlowType {
-                t: f.borrow().declared_type,
+                t: f.declared_type,
                 incomplete: false,
             };
         }
@@ -709,10 +702,7 @@ impl Checker {
             // If an antecedent type is not a subset of the declared type, we need to perform
             // subtype reduction. This happens when a "foreign" type is injected into the control
             // flow using the instanceof operator or a user defined type predicate.
-            let (declared_type, initial_type) = {
-                let fs = f.borrow();
-                (fs.declared_type, fs.initial_type)
-            };
+            let (declared_type, initial_type) = (f.declared_type, f.initial_type);
             if !self.is_type_subset_of(flow_type.t, initial_type) {
                 subtype_reduction = true;
             }
@@ -748,10 +738,10 @@ impl Checker {
     // PERF: takes the flow node that the caller has read (`flow.get_flow()`).
     pub fn get_type_at_flow_array_mutation(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         flow_node: &FlowNode,
     ) -> FlowType {
-        let declared_type = f.borrow().declared_type;
+        let declared_type = f.declared_type;
         if declared_type == self.auto_type || declared_type == self.auto_array_type {
             let node = flow_node.node;
             let expr = if is_call_expression(node) {
@@ -759,7 +749,7 @@ impl Checker {
             } else {
                 node.left().expression()
             };
-            let reference = f.borrow().reference;
+            let reference = f.reference;
             let candidate = self.get_reference_candidate(expr);
             if self.is_matching_reference(reference, candidate) {
                 let flow_type = self.get_type_at_flow_node(f, flow_node.antecedent);
@@ -796,14 +786,14 @@ impl Checker {
     // Go: checker/flow.go:1436 getDiscriminantPropertyAccess
     pub fn get_discriminant_property_access(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         expr: Node,
         computed_type: TypeId,
     ) -> Node {
         // As long as the computed type is a subset of the declared type, we use the full declared type to detect
         // a discriminant property. In cases where the computed type isn't a subset, e.g because of a preceding type
         // predicate narrowing, we use the actual computed type.
-        let declared_type = f.borrow().declared_type;
+        let declared_type = f.declared_type;
         if self.ty(declared_type).flags.intersects(TypeFlags::UNION)
             || self.ty(computed_type).flags.intersects(TypeFlags::UNION)
         {
@@ -829,10 +819,10 @@ impl Checker {
     // Go: checker/flow.go:1457 getCandidateDiscriminantPropertyAccess
     pub fn get_candidate_discriminant_property_access(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         expr: Node,
     ) -> Node {
-        let reference = f.borrow().reference;
+        let reference = f.reference;
         if is_binding_pattern(reference)
             || is_function_expression_or_arrow_function(reference)
             || is_object_literal_method(reference)
@@ -1366,16 +1356,13 @@ impl Checker {
     // leftmost identifier followed by zero or more property names separated by dots.
     // The result is nonDottedNameCacheKey if the reference isn't a dotted name.
     // Go: checker/flow.go:1657 getFlowReferenceKey
-    pub fn get_flow_reference_key(&mut self, f: &Rc<RefCell<FlowState>>) -> CacheHashKey {
-        let (reference, declared_type, initial_type, flow_container) = {
-            let fs = f.borrow();
-            (
-                fs.reference,
-                fs.declared_type,
-                fs.initial_type,
-                fs.flow_container,
-            )
-        };
+    pub fn get_flow_reference_key(&mut self, f: &mut FlowState) -> CacheHashKey {
+        let (reference, declared_type, initial_type, flow_container) = (
+            f.reference,
+            f.declared_type,
+            f.initial_type,
+            f.flow_container,
+        );
         let mut b = KeyBuilder::default();
         if self.write_flow_cache_key(
             &mut b,
