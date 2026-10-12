@@ -103,18 +103,18 @@ impl Checker {
         check_mode: CheckMode,
         write_only: bool,
     ) -> TypeId {
-        if !node.parser_flags(NodeFlags::OPTIONAL_CHAIN).is_empty() {
+        // PERF: deferbody1. Go reads `node.Flags`, `node.Expression()` and
+        // `node.Name()` as fields. Here each read was a registry lookup, so
+        // they are read through the node's view (`NodeRef`): one lookup.
+        let view = NodeRef::new(node);
+        if !view.parser_flags(NodeFlags::OPTIONAL_CHAIN).is_empty() {
             return self.check_property_access_chain(node, check_mode);
         }
-        let expr = node.expression();
+        let expr = view.expression();
+        let name = view.name();
         let left_type = self.check_non_null_expression(expr);
         self.check_property_access_expression_or_qualified_name(
-            node,
-            expr,
-            left_type,
-            node.name(),
-            check_mode,
-            write_only,
+            node, expr, left_type, name, check_mode, write_only,
         )
     }
 
@@ -588,12 +588,22 @@ impl Checker {
     }
 
     // Go: checker/checker.go:11703 isMethodAccessForCall
+    // PERF: deferbody1. Go reads `node.Parent` and its `Kind` as fields, up
+    // to four times. Here each read was a registry lookup, so the walk reads
+    // the parent's view (`NodeRef`) and kind once per step.
     pub fn is_method_access_for_call(&mut self, node: Node) -> bool {
         let mut node = node;
-        while is_parenthesized_expression(node.parent()) {
-            node = node.parent();
+        let mut parent = NodeRef::new(node).parent();
+        let mut parent_kind = parent.kind();
+        while parent_kind == SyntaxKind::ParenthesizedExpression {
+            node = parent.node();
+            parent = parent.parent();
+            parent_kind = parent.kind();
         }
-        is_call_or_new_expression(node.parent()) && node.parent().expression() == node
+        matches!(
+            parent_kind,
+            SyntaxKind::CallExpression | SyntaxKind::NewExpression
+        ) && parent.expression() == node
     }
 
     /// Go `binder.GetSymbolNameForPrivateIdentifier` in the checker: the

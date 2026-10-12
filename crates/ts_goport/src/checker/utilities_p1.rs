@@ -117,11 +117,21 @@ pub fn checker_is_empty_object_literal(expression: Node) -> bool {
 // `*ast.Node` alias, so it is `Node`.
 
 // Go: checker/utilities.go:89 getAssignmentTargetKind
+// PERF: deferbody1. Inline with the first step of `get_assignment_target`:
+// most calls end there with no target, with no call. The kind of a target
+// is read out of line.
+#[inline(always)]
 pub fn get_assignment_target_kind(node: Node) -> AssignmentKind {
     let target = get_assignment_target(node);
     if target.is_nil() {
         return AssignmentKind::NONE;
     }
+    assignment_kind_of_target(target)
+}
+
+/// `getAssignmentTargetKind` of a non-nil assignment target.
+#[inline(never)]
+fn assignment_kind_of_target(target: Node) -> AssignmentKind {
     match target.kind() {
         SyntaxKind::BinaryExpression => {
             let binary_operator = target.operator_token().kind();

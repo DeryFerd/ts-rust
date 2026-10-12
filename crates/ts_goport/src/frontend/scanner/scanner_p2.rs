@@ -638,6 +638,9 @@ impl<'a> Scanner<'a> {
     /// `scanner_util::go_value`).
     // PORT: Go uses the slice as is. It holds the same Go bytes.
     fn string_token_value(&self, from: usize, to: usize) -> &'a str {
+        if self.text_has_no_go_string_marker {
+            return self.text_token_value(from, to);
+        }
         match go_value(&self.text[from..to]) {
             Cow::Borrowed(_) => self.text_token_value(from, to),
             Cow::Owned(value) => intern_token_value(&value),

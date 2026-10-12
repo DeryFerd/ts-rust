@@ -97,7 +97,7 @@ pub fn create_unknown_option_error(
     if let Some(alternate_mode) = alternate_mode
         && let Some(options_name_map) = alternate_mode.options_name_map
     {
-        let other_option = options_name_map.get(&unknown_option.to_lowercase());
+        let other_option = options_name_map.get(&super::decls::strings_to_lower(unknown_option));
         if let Some(other_option) = other_option {
             // tscbuildoption
             let mut diagnostic = alternate_mode.diagnostic;

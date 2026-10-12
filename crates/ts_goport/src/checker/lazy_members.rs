@@ -10,9 +10,9 @@
 //! full table (`resolve_lazy_members`) reuses it.
 //!
 //! `GOPORT_LAZY_MEMBERS=1` or fast mode (`crate::fast_mode`) turns it on
-//! (`Checker::lazy_members`). Go has no switch. With the switch off, nothing here runs and the checker does what
-//! it did before. With it on, the output must equal Go at the pin with
-//! #64475 applied.
+//! (`Checker::lazy_members`). Go has no switch. With the switch off,
+//! nothing here runs and the checker does what it did before. With it on,
+//! the output must equal Go at the pin with #64475 applied.
 //!
 //! PERF (lazymem1 round 2): the hooks in the checker test
 //! `MEMBERS_RESOLVED` once, read a resolved type in place and take an
@@ -508,7 +508,7 @@ impl Checker {
         let name = name.into();
         let ty = self.ty(t);
         if ty.object_flags.intersects(ObjectFlags::MEMBERS_RESOLVED) {
-            return self.symbols.get_key(ty.as_structured_type().members, name);
+            return self.symbols.get(ty.as_structured_type().members, name);
         }
         self.get_member_of_unresolved_structured_type(t, name)
     }
@@ -524,7 +524,7 @@ impl Checker {
             Some(lm) if !is_reserved_member_key(name) => lm,
             _ => {
                 let members = self.resolve_structured_type_members(t).members;
-                return self.symbols.get_key(members, name);
+                return self.symbols.get(members, name);
             }
         };
         // The declared member, else the first base type's property (see
@@ -532,7 +532,7 @@ impl Checker {
         let mut result = SymbolId::NIL;
         let source = self.ty(t).target();
         let declared_members = self.resolve_declared_members_lazy(source).declared_members;
-        let decl = self.symbols.get_key(declared_members, name);
+        let decl = self.symbols.get(declared_members, name);
         if decl.is_some() {
             // The table holds the name, so the text is interned and `from`
             // adds nothing.

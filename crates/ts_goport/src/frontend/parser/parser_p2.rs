@@ -1715,8 +1715,18 @@ impl<'a> Parser<'a> {
         let mut property_name = Node::NIL;
         let mut can_parse_as_keyword = true;
         let disallow_keywords = kind == SyntaxKind::ImportSpecifier;
+        // PERF: parsefast2. Go tests `name.Kind == KindIdentifier &&
+        // name.Text() == "type"`; both reads are store accesses here. The
+        // name is that identifier exactly when it is made from a `type`
+        // token (the token value is the text, and its keyword is the
+        // token), so the token decides with no read.
+        let name_is_type = self.token == SyntaxKind::TypeKeyword;
         let (mut name, mut name_ok) = self.parse_module_export_name(disallow_keywords);
-        if name.kind() == SyntaxKind::Identifier && name.text() == "type" {
+        debug_assert_eq!(
+            name_is_type,
+            name.kind() == SyntaxKind::Identifier && name.text() == "type"
+        );
+        if name_is_type {
             // If the first token of an import specifier is 'type', there are a lot of possibilities,
             // especially if we see 'as' afterwards:
             //

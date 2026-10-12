@@ -573,7 +573,12 @@ impl FilesParser {
         self.run_queue(loader, Some(&mut pool));
         // Closes the queue, then waits for the workers.
         drop(prefetch);
+        let shared = Arc::clone(&pool.shared);
         drop(pool);
+        // PERF: the workers' state (the resolution cache, the jobs) is freed
+        // beside the rest of the load, as Go's GC frees it; this thread has
+        // the last reference now. Not in Go.
+        crate::execute::build::build_task::drop_in_background(shared);
     }
 
     /// Go `parse` without the workers: queue the root tasks and run the

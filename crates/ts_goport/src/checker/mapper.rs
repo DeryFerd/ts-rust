@@ -281,6 +281,10 @@ impl Checker {
 
     // Go: checker/mapper.go:27 (*TypeMapper).Map
     // Dispatches to the Go `Map` method of each mapper kind.
+    // PERF (instfast1): the simple and array mappers (about 60% of the calls
+    // on T3 server) map here. Each other kind is a tail call with the
+    // mapper's fields, so this function saves no registers and no kind
+    // reads its mapper twice.
     pub fn mapper_map(&mut self, m: MapperId, t: TypeId) -> TypeId {
         match self.mapper(m) {
             // Go: checker/mapper.go:88 (*TypeMapperBase).Map
@@ -308,6 +312,26 @@ impl Checker {
                 }
                 t
             }
+            TypeMapper::Deferred(_) | TypeMapper::Function(_) => self.callback_mapper_map(m, t),
+            TypeMapper::Merged(d) => {
+                let (m1, m2) = (d.m1, d.m2);
+                self.merged_mapper_map(m1, m2, t)
+            }
+            TypeMapper::Composite(d) => {
+                let (m1, m2) = (d.m1, d.m2);
+                self.composite_mapper_map(m1, m2, t)
+            }
+            TypeMapper::Inference(d) => {
+                let (n, fixing) = (d.n, d.fixing);
+                self.inference_type_mapper_map(n, fixing, t)
+            }
+        }
+    }
+
+    /// `mapper_map` of a deferred or function mapper.
+    #[inline(never)]
+    fn callback_mapper_map(&mut self, m: MapperId, t: TypeId) -> TypeId {
+        match self.mapper(m) {
             // Go: checker/mapper.go:193 (*DeferredTypeMapper).Map
             TypeMapper::Deferred(d) => {
                 let mut target: Option<DeferredTypeFn> = None;
@@ -327,27 +351,25 @@ impl Checker {
                 let f = d.fn_.clone();
                 f(self, t)
             }
-            // Go: checker/mapper.go:239 (*MergedTypeMapper).Map
-            TypeMapper::Merged(d) => {
-                let (m1, m2) = (d.m1, d.m2);
-                let t1 = self.mapper_map(m1, t);
-                self.mapper_map(m2, t1)
-            }
-            // Go: checker/mapper.go:265 (*CompositeTypeMapper).Map
-            TypeMapper::Composite(d) => {
-                let (m1, m2) = (d.m1, d.m2);
-                let t1 = self.mapper_map(m1, t);
-                if t1 != t {
-                    return self.instantiate_type(t1, m2);
-                }
-                self.mapper_map(m2, t)
-            }
-            // Go: checker/mapper.go:293 (*InferenceTypeMapper).Map
-            TypeMapper::Inference(d) => {
-                let (n, fixing) = (d.n, d.fixing);
-                self.inference_type_mapper_map(n, fixing, t)
-            }
+            _ => unreachable!("callback_mapper_map of another mapper kind"),
         }
+    }
+
+    // Go: checker/mapper.go:239 (*MergedTypeMapper).Map
+    #[inline(never)]
+    fn merged_mapper_map(&mut self, m1: MapperId, m2: MapperId, t: TypeId) -> TypeId {
+        let t1 = self.mapper_map(m1, t);
+        self.mapper_map(m2, t1)
+    }
+
+    // Go: checker/mapper.go:265 (*CompositeTypeMapper).Map
+    #[inline(never)]
+    fn composite_mapper_map(&mut self, m1: MapperId, m2: MapperId, t: TypeId) -> TypeId {
+        let t1 = self.mapper_map(m1, t);
+        if t1 != t {
+            return self.instantiate_type(t1, m2);
+        }
+        self.mapper_map(m2, t)
     }
 
     // Go: checker/mapper.go:28 (*TypeMapper).Kind
@@ -555,6 +577,8 @@ impl Checker {
     }
 
     // Go: checker/mapper.go:293 (*InferenceTypeMapper).Map
+    // PERF: out of line, so `mapper_map` makes only tail calls.
+    #[inline(never)]
     fn inference_type_mapper_map(
         &mut self,
         n: InferenceContextId,

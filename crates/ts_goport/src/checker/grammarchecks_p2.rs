@@ -140,7 +140,10 @@ impl Checker {
         // is empty for a nil list.
         let properties = node.properties();
         for prop in properties {
-            if prop.kind() == SyntaxKind::SpreadAssignment {
+            // PERF: deferbody1. Go reads `prop.Kind` as a field in each test;
+            // here it is read once.
+            let prop_kind = prop.kind();
+            if prop_kind == SyntaxKind::SpreadAssignment {
                 let spread_expression = prop.expression();
                 if in_destructuring {
                     // a rest property cannot be destructured any further
@@ -163,7 +166,7 @@ impl Checker {
                 self.check_grammar_computed_property_name(name);
             }
 
-            if prop.kind() == SyntaxKind::ShorthandPropertyAssignment && !in_destructuring {
+            if prop_kind == SyntaxKind::ShorthandPropertyAssignment && !in_destructuring {
                 let object_assignment_initializer = prop.object_assignment_initializer();
                 if object_assignment_initializer.is_some() {
                     // having objectAssignmentInitializer is only valid in an ObjectAssignmentPattern.
@@ -197,13 +200,21 @@ impl Checker {
             }
 
             // Modifiers are never allowed on properties except for 'async' on a method declaration
-            let modifiers = prop.modifier_nodes();
+            // PERF: deferbody1. A published store node with no modifier bits
+            // has no modifier list (as in `check_grammar_modifiers`), so its
+            // node data is not read for the list.
+            let modifiers = if frozen_store_modifier_flags(prop) == Some(ModifierFlags::NONE) {
+                debug_assert!(prop.modifiers().is_nil(), "modifier bits without a list");
+                NodeSlice::default()
+            } else {
+                prop.modifier_nodes()
+            };
             if modifiers.len() != 0 {
                 if can_have_modifiers(prop) {
                     for m in modifiers.iter() {
                         if is_modifier(m)
                             && (m.kind() != SyntaxKind::AsyncKeyword
-                                || prop.kind() != SyntaxKind::MethodDeclaration)
+                                || prop_kind != SyntaxKind::MethodDeclaration)
                         {
                             self.grammar_error_on_node(
                                 m,
@@ -234,7 +245,7 @@ impl Checker {
             //    d.IsAccessorDescriptor(previous) is true and IsAccessorDescriptor(propId.descriptor) is true
             // and either both previous and propId.descriptor have[[Get]] fields or both previous and propId.descriptor have[[Set]] fields
             let current_kind: DeclarationMeaning;
-            match prop.kind() {
+            match prop_kind {
                 SyntaxKind::ShorthandPropertyAssignment | SyntaxKind::PropertyAssignment => {
                     // PORT: Go reads `NamedMemberBase.PostfixToken` from the concrete
                     // node; `postfix_token()` (Go `Node.PostfixToken()`) reads the same

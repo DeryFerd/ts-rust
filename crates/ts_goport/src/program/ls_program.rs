@@ -1022,6 +1022,15 @@ fn get_import_adjacency(program: &NewProgram) -> Vec<Vec<usize>> {
         .enumerate()
         .map(|(i, file)| (file.store, i))
         .collect();
+    // PERF: the file index of each path of `files_by_path`, made once. An
+    // import whose path is there needs one lookup, with no copy of the file
+    // (Go looks up the file by path, then its index). Other imports take
+    // Go's way (`GetSourceFileForResolvedModule`).
+    let index_by_path: FxHashMap<&tspath::Path, Option<usize>> = program
+        .files_by_path()
+        .iter()
+        .map(|(path, file)| (path, file_indices.get(&file.store).copied()))
+        .collect();
     let mut adjacent_files: Vec<Vec<usize>> = vec![Vec::new(); files.len()];
     for (file_index, file) in files.iter().enumerate() {
         let Some(resolved_modules) = program.processed_files.resolved_modules.get(file.path())
@@ -1032,9 +1041,12 @@ fn get_import_adjacency(program: &NewProgram) -> Vec<Vec<usize>> {
             if !resolved.is_resolved() {
                 continue;
             }
-            let imported_index = program
-                .get_source_file_for_resolved_module(resolved)
-                .and_then(|imported_file| file_indices.get(&imported_file.store).copied());
+            let imported_index = match resolved.path().and_then(|path| index_by_path.get(path)) {
+                Some(&imported_index) => imported_index,
+                None => program
+                    .get_source_file_for_resolved_module(resolved)
+                    .and_then(|imported_file| file_indices.get(&imported_file.store).copied()),
+            };
             let Some(imported_index) = imported_index else {
                 continue;
             };

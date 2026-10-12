@@ -567,6 +567,12 @@ pub struct Scanner<'a> {
     pub(crate) hex_digit_cache: FxHashMap<Box<str>, &'static str>,
 
     pub(crate) comment_directives: Vec<CommentDirective>,
+
+    /// True when the caller of `set_text` found no `GO_STRING_MARKER` in
+    /// the text (`set_text_has_no_go_string_marker`). Every slice of such a
+    /// text is its own value form, so a string token value needs no
+    /// `go_value` scan. `set_text` makes it false.
+    pub(crate) text_has_no_go_string_marker: bool,
 }
 
 // Go: scanner/scanner.go:225 defaultScanner
@@ -586,6 +592,7 @@ pub(crate) fn default_scanner<'a>() -> Scanner<'a> {
         hex_number_cache: FxHashMap::default(),
         hex_digit_cache: FxHashMap::default(),
         comment_directives: Vec::new(),
+        text_has_no_go_string_marker: false,
     }
 }
 
@@ -831,6 +838,17 @@ impl<'a> Scanner<'a> {
         self.text = text;
         self.end = self.text.len() as i32;
         self.scanner_state = ScannerState::default();
+        self.text_has_no_go_string_marker = false;
+    }
+
+    /// Tells the scanner that the text of the last `set_text` holds no
+    /// `GO_STRING_MARKER` (`contains_go_string_marker`), so its string
+    /// token values are slices of the text with no `go_value` scan.
+    // PERF: parsefast2. Go uses the slice as is. The parser checks its
+    // whole text once; other scanners keep the scan of each value.
+    pub fn set_text_has_no_go_string_marker(&mut self, value: bool) {
+        debug_assert!(!value || !crate::scanner_util::contains_go_string_marker(self.text));
+        self.text_has_no_go_string_marker = value;
     }
 
     // Go: scanner/scanner.go:402 SetOnError
