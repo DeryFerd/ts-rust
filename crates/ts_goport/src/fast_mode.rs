@@ -22,9 +22,10 @@
 //! in fast mode, and `=1` turns the first two on without it.
 //!
 //! Fast mode is deterministic: each file goes to the checker of Go's split
-//! for the chosen count, so the output is the same on every run and equals
-//! Go's `--checkers N` for that N, except where lazy members or the never
-//! order change the work. `GOPORT_FAST_STEAL=1` opts in to a work-stealing
+//! for the chosen count (or of the cost split with `GOPORT_FAST_SPLIT=cost`,
+//! which can differ from Go's output), so the output is the same on every run
+//! and, with Go's split, equals Go's `--checkers N` for that N, except where
+//! lazy members or the never order change the work. `GOPORT_FAST_STEAL=1` opts in to a work-stealing
 //! check pass (`steal`), which is faster on some projects but not
 //! deterministic.
 //!
