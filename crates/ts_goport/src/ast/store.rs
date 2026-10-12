@@ -98,30 +98,6 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-/// A map keyed by a `Name::text_hash` value, which is already a hash: the
-/// key is the map hash as is (`TextHashKey`). No code iterates it.
-type TextHashMap<V> = std::collections::HashMap<u64, V, std::hash::BuildHasherDefault<TextHashKey>>;
-
-/// The hasher of `TextHashMap`: the `u64` key is the hash.
-#[derive(Default)]
-struct TextHashKey(u64);
-
-impl std::hash::Hasher for TextHashKey {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    fn write_u64(&mut self, hash: u64) {
-        self.0 = hash;
-    }
-
-    fn write(&mut self, _: &[u8]) {
-        unreachable!("TextHashKey takes only u64 keys");
-    }
-}
-
 /// Slot 0: Go `nil` stored in a astdata field that has no `Option`.
 const NIL_SLOT: u32 = 0;
 
@@ -274,6 +250,13 @@ struct FileStore {
     /// What `make_facts` needs from the slots, kept as they are made and
     /// written (`BuildFacts`).
     build_facts: BuildFacts,
+    /// The identifier name cache of the parsing thread (`identifier_name`)
+    /// while the parse runs: the store takes it from the thread
+    /// (`IDENTIFIER_NAMES`) when it is made or on its first name, and
+    /// `end_parse` gives it back.
+    // PERF: identparse1. A name slot reads the cache with no thread-local
+    // access and no `RefCell` borrow.
+    idents: Option<Box<IdentNames>>,
 }
 
 /// storefast1: the parts of `StoreFacts` and `BindCounts` that the slots of
@@ -2263,11 +2246,17 @@ impl FileStore {
     // PERF: storefast1. The kind test is inline, so the other two thirds of
     // the slots make no call.
     #[inline]
-    fn slot_text_name(kind: SyntaxKind, data: NodeData<'_>, text: Option<&str>) -> (Name, bool) {
+    fn slot_text_name(
+        &mut self,
+        kind: SyntaxKind,
+        data: NodeData<'_>,
+        text: Option<&str>,
+    ) -> (Name, bool) {
         if !is_name_kind(kind) {
             return (Name::default(), false);
         }
-        identifier_name(text.unwrap_or_else(|| identifier_text(data)))
+        let idents = self.idents.get_or_insert_with(take_thread_idents);
+        identifier_name(idents, text.unwrap_or_else(|| identifier_text(data)))
     }
 
     /// The record, kind, kids and link vectors have one entry per slot.
@@ -2375,61 +2364,267 @@ impl FileStore {
 
 /// The process-wide intern of identifier text `text` (`Name::from`) and Go
 /// `scanner.GetIdentifierToken(text) != KindIdentifier`, through the
-/// thread's cache (`IDENTIFIER_NAMES`).
+/// parsing thread's cache `names` (`FileStore::idents`).
 // Port only: Go stopped interning parser texts (`internIdentifier`) in
 // tsgo#4731.
-// PERF: one text hash per identifier node (parsefast1 item 1). storefast1:
-// the cache lives for the thread, not for one file, so the process-wide
-// intern (a shard `Mutex`) and the keyword lookup run once per distinct
-// text of the thread, not of each file. A text the cache has is interned
-// already, so the cache does not change which call interns a text first:
-// name ids and their order stay as without it.
+// PERF: storefast1: the cache lives for the thread, not for one file, so
+// the process-wide intern (a shard `Mutex`) and the keyword lookup run once
+// per distinct text of the thread, not of each file. identparse1: a hit
+// reads the text bytes (`IdentKey`) and one set of a table that keeps the
+// recent texts (`IdentNames`), with no text hash and no full clear (VS Code
+// parse: 0.42 M to 0.33 M interns for 6.6 M identifiers). Only a miss
+// hashes the text and interns it. A text the cache has is interned already,
+// so the cache does not change which call interns a text first: name ids
+// and their order stay as without it.
 #[inline(never)]
-fn identifier_name(text: &str) -> (Name, bool) {
-    let hash = Name::text_hash(text);
-    // Without the cache: a text whose hash the cache has for another text,
-    // or a call after the thread-local destructors ran (`try_with` fails,
-    // as in `Name::intern_hashed`).
-    let uncached = || {
-        (
-            Name::intern_hashed(text, hash).0,
-            get_identifier_token(text) != SyntaxKind::Identifier,
-        )
-    };
-    IDENTIFIER_NAMES
-        .try_with(|names| {
-            let mut names = names.borrow_mut();
-            if let Some((stored, name, text_is_keyword)) = names.get(&hash) {
-                if *stored == text {
-                    return (name.clone(), *text_is_keyword);
-                }
-                // Another text has the same 64-bit hash: no entry for this one.
-                return uncached();
-            }
-            let (name, stored) = Name::intern_hashed(text, hash);
-            let text_is_keyword = get_identifier_token(text) != SyntaxKind::Identifier;
-            if names.len() >= IDENTIFIER_NAMES_CAP {
-                names.clear();
-            }
-            names.insert(hash, (stored, name.clone(), text_is_keyword));
-            (name, text_is_keyword)
-        })
-        .unwrap_or_else(|_| uncached())
+fn identifier_name(names: &mut IdentNames, text: &str) -> (Name, bool) {
+    // `Name::from("")` is `Name::default()`, and "" is no keyword. Only a
+    // missing identifier has no text.
+    if text.is_empty() {
+        return (Name::default(), false);
+    }
+    let key = IdentKey::new(text.as_bytes());
+    if let Some(found) = names.find(key, text) {
+        return found;
+    }
+    let found = intern_identifier(text);
+    names.insert(key, found.0.id(), found.1);
+    found
 }
 
-/// The most texts `IDENTIFIER_NAMES` keeps; a full cache starts again.
-/// About 2.06 MiB per parsing thread on 64-bit: past 28,672 entries the map
-/// has 65,536 buckets of 33 bytes (a `u64` key, a 24-byte value and a
-/// control byte), and `clear` keeps them. So a language server that parses
-/// for days keeps a bounded cache.
-const IDENTIFIER_NAMES_CAP: usize = 1 << 15;
+/// `identifier_name` of a text that is not in the thread's cache.
+#[cold]
+#[inline(never)]
+fn intern_identifier(text: &str) -> (Name, bool) {
+    let (name, _) = Name::intern_hashed(text, Name::text_hash(text));
+    (name, get_identifier_token(text) != SyntaxKind::Identifier)
+}
+
+/// An identifier text as `IdentNames` compares it: its length and up to 24
+/// of its bytes. A text of 16 or more bytes keeps its first 16 bytes in `a`
+/// and `c` and its last 8 in `b`, a text of 8 to 15 bytes its first and its
+/// last 8 in `a` and `b` (the parts overlap when the text is shorter than
+/// their sum), a text of 4 to 7 bytes its first and its last 4 in `a`, and a
+/// shorter one its first, middle and last byte in `a`. So two texts of at
+/// most 24 bytes are equal when their keys are. For a longer text a match
+/// also compares the whole text.
+#[derive(Clone, Copy)]
+struct IdentKey {
+    a: u64,
+    b: u64,
+    c: u64,
+    len: u32,
+}
+
+impl IdentKey {
+    /// The longest text whose key is the whole text.
+    const WHOLE: u32 = 24;
+
+    #[inline]
+    fn new(t: &[u8]) -> Self {
+        let n = t.len();
+        let (a, b, c) = if n >= 8 {
+            let c = if n >= 16 { le_u64(&t[8..16]) } else { 0 };
+            (le_u64(&t[..8]), le_u64(&t[n - 8..]), c)
+        } else if n >= 4 {
+            (le_u32(&t[..4]) | le_u32(&t[n - 4..]) << 32, 0, 0)
+        } else if n > 0 {
+            let a = u64::from(t[0]) | u64::from(t[n / 2]) << 8 | u64::from(t[n - 1]) << 16;
+            (a, 0, 0)
+        } else {
+            (0, 0, 0)
+        };
+        Self {
+            a,
+            b,
+            c,
+            len: u32::try_from(n).expect("identifier length"),
+        }
+    }
+
+    /// The hash whose top bits pick the `IdentNames` set.
+    #[inline]
+    fn set_hash(self) -> u64 {
+        (self.a ^ self.b.rotate_left(21) ^ self.c.rotate_left(42) ^ u64::from(self.len) << 56)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+}
+
+/// The 8 bytes `b` as a little-endian number.
+#[inline]
+fn le_u64(b: &[u8]) -> u64 {
+    u64::from_le_bytes(b.try_into().expect("8 bytes"))
+}
+
+/// The 4 bytes `b` as a little-endian number.
+#[inline]
+fn le_u32(b: &[u8]) -> u64 {
+    u64::from(u32::from_le_bytes(b.try_into().expect("4 bytes")))
+}
+
+/// One `IdentNames` entry (32 bytes): the key of a text, its `Name::id` (0
+/// marks an empty entry: only "" has id 0) and its keyword bit
+/// (`IDENT_KEYWORD`, in `len_keyword` with the text length).
+#[derive(Clone, Copy, Default)]
+struct IdentEntry {
+    a: u64,
+    b: u64,
+    c: u64,
+    len_keyword: u32,
+    id: u32,
+}
+
+/// The keyword bit of `IdentEntry::len_keyword`.
+const IDENT_KEYWORD: u32 = 1 << 31;
+
+impl IdentEntry {
+    /// True when this entry holds the text `text`, whose key is `key`.
+    #[inline]
+    fn holds(&self, key: IdentKey, text: &str) -> bool {
+        self.a == key.a
+            && self.b == key.b
+            && self.c == key.c
+            && self.len_keyword & !IDENT_KEYWORD == key.len
+            && (key.len <= IdentKey::WHOLE || Name::from_id(self.id).as_str() == text)
+    }
+
+    #[inline]
+    fn value(&self) -> (Name, bool) {
+        (
+            Name::from_id(self.id),
+            self.len_keyword & IDENT_KEYWORD != 0,
+        )
+    }
+
+    fn key(&self) -> IdentKey {
+        IdentKey {
+            a: self.a,
+            b: self.b,
+            c: self.c,
+            len: self.len_keyword & !IDENT_KEYWORD,
+        }
+    }
+}
+
+/// One `IdentNames` set: 2 entries, one cache line, the first entry the
+/// most recently used.
+#[derive(Clone, Copy, Default)]
+#[repr(align(64))]
+struct IdentSet([IdentEntry; 2]);
+
+/// `identifier_name`'s cache: a 2-way set-associative table of identifier
+/// texts. It starts at `IDENT_FIRST_SETS` sets and doubles each time it has
+/// taken as many texts as it has entries, up to `IDENT_MAX_SETS` (2 MiB, 64K
+/// texts). A text that comes into a full set drops the less recently used
+/// entry, so a language server that parses for days keeps a bounded table.
+/// The default table is empty: it finds nothing, and its first insert
+/// makes the sets.
+#[derive(Default)]
+struct IdentNames {
+    sets: Vec<IdentSet>,
+    /// `64 - log2(sets.len())`: `set_hash >> shift` is the set index (0,
+    /// and no set, before the first insert).
+    shift: u32,
+    /// Texts put in since the table last grew.
+    inserts: usize,
+}
+
+/// `IdentNames` sets of a new table (32 KiB).
+const IDENT_FIRST_SETS: usize = 1 << 9;
+/// The most `IdentNames` sets: 2 MiB per parsing thread on 64-bit (32,768
+/// sets of 64 bytes, two 32-byte entries each, so 65,536 texts). A full
+/// table does not grow or clear: a new text drops an entry of its set.
+const IDENT_MAX_SETS: usize = 1 << 15;
+
+impl IdentNames {
+    /// The name and keyword bit of `text` (key `key`) when the table has it.
+    #[inline]
+    fn find(&mut self, key: IdentKey, text: &str) -> Option<(Name, bool)> {
+        let set = self.sets.get_mut((key.set_hash() >> self.shift) as usize)?;
+        let [first, second] = &mut set.0;
+        if first.holds(key, text) {
+            return Some(first.value());
+        }
+        if second.holds(key, text) {
+            std::mem::swap(first, second);
+            return Some(first.value());
+        }
+        None
+    }
+
+    /// Puts the text of key `key` in, with name id `id` and keyword bit
+    /// `keyword`, as the most recently used entry of its set.
+    fn insert(&mut self, key: IdentKey, id: u32, keyword: bool) {
+        if id == 0 {
+            return;
+        }
+        if self.inserts >= 2 * self.sets.len() && self.sets.len() < IDENT_MAX_SETS {
+            self.grow();
+        }
+        self.inserts += 1;
+        let entry = IdentEntry {
+            a: key.a,
+            b: key.b,
+            c: key.c,
+            len_keyword: key.len | if keyword { IDENT_KEYWORD } else { 0 },
+            id,
+        };
+        let set = &mut self.sets[(key.set_hash() >> self.shift) as usize].0;
+        set[1] = set[0];
+        set[0] = entry;
+    }
+
+    /// Doubles the sets (the first table: `IDENT_FIRST_SETS`) and puts the
+    /// entries back, the less recently used first.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let len = (2 * self.sets.len()).max(IDENT_FIRST_SETS);
+        let old = std::mem::replace(&mut self.sets, vec![IdentSet::default(); len]);
+        self.shift = 64 - len.trailing_zeros();
+        self.inserts = 0;
+        for way in [1, 0] {
+            for set in &old {
+                let entry = set.0[way];
+                if entry.id != 0 {
+                    let new = &mut self.sets[(entry.key().set_hash() >> self.shift) as usize].0;
+                    new[1] = new[0];
+                    new[0] = entry;
+                }
+            }
+        }
+    }
+}
 
 thread_local! {
-    /// `identifier_name`: the interned text, name and keyword bit of each
-    /// identifier text this thread has interned lately, keyed by the
-    /// `Name::text_hash` of the text.
-    static IDENTIFIER_NAMES: RefCell<TextHashMap<(&'static str, Name, bool)>> =
-        RefCell::new(TextHashMap::default());
+    /// The `identifier_name` cache of this thread while no store of the
+    /// thread holds it (`FileStore::idents`).
+    static IDENTIFIER_NAMES: Cell<Option<Box<IdentNames>>> = const { Cell::new(None) };
+}
+
+/// The identifier name cache of this thread, for a store that parses (an
+/// empty one when another store of the thread has it, or after the
+/// thread-local destructors ran: `try_with` fails, as in
+/// `Name::intern_hashed`, where `LocalKey::take` would panic).
+fn take_thread_idents() -> Box<IdentNames> {
+    IDENTIFIER_NAMES
+        .try_with(Cell::take)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Gives the identifier name cache `idents` of a store whose parse ended
+/// back to this thread. When the thread has one already (two stores of the
+/// thread parsed at once), the larger stays.
+fn give_back_thread_idents(idents: Box<IdentNames>) {
+    let _ = IDENTIFIER_NAMES.try_with(|spare| {
+        let keep = match spare.take() {
+            Some(other) if other.sets.len() > idents.sets.len() => other,
+            _ => idents,
+        };
+        spare.set(Some(keep));
+    });
 }
 
 /// `FileStore::unlink_children` on the link column `links`.
@@ -4182,6 +4377,9 @@ impl FileStore {
     /// Marks the store finished and marks its source file roots.
     fn end_parse(&mut self) {
         self.frozen = true;
+        if let Some(idents) = self.idents.take() {
+            give_back_thread_idents(idents);
+        }
         self.records.shrink_to_fit();
         self.kinds.shrink_to_fit();
         self.kids.shrink_to_fit();
@@ -6546,7 +6744,7 @@ pub fn replace_store_node_data(n: Node, data: BoxedData) {
         let modifier_bits =
             super::node::store_node_modifier_bits(kind, view, |m| s.modifier_list_bits(owned, m));
         if !keeps_name {
-            let (name, text_is_keyword) = FileStore::slot_text_name(kind, view, None);
+            let (name, text_is_keyword) = s.slot_text_name(kind, view, None);
             s.records[index].set_bit(NodeRecord::TEXT_IS_KEYWORD, text_is_keyword);
             s.kids[index].set_word(NodeKids::word_of(kind, &name, modifier_bits));
         }
@@ -6727,7 +6925,9 @@ pub(crate) fn reset_file_store(file: usize) {
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot reset a finished store");
         let owns_nodes = s.owned.is_some();
+        let idents = s.idents.take();
         *s = FileStore::new(s.file_name, s.text.clone());
+        s.idents = idents;
         if owns_nodes {
             s.owned = Some(Box::new(OwnedAst::new(s.records.capacity())));
         }
@@ -7067,7 +7267,7 @@ fn alloc_store_slot_node(
         let modifier_bits = s.static_modifier_bits(modifiers);
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.records.len() as u32;
-        let (name, text_is_keyword) = FileStore::slot_text_name(kind, node, text);
+        let (name, text_is_keyword) = s.slot_text_name(kind, node, text);
         s.push_node_header(kind, text_is_keyword);
         s.nodes.push(Some(node));
         s.push_no_cell();
@@ -7126,7 +7326,7 @@ fn alloc_store_owned_slot(
         });
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.records.len() as u32;
-        let (name, text_is_keyword) = FileStore::slot_text_name(kind, node.view(), text);
+        let (name, text_is_keyword) = s.slot_text_name(kind, node.view(), text);
         s.push_node_header(kind, text_is_keyword);
         let owned = s.owned_mut();
         let cell = owned.push(node);
@@ -8965,5 +9165,41 @@ mod tests {
         );
         let (_again, again) = column(1);
         assert_eq!(again, first, "equal kinds share the first column");
+    }
+
+    /// identparse1: `identifier_name` gives the name and keyword bit of the
+    /// intern for texts of each key form (up to 3, 4 to 7, 8 to 15, 16 to 24
+    /// and more bytes), for long texts whose keys are equal, and after the cache grew
+    /// and dropped entries.
+    #[test]
+    fn identifier_name_cache_gives_the_interned_name() {
+        let mut names = IdentNames::default();
+        let mut check = |text: &str| {
+            let (name, keyword) = identifier_name(&mut names, text);
+            assert_eq!(name, Name::from(text), "{text:?}");
+            assert_eq!(name.as_str(), text);
+            assert_eq!(
+                keyword,
+                get_identifier_token(text) != SyntaxKind::Identifier,
+                "{text:?}"
+            );
+        };
+        let mut texts: Vec<String> = ["", "a", "ab", "abc", "acb", "if", "await", "instanceof"]
+            .map(String::from)
+            .to_vec();
+        for len in 1..=40 {
+            for fill in ['x', 'y'] {
+                let mut text: Vec<char> = std::iter::repeat_n('m', len).collect();
+                text[len / 2] = fill;
+                texts.push(text.into_iter().collect());
+            }
+        }
+        // More texts than the largest table has entries, so sets drop some.
+        texts.extend((0..3 * 2 * IDENT_MAX_SETS).map(|i| format!("identparse1_{i}")));
+        for _ in 0..2 {
+            for text in &texts {
+                check(text);
+            }
+        }
     }
 }
