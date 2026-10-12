@@ -1928,8 +1928,10 @@ enum PrefetchRequest {
 struct PrefetchQueue {
     /// Jobs no worker has taken yet. Workers take the newest first, like
     /// the loader's queue, but take `lib.dom.d.ts` before all others. A job
-    /// can be in the list twice (`rank_largest`, `queue_batch`); a worker
-    /// skips a job that is no longer queued.
+    /// that moves up is pushed again, so it can be in the list more than
+    /// once (`rank_largest`, `queue_batch`, and the move-up of a worker's
+    /// `PrefetchShared::queue`); a worker skips a job that is no longer
+    /// queued.
     pending: Vec<Arc<PrefetchJob>>,
     /// The content-mapped jobs no worker has taken yet, newest first too.
     /// The workers of `PrefetchPool::add_mapped_workers` take only these;
@@ -2269,8 +2271,11 @@ struct PrefetchShared {
     config: PrefetchConfig,
     /// The stat cache of the workers' file systems (`WorkerFs`).
     stats: Arc<SharedStatCache>,
-    /// Set when the loader takes the workers (`FilesParser::parse`). Until
-    /// then, and with `None` inside, the workers do not resolve.
+    /// Set when the loader takes the workers (`FilesParser::parse`), or
+    /// before the loader exists by an early pool with root jobs
+    /// (`start_default_lib_prefetch`), which the loader takes only with an
+    /// equal config (`early_shared_resolution`, `FilesParser::parse`).
+    /// Until it is set, and with `None` inside, the workers do not resolve.
     resolve: OnceLock<Option<WorkerResolveConfig>>,
     /// Debug counts of `take_prefetched`, kept when `GOPORT_PREFETCH_STATS`
     /// is set and printed to stderr when the pool stops.
