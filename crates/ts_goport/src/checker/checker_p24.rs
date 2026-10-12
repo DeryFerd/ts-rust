@@ -1946,16 +1946,18 @@ impl Checker {
         m: MapperId,
         alias: Option<Rc<TypeAlias>>,
     ) -> TypeId {
-        self.instantiate_type_with_alias_impl(t, m, alias)
+        self.instantiate_type_with_alias_impl(t, m, alias.as_ref())
     }
 
     /// The body of `instantiate_type` and `instantiate_type_with_alias`.
+    /// The alias is borrowed (a plain pointer, so the no-alias copy folds
+    /// it away), and the worker gets its own `Rc`.
     #[inline(always)]
     fn instantiate_type_with_alias_impl(
         &mut self,
         t: TypeId,
         m: MapperId,
-        alias: Option<Rc<TypeAlias>>,
+        alias: Option<&Rc<TypeAlias>>,
     ) -> TypeId {
         // Check for type variables in the alias, so things like `type Brand<T> = number & {}` can potentially be copied with new alias type args, despite them being unreferenced.
         // This is the behavior most people using aliases expect, and prevents the cache from leaking type parameters outside their scope of validity.
@@ -1990,7 +1992,7 @@ impl Checker {
         // (`ActiveMapperCache`). `None` here means that key. A key with an
         // alias is made in Go's place even when no lookup follows: it gives
         // the alias symbol its id (`get_symbol_id`).
-        let alias_key = alias.as_deref().map(|alias| {
+        let alias_key = alias.map(|alias| {
             let mut b = KeyBuilder::default();
             b.write_type(t);
             b.write_alias(&self.symbols, Some(alias));
@@ -2024,10 +2026,9 @@ impl Checker {
         // server) is the first case of `instantiate_type_worker`, done here
         // without its frame. The alias is not used there either.
         let result = if is_type_parameter {
-            drop(alias);
             self.get_mapped_type(t, m)
         } else {
-            self.instantiate_type_worker(t, m, alias)
+            self.instantiate_type_worker(t, m, alias.cloned())
         };
         match cache_key {
             None => self.pop_active_mapper(),
