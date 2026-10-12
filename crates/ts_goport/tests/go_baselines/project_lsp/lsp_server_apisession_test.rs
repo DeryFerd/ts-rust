@@ -116,7 +116,7 @@ fn init_api_session(client: &LspClient) -> PathBuf {
 }
 
 /// How long a read of the API pipe waits for the server.
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
+const READ_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[cfg(unix)]
 type ApiReader = ApiStream;
@@ -241,7 +241,7 @@ fn shutdown_and_exit(client: &LspClient) {
         .message(),
     );
     assert!(
-        client.wait_server_end(Duration::from_secs(60)),
+        client.wait_server_end(Duration::from_mins(1)),
         "the server did not stop after exit"
     );
 }

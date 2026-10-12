@@ -3,7 +3,7 @@
 #
 # usage: scripts/goport/build-goport-tests.sh <checkout> <testbin-dir>
 #
-# Builds like the candidate release bins (candidate.sh side): the default toolchain (TS_CARGO_NIGHTLY=0),
+# Builds like the candidate release bins (candidate.sh side): the shipped toolchain 1.95.0 (TS_CARGO_NIGHTLY=0),
 # no incremental cache, --release --locked, in the shared candidate target runtime/cargo-target (only for
 # the checker-port checkout; any other checkout builds in <checkout>/target/goport-tests) under the lock
 # /tmp/ts-rust-candidate-target.lock. The test binaries: the lib tests and every [[test]]
@@ -29,6 +29,12 @@
 # (crates/ts_goport/CANDIDATE.md excepted), and those must not change during the build (other commits
 # in the checkout are fine). Last stdout line: DONE or FAIL rc=<N>.
 set -uo pipefail
+
+# Evidence builds (release bins, test bins, the evidence key and the quality step's rustfmt and
+# clippy) use the shipped toolchain of build-release.sh and release.yml, not the host default. On
+# alvin, 1.93.0 took about twice as long and gave the same output (scripts/goport/README.md,
+# "Build toolchain"). Install it with: rustup toolchain install 1.95.0 --profile minimal -c rustfmt,clippy
+export RUSTUP_TOOLCHAIN=1.95.0
 
 # One brace group: bash reads the whole script before it runs it, so an edit of this file does not
 # change a running build.

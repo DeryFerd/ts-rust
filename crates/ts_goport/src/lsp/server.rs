@@ -1500,7 +1500,7 @@ impl project::Client for Server {
     // IsActive implements project.Client.
     fn is_active(&self) -> bool {
         let last = self.shared.last_request_time_ms.load(Ordering::SeqCst);
-        last == 0 || unix_milli_now() - last <= Duration::from_secs(60).as_millis() as i64
+        last == 0 || unix_milli_now() - last <= Duration::from_mins(1).as_millis() as i64
     }
 
     // Go: server.go:779 RefreshInlayHints

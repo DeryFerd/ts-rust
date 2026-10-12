@@ -351,7 +351,7 @@ impl LspClient {
         let info = info.clone();
         move || {
             let mut resp = rx
-                .recv_timeout(Duration::from_secs(120))
+                .recv_timeout(Duration::from_mins(2))
                 .unwrap_or_else(|err| panic!("Request cancelled: {err}"));
             let result = resp.result.take();
             let typed = if resp.error.is_none() {
@@ -373,7 +373,7 @@ impl LspClient {
         req_id: ID,
     ) -> Option<lsproto::ResponseMessage> {
         self.send_request_message(req, req_id)
-            .recv_timeout(Duration::from_secs(120))
+            .recv_timeout(Duration::from_mins(2))
             .ok()
     }
 

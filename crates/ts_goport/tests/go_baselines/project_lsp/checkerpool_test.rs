@@ -864,7 +864,7 @@ child_test! {
 /// The idle timeout of the timer tests. Go uses 5 s and 10 s of fake time.
 /// It is long enough that a loaded host does not reach it between a release
 /// and the next check.
-const IDLE: Duration = Duration::from_millis(1000);
+const IDLE: Duration = Duration::from_secs(1);
 
 fn idle_opts(max_checkers: i32, idle_timeout: Duration) -> CheckerPoolOptions {
     CheckerPoolOptions {
