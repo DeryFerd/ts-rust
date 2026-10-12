@@ -1027,12 +1027,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "a075f506b04d824cf",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "a4ee976a97e738701",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R204 pipeline (candidate.sh side)."
