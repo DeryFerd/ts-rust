@@ -30,16 +30,17 @@
 //! type x constant reference), candidates that are settled and have nothing
 //! to check per walk are joined to their parent (union-find), so a walk
 //! over settled nodes costs about O(1). A file is indexed only once its
-//! walks have taken 16 steps per flow node (sampled), so files with short
-//! walks pay almost nothing.
+//! walks have taken 16 steps per flow node (one walk in 32 measured), so
+//! files with short walks pay almost nothing: a countdown per walk.
 //!
 //! `GOPORT_FLOWSKIP`: unset or `1` on, `0` off, `verify` indexes every file,
 //! tests each walk, then runs Go's walk anyway, and panics when the skip
 //! would differ (result, counters of made things and effects, visited nodes,
 //! depth). `GOPORT_FLOWSKIP_STATS=<file>` writes the process totals of the
-//! tests to `<file>` (updated every 256 tests per checker).
-//! `GOPORT_FLOWSKIP_BUILD_STEPS` and `GOPORT_FLOWSKIP_MIN_STEPS` set the
-//! tuning values for A/B runs.
+//! tests to `<file>` (updated every 256 tests per checker). Its writes cost
+//! instructions (VS Code +0.17%): leave it unset when you count them.
+//! `GOPORT_FLOWSKIP_BUILD_STEPS`, `GOPORT_FLOWSKIP_MIN_STEPS` and
+//! `GOPORT_FLOWSKIP_SAMPLE_EVERY` set the tuning values for A/B runs.
 
 use crate::prelude::*;
 use smallvec::SmallVec;
@@ -113,10 +114,14 @@ pub fn flow_skip_mode_from_env() -> FlowSkipMode {
 fn tuning(name: &'static str, default: u32) -> u32 {
     static VALUES: OnceLock<FxHashMap<&'static str, u32>> = OnceLock::new();
     let values = VALUES.get_or_init(|| {
-        ["GOPORT_FLOWSKIP_BUILD_STEPS", "GOPORT_FLOWSKIP_MIN_STEPS"]
-            .into_iter()
-            .filter_map(|n| Some((n, std::env::var(n).ok()?.parse().ok()?)))
-            .collect()
+        [
+            "GOPORT_FLOWSKIP_BUILD_STEPS",
+            "GOPORT_FLOWSKIP_MIN_STEPS",
+            "GOPORT_FLOWSKIP_SAMPLE_EVERY",
+        ]
+        .into_iter()
+        .filter_map(|n| Some((n, std::env::var(n).ok()?.parse().ok()?)))
+        .collect()
     });
     values.get(name).copied().unwrap_or(default)
 }
@@ -196,6 +201,7 @@ impl FlowSkipStats {
     /// writes the totals to the stats file.
     fn flush(&mut self, flushed: &mut FlowSkipStats) {
         let Some(path) = stats_path() else {
+            *flushed = *self;
             return;
         };
         let now = self.slots();
@@ -243,7 +249,15 @@ pub struct FlowSkip {
     /// A walk with fewer loop turns to its root (and no move to an outer
     /// function there) is not tested: Go's walk is cheaper than the test.
     pub min_steps: u32,
+    /// While a file is counted, one walk in this many is measured.
+    pub sample_every: u32,
     files: FxHashMap<u32, FileState>,
+    /// The last counted file (`NONE`: none) and its live count. Its entry in
+    /// `files` is stale until another counted file takes its place, so a
+    /// walk that only counts needs no map lookup (a lookup per walk cost
+    /// VS Code +0.17% instructions).
+    hot_file: u32,
+    hot: Count,
     /// Port counter of effect sites, read by verify mode: effects signature
     /// misses, `ensureAssignmentsMarked` writes, `isExhaustiveSwitchStatement`
     /// and `isReachableFlowNode` calls, entity-name key resolutions.
@@ -269,7 +283,13 @@ impl Default for FlowSkip {
                 if mode == FlowSkipMode::Verify { 0 } else { 16 },
             ),
             min_steps: tuning("GOPORT_FLOWSKIP_MIN_STEPS", 8),
+            sample_every: tuning("GOPORT_FLOWSKIP_SAMPLE_EVERY", SAMPLE_EVERY).max(1),
             files: FxHashMap::default(),
+            hot_file: NONE,
+            hot: Count {
+                countdown: 0,
+                need: 0,
+            },
             effects: 0,
             recording: None,
             stats: FlowSkipStats::default(),
@@ -289,13 +309,21 @@ impl std::fmt::Debug for FlowSkip {
     }
 }
 
+/// The count of a file before it is indexed. One walk in `sample_every` is
+/// measured (at most `DRY_CAP` steps, weighted by `sample_every`):
+/// `countdown` is the walks up to the next measured one, `need` the
+/// measured steps that the file still needs before it is indexed. The other
+/// walks pay only the countdown.
+#[derive(Clone, Copy)]
+struct Count {
+    countdown: u32,
+    need: u64,
+}
+
 enum FileState {
-    /// Walks so far, and the estimated sum of their path lengths (every
-    /// `SAMPLE_EVERY`th walk is measured, at most `DRY_CAP` steps).
-    Counting {
-        walks: u32,
-        steps: u64,
-    },
+    /// Not indexed yet (`FlowSkip::hot` holds the live count of the hot
+    /// file).
+    Counting(Count),
     Built(Box<FileIndex>),
     /// Not a static file: never indexed.
     Unsupported,
@@ -303,8 +331,11 @@ enum FileState {
 
 /// A measured walk counts at most this many steps.
 const DRY_CAP: u32 = 256;
-/// One walk in this many is measured.
-const SAMPLE_EVERY: u32 = 4;
+/// One walk in this many is measured (`FlowSkip::sample_every`). The
+/// estimate needs few samples: a file is worth an index only when it has
+/// many walks. 1 in 4 cost VS Code +0.13% instructions; 1 in 32 keeps the
+/// same files indexed on T3 server.
+const SAMPLE_EVERY: u32 = 32;
 
 /// Steps of pi(u) to its root (no move to an outer function), at most
 /// `DRY_CAP`: the length of Go's walk when nothing narrows.
@@ -1454,6 +1485,7 @@ impl Checker {
     /// returns `declared_type`. The caller has checked P1 (no explicit flow
     /// node) and P3 (declared == initial, not auto). Returns the nesting
     /// count of the path for verify mode.
+    #[inline]
     pub(crate) fn flow_skip_test(
         &mut self,
         reference: Node,
@@ -1461,8 +1493,33 @@ impl Checker {
         flow_container: Node,
         flow: FlowNodeId,
     ) -> Option<u32> {
+        // The common case where no file is indexed (VS Code): a walk of the
+        // hot counted file that is not measured pays only the countdown.
+        let fs = &mut self.flow_skip;
+        if flow.file_index() as u32 == fs.hot_file
+            && fs.hot.countdown > 1
+            && self.inline_level == 0
+            && fs.trace.is_none()
+        {
+            fs.hot.countdown -= 1;
+            fs.stats.tested += 1;
+            fs.stats.refused[Refusal::Counting as usize] += 1;
+            return None;
+        }
+        self.flow_skip_test_full(reference, declared_type, flow_container, flow)
+    }
+
+    /// `flow_skip_test` past its countdown.
+    #[inline(never)]
+    fn flow_skip_test_full(
+        &mut self,
+        reference: Node,
+        declared_type: TypeId,
+        flow_container: Node,
+        flow: FlowNodeId,
+    ) -> Option<u32> {
         self.flow_skip.stats.tested += 1;
-        if self.flow_skip.stats.tested & 255 == 0 {
+        if self.flow_skip.stats.tested - self.flow_skip.stats_flushed.tested >= 256 {
             let mut flushed = self.flow_skip.stats_flushed;
             self.flow_skip.stats.flush(&mut flushed);
             self.flow_skip.stats_flushed = flushed;
@@ -1494,40 +1551,74 @@ impl Checker {
             return Err(Refusal::Inline);
         }
         let file = flow.file_index();
-        let build_steps = self.flow_skip.build_steps;
-        let state = self
-            .flow_skip
-            .files
-            .entry(file as u32)
-            .or_insert(FileState::Counting { walks: 0, steps: 0 });
-        match state {
-            FileState::Unsupported => return Err(Refusal::File),
-            FileState::Counting { walks, steps } => {
-                // Only a static file (the CLI case) is indexed: its flow
-                // nodes live for the process.
-                let Some(flows) = static_go_file(file).and_then(|g| g.flow_nodes.get()) else {
-                    *state = FileState::Unsupported;
-                    return Err(Refusal::File);
-                };
-                *walks += 1;
-                if *walks % SAMPLE_EVERY == 0 {
-                    let u = flow.local_index();
-                    if u < flows.len() {
-                        *steps += u64::from(dry_steps(flows, file, u) * SAMPLE_EVERY);
-                    }
+        if file as u32 != self.flow_skip.hot_file {
+            let count = match self.flow_skip.files.entry(file as u32) {
+                std::collections::hash_map::Entry::Occupied(entry) => match entry.into_mut() {
+                    FileState::Unsupported => return Err(Refusal::File),
+                    FileState::Built(_) => None,
+                    FileState::Counting(count) => Some(*count),
+                },
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    // Only a static file (the CLI case) is indexed: its flow
+                    // nodes live for the process.
+                    let Some(flows) = static_go_file(file).and_then(|g| g.flow_nodes.get()) else {
+                        entry.insert(FileState::Unsupported);
+                        return Err(Refusal::File);
+                    };
+                    let count = Count {
+                        countdown: self.flow_skip.sample_every,
+                        need: u64::from(self.flow_skip.build_steps) * flows.len() as u64,
+                    };
+                    entry.insert(FileState::Counting(count));
+                    Some(count)
                 }
-                if *steps < u64::from(build_steps) * flows.len() as u64 {
+            };
+            if let Some(count) = count {
+                // The hot file's count goes back to its entry.
+                let fs = &mut self.flow_skip;
+                if let Some(FileState::Counting(old)) = fs.files.get_mut(&fs.hot_file) {
+                    *old = fs.hot;
+                }
+                fs.hot_file = file as u32;
+                fs.hot = count;
+            }
+        }
+        if file as u32 == self.flow_skip.hot_file {
+            let sample_every = self.flow_skip.sample_every;
+            let hot = &mut self.flow_skip.hot;
+            if hot.need > 0 {
+                hot.countdown -= 1;
+                if hot.countdown > 0 {
                     return Err(Refusal::Counting);
                 }
-                let start = std::time::Instant::now();
-                let index = FileIndex::build(file, flows.as_slice(), self.strict_null_checks);
-                *state = FileState::Built(Box::new(index));
-                let stats = &mut self.flow_skip.stats;
-                stats.built += 1;
-                stats.built_nodes += flows.len() as u64;
-                stats.build_ns += start.elapsed().as_nanos() as u64;
+                hot.countdown = sample_every;
+                let flows = static_go_file(file)
+                    .and_then(|g| g.flow_nodes.get())
+                    .expect("a counted file is static");
+                let u = flow.local_index();
+                let steps = if u < flows.len() {
+                    u64::from(dry_steps(flows, file, u)) * u64::from(sample_every)
+                } else {
+                    0
+                };
+                if steps < hot.need {
+                    hot.need -= steps;
+                    return Err(Refusal::Counting);
+                }
             }
-            FileState::Built(_) => {}
+            let flows = static_go_file(file)
+                .and_then(|g| g.flow_nodes.get())
+                .expect("a counted file is static");
+            let start = std::time::Instant::now();
+            let index = FileIndex::build(file, flows.as_slice(), self.strict_null_checks);
+            self.flow_skip
+                .files
+                .insert(file as u32, FileState::Built(Box::new(index)));
+            self.flow_skip.hot_file = NONE;
+            let stats = &mut self.flow_skip.stats;
+            stats.built += 1;
+            stats.built_nodes += flows.len() as u64;
+            stats.build_ns += start.elapsed().as_nanos() as u64;
         }
         let mut files = std::mem::take(&mut self.flow_skip.files);
         let Some(FileState::Built(index)) = files.get_mut(&(file as u32)) else {
