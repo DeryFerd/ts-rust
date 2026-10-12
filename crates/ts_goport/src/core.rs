@@ -3378,9 +3378,21 @@ impl SymbolArena {
         self.symbols.get_mut(symbol.index())
     }
 
-    /// Go `table[name]`. A nil table reads as empty.
+    /// Go `table[name]`. A nil table reads as empty. `name` is a `&str`
+    /// or a `&Name` (`TableKey`): a `Name` finds its entry by id
+    /// (`get_name`), so a caller that holds one passes it.
+    #[inline]
     #[must_use]
-    pub fn get(&self, table: SymbolTable, name: &str) -> SymbolId {
+    pub fn get<'a>(&self, table: SymbolTable, name: impl Into<TableKey<'a>>) -> SymbolId {
+        match name.into() {
+            TableKey::Text(text) => self.get_text(table, text),
+            TableKey::Name(name) => self.get_name(table, name),
+        }
+    }
+
+    /// Go `table[name]` by text: hashes `name` and compares texts.
+    #[must_use]
+    fn get_text(&self, table: SymbolTable, name: &str) -> SymbolId {
         if table.is_nil() {
             return SymbolId::NIL;
         }
@@ -3409,14 +3421,11 @@ impl SymbolArena {
             .map_or(SymbolId::NIL, |position| table.entries[position].symbol)
     }
 
-    /// Go `table[name]` by `get` or `get_name`, whichever `key` holds.
+    /// Go `table[name]` by `get_text` or `get_name`, whichever `key` holds.
     #[inline]
     #[must_use]
     pub fn get_key(&self, table: SymbolTable, key: TableKey<'_>) -> SymbolId {
-        match key {
-            TableKey::Text(text) => self.get(table, text),
-            TableKey::Name(name) => self.get_name(table, name),
-        }
+        self.get(table, key)
     }
 
     /// Go `table[name] = symbol`. Panics on a nil table, like Go.

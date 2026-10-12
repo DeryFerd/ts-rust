@@ -13,12 +13,12 @@ pub use flow::*;
 pub use js_string::{append_js_string, decode_js_string, encode_js_string, normalize_js_string};
 pub use syntax_kind::SyntaxKind;
 
-impl NodeData {
+impl NodeData<'_> {
     /// Whether this generated node payload is structurally compatible with a
     /// syntax kind. Most schema names match directly; shared payloads and the
     /// handful of public kind aliases are listed explicitly.
     #[must_use]
-    pub fn matches_syntax_kind(&self, kind: SyntaxKind) -> bool {
+    pub fn matches_syntax_kind(self, kind: SyntaxKind) -> bool {
         match self {
             Self::Token(_) => kind.is_token(),
             Self::KeywordExpression(_) => kind.is_keyword_expression(),
@@ -164,10 +164,10 @@ mod tests {
     use crate::astdata::text::TextRange;
 
     use super::{
-        Child, ConditionalExpressionData, DoStatementData, FileId, ImportDeclarationData,
-        JsDocParameterOrPropertyTagData, ModifierFlags, ModifierList, Node, NodeArena, NodeData,
-        NodeFlags, NodeId, NodeList, NodeRef, SourceFileData, SyntaxKind, SyntaxListData,
-        TokenData,
+        BoxedData, Child, ConditionalExpressionData, DoStatementData, FileId,
+        ImportDeclarationData, JsDocParameterOrPropertyTagData, ModifierFlags, ModifierList, Node,
+        NodeArena, NodeData, NodeFlags, NodeId, NodeList, NodeRef, SourceFileData, SyntaxKind,
+        SyntaxListData, TokenData,
     };
 
     thread_local! {
@@ -198,7 +198,7 @@ mod tests {
         }
     }
 
-    fn direct_children(data: NodeData) -> Vec<NodeId> {
+    fn direct_children(data: BoxedData) -> Vec<NodeId> {
         let node = Node {
             kind: SyntaxKind::Unknown,
             flags: NodeFlags::default(),
@@ -221,7 +221,7 @@ mod tests {
             flags: NodeFlags::default(),
             range: TextRange::default(),
             parent: None,
-            data: NodeData::Token(Box::new(TokenData)),
+            data: BoxedData::Token(Box::new(TokenData)),
         }
     }
 
@@ -239,14 +239,14 @@ mod tests {
             flags: NodeFlags::default(),
             range: TextRange::default(),
             parent: None,
-            data: NodeData::Token(Box::new(TokenData)),
+            data: BoxedData::Token(Box::new(TokenData)),
         });
         let second = arena.alloc(Node {
             kind: SyntaxKind::EndOfFile,
             flags: NodeFlags::default(),
             range: TextRange::default(),
             parent: None,
-            data: NodeData::Token(Box::new(TokenData)),
+            data: BoxedData::Token(Box::new(TokenData)),
         });
 
         assert_eq!(first.index(), 0);
@@ -387,7 +387,7 @@ mod tests {
         let cases = vec![
             (
                 "do statement visits its body before its condition",
-                NodeData::DoStatement(Box::new(DoStatementData {
+                BoxedData::DoStatement(Box::new(DoStatementData {
                     expression: NodeId::new(2),
                     statement: NodeId::new(1),
                 })),
@@ -395,7 +395,7 @@ mod tests {
             ),
             (
                 "conditional expression includes punctuation tokens",
-                NodeData::ConditionalExpression(Box::new(ConditionalExpressionData {
+                BoxedData::ConditionalExpression(Box::new(ConditionalExpressionData {
                     colon_token: NodeId::new(4),
                     condition: NodeId::new(1),
                     question_token: NodeId::new(2),
@@ -406,7 +406,7 @@ mod tests {
             ),
             (
                 "modifier and node lists flatten in place",
-                NodeData::ImportDeclaration(Box::new(ImportDeclarationData {
+                BoxedData::ImportDeclaration(Box::new(ImportDeclarationData {
                     attributes: Some(NodeId::new(6)),
                     import_clause: Some(NodeId::new(3)),
                     module_specifier: NodeId::new(5),
@@ -416,7 +416,7 @@ mod tests {
             ),
             (
                 "source-file statements precede end-of-file",
-                NodeData::SourceFile(Box::new(SourceFileData {
+                BoxedData::SourceFile(Box::new(SourceFileData {
                     end_of_file_token: NodeId::new(4),
                     statements: node_list(&[1, 2, 3]),
                 })),
@@ -424,7 +424,7 @@ mod tests {
             ),
             (
                 "raw syntax-list children retain their order",
-                NodeData::SyntaxList(Box::new(SyntaxListData {
+                BoxedData::SyntaxList(Box::new(SyntaxListData {
                     children: node_ids(&[3, 1, 2]),
                 })),
                 node_ids(&[3, 1, 2]),
@@ -443,7 +443,7 @@ mod tests {
             (false, node_ids(&[1, 3, 2, 4, 5])),
         ] {
             let data =
-                NodeData::JsDocParameterOrPropertyTag(Box::new(JsDocParameterOrPropertyTagData {
+                BoxedData::JsDocParameterOrPropertyTag(Box::new(JsDocParameterOrPropertyTagData {
                     comment: Some(node_list(&[4, 5])),
                     is_bracketed: false,
                     is_name_first,
@@ -462,7 +462,7 @@ mod tests {
             flags: NodeFlags::default(),
             range: TextRange::default(),
             parent: None,
-            data: NodeData::SourceFile(Box::new(SourceFileData {
+            data: BoxedData::SourceFile(Box::new(SourceFileData {
                 end_of_file_token: NodeId::new(4),
                 statements: node_list(&[1, 2, 3]),
             })),

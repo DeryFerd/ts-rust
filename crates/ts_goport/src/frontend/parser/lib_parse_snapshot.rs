@@ -915,10 +915,11 @@ macro_rules! payload_codec {
     ($($variant_tag:literal $variant:ident($data:ident) {
         $($field:ident: $codec:ident),* $(,)?
     })*) => {
-        /// The node data with variant tag `variant_tag`, from `dec`.
-        fn decode_payload(dec: &mut PayloadDecoder<'_, '_, '_, '_>, variant_tag: u8) -> Option<NodeData> {
+        /// The node data with variant tag `variant_tag`, from `dec`, in the
+        /// AST arena of this thread (astchunks2: no box per node).
+        fn decode_payload(dec: &mut PayloadDecoder<'_, '_, '_, '_>, variant_tag: u8) -> Option<NodeData<'static>> {
             Some(match variant_tag {
-                $($variant_tag => NodeData::$variant(Box::new(crate::astdata::$data {
+                $($variant_tag => NodeData::$variant(crate::ast::leak_in_ast_arena(crate::astdata::$data {
                     $($field: dec.$codec()?,)*
                 })),)*
                 _ => return None,
@@ -927,10 +928,10 @@ macro_rules! payload_codec {
 
         /// Writes the variant tag and the fields of `payload`.
         #[cfg(test)]
-        fn encode_payload(enc: &mut Encoder, payload: &NodeData) -> Result<(), String> {
+        fn encode_payload(enc: &mut Encoder, payload: NodeData<'_>) -> Result<(), String> {
             match payload {
                 $(NodeData::$variant(payload) => {
-                    let crate::astdata::$data { $($field),* } = &**payload;
+                    let crate::astdata::$data { $($field),* } = payload;
                     enc.u8($variant_tag);
                     $(enc.$codec($field)?;)*
                 })*

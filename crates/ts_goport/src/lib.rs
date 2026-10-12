@@ -26,8 +26,8 @@ compile_error!("build ts_goport for wasm with --no-default-features, as crates/t
 // The port below the language service (crate split step 2): each module keeps its path.
 pub use goport_core::{
     ast, astdata, astnav, baseline, binder, checker, contentmapper, core, declarations, diag,
-    diagnostics, diagnostics_loc, emitter, evaluator, execute, flags, frontend, fswatch, gostd,
-    ipc, jsnum, jsonrpc, leak_arena, locale, modulespecifiers, options, options_json, pprof,
+    diagnostics, diagnostics_loc, emitter, evaluator, execute, fast_mode, flags, frontend, fswatch,
+    gostd, ipc, jsnum, jsonrpc, leak_arena, locale, modulespecifiers, options, options_json, pprof,
     prelude, printer, program, pseudochecker, scanner_util, sourcemap, spanmap, thp_guard, tracing,
     transformers, transpile,
 };

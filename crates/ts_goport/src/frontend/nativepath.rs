@@ -387,12 +387,21 @@ mod tests {
     fn realpath_hardlinked_file() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        // Go `t.TempDir()` removes the dir when the test ends, also after a
+        // failed check: the guard removes it on return and on panic.
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         let tmp = std::env::temp_dir().join(format!(
             "ts_goport_realpath_hardlink_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
+        let _remove_tmp = RemoveOnDrop(tmp.clone());
         let real_path = tmp.join("real.d.ts");
         let alias = tmp.join("alias.d.ts");
         std::fs::write(&real_path, "export * from './lib';\n").unwrap();
@@ -415,7 +424,17 @@ mod tests {
         let worker_err = std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
-                    if let Err(err) = std::fs::File::open(&real_path) {
+                    let opened = std::fs::File::open(&real_path);
+                    // Go `openErr = f.Close()`.
+                    // PORT: std has no File close that returns the error (a
+                    // drop ignores it), and a raw close(2) needs `unsafe`.
+                    // nix's safe `close` returns it, but nix is a
+                    // dependency on Linux only, so other unix hosts check
+                    // the open only.
+                    #[cfg(target_os = "linux")]
+                    let opened =
+                        opened.and_then(|f| nix::unistd::close(f).map_err(std::io::Error::from));
+                    if let Err(err) = opened {
                         return Some(err);
                     }
                 }
@@ -429,6 +448,5 @@ mod tests {
             worker.join().unwrap()
         });
         assert!(worker_err.is_none(), "{worker_err:?}");
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

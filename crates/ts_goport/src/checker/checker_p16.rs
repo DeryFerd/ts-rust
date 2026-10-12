@@ -1157,9 +1157,7 @@ impl Checker {
         dont_resolve_alias: bool,
     ) -> SymbolId {
         let exports = self.sym(module_symbol).exports;
-        let export_value = self
-            .symbols
-            .get(exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS);
+        let export_value = self.symbols.get(exports, &*EXPORT_EQUALS_NAME);
         let export_symbol = if export_value.is_some() {
             let t = self.get_type_of_symbol(export_value);
             self.get_property_of_type_ex(
@@ -1275,6 +1273,9 @@ impl Checker {
             return SymbolId::NIL;
         }
         let name_text = name.text();
+        // PERF (jsxname1): the export lookups below take the name's `Name`
+        // (`text_name`), so they compare name ids.
+        let name_key = name.text_name();
         let target_symbol =
             self.resolve_es_module_symbol(module_symbol, specifier, module_specifier);
         if target_symbol.is_some() {
@@ -1291,20 +1292,18 @@ impl Checker {
                 // is guarded by `moduleSymbol != nil`.
                 let has_export_equals = module_symbol.is_some() && {
                     let exports = self.sym(module_symbol).exports;
-                    self.symbols
-                        .get(exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS)
-                        .is_some()
+                    self.symbols.get(exports, &*EXPORT_EQUALS_NAME).is_some()
                 };
                 let mut symbol_from_variable;
                 // First check if module was specified with "export=". If so, get the member from the resolved type
                 if has_export_equals {
                     let t = self.get_type_of_symbol(target_symbol);
                     symbol_from_variable = self.get_property_of_type_ex(
-                        t, name_text, true,  /*skipObjectFunctionPropertyAugment*/
+                        t, &name_key, true,  /*skipObjectFunctionPropertyAugment*/
                         false, /*includeTypeOnlyMembers*/
                     );
                 } else {
-                    symbol_from_variable = self.get_property_of_variable(target_symbol, name_text);
+                    symbol_from_variable = self.get_property_of_variable(target_symbol, &name_key);
                 }
                 // if symbolFromVariable is export - get its final target
                 symbol_from_variable =
@@ -1312,9 +1311,7 @@ impl Checker {
                 let mut export_container = target_symbol;
                 let has_export_equals = module_symbol.is_some() && {
                     let exports = self.sym(module_symbol).exports;
-                    self.symbols
-                        .get(exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS)
-                        .is_some()
+                    self.symbols.get(exports, &*EXPORT_EQUALS_NAME).is_some()
                 };
                 if has_export_equals {
                     // For `export =` modules, supplemental type/namespace exports live on the original module symbol.
@@ -1322,7 +1319,7 @@ impl Checker {
                 }
                 let mut symbol_from_module = self.get_export_of_module(
                     export_container,
-                    name_text,
+                    &name_key,
                     specifier,
                     dont_resolve_alias,
                 );
@@ -1386,7 +1383,12 @@ impl Checker {
     }
 
     // Go: checker/checker.go:15032 getPropertyOfVariable
-    pub fn get_property_of_variable(&mut self, symbol: SymbolId, name: &str) -> SymbolId {
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`).
+    pub fn get_property_of_variable<'a>(
+        &mut self,
+        symbol: SymbolId,
+        name: impl Into<TableKey<'a>>,
+    ) -> SymbolId {
         if self.sym(symbol).flags.intersects(SymbolFlags::VARIABLE) {
             let type_annotation = self.sym(symbol).value_declaration.type_();
             if type_annotation.is_some() {
@@ -1464,16 +1466,20 @@ impl Checker {
     }
 
     // Go: checker/checker.go:15083 getExportOfModule
-    pub fn get_export_of_module(
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`). With a `Name`,
+    // the exports lookup compares name ids.
+    pub fn get_export_of_module<'a>(
         &mut self,
         symbol: SymbolId,
-        name_text: &str,
+        name: impl Into<TableKey<'a>>,
         specifier: Node,
         dont_resolve_alias: bool,
     ) -> SymbolId {
         if self.sym(symbol).flags.intersects(SymbolFlags::MODULE) {
+            let name: TableKey<'a> = name.into();
+            let name_text = name.text();
             let exports = self.get_exports_of_symbol(symbol);
-            let export_symbol = self.symbols.get(exports, name_text);
+            let export_symbol = self.symbols.get(exports, name);
             let resolved = self.resolve_symbol_ex(export_symbol, dont_resolve_alias);
             let export_star_declaration = self
                 .module_symbol_links

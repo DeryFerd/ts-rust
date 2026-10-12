@@ -7,9 +7,10 @@ use crate::prelude::*;
 use smallvec::SmallVec;
 use std::sync::OnceLock;
 
-/// `GOPORT_FAST_NEVER_ORDER`, read once per process. Only `1` turns on the
+/// `GOPORT_FAST_NEVER_ORDER`, read once per process. `1` turns on the
 /// faster name order of `some_property_reduces_to_never`
-/// (`some_property_reduces_to_never_fast`). `Checker::new` stores it in
+/// (`some_property_reduces_to_never_fast`), `0` turns it off; else it
+/// follows fast mode (`crate::fast_mode`). `Checker::new` stores it in
 /// `Checker::fast_never_order`. Off by default, so the output, counts
 /// included, equals Go.
 // PORT: not in Go. An environment variable, not a tsconfig option: the
@@ -24,7 +25,7 @@ use std::sync::OnceLock;
 // (nevfast1 skeptic repro r02-ts2589-count).
 pub fn fast_never_order_from_env() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("GOPORT_FAST_NEVER_ORDER").as_deref() == Ok("1"))
+    *ON.get_or_init(|| crate::fast_mode::part("GOPORT_FAST_NEVER_ORDER"))
 }
 
 /// Reusable buffers of `get_named_members` (the `Checker` field
@@ -122,8 +123,13 @@ impl Checker {
      * return the symbol for that property. Otherwise return undefined.
      */
     // Go: checker/checker.go:21807 getPropertyOfObjectType
-    pub fn get_property_of_object_type(&mut self, t: TypeId, name: &str) -> SymbolId {
-        self.get_property_of_object_type_key(t, TableKey::Text(name))
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`).
+    pub fn get_property_of_object_type<'a>(
+        &mut self,
+        t: TypeId,
+        name: impl Into<TableKey<'a>>,
+    ) -> SymbolId {
+        self.get_property_of_object_type_key(t, name.into())
     }
 
     /// `get_property_of_object_type` by `TableKey`. A `Name` key compares
@@ -140,15 +146,16 @@ impl Checker {
     }
 
     // Go: checker/checker.go:21818 getPropertyOfUnionOrIntersectionType
-    pub fn get_property_of_union_or_intersection_type(
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`).
+    pub fn get_property_of_union_or_intersection_type<'a>(
         &mut self,
         t: TypeId,
-        name: &str,
+        name: impl Into<TableKey<'a>>,
         skip_object_function_property_augment: bool,
     ) -> SymbolId {
         self.get_property_of_union_or_intersection_type_key(
             t,
-            TableKey::Text(name),
+            name.into(),
             skip_object_function_property_augment,
         )
     }
@@ -183,15 +190,16 @@ impl Checker {
     // these partial properties when identifying discriminant properties, but otherwise they are filtered out
     // and do not appear to be present in the union type.
     // Go: checker/checker.go:21832 getUnionOrIntersectionProperty
-    pub fn get_union_or_intersection_property(
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`).
+    pub fn get_union_or_intersection_property<'a>(
         &mut self,
         t: TypeId,
-        name: &str,
+        name: impl Into<TableKey<'a>>,
         skip_object_function_property_augment: bool,
     ) -> SymbolId {
         self.get_union_or_intersection_property_key(
             t,
-            TableKey::Text(name),
+            name.into(),
             skip_object_function_property_augment,
         )
     }

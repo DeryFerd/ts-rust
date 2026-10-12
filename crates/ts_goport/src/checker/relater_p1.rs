@@ -1883,10 +1883,12 @@ impl Checker {
      * @param name a property name to search
      * @param isComparingJsxAttributes a boolean flag indicating whether we are searching in JsxAttributesType
      */
+    // PERF (jsxname1): `name` is the property symbol's `Name`, so the member
+    // lookups compare name ids.
     pub fn is_known_property(
         &mut self,
         target_type: TypeId,
-        name: &str,
+        name: &Name,
         is_comparing_jsx_attributes: bool,
     ) -> bool {
         if self.ty(target_type).flags.intersects(TypeFlags::OBJECT) {
@@ -1894,7 +1896,7 @@ impl Checker {
             // is incorrect and inconsistent with element access expressions, where it is an error, so eventually
             // we should remove this exception.
             if self
-                .get_property_of_object_type(target_type, name)
+                .get_property_of_object_type_key(target_type, TableKey::Name(name))
                 .is_some()
                 || self
                     .get_applicable_index_info_for_name(target_type, name)
