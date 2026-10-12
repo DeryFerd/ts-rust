@@ -10,9 +10,9 @@
 //! full table (`resolve_lazy_members`) reuses it.
 //!
 //! `GOPORT_LAZY_MEMBERS=1` or fast mode (`crate::fast_mode`) turns it on
-//! (`Checker::lazy_members`). Go has no switch. With the switch off, nothing here runs and the checker does what
-//! it did before. With it on, the output must equal Go at the pin with
-//! #64475 applied.
+//! (`Checker::lazy_members`). Go has no switch. With the switch off,
+//! nothing here runs and the checker does what it did before. With it on,
+//! the output must equal Go at the pin with #64475 applied.
 //!
 //! PERF (lazymem1 round 2): the hooks in the checker test
 //! `MEMBERS_RESOLVED` once, read a resolved type in place and take an
