@@ -241,7 +241,9 @@ pub fn is_in_type_query(node: Node) -> bool {
     // TypeScript 1.0 spec (April 2014): 3.6.3
     // A type query consists of the keyword typeof followed by an expression.
     // The expression is restricted to a single identifier or a sequence of identifiers separated by periods
-    find_ancestor_or_quit(node, |n: Node| match n.kind() {
+    // PERF: checkid1. The kinds are read through views
+    // (`find_ancestor_or_quit_ref`).
+    find_ancestor_or_quit_ref(node, |n: NodeRef| match n.kind() {
         SyntaxKind::TypeQuery => FindAncestorResult::FIND_ANCESTOR_TRUE,
         SyntaxKind::Identifier | SyntaxKind::QualifiedName => {
             FindAncestorResult::FIND_ANCESTOR_FALSE
