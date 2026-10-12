@@ -431,7 +431,11 @@ pub fn get_root_declaration(mut node: Node) -> Node {
 // walk and the flag reads are the same as Go. A nil node fails the Go
 // `node != nil` tests, so it returns early. The same holds for
 // `get_combined_node_flags` and `get_combined_parser_flags`.
-pub fn get_combined_modifier_flags(mut node: Node) -> ModifierFlags {
+// PERF: checkid1. The nodes, kinds, parents and modifier flags are read
+// through views (`NodeRef`): a parent in the same store costs no registry
+// lookup. The same holds for `get_combined_parser_flags`.
+pub fn get_combined_modifier_flags(node: Node) -> ModifierFlags {
+    let mut node = NodeRef::new(node);
     let mut kind = node.kind();
     while kind == SyntaxKind::BindingElement {
         node = node.parent().parent();
@@ -493,7 +497,8 @@ pub fn get_combined_node_flags(mut node: Node) -> NodeFlags {
 // PERF: U4 (CH7). The same walk as `get_combined_node_flags`, without the
 // binder data of each node. `(a | b | c) & mask` is
 // `(a & mask) | (b & mask) | (c & mask)`.
-pub fn get_combined_parser_flags(mut node: Node, mask: NodeFlags) -> NodeFlags {
+pub fn get_combined_parser_flags(node: Node, mask: NodeFlags) -> NodeFlags {
+    let mut node = NodeRef::new(node);
     let mut kind = node.kind();
     while kind == SyntaxKind::BindingElement {
         node = node.parent().parent();
