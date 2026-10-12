@@ -96,14 +96,15 @@ effect-tsgo 0.51.1. See [the Effect diagnostics doc](docs/effect-diagnostics.md#
 ## Status
 
 The port is pinned to one upstream revision, microsoft/TypeScript
-[`673a5f17d713`](https://github.com/microsoft/TypeScript/commit/673a5f17d713bdc8c7185f18a9c11e3c4ac5d781)
-(2026-09-29, TypeScript 7.1.0-dev; [UPSTREAM.md](UPSTREAM.md)), and compared with Go at that
-revision. To compare, use `typescript@7.1.0-dev.20260929.1`, not 7.0.x or
+[`fed0bf24149f`](https://github.com/microsoft/TypeScript/commit/fed0bf24149fb1ed36039212648bafdafc1ea10e)
+(2026-10-08, TypeScript 7.1.0-dev; [UPSTREAM.md](UPSTREAM.md)), and compared with Go at that
+revision. To compare, use `typescript@7.1.0-dev.20261008.1` (the same commit), not 7.0.x or
 `@typescript/native-preview`. A difference that this build also shows is upstream behavior, and it
-goes away when the port moves to a newer pin.
+goes away when the port moves to a newer pin. tsc-rs 0.3.0 and earlier used the 2026-09-29 pin
+(`typescript@7.1.0-dev.20260929.1`).
 
 - **Same results.** TanStack Query core and Hono check with diagnostics identical to Go's. All
-  181,711 ported Go tests pass. The language server and API answers match Go on the oracle test
+  184,745 ported Go tests pass. The language server and API answers match Go on the oracle test
   sets.
 - **Faster.** On 60 open-source projects, type checking takes about half of Go's time (geometric
   mean). The npm packages from 0.2.0 on are built in CI with PGO but without BOLT (0.1.0 has
