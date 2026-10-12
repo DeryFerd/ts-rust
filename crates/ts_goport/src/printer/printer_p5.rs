@@ -1764,6 +1764,13 @@ impl Printer {
         if nodes.is_nil() {
             return;
         }
+        // PERF: printfast1. With no auto-generate record, every
+        // `generateName` of this walk only reads the text of a name and
+        // drops it (see `generate_name`), so the walk changes nothing. The
+        // walk adds no record. Type text (`typeToString`) has none.
+        if !self.emit_context.has_any_auto_generate_info() {
+            return;
+        }
         for node in nodes.nodes() {
             self.generate_member_names(node);
         }
@@ -1803,6 +1810,13 @@ impl Printer {
     // Generate the text for a generated identifier or private identifier
     // Go: printer/printer.go:6138 generateName
     pub(crate) fn generate_name(&mut self, name: Node) {
+        // PERF: printfast1. Go drops the result. For a name with no
+        // auto-generate record, Go `GenerateName` (namegenerator.go:114)
+        // only returns `GetTextOfNode(name)`, which changes nothing, so the
+        // port does not build that string.
+        if !self.emit_context.has_auto_generate_info(name) {
+            return;
+        }
         let _ = self.sync_name_generator().generate_name(name);
     }
 
