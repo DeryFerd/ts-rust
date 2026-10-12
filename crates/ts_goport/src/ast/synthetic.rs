@@ -2132,23 +2132,20 @@ pub fn synthetic_children<const N: usize>(
     })
 }
 
-/// Go `list.Nodes` of `list`, copied in one arena borrow.
+/// Go `list.Nodes` (copied) and `list.Loc` of factory list `list`, read in
+/// one arena borrow. Panics on a node slice, which is not a `NodeList`.
 // PERF: printfast1. `NodeSlice::to_vec` of a synthetic list reads the arena
-// once per node (`synthetic_list_node`); the printer copies each list it
-// emits (`Printer::emit_list_range`).
+// once per node (`synthetic_list_node`), and `NodeList::loc` once more; the
+// printer reads both for each list it emits (`Printer::emit_list_range`).
 #[must_use]
-pub fn synthetic_list_nodes(list: SyntheticList) -> Vec<Node> {
+pub fn synthetic_list_nodes_and_loc(list: SyntheticList) -> (Vec<Node>, TextRange) {
     ARENA.with(|a| {
         let a = a.borrow();
-        match list {
-            SyntheticList::Slice { index } => a.slices[index as usize].to_vec(),
-            SyntheticList::Own { .. } => a
-                .list(list)
-                .nodes
-                .iter()
-                .map(|id| a.resolve(id.index()))
-                .collect(),
-        }
+        let l = a.list(list);
+        let nodes = l.nodes.iter().map(|id| a.resolve(id.index())).collect();
+        // As `node.rs` `text_range_of`.
+        let loc = TextRange::new(l.range.start.get() as i32, l.range.end.get() as i32);
+        (nodes, loc)
     })
 }
 

@@ -148,20 +148,27 @@ impl Printer {
         } else {
             let end = (start + count).min(length);
 
-            // PERF: printfast1. Go slices `children.Nodes`. A factory list
-            // is copied in one arena read, not one read per node.
-            let nodes = match children.synthetic_list() {
-                Some(list) => crate::ast::synthetic::synthetic_list_nodes(list),
-                None => children.nodes().to_vec(),
+            // PERF: printfast1. Go slices `children.Nodes` and reads
+            // `children.Loc`. A factory list gives its nodes and its range
+            // in one arena read, not one read per node.
+            let (nodes, children_loc) = match children.synthetic_list() {
+                Some(list) => crate::ast::synthetic::synthetic_list_nodes_and_loc(list),
+                None => (children.nodes().to_vec(), children.loc()),
             };
-            let has_trailing_comma = self.has_trailing_comma(parent_node, children);
+            // Go `children.HasTrailingComma()` (ast.go:139) from the nodes
+            // and range read above.
+            let list_has_trailing_comma = nodes
+                .last()
+                .is_some_and(|last| last.end() < children_loc.end());
+            let has_trailing_comma =
+                self.has_trailing_comma(parent_node, children, list_has_trailing_comma);
             self.emit_list_items(
                 emit,
                 parent_node,
                 &nodes[start as usize..end as usize],
                 format,
                 has_trailing_comma,
-                children.loc(),
+                children_loc,
             );
         }
 
@@ -178,11 +185,19 @@ impl Printer {
     }
 
     // Go: printer/printer.go:4801 hasTrailingComma
-    pub(crate) fn has_trailing_comma(&mut self, parent_node: Node, children: NodeList) -> bool {
+    // PERF: printfast1. The caller passes Go `children.HasTrailingComma()`
+    // (`list_has_trailing_comma`): `emit_list_range` has the nodes and range
+    // of the list, so it needs no second read of a factory list.
+    pub(crate) fn has_trailing_comma(
+        &mut self,
+        parent_node: Node,
+        children: NodeList,
+        list_has_trailing_comma: bool,
+    ) -> bool {
         // NodeList.HasTrailingComma() is unreliable on transformed nodes as some nodes may have been removed. In the event
         // we believe we may need to emit a trailing comma, we must first look to the respective node list on the original
         // node first.
-        if !children.has_trailing_comma() {
+        if !list_has_trailing_comma {
             return false;
         }
 
