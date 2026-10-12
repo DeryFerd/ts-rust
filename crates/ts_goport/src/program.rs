@@ -2201,6 +2201,9 @@ struct BindQueueState {
     /// it start at a chunk start (`ArenaOffsets::aligned`), as
     /// `Lineage::add_file` joins them (lsshells M3d).
     freeable: Vec<bool>,
+    /// Bound files that wait for their offsets, by file index, with the
+    /// bind thread that bound each.
+    waiting: std::collections::BTreeMap<usize, (BoundFile, SymbolArena, usize)>,
 }
 
 impl BindQueue {
@@ -2221,6 +2224,7 @@ impl BindQueue {
                 counts: vec![None; freeable.len()],
                 offsets: vec![first],
                 freeable,
+                waiting: std::collections::BTreeMap::new(),
             }),
             changed: std::sync::Condvar::new(),
         }
@@ -2255,6 +2259,22 @@ impl BindQueueState {
         }
         self.offsets.len() > known
     }
+
+    /// The waiting file with the lowest index whose offsets are known: of
+    /// those that bind thread `thread` bound when `own`, else of all.
+    fn take_ready(
+        &mut self,
+        thread: usize,
+        own: bool,
+    ) -> Option<(usize, BoundFile, SymbolArena, ArenaOffsets)> {
+        let i = self
+            .waiting
+            .range(..self.offsets.len())
+            .find(|(_, (_, _, bound_by))| !own || *bound_by == thread)
+            .map(|(&i, _)| i)?;
+        let (bound, file_symbols, _) = self.waiting.remove(&i)?;
+        Some((i, bound, file_symbols, self.offsets[i]))
+    }
 }
 
 /// A file of at least this many nodes binds before the others
@@ -2273,9 +2293,11 @@ const BIG_BIND_FILE: usize = 1 << 15;
 // In file order that is a few files after its bind, while its data is still
 // in the cache of that core. When the largest files bound first (R204), most
 // files waited for a small early file (VS Code: mean 79 ms in a schedule
-// model), and the three passes after the bind cost 646 ms of thread time on
-// VS Code, against 117 ms with `--singleThreaded`. A large file still binds
-// first, so it does not end the bind late: its own passes run cold.
+// model), and the three passes after the bind cost 630 ms of thread time on
+// VS Code, against 117 ms with `--singleThreaded`. In file order they cost
+// 186 ms, and the bind ended 52 ms earlier (testbox, 16 bind threads). A
+// large file still binds first, so it does not end the bind late: its own
+// passes run cold.
 fn bind_order(files: &[(Node, bool)]) -> Vec<usize> {
     let nodes: Vec<usize> = files
         .iter()
@@ -2302,12 +2324,14 @@ fn bind_order(files: &[(Node, bool)]) -> Vec<usize> {
 // earlier file counts. The thread that bound the file moves them, installs
 // the file's binder output (`BoundFile::install`: the node records and the
 // `GoFile` cells) and prepares its chunks, before it binds the next file,
-// so the data is still in its core's cache (bindonce1, `bind_order`). The
-// threads stay while their files wait for offsets. The loading thread only
-// appends chunks, in file order. The ids are the ones that a join on the
-// loading thread gives. A file is installed before its chunks join the
-// lineage, but nothing reads them in between: this thread holds the lineage
-// lock until every file is joined.
+// so the data is still in its core's cache (bindonce1, `bind_order`). A
+// thread with no file left to bind, or whose bind failed, also takes the
+// ready files of the others. The threads stay while files wait for
+// offsets, so every ready file reaches the loading thread. The loading
+// thread only appends chunks, in file order. The ids are the ones that a
+// join on the loading thread gives. A file is installed before its chunks
+// join the lineage, but nothing reads them in between: this thread holds the
+// lineage lock until every file is joined.
 // PERF (progstart1): the install on the loading thread was 338 ms of the
 // 598 ms of its `bind_all` CPU over the 60 rwtime2 repos (colyseus 10.9 ms).
 fn bind_files_parallel(lineage: &mut Lineage) {
@@ -2327,28 +2351,28 @@ fn bind_files_parallel(lineage: &mut Lineage) {
         files.iter().map(|&(_, freeable)| freeable).collect(),
         lineage.symbols.next_file_offsets(),
     );
-    // The work of one bind thread, after it installed its seed. `sender`
-    // takes its files to the loading thread.
-    let run = |sender: std::sync::mpsc::Sender<ParallelBind>| {
-        // The files bound on this thread that wait for their offsets, by file
-        // index.
-        let mut waiting: std::collections::BTreeMap<usize, (BoundFile, SymbolArena)> =
-            std::collections::BTreeMap::new();
+    // The work of bind thread `thread`, after it installed its seed.
+    // `sender` takes its files to the loading thread.
+    let run = |thread: usize, sender: std::sync::mpsc::Sender<ParallelBind>| {
         // Set when a bind here made thread-local state or panicked: this
         // thread binds no more files, as they could read that state, but it
-        // still moves the files it bound before.
+        // still moves the ids of bound files.
         let mut failed = false;
         let mut state = queue.lock();
         loop {
             if state.stop {
                 break;
             }
-            // Moving ids first: the loading thread waits for it.
-            if let Some(entry) = waiting.first_entry()
-                && let Some(&offsets) = state.offsets.get(*entry.key())
-            {
+            // Moving ids first: the loading thread waits for it. A file bound
+            // here first, while its data is in this core's cache. Another
+            // thread's file only when this thread has nothing to bind: its
+            // own thread takes it after its current bind.
+            let mut ready = state.take_ready(thread, true);
+            if ready.is_none() && (failed || state.next >= order.len()) {
+                ready = state.take_ready(thread, false);
+            }
+            if let Some((i, mut bound, file_symbols, offsets)) = ready {
                 drop(state);
-                let (i, (mut bound, file_symbols)) = entry.remove_entry();
                 bound.remap(offsets);
                 // A ready file is always joined: every earlier file has its
                 // counts, so it was bound and reaches the loading thread.
@@ -2376,23 +2400,22 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                 state.binding -= 1;
                 let Some((bound, file_symbols)) = result else {
                     // Later files never get offsets now; waiting threads
-                    // check whether to stay. The earlier files bound here
-                    // still join.
+                    // check whether to stay.
                     failed = true;
                     queue.changed.notify_all();
                     let _ = sender.send((i, None));
                     continue;
                 };
                 let more = state.record(i, file_symbols.mark());
-                waiting.insert(i, (bound, file_symbols));
+                state.waiting.insert(i, (bound, file_symbols, thread));
                 if more || state.binding == 0 {
                     queue.changed.notify_all();
                 }
                 continue;
             }
-            // Nothing to bind here. Stay while a file bound here can still
-            // get its offsets from a bind in progress.
-            if waiting.is_empty() || state.binding == 0 {
+            // Nothing to bind here. Stay while a waiting file can still get
+            // its offsets from a bind in progress.
+            if state.waiting.is_empty() || state.binding == 0 {
                 break;
             }
             state = queue
@@ -2400,10 +2423,10 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        drop(state);
         // The scope ends when the thread's closure returns, but thread-locals
         // drop only at thread exit. Let go of the program tables now, so a
         // release after the bind frees them (`WorkerSeed`).
-        drop(waiting);
         drop(TABLES.with(|cache| cache.borrow_mut().take()));
     };
     let (sender, receiver) = std::sync::mpsc::channel::<ParallelBind>();
@@ -2417,15 +2440,15 @@ fn bind_files_parallel(lineage: &mut Lineage) {
         let run = &run;
         spawn_bind_thread(scope, move || {
             seed.install();
-            for _ in 1..threads {
+            for thread in 1..threads {
                 let seed = WorkerSeed::take_unbuilt();
                 let sender = sender.clone();
                 spawn_bind_thread(scope, move || {
                     seed.install();
-                    run(sender);
+                    run(thread, sender);
                 });
             }
-            run(sender);
+            run(0, sender);
         });
         // PERF (progstart1): the bind threads do not read the shared state
         // that the program makes on first use (the symlink cache), so this
@@ -2437,12 +2460,12 @@ fn bind_files_parallel(lineage: &mut Lineage) {
         // Join the files in order as they arrive.
         let mut pending = FxHashMap::default();
         let mut joined = 0;
-        for (i, result) in &receiver {
+        'join: for (i, result) in &receiver {
             pending.insert(i, result);
             while let Some(result) = pending.remove(&joined) {
                 let Some(prepared) = result else {
                     queue.stop();
-                    return false;
+                    break 'join;
                 };
                 let (file, freeable) = files[joined];
                 lineage.add_file(file.file_index(), freeable, |symbols| {
@@ -2451,10 +2474,13 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                 joined += 1;
             }
         }
-        true
+        // The join stops at a file that failed, or that no bind thread
+        // reached because each one failed first. No later file was
+        // installed: its offsets need the counts of that file.
+        joined == files.len()
     });
     if !complete {
-        // The serial bind counts the hits of the file that stopped here.
+        // The serial bind counts the hits of the files that it binds again.
         restore_unported(&unported);
     }
 }
