@@ -1726,6 +1726,17 @@ impl NodeList {
         }
     }
 
+    /// The store id and the list of a list of a static store, else `None`
+    /// (`store::store_list_value`).
+    #[inline]
+    #[must_use]
+    pub(crate) fn static_parts(self) -> Option<(usize, &'static StaticList)> {
+        match self.0 {
+            ListRef::Ts { file, list } => Some((file as usize, list)),
+            _ => None,
+        }
+    }
+
     /// The synthetic list of the handle, else `None`.
     #[inline]
     #[must_use]
