@@ -663,7 +663,9 @@ impl Checker {
             return self.get_intersection_type(&[left, right]);
         }
         let members = self.symbols.new_table();
-        let mut skipped_private_members: FxHashSet<String> = FxHashSet::default();
+        // PERF (jsxname1): names are `Name`s, so the set and the member
+        // lookups compare name ids and copy no text.
+        let mut skipped_private_members: FxHashSet<Name> = FxHashSet::default();
         let index_infos = if left == self.empty_object_type {
             self.get_index_infos_of_type(right).to_vec()
         } else {
@@ -674,7 +676,7 @@ impl Checker {
                 .get_declaration_modifier_flags_from_symbol(right_prop)
                 .intersects(ModifierFlags::PRIVATE | ModifierFlags::PROTECTED)
             {
-                let name = self.sym(right_prop).name.to_string();
+                let name = self.sym(right_prop).name.clone();
                 skipped_private_members.insert(name);
             } else if self.is_spreadable_property(right_prop) {
                 let name = self.sym(right_prop).name.clone();
@@ -684,14 +686,14 @@ impl Checker {
         }
 
         for left_prop in self.get_properties_of_type(left) {
-            let left_name = self.sym(left_prop).name.to_string();
+            let left_name = self.sym(left_prop).name.clone();
             if skipped_private_members.contains(&left_name)
                 || !self.is_spreadable_property(left_prop)
             {
                 continue;
             }
-            if self.symbols.get(members, &left_name).is_some() {
-                let right_prop = self.symbols.get(members, &left_name);
+            if self.symbols.get_name(members, &left_name).is_some() {
+                let right_prop = self.symbols.get_name(members, &left_name);
                 let right_type = self.get_type_of_symbol(right_prop);
                 if self.sym(right_prop).flags.intersects(SymbolFlags::OPTIONAL) {
                     let mut declarations: Vec<Node> = self.sym(left_prop).declarations.to_vec();
