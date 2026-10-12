@@ -2321,6 +2321,67 @@ pub(crate) mod tests {
         }
     }
 
+    /// A reader protocol that sends on `entered` when each read starts.
+    /// The reader thread then waits in that read, after its check of `ctx`
+    /// (Go :83), so a test can cancel at a known point.
+    struct ReadSignal {
+        inner: Box<dyn Protocol + Send>,
+        entered: Sender<()>,
+    }
+
+    impl Protocol for ReadSignal {
+        fn read_message(&mut self) -> Result<Message, GoError> {
+            // `run_on_reader` drops the receiver, so the send can fail.
+            let _ = self.entered.send(());
+            self.inner.read_message()
+        }
+
+        fn write_request(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.inner.write_request(id, method, params)
+        }
+
+        fn write_notification(
+            &mut self,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.inner.write_notification(method, params)
+        }
+
+        fn write_response(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            result: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.inner.write_response(id, result)
+        }
+
+        fn write_error(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            err: &jsonrpc::ResponseError,
+        ) -> Result<(), GoError> {
+            self.inner.write_error(id, err)
+        }
+    }
+
+    /// The ends of a `run_on_reader` connection: the client end of the
+    /// socket pair, the handler's notes, the result of `run` (the thread
+    /// sends it when `run` returns), the thread, and a signal at the start
+    /// of each read of the reader thread (`ReadSignal`).
+    type ReaderRun = (
+        UnixStream,
+        Receiver<String>,
+        Receiver<Result<(), String>>,
+        std::thread::JoinHandle<()>,
+        Receiver<()>,
+    );
+
     /// Runs a connection that reads on its thread (`read_on_thread`) over
     /// one end of a socket pair, with `CallbackHandler`, on a thread of its
     /// own. Returns the other end, the handler's notes and the result of
@@ -2333,9 +2394,16 @@ pub(crate) mod tests {
         Receiver<Result<(), String>>,
         std::thread::JoinHandle<()>,
     ) {
+        let (client, notes, run_done, runner, _reads) = run_on_reader_with_reads(ctx);
+        (client, notes, run_done, runner)
+    }
+
+    /// `run_on_reader`, with the start of each read (`ReaderRun`).
+    fn run_on_reader_with_reads(ctx: &Context) -> ReaderRun {
         let (client, server) = UnixStream::pair().expect("socket pair");
         let (notes, notes_rx) = mpsc::channel();
         let (run_done, run_done_rx) = mpsc::sync_channel(1);
+        let (entered, reads) = mpsc::channel();
         let ctx = ctx.clone();
         let runner = std::thread::spawn(move || {
             let server: Arc<dyn ReadWriteCloser> = Arc::new(PipeEnd::new(server));
@@ -2347,11 +2415,24 @@ pub(crate) mod tests {
             });
             let conn = new_async_conn(server.clone(), handler.clone());
             let _ = handler.conn.set(Rc::downgrade(&conn));
-            conn.read_on_thread(Box::new(new_jsonrpc_protocol(server)));
+            conn.read_on_thread(Box::new(ReadSignal {
+                inner: Box::new(new_jsonrpc_protocol(server)),
+                entered,
+            }));
             let result = conn.run(&ctx).map_err(|err| err.error());
             run_done.send(result).expect("runDone");
         });
-        (client, notes_rx, run_done_rx, runner)
+        (client, notes_rx, run_done_rx, runner, reads)
+    }
+
+    /// Waits up to 5 s for each of the next `n` reads of the reader thread
+    /// to start. After the last one the thread waits in that read.
+    fn wait_for_reads(reads: &Receiver<()>, n: usize) {
+        for _ in 0..n {
+            reads
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the reader thread starts its next read");
+        }
     }
 
     // PORT: no Go test; Go `Run` and `Call` (ipc/conn_async.go:83-87,
@@ -2570,7 +2651,7 @@ pub(crate) mod tests {
     /// and `first`.
     fn late_reply(first: &str, nested: &str) -> [String; 2] {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
         let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{first}"}}"#);
         write_framed(&client, &body);
         let call = read_framed(&client);
@@ -2579,8 +2660,8 @@ pub(crate) mod tests {
         write_framed(&client, &body);
         let note = |what: &str| notes.recv_timeout(Duration::from_secs(5)).expect(what);
         assert_eq!(note("nested ran"), format!("{nested} | start"));
-        // The reader thread waits in its next read.
-        std::thread::sleep(Duration::from_millis(50));
+        // The reader thread read ids 1 and 2 and waits in its third read.
+        wait_for_reads(&reads, 3);
         cancel();
         write_framed(&client, r#"{"jsonrpc":"2.0","id":"api1","result":true}"#);
         let both = [note("nested returned"), note("first returned")];
@@ -2621,15 +2702,15 @@ pub(crate) mod tests {
     /// and `outer`.
     fn nested_late_reply(outer: &str, inner: &str, late_id: &str) -> [String; 2] {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
         for (id, method, api) in [(1, outer, "api1"), (2, inner, "api2")] {
             let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}"}}"#);
             write_framed(&client, &body);
             let call = read_framed(&client);
             assert!(call.contains(&format!(r#""id":"{api}""#)), "{call}");
         }
-        // The reader thread waits in its next read.
-        std::thread::sleep(Duration::from_millis(50));
+        // The reader thread read ids 1 and 2 and waits in its third read.
+        wait_for_reads(&reads, 3);
         cancel();
         let body = format!(r#"{{"jsonrpc":"2.0","id":"{late_id}","result":true}}"#);
         write_framed(&client, &body);
