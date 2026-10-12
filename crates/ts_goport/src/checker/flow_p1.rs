@@ -92,11 +92,27 @@ pub struct FlowState {
     pub shared_flow_start: i32,
     pub reduce_labels: Vec<ReduceLabel>,
     /// PERF: flowcost1. Not in Go. The flow nodes of the static file of the
-    /// last step (`flow_data`) and that file's index + 1 (0: none yet). A
+    /// last step (`flow_data`, `static_file_flow_nodes`) and that file's
+    /// index + 1 (0: none yet). A
     /// walk stays in one file, so most steps read their flow node with one
     /// compare and one index, as Go reads `*flow`.
     pub flow_nodes: &'static [FlowNode],
     pub flow_nodes_file: usize,
+}
+
+/// All flow nodes of the file of `flow` when that file is in a static
+/// publish, indexed by `local_index`; `None` for any other flow node
+/// (synthetic, a freeable file version), as the static path of
+/// `FlowNodeId::get_flow_in`.
+#[inline]
+fn static_file_flow_nodes(flow: FlowNodeId) -> Option<&'static [FlowNode]> {
+    assert!(flow.is_some(), "nil flow node dereference");
+    let g = crate::ast::static_go_file(flow.file_index())?;
+    Some(
+        g.flow_nodes
+            .get()
+            .expect("flow nodes are not built for this file"),
+    )
 }
 
 impl Default for FlowState {
@@ -141,7 +157,7 @@ impl FlowState {
         flow: FlowNodeId,
         guard: &'g mut Option<FileRef<FlowNode>>,
     ) -> &'g FlowNode {
-        match flow.static_file_flow_nodes() {
+        match static_file_flow_nodes(flow) {
             Some(nodes) => {
                 self.flow_nodes = nodes;
                 self.flow_nodes_file = flow.file_index() + 1;
