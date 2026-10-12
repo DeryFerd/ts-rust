@@ -318,7 +318,9 @@ Root decision of 2026-10-11 (state note `tbxperf0-result-2026-10-11`; data in `t
   wrapper script that sets the variable and execs the bin (the start of bash counts on that side).
 - Time like against like: every Rust side is a stable build. On a testbox, build with
   `TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 TS_CARGO_JOBS=32 scripts/run-cargo-capped.sh build --release ...`.
-  PGO and BOLT builds (`build-release.sh`) stay off testboxes: the guest has no branch stack sampling.
+  Release builds (PGO and BOLT) of a revision timing run on a testbox too: `testbox.sh release-build` (see
+  "Blacksmith testboxes"). Both sides of a timing are the same kind of build: testbox builds against testbox
+  builds, never against zbook LBR builds.
 
 ## Remote runners
 
@@ -388,6 +390,7 @@ scripts/goport/testbox.sh warmup                                # about 1 min; T
 scripts/goport/testbox.sh tests <out-dir> <base results.json>   # build-goport-tests.sh, goport-tests.sh, compare-tests.py
 scripts/goport/testbox.sh np-suite <label> [<base label>]       # np-suite.sh run, then np-suite.sh diff
 scripts/goport/testbox.sh perf <label> <bin>... [-- --noEmit]   # perf.sh: instructions:u and RSS (see "Timing")
+scripts/goport/testbox.sh release-build <out-dir>               # build-release.sh at HEAD, BOLT from instrumentation counts
 scripts/goport/testbox.sh push <bins dir>                       # then run gate.sh, lsp_oracle.py or api_oracle.py as on zbook,
                                                                  # from the zbook path, so the manifest names the same scripts:
                                                                  # run bash -c 'cd /home/theo/Code/sandbox/ts-rust && GOPORT_PIN=<pin> bash scripts/goport/gate.sh ...'
@@ -465,6 +468,16 @@ scripts/goport/testbox.sh stop                                  # or release (se
     2026-10-11 both seed commits landed: `TESTBOX_IDLE=60` (78 minutes, 3.4 GiB) and `TESTBOX_IDLE=5`
     (21 minutes, 2.6 MB). The first took 18 minutes; the second 15, almost all of it the scan of the files
     that were there.
+- Release builds: `release-build` runs `crates/ts_goport/scripts/build-release.sh` at HEAD (pushed; crates/,
+  Cargo.toml and Cargo.lock clean) with `RELEASE_BOLT_PROFILE=instrument` and fetches `<out>/bin` (BUILD.txt,
+  COMMIT, bins.sha256) and the logs. `NAME=VALUE` arguments pass on to the script (`RELEASE_*`, `BOLT_*`,
+  `PGO_*`). The guest has no branch stack sampling, so `llvm-bolt -instrument` makes a counting copy of each bin,
+  which runs the same training; the five copies train at once. The step installs what the runner image lacks:
+  the script's rustc with llvm-tools, BOLT 23 from apt.llvm.org (zbook has 23.1.1) and qemu-user. The build dirs
+  are outside the sticky `target/`. On R195 source (tbxrel1, 2026-10-11) a build took 16 minutes with the
+  fetch (zbook: 17). Against the two zbook LBR builds: st instructions:u +0.04 to +0.30%, peak RSS the same or
+  up to 11% lower, mini-743d wall -4.3 to +0.5% (7 of 9 cells lower in both builds), same output. The RSS and wall come from the profile (every block that
+  ran is in the hot text, not in `.text.cold`), the instructions from the PGO build on the testbox.
 - Times (2026-10-10, cold target): `tests` 502 s (test bins 3.6 min, suite 4.7 min), `np-suite` 112 s. With
   the R189 bins: the full gate 8.4 min, the LSP batteries 3 min, the API batteries 1 min. `perf` with two bins
   (2026-10-11): 2 minutes with the warmup (perf.sh itself 47 s at 3 rounds, 76 s at 5).
@@ -486,4 +499,4 @@ scripts/goport/testbox.sh stop                                  # or release (se
     percent higher on a testbox). `gate-compare.py` compares only the Rust growth of `editor/<project>/long`
     with its cap across runs, and that growth was the same on both kinds. `side` fails when the base and the
     candidate gates are of two kinds and a long growth is within 0.15 MiB/edit of its cap.
-- Not on testboxes yet: wall timing and PGO and BOLT builds. Wall stays on mini-743d.
+- Not on testboxes: wall timing. Wall runs on dbook-lan (alvin, cup2 and mini-743d are retired).
