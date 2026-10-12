@@ -126,48 +126,54 @@ fn fast_mode_is_off_by_default() {
     fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Go's output for the `same_output_on_every_run` project, at every
-/// checker count from 1 to 4 (tsgo-oracle-fed0bf24149f; exit code 2).
-const SAME_OUTPUT_GO: &str = r#"b.ts(1,14): error TS2322: Type '"w"' is not assignable to type '"x" | "y" | "z"'.
-d.ts(1,14): error TS2322: Type '"v"' is not assignable to type '"x" | "y" | "z"'.
-e.ts(5,14): error TS2322: Type 'string' is not assignable to type 'number'.
-f.ts(2,14): error TS2322: Type '"z"' is not assignable to type '"a" | "b"'.
-"#;
+/// `Rec<300>` instantiates too deep. A checker reports TS5114 at the first
+/// reference to it that it checks and keeps the result, so a later file on
+/// the same checker gets no error. Which of `f1.ts` to `f6.ts` report it
+/// depends on which files share a checker.
+const REC_TS: &str = r#"export type Rec<N extends number, A extends unknown[] = []> = A["length"] extends N ? A : [0, ...Rec<N, [...A, 0]>];"#;
 
-/// `--fast --checkers 2` on 6 files gives Go's output in each of 5 runs:
-/// each file goes to the checker of Go's split, so no run differs.
+/// Go's output for the `same_output_on_every_run` project with
+/// `--checkers 1` (tsgo-oracle-fed0bf24149f; exit code 2).
+const SPLIT_GO_1: &str =
+    "f1.ts(2,18): error TS5114: Instantiations of type 'Rec' appear infinitely circular.
+";
+
+/// Go's output for that project with `--checkers 4`, and with no
+/// `--checkers` (tsgo-oracle-fed0bf24149f; exit code 2). Go's output is
+/// different at each count from 1 to 7.
+const SPLIT_GO_4: &str =
+    "f1.ts(2,18): error TS5114: Instantiations of type 'Rec' appear infinitely circular.
+f2.ts(2,18): error TS5114: Instantiations of type 'Rec' appear infinitely circular.
+f3.ts(2,18): error TS5114: Instantiations of type 'Rec' appear infinitely circular.
+";
+
+/// `--fast` gives Go's `--checkers N` output for its own count N in each of
+/// 5 runs, on a project whose output depends on which files share a
+/// checker. With 7 source files the count is 4 on every machine (at most
+/// one checker per 32 files, at least 4). The `--checkers 1` run shows that
+/// the port's output also depends on the split. `skipLibCheck` keeps the
+/// lib files out of the check work, so the work-stealing pass
+/// (`GOPORT_FAST_STEAL=1`) moves one of these files to another checker, and
+/// this test then fails.
 #[test]
 fn same_output_on_every_run() {
-    let files: Vec<(String, String)> = [
-        ("a.ts", r#"export const order = ["z", "y", "x"] as const;"#),
-        ("b.ts", r#"export const pick: "x" | "y" | "z" = "w";"#),
-        ("c.ts", r#"export const other = ["x", "y"] as const;"#),
-        ("d.ts", r#"export const again: "z" | "x" | "y" = "v";"#),
+    let mut files = vec![("deep.ts".to_string(), format!("{REC_TS}\n"))];
+    files.extend((1..=6).map(|i| {
         (
-            "e.ts",
-            "export class Box<T> {
-  value!: T;
-  map<U>(fn: (value: T) => U): Box<U> { return new Box<U>(); }
-}
-export const n: number = new Box<string>().map((s) => s).value;",
-        ),
-        (
-            "f.ts",
-            r#"import { order } from "./a";
-export const first: "a" | "b" = order[0];"#,
-        ),
-        (
-            "tsconfig.json",
-            r#"{ "compilerOptions": { "noEmit": true, "strict": true, "types": [], "lib": ["es2015"] }, "files": ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts"] }"#,
-        ),
-    ]
-    .iter()
-    .map(|(file, text)| ((*file).to_string(), format!("{text}\n")))
-    .collect();
+            format!("f{i}.ts"),
+            format!("import type {{ Rec }} from \"./deep\";\nexport type T{i} = Rec<300>;\n"),
+        )
+    }));
+    files.push((
+        "tsconfig.json".into(),
+        r#"{ "compilerOptions": { "noEmit": true, "strict": true, "skipLibCheck": true, "types": [], "lib": ["es2015"] }, "files": ["deep.ts", "f1.ts", "f2.ts", "f3.ts", "f4.ts", "f5.ts", "f6.ts"] }"#.into(),
+    ));
     let dir = scratch("same", &files);
+    let output = tsgo(&dir, &["--checkers", "1"], &[]);
+    assert_eq!(stdout(&output), SPLIT_GO_1);
     for run in 0..5 {
-        let output = tsgo(&dir, &["--fast", "--checkers", "2"], &[]);
-        assert_eq!(stdout(&output), SAME_OUTPUT_GO, "run {run}");
+        let output = tsgo(&dir, &["--fast"], &[]);
+        assert_eq!(stdout(&output), SPLIT_GO_4, "run {run}");
         assert_eq!(output.status.code(), Some(2), "run {run}");
     }
     fs::remove_dir_all(&dir).unwrap();
