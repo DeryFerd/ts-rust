@@ -1315,6 +1315,30 @@ impl Checker {
         None
     }
 
+    /// Go `core.SameMap` + `core.Same` of `instantiateType` over a stored
+    /// list that never changes (detached by the caller): each element is
+    /// instantiated once, in order, and `None` means no element changed.
+    /// The same calls as `map_stored_types_if_changed`, with direct reads.
+    pub fn instantiate_types_if_changed(
+        &mut self,
+        list: &[TypeId],
+        m: MapperId,
+    ) -> Option<SmallVec<[TypeId; 8]>> {
+        for (i, &value) in list.iter().enumerate() {
+            let mapped = self.instantiate_type(value, m);
+            if mapped != value {
+                let mut result: SmallVec<[TypeId; 8]> = SmallVec::with_capacity(list.len());
+                result.extend_from_slice(&list[..i]);
+                result.push(mapped);
+                for &value in &list[i + 1..] {
+                    result.push(self.instantiate_type(value, m));
+                }
+                return Some(result);
+            }
+        }
+        None
+    }
+
     // Go: checker/checker.go:22352 getTypeArguments
     pub fn get_type_arguments(&mut self, t: TypeId) -> SharedList<TypeId> {
         if let Some(count) = self.resolve_type_arguments(t) {
@@ -2243,13 +2267,29 @@ impl Checker {
                 {
                     // PORT: Go `core.Same` on the `instantiateTypes` result
                     // is "no element changed" (`None`) here.
-                    let count = self.ty(t).as_type_reference().resolved_type_arguments.len();
-                    let Some(new_type_arguments) = self.map_stored_types_if_changed(
-                        t,
-                        count,
-                        |c, t, i| c.ty(t).as_type_reference().resolved_type_arguments[i],
-                        &mut |c, a| c.instantiate_type(a, m),
-                    ) else {
+                    // PERF (instfast1): the stored list never changes, so it
+                    // is detached once (`instantiate_types_if_changed`). An
+                    // owned list (a multi-program process) is read in place.
+                    let mut buf = SharedListBuf::<TypeId>::default();
+                    let changed = match self
+                        .ty(t)
+                        .as_type_reference()
+                        .resolved_type_arguments
+                        .detach(&mut buf)
+                    {
+                        Some(list) => self.instantiate_types_if_changed(list, m),
+                        None => {
+                            let count =
+                                self.ty(t).as_type_reference().resolved_type_arguments.len();
+                            self.map_stored_types_if_changed(
+                                t,
+                                count,
+                                |c, t, i| c.ty(t).as_type_reference().resolved_type_arguments[i],
+                                &mut |c, a| c.instantiate_type(a, m),
+                            )
+                        }
+                    };
+                    let Some(new_type_arguments) = changed else {
                         return t;
                     };
                     let target = self.ty(t).target();
@@ -2274,17 +2314,35 @@ impl Checker {
                     source = origin;
                 }
             }
-            let count = self.ty(source).types().len();
-            let changed =
-                self.map_stored_types_if_changed(source, count, Checker::type_at, &mut |c, u| {
-                    c.instantiate_type(u, m)
-                });
+            // PERF (instfast1): the constituents never change, so the list
+            // is detached once (`instantiate_types_if_changed`). An owned
+            // list (a multi-program process) is read in place.
+            let mut buf = SharedListBuf::<TypeId>::default();
+            let detached = self
+                .ty(source)
+                .as_union_or_intersection_type()
+                .types
+                .detach(&mut buf);
+            let changed = match detached {
+                Some(list) => self.instantiate_types_if_changed(list, m),
+                None => {
+                    let count = self.ty(source).types().len();
+                    self.map_stored_types_if_changed(
+                        source,
+                        count,
+                        Checker::type_at,
+                        &mut |c, u| c.instantiate_type(u, m),
+                    )
+                }
+            };
             if changed.is_none() && alias.symbol() == self.ty(t).alias.symbol() {
                 return t;
             }
             let unchanged;
             let new_types: &[TypeId] = if let Some(types) = &changed {
                 types
+            } else if let Some(list) = detached {
+                list
             } else {
                 unchanged = self.ty(source).types_list();
                 &unchanged
