@@ -2377,31 +2377,41 @@ impl FileStore {
 #[inline(never)]
 fn identifier_name(text: &str) -> (Name, bool) {
     let hash = Name::text_hash(text);
-    IDENTIFIER_NAMES.with(|names| {
-        let mut names = names.borrow_mut();
-        if let Some((stored, name, text_is_keyword)) = names.get(&hash) {
-            if *stored == text {
-                return (name.clone(), *text_is_keyword);
+    // Without the cache: a text whose hash the cache has for another text,
+    // or a call after the thread-local destructors ran (`try_with` fails,
+    // as in `Name::intern_hashed`).
+    let uncached = || {
+        (
+            Name::intern_hashed(text, hash).0,
+            get_identifier_token(text) != SyntaxKind::Identifier,
+        )
+    };
+    IDENTIFIER_NAMES
+        .try_with(|names| {
+            let mut names = names.borrow_mut();
+            if let Some((stored, name, text_is_keyword)) = names.get(&hash) {
+                if *stored == text {
+                    return (name.clone(), *text_is_keyword);
+                }
+                // Another text has the same 64-bit hash: no entry for this one.
+                return uncached();
             }
-            // Another text has the same 64-bit hash: no entry for this one.
-            return (
-                Name::intern_hashed(text, hash).0,
-                get_identifier_token(text) != SyntaxKind::Identifier,
-            );
-        }
-        let (name, stored) = Name::intern_hashed(text, hash);
-        let text_is_keyword = get_identifier_token(text) != SyntaxKind::Identifier;
-        if names.len() >= IDENTIFIER_NAMES_CAP {
-            names.clear();
-        }
-        names.insert(hash, (stored, name.clone(), text_is_keyword));
-        (name, text_is_keyword)
-    })
+            let (name, stored) = Name::intern_hashed(text, hash);
+            let text_is_keyword = get_identifier_token(text) != SyntaxKind::Identifier;
+            if names.len() >= IDENTIFIER_NAMES_CAP {
+                names.clear();
+            }
+            names.insert(hash, (stored, name.clone(), text_is_keyword));
+            (name, text_is_keyword)
+        })
+        .unwrap_or_else(|_| uncached())
 }
 
 /// The most texts `IDENTIFIER_NAMES` keeps; a full cache starts again.
-/// About 1.5 MiB per parsing thread, so a language server that parses for
-/// days keeps a bounded cache.
+/// About 2.06 MiB per parsing thread on 64-bit: past 28,672 entries the map
+/// has 65,536 buckets of 33 bytes (a `u64` key, a 24-byte value and a
+/// control byte), and `clear` keeps them. So a language server that parses
+/// for days keeps a bounded cache.
 const IDENTIFIER_NAMES_CAP: usize = 1 << 15;
 
 thread_local! {
