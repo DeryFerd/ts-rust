@@ -320,6 +320,46 @@ fn test_get_source_file_for_resolved_module_uses_resolved_path() {
     );
 }
 
+// PORT: no Go test. Go program.go:2098 looks up `ResolvedPath` as it is,
+// so an empty path misses even when a file has the resolved name (no
+// resolver makes such a resolution). The port did a `to_path` of the name.
+#[test]
+fn test_get_source_file_for_resolved_module_empty_path_misses() {
+    in_child(
+        module_path!(),
+        "test_get_source_file_for_resolved_module_empty_path_misses",
+        || {
+            let map_fs = MapFs::from_map(
+                Vec::<(String, MapFile)>::new(),
+                true, /*useCaseSensitiveFileNames*/
+            );
+            install_map_fs(&map_fs, "/");
+            let _ = map_fs
+                .fs()
+                .write_file("/resolved.ts", "export const x = 1;\n");
+            let program = new_program(
+                map_fs.fs(),
+                "/",
+                &["/resolved.ts"],
+                CompilerOptions {
+                    no_lib: Tristate::True,
+                    ..Default::default()
+                },
+            );
+            let resolved = ts_goport::program::ResolvedModule {
+                resolved_file_name: "/resolved.ts".to_string(),
+                ..Default::default()
+            };
+            let got = program.get_source_file_for_resolved_module(&resolved);
+            assert!(
+                got.is_none(),
+                "GetSourceFileForResolvedModule() = {:?}, want nil",
+                got.map(|file| file.parse_options.file_name.clone())
+            );
+        },
+    );
+}
+
 // Go: compiler/program_test.go:271 TestIncludeProcessorDiagnosticsWithMissingFileCasing
 #[test]
 fn test_include_processor_diagnostics_with_missing_file_casing() {

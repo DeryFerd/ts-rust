@@ -215,9 +215,12 @@ impl AliasResolver {
     // Go: ls/autoimport/aliasresolver.go:80 GetSourceFile
     // GetSourceFile implements checker.Program.
     pub fn get_source_file(&self, file_name: &str) -> Node {
-        let file = self
-            .host
-            .get_source_file(file_name, &(self.to_path)(file_name));
+        self.get_source_file_at(file_name, &(self.to_path)(file_name))
+    }
+
+    // Go: ls/autoimport/aliasresolver.go:83 getSourceFile
+    fn get_source_file_at(&self, file_name: &str, path: &tspath::Path) -> Node {
+        let file = self.host.get_source_file(file_name, path);
         // file may be nil due to symlink/realpath mismatch; see TestAutoImportBuilderFS
         if file.is_nil() {
             return Node::NIL;
@@ -301,10 +304,13 @@ impl AliasResolver {
         resolved
     }
 
-    // Go: ls/autoimport/aliasresolver.go:130 GetSourceFileForResolvedModule
+    // Go: ls/autoimport/aliasresolver.go:137 GetSourceFileForResolvedModule
     // GetSourceFileForResolvedModule implements checker.Program.
-    pub fn get_source_file_for_resolved_module(&self, file_name: &str) -> Node {
-        self.get_source_file(file_name)
+    pub fn get_source_file_for_resolved_module(&self, resolved: &ResolvedModule) -> Node {
+        match resolved.path() {
+            Some(path) => self.get_source_file_at(&resolved.resolved_file_name, path),
+            None => self.get_source_file(&resolved.resolved_file_name),
+        }
     }
 
     // Go: ls/autoimport/aliasresolver.go:135 GetResolvedModules
@@ -478,8 +484,8 @@ impl AliasResolverProgram for AliasResolver {
         self.get_source_file(file_name)
     }
 
-    fn source_file_for_resolved_module(&self, file_name: &str) -> Node {
-        self.get_source_file_for_resolved_module(file_name)
+    fn source_file_for_resolved_module(&self, resolved: &ResolvedModule) -> Node {
+        self.get_source_file_for_resolved_module(resolved)
     }
 
     fn resolved_module(

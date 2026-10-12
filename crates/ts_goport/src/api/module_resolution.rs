@@ -498,7 +498,9 @@ impl Session {
             contexts: self.program_resolution_contexts.clone(),
             conn,
             current_directory: self.get_current_directory(),
-            use_case_sensitive: self.fs().use_case_sensitive_file_names(),
+            // Go `f.session.caseSensitivity()` (module_resolution.go:64): the
+            // snapshot host's file system, not the project session's.
+            use_case_sensitive: self.use_case_sensitive_file_names(),
         })))
     }
 }
@@ -592,7 +594,8 @@ impl Session {
         let provider = compile_module_resolution_spec(
             params.module_resolutions.as_ref(),
             &self.get_current_directory(),
-            self.fs().use_case_sensitive_file_names(),
+            // Go `s.caseSensitivity()` (module_resolution.go:291).
+            self.use_case_sensitive_file_names(),
         )?;
         self.next_module_resolver_id
             .set(self.next_module_resolver_id.get() + 1);
@@ -732,7 +735,8 @@ impl Session {
                 conn: self.conn.borrow().clone(),
                 ctx: ctx.clone(),
                 current_directory: cwd,
-                use_case_sensitive: self.fs().use_case_sensitive_file_names(),
+                // Go `s.caseSensitivity()` (module_resolution.go:376).
+                use_case_sensitive: self.use_case_sensitive_file_names(),
                 snapshot: params.snapshot,
                 program_resolution_context_id: params.in_progress_snapshot,
                 fallback_resolver: resolver,

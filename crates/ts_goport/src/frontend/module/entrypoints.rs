@@ -39,6 +39,9 @@ pub struct ResolvedEntrypoint {
     pub original_file_name: String,
     // ResolvedFileName is the real path to the entrypoint file.
     pub resolved_file_name: String,
+    /// ts#64159 (Go N' resolver.go:2394 `ResolvedPath`): the path of
+    /// `resolved_file_name`, made by the resolver.
+    pub resolved_path: Path,
     pub module_specifier: String,
     // Ending indicates whether the file name and extension portion of ModuleSpecifier is fixed or can be changed.
     pub ending: Ending,
@@ -203,6 +206,12 @@ impl DefaultResolver {
         }
         Rc::new(ResolvedEntrypoint {
             original_file_name,
+            // ts#64159 (resolver.go:2489)
+            resolved_path: to_path(
+                &resolved_file_name,
+                &self.host.get_current_directory(),
+                self.host.fs().use_case_sensitive_file_names(),
+            ),
             resolved_file_name,
             module_specifier: module_specifier.to_string(),
             include_conditions,

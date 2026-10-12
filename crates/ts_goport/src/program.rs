@@ -97,7 +97,7 @@ pub struct ResolvedModule {
     pub resolved_file_name: String,
     /// ts#64159 (Go N' module/types.go:90 `ResolvedPath`): the path of
     /// `resolved_file_name`, made by the resolver that gave the answer.
-    /// Empty when nothing resolved; then a reader uses `to_path` of the name.
+    /// Empty when nothing resolved, as in Go: a lookup by it then misses.
     pub resolved_path: tspath::Path,
     pub original_path: String,
     pub extension: String,
@@ -121,12 +121,13 @@ impl ResolvedModule {
         !self.resolved_file_name.is_empty()
     }
 
-    /// `resolved_path` for a reader: `None` when it is empty or
-    /// `GOPORT_RESOLVED_PATH` is `0`, so the reader makes the path from the
-    /// name (the code before ts#64159; an A/B switch).
+    /// `resolved_path` for a reader, empty or not, as Go reads
+    /// `ResolvedPath`. `None` when `GOPORT_RESOLVED_PATH` is `0`: the reader
+    /// then makes the path from the name (the code before ts#64159; an A/B
+    /// switch).
     #[must_use]
     pub fn path(&self) -> Option<&tspath::Path> {
-        (!self.resolved_path.is_empty() && resolved_paths_enabled()).then_some(&self.resolved_path)
+        resolved_paths_enabled().then_some(&self.resolved_path)
     }
 }
 
@@ -1401,7 +1402,7 @@ pub trait AliasResolverProgram {
     /// Go `GetSourceFile`.
     fn source_file(&self, file_name: &str) -> Node;
     /// Go `GetSourceFileForResolvedModule`.
-    fn source_file_for_resolved_module(&self, file_name: &str) -> Node;
+    fn source_file_for_resolved_module(&self, resolved: &ResolvedModule) -> Node;
     /// Go `GetResolvedModule`.
     fn resolved_module(
         &self,
@@ -3282,17 +3283,20 @@ thread_local! {
 }
 
 // Go: compiler/program.go:2098 GetSourceFileForResolvedModule
-// PORT: the answer is memoized per thread and program. The files, their
-// paths and the redirects of a program do not change after load, so a name
+// ts#64159: a lookup by the resolution's path (`ResolvedModule::path`).
+// PORT: the answer is memoized per thread and program by file name. The
+// files, their paths and the redirects of a program do not change after
+// load, and one program's resolvers give one path for a name, so a name
 // always gives the same file. The checker asks again on each alias and
-// default-import check, and each lookup canonicalizes the path. Another
-// program version can give another file (an edited file has a new id), so
-// the memo is emptied when the current program changes.
-pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
-    // Go: ls/autoimport/aliasresolver.go:130 GetSourceFileForResolvedModule
+// default-import check. Another program version can give another file (an
+// edited file has a new id), so the memo is emptied when the current
+// program changes.
+pub fn get_source_file_for_resolved_module(resolved: &ResolvedModule) -> Node {
+    // Go: ls/autoimport/aliasresolver.go:137 GetSourceFileForResolvedModule
     if let Some(resolver) = alias_resolver() {
-        return resolver.source_file_for_resolved_module(file_name);
+        return resolver.source_file_for_resolved_module(resolved);
     }
+    let file_name = resolved.resolved_file_name.as_str();
     let program = prog().id;
     let hit = RESOLVED_MODULE_FILES.with_borrow_mut(|memo| {
         if memo.program != program {
@@ -3305,7 +3309,10 @@ pub fn get_source_file_for_resolved_module(file_name: &str) -> Node {
     if let Some(file) = hit {
         return file;
     }
-    let mut file = get_source_file(file_name);
+    let mut file = match resolved.path() {
+        Some(path) => get_source_file_by_path(path.as_str()),
+        None => get_source_file(file_name),
+    };
     if file.is_nil()
         && let Some(redirect) =
             with_go(|go| go.get_parse_file_redirect(file_name).map(str::to_string))

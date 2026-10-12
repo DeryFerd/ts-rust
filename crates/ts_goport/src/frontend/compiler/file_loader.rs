@@ -13,6 +13,7 @@ use crate::contentmapper::{
 use crate::frontend::prelude::*;
 use crate::gostd::{GoError, errors};
 use crate::spanmap::{MappingError, MappingErrorKind};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -508,6 +509,10 @@ thread_local! {
     /// name and whether the loader could use it (`FilePrep::fits`).
     static PREP_FITS: std::cell::RefCell<Vec<(String, bool)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Each file whose taken prep gave the worker's import names
+    /// (`FilePrep::names`), in the loads on this thread.
+    static PREPS_NAMED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -859,12 +864,11 @@ impl FileLoader {
         )
     }
 
-    /// Go `resolved.ResolvedPath` of a resolved module (ts#64159). PORT: a
-    /// resolution that a resolver made without the path (none should), or
-    /// `GOPORT_RESOLVED_PATH=0`, gets the loader's `to_path` of its name.
-    pub fn resolved_path(&self, resolved: &ResolvedModule) -> Path {
+    /// Go `resolved.ResolvedPath` of a resolved module (ts#64159). PORT:
+    /// `GOPORT_RESOLVED_PATH=0` gets the loader's `to_path` of its name.
+    pub fn resolved_path<'r>(&self, resolved: &'r ResolvedModule) -> Cow<'r, Path> {
         let Some(path) = resolved.path() else {
-            return self.to_path(&resolved.resolved_file_name);
+            return Cow::Owned(self.to_path(&resolved.resolved_file_name));
         };
         debug_assert_eq!(
             *path,
@@ -872,7 +876,7 @@ impl FileLoader {
             "resolved path of {}",
             resolved.resolved_file_name
         );
-        path.clone()
+        Cow::Borrowed(path)
     }
 
     // Go: fileloader.go:242 (*fileLoader).addRootTask
@@ -1805,8 +1809,11 @@ impl FileLoader {
                     Some(&options_for_file),
                     &mut file_emit_mode,
                 );
-                // The worker resolved name `index` with one mode for the
-                // whole file (`guess_import_mode`): most names have it.
+                // The worker resolved name `index` with the mode of the
+                // usage it read (`FilePrep::names`), or with the mode of a
+                // plain import (`guess_import_mode`) for a synthetic import
+                // or without the names. `answer` gives it only when that
+                // mode is `mode`.
                 let taken = prep
                     .as_ref()
                     .and_then(|prep| prep.answer(index, mode))
@@ -1845,6 +1852,8 @@ impl FileLoader {
                 }
 
                 let resolved_file_name = &resolved_module.resolved_file_name;
+                // Made once: the JS file test and the subtask both read it.
+                let resolved_path = self.resolved_path(&resolved_module);
                 let is_from_node_modules_search = resolved_module.is_external_library_import;
                 // Don't treat redirected files as JS files.
                 // tsgo#4712: nor files resolved through a content mapper extension.
@@ -1858,7 +1867,7 @@ impl FileLoader {
                         .borrow()
                         .get_redirect_parsed_command_line_for_resolution(&new_has_file_name(
                             resolved_file_name,
-                            &self.resolved_path(&resolved_module),
+                            &resolved_path,
                         ))
                         .is_none();
                 let is_js_file_from_node_modules = is_from_node_modules_search
@@ -1888,7 +1897,7 @@ impl FileLoader {
                     t.add_sub_task(
                         ResolvedRef {
                             file_name: resolved_file_name.clone(),
-                            path: self.resolved_path(&resolved_module),
+                            path: resolved_path.into_owned(),
                             increase_depth: resolved_module.is_external_library_import,
                             elide_on_depth: is_js_file_from_node_modules,
                             include_reason: Some(new_file_include_reason(
@@ -1907,6 +1916,10 @@ impl FileLoader {
             }
 
             if prep.is_some() {
+                #[cfg(test)]
+                if named {
+                    PREPS_NAMED.with(|files| files.borrow_mut().push(file_name.to_string()));
+                }
                 note_prep_taken();
                 note_names_own(names_own);
                 count_prep(|c| {
@@ -2010,7 +2023,7 @@ impl FileLoader {
             let (resolution, trace) = self.resolve_library(&library_name, &resolve_from);
             if resolution.is_resolved() {
                 path = resolution.resolved_file_name.clone();
-                path_key = Some(self.resolved_path(&resolution));
+                path_key = Some(self.resolved_path(&resolution).into_owned());
                 replaced = true;
             }
             self.path_for_lib_file_resolutions
@@ -2531,9 +2544,10 @@ fn emit_syntax_for_usage(
 
 /// Go `getModeForUsageLocation` (with `options`) for a plain `import ..
 /// from` or `export .. from` in `file_name`, the most common form. A parse
-/// worker has no import nodes after the parse, so it resolves each import
-/// with this mode. A wrong guess only resolves another cache key: the
-/// loader resolves each import with its real mode.
+/// worker resolves the synthetic imports with this mode, and the imports
+/// too when it did not read their usages (`GOPORT_LOAD_NAMES=0`). A wrong
+/// guess only resolves another cache key: the loader resolves each import
+/// with its real mode.
 pub(crate) fn guess_import_mode(
     file_name: &str,
     meta: &SourceFileMetaData,
@@ -2637,7 +2651,7 @@ pub(crate) fn get_jsx_implicit_import_base_of_file(
 #[cfg(test)]
 mod tests {
     use super::super::files_parser::{
-        names_own, preps_taken, set_load_names, set_load_prep, set_meta_wait,
+        names_own, preps_taken, set_load_names, set_load_prep, set_meta_wait, set_prep_wait,
     };
     use super::*;
     use crate::frontend::bundled;
@@ -3005,7 +3019,9 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
     // both ways, `export .. from`) in node16 CJS and ESM files, JSDoc imports
     // in TS and JS files, a source phase import, synthetic imports and a
     // module augmentation. With the names, the loader resolves no import of
-    // a file whose prep it took (only the module augmentation).
+    // a file whose prep it took (only the module augmentation). The load
+    // with names waits for each worker's metadata and prep, so a.ts and
+    // b.ts always take the worker's names.
     #[test]
     fn worker_names_give_the_same_load() {
         let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "allowJs": true,
@@ -3091,11 +3107,19 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
 "#,
             ),
         ];
+        // With no parse workers the loader reads every file itself.
+        let workers = super::super::files_parser::parse_workers_enabled();
         set_load_prep(Some(true));
         set_load_names(Some(true));
+        set_meta_wait(workers);
+        set_prep_wait(workers);
+        PREPS_NAMED.with(|files| files.borrow_mut().clear());
         let (taken, own) = (preps_taken(), names_own());
         let with_names = parallel_load("names_on", tsconfig, &files);
         let (taken, own) = (preps_taken() - taken, names_own() - own);
+        let named = PREPS_NAMED.with(|files| std::mem::take(&mut *files.borrow_mut()));
+        set_meta_wait(false);
+        set_prep_wait(false);
         set_load_names(Some(false));
         let without_names = parallel_load("names_off", tsconfig, &files);
         set_load_names(None);
@@ -3112,8 +3136,14 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
             with_names.contains(r#"module "lib" ModuleKind(99)"#),
             "{with_names}"
         );
-        if super::super::files_parser::parse_workers_enabled() {
+        if workers {
             assert!(taken > 0, "no prep taken:\n{with_names}");
+            for file in ["/src/esm/a.ts", "/src/b.ts"] {
+                assert!(
+                    named.iter().any(|name| name.ends_with(file)),
+                    "{file} took no named prep: {named:?}"
+                );
+            }
             // Only the module augmentation of b.ts: the workers resolve the
             // synthetic imports and the imports.
             assert!(
