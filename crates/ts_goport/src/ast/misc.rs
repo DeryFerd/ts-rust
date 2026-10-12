@@ -105,6 +105,11 @@ pub const INTERNAL_SYMBOL_NAME_INSTANTIATION_EXPRESSION: &str =
     "\u{FDD0}\u{10F7FE}instantiationExpression"; // Instantiation expressions
 pub const INTERNAL_SYMBOL_NAME_IMPORT_ATTRIBUTES: &str = "\u{FDD0}\u{10F7FE}importAttributes";
 pub const INTERNAL_SYMBOL_NAME_EXPORT_EQUALS: &str = "export="; // Export assignment symbol
+/// `INTERNAL_SYMBOL_NAME_EXPORT_EQUALS` as a `Name`, interned once, so a
+/// table lookup of it compares ids and hashes no text.
+// PERF (jsxname1): the module resolution lookups of `export=`.
+pub static EXPORT_EQUALS_NAME: std::sync::LazyLock<Name> =
+    std::sync::LazyLock::new(|| Name::from(INTERNAL_SYMBOL_NAME_EXPORT_EQUALS));
 pub const INTERNAL_SYMBOL_NAME_DEFAULT: &str = "default"; // Default export symbol (technically not wholly internal, but included here for usability)
 pub const INTERNAL_SYMBOL_NAME_THIS: &str = "this";
 pub const INTERNAL_SYMBOL_NAME_MODULE_EXPORTS: &str = "module.exports";

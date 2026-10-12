@@ -533,7 +533,9 @@ impl Checker {
         if contextual_type.is_nil() {
             return;
         }
-        let prop = self.get_property_of_type(contextual_type, name.text());
+        // PERF (jsxname1): the property name's `Name` (`text_name`), so the
+        // lookup compares name ids.
+        let prop = self.get_property_of_type(contextual_type, &name.text_name());
         if prop.is_nil() || self.sym(prop).declarations.is_empty() {
             return;
         }

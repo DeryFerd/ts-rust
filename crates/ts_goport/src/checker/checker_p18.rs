@@ -574,10 +574,9 @@ impl Checker {
         };
         let mut original_module = SymbolId::NIL;
         if module_symbol.is_some() {
-            let export_equals = self.symbols.get(
-                self.sym(module_symbol).exports,
-                INTERNAL_SYMBOL_NAME_EXPORT_EQUALS,
-            );
+            let export_equals = self
+                .symbols
+                .get(self.sym(module_symbol).exports, &*EXPORT_EQUALS_NAME);
             if self
                 .resolve_symbol_ex(export_equals, false /*dontResolveAlias*/)
                 .is_some()
