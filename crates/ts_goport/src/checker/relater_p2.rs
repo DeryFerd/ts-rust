@@ -347,8 +347,13 @@ impl Checker {
     }
 
     // Go: checker/relater.go:1080 isDiscriminantProperty
-    pub fn is_discriminant_property(&mut self, t: TypeId, name: &str) -> bool {
-        self.is_discriminant_property_key(t, TableKey::Text(name))
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`).
+    pub fn is_discriminant_property<'a>(
+        &mut self,
+        t: TypeId,
+        name: impl Into<TableKey<'a>>,
+    ) -> bool {
+        self.is_discriminant_property_key(t, name.into())
     }
 
     /// `is_discriminant_property` by `TableKey`.

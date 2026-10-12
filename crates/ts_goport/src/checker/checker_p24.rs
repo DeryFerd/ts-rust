@@ -122,8 +122,13 @@ impl Checker {
      * return the symbol for that property. Otherwise return undefined.
      */
     // Go: checker/checker.go:21807 getPropertyOfObjectType
-    pub fn get_property_of_object_type(&mut self, t: TypeId, name: &str) -> SymbolId {
-        self.get_property_of_object_type_key(t, TableKey::Text(name))
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`).
+    pub fn get_property_of_object_type<'a>(
+        &mut self,
+        t: TypeId,
+        name: impl Into<TableKey<'a>>,
+    ) -> SymbolId {
+        self.get_property_of_object_type_key(t, name.into())
     }
 
     /// `get_property_of_object_type` by `TableKey`. A `Name` key compares
@@ -140,15 +145,16 @@ impl Checker {
     }
 
     // Go: checker/checker.go:21818 getPropertyOfUnionOrIntersectionType
-    pub fn get_property_of_union_or_intersection_type(
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`).
+    pub fn get_property_of_union_or_intersection_type<'a>(
         &mut self,
         t: TypeId,
-        name: &str,
+        name: impl Into<TableKey<'a>>,
         skip_object_function_property_augment: bool,
     ) -> SymbolId {
         self.get_property_of_union_or_intersection_type_key(
             t,
-            TableKey::Text(name),
+            name.into(),
             skip_object_function_property_augment,
         )
     }
@@ -183,15 +189,16 @@ impl Checker {
     // these partial properties when identifying discriminant properties, but otherwise they are filtered out
     // and do not appear to be present in the union type.
     // Go: checker/checker.go:21832 getUnionOrIntersectionProperty
-    pub fn get_union_or_intersection_property(
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`).
+    pub fn get_union_or_intersection_property<'a>(
         &mut self,
         t: TypeId,
-        name: &str,
+        name: impl Into<TableKey<'a>>,
         skip_object_function_property_augment: bool,
     ) -> SymbolId {
         self.get_union_or_intersection_property_key(
             t,
-            TableKey::Text(name),
+            name.into(),
             skip_object_function_property_augment,
         )
     }
