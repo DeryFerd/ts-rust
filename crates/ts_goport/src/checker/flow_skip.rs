@@ -254,11 +254,13 @@ pub struct FlowSkip {
     /// `FIRST_GAP` up to this many walks.
     pub sample_every: u32,
     files: FxHashMap<u32, FileState>,
-    /// The last counted file (`NONE`: none) and its live count. Its entry in
-    /// `files` is stale until another counted file takes its place, so a
-    /// walk that only counts needs no map lookup (a lookup per walk cost
-    /// VS Code +0.17% instructions).
-    hot_file: u32,
+    /// The last counted file and its live count. Its entry in `files` is
+    /// stale until another counted file takes its place, so a walk that only
+    /// counts needs no map lookup (a lookup per walk cost VS Code +0.17%
+    /// instructions). An `Option`, not a `NONE` sentinel: `NONE` is the
+    /// synthetic flow file (`SYNTHETIC_FLOW_FILE`), which must reach the
+    /// lookup and become `Unsupported`.
+    hot_file: Option<u32>,
     hot: Count,
     /// Port counter of effect sites, read by verify mode: effects signature
     /// misses, `ensureAssignmentsMarked` writes, `isExhaustiveSwitchStatement`
@@ -287,7 +289,7 @@ impl Default for FlowSkip {
             min_steps: tuning("GOPORT_FLOWSKIP_MIN_STEPS", 8),
             sample_every: tuning("GOPORT_FLOWSKIP_SAMPLE_EVERY", SAMPLE_EVERY).max(1),
             files: FxHashMap::default(),
-            hot_file: NONE,
+            hot_file: None,
             hot: Count {
                 countdown: 0,
                 gap: 0,
@@ -1505,7 +1507,7 @@ impl Checker {
         // The common case where no file is indexed (VS Code): a walk of the
         // hot counted file that is not measured pays only the countdown.
         let fs = &mut self.flow_skip;
-        if flow.file_index() as u32 == fs.hot_file
+        if fs.hot_file == Some(flow.file_index() as u32)
             && fs.hot.countdown > 1
             && self.inline_level == 0
             && fs.trace.is_none()
@@ -1560,7 +1562,7 @@ impl Checker {
             return Err(Refusal::Inline);
         }
         let file = flow.file_index();
-        if file as u32 != self.flow_skip.hot_file {
+        if self.flow_skip.hot_file != Some(file as u32) {
             let count = match self.flow_skip.files.entry(file as u32) {
                 std::collections::hash_map::Entry::Occupied(entry) => match entry.into_mut() {
                     FileState::Unsupported => return Err(Refusal::File),
@@ -1587,14 +1589,16 @@ impl Checker {
             if let Some(count) = count {
                 // The hot file's count goes back to its entry.
                 let fs = &mut self.flow_skip;
-                if let Some(FileState::Counting(old)) = fs.files.get_mut(&fs.hot_file) {
+                if let Some(hot_file) = fs.hot_file
+                    && let Some(FileState::Counting(old)) = fs.files.get_mut(&hot_file)
+                {
                     *old = fs.hot;
                 }
-                fs.hot_file = file as u32;
+                fs.hot_file = Some(file as u32);
                 fs.hot = count;
             }
         }
-        if file as u32 == self.flow_skip.hot_file {
+        if self.flow_skip.hot_file == Some(file as u32) {
             let sample_every = self.flow_skip.sample_every;
             let hot = &mut self.flow_skip.hot;
             if hot.need > 0 {
@@ -1627,7 +1631,7 @@ impl Checker {
             self.flow_skip
                 .files
                 .insert(file as u32, FileState::Built(Box::new(index)));
-            self.flow_skip.hot_file = NONE;
+            self.flow_skip.hot_file = None;
             let stats = &mut self.flow_skip.stats;
             stats.built += 1;
             stats.built_nodes += flows.len() as u64;
@@ -2234,6 +2238,49 @@ mod tests {
             .filter(|(t, e, _)| t == text && *e == end)
             .map(|(_, _, skipped)| *skipped)
             .collect()
+    }
+
+    /// A flow id in the synthetic flow file reaches the file lookup and is
+    /// refused there. With a `u32::MAX` "no hot file" sentinel it matched
+    /// the empty hot file and panicked at "a counted file is static".
+    #[test]
+    fn synthetic_flow_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "ts_goport_flowskip_synthetic_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), "export const a = 1;\n").unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "types": [] }, "files": ["a.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = crate::program::try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scope = crate::core::enter_program(Some(program));
+        let file = program
+            .source_files()
+            .find(|file| file.info.file_name.ends_with("/a.ts"))
+            .expect("a.ts is not in the program")
+            .root;
+        let (result, unsupported) =
+            crate::program::with_type_checker_for_file(file, move |checker| {
+                checker.flow_skip.build_steps = 0;
+                let flow = FlowNodeId::new(SYNTHETIC_FLOW_FILE, 0);
+                let result = checker.flow_skip_test(file, checker.any_type, file, flow);
+                let unsupported = matches!(
+                    checker.flow_skip.files.get(&(SYNTHETIC_FLOW_FILE as u32)),
+                    Some(FileState::Unsupported)
+                );
+                (result, unsupported)
+            });
+        drop(scope);
+        crate::program::release_program(program);
+        assert_eq!(result, None);
+        assert!(unsupported);
     }
 
     /// Plain walks through conditions on other names are skipped, and
