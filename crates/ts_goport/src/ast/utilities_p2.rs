@@ -10,16 +10,21 @@ use crate::prelude::*;
 
 // Go: ast/utilities.go:911 FindAncestor
 /// Walks up the parents of a node to find the ancestor that matches the callback.
-// PERF: checkid1. The parent steps go through views (`find_ancestor_ref`):
-// a parent in the same store costs no registry lookup. Same nodes, same
-// order.
-#[inline]
-pub fn find_ancestor(node: Node, mut callback: impl FnMut(Node) -> bool) -> Node {
-    find_ancestor_ref(node, |n| callback(n.node()))
+pub fn find_ancestor(mut node: Node, mut callback: impl FnMut(Node) -> bool) -> Node {
+    while node.is_some() {
+        if callback(node) {
+            return node;
+        }
+        node = node.parent();
+    }
+    Node::NIL
 }
 
 /// `find_ancestor` whose callback gets the view of each node (`NodeRef`):
-/// its kind and parent reads cost no registry lookup either.
+/// a parent in the same store, and the kind and parent reads of the
+/// callback, cost no registry lookup. Same nodes, same order.
+// PERF: checkid1. For the hot walks of the identifier and property access
+// checks, which go to the root or near it.
 #[inline]
 pub fn find_ancestor_ref(node: Node, mut callback: impl FnMut(NodeRef) -> bool) -> Node {
     let mut node = NodeRef::new(node);
@@ -107,13 +112,20 @@ pub fn to_find_ancestor_result(b: bool) -> FindAncestorResult {
 
 // Go: ast/utilities.go:967 FindAncestorOrQuit
 /// Walks up the parents of a node to find the ancestor that matches the callback.
-// PERF: checkid1. Parent steps through views, as `find_ancestor`.
-#[inline]
 pub fn find_ancestor_or_quit(
-    node: Node,
+    mut node: Node,
     mut callback: impl FnMut(Node) -> FindAncestorResult,
 ) -> Node {
-    find_ancestor_or_quit_ref(node, |n| callback(n.node()))
+    while node.is_some() {
+        let result = callback(node);
+        if result == FindAncestorResult::FIND_ANCESTOR_QUIT {
+            return Node::NIL;
+        } else if result == FindAncestorResult::FIND_ANCESTOR_TRUE {
+            return node;
+        }
+        node = node.parent();
+    }
+    Node::NIL
 }
 
 /// `find_ancestor_or_quit` whose callback gets the view of each node
@@ -137,7 +149,7 @@ pub fn find_ancestor_or_quit_ref(
 }
 
 // Go: ast/utilities.go:980 IsNodeDescendantOf
-// PERF: checkid1. Parent steps through views, as `find_ancestor`.
+// PERF: checkid1. Parent steps through views, as `find_ancestor_ref`.
 pub fn is_node_descendant_of(node: Node, ancestor: Node) -> bool {
     let mut node = NodeRef::new(node);
     while node.is_some() {
