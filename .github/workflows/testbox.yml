@@ -27,9 +27,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # The toolchain of shipped bins and --profile goport. Edit-loop builds use the nightly of
-  # scripts/run-cargo-capped.sh.
-  RUSTUP_TOOLCHAIN: 1.93.0
+  # The toolchain of shipped bins (release.yml) and the candidate evidence. Edit-loop builds use the
+  # nightly of scripts/run-cargo-capped.sh.
+  RUSTUP_TOOLCHAIN: 1.95.0
   NIGHTLY_TOOLCHAIN: nightly-2026-06-17
 
 jobs:
@@ -99,8 +99,9 @@ jobs:
       - run: |
           rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal -c rustfmt,clippy
           rustup toolchain install "$NIGHTLY_TOOLCHAIN" --profile minimal
-          # Remote commands run without this job's RUSTUP_TOOLCHAIN. 1.93.0 is the default, as on zbook;
-          # run-cargo-capped.sh picks the nightly for edit-loop builds.
+          # Remote commands run without this job's RUSTUP_TOOLCHAIN, so the shipped toolchain is the default
+          # (candidate.sh and build-goport-tests.sh pin it too); run-cargo-capped.sh picks the nightly for
+          # edit-loop builds.
           rustup default "$RUSTUP_TOOLCHAIN"
       # bubblewrap for GOPORT_PIN runs (scripts/upstream/pin.py exec), psutil for gate.sh.
       - name: Set up zbook's layout

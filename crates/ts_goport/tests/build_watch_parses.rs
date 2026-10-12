@@ -233,7 +233,7 @@ mod os_watch {
     const BUILD_END: &str = "Watching for file changes";
 
     /// How long one build may take.
-    const BUILD_LIMIT: Duration = Duration::from_secs(180);
+    const BUILD_LIMIT: Duration = Duration::from_mins(3);
 
     /// How long the output stays the same before a build counts as done.
     pub const QUIET: Duration = Duration::from_millis(1500);

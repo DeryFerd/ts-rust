@@ -315,7 +315,7 @@ export function memoryFileSystem(files = new Map()) {
         readFile: path => map.get(path),
         stat(path) {
             const text = map.get(path);
-            if (text !== undefined) return { isDirectory: false, size: text.length, mtimeMs: 0 };
+            if (text !== undefined) return { isDirectory: false, size: encoder.encode(text).length, mtimeMs: 0 };
             return isDir(path) ? { isDirectory: true, size: 0, mtimeMs: 0 } : undefined;
         },
         readDirectory(path) {

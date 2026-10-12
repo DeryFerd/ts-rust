@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Remote measurement runners. zbook builds; alvin, cup2, dbook and the minis run gates, corpus suites, sweeps and
-# oracle checks.
+# Remote measurement runners. Heavy work runs on Blacksmith testboxes (scripts/goport/testbox.sh). What cannot run
+# there runs on zbook or dbook-lan only (Theo, 2026-10-12): alvin, cup2 and the minis get nothing; every command
+# refuses them.
 # Each host keeps a mirror at the same absolute paths as zbook: this repo's tooling, target/project-inputs*,
 # the target/continuation-r97-goport runners, oracle caches and default binaries, ~/.local/bin/tsgo-oracle and
 # ~/.explore/repos/microsoft__typescript-go (see target/continuation-r97-goport/remote/*-manifest.txt, *-setup.md).
@@ -16,19 +17,18 @@
 #        remote.sh sync-pin <host> [pin]       scripts/upstream/pin.py sync over this host's route
 #        remote.sh push <host> <path>...       copy files or dir trees to the same absolute path (never deletes)
 #        remote.sh fetch <host> <dir>...       copy result dirs back to zbook; adds new files, never replaces one
-# <host> is alvin, cup2, dbook-lan, mini-743d, "all" (sync-*: every host at the same time) or "auto"
-# (run and job: the first host whose lock is free and whose load is under half its cores; when none is free,
-# it checks again every 30 s). Host order is alvin, cup2, dbook-lan, mini-743d (REMOTE_HOSTS overrides it).
+# <host> is dbook-lan, "all" (sync-*: every allowed host) or "auto" (run and job: the first allowed host whose
+# lock is free and whose load is under half its cores; when none is free, it checks again every 30 s). The
+# allowed hosts are dbook-lan (REMOTE_HOSTS overrides the list, but never with a retired host).
 # Locks: run and job hold the zbook lock /tmp/goport-remote-<host>.lock until the command ends, and wait for it.
 # A caller that holds the lock already (flock FILE cmd, or exec 9>FILE; flock 9) passes the open lock file on to
 # its children; run sees it and does not lock again. So a script under `job`, and the older
 # `flock /tmp/goport-remote-<host>.lock remote.sh run <host> ...` form, both work. A script under `job` must not
 # take the lock itself: it would wait for its own lock.
-# Reserved: dbook-lan is kept for revision evidence (candidate.sh side runs the gate and the oracles there). auto
-# skips it, and run and job refuse it unless REMOTE_USE_RESERVED=1 (candidate.sh sets it; the auditor and reviewer
-# set it to repeat a revision run). Time on mini-743d. On 2026-09-30 the 11-minute R148 and R149
-# gates waited 104 and 45 minutes for skeptic timing jobs on dbook. REMOTE_RESERVED overrides the list ("" for none).
-# Retired: mini-abf9 is Theo's machine since 2026-10-04. Every command refuses it.
+# Reserved: none by default since 2026-10-12 (revision side runs move to testboxes; wall timing runs on dbook-lan).
+# REMOTE_RESERVED names hosts that auto skips and that run and job refuse unless REMOTE_USE_RESERVED=1.
+# Retired: alvin, cup2 and mini-743d (Theo, 2026-10-12: "I want those hosts to not get anything anymore"), and
+# mini-abf9 (Theo's machine since 2026-10-04). Every command refuses them.
 # dbook and the minis are on zbook's LAN and always go over it, never Tailscale. Relative dirs are relative to the repo root.
 set -uo pipefail
 REPO=/home/theo/Code/sandbox/ts-rust
@@ -49,9 +49,12 @@ canon() {
     *) echo "$1" ;;
   esac
 }
-read -ra HOSTS <<< "${REMOTE_HOSTS:-alvin cup2 dbook-lan mini-743d}"
+read -ra HOSTS <<< "${REMOTE_HOSTS:-dbook-lan}"
 for i in "${!HOSTS[@]}"; do HOSTS[i]=$(canon "${HOSTS[i]}"); done
-read -ra RESERVED <<< "${REMOTE_RESERVED-dbook-lan}"
+read -ra RESERVED <<< "${REMOTE_RESERVED-}"
+# Hosts that get nothing (see Retired above).
+retired() { case $1 in alvin|cup2|mini-743d|mini-abf9) return 0 ;; esac; return 1; }
+for h in "${HOSTS[@]}"; do retired "$h" && { echo "remote.sh: $h is retired (REMOTE_HOSTS); use dbook-lan or a testbox" >&2; exit 2; }; done
 # True when host $1 is kept for revision evidence (see Reserved above).
 reserved() { local r; for r in "${RESERVED[@]}"; do [[ $(canon "$r") == "$1" ]] && return 0; done; return 1; }
 RS=(rsync -aH --mkpath --compress --compress-choice=zstd --info=progress2)
@@ -204,15 +207,15 @@ usage() { sed -n '/^# usage:/,/^# dbook and the minis/p' "$0"; }
 cmd=$1; shift
 case $cmd in
   help|-h|--help) usage; exit ;;
-  status) (($#)) || set -- "${HOSTS[@]}"; hs=(); for h; do hs+=("$(canon "$h")"); done; status "${hs[@]}"; exit ;;
+  status) (($#)) || set -- "${HOSTS[@]}"; hs=(); for h; do h=$(canon "$h"); retired "$h" && { echo "$h: retired" >&2; continue; }; hs+=("$h"); done; ((${#hs[@]})) && status "${hs[@]}"; exit ;;
   look|run|job|sync-bins|sync-scripts|sync-pin|push|fetch) ;;
   *) die "unknown command $cmd" ;;
 esac
 [[ $# -ge 1 ]] || die "$cmd needs a host"
 # dbook and the minis are on the same LAN as zbook: always use the LAN route, never the Tailscale name.
 host=$(canon "$1"); shift
-# mini-abf9 is Theo's own machine again since 2026-10-04: no command may use it.
-[[ $host == mini-abf9 ]] && die "mini-abf9 is Theo's machine since 2026-10-04. Do not use it. Time on mini-743d."
+# Retired hosts get nothing: alvin, cup2 and mini-743d since 2026-10-12, mini-abf9 since 2026-10-04.
+retired "$host" && die "$host is retired (Theo, 2026-10-12): use a Blacksmith testbox (scripts/goport/testbox.sh), or dbook-lan or zbook. Wall timing runs on dbook-lan."
 [[ $cmd == sync-scripts || $cmd == sync-pin || $# -ge 1 ]] || die "$cmd needs more arguments"
 if [[ $host == auto ]]; then
   [[ $cmd == run || $cmd == job ]] || die "'auto' only works with run and job; inside a job, use \$REMOTE_HOST"
@@ -220,7 +223,7 @@ if [[ $host == auto ]]; then
   pick; host=$HOST
 fi
 if [[ ($cmd == run || $cmd == job) && ${REMOTE_USE_RESERVED:-0} != 1 ]] && reserved "$host"; then
-  die "$host is kept for revision evidence (candidate.sh side). Use auto, or mini-743d for timing. The auditor and reviewer set REMOTE_USE_RESERVED=1 to repeat a revision run."
+  die "$host is reserved (REMOTE_RESERVED). Set REMOTE_USE_RESERVED=1 to use it."
 fi
 if [[ $host == all ]]; then
   [[ $cmd == sync-* ]] || die "'all' only works with sync-bins, sync-scripts and sync-pin"

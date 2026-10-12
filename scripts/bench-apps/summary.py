@@ -9,7 +9,7 @@ from pathlib import Path
 R = Path(sys.argv[1]) / 'results'
 APPS = ['vscode', 'sentry', 'playwright', 'typeorm', 'excalidraw', 'trpc-server']
 T3 = ['apps-server', 'apps-web', 'apps-mobile', 'packages-client-runtime', 'packages-shared']
-TOOLS = ['tsc6', 'tsc7', 'tsc-rs', 'bun']
+TOOLS = ['tsc6', 'tsc7', 'tsc-rs', 'bun', 'tsc-rs-0.3.0']
 
 
 def medians(stem: str) -> dict[str, float] | None:

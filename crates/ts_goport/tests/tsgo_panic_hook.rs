@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use ts_goport::execute::tsc::EXIT_UNPORTED;
 
 /// The longest wait for each step of a run.
-const LIMIT: Duration = Duration::from_secs(60);
+const LIMIT: Duration = Duration::from_mins(1);
 
 #[test]
 fn a_printed_panic_with_no_stderr_reader_does_not_abort() {

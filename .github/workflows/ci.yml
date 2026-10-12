@@ -29,8 +29,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -C debuginfo=0
-  # The toolchain of shipped bins, fmt and clippy (scripts/goport/README.md, "Build toolchain").
-  RUSTUP_TOOLCHAIN: 1.93.0
+  # The toolchain of shipped bins (release.yml), the candidate evidence, fmt and clippy
+  # (scripts/goport/README.md, "Build toolchain").
+  RUSTUP_TOOLCHAIN: 1.95.0
 
 jobs:
   lint:

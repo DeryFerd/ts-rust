@@ -44,9 +44,8 @@ fn run_async_await_to_fn_try_promise(ctx: &mut RefactorContext<'_, '_>) -> Vec<C
     let data_module_name = find_module_identifier(ctx.source_file, "Data");
 
     let sf = ctx.source_file;
-    let mut go_panics = false;
     let action = ctx.new_refactor_action("Rewrite to Effect.fn with failures", |tracker| {
-        go_panics = !transform_async_to_effect_fn_try_promise(
+        transform_async_to_effect_fn_try_promise(
             tracker,
             sf,
             async_fn,
@@ -54,26 +53,20 @@ fn run_async_await_to_fn_try_promise(ctx: &mut RefactorContext<'_, '_>) -> Vec<C
             &data_module_name,
         );
     });
-    // PORT: see `replace_expression_via_statement`: Go panics after the
-    // error classes are queued; the port gives no action.
-    if go_panics {
-        return Vec::new();
-    }
     with_kind(action, "refactor.rewrite.effect.asyncAwaitToFnTryPromise")
 }
 
 // Go: refactors/async_await_to_fn_try_promise.go:50 transformAsyncToEffectFnTryPromise
-// PORT: returns false where Go panics (in `replace_expression_via_statement`).
 fn transform_async_to_effect_fn_try_promise(
     tracker: &mut Tracker,
     sf: Node,
     node: Node,
     effect_module_name: &str,
     data_module_name: &str,
-) -> bool {
+) {
     let body = get_function_like_body(node);
     if body.is_nil() {
-        return true;
+        return;
     }
 
     // Track error classes to generate
@@ -110,10 +103,10 @@ fn transform_async_to_effect_fn_try_promise(
     // Build declaration wrapping the fn call
     let new_decl = build_fn_declaration(tracker, node, effect_fn_call);
     if new_decl.is_nil() {
-        return true;
+        return;
     }
 
     set_parent_in_children(new_decl);
 
-    insert_error_classes_and_replace(tracker, sf, node, new_decl, error_classes)
+    insert_error_classes_and_replace(tracker, sf, node, new_decl, error_classes);
 }

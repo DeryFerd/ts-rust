@@ -98,6 +98,30 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
+/// A map keyed by a `Name::text_hash` value, which is already a hash: the
+/// key is the map hash as is (`TextHashKey`). No code iterates it.
+type TextHashMap<V> = std::collections::HashMap<u64, V, std::hash::BuildHasherDefault<TextHashKey>>;
+
+/// The hasher of `TextHashMap`: the `u64` key is the hash.
+#[derive(Default)]
+struct TextHashKey(u64);
+
+impl std::hash::Hasher for TextHashKey {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write_u64(&mut self, hash: u64) {
+        self.0 = hash;
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("TextHashKey takes only u64 keys");
+    }
+}
+
 /// Slot 0: Go `nil` stored in a astdata field that has no `Option`.
 const NIL_SLOT: u32 = 0;
 
@@ -243,12 +267,14 @@ struct FileStore {
     /// (`SlotLinks::NONE`) when the slot is made and written by
     /// `StoreChildLinks` and `replace_store_node_data`.
     build_links: Vec<SlotLinks>,
-    /// The name and keyword bit of each identifier text of this file, keyed
-    /// by the interned text. Port only: Go stopped interning parser texts
-    /// (`internIdentifier`) in tsgo#4731. Dropped by the freeze.
+    /// The interned text, name and keyword bit of each identifier text of
+    /// this file, keyed by the `Name::text_hash` of the text. Port only: Go
+    /// stopped interning parser texts (`internIdentifier`) in tsgo#4731.
+    /// Dropped by the freeze.
     // PERF: one text hash per identifier node; the process-wide intern (a
-    // shard `Mutex`) runs once per distinct text of the file.
-    identifier_names: FxHashMap<&'static str, (Name, bool)>,
+    // shard `Mutex`) runs once per distinct text of the file, with the same
+    // hash (parsefast1 item 1).
+    identifier_names: TextHashMap<(&'static str, Name, bool)>,
     /// U1 (e): binder capacity hints, made with `facts`.
     bind_estimate: BindEstimate,
 }
@@ -2077,7 +2103,8 @@ impl FileStore {
         lists.push(nil_static_list());
         // PERF: U1 (a). About one distinct identifier text per 16 slots, so
         // the map of a large file does not rehash while it grows.
-        let identifier_names = FxHashMap::with_capacity_and_hasher(slots / 16, Default::default());
+        let identifier_names =
+            TextHashMap::with_capacity_and_hasher(slots / 16, Default::default());
         Self {
             file_name,
             text,
@@ -2127,18 +2154,29 @@ impl FileStore {
             return (Name::default(), false);
         }
         let text = text.unwrap_or_else(|| identifier_text(data));
-        if let Some(entry) = self.identifier_names.get(text) {
-            return entry.clone();
+        // PERF: parsefast1 item 1. One hash of the text: the map probe and,
+        // on a miss, the process-wide intern use it.
+        let hash = Name::text_hash(text);
+        match self.identifier_names.entry(hash) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let (stored, name, text_is_keyword) = entry.get();
+                if *stored == text {
+                    return (name.clone(), *text_is_keyword);
+                }
+                // Another text of this file has the same 64-bit hash: no
+                // entry for this one.
+                (
+                    Name::intern_hashed(text, hash).0,
+                    get_identifier_token(text) != SyntaxKind::Identifier,
+                )
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let (name, stored) = Name::intern_hashed(text, hash);
+                let text_is_keyword = get_identifier_token(text) != SyntaxKind::Identifier;
+                entry.insert((stored, name.clone(), text_is_keyword));
+                (name, text_is_keyword)
+            }
         }
-        // U1 (d): the key is the interned text, which lives as long as the
-        // map. The data of a store identifier has no text to borrow.
-        let entry = (
-            Name::from(text),
-            get_identifier_token(text) != SyntaxKind::Identifier,
-        );
-        self.identifier_names
-            .insert(entry.0.as_str(), entry.clone());
-        entry
     }
 
     /// The record, kind, kids and link vectors have one entry per slot.
@@ -3383,8 +3421,10 @@ impl FileStore {
             return;
         }
         // The lists of a store that owns its nodes are all in its owned
-        // table (`new_store_list`).
-        debug_assert_eq!(
+        // table (`new_store_list`). The table below replaces the static
+        // table, so a static list would be lost: check it in every build
+        // (one compare per publish).
+        assert_eq!(
             self.lists.len(),
             1,
             "static lists in a store with owned nodes"
@@ -3874,7 +3914,7 @@ impl FileStore {
         self.facts = facts;
         self.facts_made = true;
         self.bind_estimate = counts.estimate();
-        self.identifier_names = FxHashMap::default();
+        self.identifier_names = TextHashMap::default();
         #[cfg(debug_assertions)]
         self.debug_check_kids();
         // R2-5: a link written after the slot was made must have gone
@@ -6015,33 +6055,39 @@ impl FileStore {
             return set_parent_in_owned_store_children(self, index);
         }
         let kind = self.kinds[index];
-        // `NodeHeader::stored_parent` of a child in the store of `parent`.
-        let stored = handle(LOCAL_STORE, index as u32);
+        // The `ParentCode` of `parent` in a child of its store
+        // (`set_slot_parent` of a `LOCAL_STORE` parent).
+        let code = local_parent_code(handle(LOCAL_STORE, index as u32));
         // `StoreChildLinks::new`.
         self.unlink_children(index);
         self.build_links[index].first_child = LINK_END;
         let mut last = LINK_END;
         let mut linking = true;
-        // The list table is moved out for the walk, so the parent writes can
-        // borrow the store.
-        let lists = std::mem::take(&mut self.lists);
+        // The fields are borrowed apart, so the walk reads the list table
+        // while the records and the links change. A panic in the walk (a
+        // Go panic that an LSP request recovers) leaves the table in place.
+        let FileStore {
+            lists,
+            records,
+            build_links,
+            ..
+        } = self;
         let stopped =
-            super::node::for_each_store_child_id(kind, node, ListIds::Static(&lists), |child| {
+            super::node::for_each_store_child_id(kind, node, ListIds::Static(lists), |child| {
                 let child = child as usize;
                 // PERF: perfP2 item 2. The record bit, not the node column: the
                 // parent write below reads and writes the same record.
-                if !self.records[child].is_node() {
+                if !records[child].is_node() {
                     return true;
                 }
                 // `StoreChildLinks::set_parent`.
-                self.set_slot_parent(child, stored);
-                if linking && !self.link_child(index, &mut last, child) {
+                records[child].set_parent_code(code);
+                if linking && !link_child(build_links, index, &mut last, child) {
                     linking = false;
-                    self.unlink_children(index);
+                    unlink_children(build_links, index);
                 }
                 false
             });
-        self.lists = lists;
         !stopped
     }
 }
@@ -7391,6 +7437,63 @@ mod tests {
             }
             false
         });
+    }
+
+    // A panic in the child walk of `set_parent_in_store_children` (a Go
+    // panic that an LSP request recovers) leaves the list table of the store
+    // in place: the walk borrows the table, it does not move it out. Here
+    // the walk panics on a list field that names no list.
+    #[test]
+    fn set_parent_in_store_children_keeps_the_lists_after_a_panic() {
+        let file = new_file_store("/walk-panic.ts", "a;");
+        let f = NodeFactory::for_file(file);
+        let a = f.new_identifier("a");
+        let statement = f.new_expression_statement(a);
+        let block = f.new_block(f.new_node_list(&[statement]), false);
+        let other = f.new_block(f.new_node_list(&[statement]), false);
+        let lists = with_store(file, |s| s.lists.len());
+        assert!(lists > 1, "the blocks have static lists");
+
+        let mut data = with_ast_data(block, Clone::clone);
+        if let NodeData::Block(d) = &mut data {
+            d.statements = crate::astdata::NodeList::new(u32::MAX - 1);
+        }
+        replace_store_node_data(block, data);
+        let walk = std::panic::catch_unwind(|| set_parent_in_store_children(block));
+        assert!(walk.is_err(), "the walk reads a list that is not there");
+
+        assert_eq!(with_store(file, |s| s.lists.len()), lists);
+        assert_eq!(other.statements().to_vec(), vec![statement]);
+        assert!(set_parent_in_store_children(other));
+        assert_eq!(statement.parent(), other);
+    }
+
+    // A store that owns its nodes keeps all its lists in its owned table,
+    // and the static publish (`leak_owned_nodes`) replaces the static table:
+    // a static list there would be lost. The check runs in every build.
+    #[test]
+    fn leak_owned_nodes_with_a_static_list_panics_in_every_build() {
+        let file = {
+            let _scope = enter_owned_parse();
+            let file = new_file_store("/owned-static-list.ts", "");
+            let f = NodeFactory::for_file(file);
+            let _block = f.new_block(f.new_node_list(&[]), false);
+            freeze_file_store(file);
+            file
+        };
+        let leak = std::panic::catch_unwind(|| {
+            with_store_mut(file, |s| {
+                let nil_list = s.lists[0];
+                s.lists.push(nil_list);
+                s.leak_owned_nodes();
+            });
+        });
+        let payload = leak.expect_err("a static list in a store with owned nodes");
+        let message = payload.downcast_ref::<String>().map_or("", String::as_str);
+        assert!(
+            message.contains("static lists in a store with owned nodes"),
+            "{message}"
+        );
     }
 
     #[test]

@@ -930,7 +930,7 @@ fn api_build_client(root: &Path, sync: bool, single_threaded: bool, fail: &str) 
     client.request(1, "createBuildOrchestrator", &create);
     let mut answer = None;
     let mut calls = Vec::new();
-    while let Ok((call, method, payload)) = messages.recv_timeout(Duration::from_secs(60)) {
+    while let Ok((call, method, payload)) = messages.recv_timeout(Duration::from_mins(1)) {
         if !call && (method == "createBuildOrchestrator" || method == "1") {
             let id = payload
                 .split(r#""buildOrchestratorID":"#)
@@ -1409,7 +1409,7 @@ fn api_build_with(
     };
     let next = || {
         messages
-            .recv_timeout(Duration::from_secs(60))
+            .recv_timeout(Duration::from_mins(1))
             .expect("a message from tsgo")
     };
     let config = norm(&root.join("tsconfig.json"));
