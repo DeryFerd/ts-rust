@@ -569,6 +569,14 @@ pub fn for_each_yield_expression(body: Node, visitor: &mut dyn FnMut(Node) -> bo
                 // These are not allowed inside a generator now, but eventually they may be allowed
                 // as local types. Regardless, skip them to avoid the work.
             }
+            // PERF: deferbody1. A token (identifiers, literals, keywords and
+            // punctuation) has no children: Go `ForEachChild` has no case for
+            // its kind (ast_generated.go:8693) and returns false, and a token
+            // is not function-like. Go gets false through `IsPartOfTypeNode`,
+            // which reads the parent of an identifier, and then the empty
+            // child walk; here the walk returns false at once. Those reads
+            // have no effect.
+            _ if kind.is_token() => {}
             _ => {
                 // PORT: Go `IsFunctionLike` also tests `node != nil`; the kind
                 // read above has already failed for nil, as Go's switch does.
