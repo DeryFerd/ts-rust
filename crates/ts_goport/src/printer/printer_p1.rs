@@ -1740,7 +1740,11 @@ impl Printer {
         }
 
         let state = self.enter_token_node(node, flags);
-        self.write_token_text(node.kind(), WriteKind::KEYWORD, node.pos());
+        // PERF: printfast1. Go `writeTokenText(node.Kind, WriteKindKeyword,
+        // node.Pos())` and drops the result, the only use of the position.
+        // A factory node reads its position in the thread's arena, so the
+        // port writes the token text with no position read.
+        self.write_as(token_to_string(node.kind()), WriteKind::KEYWORD);
         self.exit_token_node(node, state);
     }
 

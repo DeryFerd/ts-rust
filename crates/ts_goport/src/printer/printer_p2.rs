@@ -1207,13 +1207,16 @@ impl Printer {
         }
 
         let saved_in_extends = self.in_extends;
-        let parens = get_type_node_precedence(node) < precedence;
+        // PERF: printfast1. One kind read for the precedence and the switch
+        // (Go reads the `Kind` field twice).
+        let kind = node.kind();
+        let parens = type_node_precedence_of_kind(node, kind) < precedence;
         if parens {
             self.in_extends = false;
             self.write_punctuation("(");
         }
 
-        match node.kind() {
+        match kind {
             // Keyword Types
             SyntaxKind::AnyKeyword
             | SyntaxKind::UnknownKeyword
@@ -1269,7 +1272,7 @@ impl Printer {
             SyntaxKind::JsDocOptionalType => self.emit_js_doc_optional_type(node),
             SyntaxKind::JsDocVariadicType => self.emit_js_doc_variadic_type(node),
 
-            _ => panic!("unhandled TypeNode: {}", kind_string(node.kind())),
+            _ => panic!("unhandled TypeNode: {}", kind_string(kind)),
         }
 
         if parens {

@@ -1522,7 +1522,16 @@ pub fn get_leftmost_expression(mut node: Node, stop_at_call_expressions: bool) -
 // Gets the precedence of a TypeNode
 #[must_use]
 pub fn get_type_node_precedence(n: Node) -> TypePrecedence {
-    match n.kind() {
+    type_node_precedence_of_kind(n, n.kind())
+}
+
+/// `get_type_node_precedence` of `n`, whose kind `kind` the caller has read.
+// PERF: printfast1. A factory node reads its kind in the thread's arena;
+// `Printer::emit_type_node` reads it once for this and its switch.
+#[must_use]
+pub fn type_node_precedence_of_kind(n: Node, kind: SyntaxKind) -> TypePrecedence {
+    debug_assert_eq!(kind, n.kind());
+    match kind {
         SyntaxKind::ConditionalType => TypePrecedence::CONDITIONAL,
         SyntaxKind::JsDocOptionalType | SyntaxKind::JsDocVariadicType => TypePrecedence::JS_DOC,
         SyntaxKind::FunctionType | SyntaxKind::ConstructorType => TypePrecedence::FUNCTION,
