@@ -1122,14 +1122,11 @@ mod tests {
     /// `testdata/tests/cases/compiler/instantiatedReferenceLazyMembers.ts`
     /// and its `.errors.txt` baseline, which the PR made on unmodified main.
     const PR_CASE_NAME: &str = "instantiatedReferenceLazyMembers.ts";
-    const PR_CASE: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lazy_members/instantiatedReferenceLazyMembers.ts"
-    ));
-    const PR_ERRORS: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/lazy_members/instantiatedReferenceLazyMembers.errors.txt"
-    ));
+    const PR_CASE: &str =
+        include_str!("../../tests/fixtures/lazy_members/instantiatedReferenceLazyMembers.ts");
+    const PR_ERRORS: &str = include_str!(
+        "../../tests/fixtures/lazy_members/instantiatedReferenceLazyMembers.errors.txt"
+    );
 
     /// Loads `name` with `text` (the PR case options: strict, target
     /// esnext, noEmit), sets `lazy_members` on its checker, checks the file,
