@@ -27,10 +27,12 @@
 //!   when it read it.
 //!
 //!   The Go clock: Go's `terminal` check (:263) depends only on when a
-//!   goroutine makes its call, before or after `Run` returned. Here a
-//!   request that waits in a call while a nested request runs is held
-//!   until that request returns, and a request read while another one
-//!   runs starts when it returns. So each request and notification that
+//!   goroutine makes its call, before or after the read loop of `Run`
+//!   ended (its deferred `closePendingCalls`, :72). A handler cannot call
+//!   after `Run` returned: the deferred function waits for the handlers
+//!   (:74). Here a request that waits in a call while a nested request
+//!   runs is held until that request returns, and a request read while
+//!   another one runs starts when it returns. So each request and notification that
 //!   the dispatch thread runs is a frame with a lag: the time that the port
 //!   held it while Go ran it. Its Go time is the port time less the lag. A
 //!   `Call` or `Notify` whose Go time is before the end of the read loop
@@ -708,6 +710,19 @@ impl AsyncConn {
             if let Some((resp, read_at, late)) = resp {
                 // Go :290: `ctx.Done()` came at the signal, before `Run`
                 // read the late reply.
+                // PORT: this checks the call's `ctx` now, not at the read of
+                // the late reply. The two agree for the `ctx` of `run` and a
+                // `ctx` made from it: it is done at the signal, before that
+                // read. Both production callers use such a `ctx`.
+                // `callbackfs.rs:300` uses the `ctx` of `run` (set at
+                // `server.rs:264`). `api/module_resolution.rs:256` uses the
+                // builder's `ctx` (`project.rs:778`) or the `ctx` of a
+                // `resolveModuleName` request: both come from the request's
+                // `handler_ctx`, which `run` makes from its `ctx`. For another
+                // `ctx` that is done after the read, Go's `select` takes the
+                // reply and the port returns `ctx.Err()`. To follow Go here,
+                // `gostd::context` must keep when a `ctx` was done, as
+                // `next_for_call` notes for `after_cancel`.
                 if late && let Some(err) = ctx.err() {
                     break (Err(err), Some(Woke::Canceled(reader.inbox.canceled_at())));
                 }
@@ -760,7 +775,7 @@ impl AsyncConn {
         (Instant::now().saturating_duration_since(end) < lag).then_some(end)
     }
 
-    /// PORT: a `Call` that Go made before `Run` returned
+    /// PORT: a `Call` that Go made before the read loop of `Run` ended
     /// (`frame_before_the_end`). Go's `terminal` was nil (:263), so
     /// it writes its request (:281), and its `select` (:289) returns
     /// `ctx.Err()` when `ctx` was done before the end (a signal), or else
@@ -2162,13 +2177,13 @@ pub(crate) mod tests {
     /// notes their results; `slowcalls` too, but it waits `HOLD` after the
     /// first. `hcall` makes a call with its own context (the handler
     /// context, as the API's module resolver) and notes the result. `lags`
-    /// makes 2 calls and notes its frame's lag after each. `hold` waits
-    /// `HOLD` and does not look at its context; `holdcall` then makes a
-    /// call and notes its result. `bgcall` makes a call with a context that
-    /// is never done and notes the result. `endnotify` and `endcall` note
-    /// `start`, wait until the read loop ended, then notify, or call with a
-    /// context that is never done, and note the result. Other requests
-    /// answer `true`.
+    /// sets its frame's lag to 0, makes 2 calls and notes the lag after
+    /// each. `hold` waits `HOLD` and does not look at its context;
+    /// `holdcall` then makes a call and notes its result. `bgcall` makes a
+    /// call with a context that is never done and notes the result.
+    /// `endnotify` and `endcall` note `start`, wait until the read loop
+    /// ended, then notify, or call with a context that is never done, and
+    /// note the result. Other requests answer `true`.
     struct CallbackHandler {
         conn: std::cell::OnceCell<std::rc::Weak<AsyncConn>>,
         call_ctx: Context,
@@ -2196,6 +2211,15 @@ pub(crate) mod tests {
                 Err(err) => err.error(),
             };
             // Waits up to 5 s until the reader thread ended the read loop.
+            // This is a wait on the Go side: Go's handler goroutine waits
+            // until the read loop of `Run` ended (its deferred
+            // `closePendingCalls` set `terminal`), so it runs after the end.
+            // It cannot wait until `Run` returned: the deferred function of
+            // `Run` waits for its handlers (conn_async.go:74). The running
+            // frame of the Go clock then has no lag left. Without the reset,
+            // a frame that the port held (lag > 0) and that sees the end
+            // soon after it would count as before the end
+            // (`frame_before_the_end`).
             let wait_for_the_end = |conn: &AsyncConn| {
                 let reader = conn
                     .reader
@@ -2205,6 +2229,9 @@ pub(crate) mod tests {
                 let end = Instant::now() + Duration::from_secs(5);
                 while !lock(&reader.inbox.state).ended && Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(1));
+                }
+                if let Some(lag) = conn.frames.borrow_mut().last_mut() {
+                    *lag = Duration::ZERO;
                 }
             };
             match method {
@@ -2236,6 +2263,15 @@ pub(crate) mod tests {
                 }
                 "lags" => {
                     let conn = conn();
+                    // The frame starts at lag 0, as when the dispatch thread
+                    // waited idle for this request. `run` starts the reader
+                    // thread before its loop, so under load that thread can
+                    // read the request first, and the frame then starts with
+                    // that wait as its lag (`dispatch_read`). The test checks
+                    // what the calls add.
+                    if let Some(lag) = conn.frames.borrow_mut().last_mut() {
+                        *lag = Duration::ZERO;
+                    }
                     let mut lags = Vec::new();
                     for _ in 0..2 {
                         let _ = conn.call(&self.call_ctx, "callback", None);
@@ -2312,6 +2348,67 @@ pub(crate) mod tests {
         }
     }
 
+    /// A reader protocol that sends on `entered` when each read starts.
+    /// The reader thread then waits in that read, after its check of `ctx`
+    /// (Go :83), so a test can cancel at a known point.
+    struct ReadSignal {
+        inner: Box<dyn Protocol + Send>,
+        entered: Sender<()>,
+    }
+
+    impl Protocol for ReadSignal {
+        fn read_message(&mut self) -> Result<Message, GoError> {
+            // `run_on_reader` drops the receiver, so the send can fail.
+            let _ = self.entered.send(());
+            self.inner.read_message()
+        }
+
+        fn write_request(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.inner.write_request(id, method, params)
+        }
+
+        fn write_notification(
+            &mut self,
+            method: &str,
+            params: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.inner.write_notification(method, params)
+        }
+
+        fn write_response(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            result: Option<Box<dyn AnyValue>>,
+        ) -> Result<(), GoError> {
+            self.inner.write_response(id, result)
+        }
+
+        fn write_error(
+            &mut self,
+            id: Option<&jsonrpc::ID>,
+            err: &jsonrpc::ResponseError,
+        ) -> Result<(), GoError> {
+            self.inner.write_error(id, err)
+        }
+    }
+
+    /// The ends of a `run_on_reader` connection: the client end of the
+    /// socket pair, the handler's notes, the result of `run` (the thread
+    /// sends it when `run` returns), the thread, and a signal at the start
+    /// of each read of the reader thread (`ReadSignal`).
+    type ReaderRun = (
+        UnixStream,
+        Receiver<String>,
+        Receiver<Result<(), String>>,
+        std::thread::JoinHandle<()>,
+        Receiver<()>,
+    );
+
     /// Runs a connection that reads on its thread (`read_on_thread`) over
     /// one end of a socket pair, with `CallbackHandler`, on a thread of its
     /// own. Returns the other end, the handler's notes and the result of
@@ -2324,9 +2421,16 @@ pub(crate) mod tests {
         Receiver<Result<(), String>>,
         std::thread::JoinHandle<()>,
     ) {
+        let (client, notes, run_done, runner, _reads) = run_on_reader_with_reads(ctx);
+        (client, notes, run_done, runner)
+    }
+
+    /// `run_on_reader`, with the start of each read (`ReaderRun`).
+    fn run_on_reader_with_reads(ctx: &Context) -> ReaderRun {
         let (client, server) = UnixStream::pair().expect("socket pair");
         let (notes, notes_rx) = mpsc::channel();
         let (run_done, run_done_rx) = mpsc::sync_channel(1);
+        let (entered, reads) = mpsc::channel();
         let ctx = ctx.clone();
         let runner = std::thread::spawn(move || {
             let server: Arc<dyn ReadWriteCloser> = Arc::new(PipeEnd::new(server));
@@ -2338,11 +2442,24 @@ pub(crate) mod tests {
             });
             let conn = new_async_conn(server.clone(), handler.clone());
             let _ = handler.conn.set(Rc::downgrade(&conn));
-            conn.read_on_thread(Box::new(new_jsonrpc_protocol(server)));
+            conn.read_on_thread(Box::new(ReadSignal {
+                inner: Box::new(new_jsonrpc_protocol(server)),
+                entered,
+            }));
             let result = conn.run(&ctx).map_err(|err| err.error());
             run_done.send(result).expect("runDone");
         });
-        (client, notes_rx, run_done_rx, runner)
+        (client, notes_rx, run_done_rx, runner, reads)
+    }
+
+    /// Waits up to 5 s for each of the next `n` reads of the reader thread
+    /// to start. After the last one the thread waits in that read.
+    fn wait_for_reads(reads: &Receiver<()>, n: usize) {
+        for _ in 0..n {
+            reads
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the reader thread starts its next read");
+        }
     }
 
     // PORT: no Go test; Go `Run` and `Call` (ipc/conn_async.go:83-87,
@@ -2355,7 +2472,7 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_cancel_phases() {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
         write_framed(&client, r#"{"jsonrpc":"2.0","id":1,"method":"outer"}"#);
         let call = read_framed(&client);
         assert!(
@@ -2363,6 +2480,10 @@ pub(crate) mod tests {
             "{call}"
         );
 
+        // The reader thread read id 1 and waits in its second read, past
+        // its check of `ctx` (Go :83). A cancel before that check ends the
+        // read loop with no read, in Go too: then no Phase A.
+        wait_for_reads(&reads, 2);
         cancel();
         let call = read_framed(&client);
         assert!(
@@ -2526,13 +2647,17 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_cancel_beats_a_later_close() {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
         write_framed(&client, r#"{"jsonrpc":"2.0","id":1,"method":"outer"}"#);
         let call = read_framed(&client);
         assert!(call.contains(r#""id":"api1""#), "{call}");
         write_framed(&client, r#"{"jsonrpc":"2.0","id":2,"method":"late"}"#);
         let call = read_framed(&client);
         assert!(call.contains(r#""id":"api2""#), "{call}");
+        // The reader thread read ids 1 and 2 and waits in its third read.
+        // A cancel before its check of `ctx` (Go :83) ends the read loop
+        // with no read, and `run` closes the socket before the ping.
+        wait_for_reads(&reads, 3);
         cancel();
         // The 1 message read after the cancel ends the read loop.
         write_framed(&client, r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#);
@@ -2561,7 +2686,7 @@ pub(crate) mod tests {
     /// and `first`.
     fn late_reply(first: &str, nested: &str) -> [String; 2] {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
         let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{first}"}}"#);
         write_framed(&client, &body);
         let call = read_framed(&client);
@@ -2570,8 +2695,8 @@ pub(crate) mod tests {
         write_framed(&client, &body);
         let note = |what: &str| notes.recv_timeout(Duration::from_secs(5)).expect(what);
         assert_eq!(note("nested ran"), format!("{nested} | start"));
-        // The reader thread waits in its next read.
-        std::thread::sleep(Duration::from_millis(50));
+        // The reader thread read ids 1 and 2 and waits in its third read.
+        wait_for_reads(&reads, 3);
         cancel();
         write_framed(&client, r#"{"jsonrpc":"2.0","id":"api1","result":true}"#);
         let both = [note("nested returned"), note("first returned")];
@@ -2612,15 +2737,15 @@ pub(crate) mod tests {
     /// and `outer`.
     fn nested_late_reply(outer: &str, inner: &str, late_id: &str) -> [String; 2] {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
         for (id, method, api) in [(1, outer, "api1"), (2, inner, "api2")] {
             let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}"}}"#);
             write_framed(&client, &body);
             let call = read_framed(&client);
             assert!(call.contains(&format!(r#""id":"{api}""#)), "{call}");
         }
-        // The reader thread waits in its next read.
-        std::thread::sleep(Duration::from_millis(50));
+        // The reader thread read ids 1 and 2 and waits in its third read.
+        wait_for_reads(&reads, 3);
         cancel();
         let body = format!(r#"{{"jsonrpc":"2.0","id":"{late_id}","result":true}}"#);
         write_framed(&client, &body);
@@ -2896,15 +3021,20 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_idle_call_keeps_lag_zero() {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
         write_framed(&client, r#"{"jsonrpc":"2.0","id":1,"method":"lags"}"#);
         let call = read_framed(&client);
         assert!(call.contains(r#""id":"api1""#), "{call}");
+        // Idle time for the call to wait through, not a wait for a state.
         std::thread::sleep(Duration::from_millis(50));
         write_framed(&client, r#"{"jsonrpc":"2.0","id":"api1","result":null}"#);
         let call = read_framed(&client);
         assert!(call.contains(r#""id":"api2""#), "{call}");
-        std::thread::sleep(Duration::from_millis(50));
+        // The reader thread read id 1 and the reply and waits in its third
+        // read, so the 1 read after the signal is the EOF below. A cancel
+        // before its check of `ctx` (Go :83) ends the loop with
+        // `context canceled`.
+        wait_for_reads(&reads, 3);
         cancel();
         let note = notes.recv_timeout(Duration::from_secs(5)).expect("note");
         assert_eq!(note, "lags | [Some(0ns), Some(0ns)]");
