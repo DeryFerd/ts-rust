@@ -277,7 +277,6 @@ pub fn parse_source_file(
     let jsdoc_cut_text = OnceCell::new();
     let mut p = new_parser();
     p.initialize_state(opts, &source_text, script_kind);
-    p.skip_go_string_marker_scans();
     p.jsdoc_cut_text = Some(&jsdoc_cut_text);
     // lsshells M3c: each version of an edited file is a new parse, so a
     // freeable parse (`crate::ast::is_freeable_parse`) interns the name,
@@ -297,7 +296,10 @@ pub fn parse_source_file(
         .and_then(|text| super::lib_parse_snapshot::load(p.store, opts, text, script_kind));
     let result = match loaded {
         Some(loaded) => loaded.file,
-        None => p.parse_into_store(),
+        None => {
+            p.skip_go_string_marker_scans();
+            p.parse_into_store()
+        }
     };
     // PORT: only the tsconfig parser reads this table, and it parses no
     // file of the parse cache. A freeable parse (an edited source file)
@@ -358,7 +360,6 @@ pub fn parse_source_file_detached_reading<R>(
     let jsdoc_cut_text = OnceCell::new();
     let mut p = new_parser();
     p.initialize_state(opts, &source_text, script_kind);
-    p.skip_go_string_marker_scans();
     p.jsdoc_cut_text = Some(&jsdoc_cut_text);
     // As in `parse_source_file`.
     let freeable = crate::ast::is_freeable_parse();
@@ -387,6 +388,7 @@ pub fn parse_source_file_detached_reading<R>(
         };
         return (parse, read);
     }
+    p.skip_go_string_marker_scans();
     let file = p.parse_into_store();
     let import_specifiers = file.imports.iter().map(|n| n.text().to_string()).collect();
     let read = read(&file);
@@ -657,9 +659,12 @@ impl<'a> Parser<'a> {
     /// Scans the whole text once for `GO_STRING_MARKER` and tells the
     /// scanner, so string token values skip the scan of each value
     /// (`Scanner::set_text_has_no_go_string_marker`). A whole-file parse
-    /// calls it after `initialize_state`. A lazy JSDoc parse
-    /// (`parse_js_doc_for_node`) does not: it reads a few values of a file
-    /// that it would scan whole on each call.
+    /// calls it right before `parse_into_store`, not for a lib that loads
+    /// from the snapshot: the scan would read the whole lib text, which
+    /// the snapshot load does not (2.3 MiB more RSS on query-core, mostly
+    /// lib.dom.d.ts). A lazy JSDoc parse (`parse_js_doc_for_node`) does not
+    /// call it either: it reads a few values of a file that it would scan
+    /// whole on each call.
     // PERF: parsefast2. Go uses the slice as is.
     fn skip_go_string_marker_scans(&mut self) {
         let no_marker = !crate::scanner_util::contains_go_string_marker(self.source_text);
