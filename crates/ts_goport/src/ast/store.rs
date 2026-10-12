@@ -2192,13 +2192,23 @@ pub fn new_file_store(file_name: &'static str, text: impl Into<FileText>) -> usi
 // bytes of the Query, Zod and Hono sources, and one for about 14 to 21 bytes
 // of the lib and `@types` declaration files and the Effect sources (long
 // JSDoc comments). At 12 a declaration file, such as lib.dom, fills its
-// vectors without a `realloc` copy, and a source file grows them once.
-// `end_parse` gives the unused capacity back.
+// vectors without a `realloc` copy. `end_parse` gives the unused capacity
+// back.
 const STORE_TEXT_BYTES_PER_SLOT: usize = 12;
+
+/// `STORE_TEXT_BYTES_PER_SLOT` for a file that is not a declaration file.
+// PERF: storefast2. At 12 a source file grew each column once (a doubling,
+// to the capacity of 6, and a copy). At 6 it has that capacity at once.
+const SOURCE_TEXT_BYTES_PER_SLOT: usize = 6;
 
 impl FileStore {
     fn new(file_name: &'static str, text: FileText) -> Self {
-        let slots = text.len() / STORE_TEXT_BYTES_PER_SLOT + 1;
+        let bytes_per_slot = if crate::frontend::tspath::is_declaration_file_name(file_name) {
+            STORE_TEXT_BYTES_PER_SLOT
+        } else {
+            SOURCE_TEXT_BYTES_PER_SLOT
+        };
+        let slots = text.len() / bytes_per_slot + 1;
         let mut records = Vec::with_capacity(slots);
         records.push(NodeRecord::target(Node::NIL));
         let mut kinds = Vec::with_capacity(slots);
