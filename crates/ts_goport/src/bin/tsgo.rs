@@ -958,9 +958,6 @@ fn send_code(worker: Worker, code: i32) {
 // of the output (`GoOutput`).
 fn run_main(start: Instant) -> i32 {
     let mut args: Vec<String> = ts_goport::frontend::osutil::args()[1..].to_vec();
-    // PORT: not in Go (fastmode1). Go has no `--fast`: it leaves before Go's
-    // option parsing sees it.
-    ts_goport::fast_mode::take_flag(&mut args);
 
     if let Some(first) = args.first() {
         match first.as_str() {
@@ -969,6 +966,11 @@ fn run_main(start: Instant) -> i32 {
             _ => {}
         }
     }
+
+    // PORT: not in Go (fastmode1). Go has no `--fast`: where Go's parser
+    // reads it as an option name, it becomes an empty argument, which Go's
+    // option parsing skips (`take_flag`).
+    ts_goport::fast_mode::take_flag(&mut args);
 
     // Go: ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
     let (ctx, stop) = notify_context(&context::background());

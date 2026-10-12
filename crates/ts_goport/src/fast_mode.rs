@@ -1,8 +1,8 @@
 //! fastmode1: the opt-in fast mode. Not in Go.
 //!
-//! `tsgo --fast` (the bin removes the flag before Go's option parsing) or
-//! `GOPORT_FAST=1` (for every bin of the process: tsc, the LSP and the API
-//! server) turns on, together:
+//! `tsgo --fast` (the tsc command line; the bin takes the flag before Go's
+//! option parsing, `take_flag`) or `GOPORT_FAST=1` (for every bin of the
+//! process: tsc, the LSP and the API server) turns on, together:
 //!
 //! - more checkers: one per core, up to `MAX_CHECKERS`, and at most one per
 //!   `FILES_PER_CHECKER` program files that are not declaration files
@@ -61,21 +61,81 @@ static STATE: AtomicU8 = AtomicU8::new(0);
 /// `execute_tsc::is_build_flag`).
 static BUILD: AtomicBool = AtomicBool::new(false);
 
-/// Removes every `--fast` from the command line `args` (without the
-/// program name) and turns fast mode on when there was one. Call before the
-/// first `enabled` (tsgo `run_main` does).
-pub fn take_flag(args: &mut Vec<String>) {
-    let before = args.len();
-    args.retain(|arg| arg != FLAG);
-    if args.len() != before {
-        STATE.store(2, Ordering::Relaxed);
-    }
+/// Takes `--fast` from the tsc command line `args` (without the program
+/// name) and turns fast mode on when there was one. Call before the first
+/// `enabled`. tsgo `run_main` calls it after it sends `--lsp` and `--api`
+/// on, as Go does: the servers parse their flags with Go's `flag` package,
+/// so they take fast mode only from `GOPORT_FAST=1`.
+pub fn take_flag(args: &mut [String]) {
     if args
         .first()
         .is_some_and(|arg| crate::execute::execute_tsc::is_build_flag(arg))
     {
         BUILD.store(true, Ordering::Relaxed);
     }
+    if blank_flags(args, BUILD.load(Ordering::Relaxed)) {
+        STATE.store(2, Ordering::Relaxed);
+    }
+}
+
+/// Makes each `--fast` of `args` that Go's parser reads as an option name
+/// an empty argument, and returns true when there was one. A `--fast` that
+/// an option before it takes as its value stays: Go sets
+/// `tsgo --outDir --fast` to outDir "--fast". `build`: the build command
+/// line (its options differ). Go's parser skips an empty argument, and an
+/// option that does not take `--fast` as its value does not take an empty
+/// argument either (a boolean takes only "true", "false" or "null"; a list
+/// value that starts with "-" is empty, as is an empty one; a tsconfig-only
+/// option takes no value that starts with "-"). So the other arguments
+/// parse as in Go, and only Go's unknown option error for `--fast` goes.
+/// Not in a response file (`@file`): Go reads it as an unknown option.
+// PORT: not in Go (followups49). The walk is Go's `parseStrings` with the
+// port's `parse_option_value` on a scratch parser, so each option takes
+// the arguments it takes in Go.
+fn blank_flags(args: &mut [String], build: bool) -> bool {
+    if !args.iter().any(|arg| arg == FLAG) {
+        return false;
+    }
+    use crate::frontend::tsoptions::{
+        BUILD_OPTIONS_DID_YOU_MEAN_DIAGNOSTICS, COMPILER_OPTIONS_DID_YOU_MEAN_DIAGNOSTICS,
+        get_input_option_name, parse_command_line_worker,
+    };
+    let diagnostics = if build {
+        &*BUILD_OPTIONS_DID_YOU_MEAN_DIAGNOSTICS
+    } else {
+        &*COMPILER_OPTIONS_DID_YOU_MEAN_DIAGNOSTICS
+    };
+    let mut parser = parse_command_line_worker(diagnostics, &[], None, String::new());
+    let mut taken = false;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == FLAG {
+            args[i].clear();
+            taken = true;
+            i += 1;
+            continue;
+        }
+        let arg = &args[i];
+        i += 1;
+        // Go: `case '-':`. An empty argument, a response file and a file
+        // name take no other argument.
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let name = get_input_option_name(arg);
+        if let Some(opt) = parser
+            .options_map
+            .get_option_declaration_from_name(name, true)
+        {
+            i = parser.parse_option_value(
+                args,
+                i,
+                opt,
+                diagnostics.option_type_mismatch_diagnostic,
+            );
+        }
+    }
+    taken
 }
 
 /// True when fast mode is on: `--fast` (`take_flag`) or `GOPORT_FAST=1`.
