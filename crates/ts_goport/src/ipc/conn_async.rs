@@ -27,10 +27,12 @@
 //!   when it read it.
 //!
 //!   The Go clock: Go's `terminal` check (:263) depends only on when a
-//!   goroutine makes its call, before or after `Run` returned. Here a
-//!   request that waits in a call while a nested request runs is held
-//!   until that request returns, and a request read while another one
-//!   runs starts when it returns. So each request and notification that
+//!   goroutine makes its call, before or after the read loop of `Run`
+//!   ended (its deferred `closePendingCalls`, :72). A handler cannot call
+//!   after `Run` returned: the deferred function waits for the handlers
+//!   (:74). Here a request that waits in a call while a nested request
+//!   runs is held until that request returns, and a request read while
+//!   another one runs starts when it returns. So each request and notification that
 //!   the dispatch thread runs is a frame with a lag: the time that the port
 //!   held it while Go ran it. Its Go time is the port time less the lag. A
 //!   `Call` or `Notify` whose Go time is before the end of the read loop
@@ -773,7 +775,7 @@ impl AsyncConn {
         (Instant::now().saturating_duration_since(end) < lag).then_some(end)
     }
 
-    /// PORT: a `Call` that Go made before `Run` returned
+    /// PORT: a `Call` that Go made before the read loop of `Run` ended
     /// (`frame_before_the_end`). Go's `terminal` was nil (:263), so
     /// it writes its request (:281), and its `select` (:289) returns
     /// `ctx.Err()` when `ctx` was done before the end (a signal), or else
@@ -2175,13 +2177,13 @@ pub(crate) mod tests {
     /// notes their results; `slowcalls` too, but it waits `HOLD` after the
     /// first. `hcall` makes a call with its own context (the handler
     /// context, as the API's module resolver) and notes the result. `lags`
-    /// makes 2 calls and notes its frame's lag after each. `hold` waits
-    /// `HOLD` and does not look at its context; `holdcall` then makes a
-    /// call and notes its result. `bgcall` makes a call with a context that
-    /// is never done and notes the result. `endnotify` and `endcall` note
-    /// `start`, wait until the read loop ended, then notify, or call with a
-    /// context that is never done, and note the result. Other requests
-    /// answer `true`.
+    /// sets its frame's lag to 0, makes 2 calls and notes the lag after
+    /// each. `hold` waits `HOLD` and does not look at its context;
+    /// `holdcall` then makes a call and notes its result. `bgcall` makes a
+    /// call with a context that is never done and notes the result.
+    /// `endnotify` and `endcall` note `start`, wait until the read loop
+    /// ended, then notify, or call with a context that is never done, and
+    /// note the result. Other requests answer `true`.
     struct CallbackHandler {
         conn: std::cell::OnceCell<std::rc::Weak<AsyncConn>>,
         call_ctx: Context,
@@ -2210,7 +2212,10 @@ pub(crate) mod tests {
             };
             // Waits up to 5 s until the reader thread ended the read loop.
             // This is a wait on the Go side: Go's handler goroutine waits
-            // until `Run` returned, so it runs after the end. The running
+            // until the read loop of `Run` ended (its deferred
+            // `closePendingCalls` set `terminal`), so it runs after the end.
+            // It cannot wait until `Run` returned: the deferred function of
+            // `Run` waits for its handlers (conn_async.go:74). The running
             // frame of the Go clock then has no lag left. Without the reset,
             // a frame that the port held (lag > 0) and that sees the end
             // soon after it would count as before the end
@@ -2258,6 +2263,15 @@ pub(crate) mod tests {
                 }
                 "lags" => {
                     let conn = conn();
+                    // The frame starts at lag 0, as when the dispatch thread
+                    // waited idle for this request. `run` starts the reader
+                    // thread before its loop, so under load that thread can
+                    // read the request first, and the frame then starts with
+                    // that wait as its lag (`dispatch_read`). The test checks
+                    // what the calls add.
+                    if let Some(lag) = conn.frames.borrow_mut().last_mut() {
+                        *lag = Duration::ZERO;
+                    }
                     let mut lags = Vec::new();
                     for _ in 0..2 {
                         let _ = conn.call(&self.call_ctx, "callback", None);
@@ -2458,7 +2472,7 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_cancel_phases() {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
         write_framed(&client, r#"{"jsonrpc":"2.0","id":1,"method":"outer"}"#);
         let call = read_framed(&client);
         assert!(
@@ -2466,6 +2480,10 @@ pub(crate) mod tests {
             "{call}"
         );
 
+        // The reader thread read id 1 and waits in its second read, past
+        // its check of `ctx` (Go :83). A cancel before that check ends the
+        // read loop with no read, in Go too: then no Phase A.
+        wait_for_reads(&reads, 2);
         cancel();
         let call = read_framed(&client);
         assert!(
@@ -2629,13 +2647,17 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_cancel_beats_a_later_close() {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
         write_framed(&client, r#"{"jsonrpc":"2.0","id":1,"method":"outer"}"#);
         let call = read_framed(&client);
         assert!(call.contains(r#""id":"api1""#), "{call}");
         write_framed(&client, r#"{"jsonrpc":"2.0","id":2,"method":"late"}"#);
         let call = read_framed(&client);
         assert!(call.contains(r#""id":"api2""#), "{call}");
+        // The reader thread read ids 1 and 2 and waits in its third read.
+        // A cancel before its check of `ctx` (Go :83) ends the read loop
+        // with no read, and `run` closes the socket before the ping.
+        wait_for_reads(&reads, 3);
         cancel();
         // The 1 message read after the cancel ends the read loop.
         write_framed(&client, r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#);
@@ -2999,15 +3021,20 @@ pub(crate) mod tests {
     #[test]
     fn test_async_conn_reader_idle_call_keeps_lag_zero() {
         let (ctx, cancel) = context::with_cancel(&context::background());
-        let (client, notes, run_done, runner) = run_on_reader(&ctx);
+        let (client, notes, run_done, runner, reads) = run_on_reader_with_reads(&ctx);
         write_framed(&client, r#"{"jsonrpc":"2.0","id":1,"method":"lags"}"#);
         let call = read_framed(&client);
         assert!(call.contains(r#""id":"api1""#), "{call}");
+        // Idle time for the call to wait through, not a wait for a state.
         std::thread::sleep(Duration::from_millis(50));
         write_framed(&client, r#"{"jsonrpc":"2.0","id":"api1","result":null}"#);
         let call = read_framed(&client);
         assert!(call.contains(r#""id":"api2""#), "{call}");
-        std::thread::sleep(Duration::from_millis(50));
+        // The reader thread read id 1 and the reply and waits in its third
+        // read, so the 1 read after the signal is the EOF below. A cancel
+        // before its check of `ctx` (Go :83) ends the loop with
+        // `context canceled`.
+        wait_for_reads(&reads, 3);
         cancel();
         let note = notes.recv_timeout(Duration::from_secs(5)).expect("note");
         assert_eq!(note, "lags | [Some(0ns), Some(0ns)]");
