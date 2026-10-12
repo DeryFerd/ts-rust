@@ -1931,89 +1931,119 @@ impl Checker {
         if !could_contain {
             return t;
         }
+        let is_type_parameter = self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER);
         if self.instantiation_stack.len() == 100 || self.instantiation_count >= 5_000_000 {
-            // We have reached 100 recursive type instantiations, or 5M type instantiations caused by the same statement
-            // or expression. There is a very high likelihood we're dealing with a combination of infinite generic types
-            // that perpetually generate new type identities, so we stop the recursion here by yielding the error type.
-            if let Some(tr) = self.tracer {
-                tr.instant(
-                    crate::tracing::Phase::CheckTypes,
-                    "instantiateType_DepthLimit",
-                    vec![
-                        ("typeId", t.into()),
-                        (
-                            "instantiationDepth",
-                            (self.instantiation_stack.len() as u32).into(),
-                        ),
-                        ("instantiationCount", self.instantiation_count.into()),
-                    ],
-                );
-            }
-            let circular_type_names = self.get_circular_type_names();
-            let current_node = self.current_node;
-            if circular_type_names.len() == 1 {
-                self.error(
-                    current_node,
-                    diag::Instantiations_of_type_0_appear_infinitely_circular,
-                    args![circular_type_names[0].clone()],
-                );
-            } else if circular_type_names.len() > 1 {
-                self.error(
-                    current_node,
-                    diag::Instantiations_of_the_following_types_appear_infinitely_circular_Colon_0,
-                    args![quoted_and_comma_separated(&circular_type_names)],
-                );
-            } else {
-                self.error(
-                    current_node,
-                    diag::Type_instantiation_is_excessively_deep_and_possibly_infinite,
-                    args![],
-                );
-            }
-            return self.error_type;
+            return self.instantiation_depth_limit(t);
         }
         let index = self.find_active_mapper(m);
         if index == -1 {
             self.push_active_mapper(m);
         }
         // PERF: a key with no alias is `t` itself, in the `plain` map
-        // (`ActiveMapperCache`). `None` here means that key.
+        // (`ActiveMapperCache`). `None` here means that key. A key with an
+        // alias is made in Go's place even when no lookup follows: it gives
+        // the alias symbol its id (`get_symbol_id`).
         let alias_key = alias.as_deref().map(|alias| {
             let mut b = KeyBuilder::default();
             b.write_type(t);
             b.write_alias(&self.symbols, Some(alias));
             b.hash()
         });
-        let cache_index = if index != -1 {
-            index as usize
+        // PERF (instfast1): a mapper that was not active got a new cache at
+        // the top, and the caches past the active length are always empty
+        // (`pop_active_mapper`), so Go's lookup in it always misses and is
+        // skipped. Only an active mapper's cache gets the result.
+        let mut cache_key: Option<(usize, Option<CacheHashKey>)> = None;
+        if index == -1 {
+            debug_assert!(
+                self.active_type_mappers_caches[self.active_mappers.len() - 1].is_empty()
+            );
         } else {
-            self.active_mappers.len() - 1
-        };
-        let cache = &self.active_type_mappers_caches[cache_index];
-        let cached = match &alias_key {
-            None => cache.get_plain(t),
-            Some(key) => cache.aliased.get(key),
-        };
-        if let Some(&cached_type) = cached {
-            return cached_type;
+            let cache_index = index as usize;
+            let cache = &self.active_type_mappers_caches[cache_index];
+            let cached = match &alias_key {
+                None => cache.get_plain(t),
+                Some(key) => cache.aliased.get(key),
+            };
+            if let Some(&cached_type) = cached {
+                return cached_type;
+            }
+            cache_key = Some((cache_index, alias_key));
         }
         self.total_instantiation_count += 1;
         self.instantiation_count += 1;
         self.instantiation_stack.push(t);
-        let result = self.instantiate_type_worker(t, m, alias);
-        if index == -1 {
-            self.pop_active_mapper();
+        // PERF (instfast1): a type parameter (about 43% of the misses on T3
+        // server) is the first case of `instantiate_type_worker`, done here
+        // without its frame. The alias is not used there either.
+        let result = if is_type_parameter {
+            drop(alias);
+            self.get_mapped_type(t, m)
         } else {
-            let cache = &mut self.active_type_mappers_caches[cache_index];
-            match alias_key {
-                None => cache.insert_plain(t, result),
-                Some(key) => {
-                    cache.aliased.insert(key, result);
+            self.instantiate_type_worker(t, m, alias)
+        };
+        match cache_key {
+            None => self.pop_active_mapper(),
+            Some((cache_index, alias_key)) => {
+                let cache = &mut self.active_type_mappers_caches[cache_index];
+                match alias_key {
+                    None => cache.insert_plain(t, result),
+                    Some(key) => {
+                        cache.aliased.insert(key, result);
+                    }
                 }
             }
         }
         self.instantiation_stack.pop();
         result
+    }
+
+    /// The depth and count limit of Go `instantiateTypeWithAlias`: reports
+    /// the circular types (or the depth) and gives the error type.
+    // PERF: out of line, so `instantiate_type_with_alias` keeps a small
+    // frame.
+    #[cold]
+    #[inline(never)]
+    fn instantiation_depth_limit(&mut self, t: TypeId) -> TypeId {
+        // We have reached 100 recursive type instantiations, or 5M type instantiations caused by the same statement
+        // or expression. There is a very high likelihood we're dealing with a combination of infinite generic types
+        // that perpetually generate new type identities, so we stop the recursion here by yielding the error type.
+        if let Some(tr) = self.tracer {
+            tr.instant(
+                crate::tracing::Phase::CheckTypes,
+                "instantiateType_DepthLimit",
+                vec![
+                    ("typeId", t.into()),
+                    (
+                        "instantiationDepth",
+                        (self.instantiation_stack.len() as u32).into(),
+                    ),
+                    ("instantiationCount", self.instantiation_count.into()),
+                ],
+            );
+        }
+        let circular_type_names = self.get_circular_type_names();
+        let current_node = self.current_node;
+        if circular_type_names.len() == 1 {
+            self.error(
+                current_node,
+                diag::Instantiations_of_type_0_appear_infinitely_circular,
+                args![circular_type_names[0].clone()],
+            );
+        } else if circular_type_names.len() > 1 {
+            self.error(
+                current_node,
+                diag::Instantiations_of_the_following_types_appear_infinitely_circular_Colon_0,
+                args![quoted_and_comma_separated(&circular_type_names)],
+            );
+        } else {
+            self.error(
+                current_node,
+                diag::Type_instantiation_is_excessively_deep_and_possibly_infinite,
+                args![],
+            );
+        }
+        self.error_type
     }
 
     // Go: checker/checker.go:22614 getCircularTypeNames
