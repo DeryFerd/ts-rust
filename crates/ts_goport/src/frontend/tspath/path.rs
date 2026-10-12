@@ -1712,6 +1712,13 @@ pub fn compare_rooted_text(a: &str, b: &str, use_case_sensitive_file_names: bool
 }
 
 // Go: tspath/path.go:1111 ContainsPath
+// PORT: Go at the pin takes only the case setting and combines with "". No
+// Go caller outside tests uses it: the callers take typed rooted paths
+// (`CaseSensitivity.ContainsPath`, rooted_path.go:553, ts#64159). The port's
+// callers pass strings, so `options.current_directory` stays: it roots a
+// relative path, as a Go caller roots it when it makes the typed path. With
+// an empty current directory or two rooted paths, the answer is that of
+// path.go:1111.
 pub fn contains_path(parent: &str, child: &str, options: &ComparePathsOptions) -> bool {
     let parent = combine_with_directory(&options.current_directory, parent);
     let child = combine_with_directory(&options.current_directory, child);
