@@ -349,8 +349,12 @@ impl Checker {
             if attributes_type.is_nil() || self.is_type_any(attributes_type) {
                 return TypeId::NIL;
             }
-            return self
-                .get_type_of_property_of_contextual_type(attributes_type, attribute.name().text());
+            // PERF (jsxname1): the attribute's `Name` (`text_name`), so the
+            // property lookups compare name ids.
+            return self.get_type_of_property_of_contextual_type(
+                attributes_type,
+                &attribute.name().text_name(),
+            );
         }
         self.get_contextual_type(attribute.parent(), context_flags)
     }
@@ -437,10 +441,12 @@ impl Checker {
             }
         }
         let jsx_namespace = self.get_jsx_namespace_at(node);
-        let jsx_children_property_name = self.get_jsx_element_children_property_name(jsx_namespace);
-        // PERF (jsxname1): the lookups below take each symbol's `Name`, so
+        // PERF (jsxname1): the children name is interned once, so each member
+        // compares name ids. The lookups below take each symbol's `Name`, so
         // they compare name ids and hash no text, as Go's map lookups use the
         // stored string hash.
+        let jsx_children_property_name =
+            Name::from(self.get_jsx_element_children_property_name(jsx_namespace));
         let mut discriminant_properties: Vec<Node> = Vec::new();
         for p in node.properties() {
             let symbol = p.symbol();
@@ -465,7 +471,7 @@ impl Checker {
             } else {
                 let element = node.parent().parent();
                 let name = self.sym(s).name.clone();
-                if name == *jsx_children_property_name
+                if name == jsx_children_property_name
                     && is_jsx_element(element)
                     && !get_semantic_jsx_children(&element.children().nodes().to_vec()).is_empty()
                 {

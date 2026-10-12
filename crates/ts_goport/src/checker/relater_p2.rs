@@ -565,9 +565,12 @@ impl Checker {
             // have non-matching discriminants. This ensures that we ignore erroneous discriminators and gradually
             // refine the target set without eliminating every constituent (which would lead to `never`).
             let mut matched = false;
+            // PERF (jsxname1): Go reads `discriminator.name(n)` for each
+            // constituent. The name does not change in this loop, so it is
+            // read once.
+            let name = discriminator.name(self, n);
             for i in 0..types.len() {
                 if include[i] != Ternary::FALSE {
-                    let name = discriminator.name(self, n);
                     let target_type =
                         self.get_type_of_property_or_index_signature_of_type(types[i], &name);
                     if target_type.is_some() {
