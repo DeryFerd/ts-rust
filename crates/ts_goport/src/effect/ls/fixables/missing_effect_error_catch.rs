@@ -200,8 +200,11 @@ fn build_catch_tags_handlers_object(tags: &[String]) -> String {
 }
 
 // Go: fixables/missing_effect_error_catch.go:162 expressionNodeForMissingEffectError
-// PORT: Go `ast.IsExpression(stmt.Expression)` panics on a bare `return`
-// (nil expression). Rust gives no node there.
+// A bare `return` panics in Go `ast.IsExpression(stmt.Expression)` (nil
+// dereference), and `is_expression(Node::NIL)` panics the same way. No
+// match reaches it: the checker's error node for a bare return has the
+// source type `undefined` (checkReturnExpression), and
+// AnalyzeMissingEffectError skips a source that is not an Effect.
 fn expression_node_for_missing_effect_error(node: Node) -> Node {
     if node.is_nil() {
         return Node::NIL;
@@ -223,7 +226,7 @@ fn expression_node_for_missing_effect_error(node: Node) -> Node {
         }
         SyntaxKind::ReturnStatement => {
             let expression = node.expression();
-            if expression.is_some() && is_expression(expression) {
+            if is_expression(expression) {
                 return expression;
             }
         }

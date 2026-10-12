@@ -327,6 +327,16 @@ impl Checker {
         &mut self,
         node: Node, /*Union[HasModifiers, HasDecorators, HasIllegalModifiers, HasIllegalDecorators]*/
     ) -> bool {
+        // PERF: portonly1 item 3. Go tests `node.Modifiers() == nil`
+        // (grammarchecks.go:215). A published store node reads that from its
+        // modifier bits column, without its node data: a parsed modifier list
+        // is never empty (Go parser.go:3967 makes no list for no modifiers, and
+        // reparser.go:564 and :705 make lists of one or more), and each
+        // modifier and decorator kind has a flag, so no bits means no list.
+        if frozen_store_modifier_flags(node) == Some(ModifierFlags::NONE) {
+            debug_assert!(node.modifiers().is_nil(), "modifier bits without a list");
+            return false;
+        }
         let modifier_list = node.modifiers();
         if modifier_list.is_nil() {
             return false;
@@ -1321,10 +1331,20 @@ impl Checker {
 
         for i in 0..parameter_count {
             let parameter = parameter_nodes.get(i);
-            if parameter.dot_dot_dot_token().is_some() {
+            // PERF: portonly1 item 3. Go reads the fields of
+            // `parameters.Nodes[i].AsParameterDeclaration()` (grammarchecks.go:692)
+            // from one struct; `parameter_parts` reads them with one node data
+            // load. Go's `AsParameterDeclaration` panics on another kind, and
+            // so do the field accessors.
+            let parts = parameter_parts(parameter).unwrap_or_else(|| ParameterParts {
+                dot_dot_dot_token: parameter.dot_dot_dot_token(),
+                question_token: parameter.question_token(),
+                initializer: parameter.initializer(),
+            });
+            if parts.dot_dot_dot_token.is_some() {
                 if i != parameter_count - 1 {
                     return self.grammar_error_on_node(
-                        parameter.dot_dot_dot_token(),
+                        parts.dot_dot_dot_token,
                         diag::A_rest_parameter_must_be_last_in_a_parameter_list,
                         args![],
                     );
@@ -1336,15 +1356,15 @@ impl Checker {
                     );
                 }
 
-                if parameter.question_token().is_some() {
+                if parts.question_token.is_some() {
                     return self.grammar_error_on_node(
-                        parameter.question_token(),
+                        parts.question_token,
                         diag::A_rest_parameter_cannot_be_optional,
                         args![],
                     );
                 }
 
-                if parameter.initializer().is_some() {
+                if parts.initializer.is_some() {
                     return self.grammar_error_on_node(
                         parameter.name(),
                         diag::A_rest_parameter_cannot_have_an_initializer,
@@ -1354,10 +1374,10 @@ impl Checker {
             } else if is_optional_declaration(parameter) {
                 seen_optional_parameter = true;
                 // A reparsed '?' token indicates a bracketed name in @param tag
-                let question_token = parameter.question_token();
+                let question_token = parts.question_token;
                 if question_token.is_some()
                     && !question_token.flags().intersects(NodeFlags::REPARSED)
-                    && parameter.initializer().is_some()
+                    && parts.initializer.is_some()
                 {
                     return self.grammar_error_on_node(
                         parameter.name(),
@@ -1365,7 +1385,7 @@ impl Checker {
                         args![],
                     );
                 }
-            } else if seen_optional_parameter && parameter.initializer().is_nil() {
+            } else if seen_optional_parameter && parts.initializer.is_nil() {
                 return self.grammar_error_on_node(
                     parameter.name(),
                     diag::A_required_parameter_cannot_follow_an_optional_parameter,
@@ -1383,10 +1403,22 @@ impl Checker {
             let body = node.body();
             let mut use_strict_directive = Node::NIL;
             if body.is_some() && is_block(body) {
-                use_strict_directive = find_use_strict_prologue(
-                    get_source_file_of_node(node),
-                    &body.statements().to_vec(),
-                );
+                // PERF: portonly1 item 3. Go passes `body.Statements()`
+                // (grammarchecks.go:727) with no copy; the port read the
+                // statements into a new Vec for each function. This is Go
+                // binder.go:1360 `FindUseStrictPrologue` on the statements in
+                // place (`find_use_strict_prologue` takes a slice, and
+                // `binder_p2.rs` is a key source of the lib blobs).
+                let source_file = get_source_file_of_node(node);
+                for statement in body.statements() {
+                    if !is_prologue_directive(statement) {
+                        break;
+                    }
+                    if is_use_strict_prologue_directive(source_file, statement) {
+                        use_strict_directive = statement;
+                        break;
+                    }
+                }
             }
             if use_strict_directive.is_some() {
                 let non_simple_parameters: Vec<Node> = node

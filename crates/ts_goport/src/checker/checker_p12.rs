@@ -35,18 +35,26 @@ impl Checker {
     // If the given type is an object or union type with a single signature, and if that signature has at
     // least as many parameters as the given function, return the signature. Otherwise return undefined.
     // Go: checker/checker.go:10536 getContextualCallSignature
+    // PERF: portonly1 item 6. Go `core.Filter` (checker.go:10538) returns
+    // the input slice when every element passes and copies only otherwise.
+    // The port collected the passing signatures into a new Vec each call.
     pub fn get_contextual_call_signature(&mut self, t: TypeId, node: Node) -> SignatureId {
         let signatures = self.get_signatures_of_type(t, SignatureKind::CALL);
-        let mut applicable_by_arity: Vec<SignatureId> = Vec::new();
-        for s in signatures.iter().copied() {
-            if !self.is_arity_smaller(s, node) {
-                applicable_by_arity.push(s);
+        let mut filtered: Option<Vec<SignatureId>> = None;
+        for (i, &s) in signatures.iter().enumerate() {
+            let applicable = !self.is_arity_smaller(s, node);
+            match &mut filtered {
+                Some(list) if applicable => list.push(s),
+                Some(_) => {}
+                None if !applicable => filtered = Some(signatures[..i].to_vec()),
+                None => {}
             }
         }
+        let applicable_by_arity: &[SignatureId] = filtered.as_deref().unwrap_or(&signatures[..]);
         if applicable_by_arity.len() == 1 {
             return applicable_by_arity[0];
         }
-        self.get_intersected_signatures(&applicable_by_arity)
+        self.get_intersected_signatures(applicable_by_arity)
     }
 
     // Go: checker/checker.go:10545 getIntersectedSignatures
@@ -83,10 +91,22 @@ impl Checker {
         let mut target_parameter_count: i32 = 0;
         while (target_parameter_count as usize) < parameters.len() {
             let param = parameters.get(target_parameter_count as usize);
-            if param.initializer().is_some()
-                || param.question_token().is_some()
-                || has_dot_dot_dot_token(param)
-            {
+            // PERF: portonly1 item 6. Go reads the three fields of the
+            // parameter struct (checker.go:10564 isAritySmaller); `parameter_parts`
+            // reads them with one node data load, not one lookup each.
+            let stops = match parameter_parts(param) {
+                Some(parts) => {
+                    parts.initializer.is_some()
+                        || parts.question_token.is_some()
+                        || parts.dot_dot_dot_token.is_some()
+                }
+                None => {
+                    param.initializer().is_some()
+                        || param.question_token().is_some()
+                        || has_dot_dot_dot_token(param)
+                }
+            };
+            if stops {
                 break;
             }
             target_parameter_count += 1;

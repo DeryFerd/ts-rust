@@ -90,15 +90,21 @@ pub(crate) fn path_for_dynamic_resolution<'a>(
 // Go: module/resolver.go:54 resolvePathForModule (ts#64544 at 59f5b0233; ts#64159
 // replaces it with resolutionCandidate)
 // `path` resolved against `directory`; a directory path ends with "/".
+// PERF: portonly1 item 9. Go N prime resolves a candidate with
+// `RootedDirectoryPath.ResolveFile` or `ResolveDirectory`
+// (module/resolver.go:112, tspath/rooted_path.go:737 and :794), which append
+// a path that needs no normalization to the directory with one allocation
+// (`append_relative_to_normal_directory`). Other paths join and normalize.
 pub(crate) fn resolve_path_for_module(directory: &str, path: &str, directory_only: bool) -> String {
-    let resolved = normalize_path(&combine_paths(
-        directory,
-        &[&path_for_dynamic_resolution(
-            directory,
-            path,
-            directory_only,
-        )],
-    ));
+    let path = path_for_dynamic_resolution(directory, path, directory_only);
+    if let Some(mut resolved) = append_relative_to_normal_directory(directory, &path) {
+        if directory_only {
+            // `path` has no trailing separator, so the result has none.
+            resolved.push(DIRECTORY_SEPARATOR as char);
+        }
+        return resolved;
+    }
+    let resolved = normalize_path(&combine_paths(directory, &[&path]));
     if directory_only {
         return ensure_trailing_directory_separator(&resolved);
     }

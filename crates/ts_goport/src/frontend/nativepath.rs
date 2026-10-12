@@ -377,4 +377,58 @@ mod tests {
         ok(&format!("{root}/ABS/LIB"), &format!("{mono}/packages/LIB"));
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // Go: realpath_darwin_test.go:11 TestRealpathHardlinkedFile
+    // PORT: Go runs it on darwin only (the file name). The port runs it on
+    // every unix, so the Linux test hosts run it too: on Linux the open of
+    // `alias` gives the dentry of that name, and /proc/self/fd reads it back.
+    // `t.TempDir()` is a new dir that is not resolved, as here.
+    #[test]
+    fn realpath_hardlinked_file() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "ts_goport_realpath_hardlink_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let real_path = tmp.join("real.d.ts");
+        let alias = tmp.join("alias.d.ts");
+        std::fs::write(&real_path, "export * from './lib';\n").unwrap();
+        std::fs::hard_link(&real_path, &alias).unwrap();
+        let alias = go_string_from_os(alias.into_os_string());
+
+        let want = eval_symlinks(&alias).unwrap();
+
+        // Go: the worker goroutine opens and closes the real name until
+        // `stop` closes; its first error ends it. The guard is Go's
+        // `defer stopWorker()`: a failed check stops the worker before the
+        // scope joins it.
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let worker_err = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Err(err) = std::fs::File::open(&real_path) {
+                        return Some(err);
+                    }
+                }
+                None
+            });
+            let stop_worker = StopOnDrop(&stop);
+            for _ in 0..200 {
+                assert_eq!(realpath(&alias).unwrap(), want);
+            }
+            drop(stop_worker);
+            worker.join().unwrap()
+        });
+        assert!(worker_err.is_none(), "{worker_err:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
