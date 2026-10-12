@@ -272,11 +272,12 @@ case "$cmd" in
       rsync -rlpH --from0 --files-from="$t/files" -e "$ssh" "$co/" "runner@$host:$co/"
     fi
     if [[ -s $t/deleted ]]; then
-      (cd "$t" && tr '\0' '\n' < deleted | sed "s|^|$co/|" > deleted.list)
-      $ssh "runner@$host" "xargs -d '\\n' rm -f" < "$t/deleted.list"
+      # NUL-separated to the end: a file name can hold a newline.
+      while IFS= read -r -d '' f; do printf '%s\0' "$co/$f"; done < "$t/deleted" > "$t/deleted.list"
+      $ssh "runner@$host" "xargs -0 rm -f" < "$t/deleted.list"
     fi
     here_fp=$(python3 scripts/goport/fp.py "$co" | cut -d' ' -f1)
-    there_fp=$($ssh "runner@$host" "cd $remote_root && python3 scripts/goport/fp.py $co" < /dev/null | cut -d' ' -f1)
+    there_fp=$($ssh "runner@$host" "cd $remote_root && python3 scripts/goport/fp.py $(printf %q "$co")" < /dev/null | cut -d' ' -f1)
     [[ $here_fp == "$there_fp" ]] || { echo "fp.py $co: zbook $here_fp, testbox $there_fp" >&2; exit 1; }
     echo "source $co ${head:0:12} on the testbox, fp ${here_fp:0:12}"
     ;;
