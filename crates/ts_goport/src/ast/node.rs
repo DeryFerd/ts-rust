@@ -475,6 +475,16 @@ impl ChildIds {
     }
 }
 
+/// The node data and the child ids of published store node `n`, from one
+/// registry lookup, or `None` for any other node (read it with the
+/// accessors). For a hot site that reads a few fields of one node.
+#[inline]
+#[must_use]
+pub fn frozen_data_ids(n: Node) -> Option<(NodeData<'static>, FrozenIds)> {
+    let f = frozen_store_node(n)?;
+    Some((f.data()?, f.ids()))
+}
+
 /// `with_data!` that also binds `$ids`, the `ChildIds` of node `$n`: a
 /// published store node gives its node data and child ids from one registry
 /// lookup. The Go field accessors of `fields.rs` read through it.
@@ -5910,8 +5920,16 @@ fn access_kind_ref(node: NodeRef) -> AccessKind {
         SyntaxKind::ParenthesizedExpression | SyntaxKind::ArrayLiteralExpression => {
             access_kind_ref(parent)
         }
+        // PERF: noderead2. The operator and the left operand come from one
+        // node data read of the parent (`NodeRef::data`, `frozen_data_ids`),
+        // and the operator token kind is read once. Go reads the fields.
         SyntaxKind::PrefixUnaryExpression | SyntaxKind::PostfixUnaryExpression => {
-            let operator = parent.node().operator();
+            let operator = match parent.data() {
+                Some(NodeData::PrefixUnaryExpression(d)) => d.operator,
+                Some(NodeData::PostfixUnaryExpression(d)) => d.operator,
+                _ => parent.node().operator(),
+            };
+            debug_assert_eq!(operator, parent.node().operator());
             if operator == SyntaxKind::PlusPlusToken || operator == SyntaxKind::MinusMinusToken {
                 AccessKind::READ_WRITE
             } else {
@@ -5919,11 +5937,16 @@ fn access_kind_ref(node: NodeRef) -> AccessKind {
             }
         }
         SyntaxKind::BinaryExpression => {
-            let parent = parent.node();
-            if parent.left() == node.node() {
-                let operator = parent.operator_token();
-                if is_assignment_operator(operator.kind()) {
-                    if operator.kind() == SyntaxKind::EqualsToken {
+            let (left, operator_token) = match frozen_data_ids(parent.node()) {
+                Some((NodeData::BinaryExpression(d), ids)) => {
+                    (ids.node(d.left), ids.node(d.operator_token))
+                }
+                _ => (parent.node().left(), parent.node().operator_token()),
+            };
+            if left == node.node() {
+                let operator = operator_token.kind();
+                if is_assignment_operator(operator) {
+                    if operator == SyntaxKind::EqualsToken {
                         return AccessKind::WRITE;
                     }
                     return AccessKind::READ_WRITE;
