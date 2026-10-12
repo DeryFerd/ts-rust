@@ -38,11 +38,29 @@ impl NewProgram {
     }
 
     // Go: program.go:2098 (*Program).GetSourceFileForResolvedModule
+    // ts#64159: a lookup by the resolution's path. PORT: a resolution
+    // without a path (none should have one), or `GOPORT_RESOLVED_PATH=0`,
+    // uses `to_path` of its name.
     pub fn get_source_file_for_resolved_module(
         &self,
-        file_name: &str,
+        resolved: &ResolvedModule,
     ) -> Option<Rc<ParsedSourceFile>> {
-        let file = self.get_source_file(file_name);
+        match resolved.path() {
+            Some(path) => self.get_source_file_with_redirect(&resolved.resolved_file_name, path),
+            None => {
+                let path = self.to_path(&resolved.resolved_file_name);
+                self.get_source_file_with_redirect(&resolved.resolved_file_name, &path)
+            }
+        }
+    }
+
+    // Go: program.go:2102 (*Program).getSourceFileWithRedirect
+    pub fn get_source_file_with_redirect(
+        &self,
+        file_name: &str,
+        path: &Path,
+    ) -> Option<Rc<ParsedSourceFile>> {
+        let file = self.get_source_file_by_path(path);
         if file.is_none() {
             let filename = self.get_parse_file_redirect(file_name);
             if !filename.is_empty() {

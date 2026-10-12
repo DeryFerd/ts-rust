@@ -278,6 +278,48 @@ fn test_program() {
     });
 }
 
+// Go: compiler/checkerpool_test.go:12 TestGetSourceFileForResolvedModuleUsesResolvedPath
+// (ts#64159). PORT: Go makes a `Program` with only `filesByPath`; the port
+// loads a program of the file, so the test runs in a child process.
+#[test]
+fn test_get_source_file_for_resolved_module_uses_resolved_path() {
+    in_child(
+        module_path!(),
+        "test_get_source_file_for_resolved_module_uses_resolved_path",
+        || {
+            let map_fs = MapFs::from_map(
+                Vec::<(String, MapFile)>::new(),
+                true, /*useCaseSensitiveFileNames*/
+            );
+            install_map_fs(&map_fs, "/");
+            let _ = map_fs
+                .fs()
+                .write_file("/resolved.ts", "export const x = 1;\n");
+            let program = new_program(
+                map_fs.fs(),
+                "/",
+                &["/resolved.ts"],
+                CompilerOptions {
+                    no_lib: Tristate::True,
+                    ..Default::default()
+                },
+            );
+            let resolved = ts_goport::program::ResolvedModule {
+                resolved_file_name: "/different.ts".to_string(),
+                resolved_path: ts_goport::frontend::tspath::Path("/resolved.ts".to_string()),
+                ..Default::default()
+            };
+            let got = program.get_source_file_for_resolved_module(&resolved);
+            assert!(
+                got.as_ref()
+                    .is_some_and(|file| file.parse_options.file_name == "/resolved.ts"),
+                "GetSourceFileForResolvedModule() = {:?}, want /resolved.ts",
+                got.map(|file| file.parse_options.file_name.clone())
+            );
+        },
+    );
+}
+
 // Go: compiler/program_test.go:271 TestIncludeProcessorDiagnosticsWithMissingFileCasing
 #[test]
 fn test_include_processor_diagnostics_with_missing_file_casing() {

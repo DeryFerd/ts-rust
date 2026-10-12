@@ -339,6 +339,20 @@ pub fn parse_source_file_detached(
     source_text: impl Into<FileText>,
     script_kind: ScriptKind,
 ) -> DetachedParse {
+    parse_source_file_detached_reading(job, opts, source_text, script_kind, |_| ()).0
+}
+
+/// `parse_source_file_detached`, and what `read` reads of the parse while
+/// its nodes are on this thread (the parse workers' import names,
+/// `ImportNames`).
+#[must_use]
+pub fn parse_source_file_detached_reading<R>(
+    job: usize,
+    opts: &SourceFileParseOptions,
+    source_text: impl Into<FileText>,
+    script_kind: ScriptKind,
+    read: impl FnOnce(&ParsedSourceFile) -> R,
+) -> (DetachedParse, R) {
     let source_text: FileText = source_text.into();
     let jsdoc_cut_text = OnceCell::new();
     let mut p = new_parser();
@@ -361,23 +375,27 @@ pub fn parse_source_file_detached(
         .as_static()
         .and_then(|text| super::lib_parse_snapshot::load(p.store, opts, text, script_kind))
     {
-        return DetachedParse {
+        let read = read(&loaded.file);
+        let parse = DetachedParse {
             file: loaded.file,
             store: take_detached_file_store().expect("the detached store of the parse"),
             read_module_indicator_options: false,
             import_specifiers: loaded.import_specifiers,
             freeable,
         };
+        return (parse, read);
     }
     let file = p.parse_into_store();
     let import_specifiers = file.imports.iter().map(|n| n.text().to_string()).collect();
-    DetachedParse {
+    let read = read(&file);
+    let parse = DetachedParse {
         file,
         store: take_detached_file_store().expect("the detached store of the parse"),
         read_module_indicator_options: module_indicator_options_read(),
         import_specifiers,
         freeable,
-    }
+    };
+    (parse, read)
 }
 
 /// Makes a detached parse part of the program on the loading thread, as if
