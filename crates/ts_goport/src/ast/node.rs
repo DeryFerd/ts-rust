@@ -3712,9 +3712,26 @@ pub(crate) fn for_each_store_child_id(
     kind: SyntaxKind,
     data: NodeData<'_>,
     lists: ListIds<'_>,
-    v: impl FnMut(u32) -> bool,
+    v: impl StoreChildSink,
 ) -> bool {
     walk_children(data, &mut StoreChildIds { kind, lists, v })
+}
+
+/// R3-2: what `for_each_store_child_id` calls with the slot index of each
+/// child (`child` returns true to stop the walk). A closure is one.
+// PERF: storefast1. A sink whose `child` is `#[inline(always)]` (the
+// parser's parent writes, `ParentLinks` in store.rs) is inlined into each
+// arm of `walk_children`, as the generic walk is (`NodeChildVisit`). A
+// closure stays a call per child.
+pub(crate) trait StoreChildSink {
+    fn child(&mut self, index: u32) -> bool;
+}
+
+impl<F: FnMut(u32) -> bool> StoreChildSink for F {
+    #[inline(always)]
+    fn child(&mut self, index: u32) -> bool {
+        self(index)
+    }
 }
 
 /// R3-2: the fields that one arm of `walk_children` visits, in Go
@@ -4088,10 +4105,10 @@ struct StoreChildIds<'l, F> {
     v: F,
 }
 
-impl<'d, F: FnMut(u32) -> bool> ChildVisit<'d> for StoreChildIds<'_, F> {
+impl<'d, F: StoreChildSink> ChildVisit<'d> for StoreChildIds<'_, F> {
     #[inline(always)]
     fn node(&mut self, id: crate::astdata::NodeId) -> bool {
-        id.index() != 0 && (self.v)(id.index() as u32)
+        id.index() != 0 && self.v.child(id.index() as u32)
     }
 
     #[inline(always)]
@@ -4128,11 +4145,11 @@ impl<'d, F: FnMut(u32) -> bool> ChildVisit<'d> for StoreChildIds<'_, F> {
     }
 }
 
-impl<F: FnMut(u32) -> bool> StoreChildIds<'_, F> {
+impl<F: StoreChildSink> StoreChildIds<'_, F> {
     /// `v` on each slot index of `ids`, until it returns true.
     #[inline(always)]
     fn slots(&mut self, ids: &[crate::astdata::NodeId]) -> bool {
-        ids.iter().any(|id| (self.v)(id.index() as u32))
+        ids.iter().any(|id| self.v.child(id.index() as u32))
     }
 }
 

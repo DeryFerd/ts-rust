@@ -6316,8 +6316,6 @@ impl FileStore {
         // `StoreChildLinks::new`.
         self.unlink_children(index);
         self.build_links[index].first_child = LINK_END;
-        let mut last = LINK_END;
-        let mut linking = true;
         // The fields are borrowed apart, so the walk reads the list table
         // while the records and the links change. Go's walk cannot panic
         // here; only a port bug can (a list or child id that is not in the
@@ -6329,23 +6327,49 @@ impl FileStore {
             build_links,
             ..
         } = self;
-        let stopped =
-            super::node::for_each_store_child_id(kind, node, ListIds::Static(lists), |child| {
-                let child = child as usize;
-                // PERF: perfP2 item 2. The record bit, not the node column: the
-                // parent write below reads and writes the same record.
-                if !records[child].is_node() {
-                    return true;
-                }
-                // `StoreChildLinks::set_parent`.
-                records[child].set_parent_code(code);
-                if linking && !link_child(build_links, index, &mut last, child) {
-                    linking = false;
-                    unlink_children(build_links, index);
-                }
-                false
-            });
-        !stopped
+        let sink = ParentLinks {
+            records,
+            links: build_links,
+            parent: index,
+            code,
+            last: LINK_END,
+            linking: true,
+        };
+        !super::node::for_each_store_child_id(kind, node, ListIds::Static(lists), sink)
+    }
+}
+
+/// `set_slot_child_parents` for each child: Go `child.Parent = parent`
+/// (`StoreChildLinks::set_parent`) and the next link of the R2-5 chain of
+/// `parent`, whose last child so far is `last`. `code` is the `ParentCode`
+/// of `parent` in its store; `linking` is false once a child could not be
+/// linked (the chain of `parent` is then unknown).
+struct ParentLinks<'a> {
+    records: &'a mut [NodeRecord],
+    links: &'a mut [SlotLinks],
+    parent: usize,
+    code: ParentCode,
+    last: u32,
+    linking: bool,
+}
+
+impl super::node::StoreChildSink for ParentLinks<'_> {
+    // PERF: storefast1. Inlined into each arm of the child walk: no call
+    // per child, and the state stays in registers.
+    #[inline(always)]
+    fn child(&mut self, child: u32) -> bool {
+        let child = child as usize;
+        // PERF: perfP2 item 2. The record bit, not the node column: the
+        // parent write below reads and writes the same record.
+        if !self.records[child].is_node() {
+            return true;
+        }
+        self.records[child].set_parent_code(self.code);
+        if self.linking && !link_child(self.links, self.parent, &mut self.last, child) {
+            self.linking = false;
+            unlink_children(self.links, self.parent);
+        }
+        false
     }
 }
 
