@@ -112,6 +112,25 @@
 #     check 2 to 4%, T3 Code 1 to 3%), runs without it -0.6 to +2.0%, peak
 #     RSS 0.3% less (query -0.5 to -1.1 MiB).
 #
+# Measured on R195 source (tbxrel1, target/continuation-r97-goport/tbxrel1):
+# RELEASE_BOLT_PROFILE=instrument, two builds on Blacksmith testboxes
+# (testbox.sh release-build), against two lbr builds on zbook. tsgo -p on the
+# gate projects, effect without the plugin and T3 Code (4 cells); every bin
+# gives the same output.
+#   - st instructions:u +0.04 to +0.30% (testbox), peak RSS the same or up to
+#     11% lower (query: 10 MiB), default wall -4.3 to +0.5% (mini-743d; 7 of
+#     9 cells lower in both builds, effectnp +0.5% within its noise). Editor
+#     sessions (ls_edit_bench long, mini-743d): edit medians the same or up
+#     to 4% lower, RSS 10 to 20 MiB lower.
+#   - The zbook build's PGO bins with an instrument profile in place of the
+#     lbr one: st instructions:u -0.04 to -0.03%, peak RSS 1.2 to 12% lower.
+#     So the profile gives the RSS: every block that ran is in the hot text
+#     (6.7 MiB, lbr 4.0 MiB), none in .text.cold, so a run maps fewer code
+#     pages. The instructions come from the PGO build on the testbox.
+#   - The editor sessions are 12% of the tsgo counts at the default weight;
+#     with lbr on zbook (sample rate cap 3000) they are about 42% of the
+#     samples.
+#
 # Environment:
 #   RUSTUP_TOOLCHAIN  default 1.95.0. Its LLVM 22 matches the system
 #                     llvm-profdata (LLVM 22).
