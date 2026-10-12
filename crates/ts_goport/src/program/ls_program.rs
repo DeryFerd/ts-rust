@@ -1041,7 +1041,7 @@ fn get_import_adjacency(program: &NewProgram) -> Vec<Vec<usize>> {
             if !resolved.is_resolved() {
                 continue;
             }
-            let imported_index = match resolved.path().and_then(|path| index_by_path.get(path)) {
+            let imported_index = match index_by_path.get(&resolved.resolved_path) {
                 Some(&imported_index) => imported_index,
                 None => program
                     .get_source_file_for_resolved_module(resolved)

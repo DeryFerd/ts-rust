@@ -120,23 +120,6 @@ impl ResolvedModule {
     pub fn is_resolved(&self) -> bool {
         !self.resolved_file_name.is_empty()
     }
-
-    /// `resolved_path` for a reader, empty or not, as Go reads
-    /// `ResolvedPath`. `None` when `GOPORT_RESOLVED_PATH` is `0`: the reader
-    /// then makes the path from the name (the code before ts#64159; an A/B
-    /// switch).
-    #[must_use]
-    pub fn path(&self) -> Option<&tspath::Path> {
-        resolved_paths_enabled().then_some(&self.resolved_path)
-    }
-}
-
-/// False when `GOPORT_RESOLVED_PATH` is `0`: the loader and the program
-/// make each path from its file name, and do not read the paths that the
-/// resolutions carry (`ResolvedModule::path`, `ResolvedRef::path`).
-pub fn resolved_paths_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GOPORT_RESOLVED_PATH").is_none_or(|value| value != "0"))
 }
 
 /// Go `*tsoptions.ParsedCommandLine` for a resolved project reference.
@@ -3283,7 +3266,7 @@ thread_local! {
 }
 
 // Go: compiler/program.go:2098 GetSourceFileForResolvedModule
-// ts#64159: a lookup by the resolution's path (`ResolvedModule::path`).
+// ts#64159: a lookup by the resolution's path (`resolved_path`).
 // PORT: the answer is memoized per thread and program by file name. The
 // files, their paths and the redirects of a program do not change after
 // load, and one program's resolvers give one path for a name, so a name
@@ -3309,10 +3292,7 @@ pub fn get_source_file_for_resolved_module(resolved: &ResolvedModule) -> Node {
     if let Some(file) = hit {
         return file;
     }
-    let mut file = match resolved.path() {
-        Some(path) => get_source_file_by_path(path.as_str()),
-        None => get_source_file(file_name),
-    };
+    let mut file = get_source_file_by_path(resolved.resolved_path.as_str());
     if file.is_nil()
         && let Some(redirect) =
             with_go(|go| go.get_parse_file_redirect(file_name).map(str::to_string))
