@@ -3172,28 +3172,29 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
         running.finish(result);
         #[cfg(test)]
         let _settled = PrepSettled(&job);
-        let Some(refs) = refs else {
-            continue;
-        };
-        let prep = meta.zip(synthetic).map(|(meta, (synthetic, names))| {
-            (
-                PrepInput {
-                    meta: meta.meta,
-                    synthetic,
-                    names,
-                },
-                &*job,
-            )
-        });
-        // A resolution that panics (a Go panic) panics on the loader too
-        // when it resolves the same import. The worker only stops resolving.
-        let queued = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            shared.queue_references(&*fs, &refs, resolver.as_ref(), prep);
-        }));
-        if queued.is_err() {
-            resolver = None;
-            resolver_failed = true;
+        if let Some(refs) = refs {
+            let prep = meta.zip(synthetic).map(|(meta, (synthetic, names))| {
+                (
+                    PrepInput {
+                        meta: meta.meta,
+                        synthetic,
+                        names,
+                    },
+                    &*job,
+                )
+            });
+            // A resolution that panics (a Go panic) panics on the loader
+            // too when it resolves the same import. The worker only stops
+            // resolving.
+            let queued = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                shared.queue_references(&*fs, &refs, resolver.as_ref(), prep);
+            }));
+            if queued.is_err() {
+                resolver = None;
+                resolver_failed = true;
+            }
         }
+        // A job with no references (an unread file) is busy time too.
         if let Some(started) = started {
             let busy = started.elapsed();
             shared.count(|c| c.busy += busy);
@@ -3526,16 +3527,26 @@ impl WorkerResolver {
                 answers.push(None);
                 continue;
             }
-            let (resolved, _, _) =
+            let (resolved, _, err) =
                 self.resolver
                     .resolve_module_name(specifier, containing_file, mode, redirect);
             if let Some((cache, directory, redirect_name)) = &answers_from {
-                answers.push(cache.get_module(&(
-                    directory.as_str(),
-                    specifier,
-                    mode,
-                    redirect_name.as_str(),
-                )));
+                // A resolution with an error gives the loader no answer: it
+                // resolves the name itself and notes the error (Go
+                // `moduleResolutionError`, fileloader.go:884). The default
+                // resolver gives none (resolver.go:469).
+                answers.push(
+                    err.is_none()
+                        .then(|| {
+                            cache.get_module(&(
+                                directory.as_str(),
+                                specifier,
+                                mode,
+                                redirect_name.as_str(),
+                            ))
+                        })
+                        .flatten(),
+                );
             }
             if !resolved.is_resolved() {
                 continue;
