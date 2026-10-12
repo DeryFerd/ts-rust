@@ -4709,9 +4709,10 @@ pub use goport_util::core::*;
 
 /// Runs `f` and returns the text of the Go panic that it raises. Fails the
 /// test when `f` does not panic or raises a plain Rust panic. Tests of the
-/// Go `debug.*` sites (`gostd::debug`) use it.
-#[cfg(test)]
-pub(crate) fn go_panic_text(f: impl FnOnce()) -> String {
+/// Go `debug.*` sites (`gostd::debug`) use it. Not `cfg(test)`: the api
+/// tests in ts_goport use it too, and `cfg(test)` is per crate.
+#[doc(hidden)]
+pub fn go_panic_text(f: impl FnOnce()) -> String {
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("no panic");
     match payload.downcast::<GoPanic>() {
         Ok(p) => p.message,
