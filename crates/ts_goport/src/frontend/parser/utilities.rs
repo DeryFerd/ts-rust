@@ -12,6 +12,22 @@ use crate::frontend::prelude::*;
 
 // ── parser/utilities.go ────────────────────────────────────────────────
 
+/// Go `node.Kind` and `node.Flags` of a node of this parse, with one store
+/// read. The parser's own nodes are in the active store of this thread
+/// (`active_store_header`), where `Node::kind` and `Node::flags` read the
+/// same header twice. Any other node takes those two reads.
+// PERF: parsefast2. Go reads two fields; each read is a store access here.
+#[inline]
+pub(crate) fn parsed_kind_and_flags(node: Node) -> (SyntaxKind, NodeFlags) {
+    match crate::ast::active_store_header(node) {
+        Some(header) => {
+            debug_assert_eq!((header.kind, header.flags), (node.kind(), node.flags()));
+            (header.kind, header.flags)
+        }
+        None => (node.kind(), node.flags()),
+    }
+}
+
 // Go: parser/utilities.go:11 getLanguageVariant
 pub fn get_language_variant(script_kind: ScriptKind) -> LanguageVariant {
     match script_kind {

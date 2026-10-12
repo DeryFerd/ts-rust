@@ -103,9 +103,151 @@ impl Default for DefinitelyUnrelatedCache {
     }
 }
 
-/// The map type of `InferenceState::visited`. For an A/B run against
-/// hashbrown, change it to `FxHashMap<InferenceKey, InferencePriority>`.
-pub type InferenceVisitedMap = FlatMap<InferenceKey, InferencePriority>;
+/// PORT: perf. Not in Go. `InferenceState::visited`, Go
+/// `map[InferenceKey]InferencePriority`. Open addressing with linear probing
+/// like `FlatMap`, but each slot keeps the generation that wrote it, and a
+/// slot of another generation is empty. So `clear` (Go `clear(n.visited)`,
+/// once per inference) starts a new generation and writes no slot. The
+/// pooled maps keep the slots of their largest inference: on T3 server a
+/// `FlatMap::clear` wrote 454 slots per inference for 5 keys on average.
+/// The map is never iterated, so its layout cannot change any output.
+pub struct InferenceVisitedMap {
+    /// Empty until the first insert; else a power of two.
+    slots: Box<[VisitedSlot]>,
+    /// Keys of the current generation.
+    used: usize,
+    /// Never 0: new slots have generation 0, so they are empty.
+    generation: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct VisitedSlot {
+    key: InferenceKey,
+    value: InferencePriority,
+    generation: u32,
+}
+
+impl Default for InferenceVisitedMap {
+    fn default() -> Self {
+        Self {
+            slots: Box::default(),
+            used: 0,
+            generation: 1,
+        }
+    }
+}
+
+impl InferenceVisitedMap {
+    /// Slot count of the first allocation.
+    const MIN_SLOTS: usize = 8;
+
+    #[inline]
+    #[must_use]
+    pub fn get(&self, key: &InferenceKey) -> Option<InferencePriority> {
+        if self.used == 0 {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = (key.flat_hash() as usize) & mask;
+        loop {
+            let slot = &self.slots[i];
+            if slot.generation != self.generation {
+                return None;
+            }
+            if slot.key == *key {
+                return Some(slot.value);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Inserts or overwrites. The table grows before it is half full.
+    #[inline]
+    pub fn insert(&mut self, key: InferenceKey, value: InferencePriority) {
+        let generation = self.generation;
+        if !self.slots.is_empty() {
+            let max_used = self.slots.len() / 2;
+            let mask = self.slots.len() - 1;
+            let mut i = (key.flat_hash() as usize) & mask;
+            loop {
+                let slot = &mut self.slots[i];
+                if slot.generation != generation {
+                    if self.used < max_used {
+                        *slot = VisitedSlot {
+                            key,
+                            value,
+                            generation,
+                        };
+                        self.used += 1;
+                        return;
+                    }
+                    break;
+                }
+                if slot.key == key {
+                    slot.value = value;
+                    return;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        // The key is absent and the table is empty or full to its load.
+        self.grow();
+        self.insert_absent(VisitedSlot {
+            key,
+            value,
+            generation,
+        });
+        self.used += 1;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.used
+    }
+
+    /// Removes all keys: the slots of the old generation become empty.
+    #[inline]
+    pub fn clear(&mut self) {
+        if self.used == 0 {
+            return;
+        }
+        self.used = 0;
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // After 2^32 - 1 clears, old slots would match a generation again.
+            self.slots.fill(VisitedSlot::default());
+            self.generation = 1;
+        }
+    }
+
+    /// Doubles the slot count and puts back the keys of this generation.
+    #[cold]
+    fn grow(&mut self) {
+        let len = (self.slots.len() * 2).max(Self::MIN_SLOTS);
+        let old = std::mem::replace(
+            &mut self.slots,
+            vec![VisitedSlot::default(); len].into_boxed_slice(),
+        );
+        for &slot in &*old {
+            if slot.generation == self.generation {
+                self.insert_absent(slot);
+            }
+        }
+    }
+
+    /// Writes a slot whose key is absent into the first empty slot of its
+    /// probe run. The caller keeps `used` and makes sure an empty slot exists.
+    #[inline]
+    fn insert_absent(&mut self, slot: VisitedSlot) {
+        let mask = self.slots.len() - 1;
+        let mut i = (slot.key.flat_hash() as usize) & mask;
+        while self.slots[i].generation == self.generation {
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = slot;
+    }
+}
 
 /// PORT: perf. Not in Go. A `RecursionId` as one word, so the inference
 /// stacks store and compare ids with plain 8-byte moves. 0 is `None`. A node
@@ -339,7 +481,8 @@ impl InferenceStack {
 // PORT: Go `inferences []*InferenceInfo` is the inference list of an inference
 // context, so it is the `InferenceContextId` that owns the list (nil when the
 // state is in the free pool). Callers that pass a fresh list in Go push a
-// scratch context first. Go nil `visited` map is `None`.
+// scratch context first. Go nil `visited` map is an empty map: a lookup
+// misses in both.
 #[derive(Default)]
 pub struct InferenceState {
     pub inferences: InferenceContextId,
@@ -351,10 +494,7 @@ pub struct InferenceState {
     pub bivariant: bool,
     pub expanding_flags: ExpandingFlags,
     pub propagation_type: TypeId,
-    pub visited: Option<InferenceVisitedMap>,
-    // PORT: perf. Not in Go. The largest `visited` length that a root
-    // inference on this pooled state reached (see `invoke_once`).
-    pub max_visited_len: usize,
+    pub visited: InferenceVisitedMap,
     // PORT: perf. Go `sourceStack` and `targetStack` with the recursion id
     // of each entry (see `InferenceStack`).
     pub source_stack: InferenceStack,
@@ -399,24 +539,15 @@ impl Checker {
                 expanding_flags,
                 propagation_type,
                 visited,
-                max_visited_len,
                 source_stack,
                 target_stack,
                 definitely_unrelated: _,
                 generation,
                 next,
             } = &mut *guard;
-            *max_visited_len =
-                (*max_visited_len).max(visited.as_ref().map_or(0, InferenceVisitedMap::len));
-            if let Some(v) = visited.as_mut() {
-                // PORT: Go `clear(n.visited)`. Clearing costs time in the map
-                // capacity, so a mostly empty large map is dropped instead.
-                if v.capacity() > 256 && v.len() < v.capacity() / 8 {
-                    *v = InferenceVisitedMap::default();
-                } else {
-                    v.clear();
-                }
-            }
+            // Go `clear(n.visited)`. It writes no slot (see
+            // `InferenceVisitedMap`).
+            visited.clear();
             source_stack.clear();
             target_stack.clear();
             // The cache slots of this inference are stale from here on.
@@ -659,7 +790,7 @@ impl Checker {
                     {
                         let info = &mut self.inference_context_mut(ctx).inferences[inference];
                         if priority < info.priority {
-                            info.candidate_lists = None;
+                            info.clear_candidates();
                             info.top_level = true;
                             info.priority = priority;
                         }
@@ -673,9 +804,7 @@ impl Checker {
                                 .contains(&candidate)
                             {
                                 self.inference_context_mut(ctx).inferences[inference]
-                                    .candidate_lists_mut()
-                                    .contra_candidates
-                                    .push(candidate);
+                                    .push_candidate(candidate, true /*contra*/);
                                 self.clear_cached_inferences(ctx);
                             }
                         } else if !self.inference_context(ctx).inferences[inference]
@@ -683,9 +812,7 @@ impl Checker {
                             .contains(&candidate)
                         {
                             self.inference_context_mut(ctx).inferences[inference]
-                                .candidate_lists_mut()
-                                .candidates
-                                .push(candidate);
+                                .push_candidate(candidate, false /*contra*/);
                             self.clear_cached_inferences(ctx);
                         }
                     }
@@ -1031,26 +1158,14 @@ impl Checker {
             contravariant: n.contravariant,
             bivariant: n.bivariant,
         };
-        // PORT: perf. The map is made first; a lookup on Go's nil map misses,
-        // and the miss path makes the map anyway, so the map contents are the
-        // same. The insert after a miss finds the probed slots in cache.
+        // PORT: the insert after a miss finds the probed slots in cache.
         {
             let s = &mut *n;
-            let visited = s.visited.get_or_insert_with(InferenceVisitedMap::default);
-            if let Some(&p) = visited.get(&key) {
+            if let Some(p) = s.visited.get(&key) {
                 s.inference_priority = std::cmp::min(s.inference_priority, p);
                 return;
             }
-            // PORT: perf. Not in Go. `put_inference_state` drops a mostly
-            // empty large map, so a later large inference would grow it again
-            // by doubling. Once this inference reaches a quarter of the
-            // largest length seen, the map grows in one step to that length.
-            // A map sized so is not dropped at that fill, and smaller
-            // inferences never make it. The map is never iterated.
-            if visited.len() == s.max_visited_len / 4 {
-                visited.reserve(s.max_visited_len - visited.len());
-            }
-            visited.insert(key, InferencePriority::CIRCULARITY);
+            s.visited.insert(key, InferencePriority::CIRCULARITY);
         }
         let save_inference_priority;
         let save_expanding_flags;
@@ -1099,10 +1214,8 @@ impl Checker {
             s.expanding_flags = save_expanding_flags;
             let inference_priority = s.inference_priority;
             // PORT: the key was inserted above, so this overwrites it in
-            // place (one probe).
-            s.visited
-                .get_or_insert_with(InferenceVisitedMap::default)
-                .insert(key, inference_priority);
+            // place.
+            s.visited.insert(key, inference_priority);
             s.inference_priority = std::cmp::min(s.inference_priority, save_inference_priority);
         }
     }
@@ -2482,6 +2595,75 @@ impl Checker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The candidate lists of an `InferenceInfo` against two plain lists:
+    /// the inline first candidate keeps the order of both lists.
+    #[test]
+    fn inference_info_candidates_match_lists() {
+        for pattern in 0u32..64 {
+            let mut info = InferenceInfo::default();
+            let (mut co, mut contra) = (Vec::new(), Vec::new());
+            for i in 0..6u32 {
+                if i == 4 && pattern & 32 != 0 {
+                    info.clear_candidates();
+                    co.clear();
+                    contra.clear();
+                }
+                let t = TypeId(100 + i);
+                if pattern >> i & 1 != 0 {
+                    info.push_candidate(t, true);
+                    contra.push(t);
+                } else {
+                    info.push_candidate(t, false);
+                    co.push(t);
+                }
+                assert_eq!(info.candidates(), &co[..]);
+                assert_eq!(info.contra_candidates(), &contra[..]);
+                let copy = clone_inference_info(&info);
+                assert_eq!(copy.candidates(), &co[..]);
+                assert_eq!(copy.contra_candidates(), &contra[..]);
+            }
+        }
+    }
+
+    /// The visited map against a `HashMap` over many clears, with growth and a
+    /// generation wrap: a clear must hide every key of the earlier inference.
+    #[test]
+    fn inference_visited_map_matches_hash_map() {
+        let key = |n: u32| InferenceKey {
+            source: TypeId(n % 37),
+            target: TypeId(n % 11),
+            priority: InferencePriority((n % 3) as i32),
+            contravariant: n % 2 == 0,
+            bivariant: n % 5 == 0,
+        };
+        let mut map = InferenceVisitedMap::default();
+        let mut std_map = std::collections::HashMap::new();
+        let mut rng: u32 = 0x9e37_79b9;
+        for round in 0..300u32 {
+            if round == 200 {
+                map.generation = u32::MAX;
+            }
+            for _ in 0..(round % 50) {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                let k = key(rng % 4000);
+                let v = InferencePriority((rng >> 20) as i32);
+                assert_eq!(map.get(&k), std_map.get(&k).copied());
+                map.insert(k, v);
+                std_map.insert(k, v);
+                assert_eq!(map.len(), std_map.len());
+            }
+            for n in 0..4000 {
+                assert_eq!(map.get(&key(n)), std_map.get(&key(n)).copied());
+            }
+            map.clear();
+            std_map.clear();
+            assert_eq!(map.len(), 0);
+            assert_ne!(map.generation, 0);
+        }
+    }
 
     #[test]
     fn recursion_key_round_trip() {
