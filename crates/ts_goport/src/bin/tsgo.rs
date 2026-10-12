@@ -1044,7 +1044,7 @@ fn install_panic_hook() {
         }
         let location = info
             .location()
-            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .map(|l| format!(" at {}:{}", go_site_file(l.file()), l.line()))
             .unwrap_or_default();
         // The output so far comes first, also in one file with stderr.
         ts_goport::execute::tsc::stdio::flush_cli_stdout_at_exit();

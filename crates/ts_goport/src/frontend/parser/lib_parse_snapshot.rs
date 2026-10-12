@@ -31,7 +31,7 @@
 //! after each merge round, before the lib bind generator):
 //!
 //! ```text
-//! cargo test -p ts_goport --lib frontend::parser::lib_parse_snapshot::tests::generate_lib_parse_snapshot -- --ignored --exact
+//! cargo test -p goport_core --lib frontend::parser::lib_parse_snapshot::tests::generate_lib_parse_snapshot -- --ignored --exact
 //! ```
 //!
 //! `snapshot_matches_live_parse` fails while the blob is stale.
@@ -1740,7 +1740,7 @@ mod tests {
     };
 
     /// How to write the blob again.
-    const REGENERATE: &str = "run `cargo test -p ts_goport --lib \
+    const REGENERATE: &str = "run `cargo test -p goport_core --lib \
         frontend::parser::lib_parse_snapshot::tests::generate_lib_parse_snapshot -- --ignored --exact` \
         (through scripts/run-cargo-capped.sh)";
 
