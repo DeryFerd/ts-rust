@@ -116,7 +116,10 @@ function prepareRun(module, options) {
     const u8 = () => new Uint8Array(memory.buffer);
     const dv = () => new DataView(memory.buffer);
 
-    const envBytes = Object.entries(env).map(([k, v]) => encoder.encode(`${k}=${v}\0`));
+    // An undefined value unsets the variable, as in child_process.
+    const envBytes = Object.entries(env)
+        .filter(([, v]) => v !== undefined)
+        .map(([k, v]) => encoder.encode(`${k}=${v}\0`));
     const writeStrings = (list, ptrs, buf) => {
         const view = dv();
         let at = buf;
