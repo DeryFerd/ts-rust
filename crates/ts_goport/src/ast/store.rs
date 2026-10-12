@@ -8313,8 +8313,8 @@ mod tests {
             file: Box::leak(Box::new(BlockFile {
                 nodes: &[],
                 lists: &[],
-                facts: StoreFacts::ONLY_NIL_SLOT,
-                root: Node::NIL,
+                facts: FactsCell::new(StoreFacts::ONLY_NIL_SLOT),
+                root: AtomicU64::new(Node::NIL.0),
                 foreign: &[],
                 links: &[],
                 shell_kinds: &[],
