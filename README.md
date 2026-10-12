@@ -81,9 +81,9 @@ the plugin, as with `@effect/language-service`:
 The rules, options and `@effect-diagnostics` comments are a port of
 [Effect-TS/tsgo](https://github.com/Effect-TS/tsgo) 0.51.1. The language server also has its editor
 features: the Effect hover (with the Layer summary), inlay hints, the auto-import style, quick fixes,
-document symbols, completions and refactors. All the editor features of 0.51.1 are ported. The lightbulb
-and the quick fix menu show the Effect refactors. The editor's Refactor menu does not show them yet: it
-needs `refactor.rewrite` in the server's code action kinds, which waits for a decision.
+document symbols, completions and refactors. All the editor features of 0.51.1 are ported. The lightbulb,
+the quick fix menu and the editor's Refactor menu show the Effect refactors: as in 0.51.1, the server lists
+`refactor.rewrite` in its code action kinds.
 
 The API stability rules of 0.51.1 read the `@stability` JSDoc tags of Effect 4.
 `unstableApiUsage` (TS377136) and `experimentalApiUsage` (TS377135) report each use of an
@@ -111,8 +111,25 @@ goes away when the port moves to a newer pin.
 - **Real projects.** On 120 open-source repos, the command-line output differs from Go's only in
   the problems below and where Go's own output changes from run to run.
 
-Three switches make some projects faster or use less memory. They are off by default.
+Four switches make some projects faster or use less memory. They are off by default.
 
+- **`--fast`** (or `GOPORT_FAST=1`) turns on the last two switches and more checkers. It runs one
+  checker per core, up to 16 and at most one per 32 source files (`--checkers N` still sets the
+  count). Each file goes to the checker that Go's split gives it, so the output of `--fast` is the
+  same on every run and equals `tsgo --checkers N` for the chosen N, except where lazy members or
+  the never order change the work (see their bullets above). On a 32 vCPU testbox limited
+  to 16 vCPUs with `taskset` (a release build without PGO), VS Code checks in 2.6 s instead of
+  5.3 s, Sentry in 2.7 s instead of 5.5 s and T3 Code `apps/server` in 2.6 s instead of 3.5 s. On
+  those three and on Excalidraw and zod, CPU time went up as much as 2.4x and peak memory as much
+  as 1.5x. On the projects we tested, the diagnostics were the same as without `--fast`, except on
+  zod: there, TS2344 and TS5115 errors in a type cycle can appear or go away, as in Go with more
+  checkers.
+
+  `GOPORT_FAST_STEAL=1` (with `--fast`) also turns on work stealing: a checker that has checked
+  its own files takes unchecked files from the checker with the most work left. On the same
+  testbox, VS Code then checks in 2.2 s and Sentry in 2.3 s, but Excalidraw takes 0.68 s instead
+  of 0.60 s. A file can then go to a different checker in each run. So where Go's output depends
+  on which files share a checker, the output can change from run to run (on zod it does).
 - **`--checkers 8`** (Go's option; the default is 4) runs 8 checkers. On an 8-core host, VS Code
   checks in 30% less time and mui in 23% less, but T3 Code server gains nothing. CPU time goes
   up 13% to 51% and peak memory 7% to 34%. The output is the same as Go's with `--checkers 8`.
@@ -283,8 +300,9 @@ with `tsc-rs` 0.1.0 and R179 on Linux.
 
 ## Development
 
-`crates/ts_goport` is the compiler. It has two parts crates, `goport_util` and `goport_lsproto`,
-in `crates/ts_goport/parts`, and uses the lib files in `crates/ts_goport/libs`.
+`crates/ts_goport` is the compiler. It has three parts crates in `crates/ts_goport/parts`:
+`goport_core` (everything below the language service), `goport_util` and `goport_lsproto`. Their
+files stay in `crates/ts_goport/src`. It uses the lib files in `crates/ts_goport/libs`.
 `tools/ts_ast_codegen` generates `crates/ts_goport/src/astdata`, and
 `tools/ts_diagnostics_codegen` generates `crates/ts_goport/src/diagnostics/catalog.rs` and
 `crates/ts_goport/src/diag.rs`. `crates/ts_wasm` is the WebAssembly build

@@ -87,7 +87,7 @@
 //! (`ast/store.rs`). Go code that writes a field of a parsed node needs its
 //! own port decision.
 
-use crate::astdata::NodeData;
+use crate::astdata::{BoxedData, NodeData};
 use crate::prelude::*;
 use std::cell::{Cell, OnceCell};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -1506,7 +1506,7 @@ fn synthetic_ast_node(n: Node) -> HeldNode {
 // call sites, the binder's child walks among them.
 #[inline(always)]
 #[must_use]
-pub fn static_ast_node(n: Node) -> Option<&'static NodeData> {
+pub fn static_ast_node(n: Node) -> Option<NodeData<'static>> {
     assert!(n.is_some(), "nil node dereference");
     match frozen_store_ast_node(n) {
         Some(node) => Some(node),
@@ -1521,7 +1521,7 @@ pub fn static_ast_node(n: Node) -> Option<&'static NodeData> {
 /// it). Panics for any other node.
 #[cold]
 #[inline(never)]
-fn static_ast_node_slow(n: Node) -> Option<&'static NodeData> {
+fn static_ast_node_slow(n: Node) -> Option<NodeData<'static>> {
     if n.file_index() == SYNTHETIC_NODE_FILE {
         return None;
     }
@@ -1537,7 +1537,7 @@ fn static_ast_node_slow(n: Node) -> Option<&'static NodeData> {
 /// a node with `'static` data, `None` for a node that a freeable parse owns
 /// (lsshells M3c). With `None` an `_in` accessor reads the node again, as
 /// its plain accessor does (most of them read a store column).
-pub type LoadedData = Option<&'static NodeData>;
+pub type LoadedData = Option<NodeData<'static>>;
 
 /// The astdata data of parsed node `n`, for code that reads parsed nodes
 /// only: the binder, which loads the data of a node once and passes it to
@@ -1565,14 +1565,14 @@ pub fn parsed_node_data(n: Node) -> LoadedData {
 /// store, so `f` can make and change nodes. Hot node reads use the
 /// `with_data!` macro instead.
 #[inline]
-pub fn with_ast_data<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
+pub fn with_ast_data<R>(n: Node, f: impl FnOnce(NodeData<'_>) -> R) -> R {
     // One call of `f`, so a small `f` is inlined (see `with_data!`).
     let scoped;
     let data = match static_ast_node(n) {
         Some(data) => data,
         None => {
             scoped = scoped_ast_node(n);
-            &*scoped
+            scoped.data()
         }
     };
     f(data)
@@ -1587,14 +1587,13 @@ enum ScopedNode {
     Store(crate::ast::store::HeldStoreNode),
 }
 
-impl std::ops::Deref for ScopedNode {
-    type Target = NodeData;
-
+impl ScopedNode {
+    /// The held node data.
     #[inline]
-    fn deref(&self) -> &NodeData {
+    fn data(&self) -> NodeData<'_> {
         match self {
-            Self::Synthetic(node) => &node.data,
-            Self::Store(node) => &**node,
+            Self::Synthetic(node) => node.data.view(),
+            Self::Store(node) => node.data(),
         }
     }
 }
@@ -1615,7 +1614,7 @@ fn scoped_ast_node(n: Node) -> ScopedNode {
 /// node is held, so `f` can make and change nodes.
 #[cold]
 #[inline(never)]
-pub fn with_scoped_ast_node<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
+pub fn with_scoped_ast_node<R>(n: Node, f: impl FnOnce(NodeData<'_>) -> R) -> R {
     // A synthetic id is never a hot file.
     if crate::ast::store::is_hot_store_node(n) {
         return crate::ast::store::with_hot_store_node(n, f);
@@ -1628,8 +1627,8 @@ pub fn with_scoped_ast_node<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
 // registers.
 #[cold]
 #[inline(never)]
-fn with_held_ast_node<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
-    f(&scoped_ast_node(n))
+fn with_held_ast_node<R>(n: Node, f: impl FnOnce(NodeData<'_>) -> R) -> R {
+    f(scoped_ast_node(n).data())
 }
 
 /// `with_scoped_ast_node` for a field read (`with_data!`): `f` must not
@@ -1638,9 +1637,9 @@ fn with_held_ast_node<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
 /// chunk or pin clone (`ast::with_scoped_store_node`).
 #[cold]
 #[inline(never)]
-pub fn read_scoped_ast_node<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
+pub fn read_scoped_ast_node<R>(n: Node, f: impl FnOnce(NodeData<'_>) -> R) -> R {
     if n.file_index() == SYNTHETIC_NODE_FILE {
-        return f(&synthetic_ast_node(n).data);
+        return f(synthetic_ast_node(n).data.view());
     }
     crate::ast::store::with_scoped_store_node(n, f)
 }
@@ -1652,7 +1651,7 @@ pub fn read_scoped_ast_node<R>(n: Node, f: impl FnOnce(&NodeData) -> R) -> R {
 pub fn static_tier_ast_node_lists(
     n: Node,
 ) -> Option<(
-    &'static NodeData,
+    NodeData<'static>,
     &'static [&'static crate::ast::store::StaticList],
 )> {
     assert!(n.is_some(), "nil node dereference");
@@ -1691,7 +1690,7 @@ pub fn data_modifiers(n: Node, m: crate::astdata::ModifierList) -> ModifierList 
 /// so nil panics.
 #[inline]
 #[must_use]
-pub fn static_tier_ast_node(n: Node) -> Option<&'static NodeData> {
+pub fn static_tier_ast_node(n: Node) -> Option<NodeData<'static>> {
     assert!(n.is_some(), "nil node dereference");
     frozen_store_ast_node(n)
 }
@@ -1707,7 +1706,7 @@ pub fn static_tier_ast_node(n: Node) -> Option<&'static NodeData> {
 // twice.
 #[cold]
 #[inline(never)]
-pub fn read_ast_node_miss<R>(n: Node, read: impl FnOnce(&NodeData) -> R) -> R {
+pub fn read_ast_node_miss<R>(n: Node, read: impl FnOnce(NodeData<'_>) -> R) -> R {
     // lsshells M3f: a node of the hot file version (a synthetic id never
     // is), with the other misses out of line, so this path saves few
     // registers.
@@ -1721,9 +1720,9 @@ pub fn read_ast_node_miss<R>(n: Node, read: impl FnOnce(&NodeData) -> R) -> R {
 #[cfg(not(target_family = "wasm"))]
 #[cold]
 #[inline(never)]
-fn read_ast_node_cold<R>(n: Node, read: impl FnOnce(&NodeData) -> R) -> R {
+fn read_ast_node_cold<R>(n: Node, read: impl FnOnce(NodeData<'_>) -> R) -> R {
     if n.file_index() == SYNTHETIC_NODE_FILE {
-        return read(&synthetic_ast_node(n).data);
+        return read(synthetic_ast_node(n).data.view());
     }
     crate::ast::store::read_store_node_miss(n, read)
 }
@@ -1735,7 +1734,7 @@ fn read_ast_node_cold<R>(n: Node, read: impl FnOnce(&NodeData) -> R) -> R {
 #[cfg(target_family = "wasm")]
 #[cold]
 #[inline(never)]
-fn read_ast_node_cold<R>(n: Node, read: impl FnOnce(&NodeData) -> R) -> R {
+fn read_ast_node_cold<R>(n: Node, read: impl FnOnce(NodeData<'_>) -> R) -> R {
     let mut read = Some(read);
     let mut result = None;
     read_ast_node_cold_dyn(n, &mut |node| {
@@ -1748,14 +1747,14 @@ fn read_ast_node_cold<R>(n: Node, read: impl FnOnce(&NodeData) -> R) -> R {
 #[cfg(target_family = "wasm")]
 #[cold]
 #[inline(never)]
-fn read_ast_node_cold_dyn(n: Node, read: &mut dyn FnMut(&NodeData)) {
+fn read_ast_node_cold_dyn(n: Node, read: &mut dyn FnMut(NodeData<'_>)) {
     if n.file_index() == SYNTHETIC_NODE_FILE {
-        return read(&synthetic_ast_node(n).data);
+        return read(synthetic_ast_node(n).data.view());
     }
     crate::ast::store::read_store_node_miss(n, read)
 }
 
-/// `$body` with `$d` bound to the astdata data (`&NodeData`) of node `$n`,
+/// `$body` with `$d` bound to the astdata data (`NodeData<'_>`) of node `$n`,
 /// parsed or synthetic, like `with_ast_data`. Go dereferences the pointer, so
 /// nil panics. `$body` cannot keep a reference into the data, and it cannot
 /// `return` from the caller. It is a field read: it must not make or change
@@ -1774,11 +1773,11 @@ macro_rules! with_data {
         let n__: $crate::core::Node = $n;
         match $crate::ast::synthetic::static_tier_ast_node(n__) {
             Some(data__) => {
-                let $d: &crate::astdata::NodeData = data__;
+                let $d: crate::astdata::NodeData<'_> = data__;
                 $body
             }
             None => $crate::ast::synthetic::read_ast_node_miss(n__, |data__| {
-                let $d: &crate::astdata::NodeData = data__;
+                let $d: crate::astdata::NodeData<'_> = data__;
                 $body
             }),
         }
@@ -1797,7 +1796,7 @@ macro_rules! list_of {
         let n__: $crate::core::Node = $n;
         match $crate::ast::synthetic::static_tier_ast_node_lists(n__) {
             Some((data__, lists__)) => {
-                let $d: &'static crate::astdata::NodeData = data__;
+                let $d: crate::astdata::NodeData<'static> = data__;
                 let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
                 found.map(|l| {
                     $crate::ast::NodeList::from_table(
@@ -1823,7 +1822,7 @@ macro_rules! modifiers_of {
         let n__: $crate::core::Node = $n;
         match $crate::ast::synthetic::static_tier_ast_node_lists(n__) {
             Some((data__, lists__)) => {
-                let $d: &'static crate::astdata::NodeData = data__;
+                let $d: crate::astdata::NodeData<'static> = data__;
                 let found: Option<Option<$crate::ast::synthetic::AnyList<'static>>> = $body;
                 found.map(|m| {
                     $crate::ast::ModifierList::from_table(
@@ -1878,7 +1877,7 @@ impl<'a> AnyList<'a> {
 
 /// Finds a list field in node data. `None`: the data has no such field (a
 /// kind without it). `Some(None)`: the field is Go `nil`.
-pub type ListSel = for<'a> fn(&'a NodeData) -> Option<Option<AnyList<'a>>>;
+pub type ListSel = for<'a> fn(NodeData<'a>) -> Option<Option<AnyList<'a>>>;
 
 /// The number of ids that `SelectorSite::id` gave.
 static SELECTOR_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1995,7 +1994,7 @@ pub fn synthetic_modifiers_of(n: Node, sel: ListSel) -> Option<ModifierList> {
 // version) frees. `Node::text` returns `&'static str`, so the text is
 // interned instead.
 #[must_use]
-pub fn synthetic_text(n: Node, text: impl FnOnce(&NodeData) -> Option<&str>) -> &'static str {
+pub fn synthetic_text(n: Node, text: impl FnOnce(NodeData<'_>) -> Option<&str>) -> &'static str {
     read_scoped_ast_node(n, |data| match text(data) {
         Some(s) => Name::from(s).as_str(),
         None => "",
@@ -2086,7 +2085,7 @@ pub fn synthetic_list_of(n: Node, sel: ListSel) -> Option<Option<SyntheticList>>
     ARENA.with(|a| {
         let a = a.borrow();
         let data = a.node(n).data;
-        sel(&a.data(data).data).map(|l| {
+        sel(a.data(data).data.view()).map(|l| {
             l.map(|l| SyntheticList::Own {
                 index: l.index() as u32,
             })
@@ -2257,14 +2256,14 @@ fn replace_synthetic_ast_node(
 /// nodes of a ported-parser file that is not finished.
 // PORT: astdata data is shared, so the node gets a new astdata node with the
 // same kind. Writes are rare.
-pub fn replace_node_data(n: Node, data: NodeData) {
+pub fn replace_node_data(n: Node, data: BoxedData) {
     if is_store_node(n) {
         return replace_store_node_data(n, data);
     }
     replace_synthetic_ast_node(n, |old| {
         let kind = old.kind;
         debug_assert!(
-            data.matches_syntax_kind(kind),
+            data.view().matches_syntax_kind(kind),
             "{kind:?} does not fit its NodeData"
         );
         new_ts_node(kind, data)
@@ -2280,7 +2279,7 @@ pub fn set_node_kind(n: Node, kind: SyntaxKind) {
     replace_synthetic_ast_node(n, |old| {
         let data = old.data.clone();
         assert!(
-            data.matches_syntax_kind(kind),
+            data.view().matches_syntax_kind(kind),
             "{kind:?} does not fit the data of {:?}",
             old.kind
         );
@@ -2290,7 +2289,7 @@ pub fn set_node_kind(n: Node, kind: SyntaxKind) {
 
 /// A astdata node for synthetic data. Only kind and data are read; the
 /// header lives in the slot.
-fn new_ts_node(kind: SyntaxKind, data: NodeData) -> crate::astdata::Node {
+fn new_ts_node(kind: SyntaxKind, data: BoxedData) -> crate::astdata::Node {
     crate::astdata::Node {
         kind,
         flags: crate::astdata::NodeFlags(0),
@@ -2308,41 +2307,41 @@ fn new_ts_node(kind: SyntaxKind, data: NodeData) -> crate::astdata::Node {
 pub fn set_node_modifiers(n: Node, modifiers: ModifierList) {
     // astshrink1: the list goes into the list table of the node's owner.
     let mods = node_modifiers_value(n, modifiers);
-    let mut data = with_ast_data(n, Clone::clone);
+    let mut data = with_ast_data(n, |d| d.to_boxed());
     match &mut data {
-        NodeData::ArrowFunction(d) => d.modifiers = mods,
-        NodeData::BinaryExpression(d) => d.modifiers = mods,
-        NodeData::ClassDeclaration(d) => d.modifiers = mods,
-        NodeData::ClassExpression(d) => d.modifiers = mods,
-        NodeData::ClassStaticBlockDeclaration(d) => d.modifiers = mods,
-        NodeData::ConstructorDeclaration(d) => d.modifiers = mods,
-        NodeData::ConstructorTypeNode(d) => d.modifiers = mods,
-        NodeData::EnumDeclaration(d) => d.modifiers = mods,
-        NodeData::EnumMember(d) => d.modifiers = mods,
-        NodeData::ExportAssignment(d) => d.modifiers = mods,
-        NodeData::ExportDeclaration(d) => d.modifiers = mods,
-        NodeData::FunctionDeclaration(d) => d.modifiers = mods,
-        NodeData::FunctionExpression(d) => d.modifiers = mods,
-        NodeData::FunctionTypeNode(d) => d.modifiers = mods,
-        NodeData::GetAccessorDeclaration(d) => d.modifiers = mods,
-        NodeData::ImportDeclaration(d) => d.modifiers = mods,
-        NodeData::ImportEqualsDeclaration(d) => d.modifiers = mods,
-        NodeData::IndexSignatureDeclaration(d) => d.modifiers = mods,
-        NodeData::InterfaceDeclaration(d) => d.modifiers = mods,
-        NodeData::MethodDeclaration(d) => d.modifiers = mods,
-        NodeData::MethodSignatureDeclaration(d) => d.modifiers = mods,
-        NodeData::MissingDeclaration(d) => d.modifiers = mods,
-        NodeData::ModuleDeclaration(d) => d.modifiers = mods,
-        NodeData::NamespaceExportDeclaration(d) => d.modifiers = mods,
-        NodeData::ParameterDeclaration(d) => d.modifiers = mods,
-        NodeData::PropertyAssignment(d) => d.modifiers = mods,
-        NodeData::PropertyDeclaration(d) => d.modifiers = mods,
-        NodeData::PropertySignatureDeclaration(d) => d.modifiers = mods,
-        NodeData::SetAccessorDeclaration(d) => d.modifiers = mods,
-        NodeData::ShorthandPropertyAssignment(d) => d.modifiers = mods,
-        NodeData::TypeAliasDeclaration(d) => d.modifiers = mods,
-        NodeData::TypeParameterDeclaration(d) => d.modifiers = mods,
-        NodeData::VariableStatement(d) => d.modifiers = mods,
+        BoxedData::ArrowFunction(d) => d.modifiers = mods,
+        BoxedData::BinaryExpression(d) => d.modifiers = mods,
+        BoxedData::ClassDeclaration(d) => d.modifiers = mods,
+        BoxedData::ClassExpression(d) => d.modifiers = mods,
+        BoxedData::ClassStaticBlockDeclaration(d) => d.modifiers = mods,
+        BoxedData::ConstructorDeclaration(d) => d.modifiers = mods,
+        BoxedData::ConstructorTypeNode(d) => d.modifiers = mods,
+        BoxedData::EnumDeclaration(d) => d.modifiers = mods,
+        BoxedData::EnumMember(d) => d.modifiers = mods,
+        BoxedData::ExportAssignment(d) => d.modifiers = mods,
+        BoxedData::ExportDeclaration(d) => d.modifiers = mods,
+        BoxedData::FunctionDeclaration(d) => d.modifiers = mods,
+        BoxedData::FunctionExpression(d) => d.modifiers = mods,
+        BoxedData::FunctionTypeNode(d) => d.modifiers = mods,
+        BoxedData::GetAccessorDeclaration(d) => d.modifiers = mods,
+        BoxedData::ImportDeclaration(d) => d.modifiers = mods,
+        BoxedData::ImportEqualsDeclaration(d) => d.modifiers = mods,
+        BoxedData::IndexSignatureDeclaration(d) => d.modifiers = mods,
+        BoxedData::InterfaceDeclaration(d) => d.modifiers = mods,
+        BoxedData::MethodDeclaration(d) => d.modifiers = mods,
+        BoxedData::MethodSignatureDeclaration(d) => d.modifiers = mods,
+        BoxedData::MissingDeclaration(d) => d.modifiers = mods,
+        BoxedData::ModuleDeclaration(d) => d.modifiers = mods,
+        BoxedData::NamespaceExportDeclaration(d) => d.modifiers = mods,
+        BoxedData::ParameterDeclaration(d) => d.modifiers = mods,
+        BoxedData::PropertyAssignment(d) => d.modifiers = mods,
+        BoxedData::PropertyDeclaration(d) => d.modifiers = mods,
+        BoxedData::PropertySignatureDeclaration(d) => d.modifiers = mods,
+        BoxedData::SetAccessorDeclaration(d) => d.modifiers = mods,
+        BoxedData::ShorthandPropertyAssignment(d) => d.modifiers = mods,
+        BoxedData::TypeAliasDeclaration(d) => d.modifiers = mods,
+        BoxedData::TypeParameterDeclaration(d) => d.modifiers = mods,
+        BoxedData::VariableStatement(d) => d.modifiers = mods,
         _ => return,
     }
     replace_node_data(n, data);
@@ -2381,20 +2380,20 @@ pub fn set_node_locals(n: Node, locals: SymbolTable) {
 /// Go `newNode(kind, data, hooks)`: a new factory node with
 /// `Loc = UndefinedTextRange()`, nil parent, no flags and no binder data. It
 /// belongs to the current owner (see "Owners" in the module comment).
-pub fn alloc_synthetic_node(kind: SyntaxKind, data: NodeData) -> Node {
+pub fn alloc_synthetic_node(kind: SyntaxKind, data: BoxedData) -> Node {
     alloc_synthetic_node_in(false, kind, data)
 }
 
 /// `alloc_synthetic_node` for a to-string factory
 /// (`NodeFactory::set_print_owned`): in a print scope the node belongs to
 /// the print owner.
-pub fn alloc_synthetic_print_node(kind: SyntaxKind, data: NodeData) -> Node {
+pub fn alloc_synthetic_print_node(kind: SyntaxKind, data: BoxedData) -> Node {
     alloc_synthetic_node_in(true, kind, data)
 }
 
-fn alloc_synthetic_node_in(print: bool, kind: SyntaxKind, data: NodeData) -> Node {
+fn alloc_synthetic_node_in(print: bool, kind: SyntaxKind, data: BoxedData) -> Node {
     debug_assert!(
-        data.matches_syntax_kind(kind),
+        data.view().matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
     );
     let node = new_ts_node(kind, data);
@@ -2815,7 +2814,7 @@ mod tests {
             // A data write of a copy of the data keeps the list: node data
             // names its list by index (astshrink1), as a Go struct copy keeps
             // its `*NodeList` pointer. The old handle still reads the list.
-            replace_node_data(block, with_ast_data(block, Clone::clone));
+            replace_node_data(block, with_ast_data(block, |d| d.to_boxed()));
             assert_eq!(block.statement_list(), read);
             assert_eq!(read.nodes().get(0), a);
 
@@ -2899,7 +2898,7 @@ mod tests {
                 assert_eq!(block.statement_list().nodes().to_vec(), vec![statement]);
                 assert_eq!(list.nodes().to_vec(), vec![statement]);
                 // A data write goes to the owner of the node: the base.
-                replace_node_data(base, with_ast_data(base, Clone::clone));
+                replace_node_data(base, with_ast_data(base, |d| d.to_boxed()));
                 assert!(synthetic_live_slot_count() > base_slots);
                 (statement, list, block)
             };

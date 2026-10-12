@@ -3378,9 +3378,21 @@ impl SymbolArena {
         self.symbols.get_mut(symbol.index())
     }
 
-    /// Go `table[name]`. A nil table reads as empty.
+    /// Go `table[name]`. A nil table reads as empty. `name` is a `&str`
+    /// or a `&Name` (`TableKey`): a `Name` finds its entry by id
+    /// (`get_name`), so a caller that holds one passes it.
+    #[inline]
     #[must_use]
-    pub fn get(&self, table: SymbolTable, name: &str) -> SymbolId {
+    pub fn get<'a>(&self, table: SymbolTable, name: impl Into<TableKey<'a>>) -> SymbolId {
+        match name.into() {
+            TableKey::Text(text) => self.get_text(table, text),
+            TableKey::Name(name) => self.get_name(table, name),
+        }
+    }
+
+    /// Go `table[name]` by text: hashes `name` and compares texts.
+    #[must_use]
+    fn get_text(&self, table: SymbolTable, name: &str) -> SymbolId {
         if table.is_nil() {
             return SymbolId::NIL;
         }
@@ -3409,14 +3421,11 @@ impl SymbolArena {
             .map_or(SymbolId::NIL, |position| table.entries[position].symbol)
     }
 
-    /// Go `table[name]` by `get` or `get_name`, whichever `key` holds.
+    /// Go `table[name]` by `get_text` or `get_name`, whichever `key` holds.
     #[inline]
     #[must_use]
     pub fn get_key(&self, table: SymbolTable, key: TableKey<'_>) -> SymbolId {
-        match key {
-            TableKey::Text(text) => self.get(table, text),
-            TableKey::Name(name) => self.get_name(table, name),
-        }
+        self.get(table, key)
     }
 
     /// Go `table[name] = symbol`. Panics on a nil table, like Go.
@@ -4709,9 +4718,10 @@ pub use goport_util::core::*;
 
 /// Runs `f` and returns the text of the Go panic that it raises. Fails the
 /// test when `f` does not panic or raises a plain Rust panic. Tests of the
-/// Go `debug.*` sites (`gostd::debug`) use it.
-#[cfg(test)]
-pub(crate) fn go_panic_text(f: impl FnOnce()) -> String {
+/// Go `debug.*` sites (`gostd::debug`) use it. Not `cfg(test)`: the api
+/// tests in ts_goport use it too, and `cfg(test)` is per crate.
+#[doc(hidden)]
+pub fn go_panic_text(f: impl FnOnce()) -> String {
     let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("no panic");
     match payload.downcast::<GoPanic>() {
         Ok(p) => p.message,

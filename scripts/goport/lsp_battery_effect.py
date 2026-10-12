@@ -79,9 +79,13 @@ in about 1 of 5. If one is still not marked, selfcheck exits 1: run it again
 (runs add up).
 
 check sends every e1 method except initialize. lsp_oracle.py always sends
-and compares the initialize request: effect-tsgo adds "refactor.rewrite" to
-codeActionKinds (decision D1), so check prints initialize apart from the
-other methods.
+and compares the initialize request, and check prints it apart from the
+other methods (decision D1). effect-tsgo adds "refactor.rewrite" after
+"quickfix" in codeActionKinds. Without D1 option B the port does not, so
+initialize differs. D1 option B (lane goport-d1b, 535e88364) makes the port
+list it as effect-tsgo does, so initialize compares the same here; its
+lsp_oracle.py drops that kind from the port's answer only when Go's list
+lacks it (the plain Go batteries).
 
 check then compares each hover that lsp_oracle.py classes diff again, with
 the "pako:" payload of each Mermaid link (the Layer hover's "Show full
@@ -560,7 +564,7 @@ def cmd_check(args) -> int:
     s = json.loads(summary.read_text())
     by_method = s.get("methods", {})
     init = by_method.pop("initialize", {})
-    print(f"\ninitialize (D1: effect-tsgo adds refactor.rewrite): {init}")
+    print(f"\ninitialize (D1 refactor.rewrite; same with D1 option B): {init}")
     total = {}
     for m, c in sorted(by_method.items()):
         print(f"{m:40s} {json.dumps(c, sort_keys=True)}")

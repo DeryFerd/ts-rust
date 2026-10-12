@@ -2092,7 +2092,7 @@ impl FileLoader {
 /// scope of `file_name` (fileloader.go:397 to :400): for node16 to nodenext
 /// module resolution (not for `.mts`, `.cts`, `.mjs` and `.cjs` files), or
 /// for a path under `/node_modules/`.
-pub(crate) fn package_json_type_applies(
+pub fn package_json_type_applies(
     file_name: &str,
     module_resolution_kind: ModuleResolutionKind,
 ) -> bool {

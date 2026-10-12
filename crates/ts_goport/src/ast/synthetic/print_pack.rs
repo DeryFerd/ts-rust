@@ -82,7 +82,7 @@ pub fn export_print_pack(roots: &[Node], mut more: impl FnMut(Node, &mut Vec<Nod
                     // Every list field, also the ones that `for_each_child`
                     // skips (`EnumMember.modifiers`, which
                     // `set_node_modifiers` can set).
-                    data.data.for_each_list(|l| {
+                    data.data.view().for_each_list(|l| {
                         let index = l.index() as u32;
                         let list = a.own_list(index).get();
                         stack.extend(list.nodes.iter().map(|id| id.index() as u32));
@@ -204,6 +204,7 @@ pub fn release_print_packs() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::astdata::BoxedData;
 
     // A twin that installs the pack of a tree reads the same tree at the
     // same handles, with the parsed-node aliases resolved. A node that the
@@ -280,8 +281,8 @@ mod tests {
             );
             let index =
                 f.new_index_signature_declaration(ModifierList::NIL, f.new_node_list(&[]), any);
-            let mut data = with_ast_data(index, Clone::clone);
-            let NodeData::IndexSignatureDeclaration(d) = &mut data else {
+            let mut data = with_ast_data(index, |d| d.to_boxed());
+            let BoxedData::IndexSignatureDeclaration(d) = &mut data else {
                 unreachable!("an index signature has its data")
             };
             d.type_parameters = synthetic_list_value(false, f.new_node_list(&[t]));

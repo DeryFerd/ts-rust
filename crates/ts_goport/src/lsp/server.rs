@@ -721,9 +721,17 @@ const CONTENT_MAPPER_CALL_HIERARCHY_REGISTRATION_ID: &str = "content-mapper-call
 const CONTENT_MAPPER_WILL_RENAME_FILES_REGISTRATION_ID: &str = "content-mapper-will-rename-files";
 
 // Go: server.go:388 supportedCodeActionKinds (ts#63951)
+// with effect-tsgo 0.51.1 patch 017 (`017-ls-server-refactor-capability`):
+// `refactor.rewrite` after `quickfix`, always, also without an Effect plugin
+// (decision D1 option B). The editor "Refactor..." menu asks only servers
+// that list a `refactor` kind, so it then shows the Effect refactors. The
+// `initialize` answer and the content mapper code action registration use
+// this list. Plain Go has no `refactor.rewrite`: `scripts/goport/lsp_oracle.py`
+// drops it from the port's `initialize` answer before it compares with Go.
 pub fn supported_code_action_kinds() -> Vec<lsproto::CodeActionKind> {
     vec![
         lsproto::CodeActionKind::QUICK_FIX,
+        lsproto::CodeActionKind::REFACTOR_REWRITE,
         lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS_TS,
         lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS_TS,
         lsproto::CodeActionKind::SOURCE_SORT_IMPORTS_TS,
@@ -1725,23 +1733,8 @@ fn lsp_any_type_name(v: &LspAny) -> &'static str {
     }
 }
 
-/// PORT: a panic on a Go goroutine without `recover` ends the Go process.
-/// A Go panic that the port keeps (`core::go_panic`) ends it as the Go
-/// runtime does: `panic: <message>` on stderr and `EXIT_GO_PANIC` (2).
-/// Any other panic is a port gap and ends it the way `bin/goport.rs` ends a
-/// failed run: the unported report on stderr and `EXIT_UNPORTED` (70). The
-/// panic hook already printed such a panic.
-pub fn go_crash(payload: Box<dyn Any + Send>) -> ! {
-    if crate::core::print_go_panic(payload.as_ref()) {
-        std::process::exit(crate::core::EXIT_GO_PANIC);
-    }
-    let mut stderr = std::io::stderr().lock();
-    for (name, count) in crate::core::unported_report() {
-        let _ = writeln!(stderr, "unported: {name} {count}");
-    }
-    let _ = stderr.flush();
-    std::process::exit(crate::execute::tsc::EXIT_UNPORTED);
-}
+/// Moved to `execute::tsc` (the lower crate), which contentmapper also calls.
+pub use crate::execute::tsc::go_crash;
 
 /// The text of a panic value (Go `%v` of the recovered value).
 pub fn panic_value_string(r: &(dyn Any + Send)) -> String {
