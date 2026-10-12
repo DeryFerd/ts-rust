@@ -148,7 +148,12 @@ impl Printer {
         } else {
             let end = (start + count).min(length);
 
-            let nodes = children.nodes().to_vec();
+            // PERF: printfast1. Go slices `children.Nodes`. A factory list
+            // is copied in one arena read, not one read per node.
+            let nodes = match children.synthetic_list() {
+                Some(list) => crate::ast::synthetic::synthetic_list_nodes(list),
+                None => children.nodes().to_vec(),
+            };
             let has_trailing_comma = self.has_trailing_comma(parent_node, children);
             self.emit_list_items(
                 emit,

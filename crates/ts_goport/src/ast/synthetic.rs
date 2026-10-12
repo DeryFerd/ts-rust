@@ -2112,6 +2112,26 @@ pub fn synthetic_list_len(list: SyntheticList) -> usize {
     })
 }
 
+/// Go `list.Nodes` of `list`, copied in one arena borrow.
+// PERF: printfast1. `NodeSlice::to_vec` of a synthetic list reads the arena
+// once per node (`synthetic_list_node`); the printer copies each list it
+// emits (`Printer::emit_list_range`).
+#[must_use]
+pub fn synthetic_list_nodes(list: SyntheticList) -> Vec<Node> {
+    ARENA.with(|a| {
+        let a = a.borrow();
+        match list {
+            SyntheticList::Slice { index } => a.slices[index as usize].to_vec(),
+            SyntheticList::Own { .. } => a
+                .list(list)
+                .nodes
+                .iter()
+                .map(|id| a.resolve(id.index()))
+                .collect(),
+        }
+    })
+}
+
 /// Node `i` of `list`. Panics when `i` is out of range, like Go.
 #[must_use]
 pub fn synthetic_list_node(list: SyntheticList, i: usize) -> Node {
