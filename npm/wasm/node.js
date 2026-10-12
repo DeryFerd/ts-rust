@@ -5,6 +5,7 @@
 
 import { statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 export { memoryFileSystem, runTsc, runTscAsync } from "./core.js";
 
@@ -29,7 +30,8 @@ export function loadModule() {
  *
  * Without `options.files`, it reads and writes the real file system from
  * `options.cwd` (default: the current directory as `getwd` gives it, the
- * same path as the native tsgo). With `options.files` (path to
+ * same path as the native tsgo). A relative `options.cwd` is resolved
+ * against that directory. With `options.files` (path to
  * text, absolute paths), it reads only those files, and `result.files`
  * holds every file after the run, emitted ones included. In-memory runs
  * default to `/` as their current directory.
@@ -48,7 +50,9 @@ export async function tsc(args, options = {}) {
     const request = {
         module,
         args,
-        cwd: toPosix(options.cwd ?? (files === undefined ? getwd() : "/")),
+        // tsc needs an absolute current directory: a relative one ends the
+        // run with a panic ("vfs: path ... is not absolute").
+        cwd: toPosix(files === undefined ? resolve(getwd(), options.cwd ?? ".") : options.cwd ?? "/"),
         files,
         env: options.env ?? {},
         diagnosticsJson: options.diagnostics === "json",
