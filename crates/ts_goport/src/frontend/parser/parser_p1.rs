@@ -833,7 +833,7 @@ impl<'a> Parser<'a> {
             panic!("Expected end of file token from scanner.");
         }
         if !self.reparse_list.is_empty() {
-            statements.append(&mut self.reparse_list);
+            statements.extend(self.reparse_list.drain(..));
         }
         let list = self.new_node_list(TextRange::new(pos, end), &statements);
         let node = self
@@ -1054,15 +1054,18 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:613 parseListIndex
+    // PERF: identparse1. Go's `make([]*ast.Node, 0, 16)` stays on the stack
+    // (the list is cloned into the arena at the end), so the scratch list is
+    // a `SmallVec` of 16, not a heap `Vec` per list.
     pub fn parse_list_index(
         &mut self,
         kind: ParsingContext,
         mut parse_element: impl FnMut(&mut Parser<'a>, i32) -> Node,
-    ) -> Vec<Node> {
+    ) -> SmallVec<[Node; 16]> {
         let save_parsing_contexts = self.parsing_contexts;
         self.parsing_contexts |= 1 << (kind as i32);
         let mut outer_reparse_list = std::mem::take(&mut self.reparse_list);
-        let mut list: Vec<Node> = Vec::with_capacity(16);
+        let mut list: SmallVec<[Node; 16]> = SmallVec::new();
         while !self.is_list_terminator(kind) {
             if self.is_list_element(kind, false /*inErrorRecovery*/) {
                 let elt = parse_element(self, list.len() as i32);
