@@ -1267,6 +1267,20 @@ impl Checker {
             {
                 return false;
             }
+            // PERF: flowcost1. Two property accesses: Go compares the two
+            // `getAccessedPropertyName` texts (`Name().Text()` of each), and
+            // equal texts are equal interned names, so the name ids are
+            // compared (`Node::text_name`) without reading either text.
+            SyntaxKind::PropertyAccessExpression
+                if target_kind == SyntaxKind::PropertyAccessExpression =>
+            {
+                debug_assert_eq!(
+                    source.name().text_name() == target.name().text_name(),
+                    source.name().text() == target.name().text()
+                );
+                return source.name().text_name() == target.name().text_name()
+                    && self.is_matching_reference(source.expression(), target.expression());
+            }
             SyntaxKind::PropertyAccessExpression | SyntaxKind::ElementAccessExpression => {
                 let (source_property_name, ok) = self.get_accessed_property_name(source);
                 if ok {
