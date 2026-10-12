@@ -921,12 +921,12 @@ pub(crate) struct VersionTables {
     /// worker thread can read its program files after the frontend program
     /// is freed.
     file_versions: Vec<Arc<crate::ast::FileVersion>>,
-    /// The binder symbols of the program (`bind_all`, `bound_symbols`): a
-    /// copy of the binder lineage after the program files are bound. Each
-    /// checker copies it. It shares the lineage chunks, so it keeps the
-    /// chunks of a dead file version until the release frees it (lsshells
-    /// M2c, M3d).
-    bound_symbols: OnceLock<SymbolArena>,
+    /// The binder symbols of the program (`bind_all`, `bound_symbols`): the
+    /// binder lineage arena after the program files are bound, shared until
+    /// the lineage changes (`Lineage::symbols_mut`). Each checker copies it.
+    /// It shares the lineage chunks, so it keeps the chunks of a dead file
+    /// version until the release frees it (lsshells M2c, M3d).
+    bound_symbols: OnceLock<Arc<SymbolArena>>,
     /// Go `Program.packagesMap`, made on first use (`get_packages_map`).
     packages_map: OnceLock<Arc<FxHashMap<String, bool>>>,
 }
@@ -1214,8 +1214,9 @@ fn intern_program_str(text: &str) -> &'static str {
 }
 
 /// The binder symbols of a program version (Go: the symbols that the bound
-/// files of the program point to): a copy of the binder lineage after the
-/// program files are bound (`bind_all`). It derefs to the arena.
+/// files of the program point to): the binder lineage arena after the
+/// program files are bound (`bind_all`), shared until the lineage changes.
+/// It derefs to the arena.
 // PORT: Go symbols live with their files. Here they are in the program's
 // `VersionTables` (lsshells M2c), so a release frees the copy with the
 // tables, and the lineage chunks of a dead file version go when the last
@@ -1457,7 +1458,7 @@ impl Drop for AliasResolverProgramScope {
 // PORT: Go needs no program: the resolver is the `checker.Program`. A
 // checker here reads its program version (`prog()`), and it copies the
 // binder lineage when it is made (`SymbolArena::for_checker`). So the
-// program copies the lineage after `files` are bound. A file that the
+// program takes the lineage arena after `files` are bound. A file that the
 // resolver binds later reaches a checker through its catch-up
 // (`catch_up_alias_resolver_checker`). Go `GetResolvedModules` is nil, so
 // the program has no resolved modules. The program shell stays leaked like
@@ -1502,7 +1503,7 @@ pub fn new_alias_resolver_program(
         for &file in files {
             lineage.bind(file);
         }
-        lineage.symbols.clone()
+        Arc::clone(&lineage.symbols)
     });
     assert!(
         held_tables(program)
@@ -1573,8 +1574,13 @@ pub fn try_load_timed(
 /// apisym1c: each bind and free makes a new generation
 /// (`LINEAGE_GENERATION`, `SymbolArena::lineage_seen`), so a checker can
 /// tell when its copy is older.
+///
+/// edleak3: a program's copy is the lineage arena itself, shared
+/// (`bind_all`); the next change of the lineage copies it first
+/// (`symbols_mut`, `Arc::make_mut`). So the lineage and its newest program
+/// keep one chunk list between edits, not two.
 struct Lineage {
-    symbols: SymbolArena,
+    symbols: Arc<SymbolArena>,
     /// The arena range of each freeable file version bound here, by file
     /// id, until the version dies, with its symbol indexes.
     freeable: FxHashMap<usize, (ArenaMark, ArenaMark, std::ops::Range<usize>)>,
@@ -1602,7 +1608,7 @@ static LINEAGE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 fn with_lineage<R>(f: impl FnOnce(&mut Lineage) -> R) -> R {
     let mut lineage = LINEAGE.lock().unwrap_or_else(PoisonError::into_inner);
     let lineage = lineage.get_or_insert_with(|| Lineage {
-        symbols: SymbolArena::new(),
+        symbols: Arc::new(SymbolArena::new()),
         freeable: FxHashMap::default(),
         seen_dead: 0,
         freed: Vec::new(),
@@ -1612,6 +1618,12 @@ fn with_lineage<R>(f: impl FnOnce(&mut Lineage) -> R) -> R {
 }
 
 impl Lineage {
+    /// The lineage arena to change: a copy of it when a program still
+    /// shares it (`bind_all`).
+    fn symbols_mut(&mut self) -> &mut SymbolArena {
+        Arc::make_mut(&mut self.symbols)
+    }
+
     /// Frees the chunks of the freeable versions that died since the last
     /// call.
     // PERF: one atomic load when no version died.
@@ -1624,7 +1636,7 @@ impl Lineage {
         let freed = self.freed.len();
         for file in dead {
             if let Some((start, end, symbols)) = self.freeable.remove(&file) {
-                self.symbols.free_range(start, end);
+                self.symbols_mut().free_range(start, end);
                 self.freed.push((start, end));
                 crate::ast::free_lineage_symbol_ids(file, symbols);
             }
@@ -1638,10 +1650,9 @@ impl Lineage {
     /// catch up (`catch_up_checker`), and copies made from now on keep it.
     fn changed(&mut self) {
         let generation = self.symbols.lineage_seen().generation + 1;
-        self.symbols.set_lineage_seen(LineageSeen {
-            generation,
-            freed: self.freed.len(),
-        });
+        let freed = self.freed.len();
+        self.symbols_mut()
+            .set_lineage_seen(LineageSeen { generation, freed });
         LINEAGE_GENERATION.store(generation, std::sync::atomic::Ordering::Release);
     }
 
@@ -1659,22 +1670,22 @@ impl Lineage {
     ) -> R {
         // Checkers copy the lineage; publish what the file added, so they
         // share it (`SymbolArena::freeze_since` and `share_since`).
+        let arena = self.symbols_mut();
         if !freeable {
-            let mark = self.symbols.mark();
-            let result = add(&mut self.symbols);
-            self.symbols.freeze_since(mark);
+            let mark = arena.mark();
+            let result = add(arena);
+            arena.freeze_since(mark);
             self.changed();
             return result;
         }
-        self.symbols.end_chunk();
-        let start = self.symbols.mark();
-        let first = self.symbols.symbol_count();
-        let result = add(&mut self.symbols);
-        self.symbols.end_chunk();
-        self.symbols.share_since(start);
-        let symbols = first..self.symbols.symbol_count();
-        self.freeable
-            .insert(file, (start, self.symbols.mark(), symbols));
+        arena.end_chunk();
+        let start = arena.mark();
+        let first = arena.symbol_count();
+        let result = add(arena);
+        arena.end_chunk();
+        arena.share_since(start);
+        let entry = (start, arena.mark(), first..arena.symbol_count());
+        self.freeable.insert(file, entry);
         self.changed();
         result
     }
@@ -1747,8 +1758,8 @@ pub fn catch_up_alias_resolver_checker(symbols: &mut SymbolArena) {
 // Go: compiler/program.go:595 BindSourceFiles
 // PORT: Go binds files in parallel into per-file symbol tables. Here every
 // file binds into the shared `LINEAGE` arena, and the program's binder
-// symbols (`bound_symbols`, in its `VersionTables`) are a copy of it after
-// the program files are bound. `Checker::new` uses the same initializer,
+// symbols (`bound_symbols`, in its `VersionTables`) are that arena after
+// the program files are bound (shared until the lineage changes). `Checker::new` uses the same initializer,
 // so the first of the two to run binds. Files bind in parallel, each into
 // its own arena (`bind_files_parallel`), and join the lineage in file order
 // with the ids a serial bind gives. With `--singleThreaded` they bind
@@ -1772,9 +1783,9 @@ pub fn bind_all() {
                 };
                 lineage.bind(file.root);
             }
-            // Checkers clone the copy. Each file published what it added
+            // Checkers clone the arena. Each file published what it added
             // (`Lineage::add_file`).
-            lineage.symbols.clone()
+            Arc::clone(&lineage.symbols)
         })
     });
 }

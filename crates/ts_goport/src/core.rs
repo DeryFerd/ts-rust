@@ -2663,7 +2663,9 @@ pub struct SymbolArena {
     tables: CowChunks<Table>,
     /// The names that the binder gave private identifier symbols
     /// (`get_symbol_name_for_private_identifier`), as intern ids, for the
-    /// lib bind snapshot (`note_private_name`).
+    /// lib bind snapshot (`note_private_name`). Only a file arena keeps
+    /// them: the snapshot is made from file arenas, and a join drops them
+    /// (`prepare_file_arena`).
     private_names: Vec<u32>,
     /// Where `crate::ast::get_symbol_id` keeps the ids of these symbols.
     ids: SymbolIds,
@@ -3072,9 +3074,16 @@ impl SymbolArena {
 
     /// Notes that the binder gave `name` to a private identifier symbol
     /// (`get_symbol_name_for_private_identifier`), for the lib bind
-    /// snapshot (`private_names`).
+    /// snapshot (`private_names`). A lineage arena or a copy of one
+    /// (`is_interleaved`) keeps no names.
+    // PERF (edleak3): the binder lineage binds each edited file version in
+    // place (`program::Lineage::bind`), and every program and checker copy
+    // cloned the names: on a 10,000-edit query-core session, 0.31 MiB per
+    // copy that no reader used.
     pub fn note_private_name(&mut self, name: &Name) {
-        self.private_names.push(name.0);
+        if !self.is_interleaved() {
+            self.private_names.push(name.0);
+        }
     }
 
     /// The current symbol and table counts, for `share_since`.
