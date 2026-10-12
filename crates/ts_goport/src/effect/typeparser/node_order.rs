@@ -41,11 +41,14 @@ impl NodeOrder {
             end.push(0);
             n.for_each_child(|child| {
                 // Go `visit` (ast.go:31) skips a nil child field, but
-                // `visitNodes` (ast.go:38) passes a nil list entry, and each
-                // Go rule walk skips it (`if node == nil`, for example
+                // `visitNodes` (ast.go:38) passes a nil list entry. Some Go
+                // rule walks skip it (`if node == nil`, for example
                 // schema_number.go:46 and promise_in_effect_success.go:39).
-                // A parsed file has no nil list entry, so this changes no
-                // output.
+                // Others read it and would panic (`ast.IsTypeNode(node)` at
+                // any_unknown_in_error_context.go:48, `node.Kind` at
+                // generic_effect_services.go:41). A parsed file has no nil
+                // list entry, so neither case occurs and this skip changes
+                // no output.
                 if child.is_some() {
                     visit(child, nodes, end);
                 }
