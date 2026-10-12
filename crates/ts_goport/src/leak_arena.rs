@@ -86,20 +86,31 @@ impl LeakArena {
         len: usize,
         items: impl Iterator<Item = T>,
     ) -> &'static mut [T] {
-        let layout = Layout::array::<T>(len).expect("arena slice size");
-        // The check comes before the iterator runs, so a full chunk does not
-        // drop items that were already made.
-        let bump = if self.current.get().chunk_capacity() >= layout.size() + layout.align() {
-            self.current.get()
-        } else {
-            self.chunk_for(layout)
-        };
         let mut items = items;
-        let slice = bump.alloc_slice_fill_with(len, |_| {
+        let slice = self.alloc_slice_fill_with(len, |_| {
             items.next().expect("arena slice iterator ended early")
         });
         debug_assert!(items.next().is_none(), "arena slice iterator is longer");
         slice
+    }
+
+    /// A slice of `len` items in the arena, item `i` made by `make(i)`, in
+    /// order.
+    // PERF: storefast2. One room check: `make` runs only after the slice has
+    // its room, so a full chunk does not drop items that were already made
+    // (the store's list ids, about one list for 5 parsed nodes).
+    #[inline]
+    pub fn alloc_slice_fill_with<T>(
+        &self,
+        len: usize,
+        mut make: impl FnMut(usize) -> T,
+    ) -> &'static mut [T] {
+        match self.current.get().try_alloc_slice_fill_with(len, &mut make) {
+            Ok(slice) => slice,
+            Err(_) => self
+                .chunk_for(Layout::array::<T>(len).expect("arena slice size"))
+                .alloc_slice_fill_with(len, make),
+        }
     }
 
     /// The slot of a `T` that did not fit in the current chunk.

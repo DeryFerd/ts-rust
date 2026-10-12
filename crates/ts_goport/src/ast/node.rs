@@ -1726,6 +1726,25 @@ impl NodeList {
         }
     }
 
+    /// True for the Go `nil` handle (`NodeList::NIL`). Unlike `is_nil`,
+    /// false for a nil marker list (`store::NIL_LIST_POS`).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_nil_handle(self) -> bool {
+        matches!(self.0, ListRef::Nil)
+    }
+
+    /// The store id and the list of a list of a static store, else `None`
+    /// (`store::store_list_value`).
+    #[inline]
+    #[must_use]
+    pub(crate) fn static_parts(self) -> Option<(usize, &'static StaticList)> {
+        match self.0 {
+            ListRef::Ts { file, list } => Some((file as usize, list)),
+            _ => None,
+        }
+    }
+
     /// The synthetic list of the handle, else `None`.
     #[inline]
     #[must_use]
