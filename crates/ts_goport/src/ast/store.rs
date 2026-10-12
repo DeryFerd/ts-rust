@@ -4034,6 +4034,9 @@ impl FileStore {
     // a deprecated tag was written (`BuildFacts`). Debug builds check the
     // result against the pass (`debug_scan_facts`).
     fn make_facts(&mut self) {
+        // `build_facts` is taken, so a second pass would write the facts of
+        // an empty store (R202 review).
+        assert!(!self.facts_made, "make_facts ran twice on one store");
         let built = std::mem::take(&mut self.build_facts);
         // `StoreFacts::add` of every node slot after slot 0.
         let node_records = || self.records.iter().skip(1).filter(|r| r.is_node());
