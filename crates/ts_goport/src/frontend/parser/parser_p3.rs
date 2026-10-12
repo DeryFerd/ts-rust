@@ -1863,7 +1863,9 @@ impl<'a> Parser<'a> {
         // To avoid a look-ahead, we did not handle the case of an arrow function with a single un-parenthesized
         // parameter ('x => ...') above. We handle it here by checking if the parsed expression was a single
         // identifier and the current token is an arrow.
-        if expr.kind() == SyntaxKind::Identifier && self.token == SyntaxKind::EqualsGreaterThanToken
+        // PERF: parsefast2. The token test goes first: both tests are pure,
+        // and a node kind read is a store access here.
+        if self.token == SyntaxKind::EqualsGreaterThanToken && expr.kind() == SyntaxKind::Identifier
         {
             return self.parse_simple_arrow_function_expression(
                 pos,
@@ -1879,7 +1881,13 @@ impl<'a> Parser<'a> {
         //
         // Note: we call reScanGreaterToken so that we get an appropriately merged token
         // for cases like `> > =` becoming `>>=`
-        if is_left_hand_side_expression(expr)
+        // PERF: parsefast2. reScanGreaterToken changes only a `>` token. At
+        // any other token that is not an assignment operator the Go test is
+        // false, so the test of the token goes first and skips the read of
+        // the node kind (a store access here) for most expressions.
+        debug_assert_eq!(self.token, self.scanner.token());
+        if (self.token == SyntaxKind::GreaterThanToken || is_assignment_operator(self.token))
+            && is_left_hand_side_expression(expr)
             && is_assignment_operator(self.re_scan_greater_than_token())
         {
             let operator_token = self.parse_token_node();
@@ -1892,7 +1900,16 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser/parser.go:4203 isYieldExpression
+    // PERF: parsefast2. The token test is inline; the rest (yield is rare)
+    // is out of line.
+    #[inline]
     pub fn is_yield_expression(&mut self) -> bool {
+        self.token == SyntaxKind::YieldKeyword && self.is_yield_expression_at_yield()
+    }
+
+    /// `is_yield_expression` at a `yield` token.
+    #[inline(never)]
+    fn is_yield_expression_at_yield(&mut self) -> bool {
         if self.token == SyntaxKind::YieldKeyword {
             // If we have a 'yield' keyword, and this is a context where yield expressions are
             // allowed, then definitely parse out a yield expression.
