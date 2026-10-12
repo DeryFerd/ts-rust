@@ -59,7 +59,7 @@
 use crate::ast::store::{LibListTable, LibParseSlot, load_lib_parse_slots, reset_file_store};
 #[cfg(test)]
 use crate::ast::store::{lib_parse_slot_views, lib_parse_store_dump};
-use crate::astdata::NodeData;
+use crate::astdata::{BoxedData, NodeData};
 use crate::binder::lib_snapshot::{
     MIN_TEXT_LEN, Mode, SnapshotEntry, SnapshotReader, TEXT_BIT, const_hash, mix, read_entries,
     text_matches,
@@ -568,7 +568,7 @@ impl<'a> Decoder<'a> {
             None
         } else {
             let data = decode_payload(&mut PayloadDecoder { dec: self, lists }, variant)?;
-            if !data.matches_syntax_kind(kind) {
+            if !data.view().matches_syntax_kind(kind) {
                 return None;
             }
             Some(data)
@@ -916,9 +916,9 @@ macro_rules! payload_codec {
         $($field:ident: $codec:ident),* $(,)?
     })*) => {
         /// The node data with variant tag `variant_tag`, from `dec`.
-        fn decode_payload(dec: &mut PayloadDecoder<'_, '_, '_, '_>, variant_tag: u8) -> Option<NodeData> {
+        fn decode_payload(dec: &mut PayloadDecoder<'_, '_, '_, '_>, variant_tag: u8) -> Option<BoxedData> {
             Some(match variant_tag {
-                $($variant_tag => NodeData::$variant(Box::new(crate::astdata::$data {
+                $($variant_tag => BoxedData::$variant(Box::new(crate::astdata::$data {
                     $($field: dec.$codec()?,)*
                 })),)*
                 _ => return None,
@@ -927,10 +927,10 @@ macro_rules! payload_codec {
 
         /// Writes the variant tag and the fields of `payload`.
         #[cfg(test)]
-        fn encode_payload(enc: &mut Encoder, payload: &NodeData) -> Result<(), String> {
+        fn encode_payload(enc: &mut Encoder, payload: NodeData<'_>) -> Result<(), String> {
             match payload {
                 $(NodeData::$variant(payload) => {
-                    let crate::astdata::$data { $($field),* } = &**payload;
+                    let crate::astdata::$data { $($field),* } = payload;
                     enc.u8($variant_tag);
                     $(enc.$codec($field)?;)*
                 })*

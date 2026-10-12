@@ -481,7 +481,7 @@ impl<'a> AstGenerator<'a> {
         )
         .unwrap();
         writeln!(output, "    pub fn try_for_each_child<B, F>(").unwrap();
-        writeln!(output, "        &self,").unwrap();
+        writeln!(output, "        self,").unwrap();
         writeln!(output, "        visitor: &mut F,").unwrap();
         writeln!(output, "    ) -> std::ops::ControlFlow<B>").unwrap();
         writeln!(output, "    where").unwrap();
@@ -542,7 +542,7 @@ impl<'a> AstGenerator<'a> {
     /// Visits every list field of the data, also the ones that
     /// `try_for_each_child` skips, as Go `ForEachChild` does.
     #[allow(clippy::too_many_lines)]
-    pub fn for_each_list(&self, mut visitor: impl FnMut(NodeList)) {
+    pub fn for_each_list(self, mut visitor: impl FnMut(NodeList)) {
         let mut visit = |list: Option<NodeList>| {
             if let Some(list) = list {
                 visitor(list);
@@ -582,6 +582,151 @@ impl<'a> AstGenerator<'a> {
         }
         output.push_str("            _ => {}\n        }\n    }\n");
         Ok(())
+    }
+
+    /// `BoxedData`, the owning data (a box per payload), and `NodeData<'a>`,
+    /// the borrowed view that readers match (Go's `nodeData` interface word:
+    /// a tag and a pointer, 16 B). Both are `#[repr(u8)]` with one variant
+    /// order, so `BoxedData::view` is a copy (astchunks2 probe).
+    fn generate_data_enums(&self, output: &mut String) {
+        output.push_str(
+            "/// The owning node data: one box per payload. Owned file versions (LSP)
+/// and synthetic nodes keep their data in it. Readers match its `view`.
+#[derive(Clone, Debug)]
+#[repr(u8)]
+pub enum BoxedData {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(output, "    {rust_name}(Box<{rust_name}Data>),").unwrap();
+        }
+        output.push_str(
+            "}
+
+/// The node data that readers match: a tag and a reference (16 B), as Go's
+/// `nodeData` interface word. Same tags and order as `BoxedData`.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum NodeData<'a> {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(output, "    {rust_name}(&'a {rust_name}Data),").unwrap();
+        }
+        output.push_str(
+            "}
+
+impl BoxedData {
+    /// The view of the data. A 16 B copy: the two enums have one layout.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn view(&self) -> NodeData<'_> {
+        match self {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(
+                output,
+                "            Self::{rust_name}(d) => NodeData::{rust_name}(d),"
+            )
+            .unwrap();
+        }
+        output.push_str("        }\n    }\n}\n\n");
+    }
+
+    /// `NodeData::to_boxed`, `NodeData::addr` and `NodeData::same`.
+    fn generate_view_methods(&self, output: &mut String) {
+        output.push_str(
+            "
+    /// An owning copy of the data in a new box.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn to_boxed(self) -> BoxedData {
+        match self {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(
+                output,
+                "            Self::{rust_name}(d) => BoxedData::{rust_name}(Box::new(d.clone())),"
+            )
+            .unwrap();
+        }
+        output.push_str(
+            "        }
+    }
+
+    /// The address of the data. Data of a zero-size type can share an
+    /// address with other data: `same` also compares the tag.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn addr(self) -> *const () {
+        match self {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(
+                output,
+                "            Self::{rust_name}(d) => std::ptr::from_ref(d).cast(),"
+            )
+            .unwrap();
+        }
+        output.push_str(
+            "        }
+    }
+
+    /// Whether `self` and `other` view the same data: same tag and address.
+    #[must_use]
+    pub fn same(self, other: Self) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&other)
+            && std::ptr::eq(self.addr(), other.addr())
+    }
+",
+        );
+    }
+
+    /// `AstData`: the view and the box of one data struct (the factory's
+    /// `new_node<T: AstData>`).
+    fn generate_ast_data_impls(&self, output: &mut String) {
+        output.push_str(
+            "/// One node data struct: its view and its box.
+pub trait AstData: Sized {
+    /// The view of this data.
+    fn view(&self) -> NodeData<'_>;
+    /// This data in a new box.
+    fn into_boxed(self) -> BoxedData;
+}
+
+macro_rules! ast_data {
+    ($($v:ident($t:ident)),+ $(,)?) => {$(
+        impl AstData for $t {
+            #[inline]
+            fn view(&self) -> NodeData<'_> {
+                NodeData::$v(self)
+            }
+
+            #[inline]
+            fn into_boxed(self) -> BoxedData {
+                BoxedData::$v(Box::new(self))
+            }
+        }
+    )+};
+}
+
+ast_data! {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(output, "    {rust_name}({rust_name}Data),").unwrap();
+        }
+        output.push_str("}\n\n");
     }
 
     fn generate_hand_written_child_arm(
@@ -694,15 +839,8 @@ impl<'a> AstGenerator<'a> {
             writeln!(output).unwrap();
         }
 
-        writeln!(output, "#[derive(Clone, Debug)]").unwrap();
-        writeln!(output, "pub enum NodeData {{").unwrap();
-        for name in self.schema.nodes.definitions.keys() {
-            let rust_name = rust_type_name(name);
-            writeln!(output, "    {rust_name}(Box<{rust_name}Data>),").unwrap();
-        }
-        writeln!(output, "}}").unwrap();
-        writeln!(output).unwrap();
-        writeln!(output, "impl NodeData {{").unwrap();
+        self.generate_data_enums(&mut output);
+        writeln!(output, "impl<'a> NodeData<'a> {{").unwrap();
         writeln!(
             output,
             "    pub const SCHEMA_NODE_COUNT: usize = {};",
@@ -732,7 +870,7 @@ impl<'a> AstGenerator<'a> {
         writeln!(output, "    #[allow(clippy::too_many_lines)]").unwrap();
         writeln!(
             output,
-            "    pub const fn schema_name(&self) -> &'static str {{"
+            "    pub const fn schema_name(self) -> &'static str {{"
         )
         .unwrap();
         writeln!(output, "        match self {{").unwrap();
@@ -744,7 +882,10 @@ impl<'a> AstGenerator<'a> {
         writeln!(output, "    }}").unwrap();
         self.generate_child_traversal(&mut output)?;
         self.generate_list_walk(&mut output)?;
+        self.generate_view_methods(&mut output);
         writeln!(output, "}}").unwrap();
+        writeln!(output).unwrap();
+        self.generate_ast_data_impls(&mut output);
         writeln!(output).unwrap();
         write_child_traversal_helpers(&mut output);
 
@@ -846,7 +987,7 @@ where
 impl Node {
     /// Visits every direct AST child in TypeScript-Go `ForEachChild` order.
     pub fn for_each_child(&self, mut visitor: impl FnMut(Child)) {
-        let _ = self.data.try_for_each_child(&mut |child| {
+        let _ = self.data.view().try_for_each_child(&mut |child| {
             visitor(child);
             std::ops::ControlFlow::<()>::Continue(())
         });
@@ -859,7 +1000,7 @@ impl Node {
         &self,
         mut visitor: impl FnMut(Child) -> std::ops::ControlFlow<B>,
     ) -> std::ops::ControlFlow<B> {
-        self.data.try_for_each_child(&mut visitor)
+        self.data.view().try_for_each_child(&mut visitor)
     }
 }
 
@@ -1089,7 +1230,7 @@ pub struct Node {
     pub flags: NodeFlags,
     pub range: TextRange,
     pub parent: Option<NodeId>,
-    pub data: NodeData,
+    pub data: BoxedData,
 }
 
 #[derive(Debug)]
@@ -1249,6 +1390,12 @@ mod tests {
         assert!(output.contains("pub const SCHEMA_NODE_ALIAS_COUNT: usize = 72;"));
         assert!(output.contains("pub const SCHEMA_LIST_ALIAS_COUNT: usize = 23;"));
         assert_eq!(output.matches("(Box<").count(), 192);
+        assert!(output.contains("#[repr(u8)]\npub enum BoxedData {"));
+        assert!(output.contains("#[repr(u8)]\npub enum NodeData<'a> {"));
+        assert_eq!(output.matches("(&'a ").count(), 192);
+        assert!(output.contains("pub fn view(&self) -> NodeData<'_>"));
+        assert!(output.contains("pub fn to_boxed(self) -> BoxedData"));
+        assert!(output.contains("pub trait AstData: Sized"));
         assert!(output.contains("pub struct SourceFileData"));
         assert!(output.contains("pub struct JsDocParameterOrPropertyTagData"));
     }

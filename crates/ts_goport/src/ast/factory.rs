@@ -17,7 +17,7 @@
 //! Go `newNode` does not set parents. Callers set `Parent` when Go does, with
 //! `set_node_parent`.
 
-use crate::astdata::NodeData as D;
+use crate::astdata::BoxedData as D;
 use crate::prelude::*;
 
 /// Go `*ast.NodeFactory`.
@@ -201,7 +201,7 @@ impl NodeFactory {
         self.text_count.set(self.text_count.get() + 1);
         self.node_count.set(self.node_count.get() + 1);
         #[cfg(debug_assertions)]
-        debug_assert_shared_name_data(kind, &data(String::new()));
+        debug_assert_shared_name_data(kind, data(String::new()).view());
         let node = alloc_store_shared_name_node(store, kind, text.as_ref());
         // Go: ast.go:73
         if let Some(h) = &self.hooks.on_create {

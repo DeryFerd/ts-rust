@@ -6,7 +6,7 @@
 //! `ModifierList`, and Go `nil` is the `NIL` value of each. Nodes go to the
 //! factory target (synthetic arena or the store of the parsed file).
 
-use crate::astdata::NodeData as D;
+use crate::astdata::BoxedData as D;
 use crate::frontend::prelude::*;
 
 /// Go `TokenFlagsNone` in astdata form.

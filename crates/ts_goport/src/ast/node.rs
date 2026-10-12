@@ -336,8 +336,8 @@ macro_rules! list_by_data {
 }
 
 /// True when `d` is the data of parsed node `n` (the `_in` debug checks).
-fn is_data_of(d: &NodeData, n: Node) -> bool {
-    static_ast_node(n).is_some_and(|data| std::ptr::eq(d, data))
+fn is_data_of(d: NodeData<'_>, n: Node) -> bool {
+    static_ast_node(n).is_some_and(|data| d.same(data))
 }
 
 /// Defines one Go field accessor as two `Node` methods from one arm list:
@@ -465,7 +465,7 @@ macro_rules! store_node_modifier_list_fn {
         #[inline]
         pub(crate) fn store_node_modifier_list(
             kind: SyntaxKind,
-            data: &NodeData,
+            data: NodeData<'_>,
         ) -> Option<crate::astdata::ModifierList> {
             let mut has_list = false;
             $(has_list |= variant_has_kind!($v, kind);)+
@@ -489,7 +489,7 @@ modifiers_variants!(store_node_modifier_list_fn! {});
 /// of the store). 0 when the node has no list.
 pub(crate) fn store_node_modifier_bits(
     kind: SyntaxKind,
-    data: &NodeData,
+    data: NodeData<'_>,
     flags: impl FnOnce(crate::astdata::ModifierList) -> u32,
 ) -> u32 {
     store_node_modifier_list(kind, data).map_or(0, flags)
@@ -885,7 +885,7 @@ fn column_req_id(id: crate::astdata::NodeId) -> u32 {
 /// data.
 // PERF: called when the slot is made, while its data is hot (a few data
 // matches), so no pass over the node data is needed later.
-pub(crate) fn store_node_children(kind: SyntaxKind, data: &NodeData) -> SlotChildren {
+pub(crate) fn store_node_children(kind: SyntaxKind, data: NodeData<'_>) -> SlotChildren {
     debug_assert!(
         data.matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
@@ -902,7 +902,7 @@ pub(crate) fn store_node_children(kind: SyntaxKind, data: &NodeData) -> SlotChil
 }
 
 /// `store_node_children` for node data `data`.
-fn store_node_children_from_data(data: &NodeData) -> SlotChildren {
+fn store_node_children_from_data(data: NodeData<'_>) -> SlotChildren {
     let id_opt = |_: usize, id: Option<crate::astdata::NodeId>| Some(column_opt_id(id));
     let id_req = |_: usize, id: crate::astdata::NodeId| Some(column_req_id(id));
     let name = name_arms!(
@@ -2921,7 +2921,7 @@ impl Node {
     // field has no generated accessor.
     #[must_use]
     pub fn raw_text(self) -> &'static str {
-        fn raw_text_of(d: &NodeData) -> Option<&str> {
+        fn raw_text_of(d: NodeData<'_>) -> Option<&str> {
             match d {
                 NodeData::TemplateHead(d) => Some(&d.raw_text),
                 NodeData::TemplateMiddle(d) => Some(&d.raw_text),
@@ -3704,7 +3704,7 @@ fn for_each_scoped_child(
 // `Node::new_slow`), a store lookup each.
 pub(crate) fn for_each_store_child_id(
     kind: SyntaxKind,
-    data: &NodeData,
+    data: NodeData<'_>,
     lists: ListIds<'_>,
     v: impl FnMut(u32) -> bool,
 ) -> bool {
@@ -3992,7 +3992,7 @@ pub(crate) enum ChildField<'d> {
 pub(crate) fn for_each_child_field<'d>(
     kind: SyntaxKind,
     n: Node,
-    data: &'d NodeData,
+    data: NodeData<'d>,
     f: impl FnMut(ChildField<'d>),
 ) {
     let file = n.file_index();
@@ -4134,7 +4134,7 @@ impl<F: FnMut(u32) -> bool> StoreChildIds<'_, F> {
 // Go: ast_generated.go ForEachChild (one method per node struct)
 // PORT: the per-struct Go methods are merged into one match. The order of
 // each arm follows the generated Go code.
-fn walk_children<'d>(data: &'d NodeData, w: &mut impl ChildVisit<'d>) -> bool {
+fn walk_children<'d>(data: NodeData<'d>, w: &mut impl ChildVisit<'d>) -> bool {
     macro_rules! n {
         ($x:expr) => {
             w.node($x)
@@ -4665,7 +4665,7 @@ fn propagate_node_list(children: DataList, propagate: fn(Node) -> SubtreeFacts) 
 /// `ClassLikeBase` or `AccessorDeclarationBase`), on the data `d` of node
 /// `n`. Go caches `SubtreeFacts()` only for these types (`ast.go:1602`).
 #[inline]
-fn is_composite_data(n: Node, d: &NodeData) -> bool {
+fn is_composite_data(n: Node, d: NodeData<'_>) -> bool {
     match d {
         // PORT: a PropertyDeclaration that Go parses as a PropertySignature
         // (`is_type_syntax_data`).
@@ -4750,7 +4750,7 @@ fn is_composite_data(n: Node, d: &NodeData) -> bool {
 // PERF: emitast1 F2. The callers load the data once and pass it in; this
 // was two data reads of its own for each node (`with_data!` twice).
 #[inline]
-fn is_type_syntax_data(n: Node, d: &NodeData) -> bool {
+fn is_type_syntax_data(n: Node, d: NodeData<'_>) -> bool {
     match d {
         // PORT: a PropertyDeclaration that Go parses as a PropertySignature.
         NodeData::PropertyDeclaration(_) => n.kind() == SyntaxKind::PropertySignature,
@@ -4811,7 +4811,7 @@ fn propagate_node_facts(n: Node) -> SubtreeFacts {
 }
 
 /// `propagate_node_facts` over the data `d` of `n`, read in place.
-fn propagate_node_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
+fn propagate_node_facts_of_data(n: Node, d: NodeData<'_>) -> SubtreeFacts {
     // Go: ast.go:1621 (*TypeSyntaxBase).propagateSubtreeFacts
     if is_type_syntax_data(n, d) {
         return TS;
@@ -4855,7 +4855,7 @@ fn propagate_node_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
 /// node of a `CompositeBase` kind gets the cached facts, or the facts
 /// computed from `d` (and cached). Any other node (a token, an identifier,
 /// a literal, type syntax) gets the facts computed from `d`, not cached.
-fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
+fn subtree_facts_with_data(n: Node, d: NodeData<'_>) -> SubtreeFacts {
     if is_type_syntax_data(n, d) {
         // Go: ast.go:1619 (*TypeSyntaxBase).computeSubtreeFacts
         return TS;
@@ -4874,7 +4874,7 @@ fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
 // not once more here: in a deep chain of nodes that Go does not cache
 // (`await await ... x`), each step was 2 tests.
 #[inline]
-fn non_type_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
+fn non_type_subtree_facts(n: Node, d: NodeData<'_>) -> SubtreeFacts {
     debug_assert!(!is_type_syntax_data(n, d), "{:?} is type syntax", n.kind());
     if !is_composite_data(n, d) {
         return subtree_facts_of_data(n, d);
@@ -4885,7 +4885,7 @@ fn non_type_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
 /// `non_type_subtree_facts` for a node of a `CompositeBase` kind: the
 /// cached facts, or the facts computed from `d`, cached.
 #[inline(never)]
-fn composite_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
+fn composite_subtree_facts(n: Node, d: NodeData<'_>) -> SubtreeFacts {
     if let Some(word) = super::store::static_facts_word(n) {
         if let Some(facts) = computed_facts(SubtreeFacts(word.load(Ordering::Relaxed))) {
             return facts;
@@ -4909,7 +4909,7 @@ fn composite_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
 // `(*TypeSyntaxBase).computeSubtreeFacts` is in `subtree_facts_with_data`.
 /// Go `computeSubtreeFacts` over the data `d` of `n`, read in place, for a
 /// node that is not type syntax (`non_type_subtree_facts`).
-fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
+fn subtree_facts_of_data(n: Node, d: NodeData<'_>) -> SubtreeFacts {
     let f = n.file_index();
     macro_rules! p {
         ($x:expr) => {
@@ -5781,7 +5781,7 @@ pub fn is_declaration_node_ref(node: NodeRef) -> bool {
 }
 
 /// `is_declaration_node` on the data of the node.
-fn is_declaration_data(d: &NodeData) -> bool {
+fn is_declaration_data(d: NodeData<'_>) -> bool {
     matches!(
         d,
         NodeData::ArrowFunction(_)
@@ -6755,6 +6755,7 @@ pub fn get_declaration_name(declaration: Node) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::astdata::BoxedData;
 
     /// Go `(*Node)(nil).SubtreeFacts()` dereferences nil. The data read of
     /// nil panics (`static_tier_ast_node`) before any facts cache read, in a
@@ -6876,28 +6877,28 @@ mod tests {
         use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
         let (s, f) = (String::new, a::TokenFlags(0));
         let leaves = [
-            NodeData::Token(Box::new(a::TokenData)),
-            NodeData::Identifier(Box::new(a::IdentifierData { text: s() })),
-            NodeData::PrivateIdentifier(Box::new(a::PrivateIdentifierData { text: s() })),
-            NodeData::KeywordExpression(Box::new(a::KeywordExpressionData)),
-            NodeData::KeywordTypeNode(Box::new(a::KeywordTypeNodeData)),
-            NodeData::NumericLiteral(Box::new(a::NumericLiteralData {
+            BoxedData::Token(Box::new(a::TokenData)),
+            BoxedData::Identifier(Box::new(a::IdentifierData { text: s() })),
+            BoxedData::PrivateIdentifier(Box::new(a::PrivateIdentifierData { text: s() })),
+            BoxedData::KeywordExpression(Box::new(a::KeywordExpressionData)),
+            BoxedData::KeywordTypeNode(Box::new(a::KeywordTypeNodeData)),
+            BoxedData::NumericLiteral(Box::new(a::NumericLiteralData {
                 text: s(),
                 token_flags: f,
             })),
-            NodeData::BigIntLiteral(Box::new(a::BigIntLiteralData {
+            BoxedData::BigIntLiteral(Box::new(a::BigIntLiteralData {
                 text: s(),
                 token_flags: f,
             })),
-            NodeData::StringLiteral(Box::new(a::StringLiteralData {
+            BoxedData::StringLiteral(Box::new(a::StringLiteralData {
                 text: s(),
                 token_flags: f,
             })),
-            NodeData::RegularExpressionLiteral(Box::new(a::RegularExpressionLiteralData {
+            BoxedData::RegularExpressionLiteral(Box::new(a::RegularExpressionLiteralData {
                 text: s(),
                 token_flags: f,
             })),
-            NodeData::NoSubstitutionTemplateLiteral(Box::new(
+            BoxedData::NoSubstitutionTemplateLiteral(Box::new(
                 a::NoSubstitutionTemplateLiteralData {
                     raw_text: s(),
                     template_flags: f,
@@ -6905,43 +6906,43 @@ mod tests {
                     token_flags: f,
                 },
             )),
-            NodeData::TemplateHead(Box::new(a::TemplateHeadData {
+            BoxedData::TemplateHead(Box::new(a::TemplateHeadData {
                 raw_text: s(),
                 template_flags: f,
                 text: s(),
                 token_flags: f,
             })),
-            NodeData::TemplateMiddle(Box::new(a::TemplateMiddleData {
+            BoxedData::TemplateMiddle(Box::new(a::TemplateMiddleData {
                 raw_text: s(),
                 template_flags: f,
                 text: s(),
                 token_flags: f,
             })),
-            NodeData::TemplateTail(Box::new(a::TemplateTailData {
+            BoxedData::TemplateTail(Box::new(a::TemplateTailData {
                 raw_text: s(),
                 template_flags: f,
                 text: s(),
                 token_flags: f,
             })),
-            NodeData::JsxText(Box::new(a::JsxTextData {
+            BoxedData::JsxText(Box::new(a::JsxTextData {
                 contains_only_trivia_white_spaces: false,
                 text: s(),
                 token_flags: f,
             })),
-            NodeData::ThisTypeNode(Box::new(a::ThisTypeNodeData)),
-            NodeData::OmittedExpression(Box::new(a::OmittedExpressionData)),
-            NodeData::SemicolonClassElement(Box::new(a::SemicolonClassElementData)),
-            NodeData::EmptyStatement(Box::new(a::EmptyStatementData)),
-            NodeData::DebuggerStatement(Box::new(a::DebuggerStatementData)),
-            NodeData::JsxOpeningFragment(Box::new(a::JsxOpeningFragmentData)),
-            NodeData::JsxClosingFragment(Box::new(a::JsxClosingFragmentData)),
-            NodeData::JsDocAllType(Box::new(a::JsDocAllTypeData)),
-            NodeData::JsDocText(Box::new(a::JsDocTextData { text: Vec::new() })),
-            NodeData::NotEmittedStatement(Box::new(a::NotEmittedStatementData)),
-            NodeData::NotEmittedTypeElement(Box::new(a::NotEmittedTypeElementData)),
+            BoxedData::ThisTypeNode(Box::new(a::ThisTypeNodeData)),
+            BoxedData::OmittedExpression(Box::new(a::OmittedExpressionData)),
+            BoxedData::SemicolonClassElement(Box::new(a::SemicolonClassElementData)),
+            BoxedData::EmptyStatement(Box::new(a::EmptyStatementData)),
+            BoxedData::DebuggerStatement(Box::new(a::DebuggerStatementData)),
+            BoxedData::JsxOpeningFragment(Box::new(a::JsxOpeningFragmentData)),
+            BoxedData::JsxClosingFragment(Box::new(a::JsxClosingFragmentData)),
+            BoxedData::JsDocAllType(Box::new(a::JsDocAllTypeData)),
+            BoxedData::JsDocText(Box::new(a::JsDocTextData { text: Vec::new() })),
+            BoxedData::NotEmittedStatement(Box::new(a::NotEmittedStatementData)),
+            BoxedData::NotEmittedTypeElement(Box::new(a::NotEmittedTypeElementData)),
         ];
         // `n` is the node of `d`: a list field reads the lists of its file.
-        let fields = |kind: SyntaxKind, n: Node, d: &NodeData| {
+        let fields = |kind: SyntaxKind, n: Node, d: NodeData<'_>| {
             let mut fields = 0;
             for_each_child_field(kind, n, d, |_| fields += 1);
             fields
@@ -6953,15 +6954,15 @@ mod tests {
         let no_file = Node(((crate::ast::store::FILE_ID_LIMIT as u64) << 32) | 1);
         for d in &leaves {
             assert_eq!(
-                fields(SyntaxKind::Unknown, no_file, d),
+                fields(SyntaxKind::Unknown, no_file, d.view()),
                 0,
                 "{}",
-                d.schema_name()
+                d.view().schema_name()
             );
         }
         for k in 0..SyntaxKind::COUNT as u16 {
             let kind = SyntaxKind::try_from(k).unwrap();
-            let leaf = leaves.iter().any(|d| d.matches_syntax_kind(kind));
+            let leaf = leaves.iter().any(|d| d.view().matches_syntax_kind(kind));
             assert_eq!(has_no_child_fields(kind), leaf, "{kind:?}");
         }
 
