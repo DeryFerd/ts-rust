@@ -190,6 +190,10 @@ pub struct Parser<'a> {
     /// list or diagnostic that ends there or later may need a map to the
     /// file (`jsdoc_tail_pos`).
     pub jsdoc_tail_first: i32,
+    /// True when `source_text` holds no `GO_STRING_MARKER`; the scanner
+    /// then takes string token values as text slices
+    /// (`Scanner::set_text_has_no_go_string_marker`).
+    pub source_text_has_no_go_string_marker: bool,
 }
 
 // Go: parser.go:104 newParser
@@ -227,6 +231,7 @@ pub fn new_parser<'a>() -> Parser<'a> {
         store: 0,
         jsdoc_cut_text: None,
         jsdoc_tail_first: i32::MAX,
+        source_text_has_no_go_string_marker: false,
     };
     res.initialize_closures();
     res
@@ -625,6 +630,11 @@ impl<'a> Parser<'a> {
             _ => NodeFlags::NONE,
         };
         self.scanner.set_text(self.source_text);
+        // PERF: parsefast2. One scan of the text, not one per string token.
+        self.source_text_has_no_go_string_marker =
+            !crate::scanner_util::contains_go_string_marker(self.source_text);
+        self.scanner
+            .set_text_has_no_go_string_marker(self.source_text_has_no_go_string_marker);
         // Go: p.scanner.SetOnError(p.scanError)
         let diagnostics = Rc::clone(&self.diagnostics);
         let on_error: ErrorCallback = Box::new(move |message, pos, length, args| {
