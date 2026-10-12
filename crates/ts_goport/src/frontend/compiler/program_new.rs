@@ -460,10 +460,11 @@ impl NewProgram {
                 }
             }
 
-            return self.get_source_file_for_resolved_module(&file_name);
+            return self.get_source_file_with_redirect(&file_name, &self.to_path(&file_name));
         }
         if allow_non_ts_extensions {
-            let extensionless = self.get_source_file_for_resolved_module(&file_name);
+            let extensionless =
+                self.get_source_file_with_redirect(&file_name, &self.to_path(&file_name));
             if extensionless.is_some() {
                 return extensionless;
             }
@@ -471,7 +472,11 @@ impl NewProgram {
 
         // Only try adding extensions from the first supported group (which should be .ts/.tsx/.d.ts)
         for ext in &supported_extensions[0] {
-            let result = self.get_source_file_for_resolved_module(&format!("{file_name}{ext}"));
+            let file_name_with_extension = format!("{file_name}{ext}");
+            let result = self.get_source_file_with_redirect(
+                &file_name_with_extension,
+                &self.to_path(&file_name_with_extension),
+            );
             if result.is_some() {
                 return result;
             }

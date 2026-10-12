@@ -27,7 +27,7 @@
 //! as for PGO training):
 //!
 //! ```text
-//! cargo test -p ts_goport --lib binder::lib_snapshot::tests::generate_lib_bind_snapshot -- --ignored --exact
+//! cargo test -p goport_core --lib binder::lib_snapshot::tests::generate_lib_bind_snapshot -- --ignored --exact
 //! ```
 //!
 //! `snapshot_matches_live_bind` fails while the blob is stale.
@@ -1173,7 +1173,7 @@ mod tests {
     use super::*;
 
     /// How to write the blob again.
-    const REGENERATE: &str = "run `cargo test -p ts_goport --lib \
+    const REGENERATE: &str = "run `cargo test -p goport_core --lib \
         binder::lib_snapshot::tests::generate_lib_bind_snapshot -- --ignored --exact` \
         (through scripts/run-cargo-capped.sh)";
 

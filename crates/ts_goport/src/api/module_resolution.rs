@@ -39,6 +39,8 @@ pub struct ModuleResolverFactoryImpl {
     contexts: Rc<ProgramResolutionContexts>,
     conn: Option<Rc<dyn ipc::Conn>>,
     current_directory: String,
+    /// Go `caseSensitivity` (the session's).
+    use_case_sensitive: bool,
 }
 
 // Go: api/module_resolution.go programResolutionContext
@@ -62,6 +64,7 @@ pub struct CallbackModuleResolver {
     conn: Option<Rc<dyn ipc::Conn>>,
     ctx: Context,
     current_directory: String,
+    use_case_sensitive: bool,
     snapshot: SnapshotID,
     program_resolution_context_id: u64,
     fallback_resolver: Rc<dyn module::Resolver>,
@@ -94,6 +97,7 @@ impl project::ModuleResolverFactory for ModuleResolverFactoryImpl {
             conn: self.conn.clone(),
             ctx: ctx.clone(),
             current_directory: self.current_directory.clone(),
+            use_case_sensitive: self.use_case_sensitive,
             snapshot: SnapshotID(0),
             program_resolution_context_id: context_id,
             fallback_resolver: fallback,
@@ -293,6 +297,7 @@ impl CallbackModuleResolver {
             static_module_resolution_to_resolved_module(
                 Some(&static_resolution),
                 &self.current_directory,
+                self.use_case_sensitive,
             )
             .map(Arc::new),
             Vec::new(),
@@ -380,9 +385,12 @@ pub fn compile_module_resolution_spec(
             }
             static_entry.resolution_mode = Some(mode);
         }
-        static_entry.result =
-            static_module_resolution_to_resolved_module(Some(result), current_directory)
-                .map(Arc::new);
+        static_entry.result = static_module_resolution_to_resolved_module(
+            Some(result),
+            current_directory,
+            use_case_sensitive,
+        )
+        .map(Arc::new);
         entries.push(static_entry);
     }
 
@@ -404,14 +412,18 @@ pub fn compile_module_resolution_spec(
 pub fn static_module_resolution_to_resolved_module(
     static_resolution: Option<&StaticModuleResolution>,
     current_directory: &str,
+    use_case_sensitive: bool,
 ) -> Option<ResolvedModule> {
     let static_resolution = static_resolution?;
     let resolved_file_name = static_resolution.resolved_file_name.as_ref()?;
+    let resolved_file_name = tspath::get_normalized_absolute_path(
+        &resolved_file_name.to_file_name(current_directory),
+        current_directory,
+    );
     let mut result = ResolvedModule {
-        resolved_file_name: tspath::get_normalized_absolute_path(
-            &resolved_file_name.to_file_name(current_directory),
-            current_directory,
-        ),
+        // ts#64159 (Go N' module_resolution.go:197)
+        resolved_path: tspath::to_path(&resolved_file_name, current_directory, use_case_sensitive),
+        resolved_file_name,
         // ts#64638 (Go N' module_resolution.go:192)
         is_custom_resolution: true,
         ..Default::default()
@@ -486,6 +498,7 @@ impl Session {
             contexts: self.program_resolution_contexts.clone(),
             conn,
             current_directory: self.get_current_directory(),
+            use_case_sensitive: self.fs().use_case_sensitive_file_names(),
         })))
     }
 }
@@ -719,6 +732,7 @@ impl Session {
                 conn: self.conn.borrow().clone(),
                 ctx: ctx.clone(),
                 current_directory: cwd,
+                use_case_sensitive: self.fs().use_case_sensitive_file_names(),
                 snapshot: params.snapshot,
                 program_resolution_context_id: params.in_progress_snapshot,
                 fallback_resolver: resolver,

@@ -158,7 +158,7 @@ fn install_panic_hook() {
         }
         let location = info
             .location()
-            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .map(|l| format!(" at {}:{}", go_site_file(l.file()), l.line()))
             .unwrap_or_default();
         eprintln!("goport_emit: panic{location}: {message}");
         if std::env::var_os("GOPORT_TRACE").is_some() {
