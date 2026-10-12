@@ -5,6 +5,7 @@
 //! scratch dir with no fast-mode variable set, except the ones that the
 //! test sets. A passing test deletes its dir.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -191,14 +192,15 @@ const SPLIT_GO: [&[u8]; 7] = [
 
 /// Go's output for that project with `--checkers checkers`.
 fn split_go(checkers: usize) -> String {
-    SPLIT_GO[checkers - 1]
-        .iter()
-        .map(|i| {
-            format!(
-                "f{i}.ts(2,18): error TS5114: Instantiations of type 'Rec' appear infinitely circular.\n"
-            )
-        })
-        .collect()
+    let mut out = String::new();
+    for i in SPLIT_GO[checkers - 1] {
+        writeln!(
+            out,
+            "f{i}.ts(2,18): error TS5114: Instantiations of type 'Rec' appear infinitely circular."
+        )
+        .unwrap();
+    }
+    out
 }
 
 /// On a project whose output depends on which files share a checker,
