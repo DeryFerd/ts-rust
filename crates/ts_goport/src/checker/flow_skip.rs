@@ -38,7 +38,8 @@
 //! tests each walk, then runs Go's walk anyway, and panics when the skip
 //! would differ (result, counters of made things and effects, visited nodes,
 //! depth). `GOPORT_FLOWSKIP_STATS=<file>` writes the process totals of the
-//! tests to `<file>` (updated every 256 tests per checker). Its writes cost
+//! tests to `<file>` (updated after at least 256 tests per checker: the
+//! inline countdown does not flush). Its writes cost
 //! instructions (VS Code +0.17%): leave it unset when you count them.
 //! `GOPORT_FLOWSKIP_BUILD_STEPS`, `GOPORT_FLOWSKIP_MIN_STEPS` and
 //! `GOPORT_FLOWSKIP_SAMPLE_EVERY` set the tuning values for A/B runs.
@@ -344,8 +345,9 @@ const DRY_CAP: u32 = 256;
 const FIRST_GAP: u32 = 4;
 /// The largest gap (`FlowSkip::sample_every`). The estimate needs few
 /// samples: a file is worth an index only when it has many walks. A gap of
-/// 4 cost VS Code +0.13% instructions; 32 keeps the same files indexed on
-/// T3 server.
+/// 4 cost VS Code +0.13% instructions. With 32, T3 server indexes 57 files
+/// (63 with a fixed gap of 4), but the skipped steps stay the same (38.28 M,
+/// flowskip3).
 const SAMPLE_EVERY: u32 = 32;
 
 /// Steps of pi(u) to its root (no move to an outer function), at most
