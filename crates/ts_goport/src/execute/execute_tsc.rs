@@ -646,7 +646,7 @@ fn perform_incremental_compilation(
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
     let sys: &dyn System = &**sys_rc;
-    start_lib_prefetch(sys, &config, testing.is_some());
+    start_lib_prefetch(sys, &config, testing.is_some(), true);
     let content_mapper_host = new_content_mapper_host(ctx, sys_rc, config.compiler_options());
     let content_mapper_project = get_content_mapper_project(content_mapper_host.as_ref(), &config);
     let _close_content_mapper_project = CloseContentMapperProject(content_mapper_project.clone());
@@ -751,7 +751,7 @@ fn perform_compilation(
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
     let sys: &dyn System = &**sys_rc;
-    start_lib_prefetch(sys, &config, testing.is_some());
+    start_lib_prefetch(sys, &config, testing.is_some(), true);
     let content_mapper_host = new_content_mapper_host(ctx, sys_rc, config.compiler_options());
     let content_mapper_project = get_content_mapper_project(content_mapper_host.as_ref(), &config);
     let _close_content_mapper_project = CloseContentMapperProject(content_mapper_project.clone());
@@ -798,12 +798,18 @@ fn perform_compilation(
 
 /// Starts the parse of the default lib files of `config` on the parse
 /// workers, before the compiler host, the build info read and the loader
-/// setup (`start_default_lib_prefetch`). The program loaded next on this
-/// thread takes the parses; its loader checks each one. `tsc -b` calls it
-/// too (`BuildTask::compile_and_emit_start`).
+/// setup (`start_default_lib_prefetch`), and with `roots` the parse of its
+/// root files. The program loaded next on this thread takes the parses; its
+/// loader checks each one. `tsc -b` calls it too, without `roots`: its host
+/// has a stat cache (`BuildTask::compile_and_emit_start`).
 // PORT: not in Go (see `start_default_lib_prefetch`). A test run
 // (`testing`) keeps the Go order.
-pub(crate) fn start_lib_prefetch(sys: &dyn System, config: &ParsedCommandLine, testing: bool) {
+pub(crate) fn start_lib_prefetch(
+    sys: &dyn System,
+    config: &ParsedCommandLine,
+    testing: bool,
+    roots: bool,
+) {
     if testing {
         return;
     }
@@ -812,6 +818,7 @@ pub(crate) fn start_lib_prefetch(sys: &dyn System, config: &ParsedCommandLine, t
         &sys.get_current_directory(),
         sys.fs().use_case_sensitive_file_names(),
         &sys.default_library_path(),
+        roots,
     );
 }
 

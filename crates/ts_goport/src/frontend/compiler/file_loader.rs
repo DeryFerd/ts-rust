@@ -348,7 +348,9 @@ pub fn process_all_program_files(
             && compiler_options.trace_resolution != Tristate::True
             && !loader.opts.can_use_project_reference_source()
         {
-            let shared = Arc::new(SharedResolutionCache::default());
+            // PERF (parload2): the cache of the early workers, which
+            // resolved the root files with this config already.
+            let shared = super::files_parser::early_shared_resolution(&loader).unwrap_or_default();
             resolver.caches.shared = Some(SharedResolutionLink {
                 cache: shared.clone(),
                 publish: false,
@@ -2651,7 +2653,8 @@ pub(crate) fn get_jsx_implicit_import_base_of_file(
 #[cfg(test)]
 mod tests {
     use super::super::files_parser::{
-        names_own, preps_taken, set_load_names, set_load_prep, set_meta_wait, set_prep_wait,
+        early_pools_taken, names_own, preps_taken, set_load_names, set_load_prep, set_meta_wait,
+        set_prep_wait, start_default_lib_prefetch,
     };
     use super::*;
     use crate::frontend::bundled;
@@ -2732,7 +2735,7 @@ mod tests {
     /// loads the program with parse workers (not single threaded), and
     /// returns what the load found (`load_text`).
     fn parallel_load(label: &str, tsconfig: &str, files: &[(&str, &str)]) -> String {
-        load_text(label, tsconfig, files, false)
+        load_text(label, tsconfig, files, false, false)
     }
 
     /// Writes `files` and a tsconfig.json with `tsconfig` to a temp dir,
@@ -2740,12 +2743,15 @@ mod tests {
     /// files in program order, the metadata, module and type reference
     /// resolutions (in map order) and include reasons of each file, the
     /// synthetic imports, the processing diagnostics, the missing files
-    /// and the package.json entries of the resolver.
+    /// and the package.json entries of the resolver. With `early_roots`, an
+    /// early pool starts on the root files after the config parse, as in
+    /// tsc (`start_default_lib_prefetch`).
     fn load_text(
         label: &str,
         tsconfig: &str,
         files: &[(&str, &str)],
         single_threaded: bool,
+        early_roots: bool,
     ) -> String {
         use std::fmt::Write as _;
         let dir = std::env::temp_dir().join(format!(
@@ -2776,11 +2782,21 @@ mod tests {
             None,
         );
         assert!(errors.is_empty());
+        let config = config.unwrap();
+        if early_roots {
+            start_default_lib_prefetch(
+                &config,
+                &cwd,
+                fs.use_case_sensitive_file_names(),
+                &bundled::lib_path(),
+                true,
+            );
+        }
         let host = new_cached_fs_compiler_host(&cwd, fs, &bundled::lib_path(), None, None, None);
         let processed = process_all_program_files_of(
             ProgramOptions {
                 host,
-                config: Rc::new(config.unwrap()),
+                config: Rc::new(config),
                 use_source_of_project_reference: false,
                 single_threaded: if single_threaded {
                     Tristate::True
@@ -3153,6 +3169,79 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         }
     }
 
+    // parload2: an early pool parses the root files and resolves their
+    // names before the loader exists (`start_default_lib_prefetch` with
+    // roots), with the shared resolution cache that the loader then takes
+    // (`early_shared_resolution`): node16 ESM and CJS files, a script file
+    // (its parse reads the module indicator options), a package with
+    // `import` and `require` conditions and an automatic type directive.
+    // The load finds what a load without the early pool finds, and what a
+    // single threaded load finds.
+    #[test]
+    fn early_root_jobs_give_the_same_load() {
+        let tsconfig = r#"{ "compilerOptions": { "module": "node16",
+             "types": ["node-ish"], "noEmit": true }, "include": ["src"] }"#;
+        let files = [
+            ("package.json", r#"{ "name": "app", "type": "module" }"#),
+            (
+                "src/a.ts",
+                "import { b } from \"./b.js\";\nimport { e } from \"lib\";\nexport const a = b + e;\n",
+            ),
+            ("src/b.ts", "export const b = 1;\n"),
+            (
+                "src/c.cts",
+                "import lib = require(\"lib\");\nexport const c = lib.e;\n",
+            ),
+            ("src/g.ts", "declare var g: number;\n"),
+            (
+                "node_modules/lib/package.json",
+                r#"{ "name": "lib", "version": "1.0.0",
+                   "exports": { ".": { "import": "./esm.d.mts", "require": "./cjs.d.cts" } } }"#,
+            ),
+            (
+                "node_modules/lib/esm.d.mts",
+                "export declare const e: number;\n",
+            ),
+            (
+                "node_modules/lib/cjs.d.cts",
+                "export declare const e: number;\n",
+            ),
+            (
+                "node_modules/@types/node-ish/package.json",
+                r#"{ "name": "@types/node-ish", "version": "1.0.0",
+                   "exports": { ".": { "import": "./esm.d.mts", "require": "./index.d.ts" } } }"#,
+            ),
+            (
+                "node_modules/@types/node-ish/index.d.ts",
+                "declare var nodeIsh: number;\n",
+            ),
+            (
+                "node_modules/@types/node-ish/esm.d.mts",
+                "export declare const nodeIsh: number;\n",
+            ),
+        ];
+        let single = load_text("early_st", tsconfig, &files, true, false);
+        assert_eq!(parallel_load("early_off", tsconfig, &files), single);
+        let before = early_pools_taken();
+        set_meta_wait(true);
+        let early = load_text("early_on", tsconfig, &files, false, true);
+        set_meta_wait(false);
+        assert_eq!(early, single);
+        for name in [
+            "lib/cjs.d.cts",
+            "lib/esm.d.mts",
+            "@types/node-ish/index.d.ts",
+        ] {
+            assert!(
+                single.contains(&format!("file <dir>/node_modules/{name}")),
+                "{single}"
+            );
+        }
+        if super::super::files_parser::parse_workers_enabled() {
+            assert_eq!(early_pools_taken() - before, 1);
+        }
+    }
+
     /// A program with a project reference (`lib`) that it loads by the
     /// output `.d.ts` files (Go `getParseFileRedirect`, a program that does
     /// not use the sources of its references). The names in `lib/out` and
@@ -3221,7 +3310,13 @@ export const a: T | Dep | number = x + (h as never);
         let load = |label: &str, prep: bool, single_threaded: bool| {
             set_load_prep(Some(prep));
             set_meta_wait(prep && !single_threaded);
-            let text = load_text(label, REFERENCE_TSCONFIG, &REFERENCE_FILES, single_threaded);
+            let text = load_text(
+                label,
+                REFERENCE_TSCONFIG,
+                &REFERENCE_FILES,
+                single_threaded,
+                false,
+            );
             set_load_prep(None);
             set_meta_wait(false);
             text
