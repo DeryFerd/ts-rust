@@ -40,18 +40,11 @@ impl NewProgram {
     // Go: program.go:2098 (*Program).GetSourceFileForResolvedModule
     // ts#64159: a lookup by the resolution's path. An empty path misses, as
     // in Go; then only the parse redirect of the name can give a file.
-    // PORT: `GOPORT_RESOLVED_PATH=0` uses `to_path` of the name.
     pub fn get_source_file_for_resolved_module(
         &self,
         resolved: &ResolvedModule,
     ) -> Option<Rc<ParsedSourceFile>> {
-        match resolved.path() {
-            Some(path) => self.get_source_file_with_redirect(&resolved.resolved_file_name, path),
-            None => {
-                let path = self.to_path(&resolved.resolved_file_name);
-                self.get_source_file_with_redirect(&resolved.resolved_file_name, &path)
-            }
-        }
+        self.get_source_file_with_redirect(&resolved.resolved_file_name, &resolved.resolved_path)
     }
 
     // Go: program.go:2102 (*Program).getSourceFileWithRedirect

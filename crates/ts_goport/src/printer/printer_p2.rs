@@ -446,10 +446,24 @@ impl Printer {
     // Go: printer/printer.go:1657 emitPropertySignature
     pub(crate) fn emit_property_signature(&mut self, node: Node) {
         let state = self.enter_node(node);
+        // PERF: printfast1. Go reads three fields. A factory node (type
+        // text) reads its three children in one arena read.
+        let children = if is_synthetic_node(node) {
+            synthetic_children(node, |data| match data {
+                crate::astdata::NodeData::PropertySignatureDeclaration(d) => {
+                    Some([Some(d.name), d.postfix_token, Some(d.type_)])
+                }
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let [name, postfix_token, type_] =
+            children.unwrap_or_else(|| [node.name(), node.postfix_token(), node.type_()]);
         self.emit_modifier_list(node, node.modifiers(), false /*allowDecorators*/);
-        self.emit_property_name(node.name());
-        self.emit_token_node(node.postfix_token());
-        self.emit_type_annotation(node.type_());
+        self.emit_property_name(name);
+        self.emit_token_node(postfix_token);
+        self.emit_type_annotation(type_);
         self.write_trailing_semicolon();
         self.exit_node(node, state);
     }
@@ -1207,13 +1221,16 @@ impl Printer {
         }
 
         let saved_in_extends = self.in_extends;
-        let parens = get_type_node_precedence(node) < precedence;
+        // PERF: printfast1. One kind read for the precedence and the switch
+        // (Go reads the `Kind` field twice).
+        let kind = node.kind();
+        let parens = type_node_precedence_of_kind(node, kind) < precedence;
         if parens {
             self.in_extends = false;
             self.write_punctuation("(");
         }
 
-        match node.kind() {
+        match kind {
             // Keyword Types
             SyntaxKind::AnyKeyword
             | SyntaxKind::UnknownKeyword
@@ -1269,7 +1286,7 @@ impl Printer {
             SyntaxKind::JsDocOptionalType => self.emit_js_doc_optional_type(node),
             SyntaxKind::JsDocVariadicType => self.emit_js_doc_variadic_type(node),
 
-            _ => panic!("unhandled TypeNode: {}", kind_string(node.kind())),
+            _ => panic!("unhandled TypeNode: {}", kind_string(kind)),
         }
 
         if parens {
