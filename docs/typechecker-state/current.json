@@ -1002,12 +1002,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "adbbfe3bacbc51f61",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "a48ba6360badcfa93",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R199 pipeline (candidate.sh side)."
