@@ -196,7 +196,10 @@ impl<'a> Parser<'a> {
                 | SyntaxKind::AsyncKeyword
                 | SyntaxKind::EqualsGreaterThanToken
         ) {
-            debug_assert_eq!(self.is_parenthesized_arrow_function_expression(), Tristate::False);
+            debug_assert_eq!(
+                self.is_parenthesized_arrow_function_expression(),
+                Tristate::False
+            );
             return Node::NIL;
         }
         self.try_parse_parenthesized_arrow_function_expression_at_start(
@@ -2010,7 +2013,10 @@ impl<'a> Parser<'a> {
                 debug_assert!(
                     inner.parent() == expression
                         && (type_arguments.is_nil()
-                            || type_arguments.nodes().iter().all(|a| a.parent() == expression))
+                            || type_arguments
+                                .nodes()
+                                .iter()
+                                .all(|a| a.parent() == expression))
                 );
                 continue;
             }
