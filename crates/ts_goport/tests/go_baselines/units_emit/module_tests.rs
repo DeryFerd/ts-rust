@@ -80,11 +80,12 @@ fn resolves(resolver: &DefaultResolver, name: &str, containing_file: &str) -> bo
     r.is_resolved()
 }
 
-// Go: module/resolver_test.go:27 TestResolveModuleNameTrailingSlash
+// Go: module/resolver_test.go:54 TestResolveModuleNameTrailingSlash
 /// Regression test for https://github.com/microsoft/typescript-go/issues/3526.
 ///
 /// Resolving a node_modules import with a trailing slash (e.g. `pkg/`) must
-/// produce the same result as without one.
+/// produce the same result as without one, and the resolved path is the
+/// case-sensitive key of the resolved file name (resolver_test.go:77).
 #[test]
 fn test_resolve_module_name_trailing_slash() {
     let fs = vfstest::from_map(
@@ -106,8 +107,16 @@ fn test_resolve_module_name_trailing_slash() {
 
     let mut errors = Vec::new();
     for name in ["pkg", "pkg/"] {
-        if !resolves(&resolver, name, "/repo/src/file.ts") {
+        let (r, _, _) =
+            resolver.resolve_module_name(name, "/repo/src/file.ts", ModuleKind::ES_NEXT, None);
+        if !r.is_resolved() {
             errors.push(format!("{name:?} failed to resolve"));
+        }
+        if r.resolved_path != tspath::to_path(&r.resolved_file_name, "", true) {
+            errors.push(format!(
+                "{name:?} resolved path = {:?}, expected key for {:?}",
+                r.resolved_path, r.resolved_file_name
+            ));
         }
     }
     assert!(errors.is_empty(), "{}", errors.join("\n"));
@@ -399,6 +408,66 @@ fn test_resolve_dynamic_dotted_directory() {
         ModuleKind::COMMON_JS,
     );
     assert_eq!(resolved.as_deref(), Some(TARGET_FILE));
+}
+
+// Go: module/resolver_test.go:562 TestResolvedModuleCarriesCaseInsensitivePath (ts#64159)
+/// The resolver makes the resolved path with its own case sensitivity.
+#[test]
+fn test_resolved_module_carries_case_insensitive_path() {
+    let resolver = new_test_resolver(
+        &[
+            (
+                "/Repo/node_modules/Pkg/package.json",
+                r#"{"name":"pkg","types":"Index.d.ts"}"#,
+            ),
+            (
+                "/Repo/node_modules/Pkg/Index.d.ts",
+                "export const x: number;",
+            ),
+            ("/Repo/src/file.ts", ""),
+        ],
+        false,
+        "/Repo",
+        (*bundler_options()).clone(),
+    );
+    let (resolved, _, _) =
+        resolver.resolve_module_name("Pkg", "/Repo/src/file.ts", ModuleKind::ES_NEXT, None);
+    assert!(resolved.is_resolved(), "expected module to resolve");
+    let expected = tspath::to_path(&resolved.resolved_file_name, "", false);
+    assert_eq!(resolved.resolved_path, expected);
+}
+
+// Go: module/resolver_test.go:588 TestResolvedTypeReferenceDirectiveCarriesPath (ts#64159)
+#[test]
+fn test_resolved_type_reference_directive_carries_path() {
+    let resolver = new_test_resolver(
+        &[
+            (
+                "/repo/node_modules/@types/pkg/package.json",
+                r#"{"name":"@types/pkg","types":"index.d.ts"}"#,
+            ),
+            (
+                "/repo/node_modules/@types/pkg/index.d.ts",
+                "export const x: number;",
+            ),
+            ("/repo/src/file.ts", ""),
+        ],
+        false,
+        "/repo",
+        (*bundler_options()).clone(),
+    );
+    let (resolved, _) = resolver.resolve_type_reference_directive(
+        "pkg",
+        "/repo/src/file.ts",
+        ResolutionMode::NONE,
+        None,
+    );
+    assert!(
+        resolved.is_resolved(),
+        "expected type reference directive to resolve"
+    );
+    let expected = tspath::to_path(&resolved.resolved_file_name, "", false);
+    assert_eq!(resolved.resolved_path, expected);
 }
 
 // Go: module/resolver_test.go:427 TestResolveDynamicPackageJSONPath (ts#64544)
@@ -1049,8 +1118,6 @@ fn test_unaddressable_empty_export_pattern_is_not_an_entrypoint() {
 }
 
 // Go: module/resolver_test.go:1200 TestResolveModuleNameBlockedByNullExport (ts#64159)
-// PORT: the port keeps no `ResolvedPath` (the key is `tspath::to_path` of
-// the resolved file name), so only the resolution is checked.
 #[test]
 fn test_resolve_module_name_blocked_by_null_export() {
     let resolver = new_test_resolver(
@@ -1065,8 +1132,17 @@ fn test_resolve_module_name_blocked_by_null_export() {
         "/repo",
         (*bundler_options()).clone(),
     );
-    let resolved = resolved_file(&resolver, "pkg", "/repo/src/file.ts", ModuleKind::ES_NEXT);
-    assert_eq!(resolved, None, "expected null export to remain unresolved");
+    let (resolved, _, _) =
+        resolver.resolve_module_name("pkg", "/repo/src/file.ts", ModuleKind::ES_NEXT, None);
+    assert!(
+        !resolved.is_resolved(),
+        "expected null export to remain unresolved, got {:?}",
+        resolved.resolved_file_name
+    );
+    assert_eq!(
+        resolved.resolved_path.0, "",
+        "unresolved module has a resolved path"
+    );
 }
 
 /// A second resolution that a wrapped FS runs inside a `FileExists` call.
