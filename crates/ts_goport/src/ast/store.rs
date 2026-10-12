@@ -279,10 +279,56 @@ struct FileStore {
     identifier_names: TextHashMap<(&'static str, Name, bool)>,
     /// U1 (e): binder capacity hints, made with `facts`.
     bind_estimate: BindEstimate,
+    /// What `make_facts` needs from the slots, kept as they are made and
+    /// written (`BuildFacts`).
+    build_facts: BuildFacts,
 }
 
-/// Facts about the slots of one finished store, made in one pass over its
-/// records (`FileStore::make_facts`). They do not depend on the store id, so a detached
+/// storefast1: the parts of `StoreFacts` and `BindCounts` that the slots of
+/// an unfinished store give, kept as the slots are made (`kind`) and their
+/// flags written (`flags`). Slot kinds never change, so `make_facts` reads
+/// no record or kind for them. For the parent and deprecated tag facts it
+/// reads the records only when a parent in another store or a flags write
+/// with the tag was seen.
+// PERF: storefast1. `make_facts` loaded every record and kind of the store
+// at the freeze (Go has no such pass): 0.88 G instructions on VS Code.
+#[derive(Default)]
+struct BuildFacts {
+    counts: BindCounts,
+    has_alias_slot: bool,
+    has_export_alias_kind: bool,
+    has_flow_constraint_kind: bool,
+    /// A flags write of a slot had `POSSIBLY_CONTAINS_DEPRECATED_TAG`.
+    deprecated_tag_written: bool,
+}
+
+impl BuildFacts {
+    /// A new node slot of kind `kind` (`StoreFacts::add` and
+    /// `BindCounts::add` of its kind).
+    #[inline]
+    fn node(&mut self, kind: SyntaxKind) {
+        self.counts.add(kind);
+        match kind {
+            SyntaxKind::ExportAssignment | SyntaxKind::ExportSpecifier => {
+                self.has_export_alias_kind = true;
+            }
+            SyntaxKind::ConditionalType | SyntaxKind::MappedType => {
+                self.has_flow_constraint_kind = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// A flags write of `flags` into a slot record.
+    #[inline]
+    fn flags(&mut self, flags: NodeFlags) {
+        self.deprecated_tag_written |=
+            flags.intersects(NodeFlags::POSSIBLY_CONTAINS_DEPRECATED_TAG);
+    }
+}
+
+/// Facts about the slots of one finished store (`FileStore::make_facts`,
+/// from `BuildFacts`). They do not depend on the store id, so a detached
 /// store gets them when its parse ends.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StoreFacts {
@@ -315,8 +361,9 @@ impl StoreFacts {
         has_deprecated_tag: false,
     };
 
-    /// Adds the slot of `record`, after slot 0.
-    #[inline]
+    /// Adds the slot of `record`, after slot 0 (the pass that
+    /// `debug_scan_facts` checks `BuildFacts` against).
+    #[cfg(debug_assertions)]
     fn add(&mut self, record: &NodeRecord, kind: SyntaxKind) {
         if !record.is_node() {
             self.alias_free = false;
@@ -1104,7 +1151,7 @@ struct BindEstimate {
 }
 
 /// The slot kind counts of a `BindEstimate`, one `add` per slot kind.
-// PERF: U1 (e). `make_facts` adds each kind in its pass over the records,
+// PERF: U1 (e). Each new node slot adds its kind (`BuildFacts::node`),
 // so the estimate needs no second pass over the kinds.
 #[derive(Default)]
 struct BindCounts {
@@ -1144,7 +1191,65 @@ impl BindCounts {
 
 /// About how many flow nodes the binder makes for a node of kind `kind`
 /// (binder.go `bindContainer` and the `bind*Flow` functions).
+// PERF: storefast1. A table read per new slot (`BuildFacts::node`), not a
+// jump table.
+#[inline]
 fn flow_node_weight(kind: SyntaxKind) -> usize {
+    let weight = FLOW_NODE_WEIGHTS[kind as usize];
+    debug_assert_eq!(weight, flow_node_weight_of(kind), "{kind:?}");
+    usize::from(weight)
+}
+
+/// `flow_node_weight` of every kind, by `kind as usize`.
+static FLOW_NODE_WEIGHTS: [u8; SyntaxKind::COUNT] = {
+    let mut table = [0u8; SyntaxKind::COUNT];
+    let mut i = 0;
+    while i < FLOW_NODE_WEIGHT_KINDS.len() {
+        let kind = FLOW_NODE_WEIGHT_KINDS[i];
+        table[kind as usize] = flow_node_weight_of(kind);
+        i += 1;
+    }
+    table
+};
+
+/// The kinds whose `flow_node_weight_of` is not 0.
+const FLOW_NODE_WEIGHT_KINDS: [SyntaxKind; 32] = [
+    SyntaxKind::MethodSignature,
+    SyntaxKind::CallSignature,
+    SyntaxKind::ConstructSignature,
+    SyntaxKind::FunctionType,
+    SyntaxKind::ConstructorType,
+    SyntaxKind::FunctionDeclaration,
+    SyntaxKind::MethodDeclaration,
+    SyntaxKind::GetAccessor,
+    SyntaxKind::SetAccessor,
+    SyntaxKind::FunctionExpression,
+    SyntaxKind::ArrowFunction,
+    SyntaxKind::ModuleBlock,
+    SyntaxKind::CallExpression,
+    SyntaxKind::VariableDeclaration,
+    SyntaxKind::BindingElement,
+    SyntaxKind::BinaryExpression,
+    SyntaxKind::PostfixUnaryExpression,
+    SyntaxKind::DeleteExpression,
+    SyntaxKind::Constructor,
+    SyntaxKind::ClassStaticBlockDeclaration,
+    SyntaxKind::CaseClause,
+    SyntaxKind::DefaultClause,
+    SyntaxKind::LabeledStatement,
+    SyntaxKind::IfStatement,
+    SyntaxKind::ConditionalExpression,
+    SyntaxKind::WhileStatement,
+    SyntaxKind::DoStatement,
+    SyntaxKind::ForStatement,
+    SyntaxKind::ForInStatement,
+    SyntaxKind::ForOfStatement,
+    SyntaxKind::SwitchStatement,
+    SyntaxKind::TryStatement,
+];
+
+/// `flow_node_weight` as a match (the table source).
+const fn flow_node_weight_of(kind: SyntaxKind) -> u8 {
     match kind {
         // A start node for a control flow container, a flow call, a flow
         // assignment, or a logical or assignment operator.
@@ -2260,6 +2365,7 @@ impl FileStore {
     /// Go `node.Flags = flags` on slot `index`.
     #[inline]
     fn set_slot_flags(&mut self, index: usize, flags: NodeFlags) {
+        self.build_facts.flags(flags);
         self.records[index].set_flags(flags);
     }
 
@@ -3893,30 +3999,41 @@ impl FileStore {
     /// `freeze_file_store` for this store, which has id `file`.
     fn freeze(&mut self, file: usize) {
         self.end_parse();
-        // One pass over the records for the parser flags and the facts.
-        let mut flags = Vec::with_capacity(self.records.len());
-        self.make_facts(|r| flags.push(r.flags()));
-        self.parser_flags = Some(flags);
+        self.parser_flags = Some(self.records.iter().map(NodeRecord::flags).collect());
+        self.make_facts();
     }
 
-    /// Makes `facts` and the U1 (e) `bind_estimate` in one pass over the
-    /// slots, and calls `each` on every slot record. Then moves the R2-5
-    /// build vector into `links` and drops `identifier_names`.
+    /// Makes `facts` and the U1 (e) `bind_estimate` from `build_facts`.
+    /// Then moves the R2-5 build vector into `links` and drops
+    /// `identifier_names`.
     // PERF: no pass over the node data. Debug builds check the records and
-    // kids against the node data (`debug_check_kids`).
-    fn make_facts(&mut self, mut each: impl FnMut(&NodeRecord)) {
-        let mut facts = StoreFacts::ONLY_NIL_SLOT;
-        let mut counts = BindCounts::default();
-        for (i, (record, &kind)) in self.records.iter().zip(&self.kinds).enumerate() {
-            each(record);
-            counts.add(kind);
-            if i != NIL_SLOT as usize {
-                facts.add(record, kind);
-            }
-        }
+    // kids against the node data (`debug_check_kids`). storefast1: no pass
+    // over the records or kinds either, unless a parent in another store or
+    // a deprecated tag was written (`BuildFacts`). Debug builds check the
+    // result against the pass (`debug_scan_facts`).
+    fn make_facts(&mut self) {
+        let built = std::mem::take(&mut self.build_facts);
+        // `StoreFacts::add` of every node slot after slot 0.
+        let node_records = || self.records.iter().skip(1).filter(|r| r.is_node());
+        let facts = StoreFacts {
+            alias_free: !built.has_alias_slot,
+            // A record gets a foreign parent code only with a new entry of
+            // `foreign_parents` (`foreign_parent_code`).
+            parents_local: self.foreign_parents.is_empty()
+                || node_records().all(|r| !r.has_foreign_parent()),
+            has_export_alias_kind: built.has_export_alias_kind,
+            has_flow_constraint_kind: built.has_flow_constraint_kind,
+            has_deprecated_tag: built.deprecated_tag_written
+                && node_records().any(|r| {
+                    r.flags()
+                        .intersects(NodeFlags::POSSIBLY_CONTAINS_DEPRECATED_TAG)
+                }),
+        };
+        #[cfg(debug_assertions)]
+        self.debug_scan_facts(facts, built.counts.estimate());
         self.facts = facts;
         self.facts_made = true;
-        self.bind_estimate = counts.estimate();
+        self.bind_estimate = built.counts.estimate();
         self.identifier_names = TextHashMap::default();
         #[cfg(debug_assertions)]
         self.debug_check_kids();
@@ -3931,6 +4048,25 @@ impl FileStore {
         } else {
             vec![SlotLinks::NONE; slots].into_boxed_slice()
         };
+    }
+
+    /// storefast1, debug builds: `facts` and `estimate` (from `BuildFacts`)
+    /// equal the ones of one pass over the records and kinds.
+    #[cfg(debug_assertions)]
+    fn debug_scan_facts(&self, facts: StoreFacts, estimate: BindEstimate) {
+        let mut scanned = StoreFacts::ONLY_NIL_SLOT;
+        let mut counts = BindCounts::default();
+        for (i, (record, &kind)) in self.records.iter().zip(&self.kinds).enumerate() {
+            counts.add(kind);
+            if i != NIL_SLOT as usize {
+                scanned.add(record, kind);
+            }
+        }
+        assert_eq!(
+            format!("{facts:?} {estimate:?}"),
+            format!("{scanned:?} {:?}", counts.estimate()),
+            "storefast1: store facts kept as slots are made"
+        );
     }
 
     /// AST node records, debug builds: checks every record and kids entry
@@ -4042,7 +4178,7 @@ impl FileStore {
             self.root = handle(file, self.root_slot);
         }
         if !self.facts_made {
-            self.make_facts(|_| {});
+            self.make_facts();
         }
     }
 
@@ -4393,6 +4529,17 @@ fn mark_source_file_roots(store: &mut FileStore) {
 
 /// `mark_source_file_roots` on the columns of a store: the root slot (0 for
 /// none).
+///
+/// The result of a slot is a function of the slot alone: true when its
+/// parent chain (parents in this store) reaches slot `root` before any other
+/// SourceFile slot, a nil or foreign parent, or a slot it has passed. The
+/// walk goes down from the last slot, so a node slot above the current one
+/// already has its bit.
+// PERF: storefast1. The parser makes a parent after its children, so
+// nearly every node slot copies the bit of a node slot above it, with no
+// state vector. Only a parent at or below the slot (or a parent slot that
+// holds no node) takes `mark_root_walk`, which keeps the state of the walks
+// that R200 made for every slot.
 fn mark_roots(records: &mut [NodeRecord], kinds: &[SyntaxKind]) -> u32 {
     assert_eq!(records.len(), kinds.len(), "one kind per record");
     // PORT: the parser makes the SourceFile node last, so the root is the
@@ -4403,53 +4550,89 @@ fn mark_roots(records: &mut [NodeRecord], kinds: &[SyntaxKind]) -> u32 {
     else {
         return 0;
     };
-
-    const UNSEEN: u8 = 0;
-    const ON_PATH: u8 = 1;
-    const ROOT: u8 = 2;
-    const NOT_ROOT: u8 = 3;
-    let mut state = vec![UNSEEN; records.len()];
-    let mut path = Vec::new();
-    // The parser makes a parent after its children, so most parents have a
-    // higher slot. Walking the slots down finds them already marked.
+    let mut walk = RootWalk::default();
     for start in (1..records.len()).rev() {
         let record = &records[start];
         if !record.is_node() {
             continue;
         }
-        if kinds[start] != SyntaxKind::SourceFile
-            && let Some(parent) = record.local_parent()
-            && matches!(state[parent], ROOT | NOT_ROOT)
-        {
-            let result = state[parent];
-            state[start] = result;
-            records[start].set_bit(NodeRecord::SOURCE_FILE_ROOT, result == ROOT);
-            continue;
+        let is_root = if kinds[start] == SyntaxKind::SourceFile {
+            start == root
+        } else {
+            match record.local_parent() {
+                None => false,
+                Some(parent) if parent > start && records[parent].is_node() => {
+                    records[parent].has_bit(NodeRecord::SOURCE_FILE_ROOT)
+                }
+                Some(_) => walk.mark(records, kinds, root, start),
+            }
+        };
+        records[start].set_bit(NodeRecord::SOURCE_FILE_ROOT, is_root);
+    }
+    root as u32
+}
+
+/// The state of the slots that `mark_roots` walked: the slot walk of R200,
+/// for the rare slot whose parent is not a node slot above it.
+#[derive(Default)]
+struct RootWalk {
+    /// `UNSEEN`, `ON_PATH`, `ROOT` or `NOT_ROOT` per slot, made by the first
+    /// walk.
+    state: Vec<u8>,
+    path: Vec<usize>,
+}
+
+impl RootWalk {
+    const UNSEEN: u8 = 0;
+    const ON_PATH: u8 = 1;
+    const ROOT: u8 = 2;
+    const NOT_ROOT: u8 = 3;
+
+    /// The bit of slot `start` (and of each slot of its walk, which gets it
+    /// too): its parent chain up to a node slot above `start` (whose bit is
+    /// made), a SourceFile slot, a nil or foreign parent, or a slot that
+    /// the walk has passed (a parent cycle: Go never returns; the walk at
+    /// read time handles it).
+    #[cold]
+    #[inline(never)]
+    fn mark(
+        &mut self,
+        records: &mut [NodeRecord],
+        kinds: &[SyntaxKind],
+        root: usize,
+        start: usize,
+    ) -> bool {
+        if self.state.is_empty() {
+            self.state = vec![Self::UNSEEN; records.len()];
         }
+        let state = &mut self.state;
         let mut cur = start;
-        let result = loop {
+        let is_root = loop {
+            if cur > start && records[cur].is_node() {
+                break records[cur].has_bit(NodeRecord::SOURCE_FILE_ROOT);
+            }
             match state[cur] {
-                ROOT | NOT_ROOT => break state[cur],
-                // A parent cycle: Go never returns. Leave it to the walk.
-                ON_PATH => break NOT_ROOT,
+                Self::ROOT => break true,
+                Self::NOT_ROOT | Self::ON_PATH => break false,
                 _ => {}
             }
-            state[cur] = ON_PATH;
-            path.push(cur);
+            state[cur] = Self::ON_PATH;
+            self.path.push(cur);
             if kinds[cur] == SyntaxKind::SourceFile {
-                break if cur == root { ROOT } else { NOT_ROOT };
+                break cur == root;
             }
             let Some(parent) = records[cur].local_parent() else {
-                break NOT_ROOT;
+                break false;
             };
             cur = parent;
         };
-        for i in path.drain(..) {
+        let result = if is_root { Self::ROOT } else { Self::NOT_ROOT };
+        for i in self.path.drain(..) {
             state[i] = result;
-            records[i].set_bit(NodeRecord::SOURCE_FILE_ROOT, result == ROOT);
+            records[i].set_bit(NodeRecord::SOURCE_FILE_ROOT, is_root);
         }
+        is_root
     }
-    root as u32
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -6405,6 +6588,8 @@ impl FileStore {
         self.records
             .push(NodeRecord::new(bits, flags, loc, u64::from(parent)));
         self.kinds.push(kind);
+        self.build_facts.node(kind);
+        self.build_facts.flags(flags);
         self.nodes.push(Some(node));
         let (modifiers, children) = slot_kids_parts(kind, node);
         let modifier_bits = self.static_modifier_bits(modifiers);
@@ -6851,6 +7036,7 @@ impl FileStore {
             self.push_record_into_full_column(text_is_keyword);
         }
         self.kinds.push(kind);
+        self.build_facts.node(kind);
     }
 
     /// `push_node_header` when the record column is full: `Vec::push`
@@ -6914,6 +7100,7 @@ fn store_alias_id(file: usize, n: Node) -> crate::astdata::NodeId {
         let index = s.records.len() as u32;
         s.records.push(NodeRecord::target(n));
         s.kinds.push(SyntaxKind::Unknown);
+        s.build_facts.has_alias_slot = true;
         s.kids.push(NodeKids::unknown());
         s.nodes.push(None);
         s.push_no_cell();
@@ -7659,6 +7846,120 @@ mod tests {
         assert!(known > 0);
         // The parser links the root too.
         assert_ne!(links[slot_index(parsed.root)].first_child, LINK_NONE);
+    }
+
+    /// The R200 `mark_roots`: a state per slot, a walk for every slot whose
+    /// parent has no state yet.
+    fn mark_roots_with_state(records: &mut [NodeRecord], kinds: &[SyntaxKind]) -> u32 {
+        let Some(root) = (0..records.len())
+            .rev()
+            .find(|&i| records[i].is_node() && kinds[i] == SyntaxKind::SourceFile)
+        else {
+            return 0;
+        };
+        const UNSEEN: u8 = 0;
+        const ON_PATH: u8 = 1;
+        const ROOT: u8 = 2;
+        const NOT_ROOT: u8 = 3;
+        let mut state = vec![UNSEEN; records.len()];
+        let mut path = Vec::new();
+        for start in (1..records.len()).rev() {
+            if !records[start].is_node() {
+                continue;
+            }
+            if kinds[start] != SyntaxKind::SourceFile
+                && let Some(parent) = records[start].local_parent()
+                && matches!(state[parent], ROOT | NOT_ROOT)
+            {
+                state[start] = state[parent];
+                let on = state[start] == ROOT;
+                records[start].set_bit(NodeRecord::SOURCE_FILE_ROOT, on);
+                continue;
+            }
+            let mut cur = start;
+            let result = loop {
+                match state[cur] {
+                    ROOT | NOT_ROOT => break state[cur],
+                    ON_PATH => break NOT_ROOT,
+                    _ => {}
+                }
+                state[cur] = ON_PATH;
+                path.push(cur);
+                if kinds[cur] == SyntaxKind::SourceFile {
+                    break if cur == root { ROOT } else { NOT_ROOT };
+                }
+                let Some(parent) = records[cur].local_parent() else {
+                    break NOT_ROOT;
+                };
+                cur = parent;
+            };
+            for i in path.drain(..) {
+                state[i] = result;
+                records[i].set_bit(NodeRecord::SOURCE_FILE_ROOT, result == ROOT);
+            }
+        }
+        root as u32
+    }
+
+    #[test]
+    fn mark_roots_equals_the_walk_of_every_slot() {
+        // xorshift, so the shapes are the same in every run.
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..2000 {
+            let slots = 2 + next(40);
+            let mut kinds = vec![SyntaxKind::Unknown];
+            let mut records = vec![NodeRecord::target(Node::NIL)];
+            for i in 1..slots {
+                if next(12) == 0 {
+                    // An alias slot whose target has a local parent code.
+                    let target = (2u64 << 32) | next(slots) as u64;
+                    records.push(NodeRecord::target(Node(target)));
+                    kinds.push(SyntaxKind::Unknown);
+                    continue;
+                }
+                let parent = match next(10) {
+                    0 => 0,
+                    1 => FOREIGN_PARENT,
+                    // Mostly a slot above, as the parser makes them.
+                    2..=7 if i + 1 < slots => (i + 1 + next(slots - i - 1)) as u32 + 1,
+                    _ => next(slots) as u32 + 1,
+                };
+                records.push(NodeRecord::new(
+                    0,
+                    NodeFlags::NONE,
+                    TextRange::undefined(),
+                    u64::from(parent),
+                ));
+                kinds.push(if next(8) == 0 {
+                    SyntaxKind::SourceFile
+                } else {
+                    SyntaxKind::Block
+                });
+            }
+            let mut expected: Vec<NodeRecord> = records.iter().map(copy_record).collect();
+            let expected_root = mark_roots_with_state(&mut expected, &kinds);
+            let root = mark_roots(&mut records, &kinds);
+            assert_eq!(root, expected_root);
+            for (i, (a, b)) in records.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    a.has_bit(NodeRecord::SOURCE_FILE_ROOT),
+                    b.has_bit(NodeRecord::SOURCE_FILE_ROOT),
+                    "slot {i} of {slots}"
+                );
+            }
+        }
+    }
+
+    fn copy_record(r: &NodeRecord) -> NodeRecord {
+        let copy = NodeRecord::zero();
+        copy.store_from(r);
+        copy
     }
 
     #[test]
