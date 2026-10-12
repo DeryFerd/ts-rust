@@ -2654,7 +2654,7 @@ pub(crate) fn get_jsx_implicit_import_base_of_file(
 mod tests {
     use super::super::files_parser::{
         early_pools_taken, names_own, preps_taken, set_load_names, set_load_prep, set_meta_wait,
-        set_prep_wait, start_default_lib_prefetch,
+        set_move_up, set_prep_wait, start_default_lib_prefetch,
     };
     use super::*;
     use crate::frontend::bundled;
@@ -3260,6 +3260,19 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         );
         assert_eq!(other, single);
         assert_eq!(early_pools_taken() - before, 0);
+        // The move-up of queued jobs (`GOPORT_PREFETCH_MOVE_UP`) changes only
+        // the order of the worker parses: the load with it off, in this
+        // process, finds the same.
+        set_move_up(Some(false));
+        let no_move_up = load_text(
+            "early_no_move_up",
+            tsconfig,
+            &files,
+            false,
+            Some(&bundled::lib_path()),
+        );
+        set_move_up(None);
+        assert_eq!(no_move_up, single);
     }
 
     /// A program with a project reference (`lib`) that it loads by the

@@ -1974,6 +1974,8 @@ struct PrefetchQueue {
     /// True when the debug counts are kept (`GOPORT_PREFETCH_STATS`): jobs
     /// note when they are queued.
     timed: bool,
+    /// `move_up_enabled` of the thread that started the pool.
+    move_up: bool,
 }
 
 impl PrefetchQueue {
@@ -2506,6 +2508,7 @@ impl PrefetchShared {
         Self {
             queue: Mutex::new(PrefetchQueue {
                 timed: std::env::var_os("GOPORT_PREFETCH_STATS").is_some(),
+                move_up: move_up_enabled(),
                 ..PrefetchQueue::default()
             }),
             ready: Condvar::new(),
@@ -2617,7 +2620,7 @@ impl PrefetchShared {
     fn queue(&self, opts: SourceFileParseOptions, script_kind: ScriptKind) {
         let mut queue = lock(&self.queue);
         if let Some(job) = queue.by_name.get(&opts.file_name) {
-            if move_up_enabled()
+            if queue.move_up
                 && !queue.is_first(job)
                 && matches!(*lock(&job.state), PrefetchState::Queued)
             {
@@ -3058,10 +3061,27 @@ fn early_roots_enabled() -> bool {
 
 /// False when `GOPORT_PREFETCH_MOVE_UP=0`: a worker does not move up the
 /// queued jobs of the files that a parse references (`PrefetchShared::queue`).
-/// An A/B switch.
+/// An A/B switch, read once, or a test's choice for the pools that start on
+/// its thread (`set_move_up`).
 fn move_up_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = MOVE_UP.with(Cell::get) {
+        return on;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GOPORT_PREFETCH_MOVE_UP").is_none_or(|value| value != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice of `move_up_enabled` for the pools of this thread.
+    static MOVE_UP: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Sets `move_up_enabled` for the pools that start on this thread (tests).
+#[cfg(test)]
+pub(crate) fn set_move_up(on: Option<bool>) {
+    MOVE_UP.with(|move_up| move_up.set(on));
 }
 
 /// The shared resolution cache of the early pool of this thread, for the
@@ -4540,5 +4560,45 @@ pub fn take_prefetched(
     } else {
         unusable();
         Prefetched::Text(worker_text)
+    }
+}
+
+#[cfg(test)]
+mod move_up_tests {
+    use super::*;
+
+    // `GOPORT_PREFETCH_MOVE_UP` is read once per process, so a test chooses
+    // the switch per pool (`set_move_up`), and both run here. A job that no
+    // worker took moves up when a parse references its file again: it is
+    // pushed again, on top. With the switch off, it stays where it is.
+    #[test]
+    fn a_queued_job_moves_up_only_with_the_switch() {
+        let opts = |name: &str| SourceFileParseOptions {
+            file_name: format!("/p/{name}"),
+            path: Path(format!("/p/{name}")),
+            external_module_indicator_options: ExternalModuleIndicatorOptions::default(),
+        };
+        for (on, pending) in [
+            (false, ["/p/a.ts", "/p/b.ts"].as_slice()),
+            (true, ["/p/a.ts", "/p/b.ts", "/p/a.ts"].as_slice()),
+        ] {
+            set_move_up(Some(on));
+            let shared = PrefetchShared::new(PrefetchConfig {
+                current_directory: "/p".to_string(),
+                use_case_sensitive_file_names: true,
+                default_library_path: String::new(),
+            });
+            set_move_up(None);
+            for name in ["a.ts", "b.ts", "a.ts"] {
+                shared.queue(opts(name), ScriptKind::TS);
+            }
+            let queue = lock(&shared.queue);
+            let names: Vec<&str> = queue
+                .pending
+                .iter()
+                .map(|job| job.opts.file_name.as_str())
+                .collect();
+            assert_eq!(names, pending, "move-up {on}");
+        }
     }
 }
