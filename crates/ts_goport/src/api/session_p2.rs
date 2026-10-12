@@ -3521,7 +3521,7 @@ pub fn try_path_key_from_canonical(path: &str) -> bool {
 // backslash, no relative or empty segment, and a trailing separator only
 // on a bare root.
 pub fn try_rooted_path_from_normalized(path: &str) -> bool {
-    if has_rooted_url_suffix(path) {
+    if tspath::has_rooted_url_suffix(path) {
         return false;
     }
     let mut root_length = tspath::get_encoded_root_length(path);
@@ -3557,7 +3557,7 @@ pub fn resolve_directory(directory: &str, path: &str) -> String {
         return directory.to_string();
     }
     if tspath::get_encoded_root_length(path) == 0
-        && has_url_root(directory)
+        && tspath::has_url_root(directory)
         && path.contains(['?', '#'])
     {
         crate::core::go_panic("relative URL path must not contain a query or fragment".to_string());
@@ -3576,7 +3576,7 @@ pub fn resolve_directory(directory: &str, path: &str) -> String {
 
 // Go: tspath/rooted_path.go:803 rootedFilePathFromResolved (ts#64159)
 fn rooted_file_path_from_resolved(path: String) -> String {
-    if has_rooted_url_suffix(&path) {
+    if tspath::has_rooted_url_suffix(&path) {
         crate::core::go_panic("path must not contain a URL query or fragment".to_string());
     }
     path
@@ -3600,20 +3600,6 @@ fn append_path_to_directory(directory: &str, path: &str) -> String {
         return format!("{directory}{path}");
     }
     format!("{directory}/{path}")
-}
-
-// Go: tspath/rooted_path.go:106 hasRootedURLSuffix (ts#64159)
-fn has_rooted_url_suffix(path: &str) -> bool {
-    if !has_url_root(path) {
-        return false;
-    }
-    let after_scheme = path.split_once("://").map_or("", |(_, rest)| rest);
-    after_scheme.contains(['?', '#'])
-}
-
-// Go: tspath/rooted_path.go:114 hasURLRoot (ts#64159)
-fn has_url_root(path: &str) -> bool {
-    tspath::get_encoded_root_length(path) < 0 && path.contains("://")
 }
 
 // Go: tspath/path.go:554 hasRelativePathSegment
