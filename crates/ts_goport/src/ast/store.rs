@@ -2192,13 +2192,23 @@ pub fn new_file_store(file_name: &'static str, text: impl Into<FileText>) -> usi
 // bytes of the Query, Zod and Hono sources, and one for about 14 to 21 bytes
 // of the lib and `@types` declaration files and the Effect sources (long
 // JSDoc comments). At 12 a declaration file, such as lib.dom, fills its
-// vectors without a `realloc` copy, and a source file grows them once.
-// `end_parse` gives the unused capacity back.
+// vectors without a `realloc` copy. `end_parse` gives the unused capacity
+// back.
 const STORE_TEXT_BYTES_PER_SLOT: usize = 12;
+
+/// `STORE_TEXT_BYTES_PER_SLOT` for a file that is not a declaration file.
+// PERF: storefast2. At 12 a source file grew each column once (a doubling,
+// to the capacity of 6, and a copy). At 6 it has that capacity at once.
+const SOURCE_TEXT_BYTES_PER_SLOT: usize = 6;
 
 impl FileStore {
     fn new(file_name: &'static str, text: FileText) -> Self {
-        let slots = text.len() / STORE_TEXT_BYTES_PER_SLOT + 1;
+        let bytes_per_slot = if crate::frontend::tspath::is_declaration_file_name(file_name) {
+            STORE_TEXT_BYTES_PER_SLOT
+        } else {
+            SOURCE_TEXT_BYTES_PER_SLOT
+        };
+        let slots = text.len() / bytes_per_slot + 1;
         let mut records = Vec::with_capacity(slots);
         records.push(NodeRecord::target(Node::NIL));
         let mut kinds = Vec::with_capacity(slots);
@@ -5320,7 +5330,30 @@ impl NodeRef {
             "parser_flags mask {:#x} has binder bits",
             mask.bits()
         );
-        self.flags() & mask
+        // PERF: checkid1. A node that is not a published store node reads
+        // through `Node::parser_flags`, which needs no binder data (a node
+        // of a file this thread parses or binds). Same value.
+        match self.block {
+            Some(_) => self.flags() & mask,
+            None => node_ref_parser_flags(self.node, mask),
+        }
+    }
+
+    /// Go `node.ModifierFlags()` (`Node::modifier_flags`): from the
+    /// modifier word of the block's kids (`frozen_store_modifier_flags`).
+    // PERF: checkid1. For `get_combined_modifier_flags`.
+    #[inline]
+    #[must_use]
+    pub fn modifier_flags(self) -> ModifierFlags {
+        match self.block {
+            Some(b) => {
+                let index = slot_index(self.node);
+                let flags = ModifierFlags(b.kids[index].modifier_bits(b.kinds[index]));
+                debug_assert_eq!(flags, self.node.modifier_flags(), "NodeRef modifier flags");
+                flags
+            }
+            None => node_ref_modifier_flags(self.node),
+        }
     }
 
     /// Go `node.Loc` (`Node::loc`).
@@ -5451,6 +5484,18 @@ fn node_ref_flags(n: Node) -> NodeFlags {
 #[inline(never)]
 fn node_ref_loc(n: Node) -> TextRange {
     n.loc()
+}
+
+#[cold]
+#[inline(never)]
+fn node_ref_parser_flags(n: Node, mask: NodeFlags) -> NodeFlags {
+    n.parser_flags(mask)
+}
+
+#[cold]
+#[inline(never)]
+fn node_ref_modifier_flags(n: Node) -> ModifierFlags {
+    n.modifier_flags()
 }
 
 #[inline(never)]
@@ -7255,6 +7300,8 @@ pub(crate) const NIL_LIST_INDEX: u32 = 0;
 
 /// Adds a list over `ids` to static list table `lists` and returns it. The
 /// list goes into `arena`, this thread's AST arena.
+// PERF: storefast2. Inline: the parser makes about one list for 5 nodes.
+#[inline]
 fn push_static_list(
     lists: &mut Vec<&'static StaticList>,
     arena: &'static LeakArena,
@@ -7293,8 +7340,7 @@ fn new_store_list(
     // The ids make the alias slots of the nodes in order, before the store
     // borrow below.
     let arena: &'static LeakArena = AST_ARENA.with(|a| *a);
-    let ids =
-        arena.alloc_slice_fill_iter(nodes.len(), nodes.iter().map(|&n| store_child_id(file, n)));
+    let ids = arena.alloc_slice_fill_with(nodes.len(), |i| store_child_id(file, nodes[i]));
     let bits = StaticList::bits(comma, flags.unwrap_or_default());
     StoreListRef::Static(with_store_mut(file, |s| {
         push_static_list(&mut s.lists, arena, loc, ids, bits)
@@ -7390,8 +7436,30 @@ fn owns_new_data(file: usize) -> bool {
 /// table index. Go stores the `*NodeList` pointer. A list of the same store
 /// is stored as is (its index); any other list is rebuilt over ids of this
 /// store with its own `Loc` (and no missing-list bit).
+// PERF: storefast2. The parser stores lists that it has just made in its
+// own static store: the index, read inline (Go: one pointer store). The
+// rest is out of line (`other_store_list_value`).
+#[inline]
 #[must_use]
 pub fn store_list_value(file: usize, list: NodeList) -> Option<crate::astdata::NodeList> {
+    // An optional list field is nil in about half the calls.
+    if list.is_nil_handle() {
+        return None;
+    }
+    if let Some((list_file, l)) = list.static_parts()
+        && list_file == file
+        && !FREEABLE_PARSE.get()
+    {
+        // `owns_new_data(file)` is false outside a freeable parse.
+        return (!is_nil_list_range(&l.range)).then(|| crate::astdata::NodeList::new(l.index));
+    }
+    other_store_list_value(file, list)
+}
+
+/// `store_list_value` for a list that is not nil or a static list of store
+/// `file`, or inside a freeable parse.
+#[inline(never)]
+fn other_store_list_value(file: usize, list: NodeList) -> Option<crate::astdata::NodeList> {
     if list.is_nil() {
         return None;
     }
@@ -7411,14 +7479,40 @@ pub fn store_list_value(file: usize, list: NodeList) -> Option<crate::astdata::N
 /// Like `store_list_value` for a list field that astdata requires. Go `nil`
 /// becomes the list table entry `NIL_LIST_INDEX` (`NIL_LIST_POS`), which
 /// `NodeList::is_nil` reads as nil.
+#[inline]
 #[must_use]
 pub fn store_req_list_value(file: usize, list: NodeList) -> crate::astdata::NodeList {
     store_list_value(file, list).unwrap_or(crate::astdata::NodeList::new(NIL_LIST_INDEX))
 }
 
 /// A modifier list value to store inside new `NodeData` of store `file`.
+// PERF: storefast2. As `store_list_value`: the index of a static list of
+// store `file` inline, the rest out of line.
+#[inline]
 #[must_use]
 pub fn store_modifiers_value(
+    file: usize,
+    modifiers: ModifierList,
+) -> Option<crate::astdata::ModifierList> {
+    // Most nodes have no modifiers.
+    if modifiers.is_nil() {
+        return None;
+    }
+    if let Some((list_file, m)) = modifiers.node_list().static_parts()
+        && list_file == file
+        && !FREEABLE_PARSE.get()
+    {
+        return Some(crate::astdata::ModifierList {
+            list: crate::astdata::NodeList::new(m.index),
+        });
+    }
+    other_store_modifiers_value(file, modifiers)
+}
+
+/// `store_modifiers_value` for a list that is not nil or a static list of
+/// store `file`, or inside a freeable parse.
+#[inline(never)]
+fn other_store_modifiers_value(
     file: usize,
     modifiers: ModifierList,
 ) -> Option<crate::astdata::ModifierList> {

@@ -608,18 +608,23 @@ impl Checker {
 }
 
 // Go: checker/checker.go:28885 isExportOrExportExpression
+// PERF: checkid1. The walk reads each node and its parent through views
+// (`find_ancestor_ref`), with one kind read of the parent: the walk goes to
+// the root for most locations. The tests and their order are Go's.
 pub fn is_export_or_export_expression(location: Node) -> bool {
-    find_ancestor(location, |n: Node| {
+    find_ancestor_ref(location, |n: NodeRef| {
         let parent = n.parent();
-        if parent.is_some() {
-            if is_any_export_assignment(parent) {
-                return parent.expression() == n && is_entity_name_expression(n);
+        match parent.kind_or_unknown() {
+            // `is_any_export_assignment(parent)`.
+            SyntaxKind::ExportAssignment => {
+                parent.expression() == n.node() && is_entity_name_expression(n.node())
             }
-            if is_export_specifier(parent) {
-                return parent.name() == n || parent.property_name() == n;
+            SyntaxKind::ExportSpecifier => {
+                let parent = parent.node();
+                parent.name() == n.node() || parent.property_name() == n.node()
             }
+            _ => false,
         }
-        false
     })
     .is_some()
 }
