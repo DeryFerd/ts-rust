@@ -852,8 +852,10 @@ impl FlatKey for TypeId {
 //   which the declarations symbol tracker and declaration diagnostics use
 //   (see its note).
 // - `sync.Once` fields become `bool` "done" flags.
-// - `*T` pools and shared structs (`*Relation`, `*Relater`, `*FlowState`,
+// - `*T` pools and shared structs (`*Relation`, `*Relater`,
 //   `*InferenceState`) are `Rc<RefCell<T>>`; nil-able ones are `Option`.
+//   `*FlowState` is `&mut FlowState` on the walk's stack, with no free list
+//   (see `FlowState`).
 // - `ast.NodeId` map keys are `Node` handles.
 pub struct Checker {
     pub id: u32,
@@ -1115,7 +1117,6 @@ pub struct Checker {
     pub last_get_combined_modifier_flags_node: Node,
     pub last_get_combined_modifier_flags_result: ModifierFlags,
     pub freeinference_state: Option<Rc<RefCell<InferenceState>>>,
-    pub free_flow_state: Option<Rc<RefCell<FlowState>>>,
     pub flow_loop_cache: FxHashMap<FlowLoopKey, TypeId>,
     pub flow_loop_stack: Vec<FlowLoopInfo>,
     pub shared_flows: Vec<SharedFlow>,
@@ -1637,7 +1638,6 @@ impl Checker {
             last_get_combined_modifier_flags_node: Node::NIL,
             last_get_combined_modifier_flags_result: ModifierFlags::default(),
             freeinference_state: None,
-            free_flow_state: None,
             flow_loop_cache: FxHashMap::default(),
             flow_loop_stack: Vec::new(),
             shared_flows: Vec::new(),
