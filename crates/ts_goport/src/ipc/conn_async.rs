@@ -711,8 +711,12 @@ impl AsyncConn {
                 // PORT: this checks the call's `ctx` now, not at the read of
                 // the late reply. The two agree for the `ctx` of `run` and a
                 // `ctx` made from it: it is done at the signal, before that
-                // read. The real caller uses the `ctx` of `run`
-                // (`callbackfs.rs:300`, set at `server.rs:264`). For another
+                // read. Both production callers use such a `ctx`.
+                // `callbackfs.rs:300` uses the `ctx` of `run` (set at
+                // `server.rs:264`). `api/module_resolution.rs:256` uses the
+                // builder's `ctx` (`project.rs:778`) or the `ctx` of a
+                // `resolveModuleName` request: both come from the request's
+                // `handler_ctx`, which `run` makes from its `ctx`. For another
                 // `ctx` that is done after the read, Go's `select` takes the
                 // reply and the port returns `ctx.Err()`. To follow Go here,
                 // `gostd::context` must keep when a `ctx` was done, as
