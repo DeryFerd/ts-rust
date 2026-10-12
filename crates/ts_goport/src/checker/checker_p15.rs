@@ -1060,7 +1060,12 @@ impl Checker {
             return true;
         }
         let kind = view.kind();
-        if is_inline_import_attributes(node, kind, parent, parent_kind) {
+        // Go `c.isInlineImportAttributes(node)`; its first two tests are here,
+        // on the kinds read above, so most nodes make no call.
+        if kind == SyntaxKind::ObjectLiteralExpression
+            && parent_kind == SyntaxKind::PropertyAssignment
+            && is_inline_import_attributes(node, parent.node())
+        {
             return true;
         }
         if self.is_valid_const_assertion_argument_of(node, kind) {
@@ -1088,6 +1093,7 @@ impl Checker {
 
     /// `is_valid_const_assertion_argument` of `node`, whose kind `kind` the
     /// caller has read already (`is_const_context`).
+    #[inline]
     fn is_valid_const_assertion_argument_of(&mut self, node: Node, kind: SyntaxKind) -> bool {
         match kind {
             SyntaxKind::StringLiteral
@@ -1798,23 +1804,19 @@ impl Checker {
 }
 
 // Go: checker/checker.go:13878 isInlineImportAttributes
-// PERF: deferbody1. The caller (`is_const_context`) passes the node's kind,
-// its parent's view and the parent's kind, which it has read already. Most
-// nodes fail the first two tests on these values, with no node read.
-fn is_inline_import_attributes(
-    node: Node,
-    kind: SyntaxKind,
-    parent: NodeRef,
-    parent_kind: SyntaxKind,
-) -> bool {
-    debug_assert!(kind == node.kind() && parent.node() == node.parent());
-    if kind != SyntaxKind::ObjectLiteralExpression
-        || parent_kind != SyntaxKind::PropertyAssignment
-        || parent.node().initializer() != node
-    {
+// PERF: deferbody1. The caller (`is_const_context`) has tested Go's first two
+// tests on the kinds it read: `node` is an object literal and `parent`, its
+// parent, a property assignment.
+fn is_inline_import_attributes(node: Node, parent: Node) -> bool {
+    debug_assert!(
+        is_object_literal_expression(node)
+            && is_property_assignment(parent)
+            && parent == node.parent()
+    );
+    if parent.initializer() != node {
         return false;
     }
-    let property = parent.node();
+    let property = parent;
     if (!is_identifier(property.name()) && !is_string_literal_like(property.name()))
         || property.name().text() != "with"
     {
