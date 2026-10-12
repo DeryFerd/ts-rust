@@ -36,11 +36,7 @@ fn run_overridden_schema_constructor_fix(ctx: &mut FixableContext<'_, '_>) -> Ve
             if let Some(action) = ctx.new_fix_action(
                 "Rewrite using the static 'new' pattern".to_string(),
                 |tracker| {
-                    let Some(new_method) =
-                        static_new_method(tracker.node_factory(), m.constructor_node)
-                    else {
-                        return;
-                    };
+                    let new_method = static_new_method(tracker.node_factory(), m.constructor_node);
                     tracker.replace_node(sf, m.constructor_node, new_method, None);
                 },
             ) {
@@ -67,10 +63,7 @@ fn run_overridden_schema_constructor_fix(ctx: &mut FixableContext<'_, '_>) -> Ve
 /// The `public static new(...)` method that replaces the constructor: `super(...)`
 /// statements become `const _this = new this(...)`, `this` becomes `_this`, and
 /// `return _this` ends the body.
-// PORT: Go panics (`AsBlock`) when the visited body is not a block. The
-// analyzer sets `HasBody` only for a block body, and the visitor gives a block
-// for a block, so the `None` (no edit) cannot occur.
-fn static_new_method(f: &NodeFactory, ctor: Node) -> Option<Node> {
+fn static_new_method(f: &NodeFactory, ctor: Node) -> Node {
     // Build a visitor that transforms super(...) calls and this keywords
     let mut v = new_node_visitor(
         |node: Node, v| {
@@ -113,8 +106,11 @@ fn static_new_method(f: &NodeFactory, ctor: Node) -> Option<Node> {
 
     // Transform the constructor body
     let new_body = v.visit_node(ctor.body());
+    // Go: fixables/overridden_schema_constructor.go:86 `newBody.AsBlock()`
+    // panics on another kind. The analyzer sets `HasBody` only for a block
+    // body, and the visitor gives a block for a block.
     if new_body.kind() != SyntaxKind::Block {
-        return None;
+        go_node_as_panic(new_body, "Block");
     }
 
     // Append return _this to the transformed body's statements
@@ -129,7 +125,7 @@ fn static_new_method(f: &NodeFactory, ctor: Node) -> Option<Node> {
     ]);
 
     // Build the replacement method declaration
-    Some(f.new_method_declaration(
+    f.new_method_declaration(
         modifiers,
         Node::NIL,
         f.new_identifier("new"),
@@ -139,7 +135,7 @@ fn static_new_method(f: &NodeFactory, ctor: Node) -> Option<Node> {
         ctor.type_(),
         Node::NIL,
         new_block,
-    ))
+    )
 }
 
 // Go: fixables/overridden_schema_constructor.go:134 constructorSupportsStaticRewrite

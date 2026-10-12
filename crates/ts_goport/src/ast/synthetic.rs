@@ -2307,11 +2307,7 @@ fn new_ts_node(kind: SyntaxKind, data: NodeData) -> crate::astdata::Node {
 // BinaryExpression); other kinds do nothing, like Go `NodeDefault`.
 pub fn set_node_modifiers(n: Node, modifiers: ModifierList) {
     // astshrink1: the list goes into the list table of the node's owner.
-    let mods = if is_store_node(n) {
-        crate::ast::store::store_modifiers_value(n.file_index(), modifiers)
-    } else {
-        node_modifiers_value(n, modifiers)
-    };
+    let mods = node_modifiers_value(n, modifiers);
     let mut data = with_ast_data(n, Clone::clone);
     match &mut data {
         NodeData::ArrowFunction(d) => d.modifiers = mods,
@@ -2647,10 +2643,16 @@ pub fn new_synthetic_modifier_list_in(print: bool, nodes: &[Node], loc: TextRang
 // compares equal pointers.
 #[must_use]
 pub fn synthetic_list_value(print: bool, list: NodeList) -> Option<crate::astdata::NodeList> {
+    let copy = list_copy(list)?;
+    Some(own_list_field(print, copy))
+}
+
+/// The list that a list value copies, or `None` for Go `nil`.
+fn list_copy(list: NodeList) -> Option<SyntheticListData> {
     if list.is_nil() {
         return None;
     }
-    let copy = match list.synthetic_list() {
+    Some(match list.synthetic_list() {
         Some(l) => with_synthetic_list(l, SyntheticListData::clone),
         None => {
             let nodes = list.nodes().to_vec();
@@ -2661,8 +2663,7 @@ pub fn synthetic_list_value(print: bool, list: NodeList) -> Option<crate::astdat
                 crate::astdata::ModifierFlags::default(),
             )
         }
-    };
-    Some(own_list_field(print, copy))
+    })
 }
 
 /// Like `synthetic_list_value` for a list field that astdata requires. Go
@@ -2689,20 +2690,76 @@ pub fn synthetic_modifiers_value(
     })
 }
 
-/// `synthetic_modifiers_value` for a data write on synthetic node `n`
-/// (`set_node_modifiers`). The list goes to the owner of `n`, as the new
-/// data does (`replace_synthetic_ast_node`), so it lives as long as the
-/// data that names it.
-fn node_modifiers_value(n: Node, modifiers: ModifierList) -> Option<crate::astdata::ModifierList> {
-    let copy = modifiers_copy(modifiers)?;
+// The values of a Go data write on node `n` (`node.AsX().Field = v`, as
+// `replace_node_data` stores it): ids and lists in the space of `n` (its
+// store, or the synthetic space). For a synthetic node a new list goes to
+// the owner of `n`, as the new data does (`replace_synthetic_ast_node`), so
+// it lives as long as the data that names it. A list in the current owner
+// would die before that data, or live longer (astshrink2).
+
+/// The id that names `child` in the new data of node `n`.
+#[must_use]
+pub fn node_child_id(n: Node, child: Node) -> crate::astdata::NodeId {
+    if is_store_node(n) {
+        crate::ast::store::store_child_id(n.file_index(), child)
+    } else {
+        synthetic_child_id(child)
+    }
+}
+
+/// `node_child_id` for an optional field.
+#[must_use]
+pub fn node_opt_child_id(n: Node, child: Node) -> Option<crate::astdata::NodeId> {
+    if is_store_node(n) {
+        crate::ast::store::store_opt_child_id(n.file_index(), child)
+    } else {
+        synthetic_opt_child_id(child)
+    }
+}
+
+/// An optional list field of the new data of node `n`.
+#[must_use]
+pub fn node_list_value(n: Node, list: NodeList) -> Option<crate::astdata::NodeList> {
+    if is_store_node(n) {
+        return crate::ast::store::store_list_value(n.file_index(), list);
+    }
+    Some(push_node_owner_list(n, list_copy(list)?))
+}
+
+/// A required list field of the new data of node `n`. Go `nil` becomes an
+/// empty list with an undefined `Loc` (see `synthetic_req_list_value`).
+#[must_use]
+pub fn node_req_list_value(n: Node, list: NodeList) -> crate::astdata::NodeList {
+    if is_store_node(n) {
+        return crate::ast::store::store_req_list_value(n.file_index(), list);
+    }
+    let copy = list_copy(list)
+        .unwrap_or_else(|| ts_list(&[], TextRange::undefined(), false, Default::default()));
+    push_node_owner_list(n, copy)
+}
+
+/// A modifiers field of the new data of node `n` (`set_node_modifiers`).
+#[must_use]
+pub fn node_modifiers_value(
+    n: Node,
+    modifiers: ModifierList,
+) -> Option<crate::astdata::ModifierList> {
+    if is_store_node(n) {
+        return crate::ast::store::store_modifiers_value(n.file_index(), modifiers);
+    }
+    Some(crate::astdata::ModifierList {
+        list: push_node_owner_list(n, modifiers_copy(modifiers)?),
+    })
+}
+
+/// Adds `list` to the arena in the owner of synthetic node `n`.
+fn push_node_owner_list(n: Node, list: SyntheticListData) -> crate::astdata::NodeList {
     let index = ARENA.with(|a| {
         let mut a = a.borrow_mut();
         let owner = a.slot_owner[slot_index(n) / SLOT_CHUNK];
-        a.push_list(owner, OwnList::List(copy))
+        a.push_list(owner, OwnList::List(list))
     });
-    Some(crate::astdata::ModifierList {
-        list: crate::astdata::NodeList::new(index),
-    })
+    crate::astdata::NodeList::new(index)
 }
 
 /// The list that a modifier list value copies, or `None` for Go `nil`.

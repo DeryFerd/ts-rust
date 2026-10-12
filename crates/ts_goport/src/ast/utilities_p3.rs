@@ -511,12 +511,22 @@ pub fn is_super_call(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:2145 IsImportCall
+// PERF: portonly1 item 5. Go reads `node.Kind`, `Expression()` and `e.Kind`
+// as fields. Here the call's kind and expression come from one view of the
+// node (`NodeRef`: the kinds and child columns), and `e`'s kind is read once:
+// `IsImportPhaseMetaProperty` is false at once unless `e` is a MetaProperty
+// (`is_import_meta_property` tests that first).
 pub fn is_import_call(node: Node) -> bool {
-    if !is_call_expression(node) {
+    let node = NodeRef::new(node);
+    if node.kind() != SyntaxKind::CallExpression {
         return false;
     }
     let e = node.expression();
-    e.kind() == SyntaxKind::ImportKeyword || is_import_phase_meta_property(e)
+    match e.kind() {
+        SyntaxKind::ImportKeyword => true,
+        SyntaxKind::MetaProperty => is_import_phase_meta_property(e),
+        _ => false,
+    }
 }
 
 // Go: ast/utilities.go:2153 IsImportPhaseMetaProperty (ts#63915)

@@ -682,15 +682,18 @@ impl Binder {
         // order are the same as Go's.
         let data = parsed_node_data(node);
         debug_assert!(is_computed_name || !has_dynamic_name_in(node, data));
+        // PERF: parsefast1 item 2. The kind is read once (Go reads `Kind`).
+        let kind = node.kind();
         let is_default_export = has_syntactic_modifier_in(node, data, ModifierFlags::DEFAULT)
-            || is_export_specifier(node) && module_export_name_is_default(node.name_in(data));
+            || kind == SyntaxKind::ExportSpecifier
+                && module_export_name_is_default(node.name_in(data));
         // The exported symbol for an export default function/class node is always named "default"
         let name: Name = if is_computed_name {
             Name::from(INTERNAL_SYMBOL_NAME_COMPUTED)
         } else if is_default_export && parent.is_some() {
             Name::from(INTERNAL_SYMBOL_NAME_DEFAULT)
         } else {
-            self.get_declaration_name_in(node, data)
+            self.get_declaration_name_of_kind(node, kind, data)
         };
         let mut symbol: SymbolId;
         if name == INTERNAL_SYMBOL_NAME_MISSING {
@@ -725,11 +728,17 @@ impl Binder {
             let (found, slot) = self.symbols.get_slot(symbol_table, &name);
             symbol = found;
             if symbol.is_nil() {
-                symbol = self.new_symbol(SymbolFlags::NONE, name);
+                // Go `newSymbol(SymbolFlagsNone, name)`, the table write, the
+                // `SymbolFlagsReplaceableByMethod` flag, `addDeclarationToSymbol`
+                // and the parent write below, in one symbol write.
+                let flags = if is_replaceable_by_method {
+                    SymbolFlags::REPLACEABLE_BY_METHOD
+                } else {
+                    SymbolFlags::NONE
+                };
+                symbol = self.new_declared_symbol(name, flags, node, includes, parent);
                 self.symbols.set_slot(slot, symbol);
-                if is_replaceable_by_method {
-                    self.sym_mut(symbol).flags |= SymbolFlags::REPLACEABLE_BY_METHOD;
-                }
+                return symbol;
             } else if is_replaceable_by_method
                 && !self
                     .sym(symbol)
@@ -892,7 +901,21 @@ impl Binder {
     /// `get_declaration_name` on `d`, the data of `node` that the caller
     /// already loaded with `parsed_node_data` (query Q7-3). It holds the body.
     pub fn get_declaration_name_in(&mut self, node: Node, d: LoadedData) -> Name {
-        if is_export_assignment(node) {
+        self.get_declaration_name_of_kind(node, node.kind(), d)
+    }
+
+    /// `get_declaration_name_in` for a caller that already read `node.kind()`
+    /// (`kind`).
+    // PERF: parsefast1 item 2. The node kind and the name kind are each read
+    // once, as Go reads its `Kind` fields (a port kind read goes through
+    // the node store).
+    pub fn get_declaration_name_of_kind(
+        &mut self,
+        node: Node,
+        kind: SyntaxKind,
+        d: LoadedData,
+    ) -> Name {
+        if kind == SyntaxKind::ExportAssignment {
             return if node.is_export_equals() {
                 Name::from(INTERNAL_SYMBOL_NAME_EXPORT_EQUALS)
             } else {
@@ -901,7 +924,12 @@ impl Binder {
         }
         let name = get_name_of_declaration_in(node, d);
         if name.is_some() {
-            if is_ambient_module(node) {
+            let name_kind = name.kind();
+            // Go `ast.IsAmbientModule(node)`: the name of a module
+            // declaration is `name`.
+            if kind == SyntaxKind::ModuleDeclaration
+                && (name_kind == SyntaxKind::StringLiteral || is_global_scope_augmentation(node))
+            {
                 let module_name = name.text();
                 if is_global_scope_augmentation(node) {
                     return Name::from(INTERNAL_SYMBOL_NAME_GLOBAL);
@@ -918,7 +946,7 @@ impl Binder {
                 }
                 return Name::from(format!("\"{module_name}\""));
             }
-            if is_private_identifier(name) {
+            if name_kind == SyntaxKind::PrivateIdentifier {
                 // containingClass exists because private names only allowed inside classes
                 let containing_class = get_containing_class(node);
                 if containing_class.is_nil() {
@@ -933,15 +961,23 @@ impl Binder {
                 self.symbols.note_private_name(&private_name);
                 return private_name;
             }
-            if is_property_name_literal(name) || is_jsx_namespaced_name(name) {
+            // Go `ast.IsPropertyNameLiteral(name) || ast.IsJsxNamespacedName(name)`.
+            if matches!(
+                name_kind,
+                SyntaxKind::Identifier
+                    | SyntaxKind::StringLiteral
+                    | SyntaxKind::NoSubstitutionTemplateLiteral
+                    | SyntaxKind::NumericLiteral
+                    | SyntaxKind::JsxNamespacedName
+            ) {
                 // PERF: U1 (a). An identifier name reads the name interned at
                 // parse (`Node::text_name`), with no text load and no intern.
-                if is_identifier(name) {
+                if name_kind == SyntaxKind::Identifier {
                     return name.text_name();
                 }
                 return Name::from(name.text());
             }
-            if is_computed_property_name(name) {
+            if name_kind == SyntaxKind::ComputedPropertyName {
                 let name_expression = name.expression();
                 // treat computed property names where expression is string/numeric literal as just string/numeric literal
                 if is_string_or_numeric_literal_like(name_expression) {
@@ -958,7 +994,7 @@ impl Binder {
             }
             return Name::from(INTERNAL_SYMBOL_NAME_MISSING);
         }
-        match node.kind() {
+        match kind {
             SyntaxKind::Constructor => return Name::from(INTERNAL_SYMBOL_NAME_CONSTRUCTOR),
             SyntaxKind::FunctionType | SyntaxKind::CallSignature => {
                 return Name::from(INTERNAL_SYMBOL_NAME_CALL);
@@ -1443,9 +1479,7 @@ impl Binder {
     // PORT: returns `Declarations`, which holds one node inline, so no list
     // is allocated.
     pub fn new_single_declaration(&mut self, declaration: Node) -> Declarations {
-        let mut declarations = Declarations::default();
-        declarations.push(declaration);
-        declarations
+        Declarations::one(declaration)
     }
 
     // Go: binder/binder.go:538 setFlowNodeReferenced

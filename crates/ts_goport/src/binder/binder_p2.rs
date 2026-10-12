@@ -562,8 +562,10 @@ impl Binder {
 
     // Go: binder/binder.go:1172 bindVariableDeclarationOrBindingElement
     pub fn bind_variable_declaration_or_binding_element(&mut self, node: Node) {
-        self.check_strict_mode_eval_or_arguments(node, node.name());
+        // PERF: parsefast1 item 2. The name is read once (Go reads the field
+        // twice).
         let name = node.name();
+        self.check_strict_mode_eval_or_arguments(node, name);
         if name.is_some() && !is_binding_pattern(name) {
             if is_variable_declaration_initialized_to_require(node) {
                 self.declare_symbol_and_add_to_symbol_table(

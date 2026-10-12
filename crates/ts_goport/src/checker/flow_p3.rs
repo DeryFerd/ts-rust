@@ -26,9 +26,36 @@ impl Checker {
     pub fn has_matching_argument(&mut self, expression: Node, reference: Node) -> bool {
         // PERF: the argument list is program data (`NodeSlice` is `Copy`), so
         // the loop reads it in place with no copy.
+        // PERF: portonly1 item 5. Go `isOrContainsMatchingReference(reference,
+        // argument)` (flow.go:1898) walks the access chain of `reference`
+        // again for each argument (`containsMatchingReference`, flow.go:1841;
+        // `optionalChainContainsReference`, flow.go:1851).
+        // Go reads `Kind` and `Expression()` as fields; here each is a store
+        // read, so the chain is read once, before the loop. The calls of
+        // `is_matching_reference` are the same and in the same order.
+        let mut reference_chain: smallvec::SmallVec<[Node; 4]> = smallvec::SmallVec::new();
+        let mut source = reference;
+        while is_access_expression(source) {
+            source = source.expression();
+            reference_chain.push(source);
+        }
         for argument in expression.arguments() {
-            if self.is_or_contains_matching_reference(reference, argument)
-                || self.optional_chain_contains_reference(argument, reference)
+            // Go `isOrContainsMatchingReference(reference, argument)`.
+            let argument_kind = argument.kind();
+            if self.is_matching_reference_kind(reference, argument, argument_kind)
+                || reference_chain.iter().any(|&source| {
+                    self.is_matching_reference_kind(source, argument, argument_kind)
+                })
+                // `optionalChainContainsReference` is false at once unless the
+                // argument is an optional chain (`is_optional_chain` tests
+                // these kinds first).
+                || matches!(
+                    argument_kind,
+                    SyntaxKind::PropertyAccessExpression
+                        | SyntaxKind::ElementAccessExpression
+                        | SyntaxKind::CallExpression
+                        | SyntaxKind::NonNullExpression
+                ) && self.optional_chain_contains_reference(argument, reference)
             {
                 return true;
             }
