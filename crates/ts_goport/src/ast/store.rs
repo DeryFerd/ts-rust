@@ -6170,12 +6170,15 @@ pub fn finish_store_node_and_parents(
     let s = &mut *guard;
     assert!(!s.frozen, "cannot mutate a node of a finished file");
     let index = slot_index(n);
-    let Some(node) = s.nodes[index] else {
-        panic!("store handle does not name a node slot");
-    };
-    s.set_slot_loc(index, loc);
-    let flags = s.records[index].flags() | flags;
-    s.set_slot_flags(index, flags);
+    // PERF: storefast1. One record access for the slot check (the record
+    // bit agrees with the node column, `debug_check_kids`), the loc and the
+    // flags. Only a node with child fields reads its node column.
+    let record = &mut s.records[index];
+    assert!(record.is_node(), "store handle does not name a node slot");
+    record.set_loc(loc);
+    let flags = record.flags() | flags;
+    record.set_flags(flags);
+    s.build_facts.flags(flags);
     // PERF: storefast1. A leaf (Go `ForEachChild` has no case for its
     // kind, so the walk visits nothing) only gets its empty R2-5 chain:
     // what `set_slot_child_parents` writes for it, with no walk. Tokens,
@@ -6186,6 +6189,7 @@ pub fn finish_store_node_and_parents(
         s.build_links[index].first_child = LINK_END;
         return FinishedStoreNode::All;
     }
+    let node = s.nodes[index].expect("a node slot has node data");
     if s.set_slot_child_parents(index, node) {
         FinishedStoreNode::All
     } else {
