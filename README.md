@@ -117,7 +117,7 @@ Four switches make some projects faster or use less memory. They are off by defa
   checker per core, up to 16 and at most one per 32 source files (`--checkers N` still sets the
   count). Each file goes to the checker that Go's split gives it, so the output of `--fast` is the
   same on every run and equals `tsgo --checkers N` for the chosen N, except where lazy members or
-  the never order change the work (see their bullets above). On a 32 vCPU testbox limited
+  the never order change the work (see their bullets below). On a 32 vCPU testbox limited
   to 16 vCPUs with `taskset` (a release build without PGO), VS Code checks in 2.6 s instead of
   5.3 s, Sentry in 2.7 s instead of 5.5 s and T3 Code `apps/server` in 2.6 s instead of 3.5 s. On
   those three and on Excalidraw and zod, CPU time went up as much as 2.4x and peak memory as much
