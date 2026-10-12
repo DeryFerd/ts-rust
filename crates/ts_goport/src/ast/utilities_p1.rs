@@ -789,16 +789,56 @@ pub fn is_assignment_target(node: Node) -> bool {
 // Go: ast/utilities.go:184 GetAssignmentTarget
 // PERF: U4 (CH7). A step inside a published store reads the parent and its
 // kind with one store lookup (`frozen_store_parent_kind`).
+// PERF: deferbody1. Most calls end at the first step, at a parent kind that
+// the walk does not handle (a call, a property access, a statement). That
+// step is inline at the caller; the walk is out of line.
+#[inline(always)]
 pub fn get_assignment_target(node: Node) -> Node {
+    let (parent, parent_kind) = assignment_target_parent(node);
+    match parent_kind {
+        SyntaxKind::BinaryExpression
+        | SyntaxKind::PrefixUnaryExpression
+        | SyntaxKind::PostfixUnaryExpression
+        | SyntaxKind::ForInStatement
+        | SyntaxKind::ForOfStatement
+        | SyntaxKind::ParenthesizedExpression
+        | SyntaxKind::ArrayLiteralExpression
+        | SyntaxKind::SpreadElement
+        | SyntaxKind::NonNullExpression
+        | SyntaxKind::SpreadAssignment
+        | SyntaxKind::ShorthandPropertyAssignment
+        | SyntaxKind::PropertyAssignment => get_assignment_target_from(node, parent, parent_kind),
+        _ => Node::NIL,
+    }
+}
+
+/// Go `node.Parent` and `node.Parent.Kind`: one store lookup for a parent in
+/// the same published store (`frozen_store_parent_kind`).
+#[inline(always)]
+fn assignment_target_parent(node: Node) -> (Node, SyntaxKind) {
+    match frozen_store_parent_kind(node) {
+        Some(parent_and_kind) => parent_and_kind,
+        None => node_parent_and_kind_slow(node),
+    }
+}
+
+/// `node.Parent` and its kind, read one by one: a parent in another store,
+/// a nil parent (its kind read panics, as Go does) or a node that is not in
+/// a published store.
+#[cold]
+#[inline(never)]
+fn node_parent_and_kind_slow(node: Node) -> (Node, SyntaxKind) {
+    let parent = node.parent();
+    (parent, parent.kind())
+}
+
+/// The walk of `get_assignment_target` from `node`, whose parent `parent`
+/// of kind `parent_kind` the caller has read.
+#[inline(never)]
+fn get_assignment_target_from(node: Node, parent: Node, parent_kind: SyntaxKind) -> Node {
     let mut node = node;
+    let (mut parent, mut parent_kind) = (parent, parent_kind);
     loop {
-        let (parent, parent_kind) = match frozen_store_parent_kind(node) {
-            Some(parent_and_kind) => parent_and_kind,
-            None => {
-                let parent = node.parent();
-                (parent, parent.kind())
-            }
-        };
         match parent_kind {
             SyntaxKind::BinaryExpression => {
                 if is_assignment_operator(parent.operator_token().kind()) && parent.left() == node {
@@ -851,6 +891,7 @@ pub fn get_assignment_target(node: Node) -> Node {
             }
             _ => return Node::NIL,
         }
+        (parent, parent_kind) = assignment_target_parent(node);
     }
 }
 

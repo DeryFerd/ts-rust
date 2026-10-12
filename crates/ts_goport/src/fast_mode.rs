@@ -1,8 +1,8 @@
 //! fastmode1: the opt-in fast mode. Not in Go.
 //!
-//! `tsgo --fast` (the bin removes the flag before Go's option parsing) or
-//! `GOPORT_FAST=1` (for every bin of the process: tsc, the LSP and the API
-//! server) turns on, together:
+//! `tsgo --fast` (the tsc command line; the bin takes the flag before Go's
+//! option parsing, `take_flag`) or `GOPORT_FAST=1` (for every bin of the
+//! process: tsc, the LSP and the API server) turns on, together:
 //!
 //! - more checkers: one per core, up to `MAX_CHECKERS`, and at most one per
 //!   `FILES_PER_CHECKER` program files that are not declaration files
@@ -57,24 +57,85 @@ pub const FILES_PER_CHECKER: usize = 32;
 /// 0: not read yet, 1: off, 2: on.
 static STATE: AtomicU8 = AtomicU8::new(0);
 
-/// Set by `take_flag` for `tsc -b` (`--build` comes first in Go).
+/// Set by `take_flag` for `tsc -b` (a build flag comes first in Go:
+/// `execute_tsc::is_build_flag`).
 static BUILD: AtomicBool = AtomicBool::new(false);
 
-/// Removes every `--fast` from the command line `args` (without the
-/// program name) and turns fast mode on when there was one. Call before the
-/// first `enabled` (tsgo `run_main` does).
-pub fn take_flag(args: &mut Vec<String>) {
-    let before = args.len();
-    args.retain(|arg| arg != FLAG);
-    if args.len() != before {
-        STATE.store(2, Ordering::Relaxed);
-    }
+/// Takes `--fast` from the tsc command line `args` (without the program
+/// name) and turns fast mode on when there was one. Call before the first
+/// `enabled`. tsgo `run_main` calls it after it sends `--lsp` and `--api`
+/// on, as Go does: the servers parse their flags with Go's `flag` package,
+/// so they take fast mode only from `GOPORT_FAST=1`.
+pub fn take_flag(args: &mut [String]) {
     if args
         .first()
-        .is_some_and(|arg| arg == "-b" || arg == "--build")
+        .is_some_and(|arg| crate::execute::execute_tsc::is_build_flag(arg))
     {
         BUILD.store(true, Ordering::Relaxed);
     }
+    if blank_flags(args, BUILD.load(Ordering::Relaxed)) {
+        STATE.store(2, Ordering::Relaxed);
+    }
+}
+
+/// Makes each `--fast` of `args` that Go's parser reads as an option name
+/// an empty argument, and returns true when there was one. A `--fast` that
+/// an option before it takes as its value stays: Go sets
+/// `tsgo --outDir --fast` to outDir "--fast". `build`: the build command
+/// line (its options differ). Go's parser skips an empty argument, and an
+/// option that does not take `--fast` as its value does not take an empty
+/// argument either (a boolean takes only "true", "false" or "null"; a list
+/// value that starts with "-" is empty, as is an empty one; a tsconfig-only
+/// option takes no value that starts with "-"). So the other arguments
+/// parse as in Go, and only Go's unknown option error for `--fast` goes.
+/// Not in a response file (`@file`): Go reads it as an unknown option.
+// PORT: not in Go (followups49). The walk is Go's `parseStrings` with the
+// port's `parse_option_value` on a scratch parser, so each option takes
+// the arguments it takes in Go.
+fn blank_flags(args: &mut [String], build: bool) -> bool {
+    if !args.iter().any(|arg| arg == FLAG) {
+        return false;
+    }
+    use crate::frontend::tsoptions::{
+        BUILD_OPTIONS_DID_YOU_MEAN_DIAGNOSTICS, COMPILER_OPTIONS_DID_YOU_MEAN_DIAGNOSTICS,
+        get_input_option_name, parse_command_line_worker,
+    };
+    let diagnostics = if build {
+        &*BUILD_OPTIONS_DID_YOU_MEAN_DIAGNOSTICS
+    } else {
+        &*COMPILER_OPTIONS_DID_YOU_MEAN_DIAGNOSTICS
+    };
+    let mut parser = parse_command_line_worker(diagnostics, &[], None, String::new());
+    let mut taken = false;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == FLAG {
+            args[i].clear();
+            taken = true;
+            i += 1;
+            continue;
+        }
+        let arg = &args[i];
+        i += 1;
+        // Go: `case '-':`. An empty argument, a response file and a file
+        // name take no other argument.
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let name = get_input_option_name(arg);
+        if let Some(opt) = parser
+            .options_map
+            .get_option_declaration_from_name(name, true)
+        {
+            i = parser.parse_option_value(
+                args,
+                i,
+                opt,
+                diagnostics.option_type_mismatch_diagnostic,
+            );
+        }
+    }
+    taken
 }
 
 /// True when fast mode is on: `--fast` (`take_flag`) or `GOPORT_FAST=1`.
@@ -226,7 +287,74 @@ pub fn cost_split(
 
 #[cfg(test)]
 mod tests {
-    use super::cost_split;
+    use super::{blank_flags, cost_split};
+
+    fn owned(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    /// `blank_flags` on `args`: the arguments after it, and whether it took
+    /// a `--fast`.
+    fn blank(args: &[&str], build: bool) -> (Vec<String>, bool) {
+        let mut args = owned(args);
+        let taken = blank_flags(&mut args, build);
+        (args, taken)
+    }
+
+    /// `--fast` is taken where Go's parser reads an option name, and kept
+    /// where an option takes it as its value (followups49: each case gives
+    /// Go's output at fed0bf24149f with the taken `--fast` as "").
+    #[test]
+    fn take_flag_reads_the_command_line_as_go() {
+        let taken = |args: &[&str]| (owned(args), true);
+        let kept = |args: &[&str]| (owned(args), false);
+        // An option name, also twice; other spellings are not the flag.
+        assert_eq!(blank(&["--fast", "a.ts"], false), taken(&["", "a.ts"]));
+        assert_eq!(
+            blank(&["--fast", "--noEmit", "--fast"], false),
+            taken(&["", "--noEmit", ""])
+        );
+        assert_eq!(
+            blank(&["--FAST", "-fast", "--fast"], false),
+            taken(&["--FAST", "-fast", ""])
+        );
+        // The value of a string (also by short name), number or enum option.
+        for args in [
+            ["--outDir", "--fast"],
+            ["-p", "--fast"],
+            ["--checkers", "--fast"],
+            ["--target", "--fast"],
+        ] {
+            assert_eq!(blank(&args, false), kept(&args));
+        }
+        // A boolean, a list and a tsconfig-only option do not take it, so
+        // the next argument stays a file name.
+        assert_eq!(
+            blank(&["--strict", "--fast", "true"], false),
+            taken(&["--strict", "", "true"])
+        );
+        assert_eq!(
+            blank(&["--lib", "--fast", "es5"], false),
+            taken(&["--lib", "", "es5"])
+        );
+        assert_eq!(
+            blank(&["--plugins", "--fast", "foo"], false),
+            taken(&["--plugins", "", "foo"])
+        );
+        // After an option and its value.
+        assert_eq!(
+            blank(&["--outDir", "out", "--fast"], false),
+            taken(&["--outDir", "out", ""])
+        );
+        // The build command line has its own options: `--generateTrace`
+        // takes a value there, `--outDir` is unknown.
+        let args = ["-b", "--generateTrace", "--fast"];
+        assert_eq!(blank(&args, true), kept(&args));
+        assert_eq!(
+            blank(&["-b", "--outDir", "--fast"], true),
+            taken(&["-b", "--outDir", ""])
+        );
+    }
 
     /// The most costly file goes first; a file that shares an import with a
     /// placed file joins its checker while that costs less; files without

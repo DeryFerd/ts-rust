@@ -1783,11 +1783,18 @@ pub struct NameMap {
     pub short_option_names: FxHashMap<String, String>,
 }
 
+/// Go `strings.ToLower`: `unicode.ToLower` on each rune.
+// PORT: not `str::to_lowercase`, which maps U+0130 to two runes (Go: 'i',
+// so `-buİld` names the build option) and a final sigma to U+03C2.
+pub(crate) fn strings_to_lower(s: &str) -> String {
+    s.chars().map(crate::gostd::unicode::to_lower).collect()
+}
+
 impl NameMap {
     // Go: tsoptions/namemap.go:34 Get
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&'static CommandLineOption> {
-        self.options_names.get(&name.to_lowercase()).copied()
+        self.options_names.get(&strings_to_lower(name)).copied()
     }
 
     // Go: tsoptions/namemap.go:38 GetFromShort
@@ -1807,7 +1814,7 @@ impl NameMap {
         option_name: &str,
         allow_short: bool,
     ) -> Option<&'static CommandLineOption> {
-        let mut option_name = option_name.to_lowercase();
+        let mut option_name = strings_to_lower(option_name);
         // Try to translate short option names to their full equivalents.
         if allow_short {
             if let Some(short) = self.short_option_names.get(&option_name) {

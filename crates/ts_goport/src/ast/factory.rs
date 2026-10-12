@@ -214,9 +214,14 @@ impl NodeFactory {
     }
 
     /// `newNode` plus Go `node.Flags |= flags & NodeFlagsOptionalChain`.
+    // PERF: parsefast2. A node flag read and write is a store access, not a
+    // field write. Without the bit the Go write keeps the flags as they
+    // are, so it is skipped (most property accesses and calls).
     fn new_chain_node<T: AstData>(&self, kind: SyntaxKind, data: T, flags: NodeFlags) -> Node {
         let node = self.new_node(kind, data);
-        set_node_flags(node, node.flags() | (flags & NodeFlags::OPTIONAL_CHAIN));
+        if flags.intersects(NodeFlags::OPTIONAL_CHAIN) {
+            set_node_flags(node, node.flags() | NodeFlags::OPTIONAL_CHAIN);
+        }
         node
     }
 

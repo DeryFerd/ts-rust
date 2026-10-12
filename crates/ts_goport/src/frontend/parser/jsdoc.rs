@@ -322,6 +322,7 @@ impl<'a> Parser<'a> {
         // parse. The positions after the split char differ from Go's, so
         // the nodes, lists and diagnostics map them (`jsdoc_tail_pos`).
         let (cut, kept) = jsdoc_text_cut(save_source_text, end as usize);
+        let cut_has_no_tail = kept.is_empty();
         self.source_text = if kept.is_empty() {
             &save_source_text[..cut]
         } else {
@@ -340,6 +341,11 @@ impl<'a> Parser<'a> {
             }
         };
         self.scanner.set_text(self.source_text);
+        // A cut of the text with no kept tail is a prefix of the text; a
+        // tail holds invalid byte units, which are markers.
+        self.scanner.set_text_has_no_go_string_marker(
+            cut_has_no_tail && self.source_text_has_no_go_string_marker,
+        );
         // +3 for leading `/**`
         self.scanner.reset_pos(start + 3);
         self.set_context_flags(NodeFlags::JS_DOC, true);
@@ -365,6 +371,8 @@ impl<'a> Parser<'a> {
 
         self.source_text = save_source_text;
         self.scanner.set_text(self.source_text);
+        self.scanner
+            .set_text_has_no_go_string_marker(self.source_text_has_no_go_string_marker);
         self.parsing_contexts = save_parsing_contexts;
         self.context_flags = save_context_flags;
         self.scanner.comment_directives = save_comment_directives;

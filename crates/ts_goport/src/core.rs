@@ -3421,13 +3421,6 @@ impl SymbolArena {
             .map_or(SymbolId::NIL, |position| table.entries[position].symbol)
     }
 
-    /// Go `table[name]` by `get_text` or `get_name`, whichever `key` holds.
-    #[inline]
-    #[must_use]
-    pub fn get_key(&self, table: SymbolTable, key: TableKey<'_>) -> SymbolId {
-        self.get(table, key)
-    }
-
     /// Go `table[name] = symbol`. Panics on a nil table, like Go.
     pub fn set(&mut self, table: SymbolTable, name: impl Into<Name>, symbol: SymbolId) {
         assert!(table.is_some(), "assignment to entry in nil map");

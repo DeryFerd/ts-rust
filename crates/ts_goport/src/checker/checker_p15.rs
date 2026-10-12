@@ -1046,60 +1046,60 @@ impl Checker {
     }
 
     // Go: checker/checker.go:13869 isConstContext
+    // PERF: deferbody1. Go reads `node.Kind`, `node.Parent` and
+    // `parent.Kind` as fields, more than once across the tests and helpers.
+    // Here each read was a registry lookup, so the node's view, its kind, its
+    // parent and the parent's kind are read once and passed on. The tests
+    // and their order are Go's.
     pub fn is_const_context(&mut self, node: Node) -> bool {
-        let parent = node.parent();
-        if is_const_assertion(parent) {
+        let view = NodeRef::new(node);
+        let parent = view.parent();
+        let parent_kind = parent.kind();
+        // Go `ast.IsConstAssertion(parent)`.
+        if matches!(
+            parent_kind,
+            SyntaxKind::AsExpression | SyntaxKind::TypeAssertionExpression
+        ) && is_const_type_reference(parent.type_())
+        {
             return true;
         }
-        if self.is_inline_import_attributes(node) {
+        let kind = view.kind();
+        // Go `c.isInlineImportAttributes(node)`; its first two tests are here,
+        // on the kinds read above, so most nodes make no call.
+        if kind == SyntaxKind::ObjectLiteralExpression
+            && parent_kind == SyntaxKind::PropertyAssignment
+            && is_inline_import_attributes(node, parent.node())
+        {
             return true;
         }
-        if self.is_valid_const_assertion_argument(node) {
+        if self.is_valid_const_assertion_argument_of(node, kind) {
             let contextual_type = self.get_contextual_type(node, ContextFlags::NONE);
             if self.is_const_type_variable(contextual_type, 0) {
                 return true;
             }
         }
-        if (is_parenthesized_expression(parent)
-            || is_array_literal_expression(parent)
-            || is_spread_element(parent))
-            && self.is_const_context(parent)
-        {
-            return true;
+        let parent = parent.node();
+        match parent_kind {
+            SyntaxKind::ParenthesizedExpression
+            | SyntaxKind::ArrayLiteralExpression
+            | SyntaxKind::SpreadElement => self.is_const_context(parent),
+            SyntaxKind::PropertyAssignment
+            | SyntaxKind::ShorthandPropertyAssignment
+            | SyntaxKind::TemplateSpan => self.is_const_context(parent.parent()),
+            _ => false,
         }
-        (is_property_assignment(parent)
-            || is_shorthand_property_assignment(parent)
-            || is_template_span(parent))
-            && self.is_const_context(parent.parent())
-    }
-
-    // Go: checker/checker.go:13878 isInlineImportAttributes
-    pub fn is_inline_import_attributes(&self, node: Node) -> bool {
-        if !is_object_literal_expression(node)
-            || !is_property_assignment(node.parent())
-            || node.parent().initializer() != node
-        {
-            return false;
-        }
-        let property = node.parent();
-        if (!is_identifier(property.name()) && !is_string_literal_like(property.name()))
-            || property.name().text() != "with"
-        {
-            return false;
-        }
-        let options = property.parent();
-        if !is_object_literal_expression(options) {
-            return false;
-        }
-        let import_call = find_ancestor(options, is_import_call);
-        import_call.is_some()
-            && import_call.arguments().len() > 1
-            && skip_parentheses(import_call.arguments().get(1)) == options
     }
 
     // Go: checker/checker.go:13894 isValidConstAssertionArgument
     pub fn is_valid_const_assertion_argument(&mut self, node: Node) -> bool {
-        match node.kind() {
+        self.is_valid_const_assertion_argument_of(node, node.kind())
+    }
+
+    /// `is_valid_const_assertion_argument` of `node`, whose kind `kind` the
+    /// caller has read already (`is_const_context`).
+    #[inline]
+    fn is_valid_const_assertion_argument_of(&mut self, node: Node, kind: SyntaxKind) -> bool {
+        match kind {
             SyntaxKind::StringLiteral
             | SyntaxKind::NoSubstitutionTemplateLiteral
             | SyntaxKind::NumericLiteral
@@ -1805,4 +1805,33 @@ impl Checker {
         }
         diagnostic
     }
+}
+
+// Go: checker/checker.go:13878 isInlineImportAttributes
+// PERF: deferbody1. The caller (`is_const_context`) has tested Go's first two
+// tests on the kinds it read: `node` is an object literal and `parent`, its
+// parent, a property assignment.
+fn is_inline_import_attributes(node: Node, parent: Node) -> bool {
+    debug_assert!(
+        is_object_literal_expression(node)
+            && is_property_assignment(parent)
+            && parent == node.parent()
+    );
+    if parent.initializer() != node {
+        return false;
+    }
+    let property = parent;
+    if (!is_identifier(property.name()) && !is_string_literal_like(property.name()))
+        || property.name().text() != "with"
+    {
+        return false;
+    }
+    let options = property.parent();
+    if !is_object_literal_expression(options) {
+        return false;
+    }
+    let import_call = find_ancestor(options, is_import_call);
+    import_call.is_some()
+        && import_call.arguments().len() > 1
+        && skip_parentheses(import_call.arguments().get(1)) == options
 }

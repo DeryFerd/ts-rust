@@ -137,7 +137,7 @@ impl Checker {
     pub fn get_property_of_object_type_key(&mut self, t: TypeId, name: TableKey<'_>) -> SymbolId {
         if self.ty(t).flags.intersects(TypeFlags::OBJECT) {
             let members = self.resolve_structured_type_members(t).members;
-            let symbol = self.symbols.get_key(members, name);
+            let symbol = self.symbols.get(members, name);
             if symbol.is_some() && self.symbol_is_value(symbol) {
                 return symbol;
             }
@@ -214,7 +214,7 @@ impl Checker {
         skip_object_function_property_augment: bool,
     ) -> SymbolId {
         let cache = self.property_cache_table(t, skip_object_function_property_augment);
-        let prop = self.symbols.get_key(cache, name);
+        let prop = self.symbols.get(cache, name);
         if prop.is_some() {
             return prop;
         }
@@ -1323,6 +1323,34 @@ impl Checker {
         None
     }
 
+    /// Go `core.SameMap` + `core.Same` of `instantiateType` over a stored
+    /// list that never changes (detached by the caller): each element is
+    /// instantiated once, in order, and `None` means no element changed.
+    /// The same calls as `map_stored_types_if_changed`, with direct reads.
+    pub fn instantiate_types_if_changed(
+        &mut self,
+        list: &[TypeId],
+        m: MapperId,
+    ) -> Option<SmallVec<[TypeId; 8]>> {
+        for (i, &value) in list.iter().enumerate() {
+            let mapped = self.instantiate_type(value, m);
+            if mapped != value {
+                let mut result: SmallVec<[TypeId; 8]> = SmallVec::with_capacity(list.len());
+                // PERF: a push loop; the prefix is short, and
+                // `extend_from_slice` calls memmove and memcpy.
+                for &value in &list[..i] {
+                    result.push(value);
+                }
+                result.push(mapped);
+                for &value in &list[i + 1..] {
+                    result.push(self.instantiate_type(value, m));
+                }
+                return Some(result);
+            }
+        }
+        None
+    }
+
     // Go: checker/checker.go:22352 getTypeArguments
     pub fn get_type_arguments(&mut self, t: TypeId) -> SharedList<TypeId> {
         if let Some(count) = self.resolve_type_arguments(t) {
@@ -1910,16 +1938,34 @@ impl Checker {
     }
 
     // Go: checker/checker.go:22559 instantiateType
+    // PERF (instfast1): a copy of `instantiate_type_with_alias` with no
+    // alias (all but a few hundred calls on T3 server), so it has no alias
+    // tests and no alias drop.
+    #[inline(never)]
     pub fn instantiate_type(&mut self, t: TypeId, m: MapperId) -> TypeId {
-        self.instantiate_type_with_alias(t, m, None /*alias*/)
+        self.instantiate_type_with_alias_impl(t, m, None /*alias*/)
     }
 
     // Go: checker/checker.go:22563 instantiateTypeWithAlias
+    #[inline(never)]
     pub fn instantiate_type_with_alias(
         &mut self,
         t: TypeId,
         m: MapperId,
         alias: Option<Rc<TypeAlias>>,
+    ) -> TypeId {
+        self.instantiate_type_with_alias_impl(t, m, alias.as_ref())
+    }
+
+    /// The body of `instantiate_type` and `instantiate_type_with_alias`.
+    /// The alias is borrowed (a plain pointer, so the no-alias copy folds
+    /// it away), and the worker gets its own `Rc`.
+    #[inline(always)]
+    fn instantiate_type_with_alias_impl(
+        &mut self,
+        t: TypeId,
+        m: MapperId,
+        alias: Option<&Rc<TypeAlias>>,
     ) -> TypeId {
         // Check for type variables in the alias, so things like `type Brand<T> = number & {}` can potentially be copied with new alias type args, despite them being unreferenced.
         // This is the behavior most people using aliases expect, and prevents the cache from leaking type parameters outside their scope of validity.
@@ -1927,6 +1973,10 @@ impl Checker {
         if t.is_nil() || m.is_nil() {
             return t;
         }
+        // PERF: read before the `could_contain_type_variables` call, so the
+        // type parameter test below needs no second read (a type's flags
+        // never change).
+        let is_type_parameter = self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER);
         let could_contain = self.could_contain_type_variables(t) || {
             // PORT: the alias list does not change after the type is made, so
             // it is read by index instead of copied.
@@ -1940,88 +1990,116 @@ impl Checker {
             return t;
         }
         if self.instantiation_stack.len() == 100 || self.instantiation_count >= 5_000_000 {
-            // We have reached 100 recursive type instantiations, or 5M type instantiations caused by the same statement
-            // or expression. There is a very high likelihood we're dealing with a combination of infinite generic types
-            // that perpetually generate new type identities, so we stop the recursion here by yielding the error type.
-            if let Some(tr) = self.tracer {
-                tr.instant(
-                    crate::tracing::Phase::CheckTypes,
-                    "instantiateType_DepthLimit",
-                    vec![
-                        ("typeId", t.into()),
-                        (
-                            "instantiationDepth",
-                            (self.instantiation_stack.len() as u32).into(),
-                        ),
-                        ("instantiationCount", self.instantiation_count.into()),
-                    ],
-                );
-            }
-            let circular_type_names = self.get_circular_type_names();
-            let current_node = self.current_node;
-            if circular_type_names.len() == 1 {
-                self.error(
-                    current_node,
-                    diag::Instantiations_of_type_0_appear_infinitely_circular,
-                    args![circular_type_names[0].clone()],
-                );
-            } else if circular_type_names.len() > 1 {
-                self.error(
-                    current_node,
-                    diag::Instantiations_of_the_following_types_appear_infinitely_circular_Colon_0,
-                    args![quoted_and_comma_separated(&circular_type_names)],
-                );
-            } else {
-                self.error(
-                    current_node,
-                    diag::Type_instantiation_is_excessively_deep_and_possibly_infinite,
-                    args![],
-                );
-            }
-            return self.error_type;
+            return self.instantiation_depth_limit(t);
         }
         let index = self.find_active_mapper(m);
         if index == -1 {
             self.push_active_mapper(m);
         }
         // PERF: a key with no alias is `t` itself, in the `plain` map
-        // (`ActiveMapperCache`). `None` here means that key.
-        let alias_key = alias.as_deref().map(|alias| {
+        // (`ActiveMapperCache`). `None` here means that key. A key with an
+        // alias is made in Go's place even when no lookup follows: it gives
+        // the alias symbol its id (`get_symbol_id`).
+        let alias_key = alias.map(|alias| {
             let mut b = KeyBuilder::default();
             b.write_type(t);
             b.write_alias(&self.symbols, Some(alias));
             b.hash()
         });
-        let cache_index = if index != -1 {
-            index as usize
+        // PERF (instfast1): a mapper that was not active got a new cache at
+        // the top, and the caches past the active length are always empty
+        // (`pop_active_mapper`), so Go's lookup in it always misses and is
+        // skipped. Only an active mapper's cache gets the result.
+        let mut cache_key: Option<(usize, Option<CacheHashKey>)> = None;
+        if index == -1 {
+            debug_assert!(
+                self.active_type_mappers_caches[self.active_mappers.len() - 1].is_empty()
+            );
         } else {
-            self.active_mappers.len() - 1
-        };
-        let cache = &self.active_type_mappers_caches[cache_index];
-        let cached = match &alias_key {
-            None => cache.get_plain(t),
-            Some(key) => cache.aliased.get(key),
-        };
-        if let Some(&cached_type) = cached {
-            return cached_type;
+            let cache_index = index as usize;
+            let cache = &self.active_type_mappers_caches[cache_index];
+            let cached = match &alias_key {
+                None => cache.get_plain(t),
+                Some(key) => cache.aliased.get(key),
+            };
+            if let Some(&cached_type) = cached {
+                return cached_type;
+            }
+            cache_key = Some((cache_index, alias_key));
         }
         self.total_instantiation_count += 1;
         self.instantiation_count += 1;
         self.instantiation_stack.push(t);
-        let result = self.instantiate_type_worker(t, m, alias);
-        if index == -1 {
-            self.pop_active_mapper();
+        // PERF (instfast1): a type parameter (about 43% of the misses on T3
+        // server) is the first case of `instantiate_type_worker`, done here
+        // without its frame. The alias is not used there either.
+        let result = if is_type_parameter {
+            self.get_mapped_type(t, m)
         } else {
-            let cache = &mut self.active_type_mappers_caches[cache_index];
-            match alias_key {
-                None => cache.insert_plain(t, result),
-                Some(key) => {
-                    cache.aliased.insert(key, result);
+            self.instantiate_type_worker(t, m, alias.cloned())
+        };
+        match cache_key {
+            None => self.pop_active_mapper(),
+            Some((cache_index, alias_key)) => {
+                let cache = &mut self.active_type_mappers_caches[cache_index];
+                match alias_key {
+                    None => cache.insert_plain(t, result),
+                    Some(key) => {
+                        cache.aliased.insert(key, result);
+                    }
                 }
             }
         }
         self.instantiation_stack.pop();
         result
+    }
+
+    /// The depth and count limit of Go `instantiateTypeWithAlias`: reports
+    /// the circular types (or the depth) and gives the error type.
+    // PERF: out of line, so `instantiate_type_with_alias` keeps a small
+    // frame.
+    #[cold]
+    #[inline(never)]
+    fn instantiation_depth_limit(&mut self, t: TypeId) -> TypeId {
+        // We have reached 100 recursive type instantiations, or 5M type instantiations caused by the same statement
+        // or expression. There is a very high likelihood we're dealing with a combination of infinite generic types
+        // that perpetually generate new type identities, so we stop the recursion here by yielding the error type.
+        if let Some(tr) = self.tracer {
+            tr.instant(
+                crate::tracing::Phase::CheckTypes,
+                "instantiateType_DepthLimit",
+                vec![
+                    ("typeId", t.into()),
+                    (
+                        "instantiationDepth",
+                        (self.instantiation_stack.len() as u32).into(),
+                    ),
+                    ("instantiationCount", self.instantiation_count.into()),
+                ],
+            );
+        }
+        let circular_type_names = self.get_circular_type_names();
+        let current_node = self.current_node;
+        if circular_type_names.len() == 1 {
+            self.error(
+                current_node,
+                diag::Instantiations_of_type_0_appear_infinitely_circular,
+                args![circular_type_names[0].clone()],
+            );
+        } else if circular_type_names.len() > 1 {
+            self.error(
+                current_node,
+                diag::Instantiations_of_the_following_types_appear_infinitely_circular_Colon_0,
+                args![quoted_and_comma_separated(&circular_type_names)],
+            );
+        } else {
+            self.error(
+                current_node,
+                diag::Type_instantiation_is_excessively_deep_and_possibly_infinite,
+                args![],
+            );
+        }
+        self.error_type
     }
 
     // Go: checker/checker.go:22614 getCircularTypeNames
@@ -2221,13 +2299,29 @@ impl Checker {
                 {
                     // PORT: Go `core.Same` on the `instantiateTypes` result
                     // is "no element changed" (`None`) here.
-                    let count = self.ty(t).as_type_reference().resolved_type_arguments.len();
-                    let Some(new_type_arguments) = self.map_stored_types_if_changed(
-                        t,
-                        count,
-                        |c, t, i| c.ty(t).as_type_reference().resolved_type_arguments[i],
-                        &mut |c, a| c.instantiate_type(a, m),
-                    ) else {
+                    // PERF (instfast1): the stored list never changes, so it
+                    // is detached once (`instantiate_types_if_changed`). An
+                    // owned list (a multi-program process) is read in place.
+                    let mut buf = SharedListBuf::<TypeId>::default();
+                    let changed = match self
+                        .ty(t)
+                        .as_type_reference()
+                        .resolved_type_arguments
+                        .detach(&mut buf)
+                    {
+                        Some(list) => self.instantiate_types_if_changed(list, m),
+                        None => {
+                            let count =
+                                self.ty(t).as_type_reference().resolved_type_arguments.len();
+                            self.map_stored_types_if_changed(
+                                t,
+                                count,
+                                |c, t, i| c.ty(t).as_type_reference().resolved_type_arguments[i],
+                                &mut |c, a| c.instantiate_type(a, m),
+                            )
+                        }
+                    };
+                    let Some(new_type_arguments) = changed else {
                         return t;
                     };
                     let target = self.ty(t).target();
@@ -2252,17 +2346,35 @@ impl Checker {
                     source = origin;
                 }
             }
-            let count = self.ty(source).types().len();
-            let changed =
-                self.map_stored_types_if_changed(source, count, Checker::type_at, &mut |c, u| {
-                    c.instantiate_type(u, m)
-                });
+            // PERF (instfast1): the constituents never change, so the list
+            // is detached once (`instantiate_types_if_changed`). An owned
+            // list (a multi-program process) is read in place.
+            let mut buf = SharedListBuf::<TypeId>::default();
+            let detached = self
+                .ty(source)
+                .as_union_or_intersection_type()
+                .types
+                .detach(&mut buf);
+            let changed = match detached {
+                Some(list) => self.instantiate_types_if_changed(list, m),
+                None => {
+                    let count = self.ty(source).types().len();
+                    self.map_stored_types_if_changed(
+                        source,
+                        count,
+                        Checker::type_at,
+                        &mut |c, u| c.instantiate_type(u, m),
+                    )
+                }
+            };
             if changed.is_none() && alias.symbol() == self.ty(t).alias.symbol() {
                 return t;
             }
             let unchanged;
             let new_types: &[TypeId] = if let Some(types) = &changed {
                 types
+            } else if let Some(list) = detached {
+                list
             } else {
                 unchanged = self.ty(source).types_list();
                 &unchanged
