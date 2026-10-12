@@ -8,6 +8,12 @@
 //!
 //! The workers read the OS file system, so each test writes a project to a
 //! temp directory and runs with no OS override (not `child_test!`).
+//!
+//! Each test also asserts that the loader took every worker read and parse
+//! (`untaken` is 0). The workers queue the root files and the files that a
+//! parse imports. Here each of those is a file of the program (no libs or
+//! types, and each import names a `src` file), so a worker parse that the
+//! loader does not take is wasted work, which these tests catch.
 
 use ts_goport::frontend::compiler::{PrefetchCounts, prefetch_counts};
 use ts_goport::lsp::lsproto;

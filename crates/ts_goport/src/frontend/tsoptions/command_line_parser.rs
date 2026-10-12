@@ -557,13 +557,7 @@ pub fn convert_json_option_of_enum_type(
     if value.is_empty() {
         return (CompilerOptionsValue::Nil, Vec::new());
     }
-    // PORT: Go `strings.ToLower` uses the simple (one rune) mapping. The
-    // first rune of Rust `to_lowercase` is that mapping (U+0130 is the only
-    // multi-rune case, and it starts with 'i').
-    let key: String = value
-        .chars()
-        .map(|c| c.to_lowercase().next().unwrap_or(c))
-        .collect();
+    let key = super::decls::strings_to_lower(value);
     let Some(type_map) = opt.enum_map() else {
         return (CompilerOptionsValue::Nil, Vec::new());
     };

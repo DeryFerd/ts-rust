@@ -404,8 +404,15 @@ methods reach the AST through it.
   +1.1%; `SyntaxKind::try_from` is a 351-case switch until late in LLVM's
   pipeline, so the inliner left it or `frozen_store_kind` out of line at
   thousands of call sites (+3% to +7.6%). The column costs 2 bytes per
-  slot, and a node shell leaks its column unless one of the last 4 shells
-  had the same kinds (`shell_kinds`). A new per-slot field of the hot reads goes into a record or kids
+  slot. A node shell has a plain column too, which it leaks
+  (`plain_kinds`): shells with equal kinds share one, and each file gets
+  one. A later version with new kinds gets one only while those of later
+  versions stay in 4 MiB (`LATER_KINDS_BUDGET`, edleak1); past that, its
+  kinds go in an atomic column of its pooled block
+  (`BlockFile::shell_kinds`), read through one cold call
+  (`FileBlock::kind`). Before the budget a long editor session leaked
+  about 0.4 columns per edit; with every shell pooled, a 400-edit
+  query-core session cost +4.2% instructions. A new per-slot field of the hot reads goes into a record or kids
   word, not a new column. Debug builds check the records and kids against
   the node data at freeze (`debug_check_kids`), and each parent write
   against its stored form.
@@ -435,8 +442,9 @@ methods reach the AST through it.
   name, modifier flags) are not checked in a release build (they are
   about 6 instructions). So a stale read of those gives the values of
   that node while its block waits, and the new owner's data after a
-  reuse, never undefined behavior. Its kind column is never reused, so a
-  stale kind read gives the old kind. Its store, `GoFile`, extras, flow,
+  reuse, never undefined behavior. A plain kind column is never reused,
+  so a stale kind read gives the old kind; pooled kinds (past the budget,
+  edleak1) give the new owner's kind after a reuse. Its store, `GoFile`, extras, flow,
   node data and list reads panic. Every holder of a node of a version
   holds the version, so a correct reader never sees a reuse. No standing
   run has debug assertions: the protected tests run `--release`

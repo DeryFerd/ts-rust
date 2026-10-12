@@ -959,8 +959,7 @@ impl Binder {
                     return Name::from(INTERNAL_SYMBOL_NAME_MISSING);
                 }
                 let private_name = Name::from(get_symbol_name_for_private_identifier(
-                    &self.symbols,
-                    self.node_symbol(containing_class),
+                    containing_class,
                     name.text(),
                 ));
                 self.symbols.note_private_name(&private_name);
@@ -1036,33 +1035,87 @@ impl Binder {
 
 // Go: binder/binder.go:374 GetSymbolNameForPrivateIdentifier
 //
-// PORT: Go `ast.GetSymbolId` hands out lazy global ids. Here the arena index
-// is the symbol id. It is stable because every checker arena starts as a
-// clone of the binder arena, and it is unique, which is all the name needs
-// inside the process. Go binds files in parallel, and each file into its own
-// arena here, so a bind cannot give the Go id. Where Go shows `symbol.Name`
-// outside the process (the API), `go_symbol_name` puts the id back.
-pub fn get_symbol_name_for_private_identifier(
+// PORT: Go puts `ast.GetSymbolId(containingClassSymbol)`, a lazy global id,
+// in the name. Here the number is the key of the class node
+// (`private_name_key`), so the binder and the checker give the class the
+// same names, and `go_symbol_name` puts the Go id back where Go shows
+// `symbol.Name` outside the process (the API). The binder passes the
+// containing class node; the checker passes the class symbol
+// (`get_symbol_name_for_private_identifier_of_symbol`).
+// PORT: edleak1. The number was the arena index of the class symbol, so
+// each bind of an edited file (a new class symbol) interned new names, and
+// the process-wide interner never frees them (query-core: about 4 KiB per
+// edit, from 24 private members). Go frees them with the file.
+#[must_use]
+pub fn get_symbol_name_for_private_identifier(containing_class: Node, description: &str) -> String {
+    format!(
+        "{}#{}@{}",
+        INTERNAL_SYMBOL_NAME_PREFIX,
+        private_name_key(containing_class),
+        description
+    )
+}
+
+/// Rust-only (edleak1): the number in the private names of class-like node
+/// `class` (`get_symbol_name_for_private_identifier`). It is unique among
+/// the classes of a program: the hash of the file name in the high bits,
+/// and the store handle of the class name (of the class node when it has
+/// none) in the low 32 bits. The next version of an edited file gives the
+/// same class the same key when the edit adds or removes no node before its
+/// name (a node gets its handle when the parser makes it, and a class node
+/// after its members), so its names are interned again only then. The key
+/// is at least 2^32, above every symbol id
+/// (`get_symbol_name_for_private_identifier_of_symbol`).
+// PORT: a hash of the file name, not an id, so the key needs no shared
+// table: two file names with one 64-bit hash and one handle would share
+// names.
+#[must_use]
+pub fn private_name_key(class: Node) -> u128 {
+    let name = class.name();
+    let identity = if name.is_some() { name } else { class };
+    let file = source_file_file_name(get_source_file_of_node(class));
+    let file_hash = xxhash_rust::xxh3::xxh3_64(file.as_bytes());
+    ((u128::from(file_hash) + 1) << 32) | u128::from(identity.0 as u32)
+}
+
+/// Go `GetSymbolNameForPrivateIdentifier(containingClassSymbol, description)`
+/// for the checker, which has the symbol. A symbol that a class-like node
+/// declares (`node.symbol()`, the binder symbol) gets the names that the
+/// binder gave its members. Any other symbol (an interface, a merged copy
+/// of a class) gets its id as the number: Go's id of such a symbol differs
+/// from the class's too, so no member of the class matches, and an id is
+/// below 2^32, so it matches no class key.
+#[must_use]
+pub fn get_symbol_name_for_private_identifier_of_symbol(
     symbols: &SymbolArena,
     containing_class_symbol: SymbolId,
     description: &str,
 ) -> String {
-    let _ = symbols;
-    format!(
-        "{}#{}@{}",
-        INTERNAL_SYMBOL_NAME_PREFIX, containing_class_symbol.0, description
-    )
+    let class = symbols
+        .sym(containing_class_symbol)
+        .declarations
+        .iter()
+        .copied()
+        .find(|&declaration| {
+            is_class_like(declaration) && declaration.symbol() == containing_class_symbol
+        });
+    match class {
+        Some(class) => get_symbol_name_for_private_identifier(class, description),
+        None => format!(
+            "{}#{}@{}",
+            INTERNAL_SYMBOL_NAME_PREFIX, containing_class_symbol.0, description
+        ),
+    }
 }
 
 /// Rust-only: the text of Go `symbol.Name` for `symbol`, as the API returns
 /// it (Go api/session.go:75 `newSymbolResponse`). A private identifier name
-/// holds the arena index of its class
-/// (`get_symbol_name_for_private_identifier`). Go holds `ast.GetSymbolId` of
-/// the class there, which is also the API handle of the class (Go
-/// api/proto.go:40 `SymbolHandle`). This returns the name with that id
-/// (`get_symbol_id`). Other names come back as they are. Only a symbol that
-/// a private identifier declares has such a name, as in
-/// `SymbolArena::prepare_file_arena`; a name that source text spells stays.
+/// holds the key of its class (`get_symbol_name_for_private_identifier`).
+/// Go holds `ast.GetSymbolId` of the class there, which is also the API
+/// handle of the class (Go api/proto.go:40 `SymbolHandle`). This returns the
+/// name with that id (`get_symbol_id`). Other names come back as they are.
+/// Only a symbol that a private identifier declares, in a class whose key
+/// the name holds, has such a name; a name that source text spells stays.
 #[must_use]
 pub fn go_symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
     let s = symbols.sym(symbol);
@@ -1079,22 +1132,24 @@ pub fn go_symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
     let Some(at) = rest.find('@') else {
         return name.to_string();
     };
-    let Ok(class) = rest[..at].parse::<u32>() else {
+    let Ok(key) = rest[..at].parse::<u128>() else {
         return name.to_string();
     };
-    if class == 0
-        || class as usize >= symbols.symbol_count()
-        || !s
-            .declarations
-            .iter()
-            .any(|&declaration| is_private_identifier(get_name_of_declaration(declaration)))
-    {
+    // The binder names a private identifier declaration after its
+    // containing class (`get_declaration_name_of_kind`).
+    let class = s
+        .declarations
+        .iter()
+        .filter(|&&declaration| is_private_identifier(get_name_of_declaration(declaration)))
+        .map(|&declaration| get_containing_class(declaration))
+        .find(|&class| class.is_some() && private_name_key(class) == key);
+    let Some(class) = class else {
         return name.to_string();
-    }
+    };
     format!(
         "{}#{}{}",
         INTERNAL_SYMBOL_NAME_PREFIX,
-        get_symbol_id(symbols, SymbolId(class)),
+        get_symbol_id(symbols, class.symbol()),
         &rest[at..]
     )
 }
