@@ -8,7 +8,7 @@ candidate in `target/worktrees/checker-port` against the pinned `tsgo-oracle`.
 - `measure.sh`, `measure-extra.sh`, `sweep.sh`: the project comparisons that `bound2.sh` and `gate.sh` use.
 - `perf.sh [--mode default|st|both] <label> <bin>... [-- <tsgo arg>...]`: medians of wall, peak RSS and
   instructions:u on Query, Hono, zod and effect, runs interleaved across the binaries; `perf.sh compare`
-  compares two runs with the same host line, tsgo args and env. Wall on mini-743d, instructions and RSS on a
+  compares two runs with the same host line, tsgo args and env. Wall on dbook-lan, instructions and RSS on a
   testbox (`testbox.sh perf`). See "Timing".
 - `facts [section...]`: in one call, the paths and versions agents look up before their first edit: main
   against origin, the accepted revision (commit, bins checked against the gate manifest, gate, evidence),
@@ -283,15 +283,16 @@ Root decision of 2026-10-11 (state note `tbxperf0-result-2026-10-11`; data in `t
 |---|---|---|---|---|
 | instructions:u, `--singleThreaded` | 1% | a testbox, both sides on one testbox | `testbox.sh perf <label> <bin>...` | 0.005% or less |
 | peak RSS, default 4 checkers | 5% | a testbox | the same call, median of 3 | query up to 2%, the others 0.6% |
-| wall, default 4 checkers | 2% | mini-743d, every side in one run | `perf.sh <label> <bin>...` through `remote.sh` (5 rounds) | zod and effect up to 1.1% (tbxperf0: 1.5 to 1.8% at the 95th percentile), hono 0.4%; query up to 6.4% |
+| wall, default 4 checkers | 2% | dbook-lan, every side in one run (mini-743d until 2026-10-12) | `perf.sh <label> <bin>...` through `remote.sh` (5 rounds) | zod and effect up to 1.1% (tbxperf0: 1.5 to 1.8% at the 95th percentile), hono 0.4%; query up to 6.4% |
 
 - `perf.sh` runs `perf stat -e instructions:u,cycles:u,task-clock` and `/usr/bin/time` (max RSS) on each run. Wall
   is perf's own elapsed time in microseconds. `/usr/bin/time %e` had 10 ms steps (about a quarter of a Query run), and the
   sudo and perf start add 24 ms on mini-743d. `--mode st` runs `--singleThreaded`, `both` runs st and the
   default 4 checkers. `PERF_ROUNDS` or `--rounds` sets the rounds: 5 by default, 3 on a testbox.
-- Query runs for 45 ms, and its wall moves about 5% from run to run on mini-743d: use zod and effect for a wall
+- Query runs for 45 ms, and its wall moved about 5% from run to run on mini-743d: use zod and effect for a wall
   claim.
-- mini-743d is the only wall host. cup2 is not one: an A/A at median of 5 gave zod 3.0%, effect 1.8% and query
+- dbook-lan is the only wall host since Theo retired alvin, cup2 and mini-743d (2026-10-12). Its A/A is not
+  measured yet: run one before a wall claim near the 2% bar. The A/A column above is from mini-743d. cup2 was not a wall host: an A/A at median of 5 gave zod 3.0%, effect 1.8% and query
   11.5% (`perf/tbxperf1-r2-cup2-aa`; its virtio balloon has free page reporting on). alvin has no perf.
 - At 4 checkers the instruction counts include waits that depend on timing (A/A: query up to 0.42% at median of
   3 on a testbox, hono 0.09%, zod and effect 0.03%). Use the st counts for an instruction claim. Do not use cycles:u for a 1% claim on any
