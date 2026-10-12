@@ -1790,8 +1790,12 @@ impl<'a> Parser<'a> {
             true, /*allowPrivateIdentifiers*/
             true, /*allowUnicodeEscapeSequenceInIdentifierName*/
         );
-        let is_optional_chain =
-            question_dot_token.is_some() || self.try_reparse_optional_chain(expression);
+        // PERF: parsefast2. One store read for the Go reads of
+        // `expression.Flags` and `expression.Kind` below. The kind of a node
+        // does not change.
+        let (expression_kind, expression_flags) = parsed_kind_and_flags(expression);
+        let is_optional_chain = question_dot_token.is_some()
+            || self.try_reparse_optional_chain_of(expression, expression_kind, expression_flags);
         let property_access = self.factory.new_property_access_expression(
             expression,
             question_dot_token,
@@ -1810,7 +1814,7 @@ impl<'a> Parser<'a> {
                 args![],
             );
         }
-        if is_expression_with_type_arguments(expression) {
+        if expression_kind == SyntaxKind::ExpressionWithTypeArguments {
             let type_arguments = expression.type_argument_list();
             if type_arguments.is_some() {
                 let loc = TextRange::new(
@@ -1828,12 +1832,26 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:5473 tryReparseOptionalChain
-    pub fn try_reparse_optional_chain(&mut self, mut node: Node) -> bool {
-        if node.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
+    pub fn try_reparse_optional_chain(&mut self, node: Node) -> bool {
+        let (kind, flags) = parsed_kind_and_flags(node);
+        self.try_reparse_optional_chain_of(node, kind, flags)
+    }
+
+    /// `try_reparse_optional_chain` of `node`, whose Go `Kind` is `kind` and
+    /// `Flags` are `flags`.
+    // PERF: parsefast2. The callers read the kind and flags once
+    // (`parsed_kind_and_flags`) and use the kind again.
+    pub fn try_reparse_optional_chain_of(
+        &mut self,
+        mut node: Node,
+        kind: SyntaxKind,
+        flags: NodeFlags,
+    ) -> bool {
+        if flags.intersects(NodeFlags::OPTIONAL_CHAIN) {
             return true;
         }
         // check for an optional chain in a non-null expression
-        if is_non_null_expression(node) {
+        if kind == SyntaxKind::NonNullExpression {
             let mut expr = node.expression();
             while is_non_null_expression(expr)
                 && !expr.flags().intersects(NodeFlags::OPTIONAL_CHAIN)
@@ -1907,17 +1925,22 @@ impl<'a> Parser<'a> {
                 }
             }
             if type_arguments.is_some() || self.token == SyntaxKind::OpenParenToken {
+                // PERF: parsefast2. One store read for the Go reads of
+                // `expression.Kind` here and `expression.Flags` in
+                // tryReparseOptionalChain. The argument list does not change
+                // the flags of `expression`.
+                let (mut kind, mut flags) = parsed_kind_and_flags(expression);
                 // Absorb type arguments into CallExpression when preceding expression is ExpressionWithTypeArguments
-                if question_dot_token.is_nil()
-                    && expression.kind() == SyntaxKind::ExpressionWithTypeArguments
-                {
+                if question_dot_token.is_nil() && kind == SyntaxKind::ExpressionWithTypeArguments {
                     type_arguments = expression.type_argument_list();
                     expression = expression.expression();
+                    (kind, flags) = parsed_kind_and_flags(expression);
                 }
                 let inner = expression;
                 let argument_list = self.parse_argument_list();
-                let is_optional_chain =
-                    question_dot_token.is_some() || self.try_reparse_optional_chain(expression);
+                debug_assert_eq!(flags, expression.flags());
+                let is_optional_chain = question_dot_token.is_some()
+                    || self.try_reparse_optional_chain_of(expression, kind, flags);
                 let node = self.factory.new_call_expression(
                     expression,
                     question_dot_token,
