@@ -402,8 +402,9 @@ methods reach the AST through it.
   +1.1%; `SyntaxKind::try_from` is a 351-case switch until late in LLVM's
   pipeline, so the inliner left it or `frozen_store_kind` out of line at
   thousands of call sites (+3% to +7.6%). The column costs 2 bytes per
-  slot, and a node shell leaks its column unless one of the last 4 shells
-  had the same kinds (`shell_kinds`). A new per-slot field of the hot reads goes into a record or kids
+  slot. A node shell copies its kinds into an atomic column of its pooled
+  block (edleak1, `BlockFile::shell_kinds`), read through one cold call
+  (`FileBlock::kind`), so no shell leaks a column. A new per-slot field of the hot reads goes into a record or kids
   word, not a new column. Debug builds check the records and kids against
   the node data at freeze (`debug_check_kids`), and each parent write
   against its stored form.
@@ -433,8 +434,9 @@ methods reach the AST through it.
   name, modifier flags) are not checked in a release build (they are
   about 6 instructions). So a stale read of those gives the values of
   that node while its block waits, and the new owner's data after a
-  reuse, never undefined behavior. Its kind column is never reused, so a
-  stale kind read gives the old kind. Its store, `GoFile`, extras, flow,
+  reuse, never undefined behavior. Its kinds are in the block too
+  (edleak1), so a stale kind read gives the new owner's kind after a
+  reuse. Its store, `GoFile`, extras, flow,
   node data and list reads panic. Every holder of a node of a version
   holds the version, so a correct reader never sees a reuse. No standing
   run has debug assertions: the protected tests run `--release`
@@ -590,7 +592,7 @@ The batch that adds it is not accepted until Theo approves.
   holds it. The
   registry keeps a `Weak`. At publish the version takes its `FileStore`
   and its `GoFile` (M3b). Its node records and kids (`NodeRecord`,
-  `NodeKids`; 40 bytes per node, and 2 in the kind column) are in its node shell, the registry
+  `NodeKids` and the kinds; 42 bytes per node) are in its node shell, the registry
   block of its id (a pooled block, AST node records step 4), so a header or child
   read of the edited file stays inline (a pinned read per node read made
   edits 3 to 4 ms slower); the child link column is dropped, and the
