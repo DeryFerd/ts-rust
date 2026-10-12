@@ -2205,6 +2205,12 @@ pub(crate) mod tests {
                 Err(err) => err.error(),
             };
             // Waits up to 5 s until the reader thread ended the read loop.
+            // This is a wait on the Go side: Go's handler goroutine waits
+            // until `Run` returned, so it runs after the end. The running
+            // frame of the Go clock then has no lag left. Without the reset,
+            // a frame that the port held (lag > 0) and that sees the end
+            // soon after it would count as before the end
+            // (`frame_before_the_end`).
             let wait_for_the_end = |conn: &AsyncConn| {
                 let reader = conn
                     .reader
@@ -2214,6 +2220,9 @@ pub(crate) mod tests {
                 let end = Instant::now() + Duration::from_secs(5);
                 while !lock(&reader.inbox.state).ended && Instant::now() < end {
                     std::thread::sleep(Duration::from_millis(1));
+                }
+                if let Some(lag) = conn.frames.borrow_mut().last_mut() {
+                    *lag = Duration::ZERO;
                 }
             };
             match method {
