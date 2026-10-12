@@ -6,6 +6,8 @@
 # The last line is DONE or FAIL rc=N. Run sessions over 10 minutes under systemd-run --user --collect.
 set -uo pipefail
 HOST=${1:?host} S=${2:?session}
+# alvin, cup2 and the minis are retired (Theo, 2026-10-12): use a testbox, dbook-lan or zbook.
+case $HOST in alvin|cup2|mini-743d|mini-abf9) echo "$HOST is retired: use a testbox, dbook-lan or zbook" >&2; exit 2 ;; esac
 REPO=/home/theo/Code/sandbox/ts-rust
 WT=$(cd "$(dirname "$0")/../.." && pwd)
 OUT=$REPO/target/continuation-r97-goport/buildspeed/runs/$HOST-$S
