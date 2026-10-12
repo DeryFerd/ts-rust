@@ -2554,9 +2554,23 @@ impl PrefetchShared {
     }
 
     /// Queues a parse of `opts.file_name`, unless one is queued already.
+    /// A job that no worker has taken moves up.
+    // PERF (parload2): a worker queues the files that a parse references.
+    // The loader loads them right after that file (depth first), so a job
+    // that a root file or an earlier parse queued, deep in the list, moves
+    // up, as the loader's own batches move up the jobs it reaches
+    // (`queue_batch`). Else the loader reaches it first and parses it
+    // itself. `GOPORT_PREFETCH_MOVE_UP=0` turns it off.
     fn queue(&self, opts: SourceFileParseOptions, script_kind: ScriptKind) {
         let mut queue = lock(&self.queue);
-        if queue.by_name.contains_key(&opts.file_name) {
+        if let Some(job) = queue.by_name.get(&opts.file_name) {
+            if move_up_enabled()
+                && !queue.is_first(job)
+                && matches!(*lock(&job.state), PrefetchState::Queued)
+            {
+                let job = job.clone();
+                queue.push_pending(job);
+            }
             return;
         }
         let Some(job) = queue.add(opts, script_kind, None) else {
@@ -2974,6 +2988,14 @@ pub fn start_default_lib_prefetch(
 fn early_roots_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("GOPORT_EARLY_ROOTS").is_none_or(|value| value != "0"))
+}
+
+/// False when `GOPORT_PREFETCH_MOVE_UP=0`: a worker does not move up the
+/// queued jobs of the files that a parse references (`PrefetchShared::queue`).
+/// An A/B switch.
+fn move_up_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GOPORT_PREFETCH_MOVE_UP").is_none_or(|value| value != "0"))
 }
 
 /// The shared resolution cache of the early pool of this thread, for the

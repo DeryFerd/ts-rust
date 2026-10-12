@@ -3143,13 +3143,14 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
     // names before the loader exists (`start_default_lib_prefetch` with
     // roots), with the shared resolution cache that the loader then takes
     // (`early_shared_resolution`): node16 ESM and CJS files, a script file
-    // (its parse reads the module indicator options) and a package with
-    // `import` and `require` conditions. The load finds what a load without
-    // the early pool finds, and what a single threaded load finds.
+    // (its parse reads the module indicator options), a package with
+    // `import` and `require` conditions and an automatic type directive.
+    // The load finds what a load without the early pool finds, and what a
+    // single threaded load finds.
     #[test]
     fn early_root_jobs_give_the_same_load() {
-        let tsconfig = r#"{ "compilerOptions": { "module": "node16", "types": [],
-             "noEmit": true }, "include": ["src"] }"#;
+        let tsconfig = r#"{ "compilerOptions": { "module": "node16",
+             "types": ["node-ish"], "noEmit": true }, "include": ["src"] }"#;
         let files = [
             ("package.json", r#"{ "name": "app", "type": "module" }"#),
             (
@@ -3175,6 +3176,19 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 "node_modules/lib/cjs.d.cts",
                 "export declare const e: number;\n",
             ),
+            (
+                "node_modules/@types/node-ish/package.json",
+                r#"{ "name": "@types/node-ish", "version": "1.0.0",
+                   "exports": { ".": { "import": "./esm.d.mts", "require": "./index.d.ts" } } }"#,
+            ),
+            (
+                "node_modules/@types/node-ish/index.d.ts",
+                "declare var nodeIsh: number;\n",
+            ),
+            (
+                "node_modules/@types/node-ish/esm.d.mts",
+                "export declare const nodeIsh: number;\n",
+            ),
         ];
         let single = load_text("early_st", tsconfig, &files, true, false);
         assert_eq!(parallel_load("early_off", tsconfig, &files), single);
@@ -3183,10 +3197,16 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         let early = load_text("early_on", tsconfig, &files, false, true);
         set_meta_wait(false);
         assert_eq!(early, single);
-        assert!(
-            single.contains("cjs.d.cts") && single.contains("esm.d.mts"),
-            "{single}"
-        );
+        for name in [
+            "lib/cjs.d.cts",
+            "lib/esm.d.mts",
+            "@types/node-ish/index.d.ts",
+        ] {
+            assert!(
+                single.contains(&format!("file <dir>/node_modules/{name}")),
+                "{single}"
+            );
+        }
         if super::super::files_parser::parse_workers_enabled() {
             assert_eq!(early_pools_taken() - before, 1);
         }
