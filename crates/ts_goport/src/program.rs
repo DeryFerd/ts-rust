@@ -3428,7 +3428,7 @@ thread_local! {
 /// holds the program does. The tables hold the freeable file versions of
 /// the program files (`VersionTables::file_versions`), so the thread keeps
 /// those alive too.
-pub(crate) struct WorkerSeed {
+pub struct WorkerSeed {
     program: &'static GoProgram,
     tables: Option<(u32, Arc<VersionTables>)>,
     synthetic: SyntheticSeed,
@@ -3437,7 +3437,7 @@ pub(crate) struct WorkerSeed {
 }
 
 impl WorkerSeed {
-    pub(crate) fn take() -> Self {
+    pub fn take() -> Self {
         // The new thread cannot build them: it has no frontend program.
         go_frontend::build_lazy_shared_state();
         Self::take_unbuilt()
@@ -3457,7 +3457,7 @@ impl WorkerSeed {
         }
     }
 
-    pub(crate) fn install(self) {
+    pub fn install(self) {
         crate::core::set_thread_program(Some(self.program));
         if let Some(tables) = self.tables {
             TABLES.with(|cache| *cache.borrow_mut() = Some(tables));

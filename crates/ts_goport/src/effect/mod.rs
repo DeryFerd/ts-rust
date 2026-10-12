@@ -11,7 +11,8 @@
 //!
 //! `effect::ls` ports the language service hooks of effect-tsgo 0.51.1
 //! (`etslshooks`): hover, the inlay hint filter and the hook sites that the
-//! later editor lanes fill.
+//! later editor lanes fill. It uses `ls`, so it builds in `ts_goport` (its
+//! `effect` module declares it); the rest of `effect` is `goport_core`'s.
 //!
 //! Read `crates/ts_goport/src/effect/PORTING.md` before editing.
 
@@ -27,7 +28,6 @@ pub mod etscore;
 pub mod graph;
 pub mod keybuilder;
 pub mod layergraph;
-pub mod ls;
 pub mod pluginoptions;
 pub mod rule;
 pub mod rulerunner;

@@ -3962,7 +3962,7 @@ impl<'d> ChildVisit<'d> for ScopedChildVisit<'_, '_> {
 
 /// One child field of node data, in Go `ForEachChild` order
 /// (`for_each_child_field`).
-pub(crate) enum ChildField<'d> {
+pub enum ChildField<'d> {
     /// A single child (Go `visit`). `Node::NIL` for Go `nil`.
     Node(Node),
     /// The `FullSignature` child of a function-like node (Go `visit`).
@@ -3989,7 +3989,7 @@ pub(crate) enum ChildField<'d> {
 /// children. Go `VisitEachChild` visits the same fields in the same order,
 /// except in a SyntaxList, a JSDocTypeLiteral and a JSDoc parameter or
 /// property tag.
-pub(crate) fn for_each_child_field<'d>(
+pub fn for_each_child_field<'d>(
     kind: SyntaxKind,
     n: Node,
     data: &'d NodeData,
