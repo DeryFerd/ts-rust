@@ -102,7 +102,7 @@ child_test! {
 
         // Wait for the "end" progress notification before reading.
         end_rx
-            .recv_timeout(Duration::from_secs(60))
+            .recv_timeout(Duration::from_mins(1))
             .expect("timed out waiting for progress end notification");
 
         let notifications = progress_notifications

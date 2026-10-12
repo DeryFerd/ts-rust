@@ -3405,7 +3405,7 @@ export const a: T | Dep | number = x + (h as never);
                 .map(|file| processed.source_file_meta_datas[file.path()].implied_node_format);
             let _ = sender.send(a);
         });
-        let loaded = receiver.recv_timeout(std::time::Duration::from_secs(60));
+        let loaded = receiver.recv_timeout(std::time::Duration::from_mins(1));
         *PANIC_IN_JOB.lock().unwrap() = None;
         let loaded =
             loaded.expect("the loader still waits for the job of the worker that panicked");
@@ -3459,7 +3459,7 @@ export const a: T | Dep | number = x + (h as never);
                 });
             let _ = sender.send(dep);
         });
-        let loaded = receiver.recv_timeout(std::time::Duration::from_secs(60));
+        let loaded = receiver.recv_timeout(std::time::Duration::from_mins(1));
         *PANIC_IN_JOB.lock().unwrap() = None;
         let loaded =
             loaded.expect("the loader still waits for the job of the worker that panicked");

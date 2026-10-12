@@ -48,7 +48,7 @@ const BLOCK: usize = 5 * MIB / 2;
 const BLOCKS: usize = 8;
 
 /// The longest time a tsgo run of the small project may take.
-const RUN_LIMIT: Duration = Duration::from_secs(60);
+const RUN_LIMIT: Duration = Duration::from_mins(1);
 
 #[test]
 fn layout_from_inside() {

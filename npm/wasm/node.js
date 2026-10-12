@@ -28,7 +28,8 @@ export function loadModule() {
  * `options.cwd` (default: the current directory as `getwd` gives it, the
  * same path as the native tsgo). With `options.files` (path to
  * text, absolute paths), it reads only those files, and `result.files`
- * holds every file after the run, emitted ones included.
+ * holds every file after the run, emitted ones included. In-memory runs
+ * default to `/` as their current directory.
  *
  * Returns `{ exitCode, stdout, stderr, diagnostics?, files? }`.
  * `options.diagnostics: "json"` returns the diagnostics as objects in
@@ -44,7 +45,7 @@ export async function tsc(args, options = {}) {
     const request = {
         module,
         args,
-        cwd: toPosix(options.cwd ?? getwd()),
+        cwd: toPosix(options.cwd ?? (files === undefined ? getwd() : "/")),
         files,
         env: options.env ?? {},
         diagnosticsJson: options.diagnostics === "json",

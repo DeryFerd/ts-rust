@@ -3786,7 +3786,7 @@ pub(crate) fn take_prefetched_mapped(
     let mut state = lock(&job.state);
     #[cfg(test)]
     if lock(&MAPPED_WAIT_FOR_WORKER).contains(&opts.file_name) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
         while matches!(*state, PrefetchState::Queued) && std::time::Instant::now() < deadline {
             // A worker sets `Running` without a wake, so this polls.
             state = job

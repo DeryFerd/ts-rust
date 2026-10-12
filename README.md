@@ -81,9 +81,9 @@ the plugin, as with `@effect/language-service`:
 The rules, options and `@effect-diagnostics` comments are a port of
 [Effect-TS/tsgo](https://github.com/Effect-TS/tsgo) 0.51.1. The language server also has its editor
 features: the Effect hover (with the Layer summary), inlay hints, the auto-import style, quick fixes,
-document symbols, completions and refactors. All the editor features of 0.51.1 are ported. The lightbulb
-and the quick fix menu show the Effect refactors. The editor's Refactor menu does not show them yet: it
-needs `refactor.rewrite` in the server's code action kinds, which waits for a decision.
+document symbols, completions and refactors. All the editor features of 0.51.1 are ported. The lightbulb,
+the quick fix menu and the editor's Refactor menu show the Effect refactors: as in 0.51.1, the server lists
+`refactor.rewrite` in its code action kinds.
 
 The API stability rules of 0.51.1 read the `@stability` JSDoc tags of Effect 4.
 `unstableApiUsage` (TS377136) and `experimentalApiUsage` (TS377135) report each use of an
@@ -131,115 +131,117 @@ Three switches make some projects faster or use less memory. They are off by def
 
 ## Benchmark: T3 Code
 
-Full type check of [T3 Code](https://github.com/pingdotgg/t3code), compared with `tsc` 6, `tsc` 7
-and the new `bun check` in Bun. T3 Code uses Effect, so there are two cases: without the Effect
-diagnostics and with them. Each time is the sum for the five T3 Code projects. Lower is faster.
+Full type check of [T3 Code](https://github.com/pingdotgg/t3code) at
+[`cd41c4ad`](https://github.com/pingdotgg/t3code/tree/cd41c4ada0c70cc2eec95ecd7266f3dab010c58c),
+with and without Effect diagnostics. Each time is the **sum of the medians** for `apps/server`,
+`apps/web`, `apps/mobile`, `packages/client-runtime` and `packages/shared`, not the elapsed time
+of the parallel benchmark workflow. Lower is faster.
 
 **Without Effect diagnostics**
 
-| Checker     |   Time | vs `tsc` 6 | vs `tsc` 7   |                                            |
-| ----------- | -----: | ---------: | ------------ | ------------------------------------------ |
-| `bun check` |  4.07s |      15.4× | 3.95× faster | `█`                                        |
-| `tsc-rs`    |  5.27s |      11.9× | 3.05× faster | `██`                                       |
-| `tsc` 7     | 16.10s |       3.9× | baseline     | `█████`                                    |
-| `tsc` 6     | 62.63s |   baseline | 3.89× slower | `██████████████████`                       |
+| Checker | Time | Speed vs `tsc` 7 |
+| --- | ---: | ---: |
+| `bun check` | 4.57s | 3.51× |
+| `tsc-rs main` | 6.41s | 2.51× |
+| `tsc-rs` 0.3.0 | 6.87s | 2.34× |
+| `tsc` 7 | 16.07s | baseline |
+| `tsc` 6 | 79.57s | 0.20× |
 
 **With Effect diagnostics**
 
-| Checker                                         |    Time | vs `tsc` 6 | vs `tsc` 7 + Effect |                                            |
-| ----------------------------------------------- | ------: | ---------: | ------------------- | ------------------------------------------ |
-| `tsc-rs` (Effect built in)                      |   8.35s |      16.6× | 2.52× faster        | `██`                                       |
-| `tsc` 7 + `@effect/tsgo`                        |  21.07s |       6.6× | baseline            | `██████`                                   |
-| `bun check`, then `effect-tsgo diagnostics`     |  37.60s |       3.7× | 1.78× slower        | `███████████`                              |
-| `tsc` 6 + `@effect/language-service`            | 138.63s |   baseline | 6.58× slower        | `████████████████████████████████████████` |
+| Checker | Time | Speed vs `tsc` 7 |
+| --- | ---: | ---: |
+| `tsc-rs main` (Effect built in) | 8.55s | 3.06× |
+| `tsc-rs` 0.3.0 (Effect built in) | 10.71s | 2.45× |
+| `tsc` 7 + `@effect/tsgo` | 26.20s | baseline |
+| `bun check`, then `effect-tsgo diagnostics` | 45.44s | 0.58× |
+| `tsc` 6 + JavaScript Effect plugin | 167.16s | 0.16× |
 
-`bun check` is the fastest when you do not need the Effect diagnostics: 1.29× faster than
-`tsc-rs` in total. On `packages/client-runtime`, `tsc-rs` is a little faster. `bun check` does not
-have the Effect diagnostics, so an Effect project needs a second pass. `tsc-rs` gets them from its
-one check, which makes it 4.5× faster than `bun check` plus `effect-tsgo diagnostics`. See
-[Why `bun check` is faster](#why-bun-check-is-faster).
+Compared with 0.3.0, main takes **6.7% less time without Effect** and
+**20.2% less time with Effect**. Bun is fastest without Effect. With Effect,
+main is 5.32× faster than Bun followed by the separate Effect pass.
 
-Errors. `tsc-rs`, `tsc` 7 + `@effect/tsgo` and the `effect-tsgo diagnostics` pass report the same
-221 Effect diagnostics. `tsc` 6 uses the JavaScript Effect plugin
-(`@effect/language-service` 0.87.4), which has a different rule set: it reports 287 on
-`apps/server` where the others report 177. `tsc-rs` and `tsc` 6 report one more error, TS2322 in
-`apps/server/scripts/record-pi-rpc-replay-fixture.ts`. TypeScript 7.1.0-dev reports it too, and
-[pingdotgg/t3code#16704](https://github.com/pingdotgg/t3code/pull/16704) fixes it.
+Diagnostics matter when comparing these times:
 
-How it was measured: the same machine and method as the real-world apps below, with
-`--composite false` added (`apps/web` is composite). T3 Code at
-[`cd41c4ad`](https://github.com/pingdotgg/t3code/tree/cd41c4ada0c70cc2eec95ecd7266f3dab010c58c),
-projects `apps/server`, `apps/web`, `apps/mobile`, `packages/client-runtime` and
-`packages/shared`. Without Effect, the configs have no Effect plugin. With Effect, `tsc` 7 is the
-Effect-patched 7.0.2 from `@effect/tsgo` 0.46.1, and `tsc` 6 is 6.0.3 patched with
-`@effect/language-service`. These numbers are from `tsc-rs` when it was a port of 0.46.1. They
-were not measured again after the port moved to 0.51.1. The script is
-[scripts/bench-apps/t3code.sh](scripts/bench-apps/t3code.sh). The `tsc-rs` switch in T3 Code is
-[pingdotgg/t3code#16704](https://github.com/pingdotgg/t3code/pull/16704).
+- Without Effect, main matches the pinned `tsc` 7 diagnostics exactly. Both Rust versions and
+  `tsc` 6 report the same TS2322 in the server fixture; 0.3.0 formats its message differently.
+  Bun reports no TypeScript errors.
+- With Effect, main, 0.3.0 and the native Effect compiler agree on **4,823 Effect diagnostics**,
+  including 4,602 unstable-API warnings. The separate Effect pass after Bun reports the same
+  rules and messages, with different path and severity formatting.
+- The native Effect compilers also report 26 TS2790 diagnostics. Main and 0.3.0 additionally
+  report the TS2322 above, which the pinned `tsc` 7 also reports; the Effect compiler's older
+  TypeScript version does not. The JavaScript Effect plugin uses a different rule set and
+  reports 305 diagnostics in total. These tools do not all perform identical checks.
+
+Measured on 2026-10-11–12 UTC, on Blacksmith `blacksmith-16vcpu-ubuntu-2404` runners
+(16 AMD EPYC vCPUs, about 62 GiB RAM). Each project/mode has its own runner; all five compilers
+for that case run on that same runner. Every cell has 5 runs after 1 warmup, with
+`--noEmit --incremental false --composite false` and default thread counts. TypeScript 6
+runs on Node 24.19.0 with a 16 GiB heap.
+
+Without Effect, the configs have no Effect plugin and `tsc` 7 is 7.1.0-dev.20261008.1.
+With Effect, `@effect/tsgo` 0.51.1 supplies its TypeScript 7.0.2 executable; the JavaScript
+comparison uses TypeScript 6.0.3 and `@effect/language-service` 0.87.4. Bun is
+1.4.4-canary.1+7c96a1212. Main is
+[`6c4d9ae33`](https://github.com/pingdotgg/ts-rust/commit/6c4d9ae3386e8e031ff1bff5eb8733c14018c300),
+an unreleased build with the same compiler source as the app benchmark below. Both Rust
+versions use release PGO without BOLT.
+
+[Results, samples, hashes and per-case metadata](docs/benchmarks/2026-10-12-blacksmith-t3.json)
+come from [this Blacksmith run](https://github.com/pingdotgg/ts-rust/actions/runs/38185127561).
+The [workflow](.github/workflows/bench-apps.yml) caches the verified compiler and prepared
+inputs before running the comparisons in parallel. The T3 Code runner is
+[scripts/bench-apps/t3code.sh](scripts/bench-apps/t3code.sh).
 
 ## Benchmark: real-world apps
 
-Full type check of six open-source apps with `tsc` 6 (the JavaScript compiler), `tsc` 7 (the Go
-compiler), `tsc-rs` and `bun check`. The multiplier is the speedup over `tsc` 6. Lower times are
-faster.
+Full type check of six open-source apps on a Blacksmith `blacksmith-16vcpu-ubuntu-2404`
+runner (16 AMD EPYC vCPUs, about 62 GiB RAM). All five compilers ran on the same runner.
+Lower times are faster. `tsc-rs main` is an unreleased build; 0.3.0 is the published package.
 
-| App | Lines checked | `tsc` 6 | `tsc` 7 | `tsc-rs` | `bun check` |
+| App | `tsc` 6 | `tsc` 7 | `tsc-rs` 0.3.0 | `tsc-rs main` | `bun check` |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| [VS Code](https://github.com/microsoft/vscode/tree/3f07e1aba32acacb8b08ae91bfdc954b580ad1fd) | 3.75M | 54.56s | 6.84s (8.0×) | 3.49s (15.6×) | 1.62s (33.7×) |
-| [Sentry](https://github.com/getsentry/sentry/tree/8294650589dbd26f230c73f4ab26b62a68aede8f) (frontend) | 2.11M | 58.76s | 7.90s (7.4×) | 3.76s (15.6×) | 3.14s (18.7×)\* |
-| [Playwright](https://github.com/microsoft/playwright/tree/d469960fdfc461e2d5795a3fa48a58a52a91ecaf) | 585k | 4.48s | 0.66s (6.8×) | 0.29s (15.3×) | 0.18s (25.0×) |
-| [Excalidraw](https://github.com/excalidraw/excalidraw/tree/53973c3a423fbd75a4ce68107786b4fcb90e4968) | 449k | 5.32s | 0.80s (6.7×) | 0.58s (9.2×) | 0.18s (29.0×) |
-| [TypeORM](https://github.com/typeorm/typeorm/tree/c64a1f052fc39f6688b6b73b83d065d7147ba8bb) | 386k | 3.86s | 0.55s (7.0×) | 0.31s (12.4×) | 0.19s (20.0×) |
-| [tRPC](https://github.com/trpc/trpc/tree/d756e591a5e37ef20b8d75ecd4d736c195497289) (server package) | 209k | 1.10s | 0.16s (6.8×) | 0.08s (13.6×) | 0.12s (9.1×)\* |
-| **Geometric mean** | | | **7.1×** | **13.4×** | **20.9×** |
+| [VS Code](https://github.com/microsoft/vscode/tree/3f07e1aba32acacb8b08ae91bfdc954b580ad1fd) | 69.65s | 7.44s | 4.65s | 4.55s | 1.65s |
+| [Sentry (frontend)](https://github.com/getsentry/sentry/tree/8294650589dbd26f230c73f4ab26b62a68aede8f) | 71.24s | 9.02s | 4.48s | 5.01s | 2.75s |
+| [Playwright](https://github.com/microsoft/playwright/tree/d469960fdfc461e2d5795a3fa48a58a52a91ecaf) | 5.85s | 0.79s | 0.39s | 0.41s | 0.23s |
+| [Excalidraw](https://github.com/excalidraw/excalidraw/tree/53973c3a423fbd75a4ce68107786b4fcb90e4968) | 6.50s | 1.30s | 0.76s | 0.69s | 0.24s |
+| [TypeORM](https://github.com/typeorm/typeorm/tree/c64a1f052fc39f6688b6b73b83d065d7147ba8bb) | 4.99s | 0.54s | 0.38s | 0.38s | 0.14s |
+| [tRPC (server package)](https://github.com/trpc/trpc/tree/d756e591a5e37ef20b8d75ecd4d736c195497289) | 1.44s | 0.17s | 0.09s | 0.09s | 0.10s |
+| **Geometric mean vs `tsc` 6** | **1.0×** | **7.7×** | **13.5×** | **13.6×** | **27.0×** |
 
-\* `bun check` reports errors that no other checker reports: 3 on Sentry and 2 on tRPC.
+`tsc-rs main` is **1.76× faster than `tsc` 7** across these apps (geometric mean).
+The corresponding figures are 1.75× for 0.3.0 and 3.49× for Bun. Main and 0.3.0 are within
+1% overall, with differences by project shown above. Bun is fastest on five apps;
+`tsc-rs main` is fastest on tRPC.
 
-Compared with `tsc` 7, `tsc-rs` is 1.89× faster and `bun check` is 2.95× faster (geometric
-means). `bun check` is the fastest on every app except tRPC. Compared with `tsc-rs` 0.2.0,
-`bun check` is 1.56× faster (geometric mean; it was 1.83× with 0.1.0):
+Diagnostics differ between compilers. Main, 0.3.0 and the pinned `tsc` 7 produce identical
+full diagnostics: 10 on VS Code, 2 on Sentry, and none on the other four apps. `tsc` 6 reports
+9 on VS Code and none on the others. Bun reports none on VS Code or Sentry, and 2 on tRPC.
+The time comparisons do not imply identical checking behavior for Bun or `tsc` 6.
 
-| App | `bun check` vs `tsc-rs` |
-| --- | --- |
-| VS Code | 2.16× faster |
-| Sentry | 1.20× faster |
-| Playwright | 1.63× faster |
-| TypeORM | 1.61× faster |
-| Excalidraw | 3.16× faster |
-| tRPC | 1.48× slower |
+Measured on 2026-10-11: median of 5 runs after 1 warmup, `--noEmit --incremental false`,
+default thread counts, and direct native binaries. `tsc` 6 runs on Node 24.19.0 with a 16 GiB
+heap. Versions: TypeScript 6.0.3 and 7.1.0-dev.20261008.1, `tsc-rs` 0.3.0,
+[`tsc-rs main` at 69f0a1df3](https://github.com/pingdotgg/ts-rust/commit/69f0a1df3e54387e28e8ca3e9206649d5871cd66),
+and Bun 1.4.4-canary.1+7c96a1212. Both Rust builds use release PGO without BOLT; main uses the
+same static musl build and training process as the release workflow.
 
-Each config checks with 0 errors under `tsc` 7.0.2. The other differences:
+[Results, samples, hashes and input revisions](docs/benchmarks/2026-10-11-blacksmith-apps.json)
+come from [this Blacksmith run](https://github.com/pingdotgg/ts-rust/actions/runs/38182079311).
+Its app stage completed; the later T3 Code setup failure did not affect these measurements.
 
-- `tsc-rs` reports 10 errors on VS Code and 2 on Sentry. TypeScript 7.1.0-dev (`typescript@next`)
-  reports the same errors, line for line. `tsc-rs` ports a 7.1 dev revision, which has checks that
-  7.0.2 does not have.
-- `tsc` 6 reports 9 errors on VS Code.
+The pinned app inputs use the same preparation as the earlier benchmark:
 
-How it was measured: Apple M4 Pro (12 cores, 48 GB), macOS 26.5.1. [hyperfine](https://github.com/sharkdp/hyperfine),
-median of 5 runs after 1 warmup run, with `--noEmit --incremental false`. Each checker uses its
-default thread count. `tsc` 7 and `tsc-rs` run as native binaries, without the npm launcher.
-`tsc` 6 runs on Node 24.19 with a 16 GB heap, because it runs out of memory on VS Code and Sentry
-with the default heap. Versions: `tsc-rs` 0.2.0, TypeScript 7.0.2 and 6.0.3, Bun canary
-`bd599f5af`. The `tsc-rs` times are from 2026-10-09 and the others from 2026-10-07, on the same
-machine. `tsc-rs` 0.2.0 reports the same errors as 0.1.0. Lines checked is the `tsc` 7
-`--extendedDiagnostics` count, with the `.d.ts` files. The T3 Code benchmark above uses the same
-machine and method.
+- Excalidraw: remove `baseUrl`, which native TypeScript no longer supports.
+- TypeORM: use `nodenext` module resolution.
+- VS Code: install the Electron typings normally supplied by its postinstall.
+- Playwright: generate the injected sources normally supplied by its build.
 
-Four apps needed changes to check with 0 errors under `tsc` 7. Nothing else changed:
-
-- Excalidraw: no `baseUrl`, because TS 7 removed it.
-- TypeORM: `moduleResolution` changed from `node` to `nodenext`, because TS 7 removed `node`.
-- VS Code: the `electron` typings that its postinstall adds.
-- Playwright: the sources that its build generates.
-
-Two apps are not in the table:
-
-- rxjs main needs its workspace packages built first.
-- date-fns uses project references. There, `tsc -p` and `bun check` do different work.
-
-The scripts are in [scripts/bench-apps](scripts/bench-apps): `setup.sh <dir>`, then
-`run.sh <dir>` and `summary.py <dir>`, and `t3code.sh <dir>` for T3 Code. To time a new `tsc-rs`
-only, run `run.sh` and `t3code.sh` with `TOOLS=tsc-rs`.
+The scripts are in [scripts/bench-apps](scripts/bench-apps). The
+[benchmark workflow](.github/workflows/bench-apps.yml) caches the verified compiler and each
+prepared project, then runs each comparison on a separate runner of the same size. Each
+comparison keeps all compilers on one runner and saves their full output and exit codes.
 
 ### Why `bun check` is faster
 
