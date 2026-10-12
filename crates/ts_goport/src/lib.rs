@@ -41,6 +41,9 @@ mod flags_macros {
 // Macros that goport_util exports. `crate::go_assert` and `crate::unported`
 // keep working.
 pub use goport_util::{go_assert, unported};
+// Macros that goport_core exports (`#[macro_export]`), at their
+// `ts_goport::` paths from before crate split step 2.
+pub use goport_core::{args, effect_cached, effect_export_member};
 
 // Language-service port (Go `internal/{ls,lsp,project,format,api}`) and the command line.
 pub mod api;
