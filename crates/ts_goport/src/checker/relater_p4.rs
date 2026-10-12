@@ -109,7 +109,9 @@ fn relate_variances(
 
 impl Checker {
     // Go: checker/relater.go:2829 getTypeOfPropertyInTypes
-    pub fn get_type_of_property_in_types(&mut self, types: &[TypeId], name: &str) -> TypeId {
+    // PERF (jsxname1): `name` is the property symbol's `Name`, so the
+    // lookups compare name ids.
+    pub fn get_type_of_property_in_types(&mut self, types: &[TypeId], name: &Name) -> TypeId {
         let mut prop_types: Vec<TypeId> = Vec::new();
         for &t in types {
             let prop_type = self.get_type_of_property_in_type(t, name);
@@ -119,16 +121,16 @@ impl Checker {
     }
 
     // Go: checker/relater.go:2837 getTypeOfPropertyInType
-    pub fn get_type_of_property_in_type(&mut self, t: TypeId, name: &str) -> TypeId {
+    pub fn get_type_of_property_in_type(&mut self, t: TypeId, name: &Name) -> TypeId {
         let t = self.get_apparent_type(t);
         let prop = if self
             .ty(t)
             .flags
             .intersects(TypeFlags::UNION_OR_INTERSECTION)
         {
-            self.get_property_of_union_or_intersection_type(t, name, false)
+            self.get_property_of_union_or_intersection_type_key(t, TableKey::Name(name), false)
         } else {
-            self.get_property_of_object_type(t, name)
+            self.get_property_of_object_type_key(t, TableKey::Name(name))
         };
         if prop.is_some() {
             return self.get_type_of_symbol(prop);

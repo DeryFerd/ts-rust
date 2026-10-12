@@ -46,9 +46,7 @@ impl Checker {
         }
         let exports = self.sym(module_symbol).exports;
         if local_symbol.is_some() {
-            let exported_equals_symbol = self
-                .symbols
-                .get(exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS);
+            let exported_equals_symbol = self.symbols.get(exports, &*EXPORT_EQUALS_NAME);
             if exported_equals_symbol.is_some() {
                 if self
                     .get_symbol_if_same_reference(exported_equals_symbol, local_symbol)
@@ -1271,10 +1269,9 @@ impl Checker {
         dont_resolve_alias: bool,
     ) -> SymbolId {
         if module_symbol.is_some() {
-            let export_equals_symbol = self.symbols.get(
-                self.sym(module_symbol).exports,
-                INTERNAL_SYMBOL_NAME_EXPORT_EQUALS,
-            );
+            let export_equals_symbol = self
+                .symbols
+                .get(self.sym(module_symbol).exports, &*EXPORT_EQUALS_NAME);
             let export_equals = self.resolve_symbol_ex(export_equals_symbol, dont_resolve_alias);
             if export_equals.is_some() {
                 return self.get_merged_symbol(export_equals);

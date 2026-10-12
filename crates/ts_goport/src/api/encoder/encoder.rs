@@ -1129,7 +1129,7 @@ fn store_node_data<'f>(
     node: Node,
     kind: SyntaxKind,
     fast: Option<&StoreFile<'f>>,
-) -> Option<&'f NodeData> {
+) -> Option<NodeData<'f>> {
     let fast = fast?;
     if node.file_index() != fast.file || !walks_node_data(kind) {
         return None;
@@ -1229,7 +1229,7 @@ fn encode_visit(node: Node, visitor: &mut EncodeVisitor<'_>, fast: Option<&Store
 fn store_node_data_word(
     node: Node,
     kind: SyntaxKind,
-    data: &NodeData,
+    data: NodeData<'_>,
     pos: i32,
     end: i32,
     st: &mut EncodeTreeState,
@@ -1336,7 +1336,7 @@ fn encode_each_child(node: Node, visitor: &mut EncodeVisitor<'_>, fast: Option<&
 fn encode_store_children(
     node: Node,
     kind: SyntaxKind,
-    data: &NodeData,
+    data: NodeData<'_>,
     visitor: &mut EncodeVisitor<'_>,
     fast: &StoreFile<'_>,
 ) -> u8 {

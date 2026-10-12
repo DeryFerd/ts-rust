@@ -13,7 +13,7 @@
 //! PORT: Go `p.nodeSliceArena` only saves allocations. Here each call uses a
 //! new `Vec`.
 
-use crate::astdata::NodeData as D;
+use crate::astdata::BoxedData as D;
 use crate::frontend::prelude::*;
 
 /// Go `node.AsX().Field = v`: clones the data of `n`, lets `f` change it and
@@ -22,7 +22,7 @@ use crate::frontend::prelude::*;
 /// `node_list_value`, ...), not from the parser's factory: they must be in
 /// the space and owner of `n`, as its new data is (astshrink2).
 fn mutate(n: Node, f: impl FnOnce(&mut D)) {
-    let mut data = with_ast_data(n, Clone::clone);
+    let mut data = with_ast_data(n, |d| d.to_boxed());
     f(&mut data);
     replace_node_data(n, data);
 }
@@ -48,7 +48,10 @@ macro_rules! with_function_like_data {
             D::MethodSignatureDeclaration($d) => $body,
             D::SetAccessorDeclaration($d) => $body,
             D::IndexSignatureDeclaration($i) => $index_body,
-            other => panic!("node data is not function-like: {}", other.schema_name()),
+            other => panic!(
+                "node data is not function-like: {}",
+                other.view().schema_name()
+            ),
         }
     };
 }
@@ -68,7 +71,7 @@ fn set_type(n: Node, t: Node) {
         D::GetAccessorDeclaration(d) => d.type_ = id,
         other => panic!(
             "Unhandled case in mutableNode.SetType: {}",
-            other.schema_name()
+            other.view().schema_name()
         ),
     });
 }
@@ -83,7 +86,7 @@ fn set_expression(n: Node, expr: Node) {
         D::ExportAssignment(d) => d.expression = id,
         other => panic!(
             "Unhandled case in mutableNode.SetExpression: {}",
-            other.schema_name()
+            other.view().schema_name()
         ),
     });
 }
@@ -111,7 +114,10 @@ fn set_modifiers(n: Node, modifiers: ModifierList) {
         D::GetAccessorDeclaration(d) => d.modifiers = mods,
         D::SetAccessorDeclaration(d) => d.modifiers = mods,
         D::BinaryExpression(d) => d.modifiers = mods,
-        other => panic!("Unhandled case in setModifiers: {}", other.schema_name()),
+        other => panic!(
+            "Unhandled case in setModifiers: {}",
+            other.view().schema_name()
+        ),
     });
 }
 

@@ -419,7 +419,8 @@ pub fn emit_can_start_with_check() -> bool {
 /// The option part of `emit_can_start_with_check`. False with `noEmit`,
 /// `--listFilesOnly` (Go emits nothing with either), `noEmitOnError` (the
 /// emit needs every diagnostic first), `--singleThreaded`, a trace,
-/// `preserveSymlinks` (F4), `outFile`, and `GOPORT_EARLY_EMIT=0`. Then
+/// `preserveSymlinks` (F4), `outFile`, `GOPORT_EARLY_EMIT=0`, and a check
+/// that steals files (fast mode, `crate::program::stealing_check`). Then
 /// `tsc -p` keeps Go's order exactly: it does not start the check early
 /// either. `tsc -b` starts each check early in
 /// any case. When these rules and `check_cannot_see_outputs` allow it, it
@@ -429,6 +430,7 @@ pub fn emit_can_start_with_check() -> bool {
 pub fn early_emit_options_allow() -> bool {
     let options = options();
     early_emit_enabled()
+        && !crate::program::stealing_check()
         && !options.no_emit.is_true()
         && !options.list_files_only.is_true()
         && !options.no_emit_on_error.is_true()

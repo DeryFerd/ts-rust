@@ -1395,14 +1395,12 @@ impl Discriminator for ObjectLiteralDiscriminator {
     }
 
     // Go: checker/checker.go:31272 ObjectLiteralDiscriminator.name
-    fn name(&self, c: &Checker, index: i32) -> String {
+    fn name(&self, c: &Checker, index: i32) -> Name {
         let index = index as usize;
         if index < self.props.len() {
-            return c.sym(self.props[index].symbol()).name.to_string();
+            return c.sym(self.props[index].symbol()).name.clone();
         }
-        c.sym(self.members[index - self.props.len()])
-            .name
-            .to_string()
+        c.sym(self.members[index - self.props.len()]).name.clone()
     }
 
     // Go: checker/checker.go:31279 ObjectLiteralDiscriminator.matches
@@ -1476,7 +1474,7 @@ impl Checker {
             for s in self.get_properties_of_type(contextual_type) {
                 let name = self.sym(s).name.clone();
                 if self.sym(s).flags.intersects(SymbolFlags::OPTIONAL)
-                    && self.symbols.get(node_members, &name).is_nil()
+                    && self.symbols.get_name(node_members, &name).is_nil()
                     && self.is_discriminant_property_key(contextual_type, TableKey::Name(&name))
                 {
                     discriminant_members.push(s);

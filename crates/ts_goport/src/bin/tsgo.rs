@@ -957,7 +957,10 @@ fn send_code(worker: Worker, code: i32) {
 // `scanner_util::GO_STRING_MARKER`). The system writer writes the Go bytes
 // of the output (`GoOutput`).
 fn run_main(start: Instant) -> i32 {
-    let args: Vec<String> = ts_goport::frontend::osutil::args()[1..].to_vec();
+    let mut args: Vec<String> = ts_goport::frontend::osutil::args()[1..].to_vec();
+    // PORT: not in Go (fastmode1). Go has no `--fast`: it leaves before Go's
+    // option parsing sees it.
+    ts_goport::fast_mode::take_flag(&mut args);
 
     if let Some(first) = args.first() {
         match first.as_str() {
