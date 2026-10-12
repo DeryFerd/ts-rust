@@ -294,7 +294,7 @@ impl Default for FlowSkip {
             hot: Count {
                 countdown: 0,
                 gap: 0,
-                need: 0,
+                measured: 0,
             },
             effects: 0,
             recording: None,
@@ -320,14 +320,16 @@ impl std::fmt::Debug for FlowSkip {
 /// doubles from `FIRST_GAP` up to `sample_every`: a new file is judged on
 /// small gaps, so one long walk of a file with few walks does not index it
 /// (query-core lost 0.15% that way with a fixed gap of 32). `countdown` is
-/// the walks up to the next measured one, `need` the measured steps that
-/// the file still needs before it is indexed. The other walks pay only the
-/// countdown.
+/// the walks up to the next measured one, `measured` the weighted steps
+/// measured so far. The file is indexed when they reach
+/// `FlowSkip::build_steps` per flow node, read at each measured walk, so a
+/// later change of `build_steps` reaches a file that is counted already.
+/// The other walks pay only the countdown.
 #[derive(Clone, Copy)]
 struct Count {
     countdown: u32,
     gap: u32,
-    need: u64,
+    measured: u64,
 }
 
 enum FileState {
@@ -1574,15 +1576,18 @@ impl Checker {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     // Only a static file (the CLI case) is indexed: its flow
                     // nodes live for the process.
-                    let Some(flows) = static_go_file(file).and_then(|g| g.flow_nodes.get()) else {
+                    if static_go_file(file)
+                        .and_then(|g| g.flow_nodes.get())
+                        .is_none()
+                    {
                         entry.insert(FileState::Unsupported);
                         return Err(Refusal::File);
-                    };
+                    }
                     let gap = FIRST_GAP.min(self.flow_skip.sample_every);
                     let count = Count {
                         countdown: gap,
                         gap,
-                        need: u64::from(self.flow_skip.build_steps) * flows.len() as u64,
+                        measured: 0,
                     };
                     entry.insert(FileState::Counting(count));
                     Some(count)
@@ -1602,8 +1607,9 @@ impl Checker {
         }
         if self.flow_skip.hot_file == Some(file as u32) {
             let sample_every = self.flow_skip.sample_every;
+            let build_steps = self.flow_skip.build_steps;
             let hot = &mut self.flow_skip.hot;
-            if hot.need > 0 {
+            if build_steps > 0 {
                 hot.countdown -= 1;
                 if hot.countdown > 0 {
                     return Err(Refusal::Counting);
@@ -1620,8 +1626,8 @@ impl Checker {
                 } else {
                     0
                 };
-                if steps < hot.need {
-                    hot.need -= steps;
+                hot.measured += steps;
+                if hot.measured < u64::from(build_steps) * flows.len() as u64 {
                     return Err(Refusal::Counting);
                 }
             }
