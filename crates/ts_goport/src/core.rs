@@ -2662,8 +2662,8 @@ pub struct SymbolArena {
     symbols: CowChunks<Symbol>,
     tables: CowChunks<Table>,
     /// The names that the binder gave private identifier symbols
-    /// (`get_symbol_name_for_private_identifier`), as intern ids. Each holds
-    /// a symbol id, which `prepare_file_arena` moves.
+    /// (`get_symbol_name_for_private_identifier`), as intern ids, for the
+    /// lib bind snapshot (`note_private_name`).
     private_names: Vec<u32>,
     /// Where `crate::ast::get_symbol_id` keeps the ids of these symbols.
     ids: SymbolIds,
@@ -3071,8 +3071,8 @@ impl SymbolArena {
     }
 
     /// Notes that the binder gave `name` to a private identifier symbol
-    /// (`get_symbol_name_for_private_identifier`), so the name holds a
-    /// symbol id.
+    /// (`get_symbol_name_for_private_identifier`), for the lib bind
+    /// snapshot (`private_names`).
     pub fn note_private_name(&mut self, name: &Name) {
         self.private_names.push(name.0);
     }
@@ -3262,14 +3262,8 @@ impl SymbolArena {
     /// The declaration lists of a static file leak (`make_static`), because
     /// its symbols live until exit. A freeable file version (`freeable`,
     /// lsshells M3d) keeps them owned, so they go with its chunks.
-    // PORT: the binder writes a symbol id into the names of private
-    // identifier symbols (`get_symbol_name_for_private_identifier`), so those
-    // names move with the ids. Source text can spell a name of the same form
-    // (the byte 0xFE + "#1@#p", see `ast::INTERNAL_SYMBOL_NAME_PREFIX`). Go
-    // keeps such a name as written, so only a symbol that a private
-    // identifier declares moves, with its entries in the tables. Go gives
-    // symbol ids in a different order, so a source name that is equal to a
-    // private identifier name in Go is not always equal to it here.
+    // PORT: the names of private identifier symbols hold no symbol id
+    // (`get_symbol_name_for_private_identifier`, edleak1), so no name moves.
     // PERF: the entries are changed in place and moved by chunk. Rebuilding
     // each symbol in an iterator chain was most of the join time.
     #[must_use]
@@ -3277,35 +3271,12 @@ impl SymbolArena {
         let SymbolArena {
             symbols,
             tables,
-            private_names,
+            private_names: _,
             ids: _,
             seen: _,
         } = self;
-        // The file symbols whose names hold a symbol id.
         // apisym1c: ids move with offset 0 too, from the second chunk on.
-        let mut private_symbols = FxHashSet::default();
-        if !private_names.is_empty() {
-            let private_names: FxHashSet<u32> = private_names.into_iter().collect();
-            for i in 1..symbols.len() {
-                let symbol = symbols.get(i);
-                if private_names.contains(&symbol.name.0)
-                    && symbol.declarations.iter().any(|&declaration| {
-                        crate::ast::is_private_identifier(crate::ast::get_name_of_declaration(
-                            declaration,
-                        ))
-                    })
-                {
-                    private_symbols.insert(i as u32);
-                }
-            }
-        }
-        // `into_aligned` visits the symbols in order from index 1.
-        let mut index = 0u32;
         let symbols = symbols.into_aligned(1, offsets.symbols as usize + 1, |symbol| {
-            index += 1;
-            if private_symbols.contains(&index) {
-                symbol.name = offsets.private_name(&symbol.name);
-            }
             symbol.members = offsets.table(symbol.members);
             symbol.exports = offsets.table(symbol.exports);
             symbol.parent = offsets.symbol(symbol.parent);
@@ -3317,19 +3288,8 @@ impl SymbolArena {
             }
         });
         let tables = tables.into_aligned(1, offsets.tables as usize + 1, |table| {
-            let mut renamed = false;
             for entry in &mut table.entries {
-                if private_symbols.contains(&entry.symbol.0) {
-                    let name = offsets.private_name(&Name(entry.name));
-                    if name.0 != entry.name {
-                        renamed = true;
-                        entry.name = name.0;
-                    }
-                }
                 entry.symbol = offsets.symbol(entry.symbol);
-            }
-            if renamed {
-                table.reindex();
             }
         });
         PreparedFileArena {
@@ -3543,10 +3503,6 @@ pub struct ArenaMark {
     tables: usize,
 }
 
-/// Prefix of private identifier symbol names (`<prefix>#<id>@<description>`):
-/// `ast::INTERNAL_SYMBOL_NAME_PREFIX` + "#".
-const PRIVATE_PREFIX: &str = "\u{FDD0}\u{10F7FE}#";
-
 /// A file arena with its ids moved to program ids
 /// (`SymbolArena::prepare_file_arena`).
 #[derive(Debug)]
@@ -3629,23 +3585,6 @@ impl ArenaOffsets {
         } else {
             SymbolTable(lineage_index(table.0 + self.tables))
         }
-    }
-
-    /// The private identifier name `name` (`<prefix>#<id>@<description>`,
-    /// see `SymbolArena::note_private_name`) with its symbol id moved.
-    #[cold]
-    fn private_name(self, name: &Name) -> Name {
-        let Some(rest) = name.strip_prefix(PRIVATE_PREFIX) else {
-            return name.clone();
-        };
-        let Some(at) = rest.find('@') else {
-            return name.clone();
-        };
-        let Ok(id) = rest[..at].parse::<u32>() else {
-            return name.clone();
-        };
-        let moved = self.symbol(SymbolId(id));
-        Name::from(format!("{PRIVATE_PREFIX}{}{}", moved.0, &rest[at..]))
     }
 }
 
