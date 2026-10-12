@@ -5330,7 +5330,30 @@ impl NodeRef {
             "parser_flags mask {:#x} has binder bits",
             mask.bits()
         );
-        self.flags() & mask
+        // PERF: checkid1. A node that is not a published store node reads
+        // through `Node::parser_flags`, which needs no binder data (a node
+        // of a file this thread parses or binds). Same value.
+        match self.block {
+            Some(_) => self.flags() & mask,
+            None => node_ref_parser_flags(self.node, mask),
+        }
+    }
+
+    /// Go `node.ModifierFlags()` (`Node::modifier_flags`): from the
+    /// modifier word of the block's kids (`frozen_store_modifier_flags`).
+    // PERF: checkid1. For `get_combined_modifier_flags`.
+    #[inline]
+    #[must_use]
+    pub fn modifier_flags(self) -> ModifierFlags {
+        match self.block {
+            Some(b) => {
+                let index = slot_index(self.node);
+                let flags = ModifierFlags(b.kids[index].modifier_bits(b.kinds[index]));
+                debug_assert_eq!(flags, self.node.modifier_flags(), "NodeRef modifier flags");
+                flags
+            }
+            None => node_ref_modifier_flags(self.node),
+        }
     }
 
     /// Go `node.Loc` (`Node::loc`).
@@ -5461,6 +5484,18 @@ fn node_ref_flags(n: Node) -> NodeFlags {
 #[inline(never)]
 fn node_ref_loc(n: Node) -> TextRange {
     n.loc()
+}
+
+#[cold]
+#[inline(never)]
+fn node_ref_parser_flags(n: Node, mask: NodeFlags) -> NodeFlags {
+    n.parser_flags(mask)
+}
+
+#[cold]
+#[inline(never)]
+fn node_ref_modifier_flags(n: Node) -> ModifierFlags {
+    n.modifier_flags()
 }
 
 #[inline(never)]
