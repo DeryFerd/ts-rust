@@ -1930,12 +1930,28 @@ impl Checker {
     }
 
     // Go: checker/checker.go:22559 instantiateType
+    // PERF (instfast1): a copy of `instantiate_type_with_alias` with no
+    // alias (all but a few hundred calls on T3 server), so it has no alias
+    // tests and no alias drop.
+    #[inline(never)]
     pub fn instantiate_type(&mut self, t: TypeId, m: MapperId) -> TypeId {
-        self.instantiate_type_with_alias(t, m, None /*alias*/)
+        self.instantiate_type_with_alias_impl(t, m, None /*alias*/)
     }
 
     // Go: checker/checker.go:22563 instantiateTypeWithAlias
+    #[inline(never)]
     pub fn instantiate_type_with_alias(
+        &mut self,
+        t: TypeId,
+        m: MapperId,
+        alias: Option<Rc<TypeAlias>>,
+    ) -> TypeId {
+        self.instantiate_type_with_alias_impl(t, m, alias)
+    }
+
+    /// The body of `instantiate_type` and `instantiate_type_with_alias`.
+    #[inline(always)]
+    fn instantiate_type_with_alias_impl(
         &mut self,
         t: TypeId,
         m: MapperId,
@@ -1947,6 +1963,10 @@ impl Checker {
         if t.is_nil() || m.is_nil() {
             return t;
         }
+        // PERF: read before the `could_contain_type_variables` call, so the
+        // type parameter test below needs no second read (a type's flags
+        // never change).
+        let is_type_parameter = self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER);
         let could_contain = self.could_contain_type_variables(t) || {
             // PORT: the alias list does not change after the type is made, so
             // it is read by index instead of copied.
@@ -1959,7 +1979,6 @@ impl Checker {
         if !could_contain {
             return t;
         }
-        let is_type_parameter = self.ty(t).flags.intersects(TypeFlags::TYPE_PARAMETER);
         if self.instantiation_stack.len() == 100 || self.instantiation_count >= 5_000_000 {
             return self.instantiation_depth_limit(t);
         }
