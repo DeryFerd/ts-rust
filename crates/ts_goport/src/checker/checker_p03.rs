@@ -206,7 +206,7 @@ impl Checker {
         meaning: SymbolFlags,
     ) -> SymbolId {
         if meaning.intersects(SymbolFlags::ALL) {
-            let found = self.symbols.get_key(symbols, name);
+            let found = self.symbols.get(symbols, name);
             let symbol = self.get_merged_symbol(found);
             if symbol.is_some() {
                 if self.sym(symbol).flags.intersects(meaning) {
