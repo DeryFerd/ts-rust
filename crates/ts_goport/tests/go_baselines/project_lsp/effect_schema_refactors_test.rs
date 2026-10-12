@@ -51,15 +51,38 @@ export declare function Struct<A, I>(fields: { readonly id: Schema<A, I> }): Sch
 
 const PLUGIN: &str = r#"{"name":"@effect/language-service"}"#;
 
+// Self-recursive types: `Tree` is at 2:17-2:21, `Json` at 7:12-7:16. The
+// ls-case `refactors/effect-v3-port/structuralTypeToSchema_selfRecursive`
+// (scripts/effect/ls-cases.mjs) has the same declarations with the real
+// package.
+const TREE: &str = "/home/projects/p/tree.ts";
+const TREE_URI: &str = "file:///home/projects/p/tree.ts";
+const TREE_TEXT: &str = r#"import * as Schema from "effect/Schema"
+
+export interface Tree {
+  value: number
+  children: Array<Tree>
+}
+
+export type Json = string | number | boolean | null | ReadonlyArray<Json> | { readonly [key: string]: Json }
+"#;
+
 /// A session on the project with the Effect plugin and main.ts open, and its
 /// language service for main.ts.
 fn service() -> (Rc<Session>, LanguageService) {
+    service_for(MAIN_URI, MAIN_TEXT)
+}
+
+/// A session on the project with the Effect plugin and the file `file_uri`
+/// (main.ts or tree.ts) open with `text`, and its language service for it.
+fn service_for(file_uri: &str, text: &str) -> (Rc<Session>, LanguageService) {
     let config = format!(
         r#"{{"compilerOptions":{{"strict":true,"target":"ESNext","module":"ESNext","moduleResolution":"bundler","plugins":[{PLUGIN}]}}}}"#
     );
     let (session, _) = projecttestutil::setup(files(&[
         (CONFIG, &config),
         (MAIN, MAIN_TEXT),
+        (TREE, TREE_TEXT),
         (
             "/home/projects/p/node_modules/effect/package.json",
             EFFECT_PACKAGE_JSON,
@@ -73,9 +96,9 @@ fn service() -> (Rc<Session>, LanguageService) {
             EFFECT_SCHEMA,
         ),
     ]));
-    open(&session, MAIN_URI, MAIN_TEXT);
+    open(&session, file_uri, text);
     let service = session
-        .get_language_service(&projecttestutil::with_request_id(&bg()), &uri(MAIN_URI))
+        .get_language_service(&projecttestutil::with_request_id(&bg()), &uri(file_uri))
         .unwrap_or_else(|err| panic!("{}", err.error()));
     (session, service)
 }
@@ -104,34 +127,45 @@ fn offset(text: &str, pos: lsproto::Position) -> usize {
     line_start + pos.character as usize
 }
 
-/// MAIN_TEXT with `edits` applied, as an LSP client applies them (edits at
+/// `source` with `edits` applied, as an LSP client applies them (edits at
 /// the same position keep their order).
-fn apply(edits: &[(lsproto::Range, String)]) -> String {
+fn apply(source: &str, edits: &[(lsproto::Range, String)]) -> String {
     let mut sorted: Vec<_> = edits.iter().enumerate().collect();
     sorted.sort_by_key(|(i, (range, _))| {
         (
-            std::cmp::Reverse(offset(MAIN_TEXT, range.start)),
+            std::cmp::Reverse(offset(source, range.start)),
             std::cmp::Reverse(*i),
         )
     });
-    let mut text = MAIN_TEXT.to_string();
+    let mut text = source.to_string();
     for (_, (range, new_text)) in sorted {
         text.replace_range(
-            offset(MAIN_TEXT, range.start)..offset(MAIN_TEXT, range.end),
+            offset(source, range.start)..offset(source, range.end),
             new_text,
         );
     }
     text
 }
 
-/// The refactors at `range` (`only: ["refactor"]`) as `(title, kind, main.ts
-/// after the edits)`.
+/// The refactors at `range` in main.ts (`only: ["refactor"]`) as `(title,
+/// kind, main.ts after the edits)`.
 fn refactors(service: &LanguageService, range: lsproto::Range) -> Vec<(String, String, String)> {
+    refactors_in(service, MAIN_URI, MAIN_TEXT, range)
+}
+
+/// The refactors at `range` in the file `file_uri` with the text `source`, as
+/// `refactors` gives them.
+fn refactors_in(
+    service: &LanguageService,
+    file_uri: &str,
+    source: &str,
+    range: lsproto::Range,
+) -> Vec<(String, String, String)> {
     let response = service
         .provide_code_actions(
             &projecttestutil::with_request_id(&bg()),
             &lsproto::CodeActionParams {
-                text_document: lsproto::TextDocumentIdentifier { uri: uri(MAIN_URI) },
+                text_document: lsproto::TextDocumentIdentifier { uri: uri(file_uri) },
                 range,
                 context: Some(lsproto::CodeActionContext {
                     only: Some(vec![lsproto::CodeActionKind("refactor".into())]),
@@ -153,7 +187,7 @@ fn refactors(service: &LanguageService, range: lsproto::Range) -> Vec<(String, S
                 .unwrap_or_default();
             assert!(changes.len() <= 1, "edits of one file: {changes:?}");
             let edits: Vec<(lsproto::Range, String)> = changes
-                .shift_remove(&uri(MAIN_URI))
+                .shift_remove(&uri(file_uri))
                 .unwrap_or_default()
                 .into_iter()
                 .map(|edit| {
@@ -165,7 +199,7 @@ fn refactors(service: &LanguageService, range: lsproto::Range) -> Vec<(String, S
                 .kind
                 .map(|kind| kind.0.into_owned())
                 .unwrap_or_default();
-            (action.title, kind, apply(&edits))
+            (action.title, kind, apply(source, &edits))
         })
         .collect()
 }
@@ -274,5 +308,41 @@ child_test! {
             ),
         ];
         assert_eq!(opaque, expected);
+    }
+}
+
+child_test! {
+    // A type that refers to itself: the structural schemagen hoists `Tree`
+    // only after its members, so each `Array<Tree>` processes `Tree` again
+    // until the depth limit (200), and the action inserts the error as the
+    // initializer (Go: schemagen/structural.go processType, Process). The
+    // same for the union `Json` through `ReadonlyArray<Json>`. effect-tsgo
+    // 0.51.1 gives these texts (ls-case
+    // refactors/effect-v3-port/structuralTypeToSchema_selfRecursive).
+    fn structural_schema_of_a_self_recursive_type() {
+        let (_session, service) = service_for(TREE_URI, TREE_TEXT);
+        let structural = |range| {
+            let actions: Vec<_> = refactors_in(&service, TREE_URI, TREE_TEXT, range)
+                .into_iter()
+                .filter(|(_, kind, _)| kind == "refactor.rewrite.effect.structuralTypeToSchema")
+                .map(|(_, _, text)| text)
+                .collect();
+            actions
+        };
+        let with = |old: &str, new: &str| TREE_TEXT.replacen(old, new, 1);
+        assert_eq!(
+            structural(range(2, 17, 21)),
+            vec![with(
+                "export interface Tree {",
+                "export const Tree = undefined /* maximum depth exceeded */;\n\nexport interface Tree {",
+            )]
+        );
+        assert_eq!(
+            structural(range(7, 12, 16)),
+            vec![with(
+                "export type Json =",
+                "export const Json = undefined /* maximum depth exceeded */;\n\nexport type Json =",
+            )]
+        );
     }
 }

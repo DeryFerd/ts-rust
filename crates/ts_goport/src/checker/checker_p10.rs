@@ -722,20 +722,28 @@ impl Checker {
         call_chain_flags: SignatureFlags,
         mut head_message: Option<&'static crate::diagnostics::Message>,
     ) -> SignatureId {
-        let is_tagged_template = node.kind() == SyntaxKind::TaggedTemplateExpression;
-        let is_decorator = node.kind() == SyntaxKind::Decorator;
-        let is_jsx_opening_or_self_closing_element = is_jsx_opening_like_element(node);
-        let is_instanceof = node.kind() == SyntaxKind::BinaryExpression;
+        // PERF: portonly1 item 5. Go reads `node.Kind` as a field for each
+        // test; here the kind is read once.
+        let kind = node.kind();
+        let is_tagged_template = kind == SyntaxKind::TaggedTemplateExpression;
+        let is_decorator = kind == SyntaxKind::Decorator;
+        let is_jsx_opening_or_self_closing_element = matches!(
+            kind,
+            SyntaxKind::JsxOpeningElement | SyntaxKind::JsxSelfClosingElement
+        );
+        let is_instanceof = kind == SyntaxKind::BinaryExpression;
         let has_candidates_out_array = candidates_out_array.is_some();
         let report_errors = !self.is_inference_partially_blocked && !has_candidates_out_array;
         let mut s = CallState::default();
         s.node = node;
         // PORT: Go calls the checker package's `isSuperCall`, which has the same
-        // body as `ast.IsSuperCall`.
+        // body as `ast.IsSuperCall` (utilities.go:2138): here it is inlined on
+        // the kind read above.
         if !is_decorator
             && !is_instanceof
-            && !crate::ast::is_super_call(node)
-            && !is_jsx_opening_fragment(node)
+            && !(kind == SyntaxKind::CallExpression
+                && node.expression().kind() == SyntaxKind::SuperKeyword)
+            && kind != SyntaxKind::JsxOpeningFragment
         {
             s.type_arguments = node.type_arguments().iter().collect();
             // We already perform checking on the type arguments on the class declaration itself.

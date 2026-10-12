@@ -279,8 +279,6 @@ fn build_layer_magic_build(
 
     // If the old node is an expression inside a variable declaration, use replaceExpressionViaStatement
     if old_node.parent().is_some() && old_node.parent().kind() == SyntaxKind::VariableDeclaration {
-        // PORT: false (Go panics) comes before any edit, so the action has no
-        // edits and is dropped.
         replace_expression_via_statement(tracker, sf, old_node, new_declaration);
     } else {
         tracker.replace_node(sf, old_node, new_declaration, None);
@@ -490,8 +488,6 @@ fn build_layer_magic_prepare(
 
     // If the old node is an expression inside a variable declaration, use replaceExpressionViaStatement
     if old_node.parent().is_some() && old_node.parent().kind() == SyntaxKind::VariableDeclaration {
-        // PORT: false (Go panics) comes before any edit, so the action has no
-        // edits and is dropped.
         replace_expression_via_statement(tracker, sf, old_node, outer_as);
     } else {
         tracker.replace_node(sf, old_node, outer_as, None);
