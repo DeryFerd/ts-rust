@@ -32,7 +32,7 @@ async function compile(source) {
     if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) return WebAssembly.compile(source);
     const response = source instanceof Response ? source : await fetch(source);
     if (!response.ok) throw new Error(`ts-rust: cannot load the wasm module: ${response.status} ${response.url}`);
-    if (response.headers.get("content-type")?.startsWith("application/wasm")) {
+    if (response.headers.get("content-type")?.toLowerCase() === "application/wasm") {
         return WebAssembly.compileStreaming(response);
     }
     return WebAssembly.compile(await response.arrayBuffer());
