@@ -1248,7 +1248,9 @@ impl Checker {
         node: Node,
         ignore_arrow_functions: bool,
     ) -> bool {
-        find_ancestor_or_quit(node, |node: Node| match node.kind() {
+        // PERF: checkid1. Each node and its parent are read through views
+        // (`find_ancestor_or_quit_ref`). The tests and their order are Go's.
+        find_ancestor_or_quit_ref(node, |node: NodeRef| match node.kind() {
             SyntaxKind::PropertyDeclaration | SyntaxKind::ClassStaticBlockDeclaration => {
                 FindAncestorResult::FIND_ANCESTOR_TRUE
             }
@@ -1263,8 +1265,11 @@ impl Checker {
                 }
             }
             SyntaxKind::Block => {
-                if is_function_like_declaration(node.parent())
-                    && node.parent().kind() != SyntaxKind::ArrowFunction
+                // `is_function_like_declaration(node.Parent)`: a nil parent
+                // is not function-like.
+                let parent_kind = node.parent().kind_or_unknown();
+                if is_function_like_declaration_kind(parent_kind)
+                    && parent_kind != SyntaxKind::ArrowFunction
                 {
                     FindAncestorResult::FIND_ANCESTOR_QUIT
                 } else {

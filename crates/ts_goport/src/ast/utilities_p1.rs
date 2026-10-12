@@ -1309,7 +1309,7 @@ static FUNCTION_LIKE_KINDS: KindSet = KindSet::of(&[
 
 // Go: ast/utilities.go:483 isFunctionLikeDeclarationKind
 #[inline]
-fn is_function_like_declaration_kind(kind: SyntaxKind) -> bool {
+pub fn is_function_like_declaration_kind(kind: SyntaxKind) -> bool {
     FUNCTION_LIKE_DECLARATION_KINDS.contains(kind)
 }
 
