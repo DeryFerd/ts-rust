@@ -852,8 +852,10 @@ impl FlatKey for TypeId {
 //   which the declarations symbol tracker and declaration diagnostics use
 //   (see its note).
 // - `sync.Once` fields become `bool` "done" flags.
-// - `*T` pools and shared structs (`*Relation`, `*Relater`, `*FlowState`,
+// - `*T` pools and shared structs (`*Relation`, `*Relater`,
 //   `*InferenceState`) are `Rc<RefCell<T>>`; nil-able ones are `Option`.
+//   `*FlowState` is `&mut FlowState` on the walk's stack, with no free list
+//   (see `FlowState`).
 // - `ast.NodeId` map keys are `Node` handles.
 pub struct Checker {
     pub id: u32,
