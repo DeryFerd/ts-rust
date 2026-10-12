@@ -2735,7 +2735,7 @@ mod tests {
     /// loads the program with parse workers (not single threaded), and
     /// returns what the load found (`load_text`).
     fn parallel_load(label: &str, tsconfig: &str, files: &[(&str, &str)]) -> String {
-        load_text(label, tsconfig, files, false, false)
+        load_text(label, tsconfig, files, false, None)
     }
 
     /// Writes `files` and a tsconfig.json with `tsconfig` to a temp dir,
@@ -2743,15 +2743,15 @@ mod tests {
     /// files in program order, the metadata, module and type reference
     /// resolutions (in map order) and include reasons of each file, the
     /// synthetic imports, the processing diagnostics, the missing files
-    /// and the package.json entries of the resolver. With `early_roots`, an
-    /// early pool starts on the root files after the config parse, as in
-    /// tsc (`start_default_lib_prefetch`).
+    /// and the package.json entries of the resolver. With `early_lib`, an
+    /// early pool with that default lib path starts on the root files after
+    /// the config parse, as in tsc (`start_default_lib_prefetch`).
     fn load_text(
         label: &str,
         tsconfig: &str,
         files: &[(&str, &str)],
         single_threaded: bool,
-        early_roots: bool,
+        early_lib: Option<&str>,
     ) -> String {
         use std::fmt::Write as _;
         let dir = std::env::temp_dir().join(format!(
@@ -2783,12 +2783,12 @@ mod tests {
         );
         assert!(errors.is_empty());
         let config = config.unwrap();
-        if early_roots {
+        if let Some(early_lib) = early_lib {
             start_default_lib_prefetch(
                 &config,
                 &cwd,
                 fs.use_case_sensitive_file_names(),
-                &bundled::lib_path(),
+                early_lib,
                 true,
             );
         }
@@ -3220,11 +3220,17 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
                 "export declare const nodeIsh: number;\n",
             ),
         ];
-        let single = load_text("early_st", tsconfig, &files, true, false);
+        let single = load_text("early_st", tsconfig, &files, true, None);
         assert_eq!(parallel_load("early_off", tsconfig, &files), single);
         let before = early_pools_taken();
         set_meta_wait(true);
-        let early = load_text("early_on", tsconfig, &files, false, true);
+        let early = load_text(
+            "early_on",
+            tsconfig,
+            &files,
+            false,
+            Some(&bundled::lib_path()),
+        );
         set_meta_wait(false);
         assert_eq!(early, single);
         for name in [
@@ -3240,6 +3246,20 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         if super::super::files_parser::parse_workers_enabled() {
             assert_eq!(early_pools_taken() - before, 1);
         }
+        // An early pool with another default lib path (`PrefetchConfig`)
+        // gives the loader no cache: `FilesParser::parse` does not take
+        // that pool, and its workers would write the loader's cache after
+        // the load.
+        let before = early_pools_taken();
+        let other = load_text(
+            "early_other_lib",
+            tsconfig,
+            &files,
+            false,
+            Some("/no/such/lib/dir"),
+        );
+        assert_eq!(other, single);
+        assert_eq!(early_pools_taken() - before, 0);
     }
 
     /// A program with a project reference (`lib`) that it loads by the
@@ -3315,7 +3335,7 @@ export const a: T | Dep | number = x + (h as never);
                 REFERENCE_TSCONFIG,
                 &REFERENCE_FILES,
                 single_threaded,
-                false,
+                None,
             );
             set_load_prep(None);
             set_meta_wait(false);

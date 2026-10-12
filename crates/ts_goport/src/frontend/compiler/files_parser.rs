@@ -2859,6 +2859,10 @@ struct PrefetchPool {
     /// True once the workers of content-mapped jobs started
     /// (`FilesParser::queue_mapped_prefetch`).
     mapped_workers: bool,
+    /// True when a loader took the shared resolution cache of this early
+    /// pool (`early_shared_resolution`). Its workers write that cache, so
+    /// `discard` waits for them.
+    handed: bool,
 }
 
 impl PrefetchPool {
@@ -2867,6 +2871,7 @@ impl PrefetchPool {
             shared: Arc::new(PrefetchShared::new(config)),
             threads: Vec::new(),
             mapped_workers: false,
+            handed: false,
         };
         pool.add_workers(workers);
         pool
@@ -2904,10 +2909,18 @@ impl PrefetchPool {
         }
     }
 
-    /// Stops an unused pool without waiting: each worker ends after its
-    /// current job.
+    /// Stops an unused pool: each worker ends after its current job. It
+    /// waits for the workers only when a loader reads their resolution
+    /// cache (`handed`), so that no worker writes that cache after the
+    /// load, as Go waits for every parse task of a load (filesparser.go:270
+    /// `w.wg.RunAndWait()`).
     fn discard(mut self) {
         self.shared.close();
+        if self.handed {
+            for thread in self.threads.drain(..) {
+                let _ = thread.join();
+            }
+        }
         // Dropping a join handle detaches its thread.
         self.threads.clear();
     }
@@ -3048,26 +3061,33 @@ fn move_up_enabled() -> bool {
 
 /// The shared resolution cache of the early pool of this thread, for the
 /// loader that makes its shared cache now (`process_all_program_files`),
-/// when the early workers resolve with this loader's config
-/// (`WorkerResolveConfig::same`). Else the early pool stops, so that no
-/// worker answers with another config, and the loader makes a new cache.
+/// when the early workers run with this loader's config: the same
+/// `PrefetchConfig` and `WorkerResolveConfig::same`, as
+/// `FilesParser::parse` checks before it takes the pool. Else the early
+/// pool stops, so that no worker answers with another config, and the
+/// loader makes a new cache. When `parse` stops a pool that gave its cache
+/// here, it waits for the workers (`PrefetchPool::discard`).
 // PORT: not in Go (see `start_default_lib_prefetch`).
 pub(crate) fn early_shared_resolution(loader: &FileLoader) -> Option<Arc<SharedResolutionCache>> {
     EARLY_POOL.with(|early| {
         let mut early = early.borrow_mut();
-        let fits = match early.as_ref()?.shared.resolve.get() {
+        let pool = early.as_ref()?;
+        let fits = match pool.shared.resolve.get() {
             Some(Some(config)) => config.shared.clone().filter(|shared| {
                 loader.host.stat_cache().is_none()
+                    && pool.shared.config == PrefetchConfig::of_loader(loader)
                     && WorkerResolveConfig::of_loader_with(loader, Some(shared.clone()))
                         .is_some_and(|loader_config| loader_config.same(config))
             }),
             // An early pool with no root jobs: the loader sets its config.
             _ => return None,
         };
-        if fits.is_none()
-            && let Some(pool) = early.take()
-        {
-            pool.discard();
+        if fits.is_none() {
+            if let Some(pool) = early.take() {
+                pool.discard();
+            }
+        } else if let Some(pool) = early.as_mut() {
+            pool.handed = true;
         }
         #[cfg(test)]
         if fits.is_some() {
