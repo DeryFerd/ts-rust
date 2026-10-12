@@ -449,7 +449,13 @@ impl Checker {
     }
 
     // Go: checker/checker.go:19294 getPropertyOfType
-    pub fn get_property_of_type(&mut self, t: TypeId, name: &str) -> SymbolId {
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`), as in
+    // `get_property_of_type_ex`.
+    pub fn get_property_of_type<'a>(
+        &mut self,
+        t: TypeId,
+        name: impl Into<TableKey<'a>>,
+    ) -> SymbolId {
         self.get_property_of_type_ex(
             t, name, false, /*skipObjectFunctionPropertyAugment*/
             false, /*includeTypeOnlyMembers*/
