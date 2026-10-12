@@ -111,8 +111,18 @@ goes away when the port moves to a newer pin.
 - **Real projects.** On 120 open-source repos, the command-line output differs from Go's only in
   the problems below and where Go's own output changes from run to run.
 
-Three switches make some projects faster or use less memory. They are off by default.
+Four switches make some projects faster or use less memory. They are off by default.
 
+- **`--fast`** (or `GOPORT_FAST=1`) turns on the last two switches, more checkers and work
+  stealing. It runs one checker per core, up to 16 and at most one per 32 source files
+  (`--checkers N` still sets the count). A checker that has checked its own files takes unchecked
+  files from the checker with the most work left. On a 16 vCPU runner (a release build without
+  PGO), VS Code checks in 2.2 s instead of 5.4 s, Sentry in 2.3 s instead of 5.6 s and T3 Code in
+  6.0 s instead of 7.6 s. CPU time goes up as much as 2.8x and peak memory as much as 2.2x. On 15
+  projects the diagnostics were the same as without `--fast`, except on zod: a TS2344 goes away,
+  as some do in Go with more checkers. A file can go to a different checker in each run. So where
+  Go's output depends on which files share a checker, the output of `--fast` can change from run
+  to run.
 - **`--checkers 8`** (Go's option; the default is 4) runs 8 checkers. On an 8-core host, VS Code
   checks in 30% less time and mui in 23% less, but T3 Code server gains nothing. CPU time goes
   up 13% to 51% and peak memory 7% to 34%. The output is the same as Go's with `--checkers 8`.
