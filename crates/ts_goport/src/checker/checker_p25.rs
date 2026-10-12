@@ -55,88 +55,101 @@ impl Checker {
         m: MapperId,
         alias: Option<Rc<TypeAlias>>,
     ) -> TypeId {
-        let declaration: Node;
-        let target: TypeId;
-        let t_object_flags = self.ty(t).object_flags;
-        if t_object_flags.intersects(ObjectFlags::REFERENCE) {
-            // Deferred type reference
-            declaration = self.ty(t).as_type_reference().node;
-        } else if t_object_flags.intersects(ObjectFlags::INSTANTIATION_EXPRESSION_TYPE) {
-            declaration = self.ty(t).as_instantiation_expression_type().node;
-        } else {
-            let t_symbol = self.ty(t).symbol;
-            declaration = self.sym(t_symbol).declarations[0];
-        }
-        // PORT: both link fields are read with one lookup. The type parameter
-        // list is a `SharedList`, so the clone copies no elements.
+        let (t_object_flags, declaration) = {
+            let ty = self.ty(t);
+            let t_object_flags = ty.object_flags;
+            let declaration = if t_object_flags.intersects(ObjectFlags::REFERENCE) {
+                // Deferred type reference
+                ty.as_type_reference().node
+            } else if t_object_flags.intersects(ObjectFlags::INSTANTIATION_EXPRESSION_TYPE) {
+                ty.as_instantiation_expression_type().node
+            } else {
+                self.sym(ty.symbol).declarations[0]
+            };
+            (t_object_flags, declaration)
+        };
         let links = self.type_node_links.get(declaration);
         let resolved_type = links.resolved_type;
-        let cached_outer_type_parameters = links.outer_type_parameters.clone();
-        if t_object_flags.intersects(ObjectFlags::REFERENCE) {
-            // Deferred type reference
-            target = resolved_type;
-        } else if t_object_flags.intersects(ObjectFlags::INSTANTIATED) {
-            target = self.ty(t).target();
-        } else {
-            target = t;
-        }
         // PORT: Go tells a nil `outerTypeParameters` (not computed) from an
         // empty one (computed, none in scope). `None` is Go nil, so an empty
         // list is also cached and the scope and reference walk runs once per
         // declaration, as in Go.
-        let outer_type_parameters = if let Some(list) = cached_outer_type_parameters {
-            list
-        } else {
-            // The first time an anonymous type is instantiated we compute and store a list of the type
-            // parameters that are in scope (and therefore potentially referenced). For type literals that
-            // aren't the right hand side of a generic type alias declaration we optimize by reducing the
-            // set of type parameters to those that are possibly referenced in the literal.
-            let mut type_parameters =
-                self.get_outer_type_parameters(declaration, true /*includeThisTypes*/);
-            if self.ty(target).alias.type_arguments().is_empty() {
-                if t_object_flags
-                    .intersects(ObjectFlags::REFERENCE | ObjectFlags::INSTANTIATION_EXPRESSION_TYPE)
-                {
-                    type_parameters = type_parameters
-                        .into_iter()
-                        .filter(|&tp| self.is_type_parameter_possibly_referenced(tp, declaration))
-                        .collect();
-                } else {
-                    let target_symbol = self.ty(target).symbol;
-                    if self
-                        .sym(target_symbol)
-                        .flags
-                        .intersects(SymbolFlags::METHOD | SymbolFlags::TYPE_LITERAL)
-                    {
-                        let t_symbol = self.ty(t).symbol;
-                        let declarations = self.sym(t_symbol).declarations.clone();
+        // PERF (instfast1): the cached list is read in place. An empty list
+        // (about 65% of the calls on T3 server) returns at once. Another list
+        // is detached (an arena list) or copied (an inline list) into `buf`,
+        // so no `SharedList` copy moves through the stack. An owned list (a
+        // multi-program process) is cloned. Go computes the target first;
+        // that is only reads, so here it waits until the list is known.
+        let mut buf = SharedListBuf::<TypeId>::default();
+        let owned: SharedList<TypeId>;
+        let outer_type_parameters: &[TypeId] = match &links.outer_type_parameters {
+            Some(list) if list.is_empty() => return t,
+            Some(list) => match list.detach(&mut buf) {
+                Some(items) => items,
+                None => {
+                    owned = list.clone();
+                    &owned
+                }
+            },
+            None => {
+                let target = self.object_instantiation_target(t, t_object_flags, resolved_type);
+                // The first time an anonymous type is instantiated we compute and store a list of the type
+                // parameters that are in scope (and therefore potentially referenced). For type literals that
+                // aren't the right hand side of a generic type alias declaration we optimize by reducing the
+                // set of type parameters to those that are possibly referenced in the literal.
+                let mut type_parameters =
+                    self.get_outer_type_parameters(declaration, true /*includeThisTypes*/);
+                if self.ty(target).alias.type_arguments().is_empty() {
+                    if t_object_flags.intersects(
+                        ObjectFlags::REFERENCE | ObjectFlags::INSTANTIATION_EXPRESSION_TYPE,
+                    ) {
                         type_parameters = type_parameters
                             .into_iter()
                             .filter(|&tp| {
-                                declarations
-                                    .iter()
-                                    .any(|&d| self.is_type_parameter_possibly_referenced(tp, d))
+                                self.is_type_parameter_possibly_referenced(tp, declaration)
                             })
                             .collect();
+                    } else {
+                        let target_symbol = self.ty(target).symbol;
+                        if self
+                            .sym(target_symbol)
+                            .flags
+                            .intersects(SymbolFlags::METHOD | SymbolFlags::TYPE_LITERAL)
+                        {
+                            let t_symbol = self.ty(t).symbol;
+                            let declarations = self.sym(t_symbol).declarations.clone();
+                            type_parameters = type_parameters
+                                .into_iter()
+                                .filter(|&tp| {
+                                    declarations
+                                        .iter()
+                                        .any(|&d| self.is_type_parameter_possibly_referenced(tp, d))
+                                })
+                                .collect();
+                        }
                     }
                 }
+                let list: SharedList<TypeId> = type_parameters.into();
+                self.type_node_links.get(declaration).outer_type_parameters = Some(list.clone());
+                if list.is_empty() {
+                    return t;
+                }
+                owned = list;
+                &owned
             }
-            let list: SharedList<TypeId> = type_parameters.into();
-            self.type_node_links.get(declaration).outer_type_parameters = Some(list.clone());
-            list
         };
-        if outer_type_parameters.is_empty() {
-            return t;
-        }
+        let target = self.object_instantiation_target(t, t_object_flags, resolved_type);
         // We are instantiating an anonymous type that has one or more type parameters in scope. Apply the
         // mapper to the type parameters to produce the effective list of type arguments, and compute the
         // instantiation cache key from the type IDs of the type arguments.
         // PORT: the type arguments stay on the stack, because a cache hit only
-        // hashes them.
-        let t_mapper = self.ty(t).mapper();
+        // hashes them. `t` is an object type (the one caller,
+        // `instantiate_type_worker`, tests it), so Go `t.Mapper()` is its
+        // object mapper.
+        let t_mapper = self.ty(t).as_object_type().mapper;
         let mut type_arguments: SmallVec<[TypeId; 8]> =
             SmallVec::with_capacity(outer_type_parameters.len());
-        for &tp in outer_type_parameters.iter() {
+        for &tp in outer_type_parameters {
             type_arguments.push(self.map_type_with_composite_mapper(tp, t_mapper, m));
         }
         // PORT: Go `c.instantiateTypeAlias(t.alias, m)` when `alias` is nil.
@@ -175,7 +188,7 @@ impl Checker {
                 let target_alias = self.ty(target).alias.clone();
                 let target_key = get_type_instantiation_key(
                     &self.symbols,
-                    &outer_type_parameters,
+                    outer_type_parameters,
                     target_alias.as_deref(),
                     false,
                 );
@@ -194,8 +207,18 @@ impl Checker {
                 })
             });
             let type_arguments = SharedList::from(&type_arguments[..]);
-            let mut new_mapper =
-                self.new_type_mapper_shared(outer_type_parameters, type_arguments.clone());
+            // The mapper keeps the cached list itself (no copy), as Go keeps
+            // the slice. A detached list is read again from the links.
+            let sources = match self
+                .type_node_links
+                .get(declaration)
+                .outer_type_parameters
+                .clone()
+            {
+                Some(list) => list,
+                None => unreachable!("outer type parameters are cached above"),
+            };
+            let mut new_mapper = self.new_type_mapper_shared(sources, type_arguments.clone());
             let target_object_flags = self.ty(target).object_flags;
             if target_object_flags.intersects(ObjectFlags::SINGLE_SIGNATURE_TYPE) && m.is_some() {
                 new_mapper = self.combine_type_mappers(new_mapper, m);
@@ -254,6 +277,26 @@ impl Checker {
             }
         }
         result
+    }
+
+    /// The `target` of Go `getObjectTypeInstantiation`: the resolved type
+    /// of a deferred type reference's node, the target of an instantiated
+    /// type, else `t` itself.
+    #[inline(always)]
+    fn object_instantiation_target(
+        &self,
+        t: TypeId,
+        t_object_flags: ObjectFlags,
+        resolved_type: TypeId,
+    ) -> TypeId {
+        if t_object_flags.intersects(ObjectFlags::REFERENCE) {
+            // Deferred type reference
+            resolved_type
+        } else if t_object_flags.intersects(ObjectFlags::INSTANTIATED) {
+            self.ty(t).target()
+        } else {
+            t
+        }
     }
 
     // Go: checker/checker.go:22891 isTypeParameterPossiblyReferenced

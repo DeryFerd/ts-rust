@@ -670,8 +670,12 @@ impl Checker {
      * @param node the expression whose contextual type will be returned.
      * @returns the contextual type of an expression.
      */
+    // PERF: deferbody1. Go reads `node.Flags`, `node.Parent` and
+    // `parent.Kind` as fields. Here each read was a registry lookup, so they
+    // are read through the node's view (`NodeRef`): one lookup.
     pub fn get_contextual_type(&mut self, node: Node, context_flags: ContextFlags) -> TypeId {
-        if node.flags().intersects(NodeFlags::IN_WITH_STATEMENT) {
+        let view = NodeRef::new(node);
+        if view.flags().intersects(NodeFlags::IN_WITH_STATEMENT) {
             // We cannot answer semantic questions within a with block, do not proceed any further
             return TypeId::NIL;
         }
@@ -684,8 +688,9 @@ impl Checker {
         if index >= 0 {
             return self.contextual_infos[index as usize].t;
         }
-        let parent = node.parent();
-        match parent.kind() {
+        let parent_view = view.parent();
+        let parent = parent_view.node();
+        match parent_view.kind() {
             SyntaxKind::VariableDeclaration
             | SyntaxKind::Parameter
             | SyntaxKind::PropertyDeclaration
@@ -725,12 +730,13 @@ impl Checker {
             }
             SyntaxKind::ArrayLiteralExpression => {
                 let t = self.get_apparent_type_of_contextual_type(parent, context_flags);
-                let element_index = index_of_node(parent.elements(), node);
+                let elements = parent.elements();
+                let element_index = index_of_node(elements, node);
                 if element_index < 0 {
                     return TypeId::NIL;
                 }
                 let (first_spread_index, last_spread_index) = self.get_spread_indices(parent);
-                let length = parent.elements().len() as i32;
+                let length = elements.len() as i32;
                 return self.get_contextual_type_for_element_expression(
                     t,
                     element_index,

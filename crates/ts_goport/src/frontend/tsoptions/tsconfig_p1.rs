@@ -1003,7 +1003,7 @@ impl CommandLineOptionNameMap {
     pub fn get(&self, name: &str) -> Option<&'static CommandLineOption> {
         match self.0.get(name) {
             Some(opt) => Some(*opt),
-            None => self.0.get(&name.to_lowercase()).copied(),
+            None => self.0.get(&super::decls::strings_to_lower(name)).copied(),
         }
     }
 

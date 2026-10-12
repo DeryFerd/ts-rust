@@ -361,7 +361,16 @@ pub fn is_in_expression_context_of(node: Node, parent: NodeRef) -> bool {
 // store.
 pub fn is_part_of_type_node(node: Node) -> bool {
     let node = NodeRef::new(node);
-    let kind = node.kind();
+    is_part_of_type_node_of(node, node.kind())
+}
+
+/// `is_part_of_type_node` of the view `node` whose kind `kind` the caller
+/// has read already.
+// PERF: deferbody1. `for_each_yield_expression` reads the kind of each node
+// it walks; Go `IsPartOfTypeNode` reads the same `node.Kind` field again,
+// which here was one more registry lookup and kind load per node.
+pub fn is_part_of_type_node_of(node: NodeRef, kind: SyntaxKind) -> bool {
+    debug_assert_eq!(kind, node.kind());
     if (kind as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
         && (kind as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
     {
@@ -471,7 +480,9 @@ fn is_part_of_type_node_in_parent_of(node: Node, parent: NodeRef) -> bool {
         SyntaxKind::CallExpression
         | SyntaxKind::NewExpression
         | SyntaxKind::TaggedTemplateExpression => {
-            return parent.node().type_arguments().to_vec().contains(&node);
+            // PERF: deferbody1. Go `slices.Contains` reads the list in place;
+            // `to_vec` made a heap copy of it for each test.
+            return parent.node().type_arguments().iter().any(|a| a == node);
         }
         _ => {}
     }
