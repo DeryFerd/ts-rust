@@ -1232,7 +1232,7 @@ impl SharedResolutionCache {
         &self,
         key: &dyn ModuleKey,
     ) -> Option<SharedResolution<Arc<ResolvedModule>>> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
         loop {
             let found = lock_shared(&self.modules).get(key).cloned();
             if found.is_some() || std::time::Instant::now() > deadline {
@@ -1974,7 +1974,7 @@ mod tests {
         let worker = {
             let queue = queue.clone();
             std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
                 let mut marked = true;
                 while queue.waiting.load(std::sync::atomic::Ordering::SeqCst) != 2 {
                     if std::time::Instant::now() > deadline {

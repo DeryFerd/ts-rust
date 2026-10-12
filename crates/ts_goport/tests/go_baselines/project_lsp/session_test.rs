@@ -1992,7 +1992,7 @@ child_test! {
         let mut attempts = Vec::new();
         let first = Instant::now();
         while attempts.len() < 20
-            || (attempts.len() < MAX_ATTEMPTS && first.elapsed() < Duration::from_secs(60))
+            || (attempts.len() < MAX_ATTEMPTS && first.elapsed() < Duration::from_mins(1))
         {
             let (session, _, reads) = session_with_pending_warm();
             session.warm_auto_import_slow.set(true);
@@ -2027,7 +2027,7 @@ fn exit_unless_returned_in_60_s() -> std::sync::Arc<std::sync::atomic::AtomicBoo
     let returned = std::sync::Arc::new(AtomicBool::new(false));
     let watched = returned.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(60));
+        std::thread::sleep(Duration::from_mins(1));
         if !watched.load(Ordering::SeqCst) {
             eprintln!("wait_for_background_tasks did not return in 60 s");
             std::process::exit(101);
@@ -2285,12 +2285,12 @@ child_test! {
                 (INDEX, "export const x = 1;"),
             ]),
             SessionOptions {
-                debounce_delay: Duration::from_secs(60),
+                debounce_delay: Duration::from_mins(1),
                 ..projecttestutil::default_session_options()
             },
         );
         session.schedule_snapshot_update(project::UpdateReason::DID_CLOSE_FILE);
-        session.schedule_diagnostics_refresh(Duration::from_secs(60));
+        session.schedule_diagnostics_refresh(Duration::from_mins(1));
         // The tasks start and wait out their debounce, as after an LSP
         // message (the dispatch loop runs the queued work).
         ts_goport::gostd::local::run_pending();

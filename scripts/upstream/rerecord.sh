@@ -4,7 +4,7 @@
 #
 # usage: rerecord.sh <key> [host] [steps]
 #   key    pin key in UPSTREAM.json (scripts/upstream/pin.py)
-#   host   alvin (default), dbook-lan, cup2, or local (run the host steps on this machine)
+#   host   dbook-lan (default), or local (run the host steps on this machine)
 #   steps  comma list; default all, in this order:
 #     prep      zbook: corpus-full and the corpus-int3 1,500-case shard from the pin's test cases, the
 #               typesyms dumper and the Go dumps of query, hono and effect (record.py corpus, typesyms)
@@ -29,7 +29,9 @@ R=$REPO/target/continuation-r97-goport
 PIN=$REPO/scripts/upstream/pin.py
 [[ $# -ge 1 && $1 != -* ]] || { sed -n '2,27p' "$0"; exit 2; }
 KEY=$(GOPORT_PIN=$1 python3 "$PIN" show | python3 -c 'import json,sys; print(json.load(sys.stdin)["key"])') || exit 2
-HOST=${2:-alvin}
+HOST=${2:-dbook-lan}
+# alvin, cup2 and the minis are retired (Theo, 2026-10-12): use a testbox, dbook-lan or zbook.
+case $HOST in alvin|cup2|mini-743d|mini-abf9) echo "$HOST is retired: use a testbox, dbook-lan or zbook" >&2; exit 2 ;; esac
 STEPS=${3:-prep,sync,projects,f1,sweep,emit,ls,api,fetch}
 CURRENT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["current"])' "$REPO/UPSTREAM.json")
 ROOT=$(python3 "$PIN" path root "$KEY")
