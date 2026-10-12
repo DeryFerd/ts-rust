@@ -38,9 +38,9 @@ impl NewProgram {
     }
 
     // Go: program.go:2098 (*Program).GetSourceFileForResolvedModule
-    // ts#64159: a lookup by the resolution's path. PORT: a resolution
-    // without a path (none should have one), or `GOPORT_RESOLVED_PATH=0`,
-    // uses `to_path` of its name.
+    // ts#64159: a lookup by the resolution's path. An empty path misses, as
+    // in Go; then only the parse redirect of the name can give a file.
+    // PORT: `GOPORT_RESOLVED_PATH=0` uses `to_path` of the name.
     pub fn get_source_file_for_resolved_module(
         &self,
         resolved: &ResolvedModule,

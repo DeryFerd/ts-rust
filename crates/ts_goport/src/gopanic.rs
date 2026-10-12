@@ -492,7 +492,8 @@ pub fn resume_go_panic(payload: Box<dyn std::any::Any + Send>) -> Box<dyn std::a
 /// without its `<dir>/..` pairs. The roots of the `parts/` crates are
 /// `../../src/<crate>_root.rs`, so their sites are
 /// `crates/ts_goport/parts/goport_core/../../src/...`. This gives
-/// `crates/ts_goport/src/...`, the text from before the crate split.
+/// `crates/ts_goport/src/...`, the text from before the crate split. A `.`
+/// segment does not pair with a `..` (`./../x` is `../x`, not `x`).
 #[must_use]
 pub fn go_site_file(file: &str) -> std::borrow::Cow<'_, str> {
     if !file.contains("..") {
@@ -505,8 +506,7 @@ pub fn go_site_file(file: &str) -> std::borrow::Cow<'_, str> {
     let mut pieces: Vec<&str> = Vec::new();
     for piece in file.split_inclusive(['/', '\\']) {
         let parent = pieces.last().map(|last| name(last));
-        if name(piece) == ".." && parent.is_some_and(|parent| !parent.is_empty() && parent != "..")
-        {
+        if name(piece) == ".." && parent.is_some_and(|parent| !matches!(parent, "" | "." | "..")) {
             pieces.pop();
         } else {
             pieces.push(piece);
@@ -628,6 +628,8 @@ mod tests {
             r"crates\ts_goport\src\gopanic.rs"
         );
         assert_eq!(go_site_file("../x/src/a.rs"), "../x/src/a.rs");
+        assert_eq!(go_site_file("./../x/a.rs"), "./../x/a.rs");
+        assert_eq!(go_site_file("a/./../x/a.rs"), "a/./../x/a.rs");
     }
 
     // Go `printpanics` (go1.27.1 runtime/panic.go:734) for a panic in the
