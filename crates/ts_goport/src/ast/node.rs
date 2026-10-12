@@ -4566,7 +4566,7 @@ fn walk_children<'d>(data: NodeData<'d>, w: &mut impl ChildVisit<'d>) -> bool {
 /// data is a variant of the last arm of `walk_children`, which visits
 /// nothing.
 #[inline]
-const fn has_no_child_fields(kind: SyntaxKind) -> bool {
+pub(crate) const fn has_no_child_fields(kind: SyntaxKind) -> bool {
     kind.is_token()
         || matches!(
             kind,

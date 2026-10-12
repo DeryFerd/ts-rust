@@ -6156,6 +6156,16 @@ pub fn finish_store_node_and_parents(
     s.set_slot_loc(index, loc);
     let flags = s.records[index].flags() | flags;
     s.set_slot_flags(index, flags);
+    // PERF: storefast1. A leaf (Go `ForEachChild` has no case for its
+    // kind, so the walk visits nothing) only gets its empty R2-5 chain:
+    // what `set_slot_child_parents` writes for it, with no walk. Tokens,
+    // identifiers and literals are about half of the finished nodes. Go
+    // `overrideParentInImmediateChildren` on a leaf is a call that returns.
+    if super::node::has_no_child_fields(s.kinds[index]) {
+        s.unlink_children(index);
+        s.build_links[index].first_child = LINK_END;
+        return FinishedStoreNode::All;
+    }
     if s.set_slot_child_parents(index, node) {
         FinishedStoreNode::All
     } else {
