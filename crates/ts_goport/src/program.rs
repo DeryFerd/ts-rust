@@ -3606,8 +3606,7 @@ fn fast_cost_split(
             .flat_map(|resolved_modules| resolved_modules.values())
             .filter(|resolved| resolved.is_resolved())
             .filter_map(|resolved| {
-                let target =
-                    np.get_source_file_for_resolved_module(&resolved.resolved_file_name)?;
+                let target = np.get_source_file_for_resolved_module(resolved)?;
                 positions
                     .get(&target.store)
                     .copied()
