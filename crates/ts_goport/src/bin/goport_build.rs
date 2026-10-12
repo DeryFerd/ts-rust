@@ -55,15 +55,19 @@ fn main() {
     set_malloc_tunables(&budget);
     budget.install();
     let mut args: Vec<String> = ts_goport::frontend::vfs::os_args();
-    // PORT: not in Go (fastmode1). As the tsc bin (`tsgo.rs` `run_main`):
-    // `--fast` turns fast mode on, and the build flag keeps Go's 4 checkers
-    // in fast mode (`fast_mode::checker_count`), with `GOPORT_FAST=1` too.
-    ts_goport::fast_mode::take_flag(&mut args);
     install_panic_hook();
     let work = std::thread::Builder::new()
         .name("goport_build".to_string())
         .stack_size(ts_goport::gostd::stack::max_stack_size())
-        .spawn(move || run(&args));
+        .spawn(move || {
+            // PORT: not in Go (fastmode1). As the tsc bin (`tsgo.rs`
+            // `run_main`): `--fast` turns fast mode on, and the build flag
+            // keeps Go's 4 checkers in fast mode (`fast_mode::checker_count`),
+            // with `GOPORT_FAST=1` too. On the work thread, after the panic
+            // hook, so a panic here exits 70, as one in the build does.
+            ts_goport::fast_mode::take_flag(&mut args);
+            run(&args)
+        });
     let code = if let Ok(Ok(code)) = work.map(std::thread::JoinHandle::join) {
         code
     } else {
