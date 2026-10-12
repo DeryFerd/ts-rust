@@ -2257,9 +2257,119 @@ mod relative_path_tests {
 #[cfg(test)]
 mod component_ref_tests {
     use super::{
-        combine_paths, combine_with_directory, get_root_length, normalize_slashes_cow,
-        path_component_refs, path_components, reduce_path_component_refs, reduce_path_components,
+        ComparePathsOptions, combine_paths, combine_with_directory, contains_path,
+        equate_string_case_insensitive, get_path_components, get_root_length,
+        normalize_slashes_cow, path_component_refs, path_components, reduce_path_component_refs,
+        reduce_path_components,
     };
+
+    /// `contains_path` with owned parts, as before loadserial1.
+    fn contains_path_owned(parent: &str, child: &str, options: &ComparePathsOptions) -> bool {
+        let parent = combine_paths(&options.current_directory, &[parent]);
+        let child = combine_paths(&options.current_directory, &[child]);
+        if parent.is_empty() || child.is_empty() {
+            return false;
+        }
+        if parent == child {
+            return true;
+        }
+        let parent_components = reduce_path_components(get_path_components(&parent, ""));
+        let child_components = reduce_path_components(get_path_components(&child, ""));
+        if child_components.len() < parent_components.len() {
+            return false;
+        }
+        let component_comparer = options.get_equality_comparer();
+        parent_components
+            .iter()
+            .zip(&child_components)
+            .enumerate()
+            .all(|(i, (parent, child))| {
+                if i == 0 {
+                    equate_string_case_insensitive(parent, child)
+                } else {
+                    component_comparer(parent, child)
+                }
+            })
+    }
+
+    /// `contains_path` gives the answer of its owned parts for each pair of
+    /// these paths (file URL roots with ':' and "%3A", UNC, drive, rooted
+    /// and relative paths, `.` and `..`), with and without case
+    /// sensitivity and a current directory. The root compares without
+    /// case, as in Go.
+    #[test]
+    fn contains_path_matches_owned_parts() {
+        const PATHS: [&str; 30] = [
+            "",
+            ".",
+            "..",
+            "/",
+            "/a/b",
+            "/a/B",
+            "/A/b/c",
+            "/a/b/../c",
+            "/a/./b/",
+            "/a//b",
+            "a/b",
+            "A/B/c",
+            "../a",
+            "c:",
+            "C:/",
+            "c:/a",
+            "C:/A/b",
+            "c:\\a\\b",
+            "file:///a/b",
+            "FILE:///A/b/c",
+            "file:///c%3A/a",
+            "file:///C%3a/a/b",
+            "file:///c:/a/B",
+            "file://server/share/x",
+            "file://Server/share/x/y",
+            "//server/share/a",
+            "\\\\server\\share\\a\\b",
+            "http://x/a",
+            "http://X/a/b",
+            "x:/",
+        ];
+        let mut answers = [0usize; 2];
+        for use_case_sensitive_file_names in [true, false] {
+            for current_directory in ["", "/a/B"] {
+                let options = ComparePathsOptions {
+                    use_case_sensitive_file_names,
+                    current_directory: current_directory.to_string(),
+                };
+                for parent in PATHS {
+                    for child in PATHS {
+                        let answer = contains_path(parent, child, &options);
+                        assert_eq!(
+                            answer,
+                            contains_path_owned(parent, child, &options),
+                            "{parent:?} {child:?} {use_case_sensitive_file_names} {current_directory:?}"
+                        );
+                        answers[usize::from(answer)] += 1;
+                    }
+                }
+            }
+        }
+        assert!(answers[0] > 0 && answers[1] > 0, "{answers:?}");
+        let sensitive = ComparePathsOptions {
+            use_case_sensitive_file_names: true,
+            current_directory: String::new(),
+        };
+        let insensitive = ComparePathsOptions {
+            use_case_sensitive_file_names: false,
+            current_directory: String::new(),
+        };
+        assert!(!contains_path("/a/b", "/A/B/c", &sensitive));
+        assert!(contains_path("/a/b", "/A/B/c", &insensitive));
+        assert!(contains_path(
+            "file:///c%3A/a",
+            "file:///C%3a/a/b",
+            &sensitive
+        ));
+        assert!(contains_path("C:/a", "c:/a/b/../c", &sensitive));
+        assert!(!contains_path("C:/a", "c:/a/../c", &sensitive));
+    }
 
     /// The borrowed parts of `contains_path` are the owned parts, before and
     /// after the reduction, and its combined paths are `combine_paths`, for

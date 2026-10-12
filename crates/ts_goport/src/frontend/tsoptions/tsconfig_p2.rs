@@ -2177,3 +2177,78 @@ mod top_level_array_tests {
         );
     }
 }
+
+/// Option names and the `${configDir}` template with U+0130 (İ). Go
+/// `strings.ToLower` maps it to 'i' (`decls::strings_to_lower`), and Rust
+/// `to_lowercase` maps it to two chars. The expected values come from
+/// tsgo-oracle-fed0bf24149f.
+#[cfg(test)]
+mod go_lower_tests {
+    use super::*;
+    use crate::frontend::vfs::osvfs_fs;
+
+    struct Host(String);
+
+    impl ParseConfigHost for Host {
+        fn fs(&self) -> Rc<dyn Fs> {
+            osvfs_fs()
+        }
+        fn get_current_directory(&self) -> String {
+            self.0.clone()
+        }
+    }
+
+    fn command_line(args: &[&str]) -> ParsedCommandLine {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        parse_command_line(&args, &Host("/p".to_string()))
+    }
+
+    // Go: `tsgo --noImplİcitReturns` reports TS7030 (the option is on), and
+    // `tsgo -p tsconfig.json --buİld` reports TS6369.
+    #[test]
+    fn option_names_lower_like_go() {
+        let parsed = command_line(&["--noImplİcitReturns"]);
+        assert!(parsed.errors.is_empty());
+        assert_eq!(
+            parsed.compiler_options().no_implicit_returns,
+            Tristate::True
+        );
+        let parsed = command_line(&["-p", "tsconfig.json", "--buİld"]);
+        let codes: Vec<i32> = parsed.errors.iter().map(Diagnostic::code).collect();
+        assert_eq!(codes, [6369]);
+    }
+
+    // Go: base/tsconfig.base.json sets `"outDir": "${confİgDir}/out"`, and
+    // app/tsconfig.json extends it. The value starts with the template
+    // (tsconfigparsing.go:358), so it stays relative until the template
+    // substitution (:1705), which replaces only the exact case and then
+    // makes it absolute from app/: `tsgo --listEmittedFiles` in app/ prints
+    // `TSFILE: <dir>/app/${confİgDir}/out/a.js`.
+    #[test]
+    fn config_dir_template_lowers_like_go() {
+        let dir = std::env::temp_dir().join(format!("goport_go_lower_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("base")).unwrap();
+        std::fs::create_dir_all(dir.join("app")).unwrap();
+        std::fs::write(
+            dir.join("base/tsconfig.base.json"),
+            r#"{ "compilerOptions": { "outDir": "${confİgDir}/out" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("app/tsconfig.json"),
+            r#"{ "extends": "../base/tsconfig.base.json", "files": [] }"#,
+        )
+        .unwrap();
+        let root = normalize_slashes(dir.to_str().unwrap());
+        let host = Host(format!("{root}/app"));
+        let (parsed, errors) =
+            get_parsed_command_line_of_config_file("tsconfig.json", None, None, &host, None);
+        assert!(errors.is_empty());
+        assert_eq!(
+            parsed.unwrap().compiler_options().out_dir,
+            format!("{root}/app/${{confİgDir}}/out")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

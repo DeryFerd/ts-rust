@@ -589,13 +589,14 @@ fn load_config(
         return Err(messages.join("\n"));
     }
     let config = config.ok_or_else(|| format!("cannot parse {config_abs}"))?;
-    // PERF: the default lib parses start now, before the host and the
-    // loader exist (`start_default_lib_prefetch`).
+    // PERF: the default lib and root file parses start now, before the
+    // host and the loader exist (`start_default_lib_prefetch`).
     start_default_lib_prefetch(
         &config,
         &cwd,
         fs.use_case_sensitive_file_names(),
         &bundled::lib_path(),
+        true,
     );
 
     // Go: tsc.go:302 NewCachedFSCompilerHost, tsc.go:310 NewProgram.

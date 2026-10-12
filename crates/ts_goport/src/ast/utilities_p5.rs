@@ -173,14 +173,18 @@ pub fn is_call_or_new_expression(node: Node) -> bool {
     is_call_expression(node) || is_new_expression(node)
 }
 
-// Go: ast/utilities.go:3783 IndexOfNode
+// Go: ast/utilities.go:3814 IndexOfNode
 pub fn index_of_node(nodes: NodeSlice, node: Node) -> i32 {
     // PORT: Go slices.BinarySearchFunc returns the first position whose element
     // compares >= target. This lower-bound search keeps that exact position
     // without copying the list.
     // PERF: deferbody1. Go `CompareNodePositions` reads the target's `Loc` as
     // a field at each step; here that read was a registry lookup, so it is
-    // read once. The comparison is `compare_node_positions`.
+    // read once. The comparison is `compare_node_positions`. Go compares
+    // nothing in an empty list, so a nil `node` gives -1 there, not a panic.
+    if nodes.is_empty() {
+        return -1;
+    }
     let target = node.loc();
     let compare = |n: Node| {
         let r = n.loc();
@@ -202,7 +206,7 @@ pub fn index_of_node(nodes: NodeSlice, node: Node) -> i32 {
     -1
 }
 
-// Go: ast/utilities.go:3791 CompareNodePositions
+// Go: ast/utilities.go:3822 CompareNodePositions
 pub fn compare_node_positions(n1: Node, n2: Node) -> i32 {
     // PORT: inlined Go core.CompareTextRanges(n1.Loc, n2.Loc).
     let (r1, r2) = (n1.loc(), n2.loc());
@@ -1254,4 +1258,16 @@ pub fn is_proto_setter(node: Node) -> bool {
 // Go: ast/utilities.go:4628 IsStringLiteralLikeType (ts#63931)
 pub fn is_string_literal_like_type(node: Node) -> bool {
     node.kind() == SyntaxKind::LiteralType && is_string_literal_like(node.literal())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go `IndexOfNode(nil, nil)` returns -1: BinarySearchFunc compares
+    // nothing in an empty list.
+    #[test]
+    fn index_of_node_in_an_empty_list_is_minus_one() {
+        assert_eq!(index_of_node(NodeSlice::default(), Node::NIL), -1);
+    }
 }

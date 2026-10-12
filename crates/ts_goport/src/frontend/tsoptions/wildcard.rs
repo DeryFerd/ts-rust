@@ -137,8 +137,6 @@ fn rooted_directory_path(path: &str) -> String {
 }
 
 // Go: tsoptions/wildcarddirectories.go:94 getWildcardDirectoryFromSpec
-// PORT: Go `strings.ToLower` and Rust `to_lowercase` agree on the ASCII and
-// common Unicode cases that appear in paths.
 fn get_wildcard_directory_from_spec(spec: &str) -> Option<WildcardDirectoryMatch> {
     // Find the first occurrence of a wildcard character
     if let Some(first_wildcard) = spec.find(['*', '?']) {

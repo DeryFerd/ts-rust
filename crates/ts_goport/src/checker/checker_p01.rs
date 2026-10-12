@@ -416,8 +416,8 @@ pub struct InferenceInfo {
     /// Type parameter for which inferences are being made
     pub type_parameter: TypeId,
     /// Go `candidates` and `contraCandidates` when they hold more than one
-    /// candidate, else `None`. Written only through `push_candidate` and
-    /// `clear_candidates`.
+    /// candidate, else `None`. Written only through `push_candidate`,
+    /// `clear_candidates` and a copy (`clone_inference_info`, `Clone`).
     pub(super) candidate_lists: Option<Box<InferenceCandidates>>,
     /// The one candidate while `candidate_lists` is `None` (NIL when there
     /// is none). `first_is_contra` tells its list.
@@ -480,6 +480,9 @@ impl InferenceInfo {
     /// inline; the second moves both into the box.
     #[inline]
     pub fn push_candidate(&mut self, t: TypeId, contra: bool) {
+        // A nil first candidate would read as no candidate. Go appends
+        // only inferred source types, which are never nil.
+        debug_assert!(t.is_some(), "nil inference candidate");
         if self.candidate_lists.is_none() {
             if self.first_candidate.is_nil() {
                 self.first_candidate = t;

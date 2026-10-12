@@ -201,8 +201,12 @@ impl Checker {
 
             // Modifiers are never allowed on properties except for 'async' on a method declaration
             // PERF: deferbody1. A published store node with no modifier bits
-            // has no modifier list (as in `check_grammar_modifiers`), so its
-            // node data is not read for the list.
+            // has no modifier list, so its node data is not read for the
+            // list. `check_grammar_modifiers` (grammarchecks_p1.rs) gives the
+            // reason: each of Go's parser sites makes a list with one or more
+            // nodes, and each modifier and decorator kind has a flag. The
+            // fast path relies on that in every build; the debug_assert only
+            // checks it in debug builds (as there).
             let modifiers = if frozen_store_modifier_flags(prop) == Some(ModifierFlags::NONE) {
                 debug_assert!(prop.modifiers().is_nil(), "modifier bits without a list");
                 NodeSlice::default()
