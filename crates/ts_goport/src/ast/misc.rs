@@ -117,13 +117,22 @@ pub const INTERNAL_SYMBOL_NAME_MODULE_EXPORTS: &str = "module.exports";
 // Go: ast/symbol.go:72 SymbolName
 #[must_use]
 pub fn symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
+    symbol_name_str(symbols, symbol).to_string()
+}
+
+/// `symbol_name` as the interned text, with no new String.
+// PERF: printfast1. Go `SymbolName` returns a string header; callers that
+// only read the text (the node builder's `len(ast.SymbolName(...))`) use
+// this.
+#[must_use]
+pub fn symbol_name_str(symbols: &SymbolArena, symbol: SymbolId) -> &'static str {
     let s = symbols.sym(symbol);
     if s.value_declaration.is_some()
         && is_private_identifier_class_element_declaration(s.value_declaration)
     {
-        return s.value_declaration.name().text().to_string();
+        return s.value_declaration.name().text();
     }
-    s.name.to_string()
+    s.name.as_str()
 }
 
 // Go: ast/symbol.go:80 EscapeAllInternalSymbolNames
