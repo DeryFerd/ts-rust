@@ -275,7 +275,7 @@ fn lsp_session(messages: impl FnOnce(&str) -> Vec<String>) -> (Option<i32>, Vec<
         if let Some(status) = child.try_wait().expect("wait for tsgo --lsp") {
             break status;
         }
-        if start.elapsed() > Duration::from_secs(60) {
+        if start.elapsed() > Duration::from_mins(1) {
             let _ = child.kill();
             break child.wait().expect("wait for the killed tsgo --lsp");
         }
