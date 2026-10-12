@@ -15,9 +15,12 @@ const STACK_SIZE_MB = 256;
 
 let modulePromise;
 
-/** The compiled module, compiled on first use. */
+/** The compiled module, compiled on first use. Failed loads can be retried. */
 export function loadModule() {
-    modulePromise ??= readFile(wasmUrl).then(bytes => WebAssembly.compile(bytes));
+    modulePromise ??= readFile(wasmUrl).then(bytes => WebAssembly.compile(bytes)).catch(error => {
+        modulePromise = undefined;
+        throw error;
+    });
     return modulePromise;
 }
 
