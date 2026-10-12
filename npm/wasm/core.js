@@ -121,6 +121,7 @@ function prepareRun(module, options) {
     let memory;
     let staged;
     let stderrText = "";
+    const stderrDecoder = new TextDecoder();
     const u8 = () => new Uint8Array(memory.buffer);
     const dv = () => new DataView(memory.buffer);
 
@@ -177,7 +178,7 @@ function prepareRun(module, options) {
                 const chunk = u8().slice(ptr, ptr + len);
                 if (fd === 1) stdout(chunk);
                 else {
-                    stderrText += decoder.decode(chunk);
+                    stderrText += stderrDecoder.decode(chunk, { stream: true });
                     stderr(chunk);
                 }
                 total += len;
@@ -241,7 +242,7 @@ function prepareRun(module, options) {
         result(exitCode, error) {
             if (error !== undefined) {
                 if (!(error instanceof WasiExit)) {
-                    error.stderr = stderrText;
+                    error.stderr = stderrText + stderrDecoder.decode();
                     throw error;
                 }
                 exitCode = error.code;
