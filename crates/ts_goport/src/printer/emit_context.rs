@@ -715,9 +715,19 @@ impl EmitContext {
     #[must_use]
     pub fn has_auto_generate_info(&self, node: Node) -> bool {
         if node.is_some() {
-            return self.auto_generate.borrow().contains_key(&node);
+            // PERF: printfast1. No hash of the key while the map is empty.
+            let auto_generate = self.auto_generate.borrow();
+            return !auto_generate.is_empty() && auto_generate.contains_key(&node);
         }
         false
+    }
+
+    /// True when some node has an auto-generate record (`AutoGenerate`).
+    // PORT: no Go counterpart. The printer skips name walks that can
+    // change nothing (`Printer::generate_all_member_names`).
+    #[must_use]
+    pub fn has_any_auto_generate_info(&self) -> bool {
+        !self.auto_generate.borrow().is_empty()
     }
 
     // Go: printer/emitcontext.go:365 GetAutoGenerateInfo

@@ -861,17 +861,7 @@ impl Checker {
             if is_resolved_p17(resolved_module) {
                 let rm = resolved_module.unwrap();
                 // ts#64159 (checker.go:15713): Go reads `ResolvedModule.ResolvedPath`.
-                let redirect = match rm.path() {
-                    Some(path) => get_project_reference_from_source(path.as_str()),
-                    None => get_project_reference_from_source(
-                        tspath::to_path(
-                            &rm.resolved_file_name,
-                            get_current_directory(),
-                            use_case_sensitive_file_names(),
-                        )
-                        .as_str(),
-                    ),
-                };
+                let redirect = get_project_reference_from_source(rm.resolved_path.as_str());
                 if let Some(redirect) = redirect.filter(|r| !r.output_dts.is_empty()) {
                     self.error(
                         error_node,
