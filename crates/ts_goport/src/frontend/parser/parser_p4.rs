@@ -1919,7 +1919,16 @@ impl<'a> Parser<'a> {
                 );
                 let node = self.finish_node(node, pos);
                 expression = self.check_js_syntax(node);
-                self.unparse_expression_with_type_arguments(inner, type_arguments, expression);
+                // PERF: parsefast2. Go runs unparseExpressionWithTypeArguments
+                // here. `inner` and the type arguments are children of the
+                // call, so `finish_node` (overrideParentInImmediateChildren)
+                // already set their parents to it, and the Go writes keep
+                // them. Each write is a store access here, so it is skipped.
+                debug_assert!(
+                    inner.parent() == expression
+                        && (type_arguments.is_nil()
+                            || type_arguments.nodes().iter().all(|a| a.parent() == expression))
+                );
                 continue;
             }
             if question_dot_token.is_some() {
