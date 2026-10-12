@@ -338,6 +338,10 @@ impl Printer {
 
         // Emit each child.
         let mut previous_sibling = Node::NIL;
+        // PERF: printfast1. `previous_sibling.End()`, read with its `Pos`
+        // before its emit. Go reads its `Loc` again; a factory node reads
+        // it in the thread's arena. The printer moves no list node.
+        let mut previous_end = 0;
         let mut should_decrease_indent_after_emit = false;
         for &child in children {
             // Write the delimiter if this is not the first node.
@@ -352,13 +356,11 @@ impl Printer {
                 //          a
                 //          /* End of parameter a */ -> this comment isn't considered to be trailing comment of parameter "a" due to newline
                 //          ,
-                if format.intersects(ListFormat::DELIMITERS_MASK)
-                    && previous_sibling.end() != parent_end
-                {
+                if format.intersects(ListFormat::DELIMITERS_MASK) && previous_end != parent_end {
                     if !self.comments_disabled
                         && self.should_emit_trailing_comments(previous_sibling)
                     {
-                        self.emit_leading_comments(previous_sibling.end(), false /*elided*/);
+                        self.emit_leading_comments(previous_end, false /*elided*/);
                     }
                 }
 
@@ -412,7 +414,8 @@ impl Printer {
                 should_emit_intervening_comments = may_emit_intervening_comments;
             }
 
-            self.next_list_element_pos = child.pos();
+            let child_loc = child.loc();
+            self.next_list_element_pos = child_loc.pos();
             emit(self, child);
 
             if should_decrease_indent_after_emit {
@@ -421,6 +424,7 @@ impl Printer {
             }
 
             previous_sibling = child;
+            previous_end = child_loc.end();
         }
 
         // Write a trailing comma, if requested.
@@ -433,7 +437,7 @@ impl Printer {
             if previous_sibling.is_some() && !skip_trailing_comments {
                 self.emit_token(
                     SyntaxKind::CommaToken,
-                    previous_sibling.end(),
+                    previous_end,
                     WriteKind::PUNCTUATION,
                     previous_sibling,
                 );
@@ -449,14 +453,14 @@ impl Printer {
         //          /* end of element 2 */
         //       ];
         if previous_sibling.is_some()
-            && parent_end != previous_sibling.end()
+            && parent_end != previous_end
             && format.intersects(ListFormat::DELIMITERS_MASK)
             && !skip_trailing_comments
         {
             let comments_pos = if emit_trailing_comma && children_text_range.end() > 0 {
                 children_text_range.end()
             } else {
-                previous_sibling.end()
+                previous_end
             };
             self.emit_leading_comments(comments_pos, false /*elided*/);
         }
