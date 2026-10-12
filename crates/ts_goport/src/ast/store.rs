@@ -7407,6 +7407,10 @@ fn owns_new_data(file: usize) -> bool {
 #[inline]
 #[must_use]
 pub fn store_list_value(file: usize, list: NodeList) -> Option<crate::astdata::NodeList> {
+    // An optional list field is nil in about half the calls.
+    if list.is_nil_handle() {
+        return None;
+    }
     if let Some((list_file, l)) = list.static_parts()
         && list_file == file
         && !FREEABLE_PARSE.get()
@@ -7417,8 +7421,8 @@ pub fn store_list_value(file: usize, list: NodeList) -> Option<crate::astdata::N
     other_store_list_value(file, list)
 }
 
-/// `store_list_value` for a list that is not a static list of store `file`,
-/// or inside a freeable parse.
+/// `store_list_value` for a list that is not nil or a static list of store
+/// `file`, or inside a freeable parse.
 #[inline(never)]
 fn other_store_list_value(file: usize, list: NodeList) -> Option<crate::astdata::NodeList> {
     if list.is_nil() {
@@ -7455,6 +7459,10 @@ pub fn store_modifiers_value(
     file: usize,
     modifiers: ModifierList,
 ) -> Option<crate::astdata::ModifierList> {
+    // Most nodes have no modifiers.
+    if modifiers.is_nil() {
+        return None;
+    }
     if let Some((list_file, m)) = modifiers.node_list().static_parts()
         && list_file == file
         && !FREEABLE_PARSE.get()
@@ -7466,8 +7474,8 @@ pub fn store_modifiers_value(
     other_store_modifiers_value(file, modifiers)
 }
 
-/// `store_modifiers_value` for a list that is not a static list of store
-/// `file`, or inside a freeable parse.
+/// `store_modifiers_value` for a list that is not nil or a static list of
+/// store `file`, or inside a freeable parse.
 #[inline(never)]
 fn other_store_modifiers_value(
     file: usize,
