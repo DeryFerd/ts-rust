@@ -232,7 +232,9 @@ impl Checker {
         };
         let source_file = source_file_of_enclosing(enclosing_declaration);
         p.write_exported(type_node, source_file, writer.clone(), None);
-        let result = writer.borrow().string();
+        // PERF: printfast1. Go `writer.String()` hands out the builder's
+        // bytes with no copy (strings.Builder); the writer is not used again.
+        let result = writer.borrow_mut().take_string();
 
         let mut max_length = DEFAULT_MAXIMUM_TRUNCATION_LENGTH * 2;
         if let Some(vc) = vc {
