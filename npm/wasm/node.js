@@ -60,6 +60,9 @@ export async function tsc(args, options = {}) {
     }
     const worker = new Worker(new URL("./node-worker.js", import.meta.url), {
         workerData: request,
+        execArgv: process.execArgv.filter((arg, index, args) =>
+            arg !== "--input-type" && !arg.startsWith("--input-type=") && args[index - 1] !== "--input-type"
+        ),
         resourceLimits: { stackSizeMb: options.stackSizeMb ?? STACK_SIZE_MB },
         stdout: !options.stream,
         stderr: !options.stream,
