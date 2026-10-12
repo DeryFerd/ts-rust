@@ -6,7 +6,7 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
-- **Now (2026-10-12):** R201 accepted (int68b; note r201-accepted-2026-10-12; main 1c17c0b3d). v0.5.0 released (note release-v050-2026-10-12). Running: int69 (stacked on int68b: storefast1, followups50; becomes R202 after a main merge), perfwave4 (storefast2, checkid1), edleak1 (editor memory leak, note editorgrowth1-result-2026-10-12). Ready for int70: parload2 7ede33791. Waiting for Theo: the Hono record fix (note honorec1-result-2026-10-12). Parked: shared type store, flowmemo. Follow-ups: the UPSTREAM.json current switch in a quiet window; R201 reviewer items (followups51).
+- **Now (2026-10-12, 17:00 UTC):** R202 accepted (int69). R203 open (int70: parload2, followups51, clippy fix; side and np-r203 running). int71 (storefast2, checkid1; skeptic PASS) side running again on 67ccdde5c with the int70 fix: R204 after R203. Next integration int72: followups52 3612b819d (skeptic PASS) and the perfwave5 lanes that pass (flowcost1, identparse1, printfast1), edleak2 if it passes. Running: perfwave5, edleak2, np-r203, slowproj1 (TypeORM and VS Code default against Go). Waits for Theo: Hono record fix (honorec1), gatecounts1. Later: UPSTREAM.json current switch (quiet window), dbook-lan wall A/A, b4-hono #45 flaky_oracle mark, tsrs measurement.
 
 - **Public issues 2026-10-11 (note issues52-result-2026-10-11):** #52 replied (effect-tsgo 0.51.1 parity, workaround, upstream Effect-TS/tsgo#820, labeled; port the upstream fix when it lands). #49: PR #53 merged (ef82c3e59, light path). #50: PR #54 (loader: into int61; macOS CI runs realpath_case.rs).
 
