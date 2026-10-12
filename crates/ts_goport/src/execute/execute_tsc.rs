@@ -175,6 +175,18 @@ fn stop_tracing(sys: &dyn System) {
     }
 }
 
+/// True when `arg`, the first command-line argument, starts build mode:
+/// `-b`, `--b`, `-build` or `--build` in any case.
+// Go: execute/tsc.go:55 `switch strings.ToLower(commandLineArgs[0]) { case "-b", "--b", "-build", "--build":`
+// PORT: Go `strings.ToLower` maps each rune with `unicode.ToLower`, so
+// `-buİld` (U+0130) is build mode, and the build parser finds the option
+// (tsoptions `NameMap`). Rust `str::to_lowercase` maps U+0130 to two chars.
+#[must_use]
+pub fn is_build_flag(arg: &str) -> bool {
+    let lower = crate::frontend::tsoptions::decls::strings_to_lower(arg);
+    matches!(lower.as_str(), "-b" | "--b" | "-build" | "--build")
+}
+
 // Go: execute/tsc.go:53 CommandLine
 // PORT: Go parses the build command line here and passes it on; the port
 // passes the arguments, because `goport_build` calls
@@ -189,17 +201,15 @@ pub fn command_line(
     // Effect-TS/tsgo patch 009: Effect rules know they run under tsc.
     let _effect_cli_mode = crate::effect::etscore::enter_command_line_mode();
     if let Some(first) = command_line_args.first() {
-        match first.to_lowercase().as_str() {
-            "-b" | "--b" | "-build" | "--build" => {
-                if !hooks.build_mode() {
-                    unported!("tscBuildCompilation");
-                }
-                return tsc_build_compilation(ctx, sys, command_line_args, hooks.testing());
+        // Go: switch strings.ToLower(commandLineArgs[0])
+        if is_build_flag(first) {
+            if !hooks.build_mode() {
+                unported!("tscBuildCompilation");
             }
-            // case "-f":
-            // 	return fmtMain(sys, commandLineArgs[1], commandLineArgs[1])
-            _ => {}
+            return tsc_build_compilation(ctx, sys, command_line_args, hooks.testing());
         }
+        // case "-f":
+        // 	return fmtMain(sys, commandLineArgs[1], commandLineArgs[1])
     }
 
     let mut parsed = parse_command_line(command_line_args, &SystemParseConfigHost(&*sys));

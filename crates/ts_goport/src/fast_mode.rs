@@ -57,7 +57,8 @@ pub const FILES_PER_CHECKER: usize = 32;
 /// 0: not read yet, 1: off, 2: on.
 static STATE: AtomicU8 = AtomicU8::new(0);
 
-/// Set by `take_flag` for `tsc -b` (`--build` comes first in Go).
+/// Set by `take_flag` for `tsc -b` (a build flag comes first in Go:
+/// `execute_tsc::is_build_flag`).
 static BUILD: AtomicBool = AtomicBool::new(false);
 
 /// Removes every `--fast` from the command line `args` (without the
@@ -71,7 +72,7 @@ pub fn take_flag(args: &mut Vec<String>) {
     }
     if args
         .first()
-        .is_some_and(|arg| arg == "-b" || arg == "--build")
+        .is_some_and(|arg| crate::execute::execute_tsc::is_build_flag(arg))
     {
         BUILD.store(true, Ordering::Relaxed);
     }
