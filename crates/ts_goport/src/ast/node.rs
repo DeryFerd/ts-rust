@@ -449,7 +449,7 @@ pub(crate) enum ChildIds {
 
 impl ChildIds {
     /// `Node::new(file, id)`.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn node(self, id: crate::astdata::NodeId) -> Node {
         match self {
             ChildIds::Frozen(ids) => {
@@ -466,7 +466,7 @@ impl ChildIds {
     }
 
     /// Go `nil` for an optional child, else `node`.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn opt(self, id: Option<crate::astdata::NodeId>) -> Node {
         match id {
             Some(id) => self.node(id),
@@ -1691,10 +1691,6 @@ impl NodeSliceIter {
     // PERF: U1 (c). The store facts are read once in `NodeSlice::iter`. For
     // an alias-free store (most stores) each id then becomes its handle with
     // no table load (`FrozenIds::Direct`).
-    // PERF: noderead2. Only the arms of a published store and of a node
-    // slice are inline. With all five arms LLVM kept `at` out of line, a
-    // call per list element (VS Code: 0.33% of check cycles). Go ranges
-    // over a slice.
     #[inline]
     fn at(&self, i: usize) -> Node {
         match &self.ids {
@@ -1704,19 +1700,9 @@ impl NodeSliceIter {
                 debug_assert_eq!(n, self.slice.get(i));
                 n
             }
-            _ => self.at_slow(i),
-        }
-    }
-
-    /// `at` for a list that a store owns (lsshells M3c), a short list read
-    /// into the iterator, and the `Slow` lists.
-    #[cold]
-    #[inline(never)]
-    fn at_slow(&self, i: usize) -> Node {
-        match &self.ids {
             &SliceIds::Store(list) => store_list_node(list, i),
             SliceIds::Inline(nodes) => nodes[i],
-            SliceIds::Nodes(_) | SliceIds::Frozen(..) | SliceIds::Slow => self.slice.get(i),
+            SliceIds::Slow => self.slice.get(i),
         }
     }
 }
