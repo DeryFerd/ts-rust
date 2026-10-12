@@ -30,8 +30,9 @@
 //! type x constant reference), candidates that are settled and have nothing
 //! to check per walk are joined to their parent (union-find), so a walk
 //! over settled nodes costs about O(1). A file is indexed only once its
-//! walks have taken 16 steps per flow node (one walk in 32 measured), so
-//! files with short walks pay almost nothing: a countdown per walk.
+//! walks have taken 16 steps per flow node (sampled: one walk in 4 at
+//! first, then the gap doubles up to 32), so files with short walks pay
+//! almost nothing: a countdown per walk.
 //!
 //! `GOPORT_FLOWSKIP`: unset or `1` on, `0` off, `verify` indexes every file,
 //! tests each walk, then runs Go's walk anyway, and panics when the skip
@@ -249,7 +250,8 @@ pub struct FlowSkip {
     /// A walk with fewer loop turns to its root (and no move to an outer
     /// function there) is not tested: Go's walk is cheaper than the test.
     pub min_steps: u32,
-    /// While a file is counted, one walk in this many is measured.
+    /// While a file is counted, the gap between measured walks grows from
+    /// `FIRST_GAP` up to this many walks.
     pub sample_every: u32,
     files: FxHashMap<u32, FileState>,
     /// The last counted file (`NONE`: none) and its live count. Its entry in
@@ -288,6 +290,7 @@ impl Default for FlowSkip {
             hot_file: NONE,
             hot: Count {
                 countdown: 0,
+                gap: 0,
                 need: 0,
             },
             effects: 0,
@@ -309,14 +312,18 @@ impl std::fmt::Debug for FlowSkip {
     }
 }
 
-/// The count of a file before it is indexed. One walk in `sample_every` is
-/// measured (at most `DRY_CAP` steps, weighted by `sample_every`):
-/// `countdown` is the walks up to the next measured one, `need` the
-/// measured steps that the file still needs before it is indexed. The other
-/// walks pay only the countdown.
+/// The count of a file before it is indexed. The last walk of each gap is
+/// measured (at most `DRY_CAP` steps, weighted by the gap), and the gap
+/// doubles from `FIRST_GAP` up to `sample_every`: a new file is judged on
+/// small gaps, so one long walk of a file with few walks does not index it
+/// (query-core lost 0.15% that way with a fixed gap of 32). `countdown` is
+/// the walks up to the next measured one, `need` the measured steps that
+/// the file still needs before it is indexed. The other walks pay only the
+/// countdown.
 #[derive(Clone, Copy)]
 struct Count {
     countdown: u32,
+    gap: u32,
     need: u64,
 }
 
@@ -331,10 +338,12 @@ enum FileState {
 
 /// A measured walk counts at most this many steps.
 const DRY_CAP: u32 = 256;
-/// One walk in this many is measured (`FlowSkip::sample_every`). The
-/// estimate needs few samples: a file is worth an index only when it has
-/// many walks. 1 in 4 cost VS Code +0.13% instructions; 1 in 32 keeps the
-/// same files indexed on T3 server.
+/// The first gap between measured walks of a file.
+const FIRST_GAP: u32 = 4;
+/// The largest gap (`FlowSkip::sample_every`). The estimate needs few
+/// samples: a file is worth an index only when it has many walks. A gap of
+/// 4 cost VS Code +0.13% instructions; 32 keeps the same files indexed on
+/// T3 server.
 const SAMPLE_EVERY: u32 = 32;
 
 /// Steps of pi(u) to its root (no move to an outer function), at most
@@ -1565,8 +1574,10 @@ impl Checker {
                         entry.insert(FileState::Unsupported);
                         return Err(Refusal::File);
                     };
+                    let gap = FIRST_GAP.min(self.flow_skip.sample_every);
                     let count = Count {
-                        countdown: self.flow_skip.sample_every,
+                        countdown: gap,
+                        gap,
                         need: u64::from(self.flow_skip.build_steps) * flows.len() as u64,
                     };
                     entry.insert(FileState::Counting(count));
@@ -1591,13 +1602,15 @@ impl Checker {
                 if hot.countdown > 0 {
                     return Err(Refusal::Counting);
                 }
-                hot.countdown = sample_every;
+                let weight = hot.gap;
+                hot.gap = hot.gap.saturating_mul(2).min(sample_every);
+                hot.countdown = hot.gap;
                 let flows = static_go_file(file)
                     .and_then(|g| g.flow_nodes.get())
                     .expect("a counted file is static");
                 let u = flow.local_index();
                 let steps = if u < flows.len() {
-                    u64::from(dry_steps(flows, file, u)) * u64::from(sample_every)
+                    u64::from(dry_steps(flows, file, u)) * u64::from(weight)
                 } else {
                     0
                 };
