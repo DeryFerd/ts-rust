@@ -6,9 +6,9 @@
 //!
 //! - more checkers: one per core, up to `MAX_CHECKERS`, and at most one per
 //!   `FILES_PER_CHECKER` program files that are not declaration files
-//!   (`checker_count`). An explicit
-//!   `--checkers N` or `--singleThreaded` still wins, and `tsc -b` keeps
-//!   Go's 4 (it can check several projects at once);
+//!   (`checker_count`). An explicit `--checkers N` or `--singleThreaded`
+//!   still wins, and `tsc -b` keeps Go's 4 (it can check several projects
+//!   at once);
 //! - a work-stealing check pass (`program.rs` `start_checker_group_do`): each
 //!   checker starts with Go's split of its files and, when its own queue is
 //!   empty, takes the last unstarted file of the queue with the most work
@@ -38,7 +38,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 pub const FLAG: &str = "--fast";
 
 /// The most checkers fast mode starts by default (fastmode1: on a 16 vCPU
-/// runner, more than this gave no wall time on the app bench).
+/// testbox, 16 checkers were the fastest on VS Code and Sentry, and 12 to
+/// 16 on the other apps; more than 16 was not measured).
 pub const MAX_CHECKERS: usize = 16;
 
 /// Fast mode starts at most one checker per this many program files that
