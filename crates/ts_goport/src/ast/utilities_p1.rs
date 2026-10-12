@@ -792,7 +792,7 @@ pub fn is_assignment_target(node: Node) -> bool {
 // PERF: deferbody1. Most calls end at the first step, at a parent kind that
 // the walk does not handle (a call, a property access, a statement). That
 // step is inline at the caller; the walk is out of line.
-#[inline]
+#[inline(always)]
 pub fn get_assignment_target(node: Node) -> Node {
     let (parent, parent_kind) = assignment_target_parent(node);
     match parent_kind {
@@ -814,15 +814,22 @@ pub fn get_assignment_target(node: Node) -> Node {
 
 /// Go `node.Parent` and `node.Parent.Kind`: one store lookup for a parent in
 /// the same published store (`frozen_store_parent_kind`).
-#[inline]
+#[inline(always)]
 fn assignment_target_parent(node: Node) -> (Node, SyntaxKind) {
     match frozen_store_parent_kind(node) {
         Some(parent_and_kind) => parent_and_kind,
-        None => {
-            let parent = node.parent();
-            (parent, parent.kind())
-        }
+        None => node_parent_and_kind_slow(node),
     }
+}
+
+/// `node.Parent` and its kind, read one by one: a parent in another store,
+/// a nil parent (its kind read panics, as Go does) or a node that is not in
+/// a published store.
+#[cold]
+#[inline(never)]
+fn node_parent_and_kind_slow(node: Node) -> (Node, SyntaxKind) {
+    let parent = node.parent();
+    (parent, parent.kind())
 }
 
 /// The walk of `get_assignment_target` from `node`, whose parent `parent`
