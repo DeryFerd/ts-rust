@@ -1754,7 +1754,7 @@ fn read_ast_node_cold_dyn(n: Node, read: &mut dyn FnMut(NodeData<'_>)) {
     crate::ast::store::read_store_node_miss(n, read)
 }
 
-/// `$body` with `$d` bound to the astdata data (`&NodeData`) of node `$n`,
+/// `$body` with `$d` bound to the astdata data (`NodeData<'_>`) of node `$n`,
 /// parsed or synthetic, like `with_ast_data`. Go dereferences the pointer, so
 /// nil panics. `$body` cannot keep a reference into the data, and it cannot
 /// `return` from the caller. It is a field read: it must not make or change

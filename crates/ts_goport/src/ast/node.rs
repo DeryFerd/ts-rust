@@ -993,7 +993,7 @@ macro_rules! locals_container_variants {
     };
 }
 
-/// True when `$d` (a `&NodeData`) is one of the listed variants.
+/// True when `$d` (a `NodeData<'_>`) is one of the listed variants.
 macro_rules! data_is_variant {
     ($d:expr, [$($v:ident),+ $(,)?]) => {
         matches!($d, $(NodeData::$v(_))|+)

@@ -374,11 +374,16 @@ methods reach the AST through it.
   `TEXT_IS_KEYWORD`, `NO_NODE`) are bits 29 to 31 of `flags`: Go
   `NodeFlags` ends at bit 28. `NodeRecord::flags` masks them, and a parse
   flags write checks that no Go flag is in them (`checked_flags`). The
-  node column (`FileStore::nodes`, `BlockFile`) names a leaked `NodeData`
-  (16 bytes) for each node slot, not a whole `astdata::Node` (astmem1
-  P1): the kind is in the kind column and the header in the record, so no
-  read needs the rest. The node reads (`static_ast_node`,
-  `frozen_store_ast_node`) give `&NodeData`. The words are atomics that the reads load
+  node column (`FileStore::nodes`, `BlockFile`) holds a `NodeData<'static>`
+  for each node slot, not a whole `astdata::Node` (astmem1 P1): the kind
+  is in the kind column and the header in the record, so no read needs
+  the rest. `NodeData<'a>` is a tag and a reference (16 bytes), as Go's
+  `nodeData` interface word; a static parse moves the data struct into the
+  AST arena (`alloc_store_slot`, astchunks2), as Go's typed arenas. Owned
+  versions and synthetic nodes keep the boxed form, `BoxedData` (same
+  tags and layout, so `BoxedData::view` is a copy). The node reads
+  (`static_ast_node`, `frozen_store_ast_node`) give `NodeData<'static>`.
+  The words are atomics that the reads load
   with `Relaxed`. The parse writes them through `get_mut`; after the
   publish only `BoundFile::install` writes a record (`bind_store_records`:
   symbol, added flags, `bind`), through a shared ref, before any other
