@@ -72,7 +72,7 @@ fn version_and_probe(p: &NewProgram) -> (&'static GoProgram, VersionTablesProbe)
 
 /// Waits until `probe` sees the tables freed.
 fn wait_freed(probe: &VersionTablesProbe) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_mins(1);
     while !probe.is_freed() {
         assert!(
             Instant::now() < deadline,

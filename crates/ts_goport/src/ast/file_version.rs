@@ -1300,7 +1300,7 @@ mod tests {
                 "the data of a big version waits for the free thread"
             );
             go.send(()).expect("the free thread waits");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
             while big_text.upgrade().is_some() {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -1429,7 +1429,7 @@ mod tests {
 
     /// Waits up to 60 s for a free thread to free the data of `text`.
     fn wait_for_free(text: &Weak<str>) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
         while text.upgrade().is_some() {
             assert!(
                 std::time::Instant::now() < deadline,

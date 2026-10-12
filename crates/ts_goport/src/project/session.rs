@@ -4009,7 +4009,7 @@ mod tests {
         let (preempt, warm_ctx) = preempt_with_warm();
         for file_event in [false, true] {
             let (attempt_ctx, attempt_cancel) = gostd::context::with_cancel(&warm_ctx);
-            assert!(preempt.start_attempt(attempt_cancel, Some(Duration::from_secs(60))));
+            assert!(preempt.start_attempt(attempt_cancel, Some(Duration::from_mins(1))));
             let reader = message(&preempt, file_event);
             std::thread::sleep(Duration::from_millis(20));
             assert_eq!(
@@ -4019,7 +4019,7 @@ mod tests {
             let (waited, queued) = reader.join().expect("reader thread");
             assert!(queued);
             assert!(waited >= Duration::from_millis(20), "{waited:?}");
-            assert!(waited < Duration::from_secs(60), "{waited:?}");
+            assert!(waited < Duration::from_mins(1), "{waited:?}");
             assert!(attempt_ctx.err().is_none() && warm_ctx.err().is_none());
         }
     }

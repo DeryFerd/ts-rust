@@ -92,7 +92,7 @@ const MAX_FALL_PER_MS: u64 = 32 << 20;
 
 /// The watcher stops after this time, so a long run does not read the
 /// memory for its whole life. The longest run of the perf13 grid took 1.2 s.
-const WATCH_FOR: Duration = Duration::from_secs(60);
+const WATCH_FOR: Duration = Duration::from_mins(1);
 
 /// The buffer for `/proc/buddyinfo`: about 110 bytes per zone, so room for
 /// 70 nodes of 4 zones.

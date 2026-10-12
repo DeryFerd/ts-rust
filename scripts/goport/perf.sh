@@ -124,7 +124,7 @@ print(f"host-line {ni['line']}")
 print(f"tsgo args {ni['args']}")
 print(f"tsgo env {ni['env']}")
 if one:
-    print("wall: valid (compare only within this run)" if wall else "wall: not valid on a testbox (time on mini-743d)")
+    print("wall: valid (compare only within this run)" if wall else "wall: not valid on a testbox (time on dbook-lan)")
 else:
     print(f"compare: bin0 of {base_dir} (base) against {new_dir}; wall compares only within one run")
     print(f"base {bbins[0][1][:12]} {bbins[0][2]}")

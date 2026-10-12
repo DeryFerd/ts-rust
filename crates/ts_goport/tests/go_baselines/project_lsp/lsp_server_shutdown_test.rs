@@ -112,7 +112,7 @@ child_test! {
         // Shutdown (cancel context and wait for write loop to exit)
         cancel();
         write_loop_done
-            .recv_timeout(Duration::from_secs(60))
+            .recv_timeout(Duration::from_mins(1))
             .expect("write loop did not exit");
 
         // Trigger operations that would log (these should not block)
@@ -163,7 +163,7 @@ fn server_outgoing_queue_does_not_block_without_writer() {
         let _ = done_tx.send(Ok(()));
     });
 
-    match done.recv_timeout(Duration::from_secs(60)) {
+    match done.recv_timeout(Duration::from_mins(1)) {
         Ok(Ok(())) => {}
         Ok(Err(err)) => panic!("{}", err.error()),
         Err(_) => panic!("sending outgoing messages blocked without a writer"),
