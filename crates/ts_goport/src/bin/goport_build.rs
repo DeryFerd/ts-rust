@@ -7,7 +7,8 @@
 //!   loop (Go `WatchManager.RunLoop`) until the process is killed: there is
 //!   no signal handling (plan D-W3), so the loop never ends by itself.
 //!   Output goes to stdout as it is written. Every project compiles in
-//!   this process, as in Go.
+//!   this process, as in Go. `--fast` and `GOPORT_FAST=1` work as with
+//!   `tsgo -b` (`fast_mode::take_flag`).
 //!
 //! Only build mode is ported. Other command lines (Go `tscCompilation`)
 //! exit with `EXIT_UNPORTED` (70).
@@ -53,7 +54,11 @@ fn main() {
     let budget = ThreadBudget::WIDE;
     set_malloc_tunables(&budget);
     budget.install();
-    let args: Vec<String> = ts_goport::frontend::vfs::os_args();
+    let mut args: Vec<String> = ts_goport::frontend::vfs::os_args();
+    // PORT: not in Go (fastmode1). As the tsc bin (`tsgo.rs` `run_main`):
+    // `--fast` turns fast mode on, and the build flag keeps Go's 4 checkers
+    // in fast mode (`fast_mode::checker_count`), with `GOPORT_FAST=1` too.
+    ts_goport::fast_mode::take_flag(&mut args);
     install_panic_hook();
     let work = std::thread::Builder::new()
         .name("goport_build".to_string())

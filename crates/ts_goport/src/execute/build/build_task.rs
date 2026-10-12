@@ -987,7 +987,12 @@ impl BuildTask {
         host.source_files
             .for_each_stored(|_, _| host_has_parses = true);
         if host.prefetch.get() && !host_has_parses && crate::ast::published_paths().is_empty() {
-            crate::execute::execute_tsc::start_lib_prefetch(&*sys, &resolved, testing.is_some());
+            crate::execute::execute_tsc::start_lib_prefetch(
+                &*sys,
+                &resolved,
+                testing.is_some(),
+                false,
+            );
         }
         let build_info_read_start = sys.now();
         let mut old_program = None;

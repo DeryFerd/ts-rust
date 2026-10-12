@@ -297,6 +297,8 @@ impl<'a> Parser<'a> {
         let save_context_flags = self.context_flags;
         let save_parsing_contexts = self.parsing_contexts;
         let save_scanner_state = self.scanner.mark();
+        // Not in Go (parsefast2): `set_text` clears it.
+        let save_text_has_no_go_string_marker = self.scanner.text_has_no_go_string_marker;
         // Go: jsdoc.go:153 Mark saves the `commentDirectives` slice header,
         // SetText (jsdoc.go:164, scanner.go:400) starts a nil slice, so the
         // JSDoc scan appends to a new array, and Rewind (jsdoc.go:181) gives
@@ -343,9 +345,8 @@ impl<'a> Parser<'a> {
         self.scanner.set_text(self.source_text);
         // A cut of the text with no kept tail is a prefix of the text; a
         // tail holds invalid byte units, which are markers.
-        self.scanner.set_text_has_no_go_string_marker(
-            cut_has_no_tail && self.source_text_has_no_go_string_marker,
-        );
+        self.scanner
+            .set_text_has_no_go_string_marker(cut_has_no_tail && save_text_has_no_go_string_marker);
         // +3 for leading `/**`
         self.scanner.reset_pos(start + 3);
         self.set_context_flags(NodeFlags::JS_DOC, true);
@@ -372,7 +373,7 @@ impl<'a> Parser<'a> {
         self.source_text = save_source_text;
         self.scanner.set_text(self.source_text);
         self.scanner
-            .set_text_has_no_go_string_marker(self.source_text_has_no_go_string_marker);
+            .set_text_has_no_go_string_marker(save_text_has_no_go_string_marker);
         self.parsing_contexts = save_parsing_contexts;
         self.context_flags = save_context_flags;
         self.scanner.comment_directives = save_comment_directives;

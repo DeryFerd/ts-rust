@@ -205,9 +205,11 @@ new field that few values set goes in the box.
   first write (`rare_mut`). Their accessors (`return_mapper()` and the
   others) give Go's zero values while it is absent. `inferences` is a boxed
   slice: its length never changes.
-- `InferenceInfo` is 32 bytes. Its two candidate lists are in one box
-  (`candidate_lists`) that the first candidate makes. `candidates()` and
-  `contra_candidates()` give Go's nil lists while it is absent.
+- `InferenceInfo` is 32 bytes. Its first candidate is inline
+  (`first_candidate`), and the second moves both into one box of the two
+  candidate lists (`candidate_lists`). `candidates()` and
+  `contra_candidates()` give Go's lists from either, and Go's nil lists
+  while there is no candidate.
 
 ## AST (owned by ast/node.rs, ast/fields.rs, ast/misc.rs, ast/utilities_*)
 

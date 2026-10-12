@@ -65,7 +65,8 @@ static BUILD: AtomicBool = AtomicBool::new(false);
 /// name) and turns fast mode on when there was one. Call before the first
 /// `enabled`. tsgo `run_main` calls it after it sends `--lsp` and `--api`
 /// on, as Go does: the servers parse their flags with Go's `flag` package,
-/// so they take fast mode only from `GOPORT_FAST=1`.
+/// so they take fast mode only from `GOPORT_FAST=1`. `goport_build` calls
+/// it too, so its builds keep Go's 4 checkers.
 pub fn take_flag(args: &mut [String]) {
     if args
         .first()
