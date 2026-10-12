@@ -499,10 +499,15 @@ pub fn check_cannot_see_outputs() -> bool {
 
 /// False when `GOPORT_EARLY_EMIT` is `0`: the emit then waits for the whole
 /// check, as in Go (`emit_can_start_with_check`). For tests and timing on
-/// one binary. Read once.
+/// one binary. False too with the work-stealing check of fast mode
+/// (`crate::fast_mode::steal`): an emit job goes to the checker of its file
+/// when it is sent, and a file can move to another checker until the check
+/// ends. Read once.
 fn early_emit_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("GOPORT_EARLY_EMIT").as_deref() != Ok("0"))
+    *ENABLED.get_or_init(|| {
+        std::env::var("GOPORT_EARLY_EMIT").as_deref() != Ok("0") && !crate::fast_mode::steal()
+    })
 }
 
 /// Go `tr.Push(tracing.PhaseEmit, "emit", nil, true)` at the start of

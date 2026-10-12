@@ -38,6 +38,8 @@ pub mod diagnostics_loc;
 pub mod emitter;
 pub mod evaluator;
 pub mod execute;
+/// The opt-in fast mode (`--fast`, `GOPORT_FAST=1`). Not in Go.
+pub mod fast_mode;
 pub mod flags;
 /// The leaked bump arena of a thread (AST and checker arenas).
 pub mod leak_arena;

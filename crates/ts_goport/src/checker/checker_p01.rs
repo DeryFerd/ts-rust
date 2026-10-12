@@ -944,7 +944,7 @@ pub struct Checker {
     /// Go `lazyMemberTables` (microsoft/TypeScript#64475, not in the pin;
     /// lazy_members.rs). Empty unless `lazy_members` is on.
     pub(crate) lazy_member_tables: crate::checker::lazy_members::LazyMemberTables,
-    /// lazymem1: `GOPORT_LAZY_MEMBERS=1` (lazy_members.rs). Not in Go. Set
+    /// lazymem1: `GOPORT_LAZY_MEMBERS=1` or fast mode (lazy_members.rs). Not in Go. Set
     /// once at creation; off, no lazy member table is made.
     pub lazy_members: bool,
     pub context_free_types: FxHashMap<Node, TypeId>,

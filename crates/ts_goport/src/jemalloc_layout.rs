@@ -144,6 +144,10 @@ pub fn jemalloc_layout() {
 /// With many arenas (a user `_RJEM_MALLOC_CONF` without `narenas`) or one
 /// thread per arena (no watcher), jemalloc already gives each checker an
 /// arena of its own, and `claim` moves none.
+///
+/// fastmode1: fast mode can start more checkers than auto arenas. Then a
+/// checker that finds no free auto arena gets a new manual arena
+/// (`arenas.create`) of its own (`crate::fast_mode::own_arenas`).
 pub struct ArenaClaims {
     /// Bit i: arena i is an auto arena below 64.
     auto: u64,
@@ -187,6 +191,11 @@ impl ArenaClaims {
         let arena = free.trailing_zeros();
         if free != 0 && b"thread.arena\0".name().write(arena).is_ok() {
             *held |= 1 << arena;
+        } else if free == 0
+            && crate::fast_mode::own_arenas()
+            && let Ok(arena) = Access::<u32>::read(b"arenas.create\0".name())
+        {
+            let _ = b"thread.arena\0".name().write(arena);
         }
     }
 }
