@@ -470,6 +470,37 @@ fn test_resolved_type_reference_directive_carries_path() {
     assert_eq!(resolved.resolved_path, expected);
 }
 
+// Go: module/resolver_test.go:619 TestResolvedEntrypointCarriesPath (ts#64159)
+#[test]
+fn test_resolved_entrypoint_carries_path() {
+    let resolver = new_test_resolver(
+        &[
+            (
+                "/Repo/node_modules/Pkg/package.json",
+                r#"{"name":"pkg","types":"Index.d.ts"}"#,
+            ),
+            (
+                "/Repo/node_modules/Pkg/Index.d.ts",
+                "export const x: number;",
+            ),
+            ("/Repo/src/file.ts", ""),
+        ],
+        false,
+        "/Repo",
+        (*bundler_options()).clone(),
+    );
+    let (resolved, _, _) =
+        resolver.resolve_module_name("Pkg", "/Repo/src/file.ts", ModuleKind::ES_NEXT, None);
+    assert!(resolved.is_resolved(), "expected module to resolve");
+    let package_json = package_json_entry(&resolver, "/Repo/node_modules/Pkg");
+    assert!(package_json.is_some(), "expected package JSON cache entry");
+    let entrypoints = resolver.get_entrypoints_from_package_json_info(&package_json, "Pkg", false);
+    assert_eq!(entrypoints.len(), 1, "entrypoint count");
+    let entrypoint = &entrypoints[0];
+    let expected = tspath::to_path(&entrypoint.resolved_file_name, "", false);
+    assert_eq!(entrypoint.resolved_path, expected);
+}
+
 // Go: module/resolver_test.go:427 TestResolveDynamicPackageJSONPath (ts#64544)
 #[test]
 fn test_resolve_dynamic_package_json_path() {
