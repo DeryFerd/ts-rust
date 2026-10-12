@@ -115,7 +115,7 @@ pub fn analyze_effect_map_void(tp: &mut TypeParser<'_>, sf: Node) -> Vec<EffectM
             let transformation = &flow.transformations[index];
             if transformation.args.len() != 1
                 || transformation.callee.is_nil()
-                || !tp.is_node_reference_to_effect_module_api(transformation.callee, "map")
+                || !tp.is_node_reference_to_effect_module_api(transformation.callee, member!("map"))
             {
                 continue;
             }

@@ -93,17 +93,43 @@ pub struct SymbolTable;
 #[derive(Clone, Debug, Default)]
 pub struct OpaqueValue;
 
-#[derive(Clone, Debug, Default)]
-pub struct NodeList {
-    pub range: TextRange,
-    pub nodes: Vec<NodeId>,
-    pub has_trailing_comma: bool,
+/// A list field of node data: entry `index()` of the list table of the owner
+/// of the data (a file store, or the synthetic arena of a thread). The entry
+/// holds the Go `Loc`, the node ids, the missing-list bit and, for a modifier
+/// list, Go `ModifiersToFlags`. Go stores a `*NodeList`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NodeList(std::num::NonZeroU32);
+
+impl NodeList {
+    /// The list field of table entry `index`.
+    #[must_use]
+    pub const fn new(index: u32) -> Self {
+        match std::num::NonZeroU32::new(index.wrapping_add(1)) {
+            Some(n) => Self(n),
+            None => panic!("list table index out of range"),
+        }
+    }
+
+    /// The table entry.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        (self.0.get() - 1) as usize
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+/// A modifier list field: the list of its table entry (Go `ModifierList`
+/// embeds its `NodeList`).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ModifierList {
     pub list: NodeList,
-    pub flags: ModifierFlags,
+}
+
+/// A direct child that `NodeData::try_for_each_child` visits: a child node
+/// id, or a list field (whose ids are in the list table of the data's owner).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Child {
+    Node(NodeId),
+    List(NodeList),
 }
 
 #[derive(Clone, Debug)]
@@ -261,7 +287,6 @@ impl NodeArena {
 pub struct ArrayLiteralExpressionData {
     pub elements: NodeList,
     pub multi_line: bool,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -273,17 +298,11 @@ pub struct ArrayTypeNodeData {
 pub struct ArrowFunctionData {
     pub asterisk_token: Option<NodeId>,
     pub body: NodeId,
-    pub end_flow_node: Option<FlowNodeId>,
     pub equals_greater_than_token: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
@@ -309,43 +328,31 @@ pub struct BinaryExpressionData {
     pub left: NodeId,
     pub operator_token: NodeId,
     pub right: NodeId,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BindingElementData {
     pub dot_dot_dot_token: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub initializer: Option<NodeId>,
-    pub local_symbol: Option<SymbolId>,
     pub property_name: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BindingPatternData {
     pub elements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct BlockData {
-    pub flow_node: Option<FlowNodeId>,
-    pub locals: SymbolTable,
     pub multi_line: bool,
-    pub next_container: Option<NodeId>,
     pub statements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct BreakStatementData {
-    pub flow_node: Option<FlowNodeId>,
     pub label: Option<NodeId>,
 }
 
@@ -354,18 +361,13 @@ pub struct CallExpressionData {
     pub arguments: NodeList,
     pub expression: NodeId,
     pub question_dot_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct CallSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
 }
@@ -373,39 +375,25 @@ pub struct CallSignatureDeclarationData {
 #[derive(Clone, Debug)]
 pub struct CaseBlockData {
     pub clauses: NodeList,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct CaseOrDefaultClauseData {
     pub expression: NodeId,
-    pub fallthrough_flow_node: Option<FlowNodeId>,
     pub statements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct CatchClauseData {
     pub block: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub variable_declaration: Option<NodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ClassDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
     pub heritage_clauses: Option<NodeList>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
     pub members: NodeList,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -413,13 +401,8 @@ pub struct ClassDeclarationData {
 #[derive(Clone, Debug)]
 pub struct ClassExpressionData {
     pub heritage_clauses: Option<NodeList>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
     pub members: NodeList,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -427,18 +410,12 @@ pub struct ClassExpressionData {
 #[derive(Clone, Debug)]
 pub struct ClassStaticBlockDeclarationData {
     pub body: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ComputedPropertyNameData {
     pub expression: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -448,7 +425,6 @@ pub struct ConditionalExpressionData {
     pub question_token: NodeId,
     pub when_false: NodeId,
     pub when_true: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -456,18 +432,13 @@ pub struct ConditionalTypeNodeData {
     pub check_type: NodeId,
     pub extends_type: NodeId,
     pub false_type: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub true_type: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct ConstructSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
 }
@@ -476,26 +447,17 @@ pub struct ConstructSignatureDeclarationData {
 pub struct ConstructorDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ConstructorTypeNodeData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -503,19 +465,15 @@ pub struct ConstructorTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct ContinueStatementData {
-    pub flow_node: Option<FlowNodeId>,
     pub label: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
-pub struct DebuggerStatementData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct DebuggerStatementData;
 
 #[derive(Clone, Debug)]
 pub struct DecoratorData {
     pub expression: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -526,32 +484,22 @@ pub struct DeleteExpressionData {
 #[derive(Clone, Debug)]
 pub struct DoStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ElementAccessExpressionData {
     pub argument_expression: NodeId,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub question_dot_token: Option<NodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
-pub struct EmptyStatementData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct EmptyStatementData;
 
 #[derive(Clone, Debug)]
 pub struct EnumDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub local_symbol: Option<SymbolId>,
     pub members: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -560,8 +508,6 @@ pub struct EnumDeclarationData {
 pub struct EnumMemberData {
     pub initializer: Option<NodeId>,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -569,11 +515,8 @@ pub struct EnumMemberData {
 #[derive(Clone, Debug)]
 pub struct ExportAssignmentData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub is_export_equals: bool,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
@@ -581,35 +524,27 @@ pub struct ExportAssignmentData {
 pub struct ExportDeclarationData {
     pub attributes: Option<NodeId>,
     pub export_clause: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub is_type_only: bool,
     pub module_specifier: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExportSpecifierData {
     pub is_type_only: bool,
-    pub local_symbol: Option<SymbolId>,
     pub property_name: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExpressionStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExpressionWithTypeArgumentsData {
     pub expression: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -621,42 +556,26 @@ pub struct ExternalModuleReferenceData {
 pub struct ForInOrOfStatementData {
     pub await_modifier: Option<NodeId>,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub initializer: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ForStatementData {
     pub condition: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub incrementor: Option<NodeId>,
     pub initializer: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct FunctionDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -665,17 +584,10 @@ pub struct FunctionDeclarationData {
 pub struct FunctionExpressionData {
     pub asterisk_token: Option<NodeId>,
     pub body: NodeId,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -683,10 +595,7 @@ pub struct FunctionExpressionData {
 #[derive(Clone, Debug)]
 pub struct FunctionTypeNodeData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -696,17 +605,11 @@ pub struct FunctionTypeNodeData {
 pub struct GetAccessorDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -715,12 +618,10 @@ pub struct GetAccessorDeclarationData {
 pub struct HeritageClauseData {
     pub token: SyntaxKind,
     pub types: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct IdentifierData {
-    pub flow_node: Option<FlowNodeId>,
     pub text: String,
 }
 
@@ -728,15 +629,12 @@ pub struct IdentifierData {
 pub struct IfStatementData {
     pub else_statement: Option<NodeId>,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub then_statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportAttributeData {
     pub value: NodeId,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -745,38 +643,27 @@ pub struct ImportAttributesData {
     pub attributes: NodeList,
     pub multi_line: bool,
     pub token: SyntaxKind,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportClauseData {
-    pub local_symbol: Option<SymbolId>,
     pub named_bindings: Option<NodeId>,
     pub phase_modifier: Option<SyntaxKind>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportDeclarationData {
     pub attributes: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub import_clause: Option<NodeId>,
     pub module_specifier: NodeId,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportEqualsDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
     pub is_type_only: bool,
-    pub local_symbol: Option<SymbolId>,
     pub module_reference: NodeId,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -784,10 +671,7 @@ pub struct ImportEqualsDeclarationData {
 #[derive(Clone, Debug)]
 pub struct ImportSpecifierData {
     pub is_type_only: bool,
-    pub local_symbol: Option<SymbolId>,
     pub property_name: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -803,10 +687,7 @@ pub struct ImportTypeNodeData {
 #[derive(Clone, Debug)]
 pub struct IndexSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -825,11 +706,8 @@ pub struct InferTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct InterfaceDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
     pub heritage_clauses: Option<NodeList>,
-    pub local_symbol: Option<SymbolId>,
     pub members: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
@@ -995,10 +873,7 @@ pub struct JsDocSeeTagData {
 #[derive(Clone, Debug)]
 pub struct JsDocSignatureData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
 }
@@ -1039,7 +914,6 @@ pub struct JsDocTypeExpressionData {
 pub struct JsDocTypeLiteralData {
     pub is_array_type: bool,
     pub js_doc_property_tags: Option<Vec<NodeId>>,
-    pub symbol: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1071,16 +945,12 @@ pub struct JsDocVariadicTypeData {
 #[derive(Clone, Debug)]
 pub struct JsxAttributeData {
     pub initializer: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct JsxAttributesData {
     pub properties: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1096,7 +966,6 @@ pub struct JsxElementData {
     pub children: NodeList,
     pub closing_element: NodeId,
     pub opening_element: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1110,13 +979,11 @@ pub struct JsxFragmentData {
     pub children: NodeList,
     pub closing_fragment: NodeId,
     pub opening_fragment: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct JsxNamespacedNameData {
     pub namespace: NodeId,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -1125,7 +992,6 @@ pub struct JsxOpeningElementData {
     pub attributes: NodeId,
     pub tag_name: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1136,7 +1002,6 @@ pub struct JsxSelfClosingElementData {
     pub attributes: NodeId,
     pub tag_name: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1152,16 +1017,13 @@ pub struct JsxTextData {
 }
 
 #[derive(Clone, Debug)]
-pub struct KeywordExpressionData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct KeywordExpressionData;
 
 #[derive(Clone, Debug)]
 pub struct KeywordTypeNodeData;
 
 #[derive(Clone, Debug)]
 pub struct LabeledStatementData {
-    pub flow_node: Option<FlowNodeId>,
     pub label: NodeId,
     pub statement: NodeId,
 }
@@ -1173,22 +1035,17 @@ pub struct LiteralTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct MappedTypeNodeData {
-    pub locals: SymbolTable,
     pub members: Option<NodeList>,
     pub name_type: Option<NodeId>,
-    pub next_container: Option<NodeId>,
     pub question_token: Option<NodeId>,
     pub readonly_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameter: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct MetaPropertyData {
-    pub flow_node: Option<FlowNodeId>,
     pub keyword_token: SyntaxKind,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -1196,17 +1053,11 @@ pub struct MetaPropertyData {
 pub struct MethodDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1214,11 +1065,8 @@ pub struct MethodDeclarationData {
 #[derive(Clone, Debug)]
 pub struct MethodSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -1227,16 +1075,12 @@ pub struct MethodSignatureDeclarationData {
 
 #[derive(Clone, Debug)]
 pub struct MissingDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ModuleBlockData {
-    pub flow_node: Option<FlowNodeId>,
     pub statements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1244,14 +1088,7 @@ pub struct ModuleDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub attributes: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub keyword: SyntaxKind,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1259,42 +1096,34 @@ pub struct ModuleDeclarationData {
 #[derive(Clone, Debug)]
 pub struct NamedExportsData {
     pub elements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamedImportsData {
     pub elements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamedTupleMemberData {
     pub dot_dot_dot_token: Option<NodeId>,
     pub question_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamespaceExportData {
-    pub symbol: Option<SymbolId>,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamespaceExportDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamespaceImportData {
-    pub local_symbol: Option<SymbolId>,
-    pub symbol: Option<SymbolId>,
     pub name: NodeId,
 }
 
@@ -1303,13 +1132,11 @@ pub struct NewExpressionData {
     pub arguments: Option<NodeList>,
     pub expression: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct NoSubstitutionTemplateLiteralData {
     pub raw_text: String,
-    pub symbol: Option<SymbolId>,
     pub template_flags: TokenFlags,
     pub text: String,
     pub token_flags: TokenFlags,
@@ -1321,9 +1148,7 @@ pub struct NonNullExpressionData {
 }
 
 #[derive(Clone, Debug)]
-pub struct NotEmittedStatementData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct NotEmittedStatementData;
 
 #[derive(Clone, Debug)]
 pub struct NotEmittedTypeElementData;
@@ -1338,8 +1163,6 @@ pub struct NumericLiteralData {
 pub struct ObjectLiteralExpressionData {
     pub multi_line: bool,
     pub properties: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1355,9 +1178,7 @@ pub struct ParameterDeclarationData {
     pub dot_dot_dot_token: Option<NodeId>,
     pub initializer: Option<NodeId>,
     pub question_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1397,9 +1218,7 @@ pub struct PrivateIdentifierData {
 #[derive(Clone, Debug)]
 pub struct PropertyAccessExpressionData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub question_dot_token: Option<NodeId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -1407,9 +1226,7 @@ pub struct PropertyAccessExpressionData {
 pub struct PropertyAssignmentData {
     pub initializer: NodeId,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1418,9 +1235,7 @@ pub struct PropertyAssignmentData {
 pub struct PropertyDeclarationData {
     pub initializer: Option<NodeId>,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1429,7 +1244,6 @@ pub struct PropertyDeclarationData {
 pub struct PropertySignatureDeclarationData {
     pub initializer: NodeId,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
@@ -1437,10 +1251,8 @@ pub struct PropertySignatureDeclarationData {
 
 #[derive(Clone, Debug)]
 pub struct QualifiedNameData {
-    pub flow_node: Option<FlowNodeId>,
     pub left: NodeId,
     pub right: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1457,8 +1269,6 @@ pub struct RestTypeNodeData {
 #[derive(Clone, Debug)]
 pub struct ReturnStatementData {
     pub expression: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1468,25 +1278,17 @@ pub struct SatisfiesExpressionData {
 }
 
 #[derive(Clone, Debug)]
-pub struct SemicolonClassElementData {
-    pub symbol: Option<SymbolId>,
-}
+pub struct SemicolonClassElementData;
 
 #[derive(Clone, Debug)]
 pub struct SetAccessorDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1496,9 +1298,7 @@ pub struct ShorthandPropertyAssignmentData {
     pub equals_token: Option<NodeId>,
     pub object_assignment_initializer: Option<NodeId>,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1506,17 +1306,12 @@ pub struct ShorthandPropertyAssignmentData {
 #[derive(Clone, Debug)]
 pub struct SourceFileData {
     pub end_of_file_token: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub statements: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct SpreadAssignmentData {
     pub expression: NodeId,
-    pub symbol: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1534,8 +1329,6 @@ pub struct StringLiteralData {
 pub struct SwitchStatementData {
     pub case_block: NodeId,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1562,14 +1355,12 @@ pub struct TaggedTemplateExpressionData {
     pub tag: NodeId,
     pub template: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct TemplateExpressionData {
     pub head: NodeId,
     pub template_spans: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1620,8 +1411,6 @@ pub struct ThisTypeNodeData;
 #[derive(Clone, Debug)]
 pub struct ThrowStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1631,9 +1420,7 @@ pub struct TokenData;
 pub struct TryStatementData {
     pub catch_clause: Option<NodeId>,
     pub finally_block: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub try_block: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1643,11 +1430,6 @@ pub struct TupleTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct TypeAliasDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -1663,7 +1445,6 @@ pub struct TypeAssertionData {
 #[derive(Clone, Debug)]
 pub struct TypeLiteralNodeData {
     pub members: NodeList,
-    pub symbol: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1682,7 +1463,6 @@ pub struct TypeParameterDeclarationData {
     pub constraint: Option<NodeId>,
     pub default_type: Option<NodeId>,
     pub expression: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1715,24 +1495,18 @@ pub struct UnionTypeNodeData {
 pub struct VariableDeclarationData {
     pub exclamation_token: Option<NodeId>,
     pub initializer: Option<NodeId>,
-    pub local_symbol: Option<SymbolId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct VariableDeclarationListData {
     pub declarations: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct VariableStatementData {
     pub declaration_list: NodeId,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
@@ -1744,17 +1518,13 @@ pub struct VoidExpressionData {
 #[derive(Clone, Debug)]
 pub struct WhileStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct WithStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -2170,33 +1940,33 @@ impl NodeData {
     #[allow(clippy::match_same_arms, clippy::too_many_lines)]
     pub fn try_for_each_child<B, F>(&self, visitor: &mut F) -> std::ops::ControlFlow<B>
     where
-        F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+        F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
     {
         // BEGIN schema-exhaustive direct child visitor
         match self {
-            Self::ArrayLiteralExpression(node) => visit_node_list(visitor, &node.elements),
-            Self::ArrayTypeNode(node) => visitor(node.element_type),
+            Self::ArrayLiteralExpression(node) => visitor(Child::List(node.elements)),
+            Self::ArrayTypeNode(node) => visitor(Child::Node(node.element_type)),
             Self::ArrowFunction(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
-                visitor(node.equals_greater_than_token)?;
-                visitor(node.body)
+                visitor(Child::Node(node.equals_greater_than_token))?;
+                visitor(Child::Node(node.body))
             }
             Self::AsExpression(node) => {
-                visitor(node.expression)?;
-                visitor(node.type_)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.type_))
             }
-            Self::AwaitExpression(node) => visitor(node.expression),
+            Self::AwaitExpression(node) => visitor(Child::Node(node.expression)),
             Self::BigIntLiteral(..) => std::ops::ControlFlow::Continue(()),
             Self::BinaryExpression(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.left)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.left))?;
                 visit_optional_child(visitor, node.type_)?;
-                visitor(node.operator_token)?;
-                visitor(node.right)
+                visitor(Child::Node(node.operator_token))?;
+                visitor(Child::Node(node.right))
             }
             Self::BindingElement(node) => {
                 visit_optional_child(visitor, node.dot_dot_dot_token)?;
@@ -2204,642 +1974,640 @@ impl NodeData {
                 visit_optional_child(visitor, node.name)?;
                 visit_optional_child(visitor, node.initializer)
             }
-            Self::BindingPattern(node) => visit_node_list(visitor, &node.elements),
-            Self::Block(node) => visit_node_list(visitor, &node.statements),
+            Self::BindingPattern(node) => visitor(Child::List(node.elements)),
+            Self::Block(node) => visitor(Child::List(node.statements)),
             Self::BreakStatement(node) => visit_optional_child(visitor, node.label),
             Self::CallExpression(node) => {
-                visitor(node.expression)?;
+                visitor(Child::Node(node.expression))?;
                 visit_optional_child(visitor, node.question_dot_token)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())?;
-                visit_node_list(visitor, &node.arguments)
+                visit_optional_node_list(visitor, node.type_arguments)?;
+                visitor(Child::List(node.arguments))
             }
             Self::CallSignatureDeclaration(node) => {
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
-            Self::CaseBlock(node) => visit_node_list(visitor, &node.clauses),
+            Self::CaseBlock(node) => visitor(Child::List(node.clauses)),
             Self::CaseOrDefaultClause(node) => {
-                visitor(node.expression)?;
-                visit_node_list(visitor, &node.statements)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::List(node.statements))
             }
             Self::CatchClause(node) => {
                 visit_optional_child(visitor, node.variable_declaration)?;
-                visitor(node.block)
+                visitor(Child::Node(node.block))
             }
             Self::ClassDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_optional_node_list(visitor, node.heritage_clauses.as_ref())?;
-                visit_node_list(visitor, &node.members)
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visit_optional_node_list(visitor, node.heritage_clauses)?;
+                visitor(Child::List(node.members))
             }
             Self::ClassExpression(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_optional_node_list(visitor, node.heritage_clauses.as_ref())?;
-                visit_node_list(visitor, &node.members)
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visit_optional_node_list(visitor, node.heritage_clauses)?;
+                visitor(Child::List(node.members))
             }
             Self::ClassStaticBlockDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.body)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.body))
             }
-            Self::ComputedPropertyName(node) => visitor(node.expression),
+            Self::ComputedPropertyName(node) => visitor(Child::Node(node.expression)),
             Self::ConditionalExpression(node) => {
-                visitor(node.condition)?;
-                visitor(node.question_token)?;
-                visitor(node.when_true)?;
-                visitor(node.colon_token)?;
-                visitor(node.when_false)
+                visitor(Child::Node(node.condition))?;
+                visitor(Child::Node(node.question_token))?;
+                visitor(Child::Node(node.when_true))?;
+                visitor(Child::Node(node.colon_token))?;
+                visitor(Child::Node(node.when_false))
             }
             Self::ConditionalTypeNode(node) => {
-                visitor(node.check_type)?;
-                visitor(node.extends_type)?;
-                visitor(node.true_type)?;
-                visitor(node.false_type)
+                visitor(Child::Node(node.check_type))?;
+                visitor(Child::Node(node.extends_type))?;
+                visitor(Child::Node(node.true_type))?;
+                visitor(Child::Node(node.false_type))
             }
             Self::ConstructSignatureDeclaration(node) => {
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
             Self::ConstructorDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
                 visit_optional_child(visitor, node.body)
             }
             Self::ConstructorTypeNode(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
             Self::ContinueStatement(node) => visit_optional_child(visitor, node.label),
             Self::DebuggerStatement(..) => std::ops::ControlFlow::Continue(()),
-            Self::Decorator(node) => visitor(node.expression),
-            Self::DeleteExpression(node) => visitor(node.expression),
+            Self::Decorator(node) => visitor(Child::Node(node.expression)),
+            Self::DeleteExpression(node) => visitor(Child::Node(node.expression)),
             Self::DoStatement(node) => {
-                visitor(node.statement)?;
-                visitor(node.expression)
+                visitor(Child::Node(node.statement))?;
+                visitor(Child::Node(node.expression))
             }
             Self::ElementAccessExpression(node) => {
-                visitor(node.expression)?;
+                visitor(Child::Node(node.expression))?;
                 visit_optional_child(visitor, node.question_dot_token)?;
-                visitor(node.argument_expression)
+                visitor(Child::Node(node.argument_expression))
             }
             Self::EmptyStatement(..) => std::ops::ControlFlow::Continue(()),
             Self::EnumDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visit_node_list(visitor, &node.members)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visitor(Child::List(node.members))
             }
             Self::EnumMember(node) => {
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.initializer)
             }
             Self::ExportAssignment(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.type_)?;
-                visitor(node.expression)
+                visitor(Child::Node(node.expression))
             }
             Self::ExportDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.export_clause)?;
                 visit_optional_child(visitor, node.module_specifier)?;
                 visit_optional_child(visitor, node.attributes)
             }
             Self::ExportSpecifier(node) => {
                 visit_optional_child(visitor, node.property_name)?;
-                visitor(node.name)
+                visitor(Child::Node(node.name))
             }
-            Self::ExpressionStatement(node) => visitor(node.expression),
+            Self::ExpressionStatement(node) => visitor(Child::Node(node.expression)),
             Self::ExpressionWithTypeArguments(node) => {
-                visitor(node.expression)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())
+                visitor(Child::Node(node.expression))?;
+                visit_optional_node_list(visitor, node.type_arguments)
             }
-            Self::ExternalModuleReference(node) => visitor(node.expression),
+            Self::ExternalModuleReference(node) => visitor(Child::Node(node.expression)),
             Self::ForInOrOfStatement(node) => {
                 visit_optional_child(visitor, node.await_modifier)?;
-                visitor(node.initializer)?;
-                visitor(node.expression)?;
-                visitor(node.statement)
+                visitor(Child::Node(node.initializer))?;
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.statement))
             }
             Self::ForStatement(node) => {
                 visit_optional_child(visitor, node.initializer)?;
                 visit_optional_child(visitor, node.condition)?;
                 visit_optional_child(visitor, node.incrementor)?;
-                visitor(node.statement)
+                visitor(Child::Node(node.statement))
             }
             Self::FunctionDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.asterisk_token)?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
                 visit_optional_child(visitor, node.body)
             }
             Self::FunctionExpression(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.asterisk_token)?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
-                visitor(node.body)
+                visitor(Child::Node(node.body))
             }
             Self::FunctionTypeNode(node) => {
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
             Self::GetAccessorDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
                 visit_optional_child(visitor, node.body)
             }
-            Self::HeritageClause(node) => visit_node_list(visitor, &node.types),
+            Self::HeritageClause(node) => visitor(Child::List(node.types)),
             Self::Identifier(..) => std::ops::ControlFlow::Continue(()),
             Self::IfStatement(node) => {
-                visitor(node.expression)?;
-                visitor(node.then_statement)?;
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.then_statement))?;
                 visit_optional_child(visitor, node.else_statement)
             }
             Self::ImportAttribute(node) => {
-                visitor(node.name)?;
-                visitor(node.value)
+                visitor(Child::Node(node.name))?;
+                visitor(Child::Node(node.value))
             }
-            Self::ImportAttributes(node) => visit_node_list(visitor, &node.attributes),
+            Self::ImportAttributes(node) => visitor(Child::List(node.attributes)),
             Self::ImportClause(node) => {
                 visit_optional_child(visitor, node.name)?;
                 visit_optional_child(visitor, node.named_bindings)
             }
             Self::ImportDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.import_clause)?;
-                visitor(node.module_specifier)?;
+                visitor(Child::Node(node.module_specifier))?;
                 visit_optional_child(visitor, node.attributes)
             }
             Self::ImportEqualsDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visitor(node.module_reference)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visitor(Child::Node(node.module_reference))
             }
             Self::ImportSpecifier(node) => {
                 visit_optional_child(visitor, node.property_name)?;
-                visitor(node.name)
+                visitor(Child::Node(node.name))
             }
             Self::ImportTypeNode(node) => {
-                visitor(node.argument)?;
+                visitor(Child::Node(node.argument))?;
                 visit_optional_child(visitor, node.attributes)?;
                 visit_optional_child(visitor, node.qualifier)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())
+                visit_optional_node_list(visitor, node.type_arguments)
             }
             Self::IndexSignatureDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
-                visitor(node.type_)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::List(node.parameters))?;
+                visitor(Child::Node(node.type_))
             }
             Self::IndexedAccessTypeNode(node) => {
-                visitor(node.object_type)?;
-                visitor(node.index_type)
+                visitor(Child::Node(node.object_type))?;
+                visitor(Child::Node(node.index_type))
             }
-            Self::InferTypeNode(node) => visitor(node.type_parameter),
+            Self::InferTypeNode(node) => visitor(Child::Node(node.type_parameter)),
             Self::InterfaceDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_optional_node_list(visitor, node.heritage_clauses.as_ref())?;
-                visit_node_list(visitor, &node.members)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visit_optional_node_list(visitor, node.heritage_clauses)?;
+                visitor(Child::List(node.members))
             }
-            Self::IntersectionTypeNode(node) => visit_node_list(visitor, &node.types),
+            Self::IntersectionTypeNode(node) => visitor(Child::List(node.types)),
             Self::JsDoc(node) => {
-                visit_node_list(visitor, &node.comment)?;
-                visit_optional_node_list(visitor, node.tags.as_ref())
+                visitor(Child::List(node.comment))?;
+                visit_optional_node_list(visitor, node.tags)
             }
             Self::JsDocAllType(..) => std::ops::ControlFlow::Continue(()),
             Self::JsDocAugmentsTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.class_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.class_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocCallbackTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.type_expression)?;
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.type_expression))?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocDeprecatedTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocImplementsTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.class_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.class_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocImportTag(node) => {
-                visitor(node.tag_name)?;
+                visitor(Child::Node(node.tag_name))?;
                 visit_optional_child(visitor, node.import_clause)?;
-                visitor(node.module_specifier)?;
+                visitor(Child::Node(node.module_specifier))?;
                 visit_optional_child(visitor, node.attributes)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocLink(node) => visit_optional_child(visitor, node.name),
             Self::JsDocLinkCode(node) => visit_optional_child(visitor, node.name),
             Self::JsDocLinkPlain(node) => visit_optional_child(visitor, node.name),
-            Self::JsDocNameReference(node) => visitor(node.name),
-            Self::JsDocNonNullableType(node) => visitor(node.type_),
-            Self::JsDocNullableType(node) => visitor(node.type_),
-            Self::JsDocOptionalType(node) => visitor(node.type_),
+            Self::JsDocNameReference(node) => visitor(Child::Node(node.name)),
+            Self::JsDocNonNullableType(node) => visitor(Child::Node(node.type_)),
+            Self::JsDocNullableType(node) => visitor(Child::Node(node.type_)),
+            Self::JsDocOptionalType(node) => visitor(Child::Node(node.type_)),
             Self::JsDocOverloadTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.type_expression))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocOverrideTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocParameterOrPropertyTag(node) => {
-                visitor(node.tag_name)?;
+                visitor(Child::Node(node.tag_name))?;
                 if node.is_name_first {
-                    visitor(node.name)?;
+                    visitor(Child::Node(node.name))?;
                     visit_optional_child(visitor, node.type_expression)?;
                 } else {
                     visit_optional_child(visitor, node.type_expression)?;
-                    visitor(node.name)?;
+                    visitor(Child::Node(node.name))?;
                 }
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocPrivateTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocProtectedTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocPublicTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocReadonlyTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocReturnTag(node) => {
-                visitor(node.tag_name)?;
+                visitor(Child::Node(node.tag_name))?;
                 visit_optional_child(visitor, node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocSatisfiesTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.type_expression))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocSeeTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.name_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.name_expression))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocSignature(node) => {
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
             Self::JsDocTemplateTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.constraint)?;
-                visit_node_list(visitor, &node.type_parameters)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.constraint))?;
+                visitor(Child::List(node.type_parameters))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocText(..) => std::ops::ControlFlow::Continue(()),
             Self::JsDocThisTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.type_expression))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocThrowsTag(node) => {
-                visitor(node.tag_name)?;
+                visitor(Child::Node(node.tag_name))?;
                 visit_optional_child(visitor, node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
-            Self::JsDocTypeExpression(node) => visitor(node.type_),
+            Self::JsDocTypeExpression(node) => visitor(Child::Node(node.type_)),
             Self::JsDocTypeLiteral(node) => {
                 visit_optional_children(visitor, node.js_doc_property_tags.as_deref())
             }
             Self::JsDocTypeTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.type_expression))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocTypedefTag(node) => {
-                visitor(node.tag_name)?;
+                visitor(Child::Node(node.tag_name))?;
                 visit_optional_child(visitor, node.type_expression)?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocUnknownTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
-            Self::JsDocVariadicType(node) => visitor(node.type_),
+            Self::JsDocVariadicType(node) => visitor(Child::Node(node.type_)),
             Self::JsxAttribute(node) => {
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.initializer)
             }
-            Self::JsxAttributes(node) => visit_node_list(visitor, &node.properties),
-            Self::JsxClosingElement(node) => visitor(node.tag_name),
+            Self::JsxAttributes(node) => visitor(Child::List(node.properties)),
+            Self::JsxClosingElement(node) => visitor(Child::Node(node.tag_name)),
             Self::JsxClosingFragment(..) => std::ops::ControlFlow::Continue(()),
             Self::JsxElement(node) => {
-                visitor(node.opening_element)?;
-                visit_node_list(visitor, &node.children)?;
-                visitor(node.closing_element)
+                visitor(Child::Node(node.opening_element))?;
+                visitor(Child::List(node.children))?;
+                visitor(Child::Node(node.closing_element))
             }
             Self::JsxExpression(node) => {
                 visit_optional_child(visitor, node.dot_dot_dot_token)?;
                 visit_optional_child(visitor, node.expression)
             }
             Self::JsxFragment(node) => {
-                visitor(node.opening_fragment)?;
-                visit_node_list(visitor, &node.children)?;
-                visitor(node.closing_fragment)
+                visitor(Child::Node(node.opening_fragment))?;
+                visitor(Child::List(node.children))?;
+                visitor(Child::Node(node.closing_fragment))
             }
             Self::JsxNamespacedName(node) => {
-                visitor(node.namespace)?;
-                visitor(node.name)
+                visitor(Child::Node(node.namespace))?;
+                visitor(Child::Node(node.name))
             }
             Self::JsxOpeningElement(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())?;
-                visitor(node.attributes)
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.type_arguments)?;
+                visitor(Child::Node(node.attributes))
             }
             Self::JsxOpeningFragment(..) => std::ops::ControlFlow::Continue(()),
             Self::JsxSelfClosingElement(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())?;
-                visitor(node.attributes)
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.type_arguments)?;
+                visitor(Child::Node(node.attributes))
             }
-            Self::JsxSpreadAttribute(node) => visitor(node.expression),
+            Self::JsxSpreadAttribute(node) => visitor(Child::Node(node.expression)),
             Self::JsxText(..) => std::ops::ControlFlow::Continue(()),
             Self::KeywordExpression(..) => std::ops::ControlFlow::Continue(()),
             Self::KeywordTypeNode(..) => std::ops::ControlFlow::Continue(()),
             Self::LabeledStatement(node) => {
-                visitor(node.label)?;
-                visitor(node.statement)
+                visitor(Child::Node(node.label))?;
+                visitor(Child::Node(node.statement))
             }
-            Self::LiteralTypeNode(node) => visitor(node.literal),
+            Self::LiteralTypeNode(node) => visitor(Child::Node(node.literal)),
             Self::MappedTypeNode(node) => {
                 visit_optional_child(visitor, node.readonly_token)?;
-                visitor(node.type_parameter)?;
+                visitor(Child::Node(node.type_parameter))?;
                 visit_optional_child(visitor, node.name_type)?;
                 visit_optional_child(visitor, node.question_token)?;
                 visit_optional_child(visitor, node.type_)?;
-                visit_optional_node_list(visitor, node.members.as_ref())
+                visit_optional_node_list(visitor, node.members)
             }
-            Self::MetaProperty(node) => visitor(node.name),
+            Self::MetaProperty(node) => visitor(Child::Node(node.name)),
             Self::MethodDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.asterisk_token)?;
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
                 visit_optional_child(visitor, node.body)
             }
             Self::MethodSignatureDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
-            Self::MissingDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())
-            }
-            Self::ModuleBlock(node) => visit_node_list(visitor, &node.statements),
+            Self::MissingDeclaration(node) => visit_optional_modifier_list(visitor, node.modifiers),
+            Self::ModuleBlock(node) => visitor(Child::List(node.statements)),
             Self::ModuleDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.attributes)?;
                 visit_optional_child(visitor, node.body)
             }
-            Self::NamedExports(node) => visit_node_list(visitor, &node.elements),
-            Self::NamedImports(node) => visit_node_list(visitor, &node.elements),
+            Self::NamedExports(node) => visitor(Child::List(node.elements)),
+            Self::NamedImports(node) => visitor(Child::List(node.elements)),
             Self::NamedTupleMember(node) => {
                 visit_optional_child(visitor, node.dot_dot_dot_token)?;
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.question_token)?;
-                visitor(node.type_)
+                visitor(Child::Node(node.type_))
             }
-            Self::NamespaceExport(node) => visitor(node.name),
+            Self::NamespaceExport(node) => visitor(Child::Node(node.name)),
             Self::NamespaceExportDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))
             }
-            Self::NamespaceImport(node) => visitor(node.name),
+            Self::NamespaceImport(node) => visitor(Child::Node(node.name)),
             Self::NewExpression(node) => {
-                visitor(node.expression)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())?;
-                visit_optional_node_list(visitor, node.arguments.as_ref())
+                visitor(Child::Node(node.expression))?;
+                visit_optional_node_list(visitor, node.type_arguments)?;
+                visit_optional_node_list(visitor, node.arguments)
             }
             Self::NoSubstitutionTemplateLiteral(..) => std::ops::ControlFlow::Continue(()),
-            Self::NonNullExpression(node) => visitor(node.expression),
+            Self::NonNullExpression(node) => visitor(Child::Node(node.expression)),
             Self::NotEmittedStatement(..) => std::ops::ControlFlow::Continue(()),
             Self::NotEmittedTypeElement(..) => std::ops::ControlFlow::Continue(()),
             Self::NumericLiteral(..) => std::ops::ControlFlow::Continue(()),
-            Self::ObjectLiteralExpression(node) => visit_node_list(visitor, &node.properties),
+            Self::ObjectLiteralExpression(node) => visitor(Child::List(node.properties)),
             Self::OmittedExpression(..) => std::ops::ControlFlow::Continue(()),
-            Self::OptionalTypeNode(node) => visitor(node.type_),
+            Self::OptionalTypeNode(node) => visitor(Child::Node(node.type_)),
             Self::ParameterDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.dot_dot_dot_token)?;
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.question_token)?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.initializer)
             }
-            Self::ParenthesizedExpression(node) => visitor(node.expression),
-            Self::ParenthesizedTypeNode(node) => visitor(node.type_),
-            Self::PartiallyEmittedExpression(node) => visitor(node.expression),
-            Self::PostfixUnaryExpression(node) => visitor(node.operand),
-            Self::PrefixUnaryExpression(node) => visitor(node.operand),
+            Self::ParenthesizedExpression(node) => visitor(Child::Node(node.expression)),
+            Self::ParenthesizedTypeNode(node) => visitor(Child::Node(node.type_)),
+            Self::PartiallyEmittedExpression(node) => visitor(Child::Node(node.expression)),
+            Self::PostfixUnaryExpression(node) => visitor(Child::Node(node.operand)),
+            Self::PrefixUnaryExpression(node) => visitor(Child::Node(node.operand)),
             Self::PrivateIdentifier(..) => std::ops::ControlFlow::Continue(()),
             Self::PropertyAccessExpression(node) => {
-                visitor(node.expression)?;
+                visitor(Child::Node(node.expression))?;
                 visit_optional_child(visitor, node.question_dot_token)?;
-                visitor(node.name)
+                visitor(Child::Node(node.name))
             }
             Self::PropertyAssignment(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
                 visit_optional_child(visitor, node.type_)?;
-                visitor(node.initializer)
+                visitor(Child::Node(node.initializer))
             }
             Self::PropertyDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.initializer)
             }
             Self::PropertySignatureDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
-                visitor(node.type_)?;
-                visitor(node.initializer)
+                visitor(Child::Node(node.type_))?;
+                visitor(Child::Node(node.initializer))
             }
             Self::QualifiedName(node) => {
-                visitor(node.left)?;
-                visitor(node.right)
+                visitor(Child::Node(node.left))?;
+                visitor(Child::Node(node.right))
             }
             Self::RegularExpressionLiteral(..) => std::ops::ControlFlow::Continue(()),
-            Self::RestTypeNode(node) => visitor(node.type_),
+            Self::RestTypeNode(node) => visitor(Child::Node(node.type_)),
             Self::ReturnStatement(node) => visit_optional_child(visitor, node.expression),
             Self::SatisfiesExpression(node) => {
-                visitor(node.expression)?;
-                visitor(node.type_)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.type_))
             }
             Self::SemicolonClassElement(..) => std::ops::ControlFlow::Continue(()),
             Self::SetAccessorDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
                 visit_optional_child(visitor, node.body)
             }
             Self::ShorthandPropertyAssignment(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.equals_token)?;
                 visit_optional_child(visitor, node.object_assignment_initializer)
             }
             Self::SourceFile(node) => {
-                visit_node_list(visitor, &node.statements)?;
-                visitor(node.end_of_file_token)
+                visitor(Child::List(node.statements))?;
+                visitor(Child::Node(node.end_of_file_token))
             }
-            Self::SpreadAssignment(node) => visitor(node.expression),
-            Self::SpreadElement(node) => visitor(node.expression),
+            Self::SpreadAssignment(node) => visitor(Child::Node(node.expression)),
+            Self::SpreadElement(node) => visitor(Child::Node(node.expression)),
             Self::StringLiteral(..) => std::ops::ControlFlow::Continue(()),
             Self::SwitchStatement(node) => {
-                visitor(node.expression)?;
-                visitor(node.case_block)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.case_block))
             }
             Self::SyntaxList(node) => visit_children(visitor, &node.children),
             Self::SyntheticExpression(node) => {
                 visit_optional_child(visitor, node.tuple_name_source)
             }
             Self::SyntheticReferenceExpression(node) => {
-                visitor(node.expression)?;
-                visitor(node.this_arg)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.this_arg))
             }
             Self::TaggedTemplateExpression(node) => {
-                visitor(node.tag)?;
+                visitor(Child::Node(node.tag))?;
                 visit_optional_child(visitor, node.question_dot_token)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())?;
-                visitor(node.template)
+                visit_optional_node_list(visitor, node.type_arguments)?;
+                visitor(Child::Node(node.template))
             }
             Self::TemplateExpression(node) => {
-                visitor(node.head)?;
-                visit_node_list(visitor, &node.template_spans)
+                visitor(Child::Node(node.head))?;
+                visitor(Child::List(node.template_spans))
             }
             Self::TemplateHead(..) => std::ops::ControlFlow::Continue(()),
             Self::TemplateLiteralTypeNode(node) => {
-                visitor(node.head)?;
-                visit_node_list(visitor, &node.template_spans)
+                visitor(Child::Node(node.head))?;
+                visitor(Child::List(node.template_spans))
             }
             Self::TemplateLiteralTypeSpan(node) => {
-                visitor(node.type_)?;
-                visitor(node.literal)
+                visitor(Child::Node(node.type_))?;
+                visitor(Child::Node(node.literal))
             }
             Self::TemplateMiddle(..) => std::ops::ControlFlow::Continue(()),
             Self::TemplateSpan(node) => {
-                visitor(node.expression)?;
-                visitor(node.literal)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.literal))
             }
             Self::TemplateTail(..) => std::ops::ControlFlow::Continue(()),
             Self::ThisTypeNode(..) => std::ops::ControlFlow::Continue(()),
-            Self::ThrowStatement(node) => visitor(node.expression),
+            Self::ThrowStatement(node) => visitor(Child::Node(node.expression)),
             Self::Token(..) => std::ops::ControlFlow::Continue(()),
             Self::TryStatement(node) => {
-                visitor(node.try_block)?;
+                visitor(Child::Node(node.try_block))?;
                 visit_optional_child(visitor, node.catch_clause)?;
                 visit_optional_child(visitor, node.finally_block)
             }
-            Self::TupleTypeNode(node) => visit_node_list(visitor, &node.elements),
+            Self::TupleTypeNode(node) => visitor(Child::List(node.elements)),
             Self::TypeAliasDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visitor(node.type_)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::Node(node.type_))
             }
             Self::TypeAssertion(node) => {
-                visitor(node.type_)?;
-                visitor(node.expression)
+                visitor(Child::Node(node.type_))?;
+                visitor(Child::Node(node.expression))
             }
-            Self::TypeLiteralNode(node) => visit_node_list(visitor, &node.members),
-            Self::TypeOfExpression(node) => visitor(node.expression),
-            Self::TypeOperatorNode(node) => visitor(node.type_),
+            Self::TypeLiteralNode(node) => visitor(Child::List(node.members)),
+            Self::TypeOfExpression(node) => visitor(Child::Node(node.expression)),
+            Self::TypeOperatorNode(node) => visitor(Child::Node(node.type_)),
             Self::TypeParameterDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.constraint)?;
                 visit_optional_child(visitor, node.expression)?;
                 visit_optional_child(visitor, node.default_type)
             }
             Self::TypePredicateNode(node) => {
                 visit_optional_child(visitor, node.asserts_modifier)?;
-                visitor(node.parameter_name)?;
+                visitor(Child::Node(node.parameter_name))?;
                 visit_optional_child(visitor, node.type_)
             }
             Self::TypeQueryNode(node) => {
-                visitor(node.expr_name)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())
+                visitor(Child::Node(node.expr_name))?;
+                visit_optional_node_list(visitor, node.type_arguments)
             }
             Self::TypeReferenceNode(node) => {
-                visitor(node.type_name)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())
+                visitor(Child::Node(node.type_name))?;
+                visit_optional_node_list(visitor, node.type_arguments)
             }
-            Self::UnionTypeNode(node) => visit_node_list(visitor, &node.types),
+            Self::UnionTypeNode(node) => visitor(Child::List(node.types)),
             Self::VariableDeclaration(node) => {
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.exclamation_token)?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.initializer)
             }
-            Self::VariableDeclarationList(node) => visit_node_list(visitor, &node.declarations),
+            Self::VariableDeclarationList(node) => visitor(Child::List(node.declarations)),
             Self::VariableStatement(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.declaration_list)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.declaration_list))
             }
-            Self::VoidExpression(node) => visitor(node.expression),
+            Self::VoidExpression(node) => visitor(Child::Node(node.expression)),
             Self::WhileStatement(node) => {
-                visitor(node.expression)?;
-                visitor(node.statement)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.statement))
             }
             Self::WithStatement(node) => {
-                visitor(node.expression)?;
-                visitor(node.statement)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.statement))
             }
             Self::YieldExpression(node) => {
                 visit_optional_child(visitor, node.asterisk_token)?;
@@ -2848,24 +2616,214 @@ impl NodeData {
         }
         // END schema-exhaustive direct child visitor
     }
+
+    /// Visits every list field of the data, also the ones that
+    /// `try_for_each_child` skips, as Go `ForEachChild` does.
+    #[allow(clippy::too_many_lines)]
+    pub fn for_each_list(&self, mut visitor: impl FnMut(NodeList)) {
+        let mut visit = |list: Option<NodeList>| {
+            if let Some(list) = list {
+                visitor(list);
+            }
+        };
+        match self {
+            Self::ArrayLiteralExpression(node) => visit(Some(node.elements)),
+            Self::ArrowFunction(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::BinaryExpression(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::BindingPattern(node) => visit(Some(node.elements)),
+            Self::Block(node) => visit(Some(node.statements)),
+            Self::CallExpression(node) => {
+                visit(Some(node.arguments));
+                visit(node.type_arguments);
+            }
+            Self::CallSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+            }
+            Self::CaseBlock(node) => visit(Some(node.clauses)),
+            Self::CaseOrDefaultClause(node) => visit(Some(node.statements)),
+            Self::ClassDeclaration(node) => {
+                visit(node.heritage_clauses);
+                visit(Some(node.members));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ClassExpression(node) => {
+                visit(node.heritage_clauses);
+                visit(Some(node.members));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ClassStaticBlockDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ConstructSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+            }
+            Self::ConstructorDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ConstructorTypeNode(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::EnumDeclaration(node) => {
+                visit(Some(node.members));
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::EnumMember(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ExportAssignment(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ExportDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ExpressionWithTypeArguments(node) => visit(node.type_arguments),
+            Self::FunctionDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::FunctionExpression(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::FunctionTypeNode(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::GetAccessorDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::HeritageClause(node) => visit(Some(node.types)),
+            Self::ImportAttributes(node) => visit(Some(node.attributes)),
+            Self::ImportDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ImportEqualsDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ImportTypeNode(node) => visit(node.type_arguments),
+            Self::IndexSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::InterfaceDeclaration(node) => {
+                visit(node.heritage_clauses);
+                visit(Some(node.members));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::IntersectionTypeNode(node) => visit(Some(node.types)),
+            Self::JsDoc(node) => {
+                visit(Some(node.comment));
+                visit(node.tags);
+            }
+            Self::JsDocAugmentsTag(node) => visit(node.comment),
+            Self::JsDocCallbackTag(node) => visit(node.comment),
+            Self::JsDocDeprecatedTag(node) => visit(node.comment),
+            Self::JsDocImplementsTag(node) => visit(node.comment),
+            Self::JsDocImportTag(node) => visit(node.comment),
+            Self::JsDocOverloadTag(node) => visit(node.comment),
+            Self::JsDocOverrideTag(node) => visit(node.comment),
+            Self::JsDocParameterOrPropertyTag(node) => visit(node.comment),
+            Self::JsDocPrivateTag(node) => visit(node.comment),
+            Self::JsDocProtectedTag(node) => visit(node.comment),
+            Self::JsDocPublicTag(node) => visit(node.comment),
+            Self::JsDocReadonlyTag(node) => visit(node.comment),
+            Self::JsDocReturnTag(node) => visit(node.comment),
+            Self::JsDocSatisfiesTag(node) => visit(node.comment),
+            Self::JsDocSeeTag(node) => visit(node.comment),
+            Self::JsDocSignature(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+            }
+            Self::JsDocTemplateTag(node) => {
+                visit(node.comment);
+                visit(Some(node.type_parameters));
+            }
+            Self::JsDocThisTag(node) => visit(node.comment),
+            Self::JsDocThrowsTag(node) => visit(node.comment),
+            Self::JsDocTypeTag(node) => visit(node.comment),
+            Self::JsDocTypedefTag(node) => visit(node.comment),
+            Self::JsDocUnknownTag(node) => visit(node.comment),
+            Self::JsxAttributes(node) => visit(Some(node.properties)),
+            Self::JsxElement(node) => visit(Some(node.children)),
+            Self::JsxFragment(node) => visit(Some(node.children)),
+            Self::JsxOpeningElement(node) => visit(node.type_arguments),
+            Self::JsxSelfClosingElement(node) => visit(node.type_arguments),
+            Self::MappedTypeNode(node) => visit(node.members),
+            Self::MethodDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::MethodSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::MissingDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ModuleBlock(node) => visit(Some(node.statements)),
+            Self::ModuleDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::NamedExports(node) => visit(Some(node.elements)),
+            Self::NamedImports(node) => visit(Some(node.elements)),
+            Self::NamespaceExportDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::NewExpression(node) => {
+                visit(node.arguments);
+                visit(node.type_arguments);
+            }
+            Self::ObjectLiteralExpression(node) => visit(Some(node.properties)),
+            Self::ParameterDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::PropertyAssignment(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::PropertyDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::PropertySignatureDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::SetAccessorDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ShorthandPropertyAssignment(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::SourceFile(node) => visit(Some(node.statements)),
+            Self::TaggedTemplateExpression(node) => visit(node.type_arguments),
+            Self::TemplateExpression(node) => visit(Some(node.template_spans)),
+            Self::TemplateLiteralTypeNode(node) => visit(Some(node.template_spans)),
+            Self::TupleTypeNode(node) => visit(Some(node.elements)),
+            Self::TypeAliasDeclaration(node) => {
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::TypeLiteralNode(node) => visit(Some(node.members)),
+            Self::TypeParameterDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::TypeQueryNode(node) => visit(node.type_arguments),
+            Self::TypeReferenceNode(node) => visit(node.type_arguments),
+            Self::UnionTypeNode(node) => visit(Some(node.types)),
+            Self::VariableDeclarationList(node) => visit(Some(node.declarations)),
+            Self::VariableStatement(node) => visit(node.modifiers.map(|m| m.list)),
+            _ => {}
+        }
+    }
 }
 
 fn visit_optional_child<B, F>(visitor: &mut F, child: Option<NodeId>) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match child {
-        Some(child) => visitor(child),
+        Some(child) => visitor(Child::Node(child)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
 fn visit_children<B, F>(visitor: &mut F, children: &[NodeId]) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     for &child in children {
-        visitor(child)?;
+        visitor(Child::Node(child))?;
     }
     std::ops::ControlFlow::Continue(())
 }
@@ -2875,7 +2833,7 @@ fn visit_optional_children<B, F>(
     children: Option<&[NodeId]>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match children {
         Some(children) => visit_children(visitor, children),
@@ -2883,49 +2841,35 @@ where
     }
 }
 
-fn visit_node_list<B, F>(visitor: &mut F, list: &NodeList) -> std::ops::ControlFlow<B>
-where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
-{
-    visit_children(visitor, &list.nodes)
-}
-
 fn visit_optional_node_list<B, F>(
     visitor: &mut F,
-    list: Option<&NodeList>,
+    list: Option<NodeList>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match list {
-        Some(list) => visit_node_list(visitor, list),
+        Some(list) => visitor(Child::List(list)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
-fn visit_modifier_list<B, F>(visitor: &mut F, list: &ModifierList) -> std::ops::ControlFlow<B>
-where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
-{
-    visit_node_list(visitor, &list.list)
-}
-
 fn visit_optional_modifier_list<B, F>(
     visitor: &mut F,
-    list: Option<&ModifierList>,
+    list: Option<ModifierList>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match list {
-        Some(list) => visit_modifier_list(visitor, list),
+        Some(list) => visitor(Child::List(list.list)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
 impl Node {
     /// Visits every direct AST child in TypeScript-Go `ForEachChild` order.
-    pub fn for_each_child(&self, mut visitor: impl FnMut(NodeId)) {
+    pub fn for_each_child(&self, mut visitor: impl FnMut(Child)) {
         let _ = self.data.try_for_each_child(&mut |child| {
             visitor(child);
             std::ops::ControlFlow::<()>::Continue(())
@@ -2937,7 +2881,7 @@ impl Node {
     /// Returning [`std::ops::ControlFlow::Break`] stops traversal immediately.
     pub fn try_for_each_child<B>(
         &self,
-        mut visitor: impl FnMut(NodeId) -> std::ops::ControlFlow<B>,
+        mut visitor: impl FnMut(Child) -> std::ops::ControlFlow<B>,
     ) -> std::ops::ControlFlow<B> {
         self.data.try_for_each_child(&mut visitor)
     }

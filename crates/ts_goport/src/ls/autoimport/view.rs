@@ -12,6 +12,8 @@ use crate::ls::autoimport::prelude::*;
 // - Go `*ast.SourceFile` passed as an `ast.HasFileName` to a program method
 //   is `source_file_has_file_name(file)`.
 
+use crate::effect::ls::autoimportstyle::{self, FixTransformer};
+use crate::effect::rulerunner::enabled_options;
 use crate::flags_macros::go_enum;
 use crate::frontend::compiler;
 use crate::frontend::core_ls_ext::{first_non_zero, min_all_func};
@@ -31,12 +33,16 @@ use std::cell::Cell;
 // `IndexMap<K, Vec<V>>` behind an `Rc` (Go returns the pointer). The lazy
 // Go fields (`allowedEndings`, `existingImports`, `shouldUseRequireForFixes`)
 // are `RefCell<Option<..>>` / `Cell<Option<bool>>` (`None` is Go nil).
+// PORT: `effect_usage_position` has no Go field (see `new_view`).
 pub struct View {
     pub registry: Rc<Registry>,
     pub importing_file: Node,
     pub importing_file_path: tspath::Path,
     pub program: Rc<compiler::NewProgram>,
     pub preferences: modulespecifiers::UserPreferences,
+    // Effect-TS/tsgo patch 027: the auto-import style transformer.
+    pub fix_transformer: Option<FixTransformer>,
+    pub effect_usage_position: bool,
     pub project_id: ProjectID,
 
     pub allowed_endings: RefCell<Option<Vec<modulespecifiers::ModuleSpecifierEnding>>>,
@@ -84,6 +90,16 @@ pub fn new_view(
     .collect();
     let should_use_uri_style_node_core_modules =
         lsutil::should_use_uri_style_node_core_modules(importing_file, &program);
+    // Effect-TS/tsgo patch 027: Go sets `view.fixTransformer` from the
+    // registered factory after it builds the view.
+    let fix_transformer =
+        autoimportstyle::new_view_fix_transformer(&preferences, &program, importing_file);
+    // PORT: Effect-TS/tsgo patch 018 sets `UsagePosition` on every AddNew and
+    // AddToExisting fix (fix.rs `get_fixes`). Plain tsgo leaves it unset, and
+    // completion items send it in `data.autoImport`. The port sets it only
+    // with the Effect plugin on (`enabled_options`), so projects without the
+    // plugin answer as plain tsgo.
+    let effect_usage_position = enabled_options(program.options()).is_some();
     View {
         registry,
         importing_file,
@@ -91,6 +107,8 @@ pub fn new_view(
         program,
         project_id,
         preferences,
+        fix_transformer,
+        effect_usage_position,
         conditions,
         should_use_uri_style_node_core_modules,
         allowed_endings: RefCell::new(None),
@@ -188,7 +206,8 @@ impl View {
             let exports = search_fn(&**bucket);
             results.reserve(exports.len());
             for e in exports {
-                if e.module_id.0 == importing_file_path.0 {
+                // ts#64159: view.go:114, only a file module is the importing file.
+                if e.module_id.as_path_key() == Some(&importing_file_path) {
                     // Don't auto-import from the importing file itself
                     continue;
                 }
@@ -378,6 +397,8 @@ impl View {
                         existing[i] = Rc::new(Export {
                             export_id: e.export_id.clone(),
                             module_file_name: e.module_file_name.clone(),
+                            // ts#64159: view.go:219
+                            unresolved_module_specifier: e.unresolved_module_specifier.clone(),
                             package_name: e.package_name.clone(),
                             is_type_only: e.is_type_only || ex.is_type_only,
                             syntax: e.syntax.min(ex.syntax),
@@ -401,10 +422,12 @@ impl View {
 
         // PORT: see the note above. A relative module augmentation export:
         // project file (no package), module is a file that is not its path.
+        // ts#64159: the module ID kind says it is a file module.
         let is_augmentation = |e: &Export| {
             e.package_name.is_empty()
-                && e.module_id.0 != e.path.0
-                && !modulespecifiers::path_is_bare_specifier(&e.module_id.0)
+                && e.module_id
+                    .as_path_key()
+                    .is_some_and(|module_path| *module_path != e.path)
         };
         let groups: Vec<&Vec<Rc<Export>>> = grouped.values().collect();
         let (late, early): (Vec<usize>, Vec<usize>) =

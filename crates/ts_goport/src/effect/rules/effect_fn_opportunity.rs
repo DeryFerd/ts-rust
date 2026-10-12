@@ -58,17 +58,13 @@ pub fn analyze_effect_fn_opportunity(
 ) -> Vec<EffectFnOpportunityMatch> {
     let mut matches = Vec::new();
 
-    // PORT: Go's recursive `walk` closure.
-    fn walk(
+    // PORT: the body of Go's recursive `walk` closure, for one node.
+    fn visit(
         tp: &mut TypeParser<'_>,
         sf: Node,
         matches: &mut Vec<EffectFnOpportunityMatch>,
         n: Node,
-    ) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    ) {
         if let Some(result) = tp.parse_effect_fn_opportunity(n) {
             // Report on the name identifier if available, otherwise the function node
             let mut report_node = result.name_identifier;
@@ -81,12 +77,13 @@ pub fn analyze_effect_fn_opportunity(
                 result,
             });
         }
-
-        n.for_each_child(|child| walk(tp, sf, matches, child));
-        false
     }
 
-    walk(tp, sf, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, n);
+    }
 
     matches
 }

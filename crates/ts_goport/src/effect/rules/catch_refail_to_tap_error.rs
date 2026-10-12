@@ -29,7 +29,7 @@ fn run_catch_refail_to_tap_error(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnosti
             if step.args.len() != 1
                 || !ctx
                     .tp
-                    .is_node_reference_to_effect_module_api(step.callee, "catch")
+                    .is_node_reference_to_effect_module_api(step.callee, member!("catch"))
             {
                 continue;
             }
@@ -100,13 +100,13 @@ fn catch_handler_refails_original_error(tp: &mut TypeParser<'_>, handler: Node) 
     }
 
     let mut refail = step.args[0];
-    if tp.is_node_reference_to_effect_module_api(step.callee, "andThen") {
+    if tp.is_node_reference_to_effect_module_api(step.callee, member!("andThen")) {
         // andThen accepts both an Effect and a callback. Only a zero-argument
         // callback can be discarded without binding the preceding success value.
         if let Some(thunk) = parse_lazy_expression(refail, LazyExpressionFlags::THUNK) {
             refail = thunk.expression;
         }
-    } else if tp.is_node_reference_to_effect_module_api(step.callee, "flatMap") {
+    } else if tp.is_node_reference_to_effect_module_api(step.callee, member!("flatMap")) {
         let Some(thunk) = parse_lazy_expression(refail, LazyExpressionFlags::THUNK) else {
             return false;
         };
@@ -132,7 +132,7 @@ fn catch_handler_refails_original_error(tp: &mut TypeParser<'_>, handler: Node) 
         &mut [
             &mut |tp: &mut TypeParser<'_>, step: &PipingFlowTransformation| {
                 step.args.is_empty()
-                    && tp.is_node_reference_to_effect_module_api(step.callee, "fail")
+                    && tp.is_node_reference_to_effect_module_api(step.callee, member!("fail"))
             },
         ],
     )

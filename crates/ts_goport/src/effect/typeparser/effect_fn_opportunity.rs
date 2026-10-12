@@ -71,9 +71,15 @@ impl TypeParser<'_> {
             return None;
         }
 
-        cached!(self, parse_effect_fn_opportunity, node, {
-            self.parse_effect_fn_opportunity_inner(node)
-        })
+        // Go `Cached(&tp.links.ParseEffectFnOpportunity, node, ..)`.
+        if let Some(cached) = self.links().parse_effect_fn_opportunity.get(node) {
+            return cached;
+        }
+        let result = self.parse_effect_fn_opportunity_inner(node);
+        self.links()
+            .parse_effect_fn_opportunity
+            .insert(node, result.clone());
+        result
     }
 
     /// parseEffectFnOpportunityInner contains the actual parsing logic for ParseEffectFnOpportunity.
@@ -512,7 +518,7 @@ impl TypeParser<'_> {
             return Node::NIL;
         }
 
-        if !self.is_node_reference_to_effect_module_api(call.expression(), "withSpan") {
+        if !self.is_node_reference_to_effect_module_api(call.expression(), member!("withSpan")) {
             return Node::NIL;
         }
 
@@ -640,13 +646,13 @@ impl TypeParser<'_> {
         if node.is_nil() {
             return "";
         }
-        if self.is_node_reference_to_effect_layer_module_api(node, "effect") {
+        if self.is_node_reference_to_effect_layer_module_api(node, member!("effect")) {
             return "effect";
         }
-        if self.is_node_reference_to_effect_layer_module_api(node, "succeed") {
+        if self.is_node_reference_to_effect_layer_module_api(node, member!("succeed")) {
             return "succeed";
         }
-        if self.is_node_reference_to_effect_layer_module_api(node, "sync") {
+        if self.is_node_reference_to_effect_layer_module_api(node, member!("sync")) {
             return "sync";
         }
         ""

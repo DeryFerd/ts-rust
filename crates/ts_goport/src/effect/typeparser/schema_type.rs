@@ -143,9 +143,9 @@ impl TypeParser<'_> {
     pub fn is_node_reference_to_effect_schema_module_api(
         &mut self,
         node: Node,
-        member_name: &str,
+        member: &ExportMember,
     ) -> bool {
-        self.is_node_reference_to_module_export(node, &EFFECT_SCHEMA_MODULE_DESCRIPTOR, member_name)
+        self.is_node_reference_to_module_export(node, &EFFECT_SCHEMA_MODULE_DESCRIPTOR, member)
     }
 }
 
@@ -197,12 +197,12 @@ impl TypeParser<'_> {
     pub fn is_node_reference_to_effect_parse_result_module_api(
         &mut self,
         node: Node,
-        member_name: &str,
+        member: &ExportMember,
     ) -> bool {
         self.is_node_reference_to_module_export(
             node,
             &EFFECT_PARSE_RESULT_MODULE_DESCRIPTOR,
-            member_name,
+            member,
         )
     }
 }
@@ -246,12 +246,12 @@ impl TypeParser<'_> {
     pub fn is_node_reference_to_effect_schema_parser_module_api(
         &mut self,
         node: Node,
-        member_name: &str,
+        member: &ExportMember,
     ) -> bool {
         self.is_node_reference_to_module_export(
             node,
             &EFFECT_SCHEMA_PARSER_MODULE_DESCRIPTOR,
-            member_name,
+            member,
         )
     }
 }

@@ -48,18 +48,14 @@ fn run_process_env(ctx: &mut RuleContext<'_, '_>, check_in_effect: bool) -> Vec<
         message = diag::This_Effect_code_reads_from_process_env_environment_configuration_in_Effect_code_is_represented_through_Config_from_Effect_effect_processEnvInEffect;
     }
 
-    fn walk(
+    fn visit(
         ctx: &mut RuleContext<'_, '_>,
         diags: &mut Vec<Diagnostic>,
         check_in_effect: bool,
         process_symbol: SymbolId,
         message: &'static crate::diagnostics::Message,
         node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    ) {
         let in_effect = ctx
             .tp
             .get_effect_context_flags(node)
@@ -79,23 +75,15 @@ fn run_process_env(ctx: &mut RuleContext<'_, '_>, check_in_effect: bool) -> Vec<
                 }
             }
         }
-
-        node.for_each_child(|child| {
-            walk(ctx, diags, check_in_effect, process_symbol, message, child)
-        });
-        false
     }
 
     let mut diags = Vec::new();
     let sf = ctx.source_file;
-    walk(
-        ctx,
-        &mut diags,
-        check_in_effect,
-        process_symbol,
-        message,
-        sf,
-    );
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diags, check_in_effect, process_symbol, message, n);
+    }
 
     diags
 }

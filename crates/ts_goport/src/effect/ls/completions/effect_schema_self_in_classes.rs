@@ -1,0 +1,260 @@
+//! Port of Effect-TS/tsgo `internal/completions/effect_schema_self_in_classes.go`
+//! (effect-tsgo 0.51.1), with the item helpers that the other completions use.
+
+use crate::effect::ls::completion::{
+    Completion, CompletionContext, parse_data_for_extends_class_completion,
+};
+use crate::effect::typeparser::{
+    EffectMajorVersion, find_module_identifier, find_module_identifier_for_package, member,
+};
+use crate::ls::prelude::*;
+
+// Go: completions/effect_schema_self_in_classes.go:15 effectSchemaSelfInClasses
+/// effectSchemaSelfInClasses provides completion items for Schema/Model class constructors
+/// when the cursor is in the extends clause of a class declaration.
+/// For example, typing `class Foo extends Schema.|` will suggest `Class<Foo>`, `TaggedClass<Foo>`, etc.
+pub static EFFECT_SCHEMA_SELF_IN_CLASSES: Completion = Completion {
+    name: "effectSchemaSelfInClasses",
+    description: "Provides Schema/Model class constructor completions in extends clauses",
+    run: run_effect_schema_self_in_classes,
+};
+
+// Go: completions/effect_schema_self_in_classes.go:21 runEffectSchemaSelfInClasses
+fn run_effect_schema_self_in_classes(
+    ctx: &mut CompletionContext<'_, '_>,
+) -> Vec<lsproto::CompletionItem> {
+    let Some(data) = parse_data_for_extends_class_completion(ctx.source_file, ctx.position) else {
+        return Vec::new();
+    };
+
+    let schema_identifier = find_module_identifier(ctx.source_file, "Schema");
+    let accessed_text = data.accessed_object_text();
+    let is_fully_qualified = schema_identifier == accessed_text;
+    let class_name = data.class_name_text();
+
+    let version = ctx.tp.supported_effect_version();
+
+    // Build replacement range from byte offsets
+    let replacement_range =
+        byte_span_to_range(ctx, data.replacement_start, data.replacement_length);
+
+    let sort_text = "11";
+    let mut items = Vec::new();
+
+    // Schema.Class (both v3 and v4)
+    if is_fully_qualified
+        || ctx
+            .tp
+            .is_node_reference_to_effect_schema_module_api(data.accessed_object, member!("Class"))
+    {
+        let insert_text = if is_fully_qualified {
+            format!(r#"{schema_identifier}.Class<{class_name}>("{class_name}")({{${{0}}}}){{}}"#)
+        } else {
+            format!(r#"Class<{class_name}>("{class_name}")({{${{0}}}}){{}}"#)
+        };
+        items.push(make_extends_completion_item(
+            &accessed_text,
+            format!("Class<{class_name}>"),
+            insert_text,
+            sort_text,
+            replacement_range,
+        ));
+    }
+
+    // Schema.TaggedError (both v3 and v4)
+    if is_fully_qualified
+        || ctx.tp.is_node_reference_to_effect_schema_module_api(
+            data.accessed_object,
+            member!("TaggedError"),
+        )
+    {
+        let insert_text = if is_fully_qualified {
+            format!(
+                r#"{schema_identifier}.TaggedError<{class_name}>()("{class_name}", {{${{0}}}}){{}}"#
+            )
+        } else {
+            format!(r#"TaggedError<{class_name}>()("{class_name}", {{${{0}}}}){{}}"#)
+        };
+        items.push(make_extends_completion_item(
+            &accessed_text,
+            format!("TaggedError<{class_name}>"),
+            insert_text,
+            sort_text,
+            replacement_range,
+        ));
+    }
+
+    // Schema.TaggedClass (both v3 and v4)
+    if is_fully_qualified
+        || ctx.tp.is_node_reference_to_effect_schema_module_api(
+            data.accessed_object,
+            member!("TaggedClass"),
+        )
+    {
+        let insert_text = if is_fully_qualified {
+            format!(
+                r#"{schema_identifier}.TaggedClass<{class_name}>()("{class_name}", {{${{0}}}}){{}}"#
+            )
+        } else {
+            format!(r#"TaggedClass<{class_name}>()("{class_name}", {{${{0}}}}){{}}"#)
+        };
+        items.push(make_extends_completion_item(
+            &accessed_text,
+            format!("TaggedClass<{class_name}>"),
+            insert_text,
+            sort_text,
+            replacement_range,
+        ));
+    }
+
+    // Schema.TaggedRequest (v3 only)
+    if version == EffectMajorVersion::V3
+        && (is_fully_qualified
+            || ctx.tp.is_node_reference_to_effect_schema_module_api(
+                data.accessed_object,
+                member!("TaggedRequest"),
+            ))
+    {
+        let insert_text = if is_fully_qualified {
+            format!(
+                r#"{schema_identifier}.TaggedRequest<{class_name}>()("{class_name}", {{${{0}}}}){{}}"#
+            )
+        } else {
+            format!(r#"TaggedRequest<{class_name}>()("{class_name}", {{${{0}}}}){{}}"#)
+        };
+        items.push(make_extends_completion_item(
+            &accessed_text,
+            format!("TaggedRequest<{class_name}>"),
+            insert_text,
+            sort_text,
+            replacement_range,
+        ));
+    }
+
+    // Schema.Error (v4 only)
+    if version == EffectMajorVersion::V4
+        && (is_fully_qualified
+            || ctx.tp.is_node_reference_to_effect_schema_module_api(
+                data.accessed_object,
+                member!("Error"),
+            ))
+    {
+        let insert_text = if is_fully_qualified {
+            format!(r#"{schema_identifier}.Error<{class_name}>("{class_name}")({{${{0}}}}){{}}"#)
+        } else {
+            format!(r#"Error<{class_name}>("{class_name}")({{${{0}}}}){{}}"#)
+        };
+        items.push(make_extends_completion_item(
+            &accessed_text,
+            format!("Error<{class_name}>"),
+            insert_text,
+            sort_text,
+            replacement_range,
+        ));
+    }
+
+    // Model.Class (v4 only)
+    if version == EffectMajorVersion::V4 {
+        let model_identifier =
+            find_module_identifier_for_package(ctx.source_file, "effect/schema", "Model");
+
+        let is_model_fully_qualified = model_identifier == accessed_text;
+
+        if is_model_fully_qualified
+            || ctx.tp.is_node_reference_to_effect_model_module_api(
+                data.accessed_object,
+                member!("Class"),
+            )
+        {
+            let insert_text = if is_model_fully_qualified {
+                format!(r#"{model_identifier}.Class<{class_name}>("{class_name}")({{${{0}}}}){{}}"#)
+            } else {
+                format!(r#"Class<{class_name}>("{class_name}")({{${{0}}}}){{}}"#)
+            };
+            items.push(make_extends_completion_item(
+                &accessed_text,
+                format!("Class<{class_name}>"),
+                insert_text,
+                sort_text,
+                replacement_range,
+            ));
+        }
+    }
+
+    items
+}
+
+// Go: completions/effect_schema_self_in_classes.go:140 makeCompletionItem
+/// makeCompletionItem creates a CompletionItem with snippet format and a text edit.
+// PORT: Go's optional `kindOverride ...lsproto.CompletionItemKind` is the
+// `kind` argument; the callers without it pass
+// `CompletionItemKind::VARIABLE`, the Go default.
+pub fn make_completion_item(
+    label: String,
+    insert_text: String,
+    sort_text: &str,
+    replacement_range: lsproto::Range,
+    kind: lsproto::CompletionItemKind,
+) -> lsproto::CompletionItem {
+    lsproto::CompletionItem {
+        label,
+        kind: Some(kind),
+        insert_text_format: Some(lsproto::InsertTextFormat::SNIPPET),
+        sort_text: Some(sort_text.to_string()),
+        text_edit: Some(lsproto::TextEditOrInsertReplaceEdit {
+            text_edit: Some(lsproto::TextEdit {
+                new_text: insert_text,
+                range: replacement_range,
+            }),
+            insert_replace_edit: None,
+        }),
+        ..Default::default()
+    }
+}
+
+// Go: completions/effect_schema_self_in_classes.go:163 makeExtendsCompletionItem
+/// makeExtendsCompletionItem creates a CompletionItem for an extends-clause completion.
+/// It sets FilterText to accessedText.label so VS Code can filter correctly when the
+/// replacement range covers the full "Module.Property" expression.
+pub fn make_extends_completion_item(
+    accessed_text: &str,
+    label: String,
+    insert_text: String,
+    sort_text: &str,
+    replacement_range: lsproto::Range,
+) -> lsproto::CompletionItem {
+    let filter_text = format!("{accessed_text}.{label}");
+    let mut item = make_completion_item(
+        label,
+        insert_text,
+        sort_text,
+        replacement_range,
+        lsproto::CompletionItemKind::VARIABLE,
+    );
+    item.filter_text = Some(filter_text);
+    item
+}
+
+// Go: completions/effect_schema_self_in_classes.go:171 byteSpanToRange
+/// byteSpanToRange converts a byte offset span to an LSP Range.
+// PORT: Go `uint32(line)` and `uint32(char)`: both are never negative.
+pub fn byte_span_to_range(
+    ctx: &CompletionContext<'_, '_>,
+    start: i32,
+    length: i32,
+) -> lsproto::Range {
+    let (start_line, start_char) =
+        get_ecma_line_and_utf16_character_of_position(ctx.source_file, start);
+    let (end_line, end_char) =
+        get_ecma_line_and_utf16_character_of_position(ctx.source_file, start + length);
+    lsproto::Range {
+        start: lsproto::Position {
+            line: start_line as u32,
+            character: start_char as u32,
+        },
+        end: lsproto::Position {
+            line: end_line as u32,
+            character: end_char as u32,
+        },
+    }
+}

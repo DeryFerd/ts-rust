@@ -157,7 +157,7 @@ fn analyze_catch_chain_to_first_success_of_candidate(
     transformation: &PipingFlowTransformation,
 ) -> (Option<CatchChainToFirstSuccessOfCandidate>, bool) {
     if transformation.callee.is_nil()
-        || !tp.is_node_reference_to_effect_module_api(transformation.callee, "catch")
+        || !tp.is_node_reference_to_effect_module_api(transformation.callee, member!("catch"))
         || transformation.args.len() != 1
     {
         return (None, false);

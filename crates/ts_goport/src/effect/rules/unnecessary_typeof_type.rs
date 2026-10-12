@@ -45,28 +45,25 @@ pub fn analyze_unnecessary_typeof_type(
     tp: &mut TypeParser<'_>,
     sf: Node,
 ) -> Vec<UnnecessaryTypeofTypeMatch> {
-    fn walk(
+    fn visit(
         tp: &mut TypeParser<'_>,
         sf: Node,
         matches: &mut Vec<UnnecessaryTypeofTypeMatch>,
         node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
-
+    ) {
         if node.kind() == SyntaxKind::TypeQuery {
             if let Some(m) = analyze_unnecessary_typeof_type_node(tp, sf, node) {
                 matches.push(m);
             }
         }
-
-        node.for_each_child(|child| walk(tp, sf, matches, child));
-        false
     }
 
     let mut matches = Vec::new();
-    walk(tp, sf, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, n);
+    }
     matches
 }
 

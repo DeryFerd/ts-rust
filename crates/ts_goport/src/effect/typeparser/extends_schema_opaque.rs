@@ -46,7 +46,7 @@ impl TypeParser<'_> {
                 let inner_type_arguments = inner_call.type_argument_list();
                 if self.is_node_reference_to_effect_schema_module_api(
                     inner_call.expression(),
-                    "Opaque",
+                    member!("Opaque"),
                 ) {
                     break 'compute Some(Rc::new(SchemaOpaqueResult {
                         self_type_node: inner_type_arguments.nodes().get(0),

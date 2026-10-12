@@ -113,9 +113,9 @@ fn catch_to_ignore_methods(
         let prop = callee;
         effect_module_node = prop.expression();
     }
-    if tp.is_node_reference_to_effect_module_api(callee, "catch") {
+    if tp.is_node_reference_to_effect_module_api(callee, member!("catch")) {
         ("catch", "ignore", effect_module_node, true)
-    } else if tp.is_node_reference_to_effect_module_api(callee, "catchCause") {
+    } else if tp.is_node_reference_to_effect_module_api(callee, member!("catchCause")) {
         ("catchCause", "ignoreCause", effect_module_node, true)
     } else {
         ("", "", Node::NIL, false)
@@ -127,7 +127,7 @@ fn is_effect_void_reference(tp: &mut TypeParser<'_>, node: Node) -> bool {
     if node.is_nil() {
         return false;
     }
-    tp.is_node_reference_to_effect_module_api(skip_parentheses(node), "void")
+    tp.is_node_reference_to_effect_module_api(skip_parentheses(node), member!("void"))
 }
 
 // Go: rules/catch_to_ignore.go isVoidLikeEffectSuccess

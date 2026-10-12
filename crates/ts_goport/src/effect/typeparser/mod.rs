@@ -1,5 +1,5 @@
-//! Port of Effect-TS/tsgo `internal/typeparser` at `@effect/tsgo@0.46.1`
-//! (`f1a7cad0`). It recognizes Effect values, services, layers, schemas and
+//! Port of Effect-TS/tsgo `internal/typeparser` at `@effect/tsgo@0.51.1`
+//! (`47cb1ed7`). It recognizes Effect values, services, layers, schemas and
 //! call shapes from checker types. One file per Go file, in Go order.
 //!
 //! Go `Cached(&tp.links.X, key, compute)` is `cached!(self, x, key, compute)`.
@@ -8,7 +8,13 @@
 
 use crate::prelude::*;
 
+mod api_stability_inheritance;
+mod api_stability_p1;
+mod api_stability_p2;
+mod api_stability_p3;
+mod api_stability_safety;
 mod cause_type;
+pub mod checker_integration;
 mod constant_evaluation;
 mod context_tag;
 mod context_type;
@@ -45,6 +51,7 @@ mod layer_type;
 mod lazy_expression;
 mod module_export_reference;
 mod module_identifier;
+mod node_order;
 mod object_literal;
 mod option_type;
 mod packagejson;
@@ -65,6 +72,11 @@ mod unroll_members;
 mod vitest_api;
 mod yieldable_error;
 
+pub use api_stability_inheritance::*;
+pub use api_stability_p1::*;
+pub use api_stability_p2::*;
+pub use api_stability_p3::*;
+pub use api_stability_safety::*;
 pub use cause_type::*;
 pub use constant_evaluation::*;
 pub use context_tag::*;
@@ -102,6 +114,7 @@ pub use layer_type::*;
 pub use lazy_expression::*;
 pub use module_export_reference::*;
 pub use module_identifier::*;
+pub use node_order::*;
 pub use object_literal::*;
 pub use option_type::*;
 pub use packagejson::*;
@@ -126,13 +139,21 @@ pub use yieldable_error::*;
 pub struct TypeParser<'c> {
     pub program: &'static GoProgram,
     pub checker: &'c mut Checker,
+    /// PORT: the node order of the file the rules run on
+    /// (`TypeParser::node_order`, effperf4). Not in Go.
+    pub node_order: Option<Rc<NodeOrder>>,
 }
 
 /// Go `EffectLinks`: the per-checker caches. A present key with a `None`
 /// value is a cached Go nil, as `LinkStore.TryGet` gives.
+///
+/// PORT: the caches keep Go's keys and entries, but the large node caches
+/// use node link pages (`LinkStore`, Go `core.PagedLinkStore`) with small
+/// slots: rules ask about most nodes of a file. On the effect project these
+/// caches held about 110 MB in hash maps (effcache1).
 #[derive(Default)]
 pub struct EffectLinks {
-    pub type_at_location: FxHashMap<Node, TypeId>,
+    pub type_at_location: LinkStore<Node, CachedId>,
     pub effect_type: FxHashMap<TypeId, Option<Rc<Effect>>>,
     pub stream_type: FxHashMap<TypeId, Option<Rc<Effect>>>,
     pub strict_effect_type: FxHashMap<TypeId, Option<Rc<Effect>>>,
@@ -149,9 +170,28 @@ pub struct EffectLinks {
     pub promise_type: FxHashMap<TypeId, TypeId>,
     pub is_global_error_type: FxHashMap<TypeId, bool>,
     pub is_yieldable_error_type: FxHashMap<TypeId, bool>,
-    pub reference_symbol: FxHashMap<Node, SymbolId>,
+    pub reference_symbol: LinkStore<Node, CachedId>,
     pub module_export_reference: FxHashMap<ModuleExportReferenceCacheKey, bool>,
     pub pipeable_signature_shape: FxHashMap<PipeableSignatureShapeCacheKey, bool>,
+    // API-stability caches. Declared lookups persist per checker: the declared
+    // stability of a symbol, of a raw signature overload and of one
+    // declaration, shared with the unstableApiUsage/experimentalApiUsage rules.
+    // Declared lookups never trigger computed analysis. A computed stability
+    // surface lives in an analysis-local ApiStabilitySession, and every
+    // complete, settled, context-free concrete type or signature surface is
+    // additionally published here as an immutable snapshot so a later export,
+    // file or TypeParser over the same checker composes it instead of
+    // recomputing. The snapshot excludes the component's own declared tag,
+    // which stays in the declared caches and is re-added by each consumer; a
+    // substitution-context or incomplete/blocked result is never published and
+    // stays analysis-local. Ceilings, locations and diagnostics are never
+    // cached.
+    pub api_stability_declared_symbol: FxHashMap<SymbolId, ApiStabilityDeclaration>,
+    pub api_stability_declared_signature: FxHashMap<SignatureId, ApiStabilityDeclaration>,
+    pub api_stability_declared_declaration: FxHashMap<Node, ApiStabilityDeclaration>,
+    pub api_stability_surface_type:
+        FxHashMap<ApiStabilitySurfaceTypeKey, ApiStabilitySharedSurface>,
+    pub api_stability_surface_signature: FxHashMap<SignatureId, ApiStabilitySharedSurface>,
 
     pub extends_context_tag: FxHashMap<Node, Option<Rc<ContextTagResult>>>,
     pub extends_data_tagged_error: FxHashMap<Node, Option<Rc<DataTaggedErrorResult>>>,
@@ -169,11 +209,11 @@ pub struct EffectLinks {
 
     pub effect_gen_call: FxHashMap<Node, Option<Rc<EffectGenCallResult>>>,
     pub effect_fn_call: FxHashMap<Node, Option<Rc<EffectFnCallResult>>>,
-    pub parse_effect_fn_opportunity: FxHashMap<Node, Option<Rc<EffectFnOpportunityResult>>>,
+    pub parse_effect_fn_opportunity: NodeOptCache<EffectFnOpportunityResult>,
     pub parse_pipe_call: FxHashMap<Node, Option<Rc<ParsedPipeCallResult>>>,
     pub execution_flow: FxHashMap<Node, Option<Rc<ExecutionFlow>>>,
-    pub effect_context_flags: FxHashMap<Node, EffectContextFlags>,
-    pub effect_yield_generator_function: FxHashMap<Node, Node>,
+    pub effect_context_flags: LinkStore<Node, EffectContextFlags>,
+    pub effect_yield_generator_function: LinkStore<Node, CachedNode>,
 
     pub discover_packages_computed: bool,
     pub discover_packages_value: Vec<DiscoveredPackage>,
@@ -184,6 +224,90 @@ pub struct EffectLinks {
     pub expected_and_real_types: FxHashMap<Node, Rc<Vec<ExpectedAndRealType>>>,
     pub piping_flows_with_effect_fn: FxHashMap<Node, Rc<Vec<Rc<PipingFlow>>>>,
     pub piping_flows_without_effect_fn: FxHashMap<Node, Rc<Vec<Rc<PipingFlow>>>>,
+}
+
+/// A cached `TypeId` or `SymbolId` in a node link page. Go caches nil
+/// too, so the slot keeps the handle plus one: `Option<CachedId>` is 4
+/// bytes, a page of 64 nodes 256 bytes. The default is nil.
+#[derive(Clone, Copy)]
+pub struct CachedId(std::num::NonZeroU32);
+
+impl CachedId {
+    #[must_use]
+    pub fn new(handle: u32) -> Self {
+        Self(std::num::NonZeroU32::new(handle.wrapping_add(1)).expect("handle below u32::MAX"))
+    }
+
+    #[must_use]
+    pub fn get(self) -> u32 {
+        self.0.get() - 1
+    }
+}
+
+impl Default for CachedId {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+/// A cached `Node` in a node link page, kept like `CachedId`: 8 bytes in
+/// an `Option`. The default is nil.
+#[derive(Clone, Copy)]
+pub struct CachedNode(std::num::NonZeroU64);
+
+impl CachedNode {
+    #[must_use]
+    pub fn new(node: Node) -> Self {
+        Self(std::num::NonZeroU64::new(node.0.wrapping_add(1)).expect("node handle below u64::MAX"))
+    }
+
+    #[must_use]
+    pub fn get(self) -> Node {
+        Node(self.0.get() - 1)
+    }
+}
+
+impl Default for CachedNode {
+    fn default() -> Self {
+        Self::new(Node::NIL)
+    }
+}
+
+/// Go `core.LinkStore[*ast.Node, *T]` for a cache that rules fill for
+/// nearly every node of a file and that is nil for most of them
+/// (`ParseEffectFnOpportunity`). Node link pages mark the cached nodes (one
+/// byte each), and a map holds the results that are not nil.
+pub struct NodeOptCache<T> {
+    cached: LinkStore<Node, ()>,
+    values: FxHashMap<Node, Rc<T>>,
+}
+
+impl<T> Default for NodeOptCache<T> {
+    fn default() -> Self {
+        Self {
+            cached: LinkStore::default(),
+            values: FxHashMap::default(),
+        }
+    }
+}
+
+impl<T> NodeOptCache<T> {
+    /// Go `store.TryGet(node)`: `None` when `node` is not cached.
+    #[must_use]
+    pub fn get(&self, node: Node) -> Option<Option<Rc<T>>> {
+        self.cached
+            .has(node)
+            .then(|| self.values.get(&node).cloned())
+    }
+
+    /// Go `*store.Get(node) = value`.
+    pub fn insert(&mut self, node: Node, value: Option<Rc<T>>) {
+        self.cached.get(node);
+        match value {
+            Some(value) => self.values.insert(node, value),
+            None => self.values.remove(&node),
+        };
+    }
 }
 
 /// Go `Cached(&tp.links.<field>, key, compute)`: the cached value, or
@@ -210,11 +334,62 @@ impl<'c> TypeParser<'c> {
         if checker.effect_links.is_none() {
             checker.effect_links = Some(Box::default());
         }
-        TypeParser { program, checker }
+        TypeParser {
+            program,
+            checker,
+            node_order: None,
+        }
     }
 
     /// Go `tp.links`.
+    // PERF: inlined, so a `cached!` reads the links with no call. `new` makes
+    // them, so the cold path that builds them (60 maps) stays out of line
+    // (effperf3 item 4).
+    #[inline]
     pub fn links(&mut self) -> &mut EffectLinks {
-        self.checker.effect_links.get_or_insert_with(Box::default)
+        match self.checker.effect_links {
+            Some(ref mut links) => links,
+            None => new_links(&mut self.checker.effect_links),
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn new_links(links: &mut Option<Box<EffectLinks>>) -> &mut EffectLinks {
+    links.insert(Box::default())
+}
+
+// PORT: no Go counterpart. The small cache slots of `EffectLinks` keep Go's
+// `Cached` meaning: a nil result is cached, and an absent key is not.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_cache_slots_keep_cached_nil() {
+        let file_node = Node((3 << 32) | 70);
+        let synthetic_node = Node((u64::from(u32::MAX) << 32) | 5);
+
+        assert_eq!(CachedId::default().get(), 0);
+        assert_eq!(CachedId::new(7).get(), 7);
+        assert_eq!(CachedNode::default().get(), Node::NIL);
+        assert_eq!(CachedNode::new(file_node).get(), file_node);
+
+        let mut ids: LinkStore<Node, CachedId> = LinkStore::default();
+        for node in [file_node, synthetic_node] {
+            assert!(ids.try_get(node).is_none());
+            *ids.get(node) = CachedId::new(TypeId::NIL.0);
+            assert_eq!(ids.try_get(node).map(|id| id.get()), Some(0));
+        }
+
+        let mut opt: NodeOptCache<u32> = NodeOptCache::default();
+        for node in [file_node, synthetic_node] {
+            assert_eq!(opt.get(node), None);
+            opt.insert(node, Some(Rc::new(1)));
+            assert_eq!(opt.get(node), Some(Some(Rc::new(1))));
+            opt.insert(node, None);
+            assert_eq!(opt.get(node), Some(None));
+        }
     }
 }

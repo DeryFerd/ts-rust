@@ -4,7 +4,7 @@ use crate::effect::typeparser::*;
 use crate::prelude::*;
 
 /// EffectModelClassResult holds the parsed result of a class extending Model.Class
-/// from effect/unstable/schema.
+/// from effect/schema.
 #[derive(Clone, Debug)]
 pub struct EffectModelClassResult {
     /// The class name identifier
@@ -16,7 +16,7 @@ pub struct EffectModelClassResult {
 impl TypeParser<'_> {
     // Go: typeparser/extends_effect_model_class.go ExtendsEffectModelClass
     /// ExtendsEffectModelClass checks if a class declaration extends Model.Class<Self>(...)({...})
-    /// from the effect/unstable/schema module.
+    /// from the effect/schema module.
     /// It detects the double-call pattern:
     ///
     /// ```text
@@ -80,9 +80,10 @@ impl TypeParser<'_> {
                 if inner_call.expression().is_nil() {
                     continue;
                 }
-                if !self
-                    .is_node_reference_to_effect_model_module_api(inner_call.expression(), "Class")
-                {
+                if !self.is_node_reference_to_effect_model_module_api(
+                    inner_call.expression(),
+                    member!("Class"),
+                ) {
                     continue;
                 }
 

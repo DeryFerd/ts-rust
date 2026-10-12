@@ -1,5 +1,5 @@
 {
   "extends": "../tsconfig.base.json",
-  "compilerOptions": { "noEmit": true, "outDir": "dist" },
+  "compilerOptions": { "composite": false, "noEmit": true, "outDir": "dist" },
   "files": ["index.ts"]
 }
