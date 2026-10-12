@@ -97,7 +97,7 @@ pub struct ResolvedModule {
     pub resolved_file_name: String,
     /// ts#64159 (Go N' module/types.go:90 `ResolvedPath`): the path of
     /// `resolved_file_name`, made by the resolver that gave the answer.
-    /// Empty when nothing resolved; then a reader uses `to_path` of the name.
+    /// Empty when nothing resolved, as in Go: a lookup by it then misses.
     pub resolved_path: tspath::Path,
     pub original_path: String,
     pub extension: String,
@@ -121,12 +121,13 @@ impl ResolvedModule {
         !self.resolved_file_name.is_empty()
     }
 
-    /// `resolved_path` for a reader: `None` when it is empty or
-    /// `GOPORT_RESOLVED_PATH` is `0`, so the reader makes the path from the
-    /// name (the code before ts#64159; an A/B switch).
+    /// `resolved_path` for a reader, empty or not, as Go reads
+    /// `ResolvedPath`. `None` when `GOPORT_RESOLVED_PATH` is `0`: the reader
+    /// then makes the path from the name (the code before ts#64159; an A/B
+    /// switch).
     #[must_use]
     pub fn path(&self) -> Option<&tspath::Path> {
-        (!self.resolved_path.is_empty() && resolved_paths_enabled()).then_some(&self.resolved_path)
+        resolved_paths_enabled().then_some(&self.resolved_path)
     }
 }
 

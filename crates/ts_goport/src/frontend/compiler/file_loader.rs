@@ -859,9 +859,8 @@ impl FileLoader {
         )
     }
 
-    /// Go `resolved.ResolvedPath` of a resolved module (ts#64159). PORT: a
-    /// resolution that a resolver made without the path (none should), or
-    /// `GOPORT_RESOLVED_PATH=0`, gets the loader's `to_path` of its name.
+    /// Go `resolved.ResolvedPath` of a resolved module (ts#64159). PORT:
+    /// `GOPORT_RESOLVED_PATH=0` gets the loader's `to_path` of its name.
     pub fn resolved_path(&self, resolved: &ResolvedModule) -> Path {
         let Some(path) = resolved.path() else {
             return self.to_path(&resolved.resolved_file_name);
