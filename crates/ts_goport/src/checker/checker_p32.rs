@@ -627,16 +627,19 @@ impl Checker {
     }
 
     // Go: checker/checker.go:29862 getTypeOfPropertyOrIndexSignatureOfType
-    pub fn get_type_of_property_or_index_signature_of_type(
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`). With a `Name`, the
+    // property lookup compares name ids.
+    pub fn get_type_of_property_or_index_signature_of_type<'a>(
         &mut self,
         t: TypeId,
-        name: &str,
+        name: impl Into<TableKey<'a>>,
     ) -> TypeId {
+        let name: TableKey<'a> = name.into();
         let prop_type = self.get_type_of_property_of_type(t, name);
         if prop_type.is_some() {
             return prop_type;
         }
-        let index_info = self.get_applicable_index_info_for_name(t, name);
+        let index_info = self.get_applicable_index_info_for_name(t, name.text());
         if index_info.is_some() {
             let value_type = self.index_info(index_info).value_type;
             return self.add_optionality_ex(

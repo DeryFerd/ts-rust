@@ -254,7 +254,9 @@ pub trait Discriminator {
     /// Number of discriminant properties
     fn len(&self) -> i32;
     /// Property name of index-th discriminator
-    fn name(&self, c: &Checker, index: i32) -> String;
+    // PERF (jsxname1): a `Name`, not a `String` copy of its text, so the
+    // property lookups compare name ids.
+    fn name(&self, c: &Checker, index: i32) -> Name;
     /// True if index-th discriminator matches the given type
     fn matches(&mut self, c: &mut Checker, index: i32, t: TypeId) -> bool;
 }
@@ -275,8 +277,8 @@ impl<'a> Discriminator for TypeDiscriminator<'a> {
     }
 
     // Go: checker/relater.go:1040 TypeDiscriminator.name
-    fn name(&self, c: &Checker, index: i32) -> String {
-        c.sym(self.props[index as usize]).name.to_string()
+    fn name(&self, c: &Checker, index: i32) -> Name {
+        c.sym(self.props[index as usize]).name.clone()
     }
 
     // Go: checker/relater.go:1044 TypeDiscriminator.matches
