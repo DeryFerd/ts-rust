@@ -90,6 +90,10 @@ impl ResolutionState<'_> {
         resolved_module.resolution_diagnostics = self.diagnostics.clone();
 
         if let Some(resolved) = resolved {
+            // ts#64159 (resolver.go:1377): the path of a resolved file.
+            if !resolved.path.is_empty() {
+                resolved_module.resolved_path = self.path_key(&resolved.path);
+            }
             resolved_module.resolved_file_name = resolved.path;
             resolved_module.original_path = resolved.original_path;
             resolved_module.is_external_library_import = is_external_library_import;
@@ -130,8 +134,21 @@ impl ResolutionState<'_> {
                     resolved_type_reference_directive.original_path = original_path;
                 }
             }
+            // ts#64159 (resolver.go:1411)
+            resolved_type_reference_directive.resolved_path =
+                self.path_key(&resolved_type_reference_directive.resolved_file_name);
         }
         resolved_type_reference_directive
+    }
+
+    /// Go `r.resolver.fs.CaseSensitivity().PathKey(tspath.RootedPath(name))`:
+    /// the path of a resolved file name, as the loader's `to_path` makes it.
+    fn path_key(&self, file_name: &str) -> Path {
+        to_path(
+            file_name,
+            &self.resolver.host.get_current_directory(),
+            self.resolver.host.fs().use_case_sensitive_file_names(),
+        )
     }
 
     // Go: module/resolver.go:1416 getOriginalAndResolvedFileName

@@ -1256,7 +1256,7 @@ fn relative_path_from_normalized_paths(
 /// A URL root with a query or a fragment after its scheme.
 // PORT: private in Go tspath. `to_rooted_path` and the Rust ports of the
 // rooted path constructors outside tspath (`transpile.rs`,
-// `contentmapper/hostimpl.rs`) use it.
+// `contentmapper/hostimpl.rs`, `api/session_p2.rs`) use it.
 pub fn has_rooted_url_suffix(path: &str) -> bool {
     if !has_url_root(path) {
         return false;

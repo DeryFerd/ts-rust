@@ -1,11 +1,12 @@
 //! Go: compiler/filesparser.go (parse tasks, the files parser and
 //! `getProcessedFiles`).
 
-use super::file_loader::SyntheticImports;
+use super::file_loader::{ImportNames, SyntheticImports};
 use crate::frontend::prelude::*;
 use crate::gostd::slices::stable_sort_by;
 use crate::program::ThreadBudget;
 use std::cell::Cell;
+use std::rc::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -47,6 +48,12 @@ pub struct ParseTask {
 
     pub loaded_task: Option<ParseTaskRef>,
     pub all_include_reasons: Vec<Rc<FileIncludeReason>>,
+    /// The task data of the task's path (`task_data_by_path`), set when
+    /// `FilesParser::start` queues the task.
+    // PERF (parload1 step 4): Go looks the data up by path at each visit of
+    // `collectFiles`; the link saves the string hash per visit. A `Weak`
+    // link makes no `Rc` cycle (task, data, task).
+    pub data: Weak<RefCell<ParseTaskData>>,
 }
 
 /// Go `*parseTask`.
@@ -202,6 +209,7 @@ impl ParseTask {
                     self.add_sub_task(
                         ResolvedRef {
                             file_name: lib_file.path.clone(),
+                            path: lib_file.path_key.clone(),
                             include_reason: Some(include_reason),
                             ..Default::default()
                         },
@@ -219,6 +227,8 @@ impl ParseTask {
         for supplemental in file.supplemental_source_files() {
             self.sub_tasks.push(Rc::new(RefCell::new(ParseTask {
                 normalized_file_path: supplemental.file_name().to_string(),
+                // ts#64159 (filesparser.go:176)
+                path: loader.to_path(supplemental.file_name()),
                 file: Some(supplemental.clone()),
                 is_content_mapper_supplemental: true,
                 include_reason: Some(new_file_include_reason(
@@ -274,6 +284,7 @@ impl ParseTask {
         };
         let sub_task = Rc::new(RefCell::new(ParseTask {
             normalized_file_path,
+            path: ref_.path,
             lib_file,
             increase_depth: ref_.increase_depth,
             elide_on_depth: ref_.elide_on_depth,
@@ -289,10 +300,40 @@ impl ParseTask {
 #[derive(Clone, Default)]
 pub struct ResolvedRef {
     pub file_name: String,
+    /// ts#64159 (Go N' `resolvedRef.path`): the path of `file_name`, from
+    /// the resolution. Empty: `FilesParser::start` makes it.
+    pub path: Path,
     pub increase_depth: bool,
     pub elide_on_depth: bool,
     pub include_reason: Option<Rc<FileIncludeReason>>,
     pub package_id: PackageId,
+}
+
+/// Sets the path of a task that `FilesParser::start` queues: the one it
+/// came with (Go `task.path`, ts#64159), else the loader's `to_path` of its
+/// file name. `GOPORT_RESOLVED_PATH=0` makes every path here.
+fn set_task_path(loader: &FileLoader, task: &mut ParseTask) {
+    if task.path.is_empty() || !crate::program::resolved_paths_enabled() {
+        // PERF: Go `loader.toPath` asks the host for its current directory
+        // and case sensitivity each time; the loader keeps the same values
+        // (`compare_paths_options`), so no copy of the directory is made.
+        task.path = to_path(
+            &task.normalized_file_path,
+            &loader.compare_paths_options.current_directory,
+            loader.compare_paths_options.use_case_sensitive_file_names,
+        );
+    } else {
+        debug_assert_eq!(
+            task.path,
+            to_path(
+                &task.normalized_file_path,
+                &loader.compare_paths_options.current_directory,
+                loader.compare_paths_options.use_case_sensitive_file_names,
+            ),
+            "path of task {}",
+            task.normalized_file_path
+        );
+    }
 }
 
 /// One queued run of the closure that Go `filesParser.start` passes to
@@ -595,17 +636,13 @@ impl FilesParser {
         let prefetch = PREFETCH.with(|p| p.borrow().clone());
         let mut requests = Vec::new();
         for task in tasks {
-            // PERF: Go `loader.toPath` asks the host for its current
-            // directory and case sensitivity each time; the loader keeps
-            // the same values (`compare_paths_options`), so no copy of the
-            // directory is made per task.
-            let path = to_path(
-                &task.borrow().normalized_file_path,
-                &loader.compare_paths_options.current_directory,
-                loader.compare_paths_options.use_case_sensitive_file_names,
-            );
-            task.borrow_mut().path = path.clone();
-            let (data, loaded) = match self.task_data_by_path.get(&path) {
+            // ts#64159 (filesparser.go:275): Go panics on a task without a
+            // path. PORT: the tasks that Go gives a path when it makes them
+            // and the port does not (root, lib, automatic type directive
+            // and redirect tasks) get it here.
+            set_task_path(loader, &mut task.borrow_mut());
+            let existing = self.task_data_by_path.get(&task.borrow().path).cloned();
+            let (data, loaded) = match existing {
                 Some(data) => {
                     // No queued task of this path ran yet, so the loader
                     // loads the file later (a job to move up).
@@ -616,6 +653,7 @@ impl FilesParser {
                 }
                 None => {
                     let candidate = get_parse_task_data(task);
+                    let path = task.borrow().path.clone();
                     self.task_data_by_path
                         .insert(path.clone(), candidate.clone());
                     if prefetch.is_some() {
@@ -629,6 +667,7 @@ impl FilesParser {
                     (candidate, false)
                 }
             };
+            task.borrow_mut().data = Rc::downgrade(&data);
 
             self.queue.push(QueuedParseTask {
                 task: task.clone(),
@@ -755,8 +794,11 @@ impl FilesParser {
 
         let mut start_subtasks = false;
         if loaded {
-            let name = task.borrow().normalized_file_path.clone();
-            let existing_task = data.borrow().tasks.get(&name).cloned();
+            let existing_task = data
+                .borrow()
+                .tasks
+                .get(&task.borrow().normalized_file_path)
+                .cloned();
             if let Some(existing_task) = existing_task {
                 // Go: tasks[i].loadedTask = existingTask (tasks[i] is task)
                 // PORT: a restart of started subtasks (see below) queues the
@@ -767,6 +809,7 @@ impl FilesParser {
                     task.borrow_mut().loaded_task = Some(existing_task);
                 }
             } else {
+                let name = task.borrow().normalized_file_path.clone();
                 let mut d = data.borrow_mut();
                 d.tasks.insert(name, task.clone());
                 // This is new task for file name - so load subtasks if there was loading for any other casing
@@ -805,10 +848,11 @@ impl FilesParser {
             return;
         }
 
-        // PORT: Go does not change `data.tasks` in this loop, so a copy of the
-        // values iterates the same tasks.
-        let tasks_by_file_name: Vec<ParseTaskRef> = data.borrow().tasks.values().cloned().collect();
-        for task_by_file_name in tasks_by_file_name {
+        // PORT: Go does not change `data.tasks` in this loop, so an index
+        // walks the same tasks. PERF (parload1 step 4): no copy of the list.
+        let count = data.borrow().tasks.len();
+        for index in 0..count {
+            let task_by_file_name = data.borrow().tasks[index].clone();
             let mut load_sub_tasks = start_subtasks;
             if !task_by_file_name.borrow().loaded {
                 task_by_file_name.borrow_mut().load(loader);
@@ -823,9 +867,11 @@ impl FilesParser {
             // lowest depth over all paths, in every run order.
             if load_sub_tasks && (lowered || !task_by_file_name.borrow().started_sub_tasks) {
                 task_by_file_name.borrow_mut().started_sub_tasks = true;
-                let sub_tasks = task_by_file_name.borrow().sub_tasks.clone();
                 let lowest_depth = data.borrow().lowest_depth;
-                self.start(loader, &sub_tasks, lowest_depth);
+                // PERF (parload1 step 4): no copy of the list. `start`
+                // borrows only the subtasks, which are tasks of their own.
+                let parent = task_by_file_name.borrow();
+                self.start(loader, &parent.sub_tasks, lowest_depth);
             }
         }
     }
@@ -970,24 +1016,45 @@ impl FilesParser {
                             include_reason.clone(),
                         );
                     }
-                    let data = self
-                        .parser
-                        .task_data_by_path
-                        .get(&task.borrow().path)
-                        .cloned();
                     if !task.borrow().loaded {
                         continue;
                     }
-                    let data = data.expect("loaded parse task without task data");
+                    // PERF (parload1 step 4): the task's link to its data
+                    // (`ParseTask::data`), else the lookup by path.
+                    let data = {
+                        let t = task.borrow();
+                        let data = t.data.upgrade().unwrap_or_else(|| {
+                            self.parser
+                                .task_data_by_path
+                                .get(&t.path)
+                                .cloned()
+                                .expect("loaded parse task without task data")
+                        });
+                        debug_assert!(
+                            self.parser
+                                .task_data_by_path
+                                .get(&t.path)
+                                .is_some_and(|by_path| Rc::ptr_eq(by_path, &data))
+                        );
+                        data
+                    };
                     let data_key = Rc::as_ptr(&data);
 
-                    let normalized_file_path = task.borrow().normalized_file_path.clone();
-                    let task_path = task.borrow().path.clone();
-
                     // ensure we only walk each task once
-                    if let Some(checked_name) = self.seen.get(&data_key).cloned() {
-                        if let Some(file) = task.borrow().file.clone() {
-                            if checked_name != normalized_file_path
+                    // PERF (parload1 step 4): a visit of a walked task with
+                    // the same name (most visits) copies no name.
+                    if let Some(checked_name) = self.seen.get(&data_key) {
+                        if *checked_name != task.borrow().normalized_file_path {
+                            let checked_name = checked_name.clone();
+                            let (normalized_file_path, task_path, file) = {
+                                let t = task.borrow();
+                                (
+                                    t.normalized_file_path.clone(),
+                                    t.path.clone(),
+                                    t.file.clone(),
+                                )
+                            };
+                            if let Some(file) = file
                                 && self
                                     .recorded_duplicates
                                     .entry(data_key)
@@ -1007,42 +1074,43 @@ impl FilesParser {
                                         .is_content_mapper_failure_stub(),
                                 });
                             }
-                        }
-                        // PORT: equal names give equal absolute paths, so
-                        // the check below only runs for different names.
-                        if checked_name != normalized_file_path
-                            && !loader
+                            // PORT: equal names give equal absolute paths, so
+                            // the check below only runs for different names.
+                            if !loader
                                 .opts
                                 .config
                                 .compiler_options()
                                 .force_consistent_casing_in_file_names
                                 .is_false()
-                        {
-                            // Check if it differs only in drive letters its ok to ignore that error:
-                            let checked_absolute_path = get_normalized_absolute_path_without_root(
-                                &checked_name,
-                                &loader.compare_paths_options.current_directory,
-                            );
-                            let input_absolute_path = get_normalized_absolute_path_without_root(
-                                &normalized_file_path,
-                                &loader.compare_paths_options.current_directory,
-                            );
-                            if checked_absolute_path != input_absolute_path {
-                                self.include_processor
-                                    .add_processing_diagnostics_for_file_casing(
-                                        &task_path,
+                            {
+                                // Check if it differs only in drive letters its ok to ignore that error:
+                                let checked_absolute_path =
+                                    get_normalized_absolute_path_without_root(
                                         &checked_name,
-                                        &normalized_file_path,
-                                        include_reason
-                                            .clone()
-                                            .expect("nil pointer dereference: includeReason"),
+                                        &loader.compare_paths_options.current_directory,
                                     );
+                                let input_absolute_path = get_normalized_absolute_path_without_root(
+                                    &normalized_file_path,
+                                    &loader.compare_paths_options.current_directory,
+                                );
+                                if checked_absolute_path != input_absolute_path {
+                                    self.include_processor
+                                        .add_processing_diagnostics_for_file_casing(
+                                            &task_path,
+                                            &checked_name,
+                                            &normalized_file_path,
+                                            include_reason
+                                                .clone()
+                                                .expect("nil pointer dereference: includeReason"),
+                                        );
+                                }
                             }
                         }
                         continue;
-                    } else {
-                        self.seen.insert(data_key, normalized_file_path.clone());
                     }
+                    let normalized_file_path = task.borrow().normalized_file_path.clone();
+                    let task_path = task.borrow().path.clone();
+                    self.seen.insert(data_key, normalized_file_path.clone());
 
                     if let Some(tasks_seen_by_name_ignore_case) =
                         self.tasks_seen_by_name_ignore_case.as_mut()
@@ -1476,6 +1544,12 @@ struct PrefetchJob {
     /// mapper's virtual text (`prefetch_mapped`).
     // PORT: not in Go, where the parse goroutines transform (tsgo#4712).
     mapped: Option<Arc<ConcurrentTransform>>,
+    /// When the job was queued, for the debug counts of a claim
+    /// (`GOPORT_PREFETCH_STATS`). `None` without them.
+    queued_at: Option<std::time::Instant>,
+    /// True when a loader batch put the job below the others
+    /// (`queue_batch`), for the debug counts.
+    under: AtomicBool,
 }
 
 enum PrefetchState {
@@ -1539,13 +1613,18 @@ pub(crate) struct FilePrep {
     synthetic: SyntheticImports,
     /// The number of `file.imports`.
     imports: usize,
-    /// The mode of every answer: Go `getModeForUsageLocation` of a plain
-    /// `import .. from` in the file (`guess_import_mode`). The worker
-    /// cannot read the import nodes (`DetachedParse::import_specifiers`).
-    mode: ResolutionMode,
+    /// The mode of each answer: Go `getModeForUsageLocation` of its name,
+    /// from the usage that the worker read (`names`); without `names`, the
+    /// mode of a plain `import .. from` in the file (`guess_import_mode`).
+    modes: Vec<ResolutionMode>,
     /// The synthetic imports, then the imports, by module name index.
-    /// `None` for an empty name.
+    /// `None` for an empty name or a source phase import.
     answers: Vec<Option<SharedResolution<Arc<ResolvedModule>>>>,
+    /// The names, usages and flags of the file's imports and module
+    /// augmentations, read while the nodes were on the worker thread
+    /// (parload1). The loader reads them in place of the nodes. `None`
+    /// with `GOPORT_LOAD_NAMES=0` (an A/B switch).
+    pub(crate) names: Option<Box<ImportNames>>,
 }
 
 impl FilePrep {
@@ -1575,7 +1654,7 @@ impl FilePrep {
         index: usize,
         mode: ResolutionMode,
     ) -> Option<&SharedResolution<Arc<ResolvedModule>>> {
-        if mode != self.mode {
+        if self.modes.get(index) != Some(&mode) {
             return None;
         }
         self.answers.get(index)?.as_ref()
@@ -1671,6 +1750,11 @@ thread_local! {
     static LOAD_PREP: Cell<Option<bool>> = const { Cell::new(None) };
     /// The preps that loads on this thread took (`FilePrep`), for tests.
     static PREPS_TAKEN: Cell<usize> = const { Cell::new(0) };
+    /// A test's choice of `load_names_enabled` for its loads on this thread.
+    static LOAD_NAMES: Cell<Option<bool>> = const { Cell::new(None) };
+    /// The names that loads on this thread resolved themselves, for tests.
+    #[cfg(test)]
+    static NAMES_OWN: Cell<usize> = const { Cell::new(0) };
 }
 
 /// True when the parse workers of a load on this thread make preps for
@@ -1680,6 +1764,35 @@ fn load_prep_enabled() -> bool {
     LOAD_PREP
         .with(Cell::get)
         .unwrap_or_else(|| std::env::var_os("GOPORT_LOAD_PREP").is_none_or(|value| value != "0"))
+}
+
+/// True when the parse workers read the import names of their parses for
+/// the loader (`FilePrep::names`): unless `GOPORT_LOAD_NAMES` is `0` (an
+/// A/B switch), or a test chose (`set_load_names`).
+fn load_names_enabled() -> bool {
+    LOAD_NAMES
+        .with(Cell::get)
+        .unwrap_or_else(|| std::env::var_os("GOPORT_LOAD_NAMES").is_none_or(|value| value != "0"))
+}
+
+/// Sets `load_names_enabled` for the loads on this thread (tests).
+#[cfg(test)]
+pub(crate) fn set_load_names(on: Option<bool>) {
+    LOAD_NAMES.with(|names| names.set(on));
+}
+
+/// The module names that loads on this thread resolved themselves so far
+/// (tests): no prep answer had the name's mode, or no prep fit.
+#[cfg(test)]
+pub(crate) fn names_own() -> usize {
+    NAMES_OWN.with(Cell::get)
+}
+
+/// Notes module names that the loader resolved itself.
+pub(crate) fn note_names_own(count: usize) {
+    #[cfg(test)]
+    NAMES_OWN.with(|own| own.set(own.get() + count));
+    let _ = count;
 }
 
 /// Sets `load_prep_enabled` for the loads on this thread (tests).
@@ -1793,6 +1906,9 @@ struct PrefetchQueue {
     /// They wait on `ready` too (`PrefetchShared::wake`).
     // PORT: not in Go (see `PrefetchJob::mapped`).
     mapped_workers: bool,
+    /// True when the debug counts are kept (`GOPORT_PREFETCH_STATS`): jobs
+    /// note when they are queued.
+    timed: bool,
 }
 
 impl PrefetchQueue {
@@ -1828,6 +1944,8 @@ impl PrefetchQueue {
             done: Condvar::new(),
             prep: Mutex::new(None),
             mapped,
+            queued_at: self.timed.then(std::time::Instant::now),
+            under: AtomicBool::new(false),
         });
         self.next_job += 1;
         self.by_name.insert(job.opts.file_name.clone(), job.clone());
@@ -1967,6 +2085,10 @@ struct WorkerResolveConfig {
     /// its names for the loader (`FilePrep`): the loader takes worker
     /// answers, and `GOPORT_LOAD_PREP` is not `0`.
     prep: bool,
+    /// True when, with `prep`, the workers read the import names of each
+    /// parse for the loader and resolve each name with its own mode
+    /// (`FilePrep::names`): `GOPORT_LOAD_NAMES` is not `0`.
+    names: bool,
 }
 
 impl WorkerResolveConfig {
@@ -2015,6 +2137,7 @@ impl WorkerResolveConfig {
             references,
             redirects,
             prep: loader.shared_resolution.is_some() && load_prep_enabled(),
+            names: load_names_enabled(),
         })
     }
 }
@@ -2059,6 +2182,8 @@ pub(crate) struct PrefetchStats {
     /// Preps that the loader took, and that did not fit (`FilePrep::fits`).
     pub(crate) preps_taken: usize,
     pub(crate) preps_unfit: usize,
+    /// Taken preps with the worker's import names (`FilePrep::names`).
+    pub(crate) preps_named: usize,
     /// Worker parses with no prep when the loader needed it: the worker
     /// still resolved, or it made none.
     preps_missing: usize,
@@ -2066,6 +2191,13 @@ pub(crate) struct PrefetchStats {
     /// (another mode than the worker's).
     pub(crate) names_taken: usize,
     pub(crate) names_own: usize,
+    /// Per claimed job: how long it was queued, the jobs on the worker
+    /// stack then, and whether a loader batch put it below the others.
+    claims: Vec<(std::time::Duration, usize, bool)>,
+    /// When the pool started, the workers, and their time on jobs.
+    started: Option<std::time::Instant>,
+    workers: usize,
+    busy: std::time::Duration,
 }
 
 impl PrefetchStats {
@@ -2107,14 +2239,50 @@ impl PrefetchStats {
                 .join(", "),
         );
         eprintln!(
-            "goport prefetch: took {} worker metadata; preps: took {} ({} names, {} resolved here), unfit {}, missing {}",
+            "goport prefetch: took {} worker metadata; preps: took {} (named {}; {} names, {} resolved here), unfit {}, missing {}",
             self.meta_taken,
             self.preps_taken,
+            self.preps_named,
             self.names_taken,
             self.names_own,
             self.preps_unfit,
             self.preps_missing,
         );
+        // parload1: why jobs were still queued when the loader came.
+        let bucket = |age: std::time::Duration| match age.as_micros() {
+            0..100 => 0,
+            100..1000 => 1,
+            1000..10000 => 2,
+            _ => 3,
+        };
+        let mut ages = [[0usize; 4]; 2];
+        let mut pending = [0usize; 2];
+        for &(age, stack, under) in &self.claims {
+            let side = usize::from(!under);
+            ages[side][bucket(age)] += 1;
+            pending[side] += stack;
+        }
+        for (side, label) in [(0, "under"), (1, "other")] {
+            let count: usize = ages[side].iter().sum();
+            eprintln!(
+                "goport prefetch: claims {label} {count}: age <0.1ms {} <1ms {} <10ms {} >=10ms {}; worker stack mean {:.0}",
+                ages[side][0],
+                ages[side][1],
+                ages[side][2],
+                ages[side][3],
+                pending[side] as f64 / count.max(1) as f64,
+            );
+        }
+        if let Some(started) = self.started {
+            let wall = started.elapsed();
+            eprintln!(
+                "goport prefetch: {} workers busy {:.1} ms of {:.1} ms ({:.0}%)",
+                self.workers,
+                self.busy.as_secs_f64() * 1e3,
+                wall.as_secs_f64() * 1e3,
+                100.0 * self.busy.as_secs_f64() / (wall.as_secs_f64() * self.workers.max(1) as f64),
+            );
+        }
     }
 }
 
@@ -2177,14 +2345,21 @@ thread_local! {
 impl PrefetchShared {
     fn new(config: PrefetchConfig) -> Self {
         Self {
-            queue: Mutex::new(PrefetchQueue::default()),
+            queue: Mutex::new(PrefetchQueue {
+                timed: std::env::var_os("GOPORT_PREFETCH_STATS").is_some(),
+                ..PrefetchQueue::default()
+            }),
             ready: Condvar::new(),
             closed: AtomicBool::new(false),
             config,
             stats: Arc::new(SharedStatCache::default()),
             resolve: OnceLock::new(),
-            counts: std::env::var_os("GOPORT_PREFETCH_STATS")
-                .map(|_| Mutex::new(PrefetchStats::default())),
+            counts: std::env::var_os("GOPORT_PREFETCH_STATS").map(|_| {
+                Mutex::new(PrefetchStats {
+                    started: Some(std::time::Instant::now()),
+                    ..PrefetchStats::default()
+                })
+            }),
         }
     }
 
@@ -2325,6 +2500,9 @@ impl PrefetchShared {
         }
         if let Some(newest) = jobs.pop() {
             woken += jobs.len();
+            if queue.timed {
+                newest.under.store(true, AtomicOrdering::Relaxed);
+            }
             queue.push_pending(newest);
             for job in jobs {
                 queue.push_pending(job);
@@ -2528,6 +2706,7 @@ impl Drop for PrefetchPool {
         self.shared.close();
         // A discarded pool has no threads here and prints no counts.
         let used = !self.threads.is_empty();
+        let workers = self.threads.len();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -2540,6 +2719,7 @@ impl Drop for PrefetchPool {
         self.shared.count(|c| {
             c.untaken = untaken;
             c.untaken_bytes = untaken_bytes;
+            c.workers = workers;
             c.print();
         });
     }
@@ -2800,6 +2980,7 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
     });
     let mut resolver: Option<WorkerResolver> = None;
     let mut resolver_failed = false;
+    let timed = shared.counts.is_some();
     loop {
         let job = {
             let mut queue = lock(&shared.queue);
@@ -2837,6 +3018,7 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
             }
             *state = PrefetchState::Running;
         }
+        let started = timed.then(std::time::Instant::now);
         let running = RunningJob(&job);
         #[cfg(test)]
         if lock(&PANIC_IN_JOB).as_deref() == Some(job.opts.file_name.as_str()) {
@@ -2911,7 +3093,16 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
                                 ),
                             ..job.opts.clone()
                         });
-                let mut result = prefetch_parse(&*fs, &job, opts.as_ref().unwrap_or(&job.opts));
+                let read_names = prep_config.is_some_and(|config| config.names) && meta.is_some();
+                let (mut result, names) = match prefetch_parse(
+                    &*fs,
+                    &job,
+                    opts.as_ref().unwrap_or(&job.opts),
+                    read_names,
+                ) {
+                    Some((result, names)) => (Some(result), names),
+                    None => (None, None),
+                };
                 if let Some(result) = &mut result {
                     WORKER_READS.fetch_add(1, AtomicOrdering::Relaxed);
                     result.meta = meta.clone();
@@ -2928,7 +3119,10 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
                                 resolver.synthetic_imports(config, &job.opts.path, &parse.file)
                             },
                         );
-                        (Some(Arc::new(FileRefs::take_from(parse))), synthetic)
+                        (
+                            Some(Arc::new(FileRefs::take_from(parse))),
+                            synthetic.map(|synthetic| (synthetic, names)),
+                        )
                     }
                     None => (None, None),
                 };
@@ -2939,11 +3133,12 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
         let Some(refs) = refs else {
             continue;
         };
-        let prep = meta.zip(synthetic).map(|(meta, synthetic)| {
+        let prep = meta.zip(synthetic).map(|(meta, (synthetic, names))| {
             (
                 PrepInput {
                     meta: meta.meta,
                     synthetic,
+                    names,
                 },
                 &*job,
             )
@@ -2956,6 +3151,10 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
         if queued.is_err() {
             resolver = None;
             resolver_failed = true;
+        }
+        if let Some(started) = started {
+            let busy = started.elapsed();
+            shared.count(|c| c.busy += busy);
         }
     }
 }
@@ -3188,14 +3387,30 @@ impl WorkerResolver {
         let redirect = redirect
             .as_ref()
             .map(|(_, redirect)| &**redirect as &dyn ModuleResolvedProjectReference);
-        let (meta, synthetic) = match prep {
-            Some(PrepInput { meta, synthetic }) => (meta, Some(synthetic)),
+        let (meta, synthetic, import_names) = match prep {
+            Some(PrepInput {
+                meta,
+                synthetic,
+                names,
+            }) => (meta, Some(synthetic), names),
             // Go `loadSourceFileMetaData` reads the program's options.
             None => (
                 super::file_loader::source_file_meta_data(&self.resolver, &self.options, file_name),
                 None,
+                None,
             ),
         };
+        // parload1: with the import names, each import resolves with the
+        // mode of its usage, as on the loader; the names must be those of
+        // `refs` (the same parse).
+        let import_names = import_names.filter(|names| {
+            names.len() >= refs.import_specifiers.len()
+                && refs
+                    .import_specifiers
+                    .iter()
+                    .enumerate()
+                    .all(|(index, specifier)| names.get(index).0 == specifier)
+        });
         for reference in &refs.type_reference_directives {
             if shared.is_closed() {
                 return None;
@@ -3216,7 +3431,7 @@ impl WorkerResolver {
                 names.push(normalize_path(&resolved.resolved_file_name));
             }
         }
-        let mode = super::file_loader::guess_import_mode(file_name, &meta, &options);
+        let guessed_mode = super::file_loader::guess_import_mode(file_name, &meta, &options);
         // The shared cache keeps the first answer of each key with its
         // lookup logs: the prep takes that entry.
         let answers_from = synthetic
@@ -3233,15 +3448,37 @@ impl WorkerResolver {
             .as_ref()
             .map_or(0, |synthetic| synthetic.names().count());
         let mut answers = Vec::with_capacity(synthetic_names + refs.import_specifiers.len());
+        let mut modes = Vec::with_capacity(synthetic_names + refs.import_specifiers.len());
+        let mut file_emit_mode = None;
         let specifiers = synthetic
             .iter()
             .flat_map(SyntheticImports::names)
             .chain(refs.import_specifiers.iter().map(String::as_str));
-        for specifier in specifiers {
+        for (index, specifier) in specifiers.enumerate() {
             if shared.is_closed() {
                 return None;
             }
-            if specifier.is_empty() {
+            // A synthetic import is a plain `import .. from` (its usage is
+            // `ImportUsage::Other`), so the guessed mode is its mode.
+            let usage = index
+                .checked_sub(synthetic_names)
+                .zip(import_names.as_ref())
+                .map(|(import, names)| names.get(import));
+            let mode = match usage {
+                Some((_, usage, _, _)) => super::file_loader::mode_for_import_usage(
+                    usage,
+                    file_name,
+                    &meta,
+                    Some(&options),
+                    &mut file_emit_mode,
+                ),
+                None => guessed_mode,
+            };
+            modes.push(mode);
+            // ts#63915: the loader does not resolve a source phase import.
+            if specifier.is_empty()
+                || usage.is_some_and(|(_, _, _, source_phase)| source_phase == Some(true))
+            {
                 answers.push(None);
                 continue;
             }
@@ -3276,8 +3513,9 @@ impl WorkerResolver {
             containing_file: containing_file.to_string(),
             synthetic: synthetic?,
             imports: refs.import_specifiers.len(),
-            mode,
+            modes,
             answers,
+            names: import_names,
         })
     }
 }
@@ -3287,6 +3525,9 @@ impl WorkerResolver {
 struct PrepInput {
     meta: SourceFileMetaData,
     synthetic: SyntheticImports,
+    /// The import names of the parse (`FilePrep::names`), when the worker
+    /// read them.
+    names: Option<Box<ImportNames>>,
 }
 
 /// The lookups that Go `cachedvfs` caches (all but `Stat`), in maps that
@@ -3671,7 +3912,8 @@ fn prefetch_parse(
     fs: &dyn Fs,
     job: &PrefetchJob,
     opts: &SourceFileParseOptions,
-) -> Option<PrefetchResult> {
+    read_names: bool,
+) -> Option<(PrefetchResult, Option<Box<ImportNames>>)> {
     // A bundled lib text is embedded, so it needs no copy. Another text is
     // leaked, as the loader's is, except the text of a freeable file
     // version (`FileText::new`).
@@ -3692,23 +3934,30 @@ fn prefetch_parse(
         // the version frees them, and a parse that the loader does not take
         // is freed with the pool.
         let _owned_nodes = job.freeable.then(crate::ast::enter_freeable_parse);
-        parse_source_file_detached(job.job, opts, text.clone(), job.script_kind)
+        // parload1: the import names are read while the nodes are on this
+        // thread.
+        parse_source_file_detached_reading(job.job, opts, text.clone(), job.script_kind, |file| {
+            read_names.then(|| Box::new(ImportNames::of(file)))
+        })
     }));
-    let parse = match parse {
-        Ok(parse) => (parse.store.is_self_contained()
-            && (synthetic_slot_count(), next_ids()) == before)
-            .then_some(parse),
+    let (parse, names) = match parse {
+        Ok((parse, names)) => {
+            let usable =
+                parse.store.is_self_contained() && (synthetic_slot_count(), next_ids()) == before;
+            (usable.then_some(parse), names.filter(|_| usable))
+        }
         Err(_) => {
             let _ = take_detached_file_store();
-            None
+            (None, None)
         }
     };
-    Some(PrefetchResult {
+    let result = PrefetchResult {
         text,
         parse,
         meta: None,
         mapped: None,
-    })
+    };
+    Some((result, names))
 }
 
 /// A parse worker's transform of a content-mapped file: the transform
@@ -3874,16 +4123,30 @@ pub fn take_prefetched(
     let Some(shared) = PREFETCH.with(|p| p.borrow().clone()) else {
         return Prefetched::Nothing;
     };
-    let Some(job) = lock(&shared.queue).by_name.get(&opts.file_name).cloned() else {
-        shared.count(|c| c.not_queued.push(opts.file_name.clone()));
-        return Prefetched::Nothing;
+    let (job, stack) = {
+        let queue = lock(&shared.queue);
+        let Some(job) = queue.by_name.get(&opts.file_name).cloned() else {
+            drop(queue);
+            shared.count(|c| c.not_queued.push(opts.file_name.clone()));
+            return Prefetched::Nothing;
+        };
+        (job, queue.pending.len())
     };
     let mut state = lock(&job.state);
     let mut waited: Option<std::time::Instant> = None;
     let result = loop {
         match std::mem::replace(&mut *state, PrefetchState::Claimed) {
             PrefetchState::Queued | PrefetchState::Claimed => {
-                shared.count(|c| c.claimed.push(opts.file_name.clone()));
+                shared.count(|c| {
+                    c.claimed.push(opts.file_name.clone());
+                    if let Some(queued_at) = job.queued_at {
+                        c.claims.push((
+                            queued_at.elapsed(),
+                            stack,
+                            job.under.load(AtomicOrdering::Relaxed),
+                        ));
+                    }
+                });
                 return Prefetched::Nothing;
             }
             PrefetchState::Running => {

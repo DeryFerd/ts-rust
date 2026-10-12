@@ -1033,7 +1033,7 @@ fn get_import_adjacency(program: &NewProgram) -> Vec<Vec<usize>> {
                 continue;
             }
             let imported_index = program
-                .get_source_file_for_resolved_module(&resolved.resolved_file_name)
+                .get_source_file_for_resolved_module(resolved)
                 .and_then(|imported_file| file_indices.get(&imported_file.store).copied());
             let Some(imported_index) = imported_index else {
                 continue;
