@@ -311,9 +311,9 @@ pub struct ResolvedRef {
 
 /// Sets the path of a task that `FilesParser::start` queues: the one it
 /// came with (Go `task.path`, ts#64159), else the loader's `to_path` of its
-/// file name. `GOPORT_RESOLVED_PATH=0` makes every path here.
+/// file name.
 fn set_task_path(loader: &FileLoader, task: &mut ParseTask) {
-    if task.path.is_empty() || !crate::program::resolved_paths_enabled() {
+    if task.path.is_empty() {
         // PERF: Go `loader.toPath` asks the host for its current directory
         // and case sensitivity each time; the loader keeps the same values
         // (`compare_paths_options`), so no copy of the directory is made.

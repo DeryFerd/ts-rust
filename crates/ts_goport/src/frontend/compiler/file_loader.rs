@@ -13,7 +13,6 @@ use crate::contentmapper::{
 use crate::frontend::prelude::*;
 use crate::gostd::{GoError, errors};
 use crate::spanmap::{MappingError, MappingErrorKind};
-use std::borrow::Cow;
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -864,19 +863,16 @@ impl FileLoader {
         )
     }
 
-    /// Go `resolved.ResolvedPath` of a resolved module (ts#64159). PORT:
-    /// `GOPORT_RESOLVED_PATH=0` gets the loader's `to_path` of its name.
-    pub fn resolved_path<'r>(&self, resolved: &'r ResolvedModule) -> Cow<'r, Path> {
-        let Some(path) = resolved.path() else {
-            return Cow::Owned(self.to_path(&resolved.resolved_file_name));
-        };
+    /// Go `resolved.ResolvedPath` of a resolved module (ts#64159). Debug
+    /// builds check it against the loader's `to_path` of its name.
+    pub fn resolved_path<'r>(&self, resolved: &'r ResolvedModule) -> &'r Path {
         debug_assert_eq!(
-            *path,
+            resolved.resolved_path,
             self.to_path(&resolved.resolved_file_name),
             "resolved path of {}",
             resolved.resolved_file_name
         );
-        Cow::Borrowed(path)
+        &resolved.resolved_path
     }
 
     // Go: fileloader.go:242 (*fileLoader).addRootTask
@@ -1852,7 +1848,7 @@ impl FileLoader {
                 }
 
                 let resolved_file_name = &resolved_module.resolved_file_name;
-                // Made once: the JS file test and the subtask both read it.
+                // The JS file test and the subtask both read it.
                 let resolved_path = self.resolved_path(&resolved_module);
                 let is_from_node_modules_search = resolved_module.is_external_library_import;
                 // Don't treat redirected files as JS files.
@@ -1867,7 +1863,7 @@ impl FileLoader {
                         .borrow()
                         .get_redirect_parsed_command_line_for_resolution(&new_has_file_name(
                             resolved_file_name,
-                            &resolved_path,
+                            resolved_path,
                         ))
                         .is_none();
                 let is_js_file_from_node_modules = is_from_node_modules_search
@@ -1897,7 +1893,7 @@ impl FileLoader {
                     t.add_sub_task(
                         ResolvedRef {
                             file_name: resolved_file_name.clone(),
-                            path: resolved_path.into_owned(),
+                            path: resolved_path.clone(),
                             increase_depth: resolved_module.is_external_library_import,
                             elide_on_depth: is_js_file_from_node_modules,
                             include_reason: Some(new_file_include_reason(
@@ -2023,7 +2019,7 @@ impl FileLoader {
             let (resolution, trace) = self.resolve_library(&library_name, &resolve_from);
             if resolution.is_resolved() {
                 path = resolution.resolved_file_name.clone();
-                path_key = Some(self.resolved_path(&resolution).into_owned());
+                path_key = Some(self.resolved_path(&resolution).clone());
                 replaced = true;
             }
             self.path_for_lib_file_resolutions
