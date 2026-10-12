@@ -1328,7 +1328,11 @@ impl Checker {
             let mapped = self.instantiate_type(value, m);
             if mapped != value {
                 let mut result: SmallVec<[TypeId; 8]> = SmallVec::with_capacity(list.len());
-                result.extend_from_slice(&list[..i]);
+                // PERF: a push loop; the prefix is short, and
+                // `extend_from_slice` calls memmove and memcpy.
+                for &value in &list[..i] {
+                    result.push(value);
+                }
                 result.push(mapped);
                 for &value in &list[i + 1..] {
                     result.push(self.instantiate_type(value, m));
