@@ -95,6 +95,7 @@ export interface RunOptions {
 
 /** Thrown by WASI `proc_exit`; `runTsc` turns it into the exit code. */
 export class WasiExit extends Error {
+    constructor(code: number);
     code: number;
 }
 

@@ -121,6 +121,7 @@ function prepareRun(module, options) {
     let memory;
     let staged;
     let stderrText = "";
+    const stderrDecoder = new TextDecoder();
     const u8 = () => new Uint8Array(memory.buffer);
     const dv = () => new DataView(memory.buffer);
 
@@ -177,7 +178,7 @@ function prepareRun(module, options) {
                 const chunk = u8().slice(ptr, ptr + len);
                 if (fd === 1) stdout(chunk);
                 else {
-                    stderrText += decoder.decode(chunk);
+                    stderrText += stderrDecoder.decode(chunk, { stream: true });
                     stderr(chunk);
                 }
                 total += len;
@@ -241,7 +242,7 @@ function prepareRun(module, options) {
         result(exitCode, error) {
             if (error !== undefined) {
                 if (!(error instanceof WasiExit)) {
-                    error.stderr = stderrText;
+                    error.stderr = stderrText + stderrDecoder.decode();
                     throw error;
                 }
                 exitCode = error.code;
@@ -318,6 +319,7 @@ export function memoryFileSystem(files = new Map()) {
     const map = files instanceof Map ? files : new Map(Object.entries(files));
     const dirPrefix = path => (path.endsWith("/") ? path : `${path}/`);
     const isDir = path => {
+        if (path === "/") return true;
         const prefix = dirPrefix(path);
         for (const key of map.keys()) if (key.startsWith(prefix)) return true;
         return false;
@@ -344,6 +346,11 @@ export function memoryFileSystem(files = new Map()) {
         },
         realpath: path => (map.has(path) || isDir(path) ? path : undefined),
         writeFile(path, data, append) {
+            if (isDir(path)) return `open ${path}: is a directory`;
+            for (let slash = path.indexOf("/"); slash >= 0; slash = path.indexOf("/", slash + 1)) {
+                const parent = path.slice(0, slash);
+                if (map.has(parent)) return `mkdir ${parent}: not a directory`;
+            }
             const text = fileDecoder.decode(data);
             map.set(path, append ? (map.get(path) ?? "") + text : text);
         },

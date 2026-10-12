@@ -3,10 +3,11 @@
 The port tracks the Go code of [`microsoft/TypeScript`](https://github.com/microsoft/TypeScript)
 (under `tsc/`, TypeScript 7.1.0-dev).
 
-- Commit: [`673a5f17d713`](https://github.com/microsoft/TypeScript/commit/673a5f17d713bdc8c7185f18a9c11e3c4ac5d781)
-- Commit date: 2026-09-29
-- Closest npm build: `typescript@7.1.0-dev.20260929.1`
-- Oracle: `tsc/cmd/tsc` built with Go 1.27.1 (`~/.local/bin/tsgo-oracle-673a5f17d713`)
+- Commit: [`fed0bf24149f`](https://github.com/microsoft/TypeScript/commit/fed0bf24149fb1ed36039212648bafdafc1ea10e)
+- Commit date: 2026-10-08
+- Same commit as the npm build `typescript@7.1.0-dev.20261008.1` (its `gitHead`)
+- Oracle: `tsc/cmd/tsc` built with Go 1.27.1 (`~/.local/bin/tsgo-oracle-fed0bf24149f`)
+- Since tsc-rs 0.4.0. tsc-rs 0.3.0 and earlier releases used the pin `673a5f17d713` below.
 
 `tsc-rs` output is meant to be byte-equal to `tsc` at this commit. When you compare, use the
 pinned build, not `typescript@7.0.x` or `@typescript/native-preview` (its last build is from
@@ -15,11 +16,16 @@ port moves to a newer pin after upstream fixes it.
 
 ## Earlier pins
 
+- [`673a5f17d713`](https://github.com/microsoft/TypeScript/commit/673a5f17d713bdc8c7185f18a9c11e3c4ac5d781)
+  (2026-09-29, closest npm build `typescript@7.1.0-dev.20260929.1`): tsc-rs 0.3.0 and earlier.
+  Behavior that differs between this pin and the current one is upstream change, for example the
+  inference change of microsoft/TypeScript#64553 (in the nightlies from `7.1.0-dev.20261001.1`).
+
 Before 2026-09-29 the port tracked
 [`microsoft/typescript-go`](https://github.com/microsoft/typescript-go) (now archived):
 `dc37b5249ab60e2bbce936f71b883e6c8136167e` (2026-06-19), then pin B `16c25522e123`. The tooling
 below still names `dc37b5249ab6` as the default pin in `UPSTREAM.json`; development runs select
-the current pin with `GOPORT_PIN=673a5f17d713`.
+the current pin with `GOPORT_PIN=fed0bf24149f`.
 
 Generated Rust inputs under `spec/` record their own source paths and must be
 updated intentionally. Normal Cargo builds must not depend on a Go or Node
