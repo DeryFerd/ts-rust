@@ -94,6 +94,10 @@ pub struct PackageId {
 #[derive(Clone, Default)]
 pub struct ResolvedModule {
     pub resolved_file_name: String,
+    /// ts#64159 (Go N' module/types.go:90 `ResolvedPath`): the path of
+    /// `resolved_file_name`, made by the resolver that gave the answer.
+    /// Empty when nothing resolved; then a reader uses `to_path` of the name.
+    pub resolved_path: tspath::Path,
     pub original_path: String,
     pub extension: String,
     pub resolved_using_ts_extension: bool,
@@ -115,6 +119,22 @@ impl ResolvedModule {
     pub fn is_resolved(&self) -> bool {
         !self.resolved_file_name.is_empty()
     }
+
+    /// `resolved_path` for a reader: `None` when it is empty or
+    /// `GOPORT_RESOLVED_PATH` is `0`, so the reader makes the path from the
+    /// name (the code before ts#64159; an A/B switch).
+    #[must_use]
+    pub fn path(&self) -> Option<&tspath::Path> {
+        (!self.resolved_path.is_empty() && resolved_paths_enabled()).then_some(&self.resolved_path)
+    }
+}
+
+/// False when `GOPORT_RESOLVED_PATH` is `0`: the loader and the program
+/// make each path from its file name, and do not read the paths that the
+/// resolutions carry (`ResolvedModule::path`, `ResolvedRef::path`).
+pub fn resolved_paths_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GOPORT_RESOLVED_PATH").is_none_or(|value| value != "0"))
 }
 
 /// Go `*tsoptions.ParsedCommandLine` for a resolved project reference.

@@ -202,6 +202,7 @@ impl ParseTask {
                     self.add_sub_task(
                         ResolvedRef {
                             file_name: lib_file.path.clone(),
+                            path: lib_file.path_key.clone(),
                             include_reason: Some(include_reason),
                             ..Default::default()
                         },
@@ -219,6 +220,8 @@ impl ParseTask {
         for supplemental in file.supplemental_source_files() {
             self.sub_tasks.push(Rc::new(RefCell::new(ParseTask {
                 normalized_file_path: supplemental.file_name().to_string(),
+                // ts#64159 (filesparser.go:176)
+                path: loader.to_path(supplemental.file_name()),
                 file: Some(supplemental.clone()),
                 is_content_mapper_supplemental: true,
                 include_reason: Some(new_file_include_reason(
@@ -274,6 +277,7 @@ impl ParseTask {
         };
         let sub_task = Rc::new(RefCell::new(ParseTask {
             normalized_file_path,
+            path: ref_.path,
             lib_file,
             increase_depth: ref_.increase_depth,
             elide_on_depth: ref_.elide_on_depth,
@@ -289,10 +293,41 @@ impl ParseTask {
 #[derive(Clone, Default)]
 pub struct ResolvedRef {
     pub file_name: String,
+    /// ts#64159 (Go N' `resolvedRef.path`): the path of `file_name`, from
+    /// the resolution. Empty: `FilesParser::start` makes it.
+    pub path: Path,
     pub increase_depth: bool,
     pub elide_on_depth: bool,
     pub include_reason: Option<Rc<FileIncludeReason>>,
     pub package_id: PackageId,
+}
+
+/// The path of a task that `FilesParser::start` queues: the one it came
+/// with (Go `task.path`, ts#64159), else the loader's `to_path` of its file
+/// name, which it keeps. `GOPORT_RESOLVED_PATH=0` makes every path here.
+fn task_path(loader: &FileLoader, task: &mut ParseTask) -> Path {
+    if task.path.is_empty() || !crate::program::resolved_paths_enabled() {
+        // PERF: Go `loader.toPath` asks the host for its current directory
+        // and case sensitivity each time; the loader keeps the same values
+        // (`compare_paths_options`), so no copy of the directory is made.
+        task.path = to_path(
+            &task.normalized_file_path,
+            &loader.compare_paths_options.current_directory,
+            loader.compare_paths_options.use_case_sensitive_file_names,
+        );
+    } else {
+        debug_assert_eq!(
+            task.path,
+            to_path(
+                &task.normalized_file_path,
+                &loader.compare_paths_options.current_directory,
+                loader.compare_paths_options.use_case_sensitive_file_names,
+            ),
+            "path of task {}",
+            task.normalized_file_path
+        );
+    }
+    task.path.clone()
 }
 
 /// One queued run of the closure that Go `filesParser.start` passes to
@@ -595,16 +630,11 @@ impl FilesParser {
         let prefetch = PREFETCH.with(|p| p.borrow().clone());
         let mut requests = Vec::new();
         for task in tasks {
-            // PERF: Go `loader.toPath` asks the host for its current
-            // directory and case sensitivity each time; the loader keeps
-            // the same values (`compare_paths_options`), so no copy of the
-            // directory is made per task.
-            let path = to_path(
-                &task.borrow().normalized_file_path,
-                &loader.compare_paths_options.current_directory,
-                loader.compare_paths_options.use_case_sensitive_file_names,
-            );
-            task.borrow_mut().path = path.clone();
+            // ts#64159 (filesparser.go:275): Go panics on a task without a
+            // path. PORT: the tasks that Go gives a path when it makes them
+            // and the port does not (root, lib, automatic type directive
+            // and redirect tasks) get it here.
+            let path = task_path(loader, &mut task.borrow_mut());
             let (data, loaded) = match self.task_data_by_path.get(&path) {
                 Some(data) => {
                     // No queued task of this path ran yet, so the loader

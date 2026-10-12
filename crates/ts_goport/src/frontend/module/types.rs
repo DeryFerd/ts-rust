@@ -297,6 +297,9 @@ pub struct ResolvedTypeReferenceDirective {
     pub resolution_diagnostics: Vec<Diagnostic>,
     pub primary: bool,
     pub resolved_file_name: String,
+    /// ts#64159 (Go N' module/types.go:109 `ResolvedPath`): the path of
+    /// `resolved_file_name`, made by the resolver that gave the answer.
+    pub resolved_path: Path,
     pub original_path: String,
     pub package_id: PackageId,
     pub is_external_library_import: bool,

@@ -33,6 +33,8 @@ pub struct LibResolution {
 pub struct LibFile {
     pub name: String,
     pub path: String,
+    /// ts#64159 (Go N' `LibFile.pathKey`): the path of `path`.
+    pub path_key: Path,
     pub replaced: bool,
 }
 
@@ -857,6 +859,22 @@ impl FileLoader {
         )
     }
 
+    /// Go `resolved.ResolvedPath` of a resolved module (ts#64159). PORT: a
+    /// resolution that a resolver made without the path (none should), or
+    /// `GOPORT_RESOLVED_PATH=0`, gets the loader's `to_path` of its name.
+    pub fn resolved_path(&self, resolved: &ResolvedModule) -> Path {
+        let Some(path) = resolved.path() else {
+            return self.to_path(&resolved.resolved_file_name);
+        };
+        debug_assert_eq!(
+            *path,
+            self.to_path(&resolved.resolved_file_name),
+            "resolved path of {}",
+            resolved.resolved_file_name
+        );
+        path.clone()
+    }
+
     // Go: fileloader.go:242 (*fileLoader).addRootTask
     pub fn add_root_task(
         &mut self,
@@ -990,6 +1008,7 @@ impl FileLoader {
                 if resolved.is_resolved() {
                     to_parse.push(ResolvedRef {
                         file_name: resolved.resolved_file_name.clone(),
+                        path: resolved.resolved_path.clone(),
                         increase_depth: resolved.is_external_library_import,
                         elide_on_depth: false,
                         include_reason: Some(new_file_include_reason(
@@ -1520,7 +1539,8 @@ impl FileLoader {
         // ts#64159 (fileloader.go:747): the check is on the resolved file,
         // so `/// <reference path="a" />` in a.ts (found as "a" + ".ts")
         // is an error too. N checked only a name with an extension.
-        if containing_path == self.to_path(&resolved_file_name) {
+        let resolved_path = self.to_path(&resolved_file_name);
+        if containing_path == resolved_path {
             return (
                 None,
                 Some(new_explaining_processing_diagnostic(
@@ -1534,6 +1554,7 @@ impl FileLoader {
         (
             Some(ResolvedRef {
                 file_name: resolved_file_name,
+                path: resolved_path,
                 include_reason: Some(include_reason),
                 ..Default::default()
             }),
@@ -1624,6 +1645,7 @@ impl FileLoader {
                 t.add_sub_task(
                     ResolvedRef {
                         file_name: resolved.resolved_file_name.clone(),
+                        path: resolved.resolved_path.clone(),
                         increase_depth: resolved.is_external_library_import,
                         elide_on_depth: false,
                         include_reason: Some(include_reason),
@@ -1825,7 +1847,7 @@ impl FileLoader {
                         .borrow()
                         .get_redirect_parsed_command_line_for_resolution(&new_has_file_name(
                             resolved_file_name,
-                            &self.to_path(resolved_file_name),
+                            &self.resolved_path(&resolved_module),
                         ))
                         .is_none();
                 let is_js_file_from_node_modules = is_from_node_modules_search
@@ -1855,6 +1877,7 @@ impl FileLoader {
                     t.add_sub_task(
                         ResolvedRef {
                             file_name: resolved_file_name.clone(),
+                            path: self.resolved_path(&resolved_module),
                             increase_depth: resolved_module.is_external_library_import,
                             elide_on_depth: is_js_file_from_node_modules,
                             include_reason: Some(new_file_include_reason(
@@ -1954,6 +1977,7 @@ impl FileLoader {
         }
 
         let mut path = combine_paths(&self.default_library_path, &[name]);
+        let mut path_key = None;
         let mut replaced = false;
         if !self.opts.skip_module_resolution
             && self
@@ -1973,6 +1997,7 @@ impl FileLoader {
             let (resolution, trace) = self.resolve_library(&library_name, &resolve_from);
             if resolution.is_resolved() {
                 path = resolution.resolved_file_name.clone();
+                path_key = Some(self.resolved_path(&resolution));
                 replaced = true;
             }
             self.path_for_lib_file_resolutions
@@ -1993,6 +2018,7 @@ impl FileLoader {
             .or_insert_with(|| {
                 Rc::new(LibFile {
                     name: name.to_string(),
+                    path_key: path_key.unwrap_or_else(|| self.to_path(&path)),
                     path,
                     replaced,
                 })
