@@ -178,16 +178,25 @@ pub fn index_of_node(nodes: NodeSlice, node: Node) -> i32 {
     // PORT: Go slices.BinarySearchFunc returns the first position whose element
     // compares >= target. This lower-bound search keeps that exact position
     // without copying the list.
+    // PERF: deferbody1. Go `CompareNodePositions` reads the target's `Loc` as
+    // a field at each step; here that read was a registry lookup, so it is
+    // read once. The comparison is `compare_node_positions`.
+    let target = node.loc();
+    let compare = |n: Node| {
+        let r = n.loc();
+        let c = r.pos() - target.pos();
+        if c != 0 { c } else { r.end() - target.end() }
+    };
     let (mut lo, mut hi) = (0, nodes.len());
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        if compare_node_positions(nodes.get(mid), node) < 0 {
+        if compare(nodes.get(mid)) < 0 {
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
-    if lo < nodes.len() && compare_node_positions(nodes.get(lo), node) == 0 {
+    if lo < nodes.len() && compare(nodes.get(lo)) == 0 {
         return lo as i32;
     }
     -1
