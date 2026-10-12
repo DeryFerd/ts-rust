@@ -991,12 +991,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "a9b5f672606b3b81f",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "afbe18573a1075c7c",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R196 pipeline (candidate.sh side)."
