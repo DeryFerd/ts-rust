@@ -2171,6 +2171,11 @@ impl Node {
         if is_synthetic_node(self) {
             return synthetic_kind(self);
         }
+        // PERF: storefast1. A node of the file this thread parses reads its
+        // kind column, with no whole header (as `flags_slow`).
+        if let Some(kind) = active_store_kind(self) {
+            return kind;
+        }
         // A store node holds the Go kind in its header.
         if let Some(h) = try_store_header(self) {
             return h.kind;
@@ -2224,8 +2229,9 @@ impl Node {
         // PERF: a node of the file this thread parses (query Q8). No
         // program holds that file yet, so there are no binder flags and no
         // `FROZEN` or program check is needed.
-        if let Some(h) = active_store_header(self) {
-            return h.flags;
+        // PERF: storefast1. Only the flags word of its record.
+        if let Some(flags) = active_store_flags(self) {
+            return flags;
         }
         if is_synthetic_node(self) {
             return synthetic_flags(self);

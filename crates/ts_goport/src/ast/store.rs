@@ -4552,6 +4552,35 @@ pub fn active_store_header(n: Node) -> Option<NodeHeader> {
     Some(store.borrow().slot_header(file, slot_index(n)))
 }
 
+/// Go `node.Kind` of `n` when `n` is a node of the active store of this
+/// thread: the kind column only (`active_store_header` makes the whole
+/// header). `None` for any other node.
+// PERF: storefast1. The parser reads the kind of the nodes it has just
+// made (`Node::kind_slow`).
+#[inline]
+#[must_use]
+pub fn active_store_kind(n: Node) -> Option<SyntaxKind> {
+    if n.is_nil() {
+        return None;
+    }
+    let store = active_store(n.file_index())?;
+    Some(store.borrow().kinds[slot_index(n)])
+}
+
+/// Go `node.Flags` of `n` when `n` is a node of the active store of this
+/// thread: the flags word of its record only. The active store is not
+/// published, so it has no binder flags. `None` for any other node.
+// PERF: storefast1, as `active_store_kind` (`Node::flags_slow`).
+#[inline]
+#[must_use]
+pub fn active_store_flags(n: Node) -> Option<NodeFlags> {
+    if n.is_nil() {
+        return None;
+    }
+    let store = active_store(n.file_index())?;
+    Some(store.borrow().records[slot_index(n)].flags())
+}
+
 /// Go `node.Kind` of a published store node (`file_block`, the node shell
 /// of a freeable file version included). `None` for any other node: nil,
 /// synthetic and unpublished store nodes.
