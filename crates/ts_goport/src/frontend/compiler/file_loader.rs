@@ -4,7 +4,7 @@
 //! PORT: Go `opts.Tracing` is the process tracing session
 //! (`crate::tracing::get`).
 
-use super::files_parser::{TakenParse, count_prep, note_prep_taken};
+use super::files_parser::{TakenParse, count_prep, note_names_own, note_prep_taken};
 use crate::contentmapper::{
     ConcurrentTransform, DiagnosticDirectiveError, DiagnosticDirectiveErrorKind, InitializeError,
     InitializeErrorKind, InvalidVirtualExtensionError, Mapper, ProjectError, ProjectErrorKind,
@@ -1740,7 +1740,7 @@ impl FileLoader {
             // PERF (loadpar1): the answers that the parse worker of this
             // file resolved, when it resolved for this loader. Else every
             // name resolves here, as in Go.
-            let prep = prep
+            let mut prep = prep
                 .filter(|_| self.shared_resolution.is_some() && crate::tracing::get().is_none())
                 .and_then(TakenParse::take_prep)
                 .filter(|prep| {
@@ -1768,22 +1768,33 @@ impl FileLoader {
             let mut resolutions_trace: Vec<DiagAndArgs> = Vec::new();
             // PERF: the names, usages and JSDoc flags of the imports and
             // module augmentations of a parse that the loads keep
-            // (`import_names`), and the file's emit format, once per file.
-            let kept = self
-                .keeps_import_names
-                .then(|| import_names(&file))
-                .filter(|kept| kept.len() == module_names.len() - imports_start as usize);
+            // (`import_names`), or that the parse worker read (parload1,
+            // `FilePrep::names`), and the file's emit format, once per file.
+            let mut named = false;
+            let kept = if self.keeps_import_names {
+                Some(import_names(&file))
+            } else {
+                prep.as_mut()
+                    .and_then(|prep| prep.names.take())
+                    .map(|names| {
+                        named = true;
+                        Rc::new(*names)
+                    })
+            }
+            .filter(|kept| kept.len() == module_names.len() - imports_start as usize);
             let mut file_emit_mode = None;
 
             for (index, entry) in module_names.iter().copied().enumerate() {
-                let (module_name, usage, adds) =
+                let (module_name, usage, adds, source_phase) =
                     match (&kept, index.checked_sub(imports_start as usize)) {
                         (Some(kept), Some(kept_index)) => kept.get(kept_index),
-                        _ => (entry.text(), import_usage(entry), None),
+                        _ => (entry.text(), import_usage(entry), None, None),
                     };
                 // ts#63915: a source phase import is not resolved
                 // (fileloader.go:875).
-                if module_name.is_empty() || is_source_phase_import(entry.parent()) {
+                if module_name.is_empty()
+                    || source_phase.unwrap_or_else(|| is_source_phase_import(entry.parent()))
+                {
                     continue;
                 }
 
@@ -1897,8 +1908,10 @@ impl FileLoader {
 
             if prep.is_some() {
                 note_prep_taken();
+                note_names_own(names_own);
                 count_prep(|c| {
                     c.preps_taken += 1;
+                    c.preps_named += usize::from(named);
                     c.names_taken += names_taken;
                     c.names_own += names_own;
                 });
@@ -2242,7 +2255,7 @@ pub(crate) fn get_mode_for_usage_location(
 /// resolution-mode override, or the kind of usage that
 /// `getEmitSyntaxForUsageLocationWorker` tells apart (`import_usage`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImportUsage {
+pub(crate) enum ImportUsage {
     /// The `resolution-mode` of a type-only import or export, or of an
     /// import type.
     Override(ResolutionMode),
@@ -2322,7 +2335,7 @@ fn emit_usage(parent: Node) -> ImportUsage {
 /// `file_name`. `file_emit_mode` keeps the file's emit format for the other
 /// names of the file (`emit_syntax_for_usage`).
 // Go: fileloader.go:1037 getModeForUsageLocation
-fn mode_for_import_usage(
+pub(crate) fn mode_for_import_usage(
     usage: ImportUsage,
     file_name: &str,
     meta: &SourceFileMetaData,
@@ -2351,19 +2364,22 @@ fn import_adds_file(import: Node) -> bool {
 
 /// The module names of the imports and string module augmentations of a
 /// parse, in the order of `resolveImportsAndModuleAugmentations` after its
-/// synthetic imports, with each name's `ImportUsage` and, for an import,
-/// `import_adds_file`.
+/// synthetic imports, with each name's `ImportUsage`, for an import
+/// `import_adds_file`, and whether it is a source phase import. The
+/// language server keeps them with a parse (`import_names`), and a parse
+/// worker reads them while the nodes are on its thread (`FilePrep`).
 // PORT: not in Go (perf, `import_names`).
-struct ImportNames {
+pub(crate) struct ImportNames {
     /// The names, one after another.
     text: String,
-    /// Per name: its end in `text`, its usage, and whether it adds its file
-    /// (false for a module augmentation, which adds none).
-    names: Vec<(usize, ImportUsage, bool)>,
+    /// Per name: its end in `text`, its usage, whether it adds its file
+    /// (false for a module augmentation, which adds none), and
+    /// `is_source_phase_import` of its parent.
+    names: Vec<(usize, ImportUsage, bool, bool)>,
 }
 
 impl ImportNames {
-    fn of(file: &ParsedSourceFile) -> ImportNames {
+    pub(crate) fn of(file: &ParsedSourceFile) -> ImportNames {
         let augmentations = file
             .module_augmentations
             .iter()
@@ -2384,20 +2400,28 @@ impl ImportNames {
 
     fn push(&mut self, name: Node, adds: bool) {
         self.text.push_str(name.text());
-        self.names.push((self.text.len(), import_usage(name), adds));
+        let source_phase = is_source_phase_import(name.parent());
+        self.names
+            .push((self.text.len(), import_usage(name), adds, source_phase));
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.names.len()
     }
 
-    /// The name, usage and `import_adds_file` of name `index`.
-    fn get(&self, index: usize) -> (&str, ImportUsage, Option<bool>) {
-        let (end, usage, adds) = self.names[index];
+    /// The name, usage, `import_adds_file` and source phase flag of name
+    /// `index`.
+    pub(crate) fn get(&self, index: usize) -> (&str, ImportUsage, Option<bool>, Option<bool>) {
+        let (end, usage, adds, source_phase) = self.names[index];
         let start = index
             .checked_sub(1)
             .map_or(0, |before| self.names[before].0);
-        (&self.text[start..end], usage, Some(adds))
+        (
+            &self.text[start..end],
+            usage,
+            Some(adds),
+            Some(source_phase),
+        )
     }
 }
 
@@ -2612,7 +2636,9 @@ pub(crate) fn get_jsx_implicit_import_base_of_file(
 
 #[cfg(test)]
 mod tests {
-    use super::super::files_parser::{preps_taken, set_load_prep, set_meta_wait};
+    use super::super::files_parser::{
+        names_own, preps_taken, set_load_names, set_load_prep, set_meta_wait,
+    };
     use super::*;
     use crate::frontend::bundled;
     use crate::frontend::module::cache::set_answer_wait;
@@ -2968,6 +2994,132 @@ export declare namespace JSX { interface IntrinsicElements { [name: string]: any
         // loader resolves every name itself.
         if super::super::files_parser::parse_workers_enabled() {
             assert!(taken > 0, "no prep taken:\n{with_prep}");
+        }
+    }
+
+    // parload1: the parse workers read each parse's import names, usages
+    // and flags (`FilePrep::names`) and resolve each import with the mode of
+    // its usage. A load that takes them finds what a load that reads the
+    // nodes itself finds, and what a load with no prep finds: mixed modes in
+    // one file (`require`, `import()`, `import type` with `resolution-mode`
+    // both ways, `export .. from`) in node16 CJS and ESM files, JSDoc imports
+    // in TS and JS files, a source phase import, synthetic imports and a
+    // module augmentation. With the names, the loader resolves no import of
+    // a file whose prep it took (only the module augmentation).
+    #[test]
+    fn worker_names_give_the_same_load() {
+        let tsconfig = r#"{ "compilerOptions": { "module": "nodenext", "allowJs": true,
+             "checkJs": true, "importHelpers": true, "jsx": "react-jsx", "types": [],
+             "noEmit": true }, "include": ["src"] }"#;
+        let files = [
+            ("package.json", r#"{ "name": "app", "type": "commonjs" }"#),
+            ("src/esm/package.json", r#"{ "type": "module" }"#),
+            (
+                "src/esm/a.ts",
+                r#"import { b } from "../b.js";
+import type { T } from "lib" with { "resolution-mode": "require" };
+import type { T as U } from "lib" with { "resolution-mode": "import" };
+export { e } from "lib";
+import source wasm from "./m.wasm";
+export const a = b;
+export type V = T | U;
+export const later = () => import("../c.cjs");
+export const viaRequire: typeof import("lib", { with: { "resolution-mode": "require" } }) = null!;
+"#,
+            ),
+            (
+                "src/b.ts",
+                r#"import x = require("./c.cjs");
+import { e } from "lib";
+export * from "./d.mjs";
+export const b: number = x.c + e;
+export const lazy = () => import("lib");
+export const v = <div />;
+declare module "lib" { export const extra: number; }
+"#,
+            ),
+            (
+                "src/c.cts",
+                "export const c = 1;\nexport const lazy = () => import(\"lib\");\n",
+            ),
+            (
+                "src/d.mts",
+                "import { e } from \"lib\";\nexport const d = e;\n",
+            ),
+            (
+                "src/j.js",
+                r#"/** @import { T } from "lib" */
+const { c } = require("./c.cjs");
+/** @type {T} */
+export const j = c;
+"#,
+            ),
+            (
+                "src/k.ts",
+                "/** @import { T } from \"./c.cjs\" */\nexport const k = 1;\n",
+            ),
+            (
+                "node_modules/lib/package.json",
+                r#"{ "name": "lib", "version": "1.0.0",
+                   "exports": { ".": { "import": "./esm.d.mts", "require": "./cjs.d.cts" } } }"#,
+            ),
+            (
+                "node_modules/lib/esm.d.mts",
+                "export declare const e: number;\nexport type T = string;\n",
+            ),
+            (
+                "node_modules/lib/cjs.d.cts",
+                "export declare const e: number;\nexport type T = number;\n",
+            ),
+            (
+                "node_modules/tslib/package.json",
+                r#"{ "name": "tslib", "version": "2.0.0", "types": "tslib.d.ts" }"#,
+            ),
+            (
+                "node_modules/tslib/tslib.d.ts",
+                "export declare function __assign(t: any): any;\n",
+            ),
+            (
+                "node_modules/react/package.json",
+                r#"{ "name": "react", "version": "18.0.0",
+                   "exports": { "./jsx-runtime": { "types": "./jsx-runtime.d.ts" } } }"#,
+            ),
+            (
+                "node_modules/react/jsx-runtime.d.ts",
+                r#"export declare function jsx(): any;
+export declare namespace JSX { interface IntrinsicElements { [name: string]: any } }
+"#,
+            ),
+        ];
+        set_load_prep(Some(true));
+        set_load_names(Some(true));
+        let (taken, own) = (preps_taken(), names_own());
+        let with_names = parallel_load("names_on", tsconfig, &files);
+        let (taken, own) = (preps_taken() - taken, names_own() - own);
+        set_load_names(Some(false));
+        let without_names = parallel_load("names_off", tsconfig, &files);
+        set_load_names(None);
+        set_load_prep(Some(false));
+        let without_prep = parallel_load("names_prep_off", tsconfig, &files);
+        set_load_prep(None);
+        assert_eq!(with_names, without_names);
+        assert_eq!(with_names, without_prep);
+        assert!(
+            with_names.contains(r#"module "lib" ModuleKind(1)"#),
+            "{with_names}"
+        );
+        assert!(
+            with_names.contains(r#"module "lib" ModuleKind(99)"#),
+            "{with_names}"
+        );
+        if super::super::files_parser::parse_workers_enabled() {
+            assert!(taken > 0, "no prep taken:\n{with_names}");
+            // Only the module augmentation of b.ts: the workers resolve the
+            // synthetic imports and the imports.
+            assert!(
+                own <= 1,
+                "{own} names resolved on the loader:\n{with_names}"
+            );
         }
     }
 
