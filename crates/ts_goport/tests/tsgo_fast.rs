@@ -175,29 +175,43 @@ fn build_keeps_four_checkers() {
 /// depends on which files share a checker.
 const REC_TS: &str = r#"export type Rec<N extends number, A extends unknown[] = []> = A["length"] extends N ? A : [0, ...Rec<N, [...A, 0]>];"#;
 
-/// Go's output for the `same_output_on_every_run` project with
-/// `--checkers 1` (tsgo-oracle-fed0bf24149f; exit code 2).
-const SPLIT_GO_1: &str =
-    "f1.ts(2,18): error TS5114: Instantiations of type 'Rec' appear infinitely circular.
-";
+/// The files that report TS5114 in Go's output for the
+/// `same_output_on_every_run` project with `--checkers N`, for N from 1 to
+/// 7 (tsgo-oracle-fed0bf24149f; exit code 2 at each count). No `--checkers`
+/// is 4. Go's output is different at each count.
+const SPLIT_GO: [&[u8]; 7] = [
+    &[1],
+    &[1, 5],
+    &[1, 4],
+    &[1, 2, 3],
+    &[1, 2, 3, 4],
+    &[1, 2, 3, 4, 5],
+    &[1, 2, 3, 4, 5, 6],
+];
 
-/// Go's output for that project with `--checkers 4`, and with no
-/// `--checkers` (tsgo-oracle-fed0bf24149f; exit code 2). Go's output is
-/// different at each count from 1 to 7.
-const SPLIT_GO_4: &str =
-    "f1.ts(2,18): error TS5114: Instantiations of type 'Rec' appear infinitely circular.
-f2.ts(2,18): error TS5114: Instantiations of type 'Rec' appear infinitely circular.
-f3.ts(2,18): error TS5114: Instantiations of type 'Rec' appear infinitely circular.
-";
+/// Go's output for that project with `--checkers checkers`.
+fn split_go(checkers: usize) -> String {
+    SPLIT_GO[checkers - 1]
+        .iter()
+        .map(|i| {
+            format!(
+                "f{i}.ts(2,18): error TS5114: Instantiations of type 'Rec' appear infinitely circular.\n"
+            )
+        })
+        .collect()
+}
 
-/// `--fast` gives Go's `--checkers N` output for its own count N in each of
-/// 5 runs, on a project whose output depends on which files share a
-/// checker. With 7 source files the count is 4 on every machine (at most
-/// one checker per 32 files, at least 4). The `--checkers 1` run shows that
-/// the port's output also depends on the split. `skipLibCheck` keeps the
-/// lib files out of the check work, so the work-stealing pass
-/// (`GOPORT_FAST_STEAL=1`) moves one of these files to another checker, and
-/// this test then fails.
+/// On a project whose output depends on which files share a checker,
+/// `--fast` gives Go's `--checkers 4` output in each of 5 runs: with 7
+/// source files its count is 4 on every machine (at most one checker per
+/// 32 files, at least 4). `--fast --checkers N` gives Go's output for N in
+/// each of 3 runs, for each other N from 2 to 7. The `--checkers 1` run
+/// shows that the port's output also depends on the split.
+///
+/// `skipLibCheck` keeps the lib files out of the check work, so the
+/// work-stealing pass moves some of these files to another checker. The
+/// test passes its own `GOPORT_FAST_STEAL` on to tsgo, so a run with
+/// `GOPORT_FAST_STEAL=1` fails: a check that the test sees the split.
 #[test]
 fn same_output_on_every_run() {
     let mut files = vec![("deep.ts".to_string(), format!("{REC_TS}\n"))];
@@ -212,12 +226,26 @@ fn same_output_on_every_run() {
         r#"{ "compilerOptions": { "noEmit": true, "strict": true, "skipLibCheck": true, "types": [], "lib": ["es2015"] }, "files": ["deep.ts", "f1.ts", "f2.ts", "f3.ts", "f4.ts", "f5.ts", "f6.ts"] }"#.into(),
     ));
     let dir = scratch("same", &files);
-    let output = tsgo(&dir, &["--checkers", "1"], &[]);
-    assert_eq!(stdout(&output), SPLIT_GO_1);
+    let steal = std::env::var("GOPORT_FAST_STEAL").ok();
+    let vars: Vec<(&str, &str)> = steal
+        .iter()
+        .map(|steal| ("GOPORT_FAST_STEAL", steal.as_str()))
+        .collect();
+    let check = |args: &[&str], checkers: usize, label: &str| {
+        let output = tsgo(&dir, args, &vars);
+        assert_eq!(stdout(&output), split_go(checkers), "{label}");
+        assert_eq!(output.status.code(), Some(2), "{label}");
+    };
+    check(&["--checkers", "1"], 1, "--checkers 1");
     for run in 0..5 {
-        let output = tsgo(&dir, &["--fast"], &[]);
-        assert_eq!(stdout(&output), SPLIT_GO_4, "run {run}");
-        assert_eq!(output.status.code(), Some(2), "run {run}");
+        check(&["--fast"], 4, &format!("--fast, run {run}"));
+    }
+    for checkers in [2, 3, 5, 6, 7] {
+        let count = checkers.to_string();
+        for run in 0..3 {
+            let label = format!("--fast --checkers {checkers}, run {run}");
+            check(&["--fast", "--checkers", &count], checkers, &label);
+        }
     }
     fs::remove_dir_all(&dir).unwrap();
 }
