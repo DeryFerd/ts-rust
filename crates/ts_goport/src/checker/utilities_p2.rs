@@ -543,9 +543,15 @@ fn get_super_container(mut node: Node, stop_on_functions: bool) -> Node {
 }
 
 // Go: checker/utilities.go:1264 forEachYieldExpression
+// PERF: deferbody1. Go reads `node.Kind` as a field in the switch, in
+// `IsFunctionLike` and in `IsPartOfTypeNode`. Here each read was a registry
+// lookup, so the walk reads the node's view and kind once and passes them on
+// (`is_part_of_type_node_of`). The walk and its order are Go's.
 pub fn for_each_yield_expression(body: Node, visitor: &mut dyn FnMut(Node) -> bool) -> bool {
     fn traverse(node: Node, visitor: &mut dyn FnMut(Node) -> bool) -> bool {
-        match node.kind() {
+        let view = NodeRef::new(node);
+        let kind = view.kind();
+        match kind {
             SyntaxKind::YieldExpression => {
                 if visitor(node) {
                     return true;
@@ -564,13 +570,15 @@ pub fn for_each_yield_expression(body: Node, visitor: &mut dyn FnMut(Node) -> bo
                 // as local types. Regardless, skip them to avoid the work.
             }
             _ => {
-                if is_function_like(node) {
+                // PORT: Go `IsFunctionLike` also tests `node != nil`; the kind
+                // read above has already failed for nil, as Go's switch does.
+                if is_function_like_kind(kind) {
                     if node.name().is_some() && is_computed_property_name(node.name()) {
                         // Note that we will not include methods/accessors of a class because they would require
                         // first descending into the class. This is by design.
                         return traverse(node.name().expression(), visitor);
                     }
-                } else if !is_part_of_type_node(node) {
+                } else if !is_part_of_type_node_of(view, kind) {
                     // This is the general case, which should include mostly expressions and statements.
                     // Also includes NodeArrays.
                     return node.for_each_child(&mut |child: Node| traverse(child, visitor));
