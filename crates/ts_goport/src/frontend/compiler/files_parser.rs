@@ -1555,6 +1555,21 @@ struct PrefetchJob {
     /// True when a loader batch put the job below the others
     /// (`queue_batch`), for the debug counts.
     under: AtomicBool,
+    /// Tests: set when the worker that parsed the file has stored its prep
+    /// or made none (`set_prep_wait`).
+    #[cfg(test)]
+    prep_settled: AtomicBool,
+}
+
+/// Sets `PrefetchJob::prep_settled` when the worker leaves the job.
+#[cfg(test)]
+struct PrepSettled<'j>(&'j PrefetchJob);
+
+#[cfg(test)]
+impl Drop for PrepSettled<'_> {
+    fn drop(&mut self) {
+        self.0.prep_settled.store(true, AtomicOrdering::Release);
+    }
 }
 
 enum PrefetchState {
@@ -1686,6 +1701,17 @@ impl TakenParse {
     /// has stored in the shared cache by then, so it is not later than the
     /// worker.
     pub(crate) fn take_prep(self) -> Option<Box<FilePrep>> {
+        // A test can make the loader wait (up to 60 s) until the worker has
+        // stored the prep or made none (`set_prep_wait`).
+        #[cfg(test)]
+        if PREP_WAIT.with(Cell::get) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+            while !self.0.prep_settled.load(AtomicOrdering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         let prep = lock(&self.0.prep).take();
         if prep.is_none() {
             count_prep(|c| c.preps_missing += 1);
@@ -1811,6 +1837,18 @@ thread_local! {
     /// A test's choice to make the loads on this thread wait in
     /// `take_prefetched_meta` for a job that is still queued.
     static META_WAIT: Cell<bool> = const { Cell::new(false) };
+    /// A test's choice to make the loads on this thread wait in
+    /// `TakenParse::take_prep` for the worker's prep.
+    static PREP_WAIT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the loads on this thread wait in `TakenParse::take_prep` until the
+/// worker that parsed the file has stored its prep or made none, so the
+/// loader takes each prep whatever the timing (tests). A worker stores the
+/// prep after the parse that the loader waits for.
+#[cfg(test)]
+pub(crate) fn set_prep_wait(on: bool) {
+    PREP_WAIT.with(|wait| wait.set(on));
 }
 
 /// Makes the loads on this thread wait for the parse worker of each file
@@ -1951,6 +1989,8 @@ impl PrefetchQueue {
             mapped,
             queued_at: self.timed.then(std::time::Instant::now),
             under: AtomicBool::new(false),
+            #[cfg(test)]
+            prep_settled: AtomicBool::new(false),
         });
         self.next_job += 1;
         self.by_name.insert(job.opts.file_name.clone(), job.clone());
@@ -3135,28 +3175,31 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
             }
         };
         running.finish(result);
-        let Some(refs) = refs else {
-            continue;
-        };
-        let prep = meta.zip(synthetic).map(|(meta, (synthetic, names))| {
-            (
-                PrepInput {
-                    meta: meta.meta,
-                    synthetic,
-                    names,
-                },
-                &*job,
-            )
-        });
-        // A resolution that panics (a Go panic) panics on the loader too
-        // when it resolves the same import. The worker only stops resolving.
-        let queued = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            shared.queue_references(&*fs, &refs, resolver.as_ref(), prep);
-        }));
-        if queued.is_err() {
-            resolver = None;
-            resolver_failed = true;
+        #[cfg(test)]
+        let _settled = PrepSettled(&job);
+        if let Some(refs) = refs {
+            let prep = meta.zip(synthetic).map(|(meta, (synthetic, names))| {
+                (
+                    PrepInput {
+                        meta: meta.meta,
+                        synthetic,
+                        names,
+                    },
+                    &*job,
+                )
+            });
+            // A resolution that panics (a Go panic) panics on the loader
+            // too when it resolves the same import. The worker only stops
+            // resolving.
+            let queued = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                shared.queue_references(&*fs, &refs, resolver.as_ref(), prep);
+            }));
+            if queued.is_err() {
+                resolver = None;
+                resolver_failed = true;
+            }
         }
+        // A job with no references (an unread file) is busy time too.
         if let Some(started) = started {
             let busy = started.elapsed();
             shared.count(|c| c.busy += busy);
@@ -3352,7 +3395,9 @@ impl WorkerResolver {
     ///
     /// With `prep` (the file's metadata and synthetic imports), the
     /// synthetic imports resolve too, and the answers go to the loader
-    /// (`FilePrep`). The module names have no import nodes here, so each
+    /// (`FilePrep`). Each import resolves with the mode of the usage that
+    /// the worker read with the parse (`PrepInput::names`, parload1). A
+    /// synthetic import, or an import whose usage the worker did not read,
     /// resolves with the mode of a plain import (`guess_import_mode`).
     fn resolve(
         &self,
@@ -3487,16 +3532,26 @@ impl WorkerResolver {
                 answers.push(None);
                 continue;
             }
-            let (resolved, _, _) =
+            let (resolved, _, err) =
                 self.resolver
                     .resolve_module_name(specifier, containing_file, mode, redirect);
             if let Some((cache, directory, redirect_name)) = &answers_from {
-                answers.push(cache.get_module(&(
-                    directory.as_str(),
-                    specifier,
-                    mode,
-                    redirect_name.as_str(),
-                )));
+                // A resolution with an error gives the loader no answer: it
+                // resolves the name itself and notes the error (Go
+                // `moduleResolutionError`, fileloader.go:884). The default
+                // resolver gives none (resolver.go:469).
+                answers.push(
+                    err.is_none()
+                        .then(|| {
+                            cache.get_module(&(
+                                directory.as_str(),
+                                specifier,
+                                mode,
+                                redirect_name.as_str(),
+                            ))
+                        })
+                        .flatten(),
+                );
             }
             if !resolved.is_resolved() {
                 continue;

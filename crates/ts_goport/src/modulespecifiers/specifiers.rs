@@ -484,12 +484,18 @@ fn compute_module_specifiers(
                 *import_specifier,
             );
             if let Some(resolved_module) = resolved_module.filter(|r| r.is_resolved()) {
-                if tspath::to_path(
-                    &resolved_module.resolved_file_name,
-                    &host.get_current_directory(),
-                    info.use_case_sensitive_file_names,
-                ) == target_path
-                {
+                // ts#64159 (specifiers.go:371): Go compares `ResolvedPath`.
+                let matches = match resolved_module.path() {
+                    Some(path) => *path == target_path,
+                    None => {
+                        tspath::to_path(
+                            &resolved_module.resolved_file_name,
+                            &host.get_current_directory(),
+                            info.use_case_sensitive_file_names,
+                        ) == target_path
+                    }
+                };
+                if matches {
                     existing_import = *import_specifier;
                     break;
                 }
