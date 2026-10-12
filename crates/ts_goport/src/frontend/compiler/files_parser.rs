@@ -577,7 +577,10 @@ impl FilesParser {
         drop(pool);
         // PERF: the workers' state (the resolution cache, the jobs) is freed
         // beside the rest of the load, as Go's GC frees it; this thread has
-        // the last reference now. Not in Go.
+        // the last reference now. Not in Go. The free thread is one per
+        // process (`goport-free`): the first load with workers starts it,
+        // also in the LSP and API servers, and it then waits on its queue
+        // for the frees of later loads and builds.
         crate::execute::build::build_task::drop_in_background(shared);
     }
 
