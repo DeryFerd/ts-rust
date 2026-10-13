@@ -978,7 +978,8 @@ impl TableParts {
     /// The table parts of `np`, while this thread runs `beside`. Unless the
     /// program is single-threaded, the slots of the paths and the program
     /// fields are built on two threads of their own, from borrowed paths and
-    /// maps that the threads can read; `beside` must not change the program.
+    /// maps that the threads can read (a part whose thread cannot start is
+    /// built on this thread); `beside` must not change the program.
     // PERF (serialgap1): in build_program `beside` makes and publishes the
     // Go files (VS Code: the two parts took 6.9 ms of the 16 ms build).
     fn build(np: &NewProgram, beside: impl FnOnce()) -> TableParts {
@@ -1051,19 +1052,18 @@ impl TableParts {
                 (slots(), meta())
             } else {
                 std::thread::scope(|scope| {
-                    let slots = std::thread::Builder::new()
-                        .name("goport-tables".to_string())
-                        .spawn_scoped(scope, slots)
-                        .expect("cannot start a table thread");
-                    let meta = std::thread::Builder::new()
-                        .name("goport-tables".to_string())
-                        .spawn_scoped(scope, meta)
-                        .expect("cannot start a table thread");
+                    // `slots` and `meta` borrow only, so they are `Copy`: a
+                    // part whose thread cannot start is made here.
+                    let slots_thread = crate::core::helper_thread(scope, "goport-tables", slots);
+                    let meta_thread = crate::core::helper_thread(scope, "goport-tables", meta);
                     beside();
                     fn join<T>(result: std::thread::Result<T>) -> T {
                         result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
                     }
-                    (join(slots.join()), join(meta.join()))
+                    (
+                        slots_thread.map_or_else(slots, |thread| join(thread.join())),
+                        meta_thread.map_or_else(meta, |thread| join(thread.join())),
+                    )
                 })
             };
         TableParts {
@@ -1962,6 +1962,30 @@ mod tests {
         let np = new_program(opts);
         let _ = std::fs::remove_dir_all(&dir);
         np
+    }
+
+    // followups58 (R208 reviewer): a table thread that cannot start leaves
+    // its part to the calling thread, and the parts are the same. The program
+    // has a package dedup redirect path (`redirects`).
+    #[test]
+    fn table_parts_without_their_threads_are_the_same() {
+        let _scope = crate::core::enter_program(None);
+        let np = redirect_group_program("goport-table-parts");
+        assert!(np.files_by_path().len() > np.source_files().len());
+        let parts = || {
+            let mut beside = false;
+            let parts = TableParts::build(&np, || beside = true);
+            assert!(beside);
+            (
+                parts.source_file_order,
+                parts.other_files,
+                parts.file_by_path,
+                parts.file_meta,
+            )
+        };
+        let threaded = parts();
+        let fallback = crate::core::refuse_helper_threads(parts);
+        assert_eq!(fallback, threaded);
     }
 
     // followups4 (R153 reviewer): editfast1 gives a full build when a
