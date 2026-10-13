@@ -2416,3 +2416,83 @@ fn remove_file_extension(path: &str) -> &str {
     }
     path
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The binder fields in the records of each slot of `file`.
+    fn record_fields(file: usize) -> Vec<Option<(SymbolId, NodeFlags, u32)>> {
+        let records = crate::ast::bind_records(file);
+        (0..records.len())
+            .map(|index| records.node_fields(index))
+            .collect()
+    }
+
+    /// bindonce2: the binder writes the node records while it binds. A bind
+    /// that is not installed (a parallel bind that is dropped, or a panic)
+    /// sets them back as the parse left them, so the serial bind after it
+    /// gives the output of a first bind.
+    #[test]
+    fn a_bind_that_is_not_installed_resets_the_node_records() {
+        let dir = std::env::temp_dir().join(format!("ts_goport_bindonce2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.ts"),
+            "export class C { x = 1; m() { return this.x; } }\n\
+             export function f(a: number) { if (a) { return a; } }\n\
+             namespace N { export const v = 1; }\n\
+             outer: for (const i of [1]) { break outer; }\n\
+             let y = f(1) ?? N.v;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "noLib": true, "types": [] }, "files": ["a.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = crate::program::try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _scope = crate::core::enter_program(Some(program));
+        let file = program
+            .source_files()
+            .find(|file| file.info.file_name.ends_with("/a.ts"))
+            .expect("a.ts is in the program")
+            .root;
+        let parsed = record_fields(file.file_index());
+        let bind = || bind_source_file_live(file, &mut SymbolArena::new_file());
+
+        let first = bind();
+        assert_ne!(
+            record_fields(file.file_index()),
+            parsed,
+            "the bind wrote no record"
+        );
+        let parts = first.node_bind.compact().into_owned();
+        drop(first);
+        assert_eq!(
+            record_fields(file.file_index()),
+            parsed,
+            "a dropped bind left its writes"
+        );
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _bound = bind();
+            panic!("test: a bind thread panics after the bind");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            record_fields(file.file_index()),
+            parsed,
+            "a panicked bind left its writes"
+        );
+
+        let again = bind();
+        assert!(
+            again.node_bind.compact().parts() == parts.parts(),
+            "a bind after the reset gives other data"
+        );
+    }
+}
