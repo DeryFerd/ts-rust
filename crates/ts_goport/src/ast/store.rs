@@ -364,13 +364,21 @@ impl StoreFacts {
         }
     }
 
-    /// The facts as the bits of a `FactsCell`.
+    /// The facts as the bits of a `FactsCell`. It names every field, so a
+    /// new field does not compile until it has a bit.
     const fn bits(self) -> u8 {
-        (self.alias_free as u8)
-            | (self.parents_local as u8) << 1
-            | (self.has_export_alias_kind as u8) << 2
-            | (self.has_flow_constraint_kind as u8) << 3
-            | (self.has_deprecated_tag as u8) << 4
+        let Self {
+            alias_free,
+            parents_local,
+            has_export_alias_kind,
+            has_flow_constraint_kind,
+            has_deprecated_tag,
+        } = self;
+        (alias_free as u8)
+            | (parents_local as u8) << 1
+            | (has_export_alias_kind as u8) << 2
+            | (has_flow_constraint_kind as u8) << 3
+            | (has_deprecated_tag as u8) << 4
     }
 
     /// The facts of the bits of a `FactsCell`.
