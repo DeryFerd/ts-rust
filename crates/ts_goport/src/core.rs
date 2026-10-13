@@ -4746,6 +4746,54 @@ pub fn go_panic_text(f: impl FnOnce()) -> String {
     }
 }
 
+/// Starts a scoped thread named `name` that runs `f`, for port-only work
+/// that the calling thread can do itself (not work Go runs on goroutines:
+/// use `GoThread` for that). `None` when the OS refuses the thread: the
+/// caller then does the work, and the result is the same.
+// PORT: not in Go. The same fallback as the resolve and config prefetch
+// workers (followups58: the serialgap1 threads). It is here, not beside
+// `GoThread` in goport_util, so that its test hook is `cfg(test)`: its
+// callers and their tests are all in this crate (followups60).
+pub(crate) fn helper_thread<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    name: &str,
+    f: F,
+) -> Option<std::thread::ScopedJoinHandle<'scope, T>>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    #[cfg(test)]
+    if REFUSE_HELPER_THREADS.get() {
+        return None;
+    }
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn_scoped(scope, f)
+        .ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// While set, `helper_thread` on this thread starts no thread
+    /// (`refuse_helper_threads`).
+    static REFUSE_HELPER_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` as if the OS refused every `helper_thread` that this thread
+/// starts, so a test reaches the fallback.
+#[cfg(test)]
+pub(crate) fn refuse_helper_threads<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSE_HELPER_THREADS.set(self.0);
+        }
+    }
+    let _restore = Restore(REFUSE_HELPER_THREADS.replace(true));
+    f()
+}
+
 /// One version of a loaded source file: one per file id. The file registry
 /// (`ast/store.rs`) owns it from `publish_file_stores` on, or the
 /// `FileVersion` of a freeable file version (lsshells M3b); read it with
