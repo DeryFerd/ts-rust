@@ -266,9 +266,13 @@ struct SlotChunk {
 /// (7.1 MiB of `slots`, `datas` and `lists` entries in a 10,000-edit
 /// query-core session). The table keeps the numbers from `base` on in
 /// `near`. When most of `near` is empty, `compact` moves `base` up past the
-/// empty entries, and the few live chunks below it go to `far`. A chunk
-/// below `base` takes no new entry (`is_near`), so new entries, and the
-/// reads of new nodes, stay in `near`.
+/// empty entries, and the few live chunks below it go to `far`. An owner
+/// still fills its open chunk when that chunk went to `far`, so no owner
+/// leaves a partly filled chunk there: before followups59 a new chunk took
+/// the next entries, and each compact left the open chunk of each
+/// long-lived owner (the thread) in `far`, a 14 KiB allocation per table
+/// for the life of the thread. The reads of the entries added there go
+/// through `far` (at most one chunk per owner and table after a compact).
 // PORT: Go's GC frees the nodes of a released program, and nothing names
 // them after.
 // PERF: a read of `near` is one subtraction more than a read of the flat
@@ -327,13 +331,6 @@ impl<T> ChunkTable<T> {
             Some(Some(chunk)) => Some(chunk),
             _ => self.far.get_mut(&c),
         }
-    }
-
-    /// Whether chunk number `c` is in `near`, where a chunk can take new
-    /// entries.
-    #[inline]
-    fn is_near(&self, c: usize) -> bool {
-        c >= self.base
     }
 
     /// Puts `chunk` at number `c`, after `None` holes for the numbers that
@@ -836,9 +833,11 @@ impl SyntheticArena {
             ..
         } = self;
         let chunks = owner_chunks(base, owners, alias_files, &mut print.chunks, owner);
-        let open = chunks.lists.last().copied().filter(|&c| {
-            lists.is_near(c as usize) && lists.get(c as usize).expect(FREED).len() < LIST_CHUNK
-        });
+        let open = chunks
+            .lists
+            .last()
+            .copied()
+            .filter(|&c| lists.get(c as usize).expect(FREED).len() < LIST_CHUNK);
         let c = match open {
             Some(c) => c,
             None => {
@@ -941,9 +940,11 @@ fn push_slot_into(
     owner: OwnerKey,
     slot: Slot,
 ) -> u32 {
-    let open = chunks.slots.last().copied().filter(|&c| {
-        slots.is_near(c as usize) && slots.get(c as usize).expect(FREED).slots.len() < SLOT_CHUNK
-    });
+    let open = chunks
+        .slots
+        .last()
+        .copied()
+        .filter(|&c| slots.get(c as usize).expect(FREED).slots.len() < SLOT_CHUNK);
     let c = match open {
         Some(c) => c,
         None => {
@@ -977,7 +978,7 @@ fn push_data_into(
         .datas
         .last()
         .copied()
-        .filter(|&c| (fill as usize) < DATA_CHUNK && datas.is_near(c as usize));
+        .filter(|_| (fill as usize) < DATA_CHUNK);
     let (c, cell) = match open {
         Some(c) => (c, fill),
         None => {
@@ -3454,8 +3455,8 @@ mod tests {
     }
 
     // edleak3: a table whose chunks are mostly freed moves its base past
-    // them. The live chunks below the base stay readable and take no new
-    // entry, a freed number stays a hole, and numbers never move.
+    // them. The live chunks below the base stay readable, a freed number
+    // stays a hole, and numbers never move.
     #[test]
     fn chunk_table_compacts_past_freed_numbers() {
         let count = 4 * COMPACT_MIN_EMPTY;
@@ -3473,7 +3474,6 @@ mod tests {
         assert_eq!(table.len(), count, "numbers never move");
         for c in 0..count {
             assert_eq!(table.get(c), live(c).then_some(&c), "chunk {c}");
-            assert_eq!(table.is_near(c), c >= table.base);
         }
         assert_eq!(
             table.iter().count(),
@@ -3487,8 +3487,9 @@ mod tests {
 
     // edleak3: the chunks of freed program versions leave the tables
     // (`ChunkTable::compact`). A node of the thread made before stays
-    // readable from below the base, a node of a freed version panics, and
-    // new nodes go after the base.
+    // readable from below the base, and a node of a freed version panics.
+    // followups59: a new node of the thread fills the thread's open chunk,
+    // which is below the base.
     #[test]
     fn freed_program_chunks_leave_the_tables() {
         std::thread::spawn(|| {
@@ -3520,7 +3521,8 @@ mod tests {
             assert!(read_panic(|| freed.text().to_string()).is_some_and(|m| m.contains(FREED)));
             let new = f.new_identifier("new");
             assert_eq!(new.text(), "new");
-            assert!(slot_index(new) / SLOT_CHUNK >= base);
+            assert_eq!(slot_index(new) / SLOT_CHUNK, slot_index(kept) / SLOT_CHUNK);
+            assert!(slot_index(new) / SLOT_CHUNK < base);
             free_synthetic_nodes();
         })
         .join()
