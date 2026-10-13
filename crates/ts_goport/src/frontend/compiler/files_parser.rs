@@ -4392,9 +4392,17 @@ struct SharedStatCache {
     package_jsons: StatMap<(Arc<str>, bool)>,
     /// The OS stat of each path that a `FileExists`, `DirectoryExists` or
     /// root file size (`PrefetchShared::rank_largest`) asked for in the load,
-    /// as (is a directory, size), when there is no host cache: Go
-    /// `vfs.Common` answers both lookups with one stat, so one stat answers
-    /// all three here. Not for the lookups of a bundled path (`exists`).
+    /// as (is a directory, size), when there is no host cache. Go
+    /// `vfs.Common` answers each of the two lookups with a stat
+    /// (internal.go:59, :64), so here one stat answers all three. Not for
+    /// the lookups of a bundled path (`exists`).
+    // PORT: Go `cachedvfs` caches `FileExists` and `DirectoryExists` in two
+    // maps (cachedvfs.go:49, :65), so Go makes one stat per lookup kind: 2
+    // stats for a path that it asks both of. Here the first lookup of a
+    // path fixes both answers for the load, so the port makes fewer stats
+    // than Go. The answers are Go's unless the file system changes during
+    // the load, between Go's two stats of one path. The load writes no
+    // file, so the output is the same.
     nodes: StatMap<Option<(bool, i64)>>,
 }
 
@@ -4424,13 +4432,13 @@ impl SharedStatCache {
 
     /// `FileExists` (or with `directory`, `DirectoryExists`) of `path` on
     /// `fs`, the bundled wrapper of the OS file system. For an OS path it is
-    /// Go `vfs.Common.FileExists` or `DirectoryExists`, a stat, so one stat
-    /// in `nodes` answers both. A bundled path is answered by `fs` itself
-    /// (no syscall): there the stat and the lookups differ (Go embed.go:66
-    /// and :85: `Stat("bundled:///")` is a directory, but
-    /// `DirectoryExists("bundled:///")` is false). `None` with a host cache:
-    /// its lookups of each kind stay for later programs, so they must not
-    /// answer each other (`BuildStatCache`).
+    /// Go `vfs.Common.FileExists` or `DirectoryExists`, each a stat, so one
+    /// stat in `nodes` answers both (see the PORT note there). A bundled
+    /// path is answered by `fs` itself (no syscall): there the stat and the
+    /// lookups differ (Go embed.go:66 and :85: `Stat("bundled:///")` is a
+    /// directory, but `DirectoryExists("bundled:///")` is false). `None`
+    /// with a host cache: its lookups of each kind stay for later programs,
+    /// so they must not answer each other (`BuildStatCache`).
     fn exists(&self, fs: &dyn Fs, path: &str, directory: bool) -> Option<bool> {
         if self.host.get().is_some() {
             return None;

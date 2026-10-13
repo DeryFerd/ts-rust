@@ -1,11 +1,11 @@
 //! The stat cache of a parallel load (`files_parser.rs` `SharedStatCache`,
 //! `LoaderStatFs`) must answer as Go's file system. One stat answers
-//! `FileExists` and `DirectoryExists` of an OS path, as Go `vfs.Common`
-//! does, but not of a bundled path: Go `Stat("bundled:///")` is a directory
-//! while `DirectoryExists("bundled:///")` is false (bundled/embed.go:66 and
-//! :85). statcut1 round 1 answered `bundled:///` from the stat, so a
-//! parallel load saw a directory there and the single-threaded load did
-//! not.
+//! `FileExists` and `DirectoryExists` of an OS path (Go `vfs.Common` answers
+//! each with a stat of its own), but not of a bundled path: Go
+//! `Stat("bundled:///")` is a directory while
+//! `DirectoryExists("bundled:///")` is false (bundled/embed.go:66 and :85).
+//! statcut1 round 1 answered `bundled:///` from the stat, so a parallel
+//! load saw a directory there and the single-threaded load did not.
 //!
 //! Each test runs `tsgo -p tsconfig.json --traceResolution` in a new
 //! scratch dir in the default mode, with 4 parse workers
