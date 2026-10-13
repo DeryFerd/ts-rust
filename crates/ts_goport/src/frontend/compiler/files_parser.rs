@@ -1465,7 +1465,7 @@ struct FileMaps {
 }
 
 impl FileMaps {
-    /// Adds `entry` as Go `collectFiles` adds it (filesparser.go:467-524).
+    /// Adds `entry` as Go `collectFiles` adds it (filesparser.go:455-548).
     fn add(&mut self, entry: FileMapEntry) {
         match entry {
             FileMapEntry::File {
@@ -1489,37 +1489,35 @@ impl FileMaps {
     /// The maps that `walk` adds to through its sink. Each map gets its
     /// entries in the order of the walk, so it is the map that the walk
     /// would make itself. Unless `single_threaded`, another thread adds
-    /// them while the walk goes on.
+    /// them while the walk goes on; when that thread cannot start, the
+    /// walk's thread adds them.
     // PERF (serialgap1): Go's walk is serial (filesparser.go:337), and so is
     // this one; the map work of each file moves off it. VS Code: about 11k
     // files, two path copies and up to three inserts each.
     fn collect(single_threaded: bool, walk: impl FnOnce(&mut FileMapSink)) -> FileMaps {
+        let mut sink = FileMapSink {
+            maps: FileMaps::default(),
+            batch: Vec::new(),
+            send: None,
+        };
         if single_threaded || cfg!(target_family = "wasm") {
-            let mut sink = FileMapSink {
-                maps: FileMaps::default(),
-                batch: Vec::new(),
-                send: None,
-            };
             walk(&mut sink);
             return sink.maps;
         }
         let (send, receive) = std::sync::mpsc::channel::<Vec<FileMapEntry>>();
         std::thread::scope(|scope| {
-            let maps = std::thread::Builder::new()
-                .name("goport-collect".to_string())
-                .spawn_scoped(scope, move || {
-                    let mut maps = FileMaps::default();
-                    for batch in receive {
-                        batch.into_iter().for_each(|entry| maps.add(entry));
-                    }
-                    maps
-                })
-                .expect("cannot start the collect thread");
-            let mut sink = FileMapSink {
-                maps: FileMaps::default(),
-                batch: Vec::with_capacity(FileMapSink::BATCH),
-                send: Some(send),
+            let Some(maps) = crate::core::helper_thread(scope, "goport-collect", move || {
+                let mut maps = FileMaps::default();
+                for batch in receive {
+                    batch.into_iter().for_each(|entry| maps.add(entry));
+                }
+                maps
+            }) else {
+                walk(&mut sink);
+                return sink.maps;
             };
+            sink.batch = Vec::with_capacity(FileMapSink::BATCH);
+            sink.send = Some(send);
             walk(&mut sink);
             // Sends the last batch. Dropping the sender ends the thread's
             // loop (also when the walk panics).
@@ -1563,6 +1561,60 @@ impl FileMapSink {
             // The thread receives until the sender drops.
             let _ = send.send(full);
         }
+    }
+}
+
+#[cfg(test)]
+mod file_maps_tests {
+    use super::*;
+
+    // followups58 (R208 reviewer): when the collect thread cannot start, the
+    // walk's thread adds the entries itself, and the maps are the ones of a
+    // serial walk. Paths come again with other metadata, so the order of the
+    // inserts shows.
+    #[test]
+    fn collect_without_its_thread_makes_the_same_maps() {
+        let walk = |threaded: bool| {
+            move |sink: &mut FileMapSink| {
+                assert_eq!(sink.send.is_some(), threaded);
+                for i in 0..3 * FileMapSink::BATCH {
+                    let path = Path(format!("/p/f{}.ts", i % 300));
+                    sink.add(if i % 7 == 0 {
+                        FileMapEntry::Found(path)
+                    } else {
+                        FileMapEntry::File {
+                            path,
+                            resolutions: ModeAwareCache::default(),
+                            meta: SourceFileMetaData {
+                                package_json_type: i.to_string(),
+                                ..SourceFileMetaData::default()
+                            },
+                            found_searching_node_modules: i % 3 == 0,
+                        }
+                    });
+                }
+            }
+        };
+        let sorted = |maps: FileMaps| {
+            let mut resolved: Vec<Path> = maps.resolved_modules.into_keys().collect();
+            let mut metas: Vec<(Path, SourceFileMetaData)> =
+                maps.source_file_meta_datas.into_iter().collect();
+            let mut found: Vec<Path> = maps
+                .source_files_found_searching_node_modules
+                .into_iter()
+                .collect();
+            resolved.sort_by(|a, b| a.0.cmp(&b.0));
+            metas.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            (resolved, metas, found)
+        };
+        let serial = sorted(FileMaps::collect(true, walk(false)));
+        let threaded = sorted(FileMaps::collect(false, walk(true)));
+        let fallback = sorted(crate::core::refuse_helper_threads(|| {
+            FileMaps::collect(false, walk(false))
+        }));
+        assert_eq!(threaded, serial);
+        assert_eq!(fallback, serial);
     }
 }
 
