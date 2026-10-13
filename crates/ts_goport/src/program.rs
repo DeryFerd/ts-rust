@@ -2224,6 +2224,10 @@ struct BindQueue {
     state: Mutex<BindQueueState>,
     /// Signals new known offsets, a finished bind and `stop`.
     changed: std::sync::Condvar,
+    /// Test hook: the chain link that `spawn_bind_chain` starts with this
+    /// `threads` panics after its seed install, before `run`.
+    #[cfg(test)]
+    panic_before_run: Option<usize>,
 }
 
 struct BindQueueState {
@@ -2231,12 +2235,14 @@ struct BindQueueState {
     next: usize,
     /// The number of files being bound.
     binding: usize,
-    /// The bind threads whose binds have not failed: they take the files
-    /// that are left. It counts the threads that `spawn_bind_chain` did not
-    /// start. That is right: a thread is left out only when no file is left
-    /// or the bind stopped, and then no thread reads the count. A thread
-    /// that panics before it binds takes itself and the threads it would
-    /// start out of the count (`UnstartedBinders`).
+    /// The bind threads that can still bind: they take the files that are
+    /// left. It starts at the bind thread count, so it counts the threads
+    /// that `spawn_bind_chain` did not start. That is right: a thread is left
+    /// out only when no file is left or the bind stopped, and then no thread
+    /// reads the count. Each thread leaves the count one time
+    /// (`LinkBinders::leave`): at its first failed bind, or when it panics
+    /// before that. A link that panics before `run` also takes out the
+    /// threads that it would start.
     binders: usize,
     /// Set by the loading thread when it stops at a failed file.
     stop: bool,
@@ -2273,6 +2279,8 @@ impl BindQueue {
                 freeable,
             }),
             changed: std::sync::Condvar::new(),
+            #[cfg(test)]
+            panic_before_run: None,
         }
     }
 
@@ -2389,85 +2397,43 @@ fn bind_files_parallel(lineage: &mut Lineage) {
     );
     // The work of one bind thread, after it installed its seed. `sender`
     // takes its files to the loading thread.
-    let run = |sender: std::sync::mpsc::Sender<ParallelBind>| {
-        // The files bound on this thread that wait for their offsets, by file
-        // index. Their offsets are known in index order.
-        let mut waiting: std::collections::BTreeMap<usize, (BoundFile, SymbolArena)> =
-            std::collections::BTreeMap::new();
-        // Set when a bind here made thread-local state or panicked: this
-        // thread binds no more files, as they could read that state, but it
-        // still moves the ids of the files it bound before.
-        let mut failed = false;
-        let mut state = queue.lock();
-        loop {
-            if state.stop {
-                break;
-            }
-            // Moving ids first: the loading thread waits for it, and the data
-            // of the file is still in this core's cache.
-            if let Some(entry) = waiting.first_entry()
-                && let Some(&offsets) = state.offsets.get(*entry.key())
-            {
-                drop(state);
-                let (i, (mut bound, file_symbols)) = entry.remove_entry();
-                bound.remap(offsets);
-                // A ready file is always joined: every earlier file has its
-                // counts, so it was bound and reaches the loading thread.
-                bound.install();
-                let prepared = file_symbols.prepare_file_arena(offsets, files[i].1);
-                let _ = sender.send((i, Some(prepared)));
-                state = queue.lock();
-                continue;
-            }
-            if !failed && let Some(&i) = order.get(state.next) {
+    let run = |sender: std::sync::mpsc::Sender<ParallelBind>, link: &mut LinkBinders<'_>| {
+        run_bind_link(
+            &queue,
+            &order,
+            link,
+            |i| {
                 let (file, _) = files[i];
-                state.next += 1;
-                state.binding += 1;
-                drop(state);
-                let before = bind_thread_fingerprint();
-                let result = std::panic::catch_unwind(|| {
-                    let _trace = trace_bind_source_file(file);
-                    let mut file_symbols = SymbolArena::new_file();
-                    let bound = bind_source_file_detached(file, &mut file_symbols);
-                    (bound, file_symbols)
+                // The fingerprints are in the catch too: nothing between the
+                // two changes of `binding` can panic, so a panic never
+                // leaves it counted.
+                let (bound, file_symbols) = std::panic::catch_unwind(|| {
+                    let before = bind_thread_fingerprint();
+                    let bound = {
+                        let _trace = trace_bind_source_file(file);
+                        let mut file_symbols = SymbolArena::new_file();
+                        let bound = bind_source_file_detached(file, &mut file_symbols);
+                        (bound, file_symbols)
+                    };
+                    (bind_thread_fingerprint() == before).then_some(bound)
                 })
                 .ok()
-                .filter(|_| bind_thread_fingerprint() == before);
-                state = queue.lock();
-                state.binding -= 1;
-                let Some((bound, file_symbols)) = result else {
-                    // Later files never get offsets now; waiting threads
-                    // check whether to stay.
-                    failed = true;
-                    state.binders -= 1;
-                    queue.changed.notify_all();
-                    let _ = sender.send((i, None));
-                    continue;
-                };
-                let more = state.record(i, file_symbols.mark());
-                waiting.insert(i, (bound, file_symbols));
-                if more || state.binding == 0 {
-                    queue.changed.notify_all();
-                }
-                continue;
-            }
-            // Nothing to bind here. Stay while a file bound here can still get
-            // its offsets: from a bind in progress, or from a file that is
-            // left for a thread that can bind. Else a file before it failed,
-            // or no thread can bind the files before it, and the join stops
-            // there.
-            if waiting.is_empty()
-                || (state.binding == 0 && (state.next >= order.len() || state.binders == 0))
-            {
-                break;
-            }
-            state = queue
-                .changed
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        drop(state);
-        drop(waiting);
+                .flatten()?;
+                let counts = file_symbols.mark();
+                Some(((bound, file_symbols), counts))
+            },
+            |i, ready| {
+                let prepared = ready.map(|((mut bound, file_symbols), offsets)| {
+                    bound.remap(offsets);
+                    // A ready file is always joined: every earlier file has
+                    // its counts, so it was bound and reaches the loading
+                    // thread.
+                    bound.install();
+                    file_symbols.prepare_file_arena(offsets, files[i].1)
+                });
+                let _ = sender.send((i, prepared));
+            },
+        );
         // The scope ends when the thread's closure returns, but thread-locals
         // drop only at thread exit. Let go of the program tables now, so a
         // release after the bind frees them (`WorkerSeed`).
@@ -2515,8 +2481,86 @@ fn bind_files_parallel(lineage: &mut Lineage) {
     }
 }
 
+/// The work of one bind thread of `bind_files_parallel`, after it installed
+/// its seed. It takes the files of `order` from `queue` and binds each with
+/// `bind`, which gives the bound file and its arena counts, or None when the
+/// bind made thread-local state or panicked. It gives each file that it bound
+/// to `join` with the offsets of the file when they are known, and each file
+/// whose bind failed with None. At the first failed bind, the thread leaves
+/// `BindQueueState::binders` through `link` and binds no more files.
+fn run_bind_link<T>(
+    queue: &BindQueue,
+    order: &[usize],
+    link: &mut LinkBinders<'_>,
+    mut bind: impl FnMut(usize) -> Option<(T, ArenaMark)>,
+    mut join: impl FnMut(usize, Option<(T, ArenaOffsets)>),
+) {
+    // The files bound on this thread that wait for their offsets, by file
+    // index. Their offsets are known in index order.
+    let mut waiting = std::collections::BTreeMap::<usize, T>::new();
+    // Set when a bind here made thread-local state or panicked: this thread
+    // binds no more files, as they could read that state, but it still moves
+    // the ids of the files it bound before.
+    let mut failed = false;
+    let mut state = queue.lock();
+    loop {
+        if state.stop {
+            break;
+        }
+        // Moving ids first: the loading thread waits for it, and the data of
+        // the file is still in this core's cache.
+        if let Some(entry) = waiting.first_entry()
+            && let Some(&offsets) = state.offsets.get(*entry.key())
+        {
+            drop(state);
+            let (i, bound) = entry.remove_entry();
+            join(i, Some((bound, offsets)));
+            state = queue.lock();
+            continue;
+        }
+        if !failed && let Some(&i) = order.get(state.next) {
+            state.next += 1;
+            state.binding += 1;
+            drop(state);
+            let result = bind(i);
+            state = queue.lock();
+            state.binding -= 1;
+            let Some((bound, counts)) = result else {
+                // Later files never get offsets now; waiting threads check
+                // whether to stay.
+                failed = true;
+                link.leave(&mut state);
+                queue.changed.notify_all();
+                join(i, None);
+                continue;
+            };
+            let more = state.record(i, counts);
+            waiting.insert(i, bound);
+            if more || state.binding == 0 {
+                queue.changed.notify_all();
+            }
+            continue;
+        }
+        // Nothing to bind here. Stay while a file bound here can still get
+        // its offsets: from a bind in progress, or from a file that is left
+        // for a thread that can bind. Else a file before it failed, or no
+        // thread can bind the files before it, and the join stops there.
+        if waiting.is_empty()
+            || (state.binding == 0 && (state.next >= order.len() || state.binders == 0))
+        {
+            break;
+        }
+        state = queue
+            .changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    drop(state);
+    drop(waiting);
+}
+
 /// Starts `threads` bind threads in `scope` as a chain. Each thread runs
-/// `run` with a clone of `sender`. Before it runs, a thread takes the seed
+/// `run` with a clone of `sender` and its `LinkBinders`. Before it runs, a thread takes the seed
 /// of the next thread from its own copy of the loading thread's state (the
 /// same state) and starts it, while `queue` has files left. So no thread
 /// copies more than one seed before it binds, and no thread starts when all
@@ -2534,39 +2578,65 @@ fn spawn_bind_chain<'scope, F>(
     queue: &'scope BindQueue,
     sender: std::sync::mpsc::Sender<ParallelBind>,
 ) where
-    F: Fn(std::sync::mpsc::Sender<ParallelBind>) + Sync,
+    F: Fn(std::sync::mpsc::Sender<ParallelBind>, &mut LinkBinders<'scope>) + Sync,
 {
     let seed = WorkerSeed::take_unbuilt();
     spawn_bind_thread(scope, move || {
-        let mut unstarted = UnstartedBinders {
+        let mut binders = LinkBinders {
             queue,
             count: threads,
         };
         seed.install();
+        #[cfg(test)]
+        if queue.panic_before_run == Some(threads) {
+            panic!("test: a bind chain link panics before run");
+        }
         if threads > 1 && queue.files_left() {
             spawn_bind_chain(scope, threads - 1, run, queue, sender.clone());
         }
-        unstarted.count = 0;
-        run(sender);
+        // In `run` the link answers only for itself: the next link answers
+        // for the links after it, and a link that did not start stays in
+        // the count (`BindQueueState::binders`).
+        binders.count = 1;
+        run(sender, &mut binders);
+        binders.count = 0;
     });
 }
 
-/// The bind threads of a chain link that panicked before `run`: the link
-/// and the links that it did not start. On drop it takes them out of
-/// `BindQueueState::binders`, so a thread that waits for the files they
-/// would bind does not wait forever (the scope then joins and raises the
-/// panic). 0 once the link runs.
+/// The bind threads that a chain link answers for in
+/// `BindQueueState::binders`: before `run`, the link and the links that it
+/// did not start; in `run`, the link. 0 after the link left the count
+/// (`leave`, at a failed bind in `run_bind_link`) and once `run` returns.
+/// On drop, so when the link panics, it takes the threads that it still
+/// answers for out of the count. A thread that waits for the files they
+/// would bind then does not wait forever (the scope then joins and raises
+/// the panic). A link whose bind failed and that then panics leaves the
+/// count one time only.
 // Not in Go: Go binds each file on its own goroutine.
-struct UnstartedBinders<'a> {
+struct LinkBinders<'a> {
     queue: &'a BindQueue,
     count: usize,
 }
 
-impl Drop for UnstartedBinders<'_> {
+impl LinkBinders<'_> {
+    /// Takes the threads that the link answers for out of `state.binders`
+    /// (`state` is the locked state of the link's queue). The link then
+    /// answers for none, so no thread leaves the count two times.
+    fn leave(&mut self, state: &mut BindQueueState) {
+        debug_assert!(
+            state.binders >= self.count,
+            "a bind thread leaves the binders two times"
+        );
+        state.binders = state.binders.saturating_sub(self.count);
+        self.count = 0;
+    }
+}
+
+impl Drop for LinkBinders<'_> {
     fn drop(&mut self) {
         if self.count > 0 {
             let mut state = self.queue.lock();
-            state.binders = state.binders.saturating_sub(self.count);
+            self.leave(&mut state);
             drop(state);
             self.queue.changed.notify_all();
         }
@@ -6151,6 +6221,172 @@ mod tests {
                 "{file} outDir {out_dir:?} rootDir {root_dir:?} config {config_file_path:?}"
             );
         }
+    }
+
+    /// A program version of one empty file, for a test that needs a current
+    /// program and reads none of it.
+    fn small_program(name: &str) -> &'static GoProgram {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), "export {};\n").unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "noLib": true, "types": [] }, "files": ["a.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        program
+    }
+
+    /// Runs a bind chain of `threads` links (`spawn_bind_chain`) on a queue
+    /// of `threads` files, with `program` current, on a thread of its own.
+    /// The link that starts with `before_run` threads panics before `run`,
+    /// and the link that reaches `run` as number `in_run` (from 0) panics
+    /// there. Each other link that runs waits until `binders` counts only
+    /// those links, as a thread whose bind failed waits while a thread that
+    /// can bind is counted. Returns whether the chain panicked, `binders` at
+    /// the end and the number of those links. Fails when the chain does not
+    /// end.
+    fn run_bind_chain(
+        program: &'static GoProgram,
+        threads: usize,
+        before_run: Option<usize>,
+        in_run: Option<usize>,
+    ) -> (bool, usize, usize) {
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _program = crate::core::enter_program(Some(program));
+            let mut queue = BindQueue::new(
+                vec![false; threads],
+                SymbolArena::new().next_file_offsets(),
+                threads,
+            );
+            queue.panic_before_run = before_run;
+            let (arrived, ran) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let run = |_, _: &mut LinkBinders<'_>| {
+                let mut state = queue.lock();
+                if Some(arrived.fetch_add(1, Ordering::Relaxed)) == in_run {
+                    drop(state);
+                    panic!("test: a bind chain link panics in run");
+                }
+                // Under the queue lock, so no wait misses it.
+                ran.fetch_add(1, Ordering::Relaxed);
+                queue.changed.notify_all();
+                while state.binders != ran.load(Ordering::Relaxed) {
+                    state = queue
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            };
+            let (sender, _receiver) = std::sync::mpsc::channel();
+            let chain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::thread::scope(|scope| spawn_bind_chain(scope, threads, &run, &queue, sender));
+            }));
+            let _ = done.send((
+                chain.is_err(),
+                queue.lock().binders,
+                ran.load(Ordering::Relaxed),
+            ));
+        });
+        ended
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the bind chain does not end")
+    }
+
+    // followups61 (R211 reviewer items a and b): a bind chain link that
+    // panics before `run` takes itself and the links that it did not start
+    // out of `binders`, and a link that panics in `run` takes itself out
+    // (`LinkBinders`). The links that run then stop waiting for the files
+    // of those links, and the chain ends in the panic. Without the guard
+    // they wait forever.
+    #[test]
+    fn a_bind_chain_link_that_panics_leaves_the_binders() {
+        let program = small_program("goport-bind-chain");
+        // 4 links. The third (2 threads) panics, so it and the fourth leave
+        // the count, and the first two run.
+        assert_eq!(run_bind_chain(program, 4, Some(2), None), (true, 2, 2));
+        // The first link panics: no link runs.
+        assert_eq!(run_bind_chain(program, 3, Some(3), None), (true, 0, 0));
+        // 3 links. The second to reach `run` panics there.
+        assert_eq!(run_bind_chain(program, 3, None, Some(1)), (true, 2, 2));
+    }
+
+    // followups61 round 2 (R211 reviewer item b, skeptic): a link whose bind
+    // failed left `binders` already (`LinkBinders::leave`), so when it then
+    // panics in `run`, its guard takes nothing out. When the guard took it
+    // out again, `binders` came to 0 while a link could still bind. A failed
+    // bind of that link then took it to usize::MAX (release builds), and the
+    // link waited forever for a file that no link takes.
+    #[test]
+    fn a_bind_chain_link_whose_bind_failed_leaves_the_binders_once() {
+        /// Sends on drop: at the exit of its thread, as a thread-local,
+        /// after the thread's `LinkBinders` dropped.
+        struct SendAtExit(std::sync::mpsc::Sender<()>);
+        impl Drop for SendAtExit {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        thread_local! {
+            static AT_EXIT: std::cell::RefCell<Option<SendAtExit>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let program = small_program("goport-bind-chain-failed");
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _program = crate::core::enter_program(Some(program));
+            // 4 files and 2 links. The links take the files last file first,
+            // so file 0 is the last file that a link takes.
+            let order = [3, 2, 1, 0];
+            let queue = BindQueue::new(vec![false; 4], SymbolArena::new().next_file_offsets(), 2);
+            let (exited, exit) = std::sync::mpsc::channel();
+            let exit = Mutex::new(exit);
+            let returned = AtomicUsize::new(0);
+            // The link that takes file 3 binds it when the other link took
+            // file 2, failed it, panicked and ended. The first link then
+            // fails file 1 and leaves the count, and its file 3 waits for the
+            // counts of file 0, which no link can take.
+            let run = |_, link: &mut LinkBinders<'_>| {
+                run_bind_link(
+                    &queue,
+                    &order,
+                    link,
+                    |i| {
+                        if i == 3 {
+                            exit.lock().unwrap().recv().unwrap();
+                        }
+                        (i == 3).then(|| ((), SymbolArena::new_file().mark()))
+                    },
+                    |i, _| {
+                        if i == 2 {
+                            let at_exit = SendAtExit(exited.clone());
+                            AT_EXIT.with(|cell| *cell.borrow_mut() = Some(at_exit));
+                            panic!("test: a bind chain link panics after a failed bind");
+                        }
+                    },
+                );
+                returned.fetch_add(1, Ordering::Relaxed);
+            };
+            let (sender, _receiver) = std::sync::mpsc::channel();
+            let chain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::thread::scope(|scope| spawn_bind_chain(scope, 2, &run, &queue, sender));
+            }));
+            let _ = done.send((
+                chain.is_err(),
+                queue.lock().binders,
+                returned.load(Ordering::Relaxed),
+            ));
+        });
+        // The chain ends in the panic. Each link left the count one time,
+        // and the link that did not panic returned.
+        let result = ended
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the bind chain does not end");
+        assert_eq!(result, (true, 0, 1));
     }
 
     #[test]
