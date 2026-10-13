@@ -3470,23 +3470,42 @@ mod tests {
         .expect("test thread panicked");
     }
 
+    impl<T> ChunkTable<T> {
+        /// Test check: `live` counts the chunks of `near`.
+        fn assert_live(&self) {
+            assert_eq!(self.live, self.near.iter().flatten().count(), "live");
+        }
+    }
+
     // edleak3: a table whose chunks are mostly freed moves its base past
     // them. The live chunks below the base stay readable, a freed number
-    // stays a hole, and numbers never move.
+    // stays a hole, and numbers never move. followups59: a number below the
+    // base that the table never had (the other thread of a shared counter
+    // took it) can still take a chunk, in `far`.
     #[test]
     fn chunk_table_compacts_past_freed_numbers() {
         let count = 4 * COMPACT_MIN_EMPTY;
         let live = |c: usize| c % 512 == 0 || c >= count - 16;
+        // Never set: as a number of the other thread of a shared counter.
+        let skipped = |c: usize| c % 512 == 1;
         let mut table = ChunkTable::new();
-        for c in 0..count {
+        for c in (0..count).filter(|&c| !skipped(c)) {
             table.set(c, c);
         }
-        for c in (0..count).filter(|&c| !live(c)) {
+        table.assert_live();
+        for c in (0..count).filter(|&c| !live(c) && !skipped(c)) {
             assert_eq!(table.take(c), Some(c));
         }
+        table.assert_live();
         table.compact();
-        assert!(table.base > 0, "the base moved");
-        assert!(table.near.len() <= 16, "near holds the live tail");
+        table.assert_live();
+        assert_eq!(table.base, count - 16, "the base moved to the live tail");
+        assert_eq!(table.near.len(), 16, "near holds the live tail");
+        assert_eq!(table.live, 16);
+        assert_eq!(
+            table.far.len(),
+            (0..count - 16).filter(|&c| live(c)).count()
+        );
         assert_eq!(table.len(), count, "numbers never move");
         for c in 0..count {
             assert_eq!(table.get(c), live(c).then_some(&c), "chunk {c}");
@@ -3497,8 +3516,57 @@ mod tests {
         );
         assert_eq!(table.take(512), Some(512));
         assert_eq!(table.get(512), None, "a freed number below the base");
+        table.set(513, 513);
+        assert_eq!(table.get(513), Some(&513), "a set below the base");
+        assert!(table.far.contains_key(&513));
+        table.assert_live();
         table.set(count, count);
         assert_eq!(table.get(count), Some(&count));
+        table.assert_live();
+    }
+
+    // followups59: when the trigger holds but no cut drops more empty
+    // entries than 4 per live chunk it moves (live chunks at the front,
+    // holes after them), compact moves nothing, and it scans again only
+    // when more entries are empty.
+    #[test]
+    fn chunk_table_waits_for_more_holes_when_no_cut_pays() {
+        // 3 * front <= holes <= 4 * front: the trigger holds, no cut pays.
+        let (front, holes) = (300, COMPACT_MIN_EMPTY + 76);
+        let mut table = ChunkTable::new();
+        for c in 0..front + holes {
+            table.set(c, c);
+        }
+        for c in front..front + holes {
+            table.take(c);
+        }
+        table.compact();
+        table.assert_live();
+        assert_eq!((table.base, table.far.len()), (0, 0), "no cut");
+        assert_eq!(table.no_cut_empty, holes);
+        table.compact();
+        assert_eq!(table.no_cut_empty, holes, "no new hole, no scan");
+        let next = table.len();
+        table.set(next, next);
+        table.take(next);
+        table.compact();
+        assert_eq!(table.base, 0, "one more hole still does not pay");
+        assert_eq!(table.no_cut_empty, holes + 1, "a new hole, a new scan");
+        // Holes at the front make a cut pay: 100 holes and 200 live chunks
+        // before the 1,101 holes.
+        for c in 0..100 {
+            table.take(c);
+        }
+        table.compact();
+        table.assert_live();
+        assert_eq!(table.base, next + 1, "the base moved past every hole");
+        assert_eq!(table.far.len(), front - 100);
+        assert_eq!(
+            (table.near.len(), table.live, table.no_cut_empty),
+            (0, 0, 0)
+        );
+        assert_eq!(table.get(150), Some(&150));
+        assert_eq!(table.get(50), None);
     }
 
     // edleak3: the chunks of freed program versions leave the tables
@@ -3512,7 +3580,10 @@ mod tests {
             let f = NodeFactory::new();
             let kept = f.new_identifier("kept");
             let mut freed = Node::NIL;
-            for i in 0..2 * COMPACT_MIN_EMPTY {
+            // Not a multiple of COMPACT_MIN_EMPTY: the tables end between
+            // two compacts.
+            let programs = 2 * COMPACT_MIN_EMPTY + COMPACT_MIN_EMPTY / 2;
+            for i in 0..programs {
                 let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
                     id: next_program_id(),
                     options: Box::leak(Box::default()),
@@ -3525,20 +3596,48 @@ mod tests {
                 }
                 free_synthetic_owner(program.id);
             }
-            let (base, near, made) = ARENA.with(|a| {
+            let kept_chunk = slot_index(kept) / SLOT_CHUNK;
+            ARENA.with(|a| {
                 let a = a.borrow();
-                (a.slots.base, a.slots.near.len(), a.slots.len())
+                // Each program made one slot chunk and one data chunk. Every
+                // table compacted, and keeps fewer empty entries than the
+                // trigger: each free compacts once the trigger holds.
+                for (name, base, near, live, far) in [
+                    (
+                        "slots",
+                        a.slots.base,
+                        a.slots.near.len(),
+                        a.slots.live,
+                        a.slots.far.len(),
+                    ),
+                    (
+                        "datas",
+                        a.datas.base,
+                        a.datas.near.len(),
+                        a.datas.live,
+                        a.datas.far.len(),
+                    ),
+                ] {
+                    assert!(base > 0, "{name}: base {base}");
+                    assert!(
+                        near - live < COMPACT_MIN_EMPTY,
+                        "{name}: {near} entries, {live} live"
+                    );
+                    assert_eq!(far, 1, "{name}: the thread's chunk is in far");
+                }
+                assert_eq!(a.slots.len(), programs + 1);
+                assert!(a.slots.far.contains_key(&kept_chunk));
             });
-            assert!(
-                base > 0 && near < made / 4,
-                "base {base}, near {near} of {made}"
-            );
             assert_eq!(kept.text(), "kept");
             assert!(read_panic(|| freed.text().to_string()).is_some_and(|m| m.contains(FREED)));
             let new = f.new_identifier("new");
             assert_eq!(new.text(), "new");
-            assert_eq!(slot_index(new) / SLOT_CHUNK, slot_index(kept) / SLOT_CHUNK);
-            assert!(slot_index(new) / SLOT_CHUNK < base);
+            assert_eq!(
+                slot_index(new) / SLOT_CHUNK,
+                kept_chunk,
+                "the thread's open chunk"
+            );
+            assert!(ARENA.with(|a| kept_chunk < a.borrow().slots.base));
             free_synthetic_nodes();
         })
         .join()
