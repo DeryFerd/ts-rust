@@ -1347,6 +1347,11 @@ impl BuildStores {
     /// The file id of the next store of this thread. Only a publish changes
     /// `PUBLISHED`, so the ids of one build are consecutive.
     fn next_id(&mut self) -> usize {
+        // A test build waits while another test thread builds stores.
+        #[cfg(test)]
+        if self.stores.is_empty() {
+            crate::test_lock::begin_build();
+        }
         let published = PUBLISHED.load(Ordering::Acquire);
         if self.stores.is_empty() {
             self.base = published;
@@ -4851,6 +4856,9 @@ pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
 // PORT: Go needs no publish; its nodes are heap objects. The publish also
 // computes `NodeHeader::source_file_is_root` for `get_source_file_of_node`.
 pub fn publish_file_stores(go_files: Vec<GoFile>) {
+    // A test build gives the build lock back after the publish.
+    #[cfg(test)]
+    let _build_end = crate::test_lock::BuildEnd;
     // The cells stay leaked and empty. Nothing reads them after this, and
     // the next build stores of this thread reuse them (`build_store_cell`).
     ACTIVE.set(None);
@@ -9036,10 +9044,11 @@ mod tests {
     // one (step 2 skeptic), so this test does, and reads the parents before
     // the publish (the store), after it (the block of a static file and the
     // node shell of a freeable file version), and after that version dies
-    // (its records stay leaked). It publishes, so no other test may build
-    // or publish stores while it runs (the runner uses one thread).
+    // (its records stay leaked). Its version dies, so it holds the store
+    // build lock (`crate::test_lock::hold`).
     #[test]
     fn foreign_parents_read_through_the_file_block() {
+        crate::test_lock::hold();
         let a = new_file_store("/foreign/a.ts", "x;");
         let b = new_file_store("/foreign/b.ts", "y; w;");
         let c = new_file_store("/foreign/c.ts", "v;");
@@ -9171,13 +9180,14 @@ mod tests {
     }
 
     // fileid1: with a test cap, the last id below the cap is given and
-    // published, and the next new store stops at the cap. It publishes, so
-    // no other test may build or publish stores while it runs (the runner
-    // uses one thread).
+    // published, and the next new store stops at the cap. It reads the
+    // published count, so it holds the store build lock
+    // (`crate::test_lock::hold`).
     #[test]
     fn new_file_ids_stop_at_the_cap() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
         let message = std::thread::spawn(|| {
+            crate::test_lock::hold();
             let cap = PUBLISHED.load(Ordering::Acquire) + 1;
             TEST_FILE_ID_CAP.set(cap);
             let last = new_file_store("/fileidcap/a.ts", "a;");
@@ -9314,9 +9324,8 @@ mod tests {
     // astmem1 P3: the bind ORs its added flags into the `flags` word of a
     // record, whose top bits are the record bits (`RECORD_BITS`). A flag
     // outside `BINDER_ADDED_FLAGS` (a binder bug) stops the bind in every
-    // build, before it writes the record. It publishes, so no other test
-    // may build or publish stores while it runs (the runner uses one
-    // thread).
+    // build, before it writes the record. Its build takes the store build
+    // lock (`crate::test_lock`).
     #[test]
     fn a_bind_flag_outside_binder_added_flags_panics_in_every_build() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -9357,13 +9366,14 @@ mod tests {
     // and the extras) in every build (`check_block_owner`), every other
     // read with debug assertions. Without them a header read gives the new
     // owner's data (these shells have plain kind columns, which are not
-    // pooled; shells with equal kinds share one: `plain_kinds`). It
-    // publishes, so no other test may build or publish stores while it
-    // runs (the runner uses one thread).
+    // pooled; shells with equal kinds share one: `plain_kinds`). It reads
+    // the block pool and counts pin releases, so it holds the store build
+    // lock (`crate::test_lock::hold`).
     #[test]
     fn pooled_node_blocks_wait_two_releases_and_check_their_owner() {
         use super::super::file_version::{FileVersion, release_file_version_pins};
         use std::panic::{AssertUnwindSafe, catch_unwind};
+        crate::test_lock::hold();
         clear_block_pool();
         // Publishes a freeable version of one identifier per name.
         let identifiers = |name: &'static str, names: &[&str]| {
@@ -9506,11 +9516,12 @@ mod tests {
     // watchfree1: a node shell shares the kind column of any earlier shell
     // with equal kinds, not only of the last few (`plain_kinds`): a
     // `tsc --watch` build after a config change parses every file again.
-    // It publishes, so no other test may build or publish stores while it
-    // runs (the runner uses one thread).
+    // It reads the block pool, so it holds the store build lock
+    // (`crate::test_lock::hold`).
     #[test]
     fn node_shells_share_any_equal_kind_column() {
         use super::super::file_version::FileVersion;
+        crate::test_lock::hold();
         clear_block_pool();
         // Publishes a freeable version of `count` identifiers, and gives
         // the address of its kind column.
@@ -9602,11 +9613,12 @@ mod tests {
     // in its pooled block (`BlockFile::shell_kinds`), and its plain column
     // is the prefix of the newest column of the file that has the same
     // kinds (edleak3). Equal kinds share a plain column at any time. It
-    // publishes, so no other test may build or publish stores while it
-    // runs (the runner uses one thread).
+    // reads the block pool, so it holds the store build lock
+    // (`crate::test_lock::hold`).
     #[test]
     fn later_new_kinds_go_in_the_pooled_block_past_the_budget() {
         use super::super::file_version::FileVersion;
+        crate::test_lock::hold();
         // Empties the pool again when the test ends, after its versions
         // drop (it is made first, so it drops last), so a later test in the
         // process does not start with the budget used up.

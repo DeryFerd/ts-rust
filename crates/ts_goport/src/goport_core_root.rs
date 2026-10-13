@@ -67,6 +67,9 @@ pub mod pseudochecker;
 pub mod scanner_util;
 pub mod sourcemap;
 pub mod spanmap;
+/// Test builds only: one test thread at a time builds node stores.
+#[cfg(test)]
+mod test_lock;
 pub mod thp_guard;
 pub mod tracing;
 pub mod transformers;

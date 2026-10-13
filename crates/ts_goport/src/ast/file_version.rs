@@ -1186,8 +1186,11 @@ mod tests {
 
     // A map keeps the entries of a dead version until its next write, then
     // forgets them and keeps the entries of other files.
+    // It holds the store build lock (`crate::test_lock::hold`): a version
+    // that dies here must not die while another test reads the deaths.
     #[test]
     fn per_file_map_forgets_dead_file_versions() {
+        crate::test_lock::hold();
         const DYING: usize = (1 << 22) - 1;
         const OTHER: usize = DYING - 1;
         let mut map = PerFileMap::new();
@@ -1226,8 +1229,11 @@ mod tests {
     /// Publishes on this thread a freeable version of a file of one
     /// identifier per name and pins it. Gives the version (its other
     /// holder) and a weak handle to its text, which goes with its data (its
-    /// store).
+    /// store). The thread holds the store build lock to its end
+    /// (`crate::test_lock::hold`): the tests read version deaths, pin
+    /// releases and the free thread, which other tests also change.
     fn publish_pinned(name: &'static str, names: &[&str]) -> (Arc<FileVersion>, Weak<str>) {
+        crate::test_lock::hold();
         let text = FileText::Shared(Arc::from(names.join(";")));
         let weak = text.weak().expect("a shared text");
         let file = super::super::store::new_file_store(name, text);
@@ -1249,9 +1255,8 @@ mod tests {
     // and a read of it panics. The data of a version of `min_nodes` or more
     // nodes goes to the free thread, which frees it after the values queued
     // before it. The data of a smaller version is freed in the release. A
-    // version with another holder lives until that holder lets go. It
-    // publishes, so no other test may build or publish stores while it runs
-    // (the runner uses one thread).
+    // version with another holder lives until that holder lets go. Its
+    // thread holds the store build lock (`publish_pinned`).
     #[test]
     fn background_pin_release_frees_on_the_free_thread() {
         // Its own thread, so the background mode stays there.
@@ -1316,14 +1321,18 @@ mod tests {
     // followups30 item 3 (b): a `PinRelease` that waits in the garbage of
     // `gostd::local` when its thread ends drops its pins there, so the
     // thread's end frees the data and does not send it to the free thread
-    // (a thread-local destructor must not start that thread). It publishes,
-    // so no other test may build or publish stores while it runs (the
-    // runner uses one thread).
+    // (a thread-local destructor must not start that thread). Its inner
+    // thread holds the store build lock (`crate::test_lock::hold`) and
+    // blocks the free thread. The test thread does not block it: it would
+    // then wait for the inner thread, which waits for the lock, while a test
+    // that holds the lock waits for the free thread.
     #[test]
     fn a_pin_release_at_the_thread_end_frees_in_place() {
-        // First, so the free thread exists and the end does not start it.
-        let go = block_free_thread();
-        let (probe, text) = std::thread::spawn(|| {
+        let (probe, text, go) = std::thread::spawn(|| {
+            // First, so its thread-local drops last, after the version dies.
+            crate::test_lock::hold();
+            // Then the free thread, so it exists and the end does not start it.
+            let go = block_free_thread();
             // `PINS` before `LOCAL` (`keep_garbage`): the thread-local
             // destructors run in the reverse order of the first uses, so
             // `LOCAL` drops the release while the pins are still there.
@@ -1341,7 +1350,7 @@ mod tests {
             );
             let probe = file_version_probe(node(file)).expect("the pin holds the version");
             // The thread ends with no `drop_garbage`.
-            (probe, text)
+            (probe, text, go)
         })
         .join()
         .expect("the test thread ends");
@@ -1356,9 +1365,8 @@ mod tests {
     // followups32 (followups30 item 3 (a)): a version that dies in a pin
     // release on a thread that frees in the background leaves the registry
     // in the release (`FileVersion::drop`), before its data goes to the free
-    // thread, so a busy free thread leaves no entry of a dead version. It
-    // publishes, so no other test may build or publish stores while it runs
-    // (the runner uses one thread).
+    // thread, so a busy free thread leaves no entry of a dead version. Its
+    // thread holds the store build lock (`publish_pinned`).
     #[test]
     fn a_pin_release_takes_a_dying_version_out_of_the_registry() {
         std::thread::spawn(|| {
@@ -1388,9 +1396,8 @@ mod tests {
     // this thread shares does not unwrap in a pin release (`Rc::try_unwrap`
     // fails): the pin drops there, and the guard keeps the version, which
     // stays live and in the registry. When the guard drops, the version
-    // dies there, and its data is freed with it, not on the free thread. It
-    // publishes, so no other test may build or publish stores while it runs
-    // (the runner uses one thread).
+    // dies there, and its data is freed with it, not on the free thread. Its
+    // thread holds the store build lock (`publish_pinned`).
     #[test]
     fn a_pin_release_keeps_a_version_that_a_guard_shares() {
         std::thread::spawn(|| {
@@ -1446,8 +1453,8 @@ mod tests {
     // to the build's free thread, so its id is dead, it is not in the
     // registry and a read of it panics while the free thread is busy. The
     // free thread frees its data later. A version with another holder lives
-    // until that holder lets go. It publishes, so no other test may build or
-    // publish stores while it runs (the runner uses one thread).
+    // until that holder lets go. Its thread holds the store build lock
+    // (`publish_pinned`).
     #[test]
     fn a_dropped_kept_parse_dies_before_its_data_goes_to_the_free_thread() {
         std::thread::spawn(|| {
@@ -1498,6 +1505,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "file version 4194301 is released")]
     fn node_id_of_a_dead_file_version_panics() {
+        // Its version dies (`per_file_map_forgets_dead_file_versions`).
+        crate::test_lock::hold();
         const DYING: usize = (1 << 22) - 3;
         const OTHER: usize = DYING - 1;
         let version = FileVersion::new(DYING);
