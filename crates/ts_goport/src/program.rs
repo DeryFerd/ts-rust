@@ -6063,6 +6063,8 @@ mod tests {
             }
             result
         }
+        // The parsed files stay unpublished: the test reads them to its end.
+        let _stores = build_stores();
         let parse = |name: &str| {
             let opts = SourceFileParseOptions {
                 file_name: name.to_string(),
@@ -6223,6 +6225,18 @@ mod tests {
         }
     }
 
+    /// Held by each test of this module while it builds node stores: a
+    /// program load, or a parse outside a program. A thread builds its
+    /// stores at the file ids after the published ones, so a load that
+    /// another thread publishes meanwhile takes those ids. The build then
+    /// reads the published files in place of its own, and its own publish
+    /// fails ("another thread published file ids"). With the lock, the
+    /// tests pass on parallel test threads (followups63).
+    fn build_stores() -> std::sync::MutexGuard<'static, ()> {
+        static BUILD_STORES: Mutex<()> = Mutex::new(());
+        BUILD_STORES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// A program version of one empty file, for a test that needs a current
     /// program and reads none of it.
     fn small_program(name: &str) -> &'static GoProgram {
@@ -6235,8 +6249,11 @@ mod tests {
         )
         .unwrap();
         let config = dir.join("tsconfig.json");
-        let program = try_load_version(&config.to_string_lossy(), |_| {})
-            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let program = {
+            let _stores = build_stores();
+            try_load_version(&config.to_string_lossy(), |_| {})
+                .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()))
+        };
         let _ = std::fs::remove_dir_all(&dir);
         program
     }
