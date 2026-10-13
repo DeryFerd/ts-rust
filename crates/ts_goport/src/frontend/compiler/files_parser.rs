@@ -2945,8 +2945,9 @@ impl PrefetchShared {
 
     /// Queues a parse of each file in `names` that the parser can take
     /// (`parse_request`), with one lock of the queue.
-    // PERF (syscut1): a lock per name made the parse workers wait for the
-    // queue lock about 4,000 times in a VS Code load.
+    // PERF (syscut1): with a lock per name, the queue lock took 15,000 to
+    // 24,000 futex calls in a VS Code load (testbox, 4 runs), and 7,000 to
+    // 12,000 with one lock per call.
     fn queue_names(&self, names: Vec<String>) {
         let requests: Vec<_> = names
             .into_iter()

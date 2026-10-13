@@ -714,8 +714,9 @@ const SHARED_MAP_SHARDS: usize = 64;
 /// shards by the key hash (`shard`).
 // PORT: a Go `SyncMap` reads a key with no lock, so the parse goroutines
 // that look up and store answers at once do not wait for each other. One
-// lock over the whole map made the parse workers wait for it about 17,000
-// times in a VS Code load (syscut1: 45% of the futex calls of the load).
+// lock over the whole module map made the parse workers wait for it about
+// 17,000 times in a VS Code load (syscut1, testbox: 45% of the futex calls
+// of the load).
 struct SharedMap<K, V> {
     shards: Box<[std::sync::Mutex<FxHashMap<K, V>>]>,
 }
