@@ -276,8 +276,9 @@ struct SlotChunk {
 // PORT: Go's GC frees the nodes of a released program, and nothing names
 // them after.
 // PERF: a read of `near` is one subtraction more than a read of the flat
-// table; a read of `far` is a cold hash lookup. The command line frees only
-// the print chunks of a to-string call that filled more than one
+// table, and `entry` takes a register copy out for it (followups59); a read
+// of `far` is a cold hash lookup. The command line frees only the print
+// chunks of a to-string call that filled more than one
 // (`take_full_print_chunks`, on a checker thread with no d.ts twin), so it
 // compacts only when those holes are 3/4 of a table. Counted with uprobes
 // on the R209 bins (followups59, `--noEmit`): Excalidraw compacts the slot
@@ -322,16 +323,73 @@ impl<T> ChunkTable<T> {
     /// Chunk `c`, or `None` when it is freed or not made.
     #[inline]
     fn get(&self, c: usize) -> Option<&T> {
-        match self.near.get(c.wrapping_sub(self.base)) {
+        let i = c.wrapping_sub(self.base);
+        match self.near.get(i) {
             Some(Some(chunk)) => Some(chunk),
-            _ => self.far_get(c),
+            _ => self.far_get(i),
         }
     }
 
+    /// Chunk `c`. Panics when it is freed (`FREED`).
+    // PERF (followups59): for the reads that need the chunk (the pushes).
+    // The cold path takes `i`, so the fast path keeps no copy of `c`, and it
+    // panics itself, so the fast path has no second branch. R209 read
+    // through `get(..).expect(FREED)`, and a push read its open chunk twice:
+    // on the R209 PGO+BOLT tsgo, Excalidraw `--noEmit --singleThreaded` ran
+    // 3 instructions more per `SyntheticArena::node` call and 13 more per
+    // new node than on R208 (callgrind).
+    #[inline]
+    fn at(&self, c: usize) -> &T {
+        let i = c.wrapping_sub(self.base);
+        match self.near.get(i) {
+            Some(Some(chunk)) => chunk,
+            _ => self.far_at(i),
+        }
+    }
+
+    /// Entry `index % PER` of chunk `index / PER`, picked by `pick`, for a
+    /// table with `PER` entries per chunk. Panics when the chunk is freed.
+    // PERF (followups59): `at` for the hottest reads (`slot`, `data`,
+    // `own_list`). The cold path takes `index` and picks the entry itself,
+    // so the fast path keeps no copy of the chunk number and nothing lives
+    // across the call. Plain release builds, callgrind on Excalidraw
+    // `--noEmit`: `SyntheticArena::node` runs 25 instructions per call,
+    // against 26 on R208 (flat table) and 27 on R209.
+    #[inline]
+    fn entry<'a, const PER: usize, E: ?Sized>(
+        &'a self,
+        index: usize,
+        pick: impl Fn(&'a T, usize) -> &'a E,
+    ) -> &'a E {
+        match self.near.get((index / PER).wrapping_sub(self.base)) {
+            Some(Some(chunk)) => pick(chunk, index % PER),
+            _ => self.far_entry::<PER, E>(index, pick),
+        }
+    }
+
+    /// `entry` in `far`.
     #[cold]
     #[inline(never)]
-    fn far_get(&self, c: usize) -> Option<&T> {
-        self.far.get(&c)
+    fn far_entry<'a, const PER: usize, E: ?Sized>(
+        &'a self,
+        index: usize,
+        pick: impl Fn(&'a T, usize) -> &'a E,
+    ) -> &'a E {
+        pick(self.far.get(&(index / PER)).expect(FREED), index % PER)
+    }
+
+    /// The chunk of number `i + base` (wrapping) in `far`.
+    #[cold]
+    #[inline(never)]
+    fn far_get(&self, i: usize) -> Option<&T> {
+        self.far.get(&i.wrapping_add(self.base))
+    }
+
+    /// `far_get` that panics when the chunk is freed.
+    #[cold]
+    #[inline(never)]
+    fn far_at(&self, i: usize) -> &T {
+        self.far_get(i).expect(FREED)
     }
 
     /// `get` to write.
@@ -340,6 +398,17 @@ impl<T> ChunkTable<T> {
         match self.near.get_mut(c.wrapping_sub(self.base)) {
             Some(Some(chunk)) => Some(chunk),
             _ => self.far.get_mut(&c),
+        }
+    }
+
+    /// `at` to write.
+    #[inline]
+    fn at_mut(&mut self, c: usize) -> &mut T {
+        let base = self.base;
+        let i = c.wrapping_sub(base);
+        match self.near.get_mut(i) {
+            Some(Some(chunk)) => chunk,
+            _ => far_at_mut(&mut self.far, i.wrapping_add(base)),
         }
     }
 
@@ -454,6 +523,13 @@ impl<T> ChunkTable<T> {
         }
         self.base += cut;
     }
+}
+
+/// `ChunkTable::at_mut` in `far`: chunk `c`. Panics when it is freed.
+#[cold]
+#[inline(never)]
+fn far_at_mut<T>(far: &mut FxHashMap<usize, T>, c: usize) -> &mut T {
+    far.get_mut(&c).expect(FREED)
 }
 
 /// The panic of a read of an entry whose owner was freed.
@@ -747,17 +823,18 @@ impl SyntheticArena {
     /// Slot `index`. Panics when its owner was freed.
     #[inline]
     fn slot(&self, index: usize) -> &Slot {
-        &self.slots.get(index / SLOT_CHUNK).expect(FREED).slots[index % SLOT_CHUNK]
+        self.slots
+            .entry::<SLOT_CHUNK, _>(index, |chunk, i| &chunk.slots[i])
     }
 
     /// `slot` to write.
     fn slot_mut(&mut self, index: usize) -> &mut Slot {
-        &mut self.slots.get_mut(index / SLOT_CHUNK).expect(FREED).slots[index % SLOT_CHUNK]
+        &mut self.slots.at_mut(index / SLOT_CHUNK).slots[index % SLOT_CHUNK]
     }
 
     /// The owner of slot `index`. Panics when it was freed.
     fn slot_owner(&self, index: usize) -> OwnerKey {
-        self.slots.get(index / SLOT_CHUNK).expect(FREED).owner
+        self.slots.at(index / SLOT_CHUNK).owner
     }
 
     /// Adds a slot of `owner` and returns its index.
@@ -815,8 +892,8 @@ impl SyntheticArena {
     /// freed.
     #[inline]
     fn data(&self, index: u32) -> &crate::astdata::Node {
-        let i = index as usize;
-        self.datas.get(i / DATA_CHUNK).expect(FREED)[i % DATA_CHUNK]
+        self.datas
+            .entry::<DATA_CHUNK, _>(index as usize, |chunk, i| &chunk[i])
             .get()
             .expect("synthetic node data entry is not filled")
     }
@@ -839,8 +916,8 @@ impl SyntheticArena {
     /// The factory list of entry `index`. Panics when its owner was freed.
     #[inline]
     fn own_list(&self, index: u32) -> &OwnList {
-        let i = index as usize;
-        &self.lists.get(i / LIST_CHUNK).expect(FREED)[i % LIST_CHUNK]
+        self.lists
+            .entry::<LIST_CHUNK, _>(index as usize, |chunk, i| &chunk[i])
     }
 
     /// Adds a factory list of `owner` and returns its index.
@@ -855,23 +932,21 @@ impl SyntheticArena {
             ..
         } = self;
         let chunks = owner_chunks(base, owners, alias_files, &mut print.chunks, owner);
-        let open = chunks
-            .lists
-            .last()
-            .copied()
-            .filter(|&c| lists.get(c as usize).expect(FREED).len() < LIST_CHUNK);
-        let c = match open {
-            Some(c) => c,
-            None => {
-                let c = new_chunk_number(shared, LIST_TABLE, lists.len(), LIST_CHUNK);
-                lists.set(c as usize, Vec::with_capacity(LIST_CHUNK));
-                chunks.lists.push(c);
-                c
+        // PERF (followups59): one table read for the open chunk, as in
+        // `push_slot_into`.
+        if let Some(&c) = chunks.lists.last() {
+            let chunk = lists.at_mut(c as usize);
+            if chunk.len() < LIST_CHUNK {
+                chunk.push(list);
+                return (c as usize * LIST_CHUNK + chunk.len() - 1) as u32;
             }
-        };
-        let chunk = lists.get_mut(c as usize).expect(FREED);
+        }
+        let c = new_chunk_number(shared, LIST_TABLE, lists.len(), LIST_CHUNK);
+        let mut chunk = Vec::with_capacity(LIST_CHUNK);
         chunk.push(list);
-        (c as usize * LIST_CHUNK + chunk.len() - 1) as u32
+        lists.set(c as usize, chunk);
+        chunks.lists.push(c);
+        (c as usize * LIST_CHUNK) as u32
     }
 
     /// The node slot of synthetic handle `n`.
@@ -962,29 +1037,27 @@ fn push_slot_into(
     owner: OwnerKey,
     slot: Slot,
 ) -> u32 {
-    let open = chunks
-        .slots
-        .last()
-        .copied()
-        .filter(|&c| slots.get(c as usize).expect(FREED).slots.len() < SLOT_CHUNK);
-    let c = match open {
-        Some(c) => c,
-        None => {
-            let c = new_chunk_number(shared, SLOT_TABLE, slots.len(), SLOT_CHUNK);
-            slots.set(
-                c as usize,
-                SlotChunk {
-                    owner,
-                    slots: Vec::with_capacity(SLOT_CHUNK),
-                },
-            );
-            chunks.slots.push(c);
-            c
+    // PERF (followups59): one table read for the open chunk. R209 read it
+    // twice (its length, then the push), each read with a `far` path.
+    if let Some(&c) = chunks.slots.last() {
+        let chunk = &mut slots.at_mut(c as usize).slots;
+        if chunk.len() < SLOT_CHUNK {
+            chunk.push(slot);
+            return (c as usize * SLOT_CHUNK + chunk.len() - 1) as u32;
         }
-    };
-    let chunk = &mut slots.get_mut(c as usize).expect(FREED).slots;
+    }
+    let c = new_chunk_number(shared, SLOT_TABLE, slots.len(), SLOT_CHUNK);
+    let mut chunk = Vec::with_capacity(SLOT_CHUNK);
     chunk.push(slot);
-    (c as usize * SLOT_CHUNK + chunk.len() - 1) as u32
+    slots.set(
+        c as usize,
+        SlotChunk {
+            owner,
+            slots: chunk,
+        },
+    );
+    chunks.slots.push(c);
+    (c as usize * SLOT_CHUNK) as u32
 }
 
 /// `SyntheticArena::push_data` on the arena tables: `chunks` are the chunks
@@ -1012,9 +1085,7 @@ fn push_data_into(
     };
     chunks.data_fill = cell + 1;
     assert!(
-        datas.get(c as usize).expect(FREED)[cell as usize]
-            .set(node)
-            .is_ok(),
+        datas.at(c as usize)[cell as usize].set(node).is_ok(),
         "synthetic node data entry is filled twice"
     );
     (c as usize * DATA_CHUNK + cell as usize) as u32
@@ -1154,9 +1225,7 @@ pub fn enter_print_scope() {
         let c = &print.chunks;
         print.start = next(
             &c.slots,
-            c.slots
-                .last()
-                .map(|&c| slots.get(c as usize).expect(FREED).slots.len()),
+            c.slots.last().map(|&c| slots.at(c as usize).slots.len()),
             SLOT_CHUNK,
         );
         print.data_start = next(
@@ -1166,9 +1235,7 @@ pub fn enter_print_scope() {
         );
         print.list_start = next(
             &c.lists,
-            c.lists
-                .last()
-                .map(|&c| lists.get(c as usize).expect(FREED).len()),
+            c.lists.last().map(|&c| lists.at(c as usize).len()),
             LIST_CHUNK,
         );
     });
@@ -1253,7 +1320,11 @@ pub fn exit_print_scope() -> Option<Vec<(u32, u32)>> {
         } = &mut *a;
         clear_print_call(print, slots, datas, lists, &ranges);
         let freed = take_full_print_chunks(&mut print.chunks, slots, datas, lists);
-        a.compact();
+        // PERF (followups59): most calls free no chunk, and then no table
+        // has a new hole.
+        if !(freed.0.is_empty() && freed.1.is_empty() && freed.2.is_empty()) {
+            a.compact();
+        }
         (Some(ranges), Some(freed))
     });
     // The payloads drop after the arena borrow ends.
@@ -1268,7 +1339,7 @@ impl SyntheticArena {
         let (first, filled) = self.print.start;
         let mut ranges = Vec::new();
         for (i, &c) in self.print.chunks.slots.iter().enumerate().skip(first) {
-            let len = self.slots.get(c as usize).expect(FREED).slots.len();
+            let len = self.slots.at(c as usize).slots.len();
             let lo = if i == first { filled } else { 0 };
             if len > lo {
                 let base = c as usize * SLOT_CHUNK;
@@ -1285,7 +1356,7 @@ impl SyntheticArena {
         let owner = self.current_owner();
         let chunks = std::mem::take(&mut self.print.chunks);
         for &c in &chunks.slots {
-            self.slots.get_mut(c as usize).expect(FREED).owner = owner;
+            self.slots.at_mut(c as usize).owner = owner;
         }
         let SyntheticArena {
             base,
@@ -1326,7 +1397,7 @@ fn clear_print_call(
         && lo as usize / SLOT_CHUNK == last as usize
     {
         let base = last as usize * SLOT_CHUNK;
-        let chunk = &mut slots.get_mut(last as usize).expect(FREED).slots;
+        let chunk = &mut slots.at_mut(last as usize).slots;
         for slot in &mut chunk[lo as usize - base..hi as usize - base] {
             *slot = Slot::Freed;
         }
@@ -1355,7 +1426,7 @@ fn clear_print_call(
     if let Some(&last) = c.lists.last()
         && let Some(lo) = call_from(print.list_start, c.lists.len())
     {
-        let chunk = lists.get_mut(last as usize).expect(FREED);
+        let chunk = lists.at_mut(last as usize);
         for list in chunk.iter_mut().skip(lo) {
             *list = OwnList::Freed;
         }
@@ -1704,7 +1775,7 @@ fn synthetic_ast_node(n: Node) -> HeldNode {
         let a = a.borrow();
         let i = a.node(n).data as usize;
         HeldNode {
-            chunk: Rc::clone(a.datas.get(i / DATA_CHUNK).expect(FREED)),
+            chunk: Rc::clone(a.datas.at(i / DATA_CHUNK)),
             cell: i % DATA_CHUNK,
         }
     })
