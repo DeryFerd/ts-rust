@@ -1598,8 +1598,11 @@ impl BlockFile {
         Node(self.root.load(Ordering::Relaxed))
     }
 
-    /// `FileBlock::kind` of slot `index` of a node shell. Past the column it
-    /// panics, as `kinds[index]` does.
+    /// `FileBlock::kind` of slot `index` of a node shell. A shell that uses
+    /// the `BlockFile` of its pooled block reads the whole block column, so
+    /// an index past its slots and inside the block gives a stale kind of an
+    /// earlier owner of the block (only an invalid handle reads there). Past
+    /// the column it panics.
     // PERF (edleak3): a table read, with no call. `SyntaxKind::try_from`
     // is in goport_util, so it was a call, and `expect` a second branch.
     // The read stays out of line: inline at each kind read (as `try_from`
