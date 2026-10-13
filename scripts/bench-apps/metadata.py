@@ -32,7 +32,7 @@ compiler_platform, bun_platform = {
 }[(platform.system(), platform.machine())]
 tools = {
     'tsc-rs': Path(os.environ.get('RS_BIN', work / f'node_modules/@tsc-rs/{compiler_platform}/lib/tsc')),
-    'tsc-rs-0.3.0': work / f'node_modules/@tsc-rs/{compiler_platform}/lib/tsc',
+    'tsc-rs-fast': Path(os.environ.get('RS_BIN', work / f'node_modules/@tsc-rs/{compiler_platform}/lib/tsc')),
     'tsc7': work / f'node_modules/@typescript/typescript-{compiler_platform}/lib/tsc',
     'bun': work / f'bun-{bun_platform}/bun',
 }
