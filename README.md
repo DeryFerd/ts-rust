@@ -13,11 +13,11 @@ without Effect diagnostics.
 
 | Checker | Time | Relative time | Speed vs `tsc` 7 |
 | --- | ---: | --- | ---: |
-| `tsc-rs` 0.6.0 `--fast` (Effect built in) | 9.77s | ██ | 4.35× |
-| `tsc-rs` 0.6.0 (Effect built in) | 14.30s | ███ | 2.98× |
-| `tsc` 7 + `@effect/tsgo` | 42.55s | ████████ | baseline |
-| `bun check`, then `effect-tsgo diagnostics` | 59.24s | ███████████ | 0.72× |
-| `tsc` 6 + JavaScript Effect plugin | 191.00s | ████████████████████████████████████ | 0.22× |
+| `tsc-rs` 0.6.0 `--fast` (Effect built in) | 9.77s | █ | 4.35× |
+| `tsc-rs` 0.6.0 (Effect built in) | 14.30s | █▌ | 2.98× |
+| `tsc` 7 + `@effect/tsgo` | 42.55s | ████▌ | baseline |
+| `bun check`, then `effect-tsgo diagnostics` | 59.24s | ██████▎ | 0.72× |
+| `tsc` 6 + JavaScript Effect plugin | 191.00s | ████████████████████ | 0.22× |
 
 ## Motivations
 
@@ -182,11 +182,11 @@ Bar length is in proportion to time.
 
 | Checker | Time | Relative time | Speed vs `tsc` 7 |
 | --- | ---: | --- | ---: |
-| `tsc-rs` 0.6.0 `--fast` (Effect built in) | 9.77s | ██ | 4.35× |
-| `tsc-rs` 0.6.0 (Effect built in) | 14.30s | ███ | 2.98× |
-| `tsc` 7 + `@effect/tsgo` | 42.55s | ████████ | baseline |
-| `bun check`, then `effect-tsgo diagnostics` | 59.24s | ███████████ | 0.72× |
-| `tsc` 6 + JavaScript Effect plugin | 191.00s | ████████████████████████████████████ | 0.22× |
+| `tsc-rs` 0.6.0 `--fast` (Effect built in) | 9.77s | █ | 4.35× |
+| `tsc-rs` 0.6.0 (Effect built in) | 14.30s | █▌ | 2.98× |
+| `tsc` 7 + `@effect/tsgo` | 42.55s | ████▌ | baseline |
+| `bun check`, then `effect-tsgo diagnostics` | 59.24s | ██████▎ | 0.72× |
+| `tsc` 6 + JavaScript Effect plugin | 191.00s | ████████████████████ | 0.22× |
 
 With Effect, `tsc-rs --fast` is fastest: 4.35× the Effect-patched `tsc` 7 and 6.1× Bun
 followed by the separate Effect pass. On the smallest projects (`apps/mobile`,
@@ -199,11 +199,11 @@ Bar length is in proportion to time.
 
 | Checker | Time | Relative time | Speed vs `tsc` 7 |
 | --- | ---: | --- | ---: |
-| `bun check` | 6.24s | ███ | 3.12× |
-| `tsc-rs` 0.6.0 `--fast` | 6.91s | ███ | 2.81× |
-| `tsc-rs` 0.6.0 | 7.95s | ███ | 2.45× |
-| `tsc` 7 | 19.45s | ████████ | baseline |
-| `tsc` 6 | 87.87s | ████████████████████████████████████ | 0.22× |
+| `bun check` | 6.24s | █▍ | 3.12× |
+| `tsc-rs` 0.6.0 `--fast` | 6.91s | █▋ | 2.81× |
+| `tsc-rs` 0.6.0 | 7.95s | █▊ | 2.45× |
+| `tsc` 7 | 19.45s | ████▍ | baseline |
+| `tsc` 6 | 87.87s | ████████████████████ | 0.22× |
 
 Bun is fastest without Effect.
 
