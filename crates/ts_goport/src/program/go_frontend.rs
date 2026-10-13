@@ -1876,7 +1876,7 @@ fn assert_same_include_diagnostics(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// A copy of `np` with the file at `slot` parsed again, as Go
@@ -1914,8 +1914,9 @@ mod tests {
     /// A program whose `index.ts` imports two packages, each with its own
     /// copy of pkg@1.0.0: a package redirect group. The second copy's path
     /// is a redirect path, and the first copy is its target. `name` names
-    /// the fixture dir. The caller enters the program scope.
-    fn redirect_group_program(name: &str) -> NewProgram {
+    /// the fixture dir. The caller enters the program scope. The split
+    /// tests (`ls_program`) use it too.
+    pub(in crate::program) fn redirect_group_program(name: &str) -> NewProgram {
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let pkg = r#"{"name":"pkg","version":"1.0.0","types":"index.d.ts"}"#;
