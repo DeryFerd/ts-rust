@@ -288,6 +288,9 @@ struct ChunkTable<T> {
     far: FxHashMap<usize, T>,
     /// The `Some` entries of `near`.
     live: usize,
+    /// The empty entries of `near` when `compact` last found no cut, else
+    /// 0. `compact` scans again only when more entries are empty.
+    no_cut_empty: usize,
 }
 
 /// `ChunkTable::compact` runs when `near` has at least this many empty
@@ -301,6 +304,7 @@ impl<T> ChunkTable<T> {
             base: 0,
             far: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
             live: 0,
+            no_cut_empty: 0,
         }
     }
 
@@ -384,6 +388,7 @@ impl<T> ChunkTable<T> {
             base: self.base,
             far: self.far.iter().map(|(&c, chunk)| (c, f(chunk))).collect(),
             live: self.live,
+            no_cut_empty: self.no_cut_empty,
         }
     }
 
@@ -402,15 +407,24 @@ impl<T> ChunkTable<T> {
                 .map(|(c, chunk)| (c, f(chunk)))
                 .collect(),
             live: self.live,
+            no_cut_empty: self.no_cut_empty,
         }
     }
 
     /// Moves `base` up when most of `near` is empty (`COMPACT_MIN_EMPTY`):
     /// to the cut that drops the most empty entries for the live chunks it
-    /// moves to `far`, each of which counts as 4 empty entries.
+    /// moves to `far`, each of which counts as 4 empty entries. When no cut
+    /// drops any (live chunks at the front, the holes after them), it does
+    /// not scan again until more entries are empty (`no_cut_empty`).
+    // PERF (followups59): without that, every free and every outermost
+    // print exit scanned all of `near` in 3 tables while the trigger held
+    // and no cut was possible.
     fn compact(&mut self) {
         let empty = self.near.len() - self.live;
-        if empty < COMPACT_MIN_EMPTY || empty * 4 < self.near.len() * 3 {
+        if empty < COMPACT_MIN_EMPTY
+            || empty * 4 < self.near.len() * 3
+            || empty <= self.no_cut_empty
+        {
             return;
         }
         let (mut score, mut best, mut cut) = (0isize, 0isize, 0);
@@ -421,8 +435,10 @@ impl<T> ChunkTable<T> {
             }
         }
         if cut == 0 {
+            self.no_cut_empty = empty;
             return;
         }
+        self.no_cut_empty = 0;
         let base = self.base;
         for (i, chunk) in self.near.drain(..cut).enumerate() {
             if let Some(chunk) = chunk {
