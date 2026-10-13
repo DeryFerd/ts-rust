@@ -1054,8 +1054,8 @@ impl TableParts {
                 std::thread::scope(|scope| {
                     // `slots` and `meta` borrow only, so they are `Copy`: a
                     // part whose thread cannot start is made here.
-                    let slots_thread = crate::core::helper_thread(scope, "goport-tables", slots);
-                    let meta_thread = crate::core::helper_thread(scope, "goport-tables", meta);
+                    let slots_thread = crate::program::helper_thread(scope, "goport-tables", slots);
+                    let meta_thread = crate::program::helper_thread(scope, "goport-tables", meta);
                     beside();
                     fn join<T>(result: std::thread::Result<T>) -> T {
                         result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
@@ -1985,7 +1985,7 @@ pub(super) mod tests {
             )
         };
         let threaded = parts();
-        let fallback = crate::core::refuse_helper_threads(parts);
+        let fallback = crate::program::refuse_helper_threads(parts);
         assert_eq!(fallback, threaded);
     }
 
