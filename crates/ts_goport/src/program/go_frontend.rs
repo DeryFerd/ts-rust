@@ -73,7 +73,7 @@ pub(super) struct GoSharedState {
     known_symlinks: OnceLock<Arc<crate::modulespecifiers::symlinks::KnownSymlinks>>,
     /// The loading thread's part of `known_symlinks`, when another thread
     /// can finish it (`SymlinkSeed`, `build_lazy_shared_state`).
-    symlink_seed: std::sync::Mutex<Option<SymlinkSeed>>,
+    symlink_seed: SymlinkSeedSlot,
     /// Go `processedFiles.sourceFilesFoundSearchingNodeModules`, by path.
     /// Shared like `resolved_modules`.
     source_files_found_searching_node_modules: Arc<FxHashSet<String>>,
@@ -306,12 +306,9 @@ pub(super) fn known_symlinks() -> Arc<crate::modulespecifiers::symlinks::KnownSy
         // that asks meanwhile waits for it (`OnceLock::get_or_init`).
         return with_go(|go| {
             Arc::clone(go.known_symlinks.get_or_init(|| {
-                let seed = go
-                    .symlink_seed
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                    .expect("the loading thread made the symlink cache seed (`build_lazy_shared_state`)");
+                let seed = go.symlink_seed.take().expect(
+                    "the loading thread made the symlink cache seed (`build_lazy_shared_state`)",
+                );
                 Arc::new(seed.finish())
             }))
         });
@@ -335,7 +332,13 @@ pub(super) fn known_symlinks() -> Arc<crate::modulespecifiers::symlinks::KnownSy
             Arc::new(built.expect("without_fs_tracking runs its callback"))
         }
     };
-    with_go(|go| Arc::clone(go.known_symlinks.get_or_init(|| copy)))
+    with_go(|go| {
+        let built = Arc::clone(go.known_symlinks.get_or_init(|| copy));
+        // No thread finishes the seed now: free it and the load's lookups
+        // that it keeps.
+        go.symlink_seed.discard();
+        built
+    })
 }
 
 /// Makes the shared state values that the current program makes on first
@@ -354,26 +357,60 @@ pub(super) fn build_lazy_shared_state() {
     let Some(frontend) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned()) else {
         return;
     };
-    let ready = with_go(|go| {
-        go.known_symlinks.get().is_some()
-            || go
-                .symlink_seed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some()
-    });
+    let ready = with_go(|go| go.known_symlinks.get().is_some() || go.symlink_seed.is_set());
     if ready {
         return;
     }
     match SymlinkSeed::of(&frontend) {
-        Some(seed) => with_go(|go| {
-            *go.symlink_seed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seed);
-        }),
+        Some(seed) => with_go(|go| go.symlink_seed.set(seed)),
         None => {
             let _ = known_symlinks();
         }
+    }
+}
+
+/// The symlink cache seed of a program (`SymlinkSeed`), until the first
+/// thread that uses the cache takes it to finish it. A seed that no thread
+/// finishes (the loading thread built the cache itself, or no thread used
+/// it) frees on the free thread (`drop_in_background`), as do the load's
+/// lookups that it keeps: when the cache is built (`discard`), or when the
+/// program's shared state drops.
+// PORT: not in Go (see `SymlinkSeed`).
+#[derive(Default)]
+pub(super) struct SymlinkSeedSlot(std::sync::Mutex<Option<SymlinkSeed>>);
+
+impl SymlinkSeedSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<SymlinkSeed>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// True when the loading thread made the seed and no thread took it.
+    fn is_set(&self) -> bool {
+        self.lock().is_some()
+    }
+
+    fn set(&self, seed: SymlinkSeed) {
+        *self.lock() = Some(seed);
+    }
+
+    /// The seed, for the thread that finishes it.
+    fn take(&self) -> Option<SymlinkSeed> {
+        self.lock().take()
+    }
+
+    /// Frees the seed on the free thread: the cache is built.
+    fn discard(&self) {
+        if let Some(seed) = self.take() {
+            crate::execute::build::build_task::drop_in_background(seed);
+        }
+    }
+}
+
+impl Drop for SymlinkSeedSlot {
+    fn drop(&mut self) {
+        self.discard();
     }
 }
 
@@ -1735,7 +1772,7 @@ impl GoSharedState {
             redirects_for_resolution,
             resolved_project_references,
             known_symlinks,
-            symlink_seed: std::sync::Mutex::default(),
+            symlink_seed: SymlinkSeedSlot::default(),
             source_files_found_searching_node_modules,
             from_old_tables: reused.is_some(),
         }
@@ -2321,6 +2358,35 @@ pub(super) mod tests {
             );
         }
         drop(frontend);
+        crate::program::release_program(program);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // followups66: when the loading thread builds the symlink cache itself
+    // (here after it seeded a thread that did not use it), no thread
+    // finishes the seed, so the seed and the load's lookups that it keeps
+    // go at once (`SymlinkSeedSlot::discard`), not when the program drops.
+    #[cfg(unix)]
+    #[test]
+    fn loading_thread_build_frees_the_symlink_seed() {
+        let dir = symlinked_package_project("goport-seed-discard");
+        let program = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        {
+            let _scope = crate::core::enter_program(Some(program));
+            crate::program::spawn_seeded_thread(|| ())
+                .join()
+                .expect("the seeded thread ends");
+            assert!(
+                with_go(|go| go.symlink_seed.is_set()),
+                "seeding a thread made no symlink cache seed"
+            );
+            let _ = crate::program::get_go_symlink_cache().expect("a Go frontend program");
+            assert!(
+                !with_go(|go| go.symlink_seed.is_set()),
+                "the symlink cache seed outlived the cache"
+            );
+        }
         crate::program::release_program(program);
         let _ = std::fs::remove_dir_all(&dir);
     }
