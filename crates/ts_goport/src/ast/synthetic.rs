@@ -266,14 +266,25 @@ struct SlotChunk {
 /// (7.1 MiB of `slots`, `datas` and `lists` entries in a 10,000-edit
 /// query-core session). The table keeps the numbers from `base` on in
 /// `near`. When most of `near` is empty, `compact` moves `base` up past the
-/// empty entries, and the few live chunks below it go to `far`. A chunk
-/// below `base` takes no new entry (`is_near`), so new entries, and the
-/// reads of new nodes, stay in `near`.
+/// empty entries, and the few live chunks below it go to `far`. An owner
+/// still fills its open chunk when that chunk went to `far`, so no owner
+/// leaves a partly filled chunk there: before followups59 a new chunk took
+/// the next entries, and each compact left the open chunk of each
+/// long-lived owner (the thread) in `far`, a 14 KiB allocation per table
+/// for the life of the thread. The reads of the entries added there go
+/// through `far` (at most one chunk per owner and table after a compact).
 // PORT: Go's GC frees the nodes of a released program, and nothing names
 // them after.
 // PERF: a read of `near` is one subtraction more than a read of the flat
-// table; a read of `far` is a cold hash lookup. A process that frees no
-// chunk (the command line) never compacts.
+// table, and `entry` takes a register copy out for it (followups59); a read
+// of `far` is a cold hash lookup. The command line frees only the print
+// chunks of a to-string call that filled more than one
+// (`take_full_print_chunks`, on a checker thread with no d.ts twin), so it
+// compacts only when those holes are 3/4 of a table. Counted with uprobes
+// on the R209 bins (followups59, `--noEmit`): Excalidraw compacts the slot
+// table 16 times over its checker threads and moves 40 live chunks to
+// `far` (4 times and 28 chunks with `--singleThreaded`); VS Code and Sentry
+// never compact.
 #[derive(Clone)]
 struct ChunkTable<T> {
     /// Chunk `base + i` at `near[i]`; `None` for a freed chunk, or a number
@@ -284,6 +295,9 @@ struct ChunkTable<T> {
     far: FxHashMap<usize, T>,
     /// The `Some` entries of `near`.
     live: usize,
+    /// The empty entries of `near` when `compact` last found no cut, else
+    /// 0. `compact` scans again only when more entries are empty.
+    no_cut_empty: usize,
 }
 
 /// `ChunkTable::compact` runs when `near` has at least this many empty
@@ -297,6 +311,7 @@ impl<T> ChunkTable<T> {
             base: 0,
             far: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
             live: 0,
+            no_cut_empty: 0,
         }
     }
 
@@ -308,16 +323,73 @@ impl<T> ChunkTable<T> {
     /// Chunk `c`, or `None` when it is freed or not made.
     #[inline]
     fn get(&self, c: usize) -> Option<&T> {
-        match self.near.get(c.wrapping_sub(self.base)) {
+        let i = c.wrapping_sub(self.base);
+        match self.near.get(i) {
             Some(Some(chunk)) => Some(chunk),
-            _ => self.far_get(c),
+            _ => self.far_get(i),
         }
     }
 
+    /// Chunk `c`. Panics when it is freed (`FREED`).
+    // PERF (followups59): for the reads that need the chunk (the pushes).
+    // The cold path takes `i`, so the fast path keeps no copy of `c`, and it
+    // panics itself, so the fast path has no second branch. R209 read
+    // through `get(..).expect(FREED)`, and a push read its open chunk twice:
+    // on the R209 PGO+BOLT tsgo, Excalidraw `--noEmit --singleThreaded` ran
+    // 3 instructions more per `SyntheticArena::node` call and 13 more per
+    // new node than on R208 (callgrind).
+    #[inline]
+    fn at(&self, c: usize) -> &T {
+        let i = c.wrapping_sub(self.base);
+        match self.near.get(i) {
+            Some(Some(chunk)) => chunk,
+            _ => self.far_at(i),
+        }
+    }
+
+    /// Entry `index % PER` of chunk `index / PER`, picked by `pick`, for a
+    /// table with `PER` entries per chunk. Panics when the chunk is freed.
+    // PERF (followups59): `at` for the hottest reads (`slot`, `data`,
+    // `own_list`). The cold path takes `index` and picks the entry itself,
+    // so the fast path keeps no copy of the chunk number and nothing lives
+    // across the call. Plain release builds, callgrind on Excalidraw
+    // `--noEmit`: `SyntheticArena::node` runs 25 instructions per call,
+    // against 26 on R208 (flat table) and 27 on R209.
+    #[inline]
+    fn entry<'a, const PER: usize, E: ?Sized>(
+        &'a self,
+        index: usize,
+        pick: impl Fn(&'a T, usize) -> &'a E,
+    ) -> &'a E {
+        match self.near.get((index / PER).wrapping_sub(self.base)) {
+            Some(Some(chunk)) => pick(chunk, index % PER),
+            _ => self.far_entry::<PER, E>(index, pick),
+        }
+    }
+
+    /// `entry` in `far`.
     #[cold]
     #[inline(never)]
-    fn far_get(&self, c: usize) -> Option<&T> {
-        self.far.get(&c)
+    fn far_entry<'a, const PER: usize, E: ?Sized>(
+        &'a self,
+        index: usize,
+        pick: impl Fn(&'a T, usize) -> &'a E,
+    ) -> &'a E {
+        pick(self.far.get(&(index / PER)).expect(FREED), index % PER)
+    }
+
+    /// The chunk of number `i + base` (wrapping) in `far`.
+    #[cold]
+    #[inline(never)]
+    fn far_get(&self, i: usize) -> Option<&T> {
+        self.far.get(&i.wrapping_add(self.base))
+    }
+
+    /// `far_get` that panics when the chunk is freed.
+    #[cold]
+    #[inline(never)]
+    fn far_at(&self, i: usize) -> &T {
+        self.far_get(i).expect(FREED)
     }
 
     /// `get` to write.
@@ -329,11 +401,15 @@ impl<T> ChunkTable<T> {
         }
     }
 
-    /// Whether chunk number `c` is in `near`, where a chunk can take new
-    /// entries.
+    /// `at` to write.
     #[inline]
-    fn is_near(&self, c: usize) -> bool {
-        c >= self.base
+    fn at_mut(&mut self, c: usize) -> &mut T {
+        let base = self.base;
+        let i = c.wrapping_sub(base);
+        match self.near.get_mut(i) {
+            Some(Some(chunk)) => chunk,
+            _ => far_at_mut(&mut self.far, i.wrapping_add(base)),
+        }
     }
 
     /// Puts `chunk` at number `c`, after `None` holes for the numbers that
@@ -387,6 +463,7 @@ impl<T> ChunkTable<T> {
             base: self.base,
             far: self.far.iter().map(|(&c, chunk)| (c, f(chunk))).collect(),
             live: self.live,
+            no_cut_empty: self.no_cut_empty,
         }
     }
 
@@ -405,15 +482,24 @@ impl<T> ChunkTable<T> {
                 .map(|(c, chunk)| (c, f(chunk)))
                 .collect(),
             live: self.live,
+            no_cut_empty: self.no_cut_empty,
         }
     }
 
     /// Moves `base` up when most of `near` is empty (`COMPACT_MIN_EMPTY`):
     /// to the cut that drops the most empty entries for the live chunks it
-    /// moves to `far`, each of which counts as 4 empty entries.
+    /// moves to `far`, each of which counts as 4 empty entries. When no cut
+    /// drops any (live chunks at the front, the holes after them), it does
+    /// not scan again until more entries are empty (`no_cut_empty`).
+    // PERF (followups59): without that, every free and every outermost
+    // print exit scanned all of `near` in 3 tables while the trigger held
+    // and no cut was possible.
     fn compact(&mut self) {
         let empty = self.near.len() - self.live;
-        if empty < COMPACT_MIN_EMPTY || empty * 4 < self.near.len() * 3 {
+        if empty < COMPACT_MIN_EMPTY
+            || empty * 4 < self.near.len() * 3
+            || empty <= self.no_cut_empty
+        {
             return;
         }
         let (mut score, mut best, mut cut) = (0isize, 0isize, 0);
@@ -424,8 +510,10 @@ impl<T> ChunkTable<T> {
             }
         }
         if cut == 0 {
+            self.no_cut_empty = empty;
             return;
         }
+        self.no_cut_empty = 0;
         let base = self.base;
         for (i, chunk) in self.near.drain(..cut).enumerate() {
             if let Some(chunk) = chunk {
@@ -435,6 +523,13 @@ impl<T> ChunkTable<T> {
         }
         self.base += cut;
     }
+}
+
+/// `ChunkTable::at_mut` in `far`: chunk `c`. Panics when it is freed.
+#[cold]
+#[inline(never)]
+fn far_at_mut<T>(far: &mut FxHashMap<usize, T>, c: usize) -> &mut T {
+    far.get_mut(&c).expect(FREED)
 }
 
 /// The panic of a read of an entry whose owner was freed.
@@ -728,17 +823,18 @@ impl SyntheticArena {
     /// Slot `index`. Panics when its owner was freed.
     #[inline]
     fn slot(&self, index: usize) -> &Slot {
-        &self.slots.get(index / SLOT_CHUNK).expect(FREED).slots[index % SLOT_CHUNK]
+        self.slots
+            .entry::<SLOT_CHUNK, _>(index, |chunk, i| &chunk.slots[i])
     }
 
     /// `slot` to write.
     fn slot_mut(&mut self, index: usize) -> &mut Slot {
-        &mut self.slots.get_mut(index / SLOT_CHUNK).expect(FREED).slots[index % SLOT_CHUNK]
+        &mut self.slots.at_mut(index / SLOT_CHUNK).slots[index % SLOT_CHUNK]
     }
 
     /// The owner of slot `index`. Panics when it was freed.
     fn slot_owner(&self, index: usize) -> OwnerKey {
-        self.slots.get(index / SLOT_CHUNK).expect(FREED).owner
+        self.slots.at(index / SLOT_CHUNK).owner
     }
 
     /// Adds a slot of `owner` and returns its index.
@@ -796,8 +892,8 @@ impl SyntheticArena {
     /// freed.
     #[inline]
     fn data(&self, index: u32) -> &crate::astdata::Node {
-        let i = index as usize;
-        self.datas.get(i / DATA_CHUNK).expect(FREED)[i % DATA_CHUNK]
+        self.datas
+            .entry::<DATA_CHUNK, _>(index as usize, |chunk, i| &chunk[i])
             .get()
             .expect("synthetic node data entry is not filled")
     }
@@ -820,8 +916,8 @@ impl SyntheticArena {
     /// The factory list of entry `index`. Panics when its owner was freed.
     #[inline]
     fn own_list(&self, index: u32) -> &OwnList {
-        let i = index as usize;
-        &self.lists.get(i / LIST_CHUNK).expect(FREED)[i % LIST_CHUNK]
+        self.lists
+            .entry::<LIST_CHUNK, _>(index as usize, |chunk, i| &chunk[i])
     }
 
     /// Adds a factory list of `owner` and returns its index.
@@ -836,21 +932,21 @@ impl SyntheticArena {
             ..
         } = self;
         let chunks = owner_chunks(base, owners, alias_files, &mut print.chunks, owner);
-        let open = chunks.lists.last().copied().filter(|&c| {
-            lists.is_near(c as usize) && lists.get(c as usize).expect(FREED).len() < LIST_CHUNK
-        });
-        let c = match open {
-            Some(c) => c,
-            None => {
-                let c = new_chunk_number(shared, LIST_TABLE, lists.len(), LIST_CHUNK);
-                lists.set(c as usize, Vec::with_capacity(LIST_CHUNK));
-                chunks.lists.push(c);
-                c
+        // PERF (followups59): one table read for the open chunk, as in
+        // `push_slot_into`.
+        if let Some(&c) = chunks.lists.last() {
+            let chunk = lists.at_mut(c as usize);
+            if chunk.len() < LIST_CHUNK {
+                chunk.push(list);
+                return (c as usize * LIST_CHUNK + chunk.len() - 1) as u32;
             }
-        };
-        let chunk = lists.get_mut(c as usize).expect(FREED);
+        }
+        let c = new_chunk_number(shared, LIST_TABLE, lists.len(), LIST_CHUNK);
+        let mut chunk = Vec::with_capacity(LIST_CHUNK);
         chunk.push(list);
-        (c as usize * LIST_CHUNK + chunk.len() - 1) as u32
+        lists.set(c as usize, chunk);
+        chunks.lists.push(c);
+        (c as usize * LIST_CHUNK) as u32
     }
 
     /// The node slot of synthetic handle `n`.
@@ -941,27 +1037,27 @@ fn push_slot_into(
     owner: OwnerKey,
     slot: Slot,
 ) -> u32 {
-    let open = chunks.slots.last().copied().filter(|&c| {
-        slots.is_near(c as usize) && slots.get(c as usize).expect(FREED).slots.len() < SLOT_CHUNK
-    });
-    let c = match open {
-        Some(c) => c,
-        None => {
-            let c = new_chunk_number(shared, SLOT_TABLE, slots.len(), SLOT_CHUNK);
-            slots.set(
-                c as usize,
-                SlotChunk {
-                    owner,
-                    slots: Vec::with_capacity(SLOT_CHUNK),
-                },
-            );
-            chunks.slots.push(c);
-            c
+    // PERF (followups59): one table read for the open chunk. R209 read it
+    // twice (its length, then the push), each read with a `far` path.
+    if let Some(&c) = chunks.slots.last() {
+        let chunk = &mut slots.at_mut(c as usize).slots;
+        if chunk.len() < SLOT_CHUNK {
+            chunk.push(slot);
+            return (c as usize * SLOT_CHUNK + chunk.len() - 1) as u32;
         }
-    };
-    let chunk = &mut slots.get_mut(c as usize).expect(FREED).slots;
+    }
+    let c = new_chunk_number(shared, SLOT_TABLE, slots.len(), SLOT_CHUNK);
+    let mut chunk = Vec::with_capacity(SLOT_CHUNK);
     chunk.push(slot);
-    (c as usize * SLOT_CHUNK + chunk.len() - 1) as u32
+    slots.set(
+        c as usize,
+        SlotChunk {
+            owner,
+            slots: chunk,
+        },
+    );
+    chunks.slots.push(c);
+    (c as usize * SLOT_CHUNK) as u32
 }
 
 /// `SyntheticArena::push_data` on the arena tables: `chunks` are the chunks
@@ -977,7 +1073,7 @@ fn push_data_into(
         .datas
         .last()
         .copied()
-        .filter(|&c| (fill as usize) < DATA_CHUNK && datas.is_near(c as usize));
+        .filter(|_| (fill as usize) < DATA_CHUNK);
     let (c, cell) = match open {
         Some(c) => (c, fill),
         None => {
@@ -989,9 +1085,7 @@ fn push_data_into(
     };
     chunks.data_fill = cell + 1;
     assert!(
-        datas.get(c as usize).expect(FREED)[cell as usize]
-            .set(node)
-            .is_ok(),
+        datas.at(c as usize)[cell as usize].set(node).is_ok(),
         "synthetic node data entry is filled twice"
     );
     (c as usize * DATA_CHUNK + cell as usize) as u32
@@ -1131,9 +1225,7 @@ pub fn enter_print_scope() {
         let c = &print.chunks;
         print.start = next(
             &c.slots,
-            c.slots
-                .last()
-                .map(|&c| slots.get(c as usize).expect(FREED).slots.len()),
+            c.slots.last().map(|&c| slots.at(c as usize).slots.len()),
             SLOT_CHUNK,
         );
         print.data_start = next(
@@ -1143,9 +1235,7 @@ pub fn enter_print_scope() {
         );
         print.list_start = next(
             &c.lists,
-            c.lists
-                .last()
-                .map(|&c| lists.get(c as usize).expect(FREED).len()),
+            c.lists.last().map(|&c| lists.at(c as usize).len()),
             LIST_CHUNK,
         );
     });
@@ -1230,7 +1320,11 @@ pub fn exit_print_scope() -> Option<Vec<(u32, u32)>> {
         } = &mut *a;
         clear_print_call(print, slots, datas, lists, &ranges);
         let freed = take_full_print_chunks(&mut print.chunks, slots, datas, lists);
-        a.compact();
+        // PERF (followups59): most calls free no chunk, and then no table
+        // has a new hole.
+        if !(freed.0.is_empty() && freed.1.is_empty() && freed.2.is_empty()) {
+            a.compact();
+        }
         (Some(ranges), Some(freed))
     });
     // The payloads drop after the arena borrow ends.
@@ -1245,7 +1339,7 @@ impl SyntheticArena {
         let (first, filled) = self.print.start;
         let mut ranges = Vec::new();
         for (i, &c) in self.print.chunks.slots.iter().enumerate().skip(first) {
-            let len = self.slots.get(c as usize).expect(FREED).slots.len();
+            let len = self.slots.at(c as usize).slots.len();
             let lo = if i == first { filled } else { 0 };
             if len > lo {
                 let base = c as usize * SLOT_CHUNK;
@@ -1262,7 +1356,7 @@ impl SyntheticArena {
         let owner = self.current_owner();
         let chunks = std::mem::take(&mut self.print.chunks);
         for &c in &chunks.slots {
-            self.slots.get_mut(c as usize).expect(FREED).owner = owner;
+            self.slots.at_mut(c as usize).owner = owner;
         }
         let SyntheticArena {
             base,
@@ -1303,7 +1397,7 @@ fn clear_print_call(
         && lo as usize / SLOT_CHUNK == last as usize
     {
         let base = last as usize * SLOT_CHUNK;
-        let chunk = &mut slots.get_mut(last as usize).expect(FREED).slots;
+        let chunk = &mut slots.at_mut(last as usize).slots;
         for slot in &mut chunk[lo as usize - base..hi as usize - base] {
             *slot = Slot::Freed;
         }
@@ -1332,7 +1426,7 @@ fn clear_print_call(
     if let Some(&last) = c.lists.last()
         && let Some(lo) = call_from(print.list_start, c.lists.len())
     {
-        let chunk = lists.get_mut(last as usize).expect(FREED);
+        let chunk = lists.at_mut(last as usize);
         for list in chunk.iter_mut().skip(lo) {
             *list = OwnList::Freed;
         }
@@ -1348,7 +1442,8 @@ type FreedChunks = (
 
 /// Takes all print chunks but the last of each table out of the tables (the
 /// holes stay `None`, so a read of their entries panics). Each of them is
-/// full, and every call that put entries in it has ended.
+/// full (a push fills the open chunk of its owner, also in `far`), and
+/// every call that put entries in it has ended.
 fn take_full_print_chunks(
     chunks: &mut OwnerChunks,
     slots: &mut ChunkTable<SlotChunk>,
@@ -1680,7 +1775,7 @@ fn synthetic_ast_node(n: Node) -> HeldNode {
         let a = a.borrow();
         let i = a.node(n).data as usize;
         HeldNode {
-            chunk: Rc::clone(a.datas.get(i / DATA_CHUNK).expect(FREED)),
+            chunk: Rc::clone(a.datas.at(i / DATA_CHUNK)),
             cell: i % DATA_CHUNK,
         }
     })
@@ -3453,27 +3548,45 @@ mod tests {
         .expect("test thread panicked");
     }
 
+    impl<T> ChunkTable<T> {
+        /// Test check: `live` counts the chunks of `near`.
+        fn assert_live(&self) {
+            assert_eq!(self.live, self.near.iter().flatten().count(), "live");
+        }
+    }
+
     // edleak3: a table whose chunks are mostly freed moves its base past
-    // them. The live chunks below the base stay readable and take no new
-    // entry, a freed number stays a hole, and numbers never move.
+    // them. The live chunks below the base stay readable, a freed number
+    // stays a hole, and numbers never move. followups59: a number below the
+    // base that the table never had (the other thread of a shared counter
+    // took it) can still take a chunk, in `far`.
     #[test]
     fn chunk_table_compacts_past_freed_numbers() {
         let count = 4 * COMPACT_MIN_EMPTY;
         let live = |c: usize| c % 512 == 0 || c >= count - 16;
+        // Never set: as a number of the other thread of a shared counter.
+        let skipped = |c: usize| c % 512 == 1;
         let mut table = ChunkTable::new();
-        for c in 0..count {
+        for c in (0..count).filter(|&c| !skipped(c)) {
             table.set(c, c);
         }
-        for c in (0..count).filter(|&c| !live(c)) {
+        table.assert_live();
+        for c in (0..count).filter(|&c| !live(c) && !skipped(c)) {
             assert_eq!(table.take(c), Some(c));
         }
+        table.assert_live();
         table.compact();
-        assert!(table.base > 0, "the base moved");
-        assert!(table.near.len() <= 16, "near holds the live tail");
+        table.assert_live();
+        assert_eq!(table.base, count - 16, "the base moved to the live tail");
+        assert_eq!(table.near.len(), 16, "near holds the live tail");
+        assert_eq!(table.live, 16);
+        assert_eq!(
+            table.far.len(),
+            (0..count - 16).filter(|&c| live(c)).count()
+        );
         assert_eq!(table.len(), count, "numbers never move");
         for c in 0..count {
             assert_eq!(table.get(c), live(c).then_some(&c), "chunk {c}");
-            assert_eq!(table.is_near(c), c >= table.base);
         }
         assert_eq!(
             table.iter().count(),
@@ -3481,21 +3594,74 @@ mod tests {
         );
         assert_eq!(table.take(512), Some(512));
         assert_eq!(table.get(512), None, "a freed number below the base");
+        table.set(513, 513);
+        assert_eq!(table.get(513), Some(&513), "a set below the base");
+        assert!(table.far.contains_key(&513));
+        table.assert_live();
         table.set(count, count);
         assert_eq!(table.get(count), Some(&count));
+        table.assert_live();
+    }
+
+    // followups59: when the trigger holds but no cut drops more empty
+    // entries than 4 per live chunk it moves (live chunks at the front,
+    // holes after them), compact moves nothing, and it scans again only
+    // when more entries are empty.
+    #[test]
+    fn chunk_table_waits_for_more_holes_when_no_cut_pays() {
+        // 3 * front <= holes <= 4 * front: the trigger holds, no cut pays.
+        let (front, holes) = (300, COMPACT_MIN_EMPTY + 76);
+        let mut table = ChunkTable::new();
+        for c in 0..front + holes {
+            table.set(c, c);
+        }
+        for c in front..front + holes {
+            table.take(c);
+        }
+        table.compact();
+        table.assert_live();
+        assert_eq!((table.base, table.far.len()), (0, 0), "no cut");
+        assert_eq!(table.no_cut_empty, holes);
+        table.compact();
+        assert_eq!(table.no_cut_empty, holes, "no new hole, no scan");
+        let next = table.len();
+        table.set(next, next);
+        table.take(next);
+        table.compact();
+        assert_eq!(table.base, 0, "one more hole still does not pay");
+        assert_eq!(table.no_cut_empty, holes + 1, "a new hole, a new scan");
+        // Holes at the front make a cut pay: 100 holes and 200 live chunks
+        // before the 1,101 holes.
+        for c in 0..100 {
+            table.take(c);
+        }
+        table.compact();
+        table.assert_live();
+        assert_eq!(table.base, next + 1, "the base moved past every hole");
+        assert_eq!(table.far.len(), front - 100);
+        assert_eq!(
+            (table.near.len(), table.live, table.no_cut_empty),
+            (0, 0, 0)
+        );
+        assert_eq!(table.get(150), Some(&150));
+        assert_eq!(table.get(50), None);
     }
 
     // edleak3: the chunks of freed program versions leave the tables
     // (`ChunkTable::compact`). A node of the thread made before stays
-    // readable from below the base, a node of a freed version panics, and
-    // new nodes go after the base.
+    // readable from below the base, and a node of a freed version panics.
+    // followups59: a new node of the thread fills the thread's open chunk,
+    // which is below the base.
     #[test]
     fn freed_program_chunks_leave_the_tables() {
         std::thread::spawn(|| {
             let f = NodeFactory::new();
             let kept = f.new_identifier("kept");
             let mut freed = Node::NIL;
-            for i in 0..2 * COMPACT_MIN_EMPTY {
+            // Not a multiple of COMPACT_MIN_EMPTY: the tables end between
+            // two compacts.
+            let programs = 2 * COMPACT_MIN_EMPTY + COMPACT_MIN_EMPTY / 2;
+            for i in 0..programs {
                 let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
                     id: next_program_id(),
                     options: Box::leak(Box::default()),
@@ -3508,19 +3674,48 @@ mod tests {
                 }
                 free_synthetic_owner(program.id);
             }
-            let (base, near, made) = ARENA.with(|a| {
+            let kept_chunk = slot_index(kept) / SLOT_CHUNK;
+            ARENA.with(|a| {
                 let a = a.borrow();
-                (a.slots.base, a.slots.near.len(), a.slots.len())
+                // Each program made one slot chunk and one data chunk. Every
+                // table compacted, and keeps fewer empty entries than the
+                // trigger: each free compacts once the trigger holds.
+                for (name, base, near, live, far) in [
+                    (
+                        "slots",
+                        a.slots.base,
+                        a.slots.near.len(),
+                        a.slots.live,
+                        a.slots.far.len(),
+                    ),
+                    (
+                        "datas",
+                        a.datas.base,
+                        a.datas.near.len(),
+                        a.datas.live,
+                        a.datas.far.len(),
+                    ),
+                ] {
+                    assert!(base > 0, "{name}: base {base}");
+                    assert!(
+                        near - live < COMPACT_MIN_EMPTY,
+                        "{name}: {near} entries, {live} live"
+                    );
+                    assert_eq!(far, 1, "{name}: the thread's chunk is in far");
+                }
+                assert_eq!(a.slots.len(), programs + 1);
+                assert!(a.slots.far.contains_key(&kept_chunk));
             });
-            assert!(
-                base > 0 && near < made / 4,
-                "base {base}, near {near} of {made}"
-            );
             assert_eq!(kept.text(), "kept");
             assert!(read_panic(|| freed.text().to_string()).is_some_and(|m| m.contains(FREED)));
             let new = f.new_identifier("new");
             assert_eq!(new.text(), "new");
-            assert!(slot_index(new) / SLOT_CHUNK >= base);
+            assert_eq!(
+                slot_index(new) / SLOT_CHUNK,
+                kept_chunk,
+                "the thread's open chunk"
+            );
+            assert!(ARENA.with(|a| kept_chunk < a.borrow().slots.base));
             free_synthetic_nodes();
         })
         .join()

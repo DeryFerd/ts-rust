@@ -2186,7 +2186,9 @@ struct BindQueueState {
     /// The bind threads whose binds have not failed: they take the files
     /// that are left. It counts the threads that `spawn_bind_chain` did not
     /// start. That is right: a thread is left out only when no file is left
-    /// or the bind stopped, and then no thread reads the count.
+    /// or the bind stopped, and then no thread reads the count. A thread
+    /// that panics before it binds takes itself and the threads it would
+    /// start out of the count (`UnstartedBinders`).
     binders: usize,
     /// Set by the loading thread when it stops at a failed file.
     stop: bool,
@@ -2488,12 +2490,39 @@ fn spawn_bind_chain<'scope, F>(
 {
     let seed = WorkerSeed::take_unbuilt();
     spawn_bind_thread(scope, move || {
+        let mut unstarted = UnstartedBinders {
+            queue,
+            count: threads,
+        };
         seed.install();
         if threads > 1 && queue.files_left() {
             spawn_bind_chain(scope, threads - 1, run, queue, sender.clone());
         }
+        unstarted.count = 0;
         run(sender);
     });
+}
+
+/// The bind threads of a chain link that panicked before `run`: the link
+/// and the links that it did not start. On drop it takes them out of
+/// `BindQueueState::binders`, so a thread that waits for the files they
+/// would bind does not wait forever (the scope then joins and raises the
+/// panic). 0 once the link runs.
+// Not in Go: Go binds each file on its own goroutine.
+struct UnstartedBinders<'a> {
+    queue: &'a BindQueue,
+    count: usize,
+}
+
+impl Drop for UnstartedBinders<'_> {
+    fn drop(&mut self) {
+        if self.count > 0 {
+            let mut state = self.queue.lock();
+            state.binders = state.binders.saturating_sub(self.count);
+            drop(state);
+            self.queue.changed.notify_all();
+        }
+    }
 }
 
 /// Starts bind thread `f` in `scope`, with the Go stack size.
