@@ -1,4 +1,4 @@
-//! The stat cache of a parallel load (files_parser.rs `SharedStatCache`,
+//! The stat cache of a parallel load (`files_parser.rs` `SharedStatCache`,
 //! `LoaderStatFs`) must answer as Go's file system. One stat answers
 //! `FileExists` and `DirectoryExists` of an OS path, as Go `vfs.Common`
 //! does, but not of a bundled path: Go `Stat("bundled:///")` is a directory
@@ -18,8 +18,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-/// The runs of each test: the extra arguments and variables.
-const MODES: [(&[&str], &[(&str, &str)]); 3] = [
+/// One run of a test: the extra arguments and variables.
+type Mode = (
+    &'static [&'static str],
+    &'static [(&'static str, &'static str)],
+);
+
+/// The runs of each test.
+const MODES: [Mode; 3] = [
     (&[], &[]),
     (&[], &[("GOPORT_PARSE_THREADS", "4")]),
     (&["--singleThreaded"], &[]),
@@ -107,7 +113,7 @@ a.ts(1,20): error TS2307: Cannot find module 'x' or its corresponding type decla
         let lines: String = text
             .lines()
             .filter(|line| line.contains("bundled:///") || line.contains("error TS"))
-            .map(|line| format!("{line}\n"))
+            .flat_map(|line| [line, "\n"])
             .collect();
         assert_eq!(
             (*code, lines.as_str()),
