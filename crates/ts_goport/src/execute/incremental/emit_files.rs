@@ -352,7 +352,9 @@ impl<'a> EmitFilesHandler<'a> {
         order: &[Path],
         write_file: Option<&WriteFile>,
     ) -> bool {
-        let Some(failures) = flush_writes(writes, order, write_file) else {
+        // Go: emitfileshandler.go:124 `h.program.program.SingleThreaded()`.
+        let single_threaded = self.program.program().single_threaded();
+        let Some(failures) = flush_writes(writes, order, write_file, single_threaded) else {
             return false;
         };
         *self.shared.lock().expect("emit files lock") = EmitFilesShared::default();
@@ -855,7 +857,8 @@ const MAX_FLUSH_THREADS: usize = 8;
 /// map, then the JS, then the declaration map, then the declaration; a
 /// failed write does not stop the others. Here the files' outputs go in
 /// that order, the files in `order`, on up to `MAX_FLUSH_THREADS` threads
-/// (1 under `flush_writes_on_this_thread`). Returns what it did not write
+/// (1 under `flush_writes_on_this_thread`). `single_threaded` is the
+/// emitting program's `--singleThreaded`. Returns what it did not write
 /// when a write failed (`FlushFailures`), else `None`.
 ///
 /// After a failed write of a file, Go's d.ts callback has the TS5033 in
@@ -868,6 +871,7 @@ fn flush_writes(
     mut writes: Vec<BufferedWrite>,
     order: &[Path],
     write_file: Option<&WriteFile>,
+    single_threaded: bool,
 ) -> Option<FlushFailures> {
     let order: FxHashMap<&Path, usize> = order
         .iter()
@@ -883,7 +887,7 @@ fn flush_writes(
     };
     crate::gostd::slices::stable_sort_by(&mut writes, |a, b| key(a).cmp(&key(b)));
     if let Some(calls) = CLIENT_WRITES.get()
-        && !crate::program::single_threaded()
+        && !single_threaded
     {
         return flush_client_writes(writes, calls, write_file);
     }
