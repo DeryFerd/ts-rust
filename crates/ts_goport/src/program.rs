@@ -1777,6 +1777,8 @@ pub fn bind_all() {
             for file in program.source_files() {
                 // Go: program.go:601 traces the files that are not bound yet.
                 let _trace = if file.file_bind.get().is_none() {
+                    #[cfg(test)]
+                    TEST_SERIAL_BINDS.with(|files| files.borrow_mut().push(file.root));
                     trace_bind_source_file(file.root)
                 } else {
                     None
@@ -1884,6 +1886,11 @@ thread_local! {
     /// serial one on any machine.
     static TEST_BIND_THREADS: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    /// The files that `bind_all` bound serially on this thread, in order:
+    /// every file of a serial bind, and after a parallel bind the files
+    /// from the first one that it did not bind (`bind_files_parallel`).
+    static TEST_SERIAL_BINDS: std::cell::RefCell<Vec<Node>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// From this many files to bind on, a load binds as a large load on
@@ -6444,9 +6451,10 @@ mod tests {
         let config = dir.join("tsconfig.json");
         // Loads and binds the program on `threads` bind threads. Returns the
         // locals of each file (names, and symbol ids from the first symbol
-        // of the program: the lineage holds the symbols of earlier loads)
-        // and the fingerprint of the loading thread after the bind. Each
-        // load is on a new thread, so each starts from the same ids.
+        // of the program: the lineage holds the symbols of earlier loads),
+        // the fingerprint of the loading thread after the bind and the
+        // indexes of the files that `bind_all` bound serially. Each load is
+        // on a new thread, so each starts from the same ids.
         let bind = |threads: usize| {
             let config = config.clone();
             std::thread::spawn(move || {
@@ -6470,7 +6478,17 @@ mod tests {
                     .into_iter()
                     .map(|file| file.into_iter().map(|(n, id)| (n, id - first)).collect())
                     .collect();
-                (locals, bind_thread_fingerprint())
+                let serial_binds: Vec<usize> = TEST_SERIAL_BINDS
+                    .take()
+                    .into_iter()
+                    .map(|root| {
+                        program
+                            .source_files()
+                            .position(|file| file.root == root)
+                            .unwrap()
+                    })
+                    .collect();
+                (locals, bind_thread_fingerprint(), serial_binds)
             })
             .join()
             .unwrap()
@@ -6487,7 +6505,16 @@ mod tests {
             "the pattern modules are named after node ids: {:?}",
             serial.0
         );
-        assert_eq!(parallel, serial);
+        assert_eq!((&parallel.0, parallel.1), (&serial.0, serial.1));
+        assert_eq!(serial.2, [0, 1, 2, 3, 4], "a serial bind binds every file");
+        // The bind threads bind a.d.ts, and the bind of b.d.ts (the first
+        // pattern module) fails there. bind_all then binds b.d.ts and the
+        // files after it serially: d.d.ts, the other pattern module, too.
+        assert_eq!(
+            parallel.2,
+            [1, 2, 3, 4],
+            "the serial fallback binds both pattern modules"
+        );
     }
 
     #[test]
