@@ -6469,10 +6469,10 @@ mod tests {
         .unwrap();
         let config = dir.join("tsconfig.json");
         // Loads and binds the program on `threads` bind threads. Returns the
-        // locals of each file (names, and symbol ids from the first symbol
-        // of the program: the lineage holds the symbols of earlier loads)
-        // and the fingerprint of the loading thread after the bind. Each
-        // load is on a new thread, so each starts from the same ids.
+        // locals of each file (names, and symbol places from the first symbol
+        // of the program) and the fingerprint of the loading thread after
+        // the bind. Each load is on a new thread, so each starts from the
+        // same thread state (node ids).
         let bind = |threads: usize| {
             let config = config.clone();
             std::thread::spawn(move || {
@@ -6495,9 +6495,20 @@ mod tests {
                     })
                     .collect();
                 let first = locals.iter().flatten().map(|&(_, id)| id).min().unwrap();
-                let locals: Vec<Vec<(String, u32)>> = locals
+                // The lineage holds the symbols of earlier loads, and of the
+                // earlier tests of this process. Its ids skip the odd chunks
+                // (`is_own_index`, a checker's own symbols), so a load that
+                // crosses a chunk end has a gap of a chunk. Count the lineage
+                // ids from the first symbol: the place of a symbol in its
+                // load does not depend on where in a chunk the load starts.
+                let place = |id: u32| {
+                    (first..id)
+                        .filter(|&i| !crate::core::is_own_index(i))
+                        .count()
+                };
+                let locals: Vec<Vec<(String, usize)>> = locals
                     .into_iter()
-                    .map(|file| file.into_iter().map(|(n, id)| (n, id - first)).collect())
+                    .map(|file| file.into_iter().map(|(n, id)| (n, place(id))).collect())
                     .collect();
                 (locals, bind_thread_fingerprint())
             })
