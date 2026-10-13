@@ -586,13 +586,27 @@ pub fn collect_all_affected_files(program: &Program) {
 
     let mut handler = AffectedFilesHandler::new(program);
     let mut result: FxIndexSet<Node> = FxIndexSet::default();
-    let changed_files: Vec<Path> = program
+    let mut changed_files: Vec<Path> = program
         .snapshot
         .borrow()
         .changed_files_set
         .iter()
         .cloned()
         .collect();
+    // PORT: Go runs both loops on work groups. Each `computeDtsSignature` is a
+    // d.ts emit of one file (affectedfileshandler.go:69), and where its
+    // widenings come first sets the d.ts text, so the order counts. Single
+    // threaded, Go runs each queue last queued first (singleThreadedWorkGroup
+    // pop, core/workgroup.go:78), so the port runs both loops in reverse
+    // (dtsorder1: better-auth/00/incr step 2). Go calls `getDtsMayChange` in
+    // the `Range` before it queues, but the port calls it in the reversed
+    // loop, so new pending-emit entries come in reverse order. Go's order
+    // there comes from random map order, so the reverse is still one of Go's
+    // possible orders.
+    let single_threaded = crate::program::single_threaded();
+    if single_threaded {
+        changed_files.reverse();
+    }
     for file in &changed_files {
         for affected_file in handler.get_files_affected_by(file) {
             result.insert(affected_file);
@@ -602,6 +616,10 @@ pub fn collect_all_affected_files(program: &Program) {
     // For all the affected files, get all the files that would need to change their dts or js files,
     // update their diagnostics
     let emit_kind = get_file_emit_kind(program.snapshot.borrow().options);
+    let mut result: Vec<Node> = result.into_iter().collect();
+    if single_threaded {
+        result.reverse();
+    }
     for file in result {
         // remove the cached semantic diagnostics and handle dts emit and js emit if needed
         let dts_may_change = handler.get_dts_may_change(path_of(file), emit_kind);
