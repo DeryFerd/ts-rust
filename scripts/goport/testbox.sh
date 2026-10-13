@@ -64,6 +64,13 @@
 # TESTBOX_ID overrides the saved ID. TESTBOX_ID_FILE: the file of the saved ID (default target/testbox-id of
 # this worktree). TESTBOX_IDLE: idle minutes before the testbox stops (default 15).
 # TESTBOX_REF: the ref the workflow runs from (default main: the workflow must be on the default branch).
+# Retries: after a transient failure (a DNS, connect or TLS error or a request timeout), these steps run again,
+# up to 6 tries in all: warmup, status, stop and list (blacksmith API calls), the rsync of push, get, source and
+# the fetch of a job's results, and the start of run and job. Each retry prints one line on stderr. A command
+# that started on the testbox never runs again (job handles a dropped SSH session), and a nonzero exit of the
+# command or of a build is not a transient failure. A warmup whose answer was lost can leave one extra testbox
+# that ends at its idle timeout. TESTBOX_RETRY_WAITS: the seconds before each retry (default "5 10 20 30 30";
+# "" turns retries off).
 # Auth: `blacksmith auth login` once per host (`blacksmith auth status` shows it).
 # scripts/goport/testbox-remote.sh holds the steps that run on the testbox.
 set -euo pipefail
@@ -75,6 +82,55 @@ id_file="${TESTBOX_ID_FILE:-$repo_root/target/testbox-id}"
 remote_root=_work/ts-rust/ts-rust
 cd "$repo_root"
 
+# Transient failures of the blacksmith API, ssh and rsync (2026-10-13: "request timed out after 30s", "net/http:
+# TLS handshake timeout", "Could not resolve hostname ...: Name or service not known").
+transient_re='request timed out|TLS handshake timeout|i/o timeout|Client\.Timeout exceeded|context deadline exceeded'
+transient_re+='|connection reset by peer|connection refused|no such host|server misbehaving|unexpected EOF'
+transient_re+='|temporary failure in name resolution|could not resolve hostname|name or service not known'
+transient_re+='|network is unreachable|no route to host|connection timed out|connection closed by|closed by remote host'
+transient_re+='|kex_exchange_identification|broken pipe|handshake failed: EOF|502 Bad Gateway|503 Service Unavailable'
+transient_re+='|504 Gateway Timeout'
+read -ra retry_waits <<<"${TESTBOX_RETRY_WAITS-5 10 20 30 30}"
+[[ ${retry_waits[*]} =~ ^[0-9\ ]*$ ]] ||
+  { echo "TESTBOX_RETRY_WAITS: whole seconds, for example '5 10 20 30 30'" >&2; exit 2; }
+# remote prints this line on the testbox's stderr just before the command. retry takes it out of the output.
+start_marker="testbox.sh:start:$$:$RANDOM$RANDOM"
+# Retry notices go to fd 4, this script's stderr, also from inside $(... 2>&1).
+exec 4>&2
+
+# retry KIND CMD...: run CMD, and run it again after each wait of retry_waits while it fails for a transient
+# reason. CMD's stderr passes through and is checked for transient_re. Returns CMD's last exit code. KIND:
+#   api  a blacksmith API call (warmup, status, stop, list): any nonzero exit.
+#   net  ssh or rsync: exit 255 (ssh) or rsync's 12, 30 or 35 (the stream closed or timed out). Use it only for a
+#        step that is safe to repeat.
+#   run  blacksmith testbox run: only before the start marker, so a command that started never runs again.
+retry() {
+  local kind=$1 try=1 rc errf what line
+  shift
+  what=${1##*/}
+  [[ $what != blacksmith ]] || what+=" $2 $3"
+  errf=$(mktemp)
+  while :; do
+    rc=0
+    # stdout goes straight through on fd 3. awk copies stderr to errf up to the start marker, and to our stderr
+    # without the marker.
+    { "$@" 2>&1 1>&3 3>&- 4>&- |
+        awk -v m="$start_marker" -v f="$errf" '!s {print > f; fflush(f)} $0 == m {s = 1; close(f); next} {print; fflush()}' >&2 3>&- 4>&- ||
+        rc=${PIPESTATUS[0]}; } 3>&1
+    ((rc != 0 && try <= ${#retry_waits[@]})) || break
+    case $kind in
+      net) ((rc == 255 || rc == 12 || rc == 30 || rc == 35)) || break ;;
+      run) ! grep -qxF -- "$start_marker" "$errf" || break ;;
+    esac
+    line=$(grep -m1 -iE -- "$transient_re" "$errf" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\r//g') || break
+    echo "testbox.sh: $what failed (rc $rc: ${line:0:160}); try $((try + 1)) of $((${#retry_waits[@]} + 1)) in ${retry_waits[try - 1]} s" >&4
+    sleep "${retry_waits[try - 1]}"
+    try=$((try + 1))
+  done
+  rm -f "$errf"
+  return "$rc"
+}
+
 saved_id() {
   local id="${TESTBOX_ID:-$(cat "$id_file" 2>/dev/null || true)}"
   [[ -n "$id" ]] || { echo "no testbox: run 'testbox.sh warmup' or set TESTBOX_ID" >&2; exit 2; }
@@ -83,13 +139,15 @@ saved_id() {
 batch_pin() { jq -r '.batch.upstreamPin.to // empty' docs/typechecker-state/current.json; }
 
 # remote <command...>: sync this worktree, run the command in the testbox's repo root with the testbox env.
+# A transient failure before the command starts (the CLI's status wait, DNS, the sync) runs it again.
 remote() {
-  local remote_cmd
+  local remote_cmd id
+  id="$(saved_id)"
   printf -v remote_cmd '%q ' "$@"
   # A subshell: the CLI touches ~/.testbox-last-activity after the command in this shell, and testbox.env sets
   # HOME=/home/theo. Outside the subshell that touch would miss the marker, and the idle time would count from
   # the start of a long command.
-  blacksmith testbox run --id "$(saved_id)" "(. ~/testbox.env && $remote_cmd)"
+  retry run blacksmith testbox run --id "$id" "(echo $start_marker >&2; . ~/testbox.env && $remote_cmd)"
 }
 
 # ssh_route: sets host and ssh for rsync over the CLI's own SSH route (port 64000 and the key that warmup
@@ -99,7 +157,7 @@ ssh_route() {
   local id key
   id="$(saved_id)"
   # --wait: a testbox that is not ready yet has no IP, and its row has the workflow path in that column.
-  host="$(blacksmith testbox status --id "$id" --wait --wait-timeout 15m | awk -v id="$id" '$1 == id && $2 == "ready" {print $3}')"
+  host="$(retry api blacksmith testbox status --id "$id" --wait --wait-timeout 15m | awk -v id="$id" '$1 == id && $2 == "ready" {print $3}')"
   key="$HOME/.blacksmith/testboxes/$id/id_ed25519"
   # A host with a / would make rsync copy to a local path.
   [[ -n "$host" && $host != */* && -f "$key" ]] || { echo "no SSH route to $id (host '$host', key $key)" >&2; exit 1; }
@@ -120,8 +178,8 @@ push_paths() {
     p="$(realpath -s "$p")"
     echo "push $p"
     # A file of testbox-data.txt is a bind mount there: write it in place, not by rename.
-    if [[ -d "$p" ]]; then rsync -aH --mkpath --compress --compress-choice=zstd -e "$ssh" "$p/" "runner@$host:$p/"
-    else rsync -aHL --mkpath --inplace --compress --compress-choice=zstd -e "$ssh" "$p" "runner@$host:$p"; fi
+    if [[ -d "$p" ]]; then retry net rsync -aH --mkpath --compress --compress-choice=zstd -e "$ssh" "$p/" "runner@$host:$p/"
+    else retry net rsync -aHL --mkpath --inplace --compress --compress-choice=zstd -e "$ssh" "$p" "runner@$host:$p"; fi
   done
   # A caller can run on for minutes (tests): stop the keepalive now.
   kill "$keep" 2>/dev/null || true
@@ -193,17 +251,18 @@ fetch() {
   local host ssh t
   ssh_route
   t=$(mktemp -d)
-  rsync -a -e "$ssh" "runner@$host:$remote_root/$1/out.tar.gz" "$t/" || {
+  retry net rsync -a -e "$ssh" "runner@$host:$remote_root/$1/out.tar.gz" "$t/" || {
     rm -rf "$t"
     echo "no $1/out.tar.gz on the testbox (the job log above has its error; $1.log stays there)" >&2
     return 1
   }
-  rsync -a -e "$ssh" "runner@$host:$remote_root/$1.log" "$t/testbox.log"
+  retry net rsync -a -e "$ssh" "runner@$host:$remote_root/$1.log" "$t/testbox.log"
   mkdir -p "$2"
   tar -xzf "$t/out.tar.gz" -C "$2"
   mv "$t/testbox.log" "$2/"
   rm -rf "$t"
-  $ssh "runner@$host" rm -rf "$remote_root/$1" "$remote_root/$1.log" "$remote_root/$1.rc" < /dev/null
+  # shellcheck disable=SC2086 # $ssh is the ssh command and its options
+  retry net $ssh "runner@$host" rm -rf "$remote_root/$1" "$remote_root/$1.log" "$remote_root/$1.rc" < /dev/null
 }
 
 cmd="$1"
@@ -218,10 +277,11 @@ pin_key=${pin_key:-$(batch_pin)}
 case "$cmd" in
   warmup)
     rc=0
-    out="$(blacksmith testbox warmup testbox.yml --ref "${TESTBOX_REF:-main}" --idle-timeout "${TESTBOX_IDLE:-15}" 2>&1)" || rc=$?
+    out="$(retry api blacksmith testbox warmup testbox.yml --ref "${TESTBOX_REF:-main}" --idle-timeout "${TESTBOX_IDLE:-15}" 2>&1)" || rc=$?
     echo "$out"
     ((rc == 0)) || exit "$rc"
-    id="$(grep -oE 'tbx_[A-Za-z0-9_-]+' <<<"$out" | head -1)"
+    # The last ID: $out also holds the errors of failed tries, and those can name a testbox.
+    id="$(grep -oE 'tbx_[A-Za-z0-9_-]+' <<<"$out" | tail -1)"
     [[ -n "$id" ]] || { echo "warmup printed no testbox ID" >&2; exit 1; }
     mkdir -p "$(dirname "$id_file")"
     echo "$id" >"$id_file"
@@ -275,7 +335,7 @@ case "$cmd" in
     ssh_route
     if [[ -s $t/files ]]; then
       echo "copy $(tr -cd '\0' < "$t/files" | wc -c) modified or untracked files"
-      rsync -rlpH --from0 --files-from="$t/files" -e "$ssh" "$co/" "runner@$host:$co/"
+      retry net rsync -rlpH --from0 --files-from="$t/files" -e "$ssh" "$co/" "runner@$host:$co/"
     fi
     if [[ -s $t/deleted ]]; then
       # NUL-separated to the end: a file name can hold a newline.
@@ -283,7 +343,8 @@ case "$cmd" in
       $ssh "runner@$host" "xargs -0 rm -f" < "$t/deleted.list"
     fi
     here_fp=$(python3 scripts/goport/fp.py "$co" | cut -d' ' -f1)
-    there_fp=$($ssh "runner@$host" "cd $remote_root && python3 scripts/goport/fp.py $(printf %q "$co")" < /dev/null | cut -d' ' -f1)
+    # shellcheck disable=SC2086 # $ssh is the ssh command and its options
+    there_fp=$(retry net $ssh "runner@$host" "cd $remote_root && python3 scripts/goport/fp.py $(printf %q "$co")" < /dev/null | cut -d' ' -f1)
     [[ $here_fp == "$there_fp" ]] || { echo "fp.py $co: zbook $here_fp, testbox $there_fp" >&2; exit 1; }
     echo "source $co ${head:0:12} on the testbox, fp ${here_fp:0:12}"
     ;;
@@ -405,7 +466,7 @@ case "$cmd" in
     ssh_route
     src="$1"
     [[ "$src" == /* ]] || src="$remote_root/$src"
-    rsync -aH --compress --compress-choice=zstd -e "$ssh" "runner@$host:$src" "${2:-.}"
+    retry net rsync -aH --compress --compress-choice=zstd -e "$ssh" "runner@$host:$src" "${2:-.}"
     ;;
   push)
     (($#)) || { echo "usage: testbox.sh push <path>..." >&2; exit 2; }
@@ -418,11 +479,11 @@ case "$cmd" in
     ((${#paths[@]})) || { echo "no seed paths for: ${*:-inputs pin}" >&2; exit 2; }
     push_paths "${paths[@]}"
     ;;
-  status) blacksmith testbox status --id "$(saved_id)" "$@" ;;
+  status) retry api blacksmith testbox status --id "$(saved_id)" "$@" ;;
   stop | release)
     id="$(saved_id)"
     if [[ $cmd == stop ]]; then
-      blacksmith testbox stop --id "$id"
+      retry api blacksmith testbox stop --id "$id"
     else
       echo "testbox $id: released; it ends at its idle timeout and requests a commit of its sticky disks"
       echo "(TESTBOX_ID=$id scripts/goport/testbox.sh status shows when it completed)"
@@ -430,6 +491,6 @@ case "$cmd" in
     # Keep the saved ID when TESTBOX_ID named another testbox.
     [[ "$(cat "$id_file" 2>/dev/null || true)" != "$id" ]] || rm -f "$id_file"
     ;;
-  list) blacksmith testbox list "$@" ;;
+  list) retry api blacksmith testbox list "$@" ;;
   *) echo "unknown command: $cmd (testbox.sh help)" >&2; exit 2 ;;
 esac
