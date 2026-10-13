@@ -335,9 +335,9 @@ struct CheckerPool {
     threads: Vec<std::thread::JoinHandle<()>>,
     /// wasm has one thread: the checkers stay on the loading thread, each
     /// with the ids of a worker, and each job runs when it is sent
-    /// (`send_thread_job`). A slot is empty while its checker runs a job.
+    /// (`send_thread_job`).
     #[cfg(target_family = "wasm")]
-    checkers: Vec<Option<(Checker, WorkerIds)>>,
+    checkers: Vec<InlineChecker>,
     /// The program's emit pool, made on its first job
     /// (`send_emit_pool_jobs`). It stops with the checkers. wasm has none.
     #[cfg(not(target_family = "wasm"))]
@@ -426,8 +426,10 @@ impl CheckerPool {
             checkers,
             carry_from: _,
         } = self;
-        for (checker, mut ids) in checkers.into_iter().flatten() {
-            ids.run(|| drop(checker));
+        for slot in checkers {
+            if let InlineChecker::Made(checker, mut ids) = slot {
+                ids.run(|| drop(checker));
+            }
         }
         Vec::new()
     }
@@ -468,11 +470,23 @@ impl CheckerPool {
         receiver.recv().ok()
     }
 
-    /// wasm: a copy of the symbol ids of the pool's first checker.
+    /// wasm: a copy of the symbol ids of the pool's first checker, made
+    /// first if no job has made it yet.
     #[cfg(target_family = "wasm")]
     fn symbol_ids(&mut self) -> Option<SymbolIdCarry> {
-        let (_, ids) = self.checkers.first_mut()?.as_mut()?;
-        Some(ids.run(copy_symbol_ids))
+        let count = self.checkers.len();
+        let slot = self.checkers.first_mut()?;
+        if matches!(slot, InlineChecker::Unmade(_)) {
+            let (checker, ids) =
+                std::mem::replace(slot, InlineChecker::Busy).into_checker(0, count);
+            *slot = InlineChecker::Made(checker, ids);
+        }
+        match slot {
+            InlineChecker::Made(_, ids) | InlineChecker::Released(ids) => {
+                Some(ids.run(copy_symbol_ids))
+            }
+            InlineChecker::Unmade(_) | InlineChecker::Busy => None,
+        }
     }
 }
 
@@ -4010,24 +4024,82 @@ fn start_checkers(count: usize) -> CheckerPool {
     }
 }
 
-/// wasm has one thread: makes the `count` checkers on the loading thread,
-/// each with its own `WorkerIds`, as a worker would make it.
+/// wasm has one thread: gives each of the `count` checkers its own
+/// `WorkerIds`, as a worker would start. Each checker is made on the
+/// loading thread by its first job (`InlineChecker::into_checker`).
 #[cfg(target_family = "wasm")]
 fn start_checkers(count: usize) -> CheckerPool {
     // First, as on native: the carry of the last pool becomes this thread's
     // ids, and each checker starts from them (`id_seed`).
     let carry_from = symbol_id_carry_start(count);
     let checkers = (0..count)
-        .map(|index| {
-            let mut ids = WorkerIds(id_seed().into());
-            let checker = ids.run(|| new_pool_checker(index, count));
-            Some((checker, ids))
-        })
+        .map(|_| InlineChecker::Unmade(WorkerIds(id_seed().into())))
         .collect();
     CheckerPool {
         checkers,
         carry_from,
     }
+}
+
+/// wasm: a checker of the inline pool. Making it on its first job, and
+/// dropping it when the caller is done with it (`release_checker`), keeps
+/// only the checkers in use alive: the jobs run one after the other.
+#[cfg(target_family = "wasm")]
+enum InlineChecker {
+    /// No job has run yet: the ids the checker starts from.
+    Unmade(WorkerIds),
+    Made(Checker, WorkerIds),
+    /// A job runs with the checker.
+    Busy,
+    /// `release_checker` dropped it.
+    Released(WorkerIds),
+}
+
+#[cfg(target_family = "wasm")]
+impl InlineChecker {
+    /// The checker for a job: checker `index` of a pool of `count`, made
+    /// first with its ids, as its worker would make it. Its slot is `Busy`
+    /// until the caller puts it back.
+    fn into_checker(self, index: usize, count: usize) -> (Checker, WorkerIds) {
+        match self {
+            InlineChecker::Unmade(mut ids) => {
+                let checker = ids.run(|| new_pool_checker(index, count));
+                (checker, ids)
+            }
+            InlineChecker::Made(checker, ids) => (checker, ids),
+            InlineChecker::Busy => panic!("checker {index} in use"),
+            InlineChecker::Released(_) => panic!("checker {index} used after its release"),
+        }
+    }
+}
+
+/// wasm: drops checker `index` of the current program's pool, as its
+/// worker would when the program is released, so its tables are freed
+/// before the next checker is made. A later job for it panics. Native
+/// checkers live until the program is released.
+#[cfg(target_family = "wasm")]
+pub fn release_checker(index: usize) {
+    let id = prog().id;
+    let slot = POOLS.with(|pools| {
+        let mut pools = pools.borrow_mut();
+        let slot = pools.get_mut(&id)?.checkers.get_mut(index)?;
+        Some(std::mem::replace(slot, InlineChecker::Busy))
+    });
+    // The drop runs outside the pool borrow, with the checker's ids.
+    let ids = match slot {
+        None => return,
+        Some(InlineChecker::Made(checker, mut ids)) => {
+            ids.run(|| drop(checker));
+            ids
+        }
+        Some(InlineChecker::Unmade(ids) | InlineChecker::Released(ids)) => ids,
+        Some(InlineChecker::Busy) => panic!("checker {index} released while in use"),
+    };
+    POOLS.with(|pools| {
+        if let Some(pool) = pools.borrow_mut().get_mut(&id) {
+            pool.checkers[index] = InlineChecker::Released(ids);
+        }
+    });
 }
 
 /// wasm: the ids of one checker of the inline pool. A native checker
@@ -4179,9 +4251,16 @@ fn send_thread_job<R: Send + 'static>(
         "checker job sent from a checker job"
     );
     let id = prog().id;
-    // The pool borrow ends before the job runs: a job reads the pool
-    // (`checker_index_for_file`).
-    let (checker, mut ids) = with_pool(|pool| pool.checkers[index].take().expect("checker in use"));
+    // The pool borrow ends before the checker is made and before the job
+    // runs: a job reads the pool (`checker_index_for_file`).
+    let (slot, count) = with_pool(|pool| {
+        let count = pool.checkers.len();
+        (
+            std::mem::replace(&mut pool.checkers[index], InlineChecker::Busy),
+            count,
+        )
+    });
+    let (checker, mut ids) = slot.into_checker(index, count);
     let (result, checker) = ids.run(|| {
         WORKER_CHECKER.with(|slot| *slot.borrow_mut() = Some(checker));
         WORKER_INDEX.with(|slot| slot.set(Some(index)));
@@ -4194,7 +4273,7 @@ fn send_thread_job<R: Send + 'static>(
     });
     POOLS.with(|pools| {
         if let Some(pool) = pools.borrow_mut().get_mut(&id) {
-            pool.checkers[index] = Some((checker, ids));
+            pool.checkers[index] = InlineChecker::Made(checker, ids);
         }
     });
     JobReceiver(result)
