@@ -11,7 +11,7 @@ mkdir -p repos logs
 
 # Compilers. TypeScript 6 and 7 both name their bin tsc, so run.sh calls each one by path.
 [[ -f package.json ]] || echo '{ "private": true }' >package.json
-npm i -q --no-audit --no-fund tsc-rs@0.3.0 typescript@7.1.0-dev.20261008.1 ts6@npm:typescript@6.0.3
+npm i -q --no-audit --no-fund tsc-rs@0.6.0 typescript@7.1.0-dev.20261008.1 ts6@npm:typescript@6.0.3
 # Save the archive hash and revision: the canary download URL moves.
 case "$(uname -s)/$(uname -m)" in
   Linux/x86_64) bun_platform=linux-x64 ;;
