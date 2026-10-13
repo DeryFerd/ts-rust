@@ -2771,7 +2771,10 @@ impl PrefetchShared {
         let mut sized: Vec<(i64, Arc<PrefetchJob>)> = jobs
             .into_iter()
             .filter(|job| queued(job))
-            .filter_map(|job| fs.stat(&job.opts.file_name).map(|info| (info.size(), job)))
+            .filter_map(|job| {
+                let (_, size) = self.stats.node(fs, &job.opts.file_name)?;
+                Some((size, job))
+            })
             .collect();
         // Stable: files of one size keep the root order.
         sized.sort_by_key(|(size, _)| *size);
@@ -4064,66 +4067,168 @@ struct PrepInput {
 /// cache in them too (`BuildStatCache`).
 #[derive(Default)]
 pub struct StatCache {
-    file_exists: Mutex<FxHashMap<String, bool>>,
-    directory_exists: Mutex<FxHashMap<String, bool>>,
-    realpath: Mutex<FxHashMap<String, String>>,
-    entries: Mutex<FxHashMap<String, Entries>>,
+    file_exists: StatMap<bool>,
+    directory_exists: StatMap<bool>,
+    realpath: StatMap<String>,
+    entries: StatMap<Entries>,
 }
 
-/// The cached value of `path`, or `load()` stored as it. The lock is not
-/// held while `load` runs.
-fn cached_stat<V: Clone>(
-    cache: &Mutex<FxHashMap<String, V>>,
-    path: &str,
-    load: impl FnOnce() -> V,
-) -> V {
-    if let Some(value) = lock(cache).get(path) {
-        return value.clone();
+/// The shards of a `StatMap`.
+const STAT_MAP_SHARDS: usize = 64;
+
+/// How long a lookup waits for the thread that loads the same path
+/// (`StatMap::get_or_load`) before it loads the path itself.
+const STAT_MAP_WAIT: std::time::Duration = std::time::Duration::from_micros(20);
+
+/// Go `collections.SyncMap` of one `cachedvfs` lookup, for threads: one map
+/// per shard of the path hash. The parse workers of a directory ask for
+/// the same package.json scope and `node_modules` lookups together, so a
+/// miss marks its path as loading (`StatSlot::Loading`): a thread that asks
+/// for that path meanwhile waits for the answer (`STAT_MAP_WAIT`, spinning:
+/// a lock wait costs more than the call) and makes no call of its own.
+// PORT: Go `cachedvfs` loads outside the map (cachedvfs.go:48), so two
+// goroutines can both call the file system for one path. The answer is
+// the same.
+struct StatMap<V> {
+    shards: Box<[Mutex<FxHashMap<String, StatSlot<V>>>]>,
+}
+
+enum StatSlot<V> {
+    Ready(V),
+    /// A thread loads the value now. It sets the cell, then makes the slot
+    /// `Ready`.
+    Loading(Arc<OnceLock<V>>),
+}
+
+impl<V: Clone> StatSlot<V> {
+    fn value(&self) -> Option<V> {
+        match self {
+            StatSlot::Ready(value) => Some(value.clone()),
+            StatSlot::Loading(cell) => cell.get().cloned(),
+        }
     }
-    let value = load();
-    lock(cache).entry(path.to_string()).or_insert(value).clone()
+}
+
+impl<V> Default for StatMap<V> {
+    fn default() -> Self {
+        StatMap {
+            shards: (0..STAT_MAP_SHARDS).map(|_| Mutex::default()).collect(),
+        }
+    }
+}
+
+impl<V: Clone> StatMap<V> {
+    fn shard(&self, path: &str) -> &Mutex<FxHashMap<String, StatSlot<V>>> {
+        use std::hash::BuildHasher;
+        let hash = rustc_hash::FxBuildHasher.hash_one(path);
+        // The high bits: Fx mixes them best.
+        &self.shards[(hash >> 58) as usize % STAT_MAP_SHARDS]
+    }
+
+    /// The cached value of `path`.
+    fn get(&self, path: &str) -> Option<V> {
+        lock(self.shard(path)).get(path).and_then(StatSlot::value)
+    }
+
+    /// The cached value of `path`, or `load()` stored as it.
+    fn get_or_load(&self, path: &str, load: impl FnOnce() -> V) -> V {
+        let loading = {
+            let mut shard = lock(self.shard(path));
+            match shard.get(path) {
+                Some(StatSlot::Ready(value)) => return value.clone(),
+                Some(StatSlot::Loading(cell)) => Some(cell.clone()),
+                None => {
+                    shard.insert(path.to_string(), StatSlot::Loading(Arc::default()));
+                    None
+                }
+            }
+        };
+        if let Some(cell) = loading {
+            let start = std::time::Instant::now();
+            loop {
+                if let Some(value) = cell.get() {
+                    return value.clone();
+                }
+                for _ in 0..32 {
+                    std::hint::spin_loop();
+                }
+                if start.elapsed() > STAT_MAP_WAIT {
+                    // The loading thread is slow (or descheduled): the
+                    // answer is the same.
+                    return load();
+                }
+            }
+        }
+        let value = load();
+        self.insert_if_absent(path, value)
+    }
+
+    /// Stores `value` as the value of `path` when there is none (or only
+    /// a load of it). Returns the value that the map has.
+    fn insert_if_absent(&self, path: &str, value: V) -> V {
+        let mut shard = lock(self.shard(path));
+        match shard.get_mut(path) {
+            Some(StatSlot::Ready(old)) => old.clone(),
+            Some(slot) => {
+                if let StatSlot::Loading(cell) = slot {
+                    let _ = cell.set(value.clone());
+                }
+                *slot = StatSlot::Ready(value.clone());
+                value
+            }
+            None => {
+                shard.insert(path.to_string(), StatSlot::Ready(value.clone()));
+                value
+            }
+        }
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            lock(shard).clear();
+        }
+    }
 }
 
 /// Stores the value of `path` in `from` in `to`, when `to` has none.
-fn copy_stat<V: Clone>(
-    from: &Mutex<FxHashMap<String, V>>,
-    to: &Mutex<FxHashMap<String, V>>,
-    path: &str,
-) {
-    let Some(value) = lock(from).get(path).cloned() else {
-        return;
-    };
-    lock(to).entry(path.to_string()).or_insert(value);
+fn copy_stat<V: Clone>(from: &StatMap<V>, to: &StatMap<V>, path: &str) {
+    if let Some(value) = from.get(path) {
+        to.insert_if_absent(path, value);
+    }
 }
 
 /// Stores each value of `from` in `to`, when `to` has none for its path.
-fn merge_stats<V>(from: &Mutex<FxHashMap<String, V>>, to: &Mutex<FxHashMap<String, V>>) {
-    let from = std::mem::take(&mut *lock(from));
-    let mut to = lock(to);
-    for (path, value) in from {
-        to.entry(path).or_insert(value);
+/// `from` is empty after.
+fn merge_stats<V: Clone>(from: &StatMap<V>, to: &StatMap<V>) {
+    for shard in &from.shards {
+        let slots = std::mem::take(&mut *lock(shard));
+        for (path, slot) in slots {
+            if let Some(value) = slot.value() {
+                to.insert_if_absent(&path, value);
+            }
+        }
     }
 }
 
 impl StatCache {
     /// The cached `FileExists(path)`, or `load()` stored as it.
     pub fn file_exists(&self, path: &str, load: impl FnOnce() -> bool) -> bool {
-        cached_stat(&self.file_exists, path, load)
+        self.file_exists.get_or_load(path, load)
     }
 
     /// The cached `DirectoryExists(path)`, or `load()` stored as it.
     pub fn directory_exists(&self, path: &str, load: impl FnOnce() -> bool) -> bool {
-        cached_stat(&self.directory_exists, path, load)
+        self.directory_exists.get_or_load(path, load)
     }
 
     /// The cached `Realpath(path)`, or `load()` stored as it.
     pub fn realpath(&self, path: &str, load: impl FnOnce() -> String) -> String {
-        cached_stat(&self.realpath, path, load)
+        self.realpath.get_or_load(path, load)
     }
 
     /// The cached `GetAccessibleEntries(path)`, or `load()` stored as it.
     pub fn entries(&self, path: &str, load: impl FnOnce() -> Entries) -> Entries {
-        cached_stat(&self.entries, path, load)
+        self.entries.get_or_load(path, load)
     }
 
     /// Stores the value of `lookup` in `from` here, when this cache has
@@ -4142,10 +4247,10 @@ impl StatCache {
 
     /// Go `cachedvfs.FS.ClearCache` for these lookups.
     pub fn clear(&self) {
-        lock(&self.file_exists).clear();
-        lock(&self.directory_exists).clear();
-        lock(&self.realpath).clear();
-        lock(&self.entries).clear();
+        self.file_exists.clear();
+        self.directory_exists.clear();
+        self.realpath.clear();
+        self.entries.clear();
     }
 }
 
@@ -4184,20 +4289,16 @@ impl BuildStatCache {
     /// `cached`, as Go `cachedvfs` stores each lookup.
     fn host_lookup<V: Clone>(
         &self,
-        map: impl Fn(&StatCache) -> &Mutex<FxHashMap<String, V>>,
+        map: impl Fn(&StatCache) -> &StatMap<V>,
         path: &str,
         load: impl FnOnce() -> V,
     ) -> V {
         let cached = map(&self.cached);
-        if let Some(value) = lock(cached).get(path) {
-            return value.clone();
+        if let Some(value) = cached.get(path) {
+            return value;
         }
-        let found = lock(map(&self.load)).get(path).cloned();
-        let value = found.unwrap_or_else(load);
-        lock(cached)
-            .entry(path.to_string())
-            .or_insert(value)
-            .clone()
+        let value = map(&self.load).get(path).unwrap_or_else(load);
+        cached.insert_if_absent(path, value)
     }
 
     /// A parse worker's lookup: the value in `cached`, else in `load`, else
@@ -4205,16 +4306,16 @@ impl BuildStatCache {
     /// into the log of the resolution that runs (`note_worker_lookup`).
     fn worker_lookup<V: Clone>(
         &self,
-        map: impl Fn(&StatCache) -> &Mutex<FxHashMap<String, V>>,
+        map: impl Fn(&StatCache) -> &StatMap<V>,
         kind: StatKind,
         path: &str,
         load: impl FnOnce() -> V,
     ) -> V {
-        if let Some(value) = lock(map(&self.cached)).get(path) {
-            return value.clone();
+        if let Some(value) = map(&self.cached).get(path) {
+            return value;
         }
         note_worker_lookup(kind, path);
-        cached_stat(map(&self.load), path, load)
+        map(&self.load).get_or_load(path, load)
     }
 
     /// The host's `FileExists(path)` (see `host_lookup`).
@@ -4284,6 +4385,17 @@ impl BuildStatCache {
 struct SharedStatCache {
     own: StatCache,
     host: OnceLock<Arc<BuildStatCache>>,
+    /// The package.json texts that the workers' resolvers read
+    /// (`WorkerFs::read_file`), so that each is read once in the load. Go
+    /// reads each once into the resolver's package.json cache, which all
+    /// parse tasks share; each worker resolver here has its own cache.
+    package_jsons: StatMap<(Arc<str>, bool)>,
+    /// The OS stat of each path that a `FileExists`, `DirectoryExists` or
+    /// root file size (`PrefetchShared::rank_largest`) asked for in the load,
+    /// as (is a directory, size), when there is no host cache: Go
+    /// `vfs.Common` answers both lookups with one stat, so one stat answers
+    /// all three here.
+    nodes: StatMap<Option<(bool, i64)>>,
 }
 
 impl SharedStatCache {
@@ -4292,15 +4404,36 @@ impl SharedStatCache {
     /// or `load()` stored there.
     fn lookup<V: Clone>(
         &self,
-        map: impl Fn(&StatCache) -> &Mutex<FxHashMap<String, V>>,
+        map: impl Fn(&StatCache) -> &StatMap<V>,
         kind: StatKind,
         path: &str,
         load: impl FnOnce() -> V,
     ) -> V {
         match self.host.get() {
             Some(host) => host.worker_lookup(map, kind, path, load),
-            None => cached_stat(map(&self.own), path, load),
+            None => map(&self.own).get_or_load(path, load),
         }
+    }
+
+    /// The OS stat of `path` on `fs` (see `nodes`).
+    fn node(&self, fs: &dyn Fs, path: &str) -> Option<(bool, i64)> {
+        self.nodes.get_or_load(path, || {
+            fs.stat(path).map(|info| (info.is_dir(), info.size()))
+        })
+    }
+
+    /// Go `vfs.Common.FileExists` and `DirectoryExists` of `path` on `fs`
+    /// (a stat), from `nodes`, or `None` with a host cache: its lookups of
+    /// each kind stay for later programs, so they must not answer each
+    /// other (`BuildStatCache`).
+    fn exists(&self, fs: &dyn Fs, path: &str, directory: bool) -> Option<bool> {
+        if self.host.get().is_some() {
+            return None;
+        }
+        Some(
+            self.node(fs, path)
+                .is_some_and(|(is_dir, _)| is_dir == directory),
+        )
     }
 }
 
@@ -4321,6 +4454,9 @@ impl Fs for WorkerFs {
     }
 
     fn file_exists(&self, path: &str) -> bool {
+        if let Some(exists) = self.stats.exists(&*self.fs, path, false) {
+            return exists;
+        }
         self.stats.lookup(
             |c| &c.file_exists,
             StatKind::FileExists,
@@ -4330,9 +4466,15 @@ impl Fs for WorkerFs {
     }
 
     fn read_file(&self, path: &str) -> (String, bool) {
-        let read = self.fs.read_file(path);
+        if !path.ends_with("/package.json") {
+            return self.fs.read_file(path);
+        }
+        let (text, ok) = self.stats.package_jsons.get_or_load(path, || {
+            let (text, ok) = self.fs.read_file(path);
+            (Arc::from(text), ok)
+        });
+        let read = (text.to_string(), ok);
         if let Some(shared) = &self.keep_package_jsons
-            && path.ends_with("/package.json")
             && !shared.has_package_json_read(path)
         {
             note_worker_package_json_read(path, &read.0);
@@ -4362,6 +4504,9 @@ impl Fs for WorkerFs {
     }
 
     fn directory_exists(&self, path: &str) -> bool {
+        if let Some(exists) = self.stats.exists(&*self.fs, path, true) {
+            return exists;
+        }
         self.stats.lookup(
             |c| &c.directory_exists,
             StatKind::DirectoryExists,
@@ -4390,6 +4535,124 @@ impl Fs for WorkerFs {
             path,
             || self.fs.realpath(path),
         )
+    }
+}
+
+/// The base file system of a compiler host on the plain OS file system
+/// (`new_cached_fs_compiler_host`, under its `cachedvfs`): its
+/// `FileExists`, `DirectoryExists`, `Realpath` and `GetAccessibleEntries`
+/// calls on this thread go through the stat cache of the parse workers of
+/// this thread's load or early pool (`SharedStatCache::own`), as Go parse
+/// tasks and the loader share the host's cachedvfs. The loader then makes
+/// no call that a worker made already, and a worker makes none that the
+/// loader made (for example the root file checks of `addRootFileTask`,
+/// which the workers' import lookups ask for again). Every other call goes
+/// to `fs`.
+// PORT: not in Go (see `SharedStatCache`). The workers read the same OS
+// file system (`CompilerHost::is_plain_os_fs`), so a worker's answer is
+// the answer of `fs`.
+pub(crate) struct LoaderStatFs {
+    fs: Rc<dyn Fs>,
+}
+
+impl LoaderStatFs {
+    pub(crate) fn new(fs: Rc<dyn Fs>) -> Self {
+        LoaderStatFs { fs }
+    }
+
+    /// `load()`, or the value of `path` in the workers' cache of this
+    /// thread's load (else of its early pool), where `load()` is stored
+    /// when the cache has none. Only a cache of the workers' own (no
+    /// `tsc -b` host cache).
+    fn shared<V: Clone>(
+        &self,
+        map: impl Fn(&StatCache) -> &StatMap<V>,
+        path: &str,
+        load: impl FnOnce() -> V,
+    ) -> V {
+        match worker_stats() {
+            Some(stats) => map(&stats.own).get_or_load(path, load),
+            None => load(),
+        }
+    }
+
+    /// `FileExists` (or with `directory`, `DirectoryExists`) of `path`
+    /// (see `SharedStatCache::exists`).
+    fn exists(&self, path: &str, directory: bool) -> bool {
+        match worker_stats() {
+            Some(stats) => stats.exists(&*self.fs, path, directory) == Some(true),
+            None if directory => self.fs.directory_exists(path),
+            None => self.fs.file_exists(path),
+        }
+    }
+}
+
+/// The stat cache of the parse workers of this thread's load (else of its
+/// early pool), when it is their own (no `tsc -b` host cache).
+fn worker_stats() -> Option<Arc<SharedStatCache>> {
+    let shared = PREFETCH.with(|p| p.borrow().clone()).or_else(|| {
+        EARLY_POOL.with(|early| early.borrow().as_ref().map(|pool| pool.shared.clone()))
+    })?;
+    shared
+        .stats
+        .host
+        .get()
+        .is_none()
+        .then(|| shared.stats.clone())
+}
+
+impl Fs for LoaderStatFs {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.fs.use_case_sensitive_file_names()
+    }
+
+    fn file_exists(&self, path: &str) -> bool {
+        self.exists(path, false)
+    }
+
+    fn read_file(&self, path: &str) -> (String, bool) {
+        self.fs.read_file(path)
+    }
+
+    fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.write_file(path, data)
+    }
+
+    fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.append_file(path, data)
+    }
+
+    fn remove(&self, path: &str) -> Result<(), FsError> {
+        self.fs.remove(path)
+    }
+
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<std::time::SystemTime>,
+        m_time: Option<std::time::SystemTime>,
+    ) -> Result<(), FsError> {
+        self.fs.chtimes(path, a_time, m_time)
+    }
+
+    fn directory_exists(&self, path: &str) -> bool {
+        self.exists(path, true)
+    }
+
+    fn get_accessible_entries(&self, path: &str) -> Entries {
+        self.shared(
+            |c| &c.entries,
+            path,
+            || self.fs.get_accessible_entries(path),
+        )
+    }
+
+    fn stat(&self, path: &str) -> Option<FileInfo> {
+        self.fs.stat(path)
+    }
+
+    fn realpath(&self, path: &str) -> String {
+        self.shared(|c| &c.realpath, path, || self.fs.realpath(path))
     }
 }
 

@@ -198,6 +198,13 @@ pub fn new_cached_fs_compiler_host(
     content_mapper_project: Option<Rc<dyn Project>>,
 ) -> Rc<dyn CompilerHost> {
     let plain_os_fs = is_wrapped_os_fs(&fs);
+    // PERF: on the plain OS file system, the cache's calls go through the
+    // stat cache of the parse workers (`LoaderStatFs`).
+    let fs: Rc<dyn Fs> = if plain_os_fs {
+        Rc::new(super::files_parser::LoaderStatFs::new(fs))
+    } else {
+        fs
+    };
     new_compiler_host_with(
         current_directory,
         cachedvfs_from(fs),
