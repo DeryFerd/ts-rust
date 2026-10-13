@@ -596,9 +596,13 @@ pub fn collect_all_affected_files(program: &Program) {
     // PORT: Go runs both loops on work groups. Each `computeDtsSignature` is a
     // d.ts emit of one file (affectedfileshandler.go:69), and where its
     // widenings come first sets the d.ts text, so the order counts. Single
-    // threaded, Go runs each queue last queued first (core/workgroup.go:67),
-    // so the port runs both loops in reverse (dtsorder1: better-auth/00/incr
-    // step 2).
+    // threaded, Go runs each queue last queued first (singleThreadedWorkGroup
+    // pop, core/workgroup.go:78), so the port runs both loops in reverse
+    // (dtsorder1: better-auth/00/incr step 2). Go calls `getDtsMayChange` in
+    // the `Range` before it queues, but the port calls it in the reversed
+    // loop, so new pending-emit entries come in reverse order. Go's order
+    // there comes from random map order, so the reverse is still one of Go's
+    // possible orders.
     let single_threaded = crate::program::single_threaded();
     if single_threaded {
         changed_files.reverse();
