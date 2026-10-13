@@ -4405,7 +4405,7 @@ struct SharedStatCache {
     /// `vfs.Common` answers each of the two lookups with a stat
     /// (internal.go:59, :64), so here one stat answers all three. Not for
     /// the lookups of a bundled path (`exists`).
-    // PORT: Go `cachedvfs` caches `FileExists` and `DirectoryExists` in two
+    // PORT: Go `cachedvfs` caches `DirectoryExists` and `FileExists` in two
     // maps (cachedvfs.go:49, :65), so Go makes one stat per lookup kind: 2
     // stats for a path that it asks both of. Here the first lookup of a
     // path fixes both answers for the load, so the port makes fewer stats
@@ -4634,8 +4634,11 @@ impl LoaderStatFs {
 ///
 /// An early pool's cache keeps the OS answers from when its workers ran.
 /// Each flow that starts an early pool makes its host next and loads with
-/// that host, and the load takes the pool (`FilesParser::parse`). So the
-/// pool's answers are those of the host's own load. An early pool goes
+/// that host, and the load takes the pool (`FilesParser::parse`), except
+/// `tsc -b`: it starts an early pool but makes no `LoaderStatFs` (its host
+/// is `new_compiler_host_over`), and its load gives the pool the build
+/// host's stat cache, which this does not give. So the pool's answers are
+/// those of the host's own load. An early pool goes
 /// only to the first host made after it (`PrefetchPool::host`): a later
 /// host does not read the pool of a host that never loaded. A flow that
 /// makes no host after it starts a pool leaves the pool to the next host
