@@ -145,7 +145,9 @@ impl FlowState {
         guard: &'g mut Option<FileRef<FlowNode>>,
     ) -> &'g FlowNode {
         let nodes = self.flow_nodes;
-        if flow.file_index() + 1 == self.flow_nodes_file {
+        // `checked_add`: the synthetic flow file is 0xffff_ffff, and on a
+        // 32-bit target `+ 1` wraps to 0, the "no file" marker.
+        if flow.file_index().checked_add(1) == Some(self.flow_nodes_file) {
             return &nodes[flow.local_index()];
         }
         self.flow_data_slow(flow, guard)
@@ -160,7 +162,7 @@ impl FlowState {
         match static_file_flow_nodes(flow) {
             Some(nodes) => {
                 self.flow_nodes = nodes;
-                self.flow_nodes_file = flow.file_index() + 1;
+                self.flow_nodes_file = flow.file_index().wrapping_add(1);
                 &nodes[flow.local_index()]
             }
             None => flow.get_flow_in(guard),
