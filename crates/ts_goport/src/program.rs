@@ -2362,12 +2362,16 @@ fn bind_order(files: &[(Node, bool)]) -> Vec<usize> {
 /// `Lineage::add_file`). It stops at the first file that made thread-local
 /// state while binding (for example a lazy JSDoc parse) or panicked;
 /// `bind_all` binds that file and the rest serially, which gives the same
-/// result as a serial bind of every file.
+/// result as a serial bind of every file. Each bind that is dropped (that
+/// file, and the files after it that wait for its offsets) sets its node
+/// records back when it drops (`binder::NodeBindRecords`), before the scope
+/// ends.
 // PERF: a file's ids move to their program values on a bind thread, as soon
 // as every earlier file is bound, because its offsets are the sums of the
-// earlier file counts. The thread that bound the file moves them, installs
-// the file's binder output (`BoundFile::install`: the node records and the
-// `GoFile` cells) and prepares its chunks, before it binds the next file,
+// earlier file counts. The thread that bound the file moves them (in the
+// node records that got a symbol, bindonce2), installs the file's binder
+// output (`BoundFile::install`: the `GoFile` cells) and prepares its
+// chunks, before it binds the next file,
 // so the data is still in its core's cache (bindonce1, `bind_order`). Each
 // thread stays while a file it bound can still get its offsets, so every
 // file before the first failed one reaches the loading thread. The loading

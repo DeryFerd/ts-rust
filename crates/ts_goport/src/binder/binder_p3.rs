@@ -7,9 +7,10 @@ use crate::prelude::*;
 
 // PORT: Binder storage used by this file. Go stores binder output on the AST
 // nodes and flow nodes directly. The Rust `Binder` (defined in binder_p1)
-// holds that output until `bind_source_file` fills the `GoFile` cells:
+// writes the node records and holds the rest until `bind_source_file` fills
+// the `GoFile` cells:
 // - `self.flow_nodes: Vec<FlowNode>`, indexed by `FlowNodeId::local_index()`.
-// - `self.node_bind: NodeBindBuilder`, indexed by `node.node_id().index()`.
+// - `self.node_bind: NodeBindRecords`, indexed by `node.node_id().index()`.
 // - `self.file_bind: FileBindData` (bind diagnostics and the other file data).
 // - `self.symbols: SymbolArena` (Go `symbolArena`).
 // - `self.active_label_list: Option<Rc<RefCell<ActiveLabel>>>`.
@@ -28,16 +29,8 @@ impl Binder {
         self.flow_nodes[flow.local_index()].antecedents = antecedents;
     }
 
-    fn p3_node_bind_mut(&mut self, node: Node) -> &mut NodeBindData {
-        debug_assert!(
-            node.file_index() == self.file.file_index(),
-            "binder data for a node in another file"
-        );
-        self.node_bind.get_mut(node.node_id().index())
-    }
-
-    /// Writes the `flow_node` of a node. Flow nodes are kept apart from the
-    /// other node data while binding (`NodeBindBuilder::set_flow_node`).
+    /// Writes the `flow_node` of a node: its record, or its extras entry
+    /// (`NodeBindRecords::set_flow_node`).
     fn p3_set_node_flow(&mut self, node: Node, flow: FlowNodeId) {
         debug_assert!(
             node.file_index() == self.file.file_index(),
@@ -586,7 +579,7 @@ impl Binder {
         let active = self.active_label_list.clone().expect("active label list");
         if !active.borrow().referenced {
             // Mark the label as unused; the checker will decide whether to report it
-            self.p3_node_bind_mut(label).added_flags |= NodeFlags::UNREACHABLE;
+            self.add_node_flags(label, NodeFlags::UNREACHABLE);
         }
         self.active_label_list = active.borrow().next.clone();
         self.add_antecedent(post_statement_label, self.current_flow);
@@ -1022,7 +1015,7 @@ impl Binder {
             | SyntaxKind::FunctionDeclaration
             | SyntaxKind::FunctionExpression
             | SyntaxKind::ClassStaticBlockDeclaration => {
-                self.p3_node_bind_mut(node).return_flow_node = return_flow_node;
+                self.set_node_return_flow_node(node, return_flow_node);
             }
             _ => {}
         }
@@ -1039,7 +1032,7 @@ impl Binder {
     pub fn add_to_container_chain(&mut self, next: Node) {
         if self.last_container.is_some() {
             let last_container = self.last_container;
-            self.p3_node_bind_mut(last_container).next_container = next;
+            self.set_next_container(last_container, next);
         }
         self.last_container = next;
     }
@@ -1056,7 +1049,7 @@ impl Binder {
         node: Node,
         symbol_flags: SymbolFlags,
     ) {
-        self.p3_node_bind_mut(node).symbol = symbol;
+        self.set_node_symbol(node, symbol);
         let s = self.symbols.sym_mut(symbol);
         s.flags |= symbol_flags;
         // PORT: Go `newSingleDeclaration` for a nil list, else
@@ -1125,7 +1118,7 @@ impl Binder {
         if const_enum_reset {
             self.not_const_enum_only_modules.insert(symbol);
         }
-        self.p3_node_bind_mut(node).symbol = symbol;
+        self.set_node_symbol(node, symbol);
         symbol
     }
 }
