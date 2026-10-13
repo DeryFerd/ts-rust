@@ -268,38 +268,32 @@ fn embedded_contents(rest: &str) -> Option<&'static str> {
 
 // Go: embed_generated.go:242 embeddedContents
 // PORT: wasm unpacks the one stream of build.rs (`libs.lzma`, the libs in
-// `PACKED_LIBS` order) up to lib `rest`, and keeps each text it unpacks for
-// the life of the process. The reader stays too, with its 3.8 MB window
-// (one stream per lib needed at most 2.35 MB, for lib.dom.d.ts, at a time).
+// `PACKED_LIBS` order) on first use, all of it, and keeps the texts for the
+// life of the process. The reader goes with its 3.8 MB window. Unpacking
+// only up to the lib asked for kept the reader, and saved little: lib.es5,
+// which every program reads, is near the end of the stream.
 #[cfg(target_family = "wasm")]
 fn embedded_contents(rest: &str) -> Option<&'static str> {
     use std::io::Read;
-    use std::sync::{Mutex, PoisonError};
-    struct Unpacked {
-        reader: lzma_rust2::LzmaReader<&'static [u8]>,
-        texts: Vec<&'static str>,
-    }
-    static UNPACKED: Mutex<Option<Unpacked>> = Mutex::new(None);
+    static TEXTS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     let index = packed_lib_index(rest)?;
-    let mut unpacked = UNPACKED.lock().unwrap_or_else(PoisonError::into_inner);
-    let unpacked = unpacked.get_or_insert_with(|| {
+    let texts = TEXTS.get_or_init(|| {
         let packed: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libs.lzma"));
-        Unpacked {
-            reader: lzma_rust2::LzmaReader::new_mem_limit(packed, u32::MAX, None)
-                .expect("build.rs packs the libs"),
-            texts: Vec::new(),
-        }
-    });
-    while unpacked.texts.len() <= index {
-        let mut text = vec![0; PACKED_LIBS[unpacked.texts.len()].1];
-        unpacked
-            .reader
-            .read_exact(&mut text)
+        let mut reader = lzma_rust2::LzmaReader::new_mem_limit(packed, u32::MAX, None)
             .expect("build.rs packs the libs");
-        let text = String::from_utf8(text).expect("a lib is UTF-8");
-        unpacked.texts.push(Box::leak(text.into_boxed_str()));
-    }
-    Some(unpacked.texts[index])
+        PACKED_LIBS
+            .iter()
+            .map(|&(_, len)| {
+                let mut text = vec![0; len];
+                reader
+                    .read_exact(&mut text)
+                    .expect("build.rs packs the libs");
+                let text = String::from_utf8(text).expect("a lib is UTF-8");
+                &*Box::leak(text.into_boxed_str())
+            })
+            .collect()
+    });
+    Some(texts[index])
 }
 
 /// The size of lib `rest` (`embedded_contents`) in bytes.

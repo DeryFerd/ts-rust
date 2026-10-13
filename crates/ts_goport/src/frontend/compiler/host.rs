@@ -341,7 +341,9 @@ impl CompilerHost for CompilerHostImpl {
             match take_prefetched(opts, script_kind, Some(text.as_str())) {
                 Prefetched::Parse(file) => return Some(Rc::new(file)),
                 Prefetched::Text(worker_text) => worker_text,
-                Prefetched::Nothing => FileText::new(text, freeable),
+                Prefetched::Nothing => {
+                    unpacked_lib_text(&opts.file_name, &text).unwrap_or_else(|| FileText::new(text, freeable))
+                }
             }
         };
         // Not in Go: while `ast::free_file_versions` is on (`tsc --watch`,
@@ -396,6 +398,19 @@ impl CompilerHost for CompilerHostImpl {
     fn is_plain_os_fs(&self) -> bool {
         self.plain_os_fs
     }
+}
+
+/// wasm: the unpacked text of bundled lib `file_name` when the file system
+/// showed the same `text`. It lives as long as the process, so a parse of
+/// it leaks no copy. `None` on native, and for other files.
+// PORT: not in Go.
+fn unpacked_lib_text(file_name: &str, text: &str) -> Option<FileText> {
+    if !cfg!(target_family = "wasm") {
+        return None;
+    }
+    bundled_text(file_name)
+        .filter(|&lib| lib == text)
+        .map(FileText::from)
 }
 
 // PORT: Go passes the `*compilerHost` as a `tsoptions.ParseConfigHost`
