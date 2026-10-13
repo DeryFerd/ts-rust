@@ -9,8 +9,8 @@ bench_tools() {
     Darwin/arm64) platform=darwin-arm64; bun_platform=darwin-aarch64 ;;
     *) echo "unsupported benchmark platform" >&2; exit 1 ;;
   esac
-  RS03=$work/node_modules/@tsc-rs/$platform/lib/tsc
-  RS=${RS_BIN:-$RS03}
+  RS_PKG=$work/node_modules/@tsc-rs/$platform/lib/tsc
+  RS=${RS_BIN:-$RS_PKG}
   GO=$work/node_modules/@typescript/typescript-$platform/lib/tsc
   BUN=$work/bun-$bun_platform/bun
 }
