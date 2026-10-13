@@ -353,8 +353,8 @@ fn finish_symlink_seed(
 /// cannot read the frontend program. For the symlink cache, that is its
 /// seed (`SymlinkSeed`), which makes no file system call, so a program that
 /// never uses the cache makes none of its `realpath` calls, as in Go. Where
-/// a seed cannot be finished on another thread with the host's lookups,
-/// the cache itself. Does nothing on another thread, which was seeded after
+/// a seed cannot be finished on another thread (`SymlinkSeed::of`), the
+/// cache itself. Does nothing on another thread, which was seeded after
 /// this, or for an alias resolver program.
 // PERF (syscut1): the cache took 62 `realpath` calls (open, readlink,
 // close) in a VS Code `--noEmit` check, where Go makes none.
@@ -378,9 +378,9 @@ pub(super) fn build_lazy_shared_state() {
 /// The symlink cache seed of a program (`SymlinkSeed`), until the first
 /// thread that uses the cache takes it to finish it (`finish`). A seed that
 /// no thread finishes (the loading thread built the cache itself, or no
-/// thread used it) frees on the free thread (`drop_in_background`), as do
-/// the load's lookups that it keeps: when the cache is built (`discard`),
-/// or when the program's shared state drops.
+/// thread used it) frees with the load's lookups that it keeps on the free
+/// thread (`SymlinkSeed::free`): when the cache is built (`discard`), or
+/// when the program's shared state drops.
 // PORT: not in Go (see `SymlinkSeed`).
 #[derive(Default)]
 pub(super) struct SymlinkSeedSlot(std::sync::Mutex<SeedState>);
@@ -449,11 +449,11 @@ impl SymlinkSeedSlot {
         }
     }
 
-    /// Frees the seed on the free thread: the cache is built.
+    /// Lets go of the seed (`SymlinkSeed::free`): the cache is built.
     fn discard(&self) {
         let state = std::mem::take(&mut *self.lock());
         if let SeedState::Ready(seed) = state {
-            crate::execute::build::build_task::drop_in_background(seed);
+            seed.free();
         }
     }
 }
@@ -522,8 +522,9 @@ pub(super) struct SymlinkSeed {
     project_name: String,
     current_directory: String,
     /// The lookups of the program's host (Go `p.Host().FS()`, a
-    /// `cachedvfs`) that another thread can read.
-    stats: crate::frontend::compiler::HostStatCache,
+    /// `cachedvfs`) that another thread can read. `None` when it has none
+    /// (see `of`).
+    stats: Option<crate::frontend::compiler::HostStatCache>,
 }
 
 impl SymlinkSeed {
@@ -531,24 +532,33 @@ impl SymlinkSeed {
     /// cache itself: a host that does not show the plain OS file system (a
     /// new resolver of another thread would not see its files), project
     /// references and content mappers (the program resolver's host maps
-    /// files that the OS file system does not show), a program that emits
-    /// declarations, which uses the cache, and a host whose lookups only
-    /// the loading thread can read (a load with no parse workers, as with
-    /// `--singleThreaded`): a resolver of another thread would make each
-    /// lookup of the load again.
+    /// files that the OS file system does not show), and a program that
+    /// emits declarations, which uses the cache.
+    ///
+    /// A load with no parse workers (as with `--singleThreaded`, whose one
+    /// checker has a thread of its own) leaves its lookups only in the
+    /// host's `CachedFs`, which only the loading thread reads. Its seed has
+    /// none, so the finish makes the lookups that it needs
+    /// (`HostStatCache::empty`): Go builds the cache on first use in every
+    /// mode (program.go:2330 `GetSymlinkCache`).
+    // PERF (followups66): the eager build of a `--singleThreaded` VS Code
+    // `--noEmit` check made 61 more readlink calls than the default mode.
     fn of(frontend: &NewProgram) -> Option<Self> {
+        use crate::frontend::compiler::HostStatCache;
         let stats = frontend
             .host()
             .stat_cache()
-            .map(crate::frontend::compiler::HostStatCache::Build)
-            .or_else(|| frontend.load_stats.take())?;
+            .map(HostStatCache::Build)
+            .or_else(|| frontend.load_stats.take());
         let options = frontend.options();
         if !frontend.host().is_plain_os_fs()
             || !frontend.get_resolved_project_references().is_empty()
             || !frontend.content_mapper_extensions().is_empty()
             || (options.get_emit_declarations() && !options.no_emit.is_true())
         {
-            stats.free();
+            if let Some(stats) = stats {
+                stats.free();
+            }
             return None;
         }
         Some(SymlinkSeed {
@@ -559,6 +569,17 @@ impl SymlinkSeed {
             current_directory: frontend.host().get_current_directory(),
             stats,
         })
+    }
+
+    /// Lets go of a seed that no thread finishes. A seed with the host's
+    /// lookups goes to the free thread (`drop_in_background`, which the
+    /// load started), as `HostStatCache::free` does; one without them is
+    /// small and drops here, so a `--singleThreaded` run starts no thread
+    /// for it.
+    fn free(self) {
+        if self.stats.is_some() {
+            crate::execute::build::build_task::drop_in_background(self);
+        }
     }
 
     /// The symlink cache: the seed finished with a new resolver of the
@@ -579,10 +600,15 @@ impl SymlinkSeed {
                 &self.current_directory
             }
         }
+        // The finish's own lookups, when the host has none that this thread
+        // can read, are few: they drop here with the resolver.
         let stats = self.stats.clone();
         let resolver = new_resolver(ResolverOptions {
             host: Some(Rc::new(OsHost {
-                fs: Rc::new(crate::frontend::compiler::HostStatFs::new(self.stats)),
+                fs: Rc::new(crate::frontend::compiler::HostStatFs::new(
+                    self.stats
+                        .unwrap_or_else(crate::frontend::compiler::HostStatCache::empty),
+                )),
                 current_directory: self.current_directory,
             })),
             compiler_options: Some(Rc::new(self.options)),
@@ -600,7 +626,9 @@ impl SymlinkSeed {
             )
         });
         drop(resolver);
-        stats.free();
+        if let Some(stats) = stats {
+            stats.free();
+        }
         symlinks
     }
 }
@@ -2401,7 +2429,32 @@ pub(super) mod tests {
     #[cfg(unix)]
     #[test]
     fn seeded_thread_finishes_the_symlink_cache() {
-        let dir = symlinked_package_project("goport-seed-symlinks");
+        assert_seeded_thread_finishes_the_symlink_cache("goport-seed-symlinks", false);
+    }
+
+    // followups66: a `--singleThreaded` load has no parse workers, so no
+    // other thread can read its lookups. Its one checker runs on a seeded
+    // thread, which finishes the seed with lookups of its own: the load
+    // does not build the cache, as in Go (`GetSymlinkCache` is a
+    // `lazyValue` in every mode).
+    #[cfg(unix)]
+    #[test]
+    fn single_threaded_seeded_thread_finishes_the_symlink_cache() {
+        assert_seeded_thread_finishes_the_symlink_cache("goport-seed-symlinks-st", true);
+    }
+
+    /// The body of `seeded_thread_finishes_the_symlink_cache`, for a
+    /// project dir named `name`, `--singleThreaded` when `single_threaded`.
+    #[cfg(unix)]
+    fn assert_seeded_thread_finishes_the_symlink_cache(name: &str, single_threaded: bool) {
+        let dir = symlinked_package_project(name);
+        if single_threaded {
+            std::fs::write(
+                format!("{dir}/tsconfig.json"),
+                r#"{"compilerOptions":{"types":[],"singleThreaded":true},"files":["index.ts"]}"#,
+            )
+            .unwrap();
+        }
         std::fs::write(
             format!("{dir}/package.json"),
             r#"{"name":"app","dependencies":{"pkg":"1.0.0","dep":"1.0.0"}}"#,
@@ -2424,6 +2477,7 @@ pub(super) mod tests {
         let frontend = frontend_of(program);
         let seeded = {
             let _scope = crate::core::enter_program(Some(program));
+            assert_eq!(crate::program::single_threaded(), single_threaded);
             crate::program::spawn_seeded_thread(|| ())
                 .join()
                 .expect("the seeded thread ends");

@@ -4806,13 +4806,22 @@ pub(crate) enum HostStatCache {
     /// The lookups that the loader (`LoaderStatFs`) and the parse workers
     /// of a load on the plain OS file system made (`SharedStatCache`).
     /// They answer for the host: every answer is the OS answer, and the
-    /// load writes no file.
+    /// load writes no file. Empty for a load that made none that another
+    /// thread can read (`empty`).
     Load(Arc<SharedStatCache>),
     /// The cache of the `tsc -b` host (`CompilerHost::stat_cache`).
     Build(Arc<BuildStatCache>),
 }
 
 impl HostStatCache {
+    /// No lookups, for a load on the plain OS file system with no parse
+    /// workers (as with `--singleThreaded`): its lookups are in the host's
+    /// `CachedFs`, which only the loading thread reads. A `HostStatFs` on
+    /// it makes each lookup that it needs, once.
+    pub(crate) fn empty() -> Self {
+        HostStatCache::Load(Arc::default())
+    }
+
     /// Lets go of these lookups. A load's lookups go to the free thread
     /// (`drop_in_background`, which the load started), so this thread does
     /// not free them; the `tsc -b` host keeps its own.
