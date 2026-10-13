@@ -5109,4 +5109,92 @@ mod stat_cache_tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A lookup of a path that another thread loads waits at most
+    /// `STAT_MAP_WAIT`, then loads the path itself and stores nothing: the
+    /// value of the path stays the loader's.
+    #[test]
+    fn stat_map_waiter_loads_itself() {
+        use std::sync::mpsc;
+        let map = &StatMap::<u32>::default();
+        std::thread::scope(|scope| {
+            let (started, on_start) = mpsc::channel();
+            let (finish, on_finish) = mpsc::channel::<()>();
+            let loader = scope.spawn(move || {
+                map.get_or_load("p", || {
+                    started.send(()).unwrap();
+                    // Until `finish` is dropped.
+                    let _ = on_finish.recv();
+                    1
+                })
+            });
+            on_start.recv().unwrap();
+            let (waited, on_wait) = mpsc::channel();
+            scope.spawn(move || waited.send(map.get_or_load("p", || 2)));
+            // A waiter that waited for the loader would get 1, after
+            // `finish`.
+            let wait = on_wait.recv_timeout(std::time::Duration::from_secs(10));
+            let stored = map.get("p");
+            drop(finish);
+            assert_eq!(wait, Ok(2));
+            assert_eq!(stored, None);
+            assert_eq!(loader.join().unwrap(), 1);
+        });
+        assert_eq!(map.get("p"), Some(1));
+    }
+
+    /// A load that never finishes (it panics) leaves its slot `Loading`.
+    /// Each lookup of the path then loads it itself, and an insert stores
+    /// its value there.
+    #[test]
+    fn stat_map_load_that_never_finishes() {
+        let map = Arc::new(StatMap::<u32>::default());
+        let load = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.get_or_load("p", || panic!("the load fails"))
+        }));
+        assert!(load.is_err());
+        assert_eq!(map.get("p"), None);
+        // On another thread, so that a lookup that waits for the slot
+        // fails the test and does not stop it.
+        let (looked, on_look) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let map = map.clone();
+            move || looked.send((map.get_or_load("p", || 1), map.get_or_load("p", || 2)))
+        });
+        let looks = on_look.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(looks, Ok((1, 2)));
+        assert_eq!(map.insert_if_absent("p", 3), 3);
+        assert_eq!(map.get_or_load("p", || 4), 3);
+    }
+
+    /// A clear drops the values and the slots of the loads that run, as Go
+    /// `ClearCache`. The value of a load that runs over the clear is then
+    /// stored, as Go's `Store` after `ClearCache`.
+    #[test]
+    fn stat_map_insert_after_clear() {
+        use std::sync::mpsc;
+        let map = &StatMap::<u32>::default();
+        assert_eq!(map.get_or_load("p", || 1), 1);
+        map.clear();
+        assert_eq!(map.get("p"), None);
+        assert_eq!(map.insert_if_absent("p", 2), 2);
+        assert_eq!(map.get_or_load("p", || 3), 2);
+        std::thread::scope(|scope| {
+            let (started, on_start) = mpsc::channel();
+            let (finish, on_finish) = mpsc::channel::<()>();
+            let loader = scope.spawn(move || {
+                map.get_or_load("q", || {
+                    started.send(()).unwrap();
+                    let _ = on_finish.recv();
+                    4
+                })
+            });
+            on_start.recv().unwrap();
+            map.clear();
+            drop(finish);
+            assert_eq!(loader.join().unwrap(), 4);
+        });
+        assert_eq!(map.get("q"), Some(4));
+        assert_eq!(map.get_or_load("q", || 5), 4);
+    }
 }
