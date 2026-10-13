@@ -9596,6 +9596,16 @@ mod tests {
     #[test]
     fn later_new_kinds_go_in_the_pooled_block_past_the_budget() {
         use super::super::file_version::FileVersion;
+        // Empties the pool again when the test ends, after its versions
+        // drop (it is made first, so it drops last), so a later test in the
+        // process does not start with the budget used up.
+        struct ClearPoolAtEnd;
+        impl Drop for ClearPoolAtEnd {
+            fn drop(&mut self) {
+                clear_block_pool();
+            }
+        }
+        let _clear = ClearPoolAtEnd;
         clear_block_pool();
         // Publishes a freeable version of file `name` with `count`
         // identifiers, and gives its plain kind column (a prefix when its
