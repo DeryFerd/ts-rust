@@ -296,7 +296,10 @@ struct ChunkTable<T> {
     /// The `Some` entries of `near`.
     live: usize,
     /// The empty entries of `near` when `compact` last found no cut, else
-    /// 0. `compact` scans again only when more entries are empty.
+    /// 0. `compact` scans again only when more entries are empty. That is
+    /// exact because a table that compacts never fills a hole of `near`
+    /// (`set`): only a d.ts twin sets a taken number again, and a twin never
+    /// compacts.
     no_cut_empty: usize,
 }
 
@@ -421,6 +424,10 @@ impl<T> ChunkTable<T> {
             return;
         }
         let i = c - self.base;
+        debug_assert!(
+            self.no_cut_empty == 0 || i >= self.near.len(),
+            "a chunk table filled a hole after a compact found no cut"
+        );
         if self.near.len() <= i {
             self.near.resize_with(i + 1, || None);
         }
@@ -3647,6 +3654,32 @@ mod tests {
         assert_eq!(table.get(50), None);
     }
 
+    /// Opens `count` program versions as owners on this thread, one after
+    /// the other. Each makes one node with `f` and is freed, so the slot and
+    /// data tables get a hole per version and compact. Returns the node of
+    /// the last version.
+    fn free_program_versions(f: &NodeFactory, count: usize) -> Node {
+        let mut freed = Node::NIL;
+        for i in 0..count {
+            let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
+                id: next_program_id(),
+                options: Box::leak(Box::default()),
+                state: std::sync::OnceLock::new(),
+            }));
+            open_synthetic_owner(program.id);
+            {
+                let _program = enter_program(Some(program));
+                freed = f.new_identifier(format!("v{i}"));
+            }
+            free_synthetic_owner(program.id);
+        }
+        freed
+    }
+
+    /// Program versions for `free_program_versions`. Not a multiple of
+    /// COMPACT_MIN_EMPTY: the tables end between two compacts.
+    const FREED_PROGRAMS: usize = 2 * COMPACT_MIN_EMPTY + COMPACT_MIN_EMPTY / 2;
+
     // edleak3: the chunks of freed program versions leave the tables
     // (`ChunkTable::compact`). A node of the thread made before stays
     // readable from below the base, and a node of a freed version panics.
@@ -3657,23 +3690,8 @@ mod tests {
         std::thread::spawn(|| {
             let f = NodeFactory::new();
             let kept = f.new_identifier("kept");
-            let mut freed = Node::NIL;
-            // Not a multiple of COMPACT_MIN_EMPTY: the tables end between
-            // two compacts.
-            let programs = 2 * COMPACT_MIN_EMPTY + COMPACT_MIN_EMPTY / 2;
-            for i in 0..programs {
-                let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
-                    id: next_program_id(),
-                    options: Box::leak(Box::default()),
-                    state: std::sync::OnceLock::new(),
-                }));
-                open_synthetic_owner(program.id);
-                {
-                    let _program = enter_program(Some(program));
-                    freed = f.new_identifier(format!("v{i}"));
-                }
-                free_synthetic_owner(program.id);
-            }
+            let programs = FREED_PROGRAMS;
+            let freed = free_program_versions(&f, programs);
             let kept_chunk = slot_index(kept) / SLOT_CHUNK;
             ARENA.with(|a| {
                 let a = a.borrow();
@@ -3716,6 +3734,120 @@ mod tests {
                 "the thread's open chunk"
             );
             assert!(ARENA.with(|a| kept_chunk < a.borrow().slots.base));
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    // followups61 (R211 reviewer item d): a compact between two to-string
+    // calls moves the open chunk of the print owner to `far`. The next call
+    // fills that chunk (a push fills the open chunk of its owner, also in
+    // `far`) and goes on in a new one. Its end takes the chunk in `far`
+    // (`take_full_print_chunks`): the number is a hole, the nodes of the
+    // call panic, and the print owner keeps one chunk per table.
+    #[test]
+    fn a_print_chunk_in_far_fills_and_goes_at_the_print_exit() {
+        std::thread::spawn(|| {
+            let printer = NodeFactory::new();
+            printer.set_print_owned();
+            let f = NodeFactory::new();
+            let kept = f.new_identifier("kept");
+            enter_print_scope();
+            printer.new_identifier("first");
+            exit_print_scope().expect("an unpinned call frees");
+            assert_eq!(print_chunk_counts(), (1, 1, 0));
+            let (slot_chunk, data_chunk) = ARENA.with(|a| {
+                let c = &a.borrow().print.chunks;
+                (c.slots[0] as usize, c.datas[0] as usize)
+            });
+            free_program_versions(&f, FREED_PROGRAMS);
+            ARENA.with(|a| {
+                let a = a.borrow();
+                assert!(a.slots.far.contains_key(&slot_chunk), "slot chunk in far");
+                assert!(a.datas.far.contains_key(&data_chunk), "data chunk in far");
+            });
+
+            enter_print_scope();
+            let nodes: Vec<Node> = (0..SLOT_CHUNK.max(DATA_CHUNK))
+                .map(|i| printer.new_identifier(format!("p{i}")))
+                .collect();
+            assert_eq!(slot_index(nodes[0]) / SLOT_CHUNK, slot_chunk);
+            ARENA.with(|a| {
+                let c = &a.borrow().print.chunks;
+                let datas = (c.datas.len(), c.datas[0] as usize);
+                assert_eq!((c.slots.len(), datas), (2, (2, data_chunk)));
+            });
+            let ranges = exit_print_scope().expect("an unpinned call frees");
+            assert_eq!(print_range_nodes(&ranges).collect::<Vec<_>>(), nodes);
+            assert_eq!(print_chunk_counts(), (1, 1, 0));
+            ARENA.with(|a| {
+                let a = a.borrow();
+                assert!(a.slots.get(slot_chunk).is_none(), "slot chunk taken");
+                assert!(a.datas.get(data_chunk).is_none(), "data chunk taken");
+                a.slots.assert_live();
+                a.datas.assert_live();
+            });
+            for n in [nodes[0], nodes[nodes.len() - 1]] {
+                assert!(read_panic(|| n.text().to_string()).is_some());
+            }
+            assert_eq!(kept.text(), "kept");
+            enter_print_scope();
+            let next = printer.new_identifier("next");
+            assert_eq!(next.text(), "next");
+            exit_print_scope();
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
+    }
+
+    // followups61 (R211 reviewer item d): a compact before a d.ts twin
+    // starts. The shared counters start at `len`, past every number below
+    // the base, so no chunk of the twin takes a number of the checker. A
+    // node of the checker in a chunk in `far` comes to the twin in a print
+    // pack, and the checker keeps filling that chunk.
+    #[test]
+    fn a_twin_after_a_compact_reads_the_checker_nodes_in_far() {
+        std::thread::spawn(|| {
+            let f = NodeFactory::new();
+            let kept = f.new_identifier("kept");
+            free_program_versions(&f, FREED_PROGRAMS);
+            let kept_chunk = slot_index(kept) / SLOT_CHUNK;
+            let len = ARENA.with(|a| {
+                let a = a.borrow();
+                assert!(kept_chunk < a.slots.base);
+                assert!(a.slots.far.contains_key(&kept_chunk));
+                a.slots.len()
+            });
+            let shared = share_synthetic_chunks();
+            let block = f.new_block(f.new_node_list(&[kept]), false);
+            assert_eq!(slot_index(block) / SLOT_CHUNK, kept_chunk);
+            let pack = export_print_pack(&[block], |_, _| {});
+
+            std::thread::spawn(move || {
+                install_twin_synthetic_arena(shared);
+                install_print_pack(pack);
+                assert_eq!(block.statement_list().nodes().to_vec(), vec![kept]);
+                assert_eq!(kept.text(), "kept");
+                let own = NodeFactory::new().new_identifier("own");
+                assert!(slot_index(own) / SLOT_CHUNK >= len, "a new number");
+                assert_eq!(own.text(), "own");
+                release_print_packs();
+                assert!(read_panic(|| kept.text().to_string()).is_some());
+                assert_eq!(own.text(), "own");
+            })
+            .join()
+            .expect("twin thread panicked");
+
+            // The checker's next chunk skips the number the twin took.
+            let nodes: Vec<Node> = (0..SLOT_CHUNK)
+                .map(|i| f.new_identifier(format!("n{i}")))
+                .collect();
+            let last = nodes[nodes.len() - 1];
+            assert!(slot_index(last) / SLOT_CHUNK > len);
+            assert_eq!(last.text(), format!("n{}", SLOT_CHUNK - 1));
+            assert_eq!(block.statement_list().nodes().to_vec(), vec![kept]);
             free_synthetic_nodes();
         })
         .join()

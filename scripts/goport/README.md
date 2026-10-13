@@ -455,6 +455,12 @@ scripts/goport/testbox.sh stop                                  # or release (se
   `HOME=/home/theo` of the testbox env does not move the end touch. The timer does not see the SSH route
   of `push`, `get` and the `tests` poll. So `push` and `seed` touch the marker every minute, and the
   `tests` and `np-suite` jobs every 30 s.
+- Retries: a DNS, connect or TLS error or a request timeout of the blacksmith API, ssh or rsync makes the step
+  run again, up to 6 tries after 5, 10, 20, 30 and 30 s (`TESTBOX_RETRY_WAITS`), with one line on stderr per
+  retry. This covers warmup, status, stop, list, the rsync of push, get, source and fetch, and the start of
+  `run` and `job`. A command that started on the testbox never runs again: `run` prints a start marker on the
+  testbox's stderr, and retries only before it. A nonzero exit of the command (a failed build too) is not
+  retried. `scripts/goport/tests/testbox-retry.sh` checks this with shims and no testbox.
 - Sticky disks: `target/` and the cargo registry, and the inputs and pin disks. The inputs and pin disks
   commit only when a file changed (`commit: on-change`), so a testbox that only reads them does not commit an
   older copy. A sticky disk commits only when the job ends with no failed or cancelled step. `stop` cancels the
