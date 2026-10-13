@@ -1449,10 +1449,20 @@ pub const DETACHED_STORE_LIMIT: usize = 0x4000_0000;
 pub(crate) const FILE_ID_LIMIT: usize = 1 << 28;
 /// AST node records, step 3: a file id below this has its entry in
 /// `FILE_BLOCKS`; a higher one in a chunk of `HIGH_BLOCKS`.
+#[cfg(not(target_family = "wasm"))]
 const LOW_BLOCKS: usize = 1 << 16;
 /// Entries per `HIGH_BLOCKS` chunk: 1 MiB of entries per chunk, and 16,380
 /// chunk cells (256 KiB of `.data`) up to `FILE_ID_LIMIT`.
+#[cfg(not(target_family = "wasm"))]
 const HIGH_CHUNK: usize = 1 << 14;
+/// wasm: linear memory holds all of `FILE_BLOCKS` from the start, set or
+/// not, so it has 8,192 entries (512 KiB, where 65,536 took 4 MiB), more
+/// than the files of a large project with its `node_modules`. Chunks of
+/// the same size: 32,767 chunk cells (256 KiB).
+#[cfg(target_family = "wasm")]
+const LOW_BLOCKS: usize = 1 << 13;
+#[cfg(target_family = "wasm")]
+const HIGH_CHUNK: usize = 1 << 13;
 
 // A real file id is never `LOCAL_STORE`, and the chunks end at the limit.
 const _: () = assert!(FILE_ID_LIMIT <= LOCAL_STORE);
