@@ -734,8 +734,7 @@ impl<K, V> Default for SharedMap<K, V> {
 impl<K, V> SharedMap<K, V> {
     /// The locked shard of the key whose hash is `hash` (`key_hash`).
     fn shard(&self, hash: u64) -> std::sync::MutexGuard<'_, FxHashMap<K, V>> {
-        // The high bits: Fx mixes them best.
-        lock_shared(&self.shards[(hash >> 58) as usize % SHARED_MAP_SHARDS])
+        lock_shared(&self.shards[shard_index(hash)])
     }
 
     /// Calls `f` with each value, one shard at a time.
@@ -759,6 +758,18 @@ impl<K, V> SharedMap<K, V> {
 fn key_hash<Q: std::hash::Hash + ?Sized>(key: &Q) -> u64 {
     use std::hash::BuildHasher;
     rustc_hash::FxBuildHasher.hash_one(key)
+}
+
+/// The shard of a key whose Fx hash is `hash`, in a map of 64 shards:
+/// bits 51 to 56. The map in the shard hashes the key with Fx too, and
+/// hashbrown takes its 7-bit tag from the top bits (57 to 63) and its
+/// bucket from the low bits. Shards by the top bits gave each shard's keys
+/// nearly one tag, so a lookup compared many keys: 5 times slower than
+/// one map (syscut1 round 2 bench, 50k module keys, one thread). Shared by
+/// `StatMap::shard` (compiler/files_parser.rs).
+pub(crate) fn shard_index(hash: u64) -> usize {
+    const _: () = assert!(SHARED_MAP_SHARDS == 64);
+    ((hash >> 51) & 63) as usize
 }
 
 /// A parse worker's answer in the `SharedResolutionCache`.

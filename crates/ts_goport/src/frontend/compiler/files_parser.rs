@@ -4198,9 +4198,9 @@ impl<V> Default for StatMap<V> {
 impl<V: Clone> StatMap<V> {
     fn shard(&self, path: &str) -> &Mutex<FxHashMap<String, StatSlot<V>>> {
         use std::hash::BuildHasher;
+        const _: () = assert!(STAT_MAP_SHARDS == 64);
         let hash = rustc_hash::FxBuildHasher.hash_one(path);
-        // The high bits: Fx mixes them best.
-        &self.shards[(hash >> 58) as usize % STAT_MAP_SHARDS]
+        &self.shards[crate::frontend::module::shard_index(hash)]
     }
 
     /// The cached value of `path`.
