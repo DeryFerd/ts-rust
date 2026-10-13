@@ -693,22 +693,71 @@ impl Caches {
 // adds them to its own package.json cache.
 #[derive(Default)]
 pub struct SharedResolutionCache {
-    modules: std::sync::Mutex<
-        FxHashMap<ModuleResolutionCacheKey, SharedResolution<Arc<ResolvedModule>>>,
-    >,
-    type_ref_directives: std::sync::Mutex<
-        FxHashMap<
-            TypeRefDirectiveResolutionCacheKey,
-            SharedResolution<Arc<ResolvedTypeReferenceDirective>>,
-        >,
+    modules: SharedMap<ModuleResolutionCacheKey, SharedResolution<Arc<ResolvedModule>>>,
+    type_ref_directives: SharedMap<
+        TypeRefDirectiveResolutionCacheKey,
+        SharedResolution<Arc<ResolvedTypeReferenceDirective>>,
     >,
     /// The package scopes that resolve-ahead workers found, by directory
     /// (`DefaultResolver::publish_package_scope`), or that parse workers
     /// found for the metadata of the files they parse (`store_scope`).
-    scopes: std::sync::Mutex<FxHashMap<String, SharedResolution<Option<PackageScope>>>>,
+    scopes: SharedMap<String, SharedResolution<Option<PackageScope>>>,
     /// The first read of each package.json that a parse worker made in this
     /// load, by file name (`store_package_json_read`).
-    package_json_reads: std::sync::Mutex<FxHashMap<String, Arc<WorkerPackageJsonRead>>>,
+    package_json_reads: SharedMap<String, Arc<WorkerPackageJsonRead>>,
+}
+
+/// The shards of a `SharedMap`.
+const SHARED_MAP_SHARDS: usize = 64;
+
+/// One map of a `SharedResolutionCache`: Go `collections.SyncMap`, in
+/// shards by the key hash (`shard`).
+// PORT: a Go `SyncMap` reads a key with no lock, so the parse goroutines
+// that look up and store answers at once do not wait for each other. One
+// lock over the whole map made the parse workers wait for it about 17,000
+// times in a VS Code load (syscut1: 45% of the futex calls of the load).
+struct SharedMap<K, V> {
+    shards: Box<[std::sync::Mutex<FxHashMap<K, V>>]>,
+}
+
+impl<K, V> Default for SharedMap<K, V> {
+    fn default() -> Self {
+        SharedMap {
+            shards: (0..SHARED_MAP_SHARDS)
+                .map(|_| std::sync::Mutex::default())
+                .collect(),
+        }
+    }
+}
+
+impl<K, V> SharedMap<K, V> {
+    /// The locked shard of the key whose hash is `hash` (`key_hash`).
+    fn shard(&self, hash: u64) -> std::sync::MutexGuard<'_, FxHashMap<K, V>> {
+        // The high bits: Fx mixes them best.
+        lock_shared(&self.shards[(hash >> 58) as usize % SHARED_MAP_SHARDS])
+    }
+
+    /// Calls `f` with each value, one shard at a time.
+    fn for_each_value(&self, mut f: impl FnMut(&V)) {
+        for shard in &self.shards {
+            lock_shared(shard).values().for_each(&mut f);
+        }
+    }
+
+    /// Takes every value out of the map.
+    fn take_values(&self) -> Vec<V> {
+        self.shards
+            .iter()
+            .flat_map(|shard| std::mem::take(&mut *lock_shared(shard)).into_values())
+            .collect()
+    }
+}
+
+/// The hash that picks the shard of `key` in a `SharedMap`. A borrowed
+/// key must give the hash of its owned key (`Borrow`).
+fn key_hash<Q: std::hash::Hash + ?Sized>(key: &Q) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one(key)
 }
 
 /// A parse worker's answer in the `SharedResolutionCache`.
@@ -1221,7 +1270,7 @@ impl SharedResolutionCache {
         if ANSWER_WAIT.with(Cell::get) {
             return self.wait_for_module(key);
         }
-        lock_shared(&self.modules).get(key).cloned()
+        self.modules.shard(key_hash(&key.parts())).get(key).cloned()
     }
 
     /// `get_module` on a thread that waits for the answers of the parse
@@ -1234,7 +1283,7 @@ impl SharedResolutionCache {
     ) -> Option<SharedResolution<Arc<ResolvedModule>>> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
         loop {
-            let found = lock_shared(&self.modules).get(key).cloned();
+            let found = self.modules.shard(key_hash(&key.parts())).get(key).cloned();
             if found.is_some() || std::time::Instant::now() > deadline {
                 return found;
             }
@@ -1246,25 +1295,29 @@ impl SharedResolutionCache {
     /// package scope (`SharedResolution::ahead`).
     // PORT: not in Go (resolve ahead, compiler/resolve_ahead.rs).
     pub fn for_each_ahead_calls(&self, mut f: impl FnMut(&[AheadCall])) {
-        for value in lock_shared(&self.modules).values() {
-            f(value.ahead.as_deref().unwrap_or_default());
-        }
-        for value in lock_shared(&self.scopes).values() {
-            f(value.ahead.as_deref().unwrap_or_default());
-        }
+        self.modules
+            .for_each_value(|value| f(value.ahead.as_deref().unwrap_or_default()));
+        self.scopes
+            .for_each_value(|value| f(value.ahead.as_deref().unwrap_or_default()));
     }
 
     /// The package scope of `directory` that a worker found.
     // PORT: not in Go (resolve ahead).
     #[must_use]
     pub fn get_scope(&self, directory: &str) -> Option<SharedResolution<Option<PackageScope>>> {
-        lock_shared(&self.scopes).get(directory).cloned()
+        self.scopes
+            .shard(key_hash(directory))
+            .get(directory)
+            .cloned()
     }
 
     /// Publishes the package scope of `directory` (the first value wins).
     // PORT: not in Go (resolve ahead).
     pub fn set_scope(&self, directory: String, value: SharedResolution<Option<PackageScope>>) {
-        lock_shared(&self.scopes).entry(directory).or_insert(value);
+        self.scopes
+            .shard(key_hash(directory.as_str()))
+            .entry(directory)
+            .or_insert(value);
     }
 
     /// Stores `read()`, a parse worker's read of the package.json
@@ -1276,7 +1329,8 @@ impl SharedResolutionCache {
         file_name: &str,
         read: impl FnOnce() -> WorkerPackageJsonRead,
     ) -> Arc<WorkerPackageJsonRead> {
-        lock_shared(&self.package_json_reads)
+        self.package_json_reads
+            .shard(key_hash(file_name))
             .entry(file_name.to_string())
             .or_insert_with(|| Arc::new(read()))
             .clone()
@@ -1287,7 +1341,8 @@ impl SharedResolutionCache {
     // PORT: not in Go (see `WorkerPackageJsonRead`).
     #[must_use]
     pub fn package_json_read(&self, file_name: &str) -> Option<Arc<WorkerPackageJsonRead>> {
-        lock_shared(&self.package_json_reads)
+        self.package_json_reads
+            .shard(key_hash(file_name))
             .get(file_name)
             .cloned()
     }
@@ -1297,7 +1352,9 @@ impl SharedResolutionCache {
     // PORT: not in Go (see `WorkerPackageJsonRead`).
     #[must_use]
     pub fn has_package_json_read(&self, file_name: &str) -> bool {
-        lock_shared(&self.package_json_reads).contains_key(file_name)
+        self.package_json_reads
+            .shard(key_hash(file_name))
+            .contains_key(file_name)
     }
 
     /// Gives the package.json reads of the load that the loader did not
@@ -1309,8 +1366,7 @@ impl SharedResolutionCache {
     /// for it (`InfoCache::get`).
     // PORT: not in Go (see `WorkerPackageJsonRead`).
     pub fn end_package_json_reads(&self, cache: &InfoCache) {
-        let reads = std::mem::take(&mut *lock_shared(&self.package_json_reads));
-        for read in reads.values() {
+        for read in self.package_json_reads.take_values() {
             read.adopt(cache);
         }
     }
@@ -1326,7 +1382,8 @@ impl SharedResolutionCache {
         directory: &str,
         value: SharedResolution<Option<PackageScope>>,
     ) -> SharedResolution<Option<PackageScope>> {
-        lock_shared(&self.scopes)
+        self.scopes
+            .shard(key_hash(directory))
             .entry(directory.to_string())
             .or_insert(value)
             .clone()
@@ -1338,7 +1395,10 @@ impl SharedResolutionCache {
         key: ModuleResolutionCacheKey,
         value: SharedResolution<Arc<ResolvedModule>>,
     ) {
-        lock_shared(&self.modules).entry(key).or_insert(value);
+        self.modules
+            .shard(key_hash(&key.parts()))
+            .entry(key)
+            .or_insert(value);
     }
 
     /// Go `typeRefDirectiveResolutionCache.Get`.
@@ -1347,7 +1407,10 @@ impl SharedResolutionCache {
         &self,
         key: &TypeRefDirectiveResolutionCacheKey,
     ) -> Option<SharedResolution<Arc<ResolvedTypeReferenceDirective>>> {
-        lock_shared(&self.type_ref_directives).get(key).cloned()
+        self.type_ref_directives
+            .shard(key_hash(key))
+            .get(key)
+            .cloned()
     }
 
     /// Go `typeRefDirectiveResolutionCache.Set` (`Store`: the last value
@@ -1357,7 +1420,9 @@ impl SharedResolutionCache {
         key: TypeRefDirectiveResolutionCacheKey,
         value: SharedResolution<Arc<ResolvedTypeReferenceDirective>>,
     ) {
-        lock_shared(&self.type_ref_directives).insert(key, value);
+        self.type_ref_directives
+            .shard(key_hash(&key))
+            .insert(key, value);
     }
 }
 

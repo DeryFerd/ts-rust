@@ -71,6 +71,9 @@ pub(super) struct GoSharedState {
     /// Shared with the version this one was updated from when the frontend
     /// shares the cache (Go `tryReuse`).
     known_symlinks: OnceLock<Arc<crate::modulespecifiers::symlinks::KnownSymlinks>>,
+    /// The loading thread's part of `known_symlinks`, when another thread
+    /// can finish it (`SymlinkSeed`, `build_lazy_shared_state`).
+    symlink_seed: std::sync::Mutex<Option<SymlinkSeed>>,
     /// Go `processedFiles.sourceFilesFoundSearchingNodeModules`, by path.
     /// Shared like `resolved_modules`.
     source_files_found_searching_node_modules: Arc<FxHashSet<String>>,
@@ -290,16 +293,29 @@ pub(super) fn mark_freeable_parses(np: &NewProgram) {
 // PORT: Go builds the cache on first use, on any goroutine. The port
 // builds it from the frontend program, which only the loading thread has,
 // and keeps a thread-safe copy in the program's shared state. The loading
-// thread builds it on first use, or when it seeds a thread
-// (`build_lazy_shared_state`), so a seeded thread finds it built.
+// thread builds it on first use. A thread seeded from it finishes the
+// seed that the loading thread made when it seeded the thread
+// (`build_lazy_shared_state`), or finds the cache built.
 pub(super) fn known_symlinks() -> Arc<crate::modulespecifiers::symlinks::KnownSymlinks> {
     if let Some(built) = with_go(GoSharedState::built_known_symlinks) {
         return built;
     }
     let id = prog().id;
-    let frontend = FRONTENDS
-        .with(|frontends| frontends.borrow().get(&id).cloned())
-        .expect("the symlink cache is built on the loading thread (`build_lazy_shared_state`)");
+    let Some(frontend) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned()) else {
+        // A seeded thread: the first one finishes the seed, and a thread
+        // that asks meanwhile waits for it (`OnceLock::get_or_init`).
+        return with_go(|go| {
+            Arc::clone(go.known_symlinks.get_or_init(|| {
+                let seed = go
+                    .symlink_seed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                    .expect("the loading thread made the symlink cache seed (`build_lazy_shared_state`)");
+                Arc::new(seed.finish())
+            }))
+        });
+    };
     // PORT: the parallel bind seeds threads while the project host still
     // tracks its file system calls, before Go makes any use of the cache. A
     // Go first use after the host is frozen (project/compilerhost.go:57)
@@ -322,15 +338,121 @@ pub(super) fn known_symlinks() -> Arc<crate::modulespecifiers::symlinks::KnownSy
     with_go(|go| Arc::clone(go.known_symlinks.get_or_init(|| copy)))
 }
 
-/// Builds the shared state values that the current program makes on first
-/// use (`known_symlinks`), when this thread loaded it: a thread seeded from
-/// this one (`WorkerSeed`) cannot build them. Does nothing on another
-/// thread, which was seeded after they were built, or for an alias
-/// resolver program.
+/// Makes the shared state values that the current program makes on first
+/// use (`known_symlinks`) ready for a thread seeded from this one
+/// (`WorkerSeed`), when this thread loaded the program: a seeded thread
+/// cannot read the frontend program. For the symlink cache, that is its
+/// seed (`SymlinkSeed`), which makes no file system call, so a program that
+/// never uses the cache makes none of its `realpath` calls, as in Go. Where
+/// a seed cannot be finished on another thread, the cache itself. Does
+/// nothing on another thread, which was seeded after this, or for an
+/// alias resolver program.
+// PERF (syscut1): the cache took 62 `realpath` calls (open, readlink,
+// close) in a VS Code `--noEmit` check, where Go makes none.
 pub(super) fn build_lazy_shared_state() {
     let id = prog().id;
-    if FRONTENDS.with(|frontends| frontends.borrow().contains_key(&id)) {
-        let _ = known_symlinks();
+    let Some(frontend) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned()) else {
+        return;
+    };
+    let ready = with_go(|go| {
+        go.known_symlinks.get().is_some()
+            || go
+                .symlink_seed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some()
+    });
+    if ready {
+        return;
+    }
+    match SymlinkSeed::of(&frontend) {
+        Some(seed) => with_go(|go| {
+            *go.symlink_seed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seed);
+        }),
+        None => {
+            let _ = known_symlinks();
+        }
+    }
+}
+
+/// The loading thread's part of the symlink cache
+/// (`NewProgram::symlink_cache_seed`), and what a resolver of the program
+/// needs, so that the thread that first uses the cache finishes it with its
+/// own resolver (`finish`).
+// PORT: not in Go, where any goroutine reads the program (see
+// `known_symlinks`).
+pub(super) struct SymlinkSeed {
+    seed: crate::frontend::compiler::SymlinkCacheSeed,
+    options: crate::options::CompilerOptions,
+    typings_location: String,
+    project_name: String,
+    current_directory: String,
+}
+
+impl SymlinkSeed {
+    /// The seed of `frontend`. `None` where the loading thread builds the
+    /// cache itself: a host that does not show the plain OS file system (a
+    /// new resolver of another thread would not see its files), project
+    /// references and content mappers (the program resolver's host maps
+    /// files that the OS file system does not show), and a program that
+    /// emits declarations, which uses the cache: there the program
+    /// resolver's caches answer most lookups of the dependencies.
+    fn of(frontend: &NewProgram) -> Option<Self> {
+        let options = frontend.options();
+        if !frontend.host().is_plain_os_fs()
+            || !frontend.get_resolved_project_references().is_empty()
+            || !frontend.content_mapper_extensions().is_empty()
+            || (options.get_emit_declarations() && !options.no_emit.is_true())
+        {
+            return None;
+        }
+        Some(SymlinkSeed {
+            seed: frontend.symlink_cache_seed(),
+            options: options.clone(),
+            typings_location: frontend.get_global_typings_cache_location(),
+            project_name: frontend.opts.project_name.clone(),
+            current_directory: frontend.host().get_current_directory(),
+        })
+    }
+
+    /// The symlink cache: the seed finished with a new resolver of the
+    /// program on the OS file system of this thread (Go `newResolver`,
+    /// program.go:191, on the host's file system).
+    fn finish(self) -> crate::modulespecifiers::symlinks::KnownSymlinks {
+        use crate::frontend::module::{ResolutionHost, ResolverOptions, new_resolver};
+        struct OsHost {
+            fs: Rc<dyn Fs>,
+            current_directory: String,
+        }
+        impl ResolutionHost for OsHost {
+            fn fs(&self) -> &dyn Fs {
+                &*self.fs
+            }
+            fn get_current_directory(&self) -> &str {
+                &self.current_directory
+            }
+        }
+        let resolver = new_resolver(ResolverOptions {
+            host: Some(Rc::new(OsHost {
+                fs: bundled::wrap_fs(osvfs_fs()),
+                current_directory: self.current_directory,
+            })),
+            compiler_options: Some(Rc::new(self.options)),
+            typings_location: self.typings_location,
+            project_name: self.project_name,
+            extra_extensions: Vec::new(),
+            package_json_cache: None,
+        });
+        self.seed.finish(|dep, package_json_name| {
+            resolver.resolve_package_directory(
+                dep,
+                package_json_name,
+                crate::options::RESOLUTION_MODE_COMMON_JS,
+                None,
+            )
+        })
     }
 }
 
@@ -1596,6 +1718,7 @@ impl GoSharedState {
             redirects_for_resolution,
             resolved_project_references,
             known_symlinks,
+            symlink_seed: std::sync::Mutex::default(),
             source_files_found_searching_node_modules,
             from_old_tables: reused.is_some(),
         }
@@ -2076,9 +2199,10 @@ pub(super) mod tests {
     }
 
     // progtables1: Go builds the symlink cache on first use
-    // (program.go:2300 GetSymlinkCache, a `lazyValue`). A load does not
-    // build it. A seeded thread cannot build it, so the loading thread
-    // builds it when it seeds one, and both read the same copy.
+    // (program.go:2330 GetSymlinkCache, a `lazyValue`). A load does not
+    // build it. A seeded thread cannot read the frontend program, so the
+    // loading thread makes the cache's seed when it seeds one, and both
+    // read the same copy.
     #[cfg(unix)]
     #[test]
     fn symlink_cache_is_built_on_first_use() {
@@ -2114,6 +2238,71 @@ pub(super) mod tests {
                 .any(|path| path.0.ends_with("/node_modules/pkg/")),
             "node_modules/pkg is not a known symlink"
         );
+        drop(frontend);
+        crate::program::release_program(program);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // syscut1: seeding a thread does not build the symlink cache, so a
+    // program that never uses it makes none of its `realpath` calls, as in
+    // Go. The seeded thread that first uses it finishes the loading
+    // thread's seed (`SymlinkSeed`) and finds the symlink of a runtime
+    // dependency that nothing imports (`dep`, found only by
+    // `ResolvePackageDirectory`, program.go:2367) as the frontend does.
+    #[cfg(unix)]
+    #[test]
+    fn seeded_thread_finishes_the_symlink_cache() {
+        let dir = symlinked_package_project("goport-seed-symlinks");
+        std::fs::write(
+            format!("{dir}/package.json"),
+            r#"{"name":"app","dependencies":{"pkg":"1.0.0","dep":"1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(format!("{dir}/real/dep")).unwrap();
+        std::fs::write(
+            format!("{dir}/real/dep/package.json"),
+            r#"{"name":"dep","types":"index.d.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            format!("{dir}/real/dep/index.d.ts"),
+            "export declare const d: number;\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../real/dep", format!("{dir}/node_modules/dep")).unwrap();
+        let program = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        let frontend = frontend_of(program);
+        let seeded = {
+            let _scope = crate::core::enter_program(Some(program));
+            crate::program::spawn_seeded_thread(|| ())
+                .join()
+                .expect("the seeded thread ends");
+            assert!(
+                with_go(|go| go.known_symlinks.get().is_none()),
+                "seeding a thread built the symlink cache"
+            );
+            crate::program::spawn_seeded_thread(|| {
+                crate::program::get_go_symlink_cache().expect("a Go frontend program")
+            })
+            .join()
+            .expect("the seeded thread reads the cache")
+        };
+        let directories = |symlinks: &crate::modulespecifiers::symlinks::KnownSymlinks| {
+            symlinks.directories().keys().cloned().collect::<Vec<_>>()
+        };
+        assert_eq!(
+            directories(&seeded),
+            directories(&frontend.build_symlink_cache())
+        );
+        for name in ["pkg", "dep"] {
+            assert!(
+                directories(&seeded)
+                    .iter()
+                    .any(|path| path.0.ends_with(&format!("/node_modules/{name}/"))),
+                "node_modules/{name} is not a known symlink"
+            );
+        }
         drop(frontend);
         crate::program::release_program(program);
         let _ = std::fs::remove_dir_all(&dir);
