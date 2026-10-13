@@ -2675,6 +2675,10 @@ thread_local! {
     /// them.
     static EARLY_POOL: RefCell<Option<PrefetchPool>> = const { RefCell::new(None) };
 
+    /// The `LoaderStatFs` made on this thread so far: the next one gets this
+    /// number (`PrefetchPool::host`).
+    static LOADER_HOSTS: Cell<u64> = const { Cell::new(0) };
+
     /// The job of the worker parse that `take_prefetched` gave last, and
     /// the root node of the adopted parse (`TakenParse::of`).
     static TAKEN: RefCell<Option<(Arc<PrefetchJob>, Node)>> = const { RefCell::new(None) };
@@ -3051,6 +3055,10 @@ struct PrefetchPool {
     /// pool (`early_shared_resolution`). Its workers write that cache, so
     /// `discard` waits for them.
     handed: bool,
+    /// The number of the next `LoaderStatFs` on this thread when the pool
+    /// started (`LOADER_HOSTS`). An early pool goes to that host
+    /// (`worker_stats`).
+    host: u64,
 }
 
 impl PrefetchPool {
@@ -3060,6 +3068,7 @@ impl PrefetchPool {
             threads: Vec::new(),
             mapped_workers: false,
             handed: false,
+            host: LOADER_HOSTS.with(Cell::get),
         };
         pool.add_workers(workers);
         pool
@@ -4392,9 +4401,17 @@ struct SharedStatCache {
     package_jsons: StatMap<(Arc<str>, bool)>,
     /// The OS stat of each path that a `FileExists`, `DirectoryExists` or
     /// root file size (`PrefetchShared::rank_largest`) asked for in the load,
-    /// as (is a directory, size), when there is no host cache: Go
-    /// `vfs.Common` answers both lookups with one stat, so one stat answers
-    /// all three here. Not for the lookups of a bundled path (`exists`).
+    /// as (is a directory, size), when there is no host cache. Go
+    /// `vfs.Common` answers each of the two lookups with a stat
+    /// (internal.go:59, :64), so here one stat answers all three. Not for
+    /// the lookups of a bundled path (`exists`).
+    // PORT: Go `cachedvfs` caches `FileExists` and `DirectoryExists` in two
+    // maps (cachedvfs.go:49, :65), so Go makes one stat per lookup kind: 2
+    // stats for a path that it asks both of. Here the first lookup of a
+    // path fixes both answers for the load, so the port makes fewer stats
+    // than Go. The answers are Go's unless the file system changes during
+    // the load, between Go's two stats of one path. The load writes no
+    // file, so the output is the same.
     nodes: StatMap<Option<(bool, i64)>>,
 }
 
@@ -4424,13 +4441,13 @@ impl SharedStatCache {
 
     /// `FileExists` (or with `directory`, `DirectoryExists`) of `path` on
     /// `fs`, the bundled wrapper of the OS file system. For an OS path it is
-    /// Go `vfs.Common.FileExists` or `DirectoryExists`, a stat, so one stat
-    /// in `nodes` answers both. A bundled path is answered by `fs` itself
-    /// (no syscall): there the stat and the lookups differ (Go embed.go:66
-    /// and :85: `Stat("bundled:///")` is a directory, but
-    /// `DirectoryExists("bundled:///")` is false). `None` with a host cache:
-    /// its lookups of each kind stay for later programs, so they must not
-    /// answer each other (`BuildStatCache`).
+    /// Go `vfs.Common.FileExists` or `DirectoryExists`, each a stat, so one
+    /// stat in `nodes` answers both (see the PORT note there). A bundled
+    /// path is answered by `fs` itself (no syscall): there the stat and the
+    /// lookups differ (Go embed.go:66 and :85: `Stat("bundled:///")` is a
+    /// directory, but `DirectoryExists("bundled:///")` is false). `None`
+    /// with a host cache: its lookups of each kind stay for later programs,
+    /// so they must not answer each other (`BuildStatCache`).
     fn exists(&self, fs: &dyn Fs, path: &str, directory: bool) -> Option<bool> {
         if self.host.get().is_some() {
             return None;
@@ -4554,22 +4571,29 @@ impl Fs for WorkerFs {
 /// (`new_cached_fs_compiler_host`, under its `cachedvfs`): its
 /// `FileExists`, `DirectoryExists`, `Realpath` and `GetAccessibleEntries`
 /// calls on this thread go through the stat cache of the parse workers of
-/// this thread's load or early pool (`SharedStatCache::own`), as Go parse
-/// tasks and the loader share the host's cachedvfs. The loader then makes
-/// no call that a worker made already, and a worker makes none that the
-/// loader made (for example the root file checks of `addRootFileTask`,
-/// which the workers' import lookups ask for again). Every other call goes
-/// to `fs`.
+/// this thread's load or of its own load's early pool (`worker_stats`,
+/// `SharedStatCache::own`), as Go parse tasks and the loader share the
+/// host's cachedvfs. The loader then makes no call that a worker made
+/// already, and a worker makes none that the loader made (for example the
+/// root file checks of `addRootFileTask`, which the workers' import
+/// lookups ask for again). Every other call goes to `fs`.
 // PORT: not in Go (see `SharedStatCache`). The workers read the same OS
 // file system (`CompilerHost::is_plain_os_fs`), so a worker's answer is
 // the answer of `fs`.
 pub(crate) struct LoaderStatFs {
     fs: Rc<dyn Fs>,
+    /// The number of this host on its thread (`LOADER_HOSTS`).
+    host: u64,
 }
 
 impl LoaderStatFs {
     pub(crate) fn new(fs: Rc<dyn Fs>) -> Self {
-        LoaderStatFs { fs }
+        let host = LOADER_HOSTS.with(|hosts| {
+            let host = hosts.get();
+            hosts.set(host + 1);
+            host
+        });
+        LoaderStatFs { fs, host }
     }
 
     /// `load()`, or the value of `path` in the workers' cache of this
@@ -4582,7 +4606,7 @@ impl LoaderStatFs {
         path: &str,
         load: impl FnOnce() -> V,
     ) -> V {
-        match worker_stats() {
+        match worker_stats(self.host) {
             Some(stats) => map(&stats.own).get_or_load(path, load),
             None => load(),
         }
@@ -4592,7 +4616,7 @@ impl LoaderStatFs {
     /// (see `SharedStatCache::exists`), else the call on `fs`.
     fn exists(&self, path: &str, directory: bool) -> bool {
         if let Some(exists) =
-            worker_stats().and_then(|stats| stats.exists(&*self.fs, path, directory))
+            worker_stats(self.host).and_then(|stats| stats.exists(&*self.fs, path, directory))
         {
             return exists;
         }
@@ -4604,11 +4628,27 @@ impl LoaderStatFs {
     }
 }
 
-/// The stat cache of the parse workers of this thread's load (else of its
-/// early pool), when it is their own (no `tsc -b` host cache).
-fn worker_stats() -> Option<Arc<SharedStatCache>> {
+/// The stat cache of the parse workers of this thread's load, else of the
+/// early pool of `host`'s load (`host` is a `LoaderStatFs` number), when
+/// the cache is their own (no `tsc -b` host cache).
+///
+/// An early pool's cache keeps the OS answers from when its workers ran.
+/// Each flow that starts an early pool makes its host next and loads with
+/// that host, and the load takes the pool (`FilesParser::parse`). So the
+/// pool's answers are those of the host's own load. An early pool goes
+/// only to the first host made after it (`PrefetchPool::host`): a later
+/// host does not read the pool of a host that never loaded. A flow that
+/// makes no host after it starts a pool leaves the pool to the next host
+/// on the thread, until a load takes the pool or a new pool replaces it.
+fn worker_stats(host: u64) -> Option<Arc<SharedStatCache>> {
     let shared = PREFETCH.with(|p| p.borrow().clone()).or_else(|| {
-        EARLY_POOL.with(|early| early.borrow().as_ref().map(|pool| pool.shared.clone()))
+        EARLY_POOL.with(|early| {
+            early
+                .borrow()
+                .as_ref()
+                .filter(|pool| pool.host == host)
+                .map(|pool| pool.shared.clone())
+        })
     })?;
     shared
         .stats
@@ -5100,5 +5140,121 @@ mod stat_cache_tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lookup of a path that another thread loads waits at most
+    /// `STAT_MAP_WAIT`, then loads the path itself and stores nothing: the
+    /// value of the path stays the loader's.
+    #[test]
+    fn stat_map_waiter_loads_itself() {
+        use std::sync::mpsc;
+        let map = &StatMap::<u32>::default();
+        std::thread::scope(|scope| {
+            let (started, on_start) = mpsc::channel();
+            let (finish, on_finish) = mpsc::channel::<()>();
+            let loader = scope.spawn(move || {
+                map.get_or_load("p", || {
+                    started.send(()).unwrap();
+                    // Until `finish` is dropped.
+                    let _ = on_finish.recv();
+                    1
+                })
+            });
+            on_start.recv().unwrap();
+            let (waited, on_wait) = mpsc::channel();
+            scope.spawn(move || waited.send(map.get_or_load("p", || 2)));
+            // A waiter that waited for the loader would get 1, after
+            // `finish`.
+            let wait = on_wait.recv_timeout(std::time::Duration::from_secs(10));
+            let stored = map.get("p");
+            drop(finish);
+            assert_eq!(wait, Ok(2));
+            assert_eq!(stored, None);
+            assert_eq!(loader.join().unwrap(), 1);
+        });
+        assert_eq!(map.get("p"), Some(1));
+    }
+
+    /// A load that never finishes (it panics) leaves its slot `Loading`.
+    /// Each lookup of the path then loads it itself, and an insert stores
+    /// its value there.
+    #[test]
+    fn stat_map_load_that_never_finishes() {
+        let map = Arc::new(StatMap::<u32>::default());
+        let load = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.get_or_load("p", || panic!("the load fails"))
+        }));
+        assert!(load.is_err());
+        assert_eq!(map.get("p"), None);
+        // On another thread, so that a lookup that waits for the slot
+        // fails the test and does not stop it.
+        let (looked, on_look) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let map = map.clone();
+            move || looked.send((map.get_or_load("p", || 1), map.get_or_load("p", || 2)))
+        });
+        let looks = on_look.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(looks, Ok((1, 2)));
+        assert_eq!(map.insert_if_absent("p", 3), 3);
+        assert_eq!(map.get_or_load("p", || 4), 3);
+    }
+
+    /// A clear drops the values and the slots of the loads that run, as Go
+    /// `ClearCache`. The value of a load that runs over the clear is then
+    /// stored, as Go's `Store` after `ClearCache`.
+    #[test]
+    fn stat_map_insert_after_clear() {
+        use std::sync::mpsc;
+        let map = &StatMap::<u32>::default();
+        assert_eq!(map.get_or_load("p", || 1), 1);
+        map.clear();
+        assert_eq!(map.get("p"), None);
+        assert_eq!(map.insert_if_absent("p", 2), 2);
+        assert_eq!(map.get_or_load("p", || 3), 2);
+        std::thread::scope(|scope| {
+            let (started, on_start) = mpsc::channel();
+            let (finish, on_finish) = mpsc::channel::<()>();
+            let loader = scope.spawn(move || {
+                map.get_or_load("q", || {
+                    started.send(()).unwrap();
+                    let _ = on_finish.recv();
+                    4
+                })
+            });
+            on_start.recv().unwrap();
+            map.clear();
+            drop(finish);
+            assert_eq!(loader.join().unwrap(), 4);
+        });
+        assert_eq!(map.get("q"), Some(4));
+        assert_eq!(map.get_or_load("q", || 5), 4);
+    }
+
+    /// An early pool's stat cache goes only to the first `LoaderStatFs`
+    /// made on its thread after the pool started (`worker_stats`).
+    #[test]
+    fn early_pool_stats_go_to_the_next_host() {
+        let new_host = || LoaderStatFs::new(crate::frontend::vfs::osvfs_fs()).host;
+        let before = new_host();
+        let pool = PrefetchPool::start(
+            PrefetchConfig {
+                current_directory: "/".to_string(),
+                use_case_sensitive_file_names: true,
+                default_library_path: String::new(),
+            },
+            0,
+        );
+        let stats = pool.shared.stats.clone();
+        if let Some(old) = EARLY_POOL.with(|early| early.borrow_mut().replace(pool)) {
+            old.discard();
+        }
+        let first = new_host();
+        let later = new_host();
+        let reads = |host| worker_stats(host).is_some_and(|got| Arc::ptr_eq(&got, &stats));
+        let read = [reads(before), reads(first), reads(later)];
+        if let Some(pool) = EARLY_POOL.with(|early| early.borrow_mut().take()) {
+            pool.discard();
+        }
+        assert_eq!(read, [false, true, false], "before, first, later");
     }
 }
