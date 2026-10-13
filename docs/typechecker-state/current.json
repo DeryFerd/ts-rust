@@ -1105,7 +1105,16 @@
       "agent": "afe08f180e63edf8b",
       "verdict": "PENDING"
     },
-    "nextPermittedAction": "Run the R218 pipeline (candidate.sh side)."
+    "nextPermittedAction": "Run the R218 pipeline (candidate.sh side).",
+    "retainedTestChanges": [
+      {
+        "suite": "goport_core_lib",
+        "test": "program::tests::a_bind_that_gives_a_node_id_on_a_bind_thread_matches_the_serial_bind",
+        "change": "counts binder lineage symbol ids by dense place (skips the odd 256-id chunks, core::is_own_index) in place of id - first symbol id; the old form moved by 256 when a load crossed a chunk end, which depends on how many symbols earlier tests in the process bound (root commit 50159443c on goport-int85; int85/lost-test.md); same claim: a parallel bind with a node id on a bind thread equals the serial bind (names and next node id); the mutation with the fingerprint check removed still fails",
+        "goEvidence": "port-only test (no Go counterpart); Go binder.go:310-312 names the pattern ambient module after the attributes node id",
+        "review": "pending: independent reviewer of batch 99 (R218)"
+      }
+    ]
   },
   "parallelModelPreference": {
     "model": "GPT-6 Astra",
