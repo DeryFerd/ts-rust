@@ -364,13 +364,21 @@ impl StoreFacts {
         }
     }
 
-    /// The facts as the bits of a `FactsCell`.
+    /// The facts as the bits of a `FactsCell`. It names every field, so a
+    /// new field does not compile until it has a bit.
     const fn bits(self) -> u8 {
-        (self.alias_free as u8)
-            | (self.parents_local as u8) << 1
-            | (self.has_export_alias_kind as u8) << 2
-            | (self.has_flow_constraint_kind as u8) << 3
-            | (self.has_deprecated_tag as u8) << 4
+        let Self {
+            alias_free,
+            parents_local,
+            has_export_alias_kind,
+            has_flow_constraint_kind,
+            has_deprecated_tag,
+        } = self;
+        (alias_free as u8)
+            | (parents_local as u8) << 1
+            | (has_export_alias_kind as u8) << 2
+            | (has_flow_constraint_kind as u8) << 3
+            | (has_deprecated_tag as u8) << 4
     }
 
     /// The facts of the bits of a `FactsCell`.
@@ -1598,8 +1606,11 @@ impl BlockFile {
         Node(self.root.load(Ordering::Relaxed))
     }
 
-    /// `FileBlock::kind` of slot `index` of a node shell. Past the column it
-    /// panics, as `kinds[index]` does.
+    /// `FileBlock::kind` of slot `index` of a node shell. A shell that uses
+    /// the `BlockFile` of its pooled block reads the whole block column, so
+    /// an index past its slots and inside the block gives a stale kind of an
+    /// earlier owner of the block (only an invalid handle reads there). Past
+    /// the column it panics.
     // PERF (edleak3): a table read, with no call. `SyntaxKind::try_from`
     // is in goport_util, so it was a call, and `expect` a second branch.
     // The read stays out of line: inline at each kind read (as `try_from`
@@ -9596,6 +9607,16 @@ mod tests {
     #[test]
     fn later_new_kinds_go_in_the_pooled_block_past_the_budget() {
         use super::super::file_version::FileVersion;
+        // Empties the pool again when the test ends, after its versions
+        // drop (it is made first, so it drops last), so a later test in the
+        // process does not start with the budget used up.
+        struct ClearPoolAtEnd;
+        impl Drop for ClearPoolAtEnd {
+            fn drop(&mut self) {
+                clear_block_pool();
+            }
+        }
+        let _clear = ClearPoolAtEnd;
         clear_block_pool();
         // Publishes a freeable version of file `name` with `count`
         // identifiers, and gives its plain kind column (a prefix when its
