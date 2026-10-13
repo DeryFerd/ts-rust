@@ -296,7 +296,10 @@ struct ChunkTable<T> {
     /// The `Some` entries of `near`.
     live: usize,
     /// The empty entries of `near` when `compact` last found no cut, else
-    /// 0. `compact` scans again only when more entries are empty.
+    /// 0. `compact` scans again only when more entries are empty. That is
+    /// exact because a table that compacts never fills a hole of `near`
+    /// (`set`): only a d.ts twin sets a taken number again, and a twin never
+    /// compacts.
     no_cut_empty: usize,
 }
 
@@ -421,6 +424,10 @@ impl<T> ChunkTable<T> {
             return;
         }
         let i = c - self.base;
+        debug_assert!(
+            self.no_cut_empty == 0 || i >= self.near.len(),
+            "a chunk table filled a hole after a compact found no cut"
+        );
         if self.near.len() <= i {
             self.near.resize_with(i + 1, || None);
         }
