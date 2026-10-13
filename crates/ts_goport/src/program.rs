@@ -2176,6 +2176,10 @@ struct BindQueue {
     state: Mutex<BindQueueState>,
     /// Signals new known offsets, a finished bind and `stop`.
     changed: std::sync::Condvar,
+    /// Test hook: the chain link that `spawn_bind_chain` starts with this
+    /// `threads` panics after its seed install, before `run`.
+    #[cfg(test)]
+    panic_before_run: Option<usize>,
 }
 
 struct BindQueueState {
@@ -2225,6 +2229,8 @@ impl BindQueue {
                 freeable,
             }),
             changed: std::sync::Condvar::new(),
+            #[cfg(test)]
+            panic_before_run: None,
         }
     }
 
@@ -2495,6 +2501,10 @@ fn spawn_bind_chain<'scope, F>(
             count: threads,
         };
         seed.install();
+        #[cfg(test)]
+        if queue.panic_before_run == Some(threads) {
+            panic!("test: a bind chain link panics before run");
+        }
         if threads > 1 && queue.files_left() {
             spawn_bind_chain(scope, threads - 1, run, queue, sender.clone());
         }
@@ -6103,6 +6113,88 @@ mod tests {
                 "{file} outDir {out_dir:?} rootDir {root_dir:?} config {config_file_path:?}"
             );
         }
+    }
+
+    /// A program version of one empty file, for a test that needs a current
+    /// program and reads none of it.
+    fn small_program(name: &str) -> &'static GoProgram {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), "export {};\n").unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "noLib": true, "types": [] }, "files": ["a.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        program
+    }
+
+    /// Runs a bind chain of `threads` links (`spawn_bind_chain`) on a queue
+    /// of `threads` files, with `program` current, on a thread of its own.
+    /// The link that starts with `before_run` threads panics before `run`.
+    /// Each link that runs waits until `binders` counts only the links that
+    /// run, as a thread whose bind failed waits while a thread that can bind
+    /// is counted. Returns whether the chain panicked, `binders` at the end
+    /// and the number of links that ran. Fails when the chain does not end.
+    fn run_bind_chain(
+        program: &'static GoProgram,
+        threads: usize,
+        before_run: Option<usize>,
+    ) -> (bool, usize, usize) {
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _program = crate::core::enter_program(Some(program));
+            let mut queue = BindQueue::new(
+                vec![false; threads],
+                SymbolArena::new().next_file_offsets(),
+                threads,
+            );
+            queue.panic_before_run = before_run;
+            let ran = AtomicUsize::new(0);
+            let run = |_| {
+                let mut state = queue.lock();
+                // Under the queue lock, so no wait misses it.
+                ran.fetch_add(1, Ordering::Relaxed);
+                queue.changed.notify_all();
+                while state.binders != ran.load(Ordering::Relaxed) {
+                    state = queue
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            };
+            let (sender, _receiver) = std::sync::mpsc::channel();
+            let chain = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                std::thread::scope(|scope| spawn_bind_chain(scope, threads, &run, &queue, sender));
+            }));
+            let _ = done.send((
+                chain.is_err(),
+                queue.lock().binders,
+                ran.load(Ordering::Relaxed),
+            ));
+        });
+        ended
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the bind chain does not end")
+    }
+
+    // followups61 (R211 reviewer item a): a bind chain link that panics
+    // before `run` takes itself and the links that it did not start out of
+    // `binders` (`UnstartedBinders`). The links that run then stop waiting
+    // for the files of those links, and the chain ends in the panic.
+    // Without the guard they wait forever.
+    #[test]
+    fn a_bind_chain_link_that_panics_leaves_the_binders() {
+        let program = small_program("goport-bind-chain");
+        // 4 links. The third (2 threads) panics, so it and the fourth leave
+        // the count, and the first two run.
+        assert_eq!(run_bind_chain(program, 4, Some(2)), (true, 2, 2));
+        // The first link panics: no link runs.
+        assert_eq!(run_bind_chain(program, 3, Some(3)), (true, 0, 0));
     }
 
     #[test]
