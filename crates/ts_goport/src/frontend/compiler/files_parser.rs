@@ -1506,7 +1506,7 @@ impl FileMaps {
         }
         let (send, receive) = std::sync::mpsc::channel::<Vec<FileMapEntry>>();
         std::thread::scope(|scope| {
-            let Some(maps) = crate::core::helper_thread(scope, "goport-collect", move || {
+            let Some(maps) = crate::program::helper_thread(scope, "goport-collect", move || {
                 let mut maps = FileMaps::default();
                 for batch in receive {
                     batch.into_iter().for_each(|entry| maps.add(entry));
@@ -1610,7 +1610,7 @@ mod file_maps_tests {
         };
         let serial = sorted(FileMaps::collect(true, walk(false)));
         let threaded = sorted(FileMaps::collect(false, walk(true)));
-        let fallback = sorted(crate::core::refuse_helper_threads(|| {
+        let fallback = sorted(crate::program::refuse_helper_threads(|| {
             FileMaps::collect(false, walk(false))
         }));
         assert_eq!(threaded, serial);
