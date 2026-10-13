@@ -4,6 +4,21 @@ I wanted to see if LLMs could port the TypeScript compiler, checker and lsp to R
 
 It [cost over $420,000](#how-did-this-go) in tokens to do it, but you could probably have done it for ~$20k (see below).
 
+## Benchmark: T3 Code with Effect diagnostics
+
+Full type check of [T3 Code](https://github.com/pingdotgg/t3code) with Effect diagnostics on.
+Time is the sum of the medians for its five checked projects. Lower is faster. Bar length is
+in proportion to time. See [Benchmark: T3 Code](#benchmark-t3-code) for the method and the run
+without Effect diagnostics.
+
+| Checker | Time | Relative time | Speed vs `tsc` 7 |
+| --- | ---: | --- | ---: |
+| `tsc-rs` 0.6.0 `--fast` (Effect built in) | 9.77s | ██ | 4.35× |
+| `tsc-rs` 0.6.0 (Effect built in) | 14.30s | ███ | 2.98× |
+| `tsc` 7 + `@effect/tsgo` | 42.55s | ████████ | baseline |
+| `bun check`, then `effect-tsgo diagnostics` | 59.24s | ███████████ | 0.72× |
+| `tsc` 6 + JavaScript Effect plugin | 191.00s | ████████████████████████████████████ | 0.22× |
+
 ## Motivations
 
 - Test model capabilities
@@ -161,29 +176,38 @@ with and without Effect diagnostics. Each time is the **sum of the medians** for
 `apps/web`, `apps/mobile`, `packages/client-runtime` and `packages/shared`, not the elapsed time
 of the parallel benchmark workflow. Lower is faster.
 
-**Without Effect diagnostics**
-
-| Checker | Time | Speed vs `tsc` 7 |
-| --- | ---: | ---: |
-| `bun check` | 6.24s | 3.12× |
-| `tsc-rs` 0.6.0 `--fast` | 6.91s | 2.81× |
-| `tsc-rs` 0.6.0 | 7.95s | 2.45× |
-| `tsc` 7 | 19.45s | baseline |
-| `tsc` 6 | 87.87s | 0.22× |
-
 **With Effect diagnostics**
 
-| Checker | Time | Speed vs `tsc` 7 |
-| --- | ---: | ---: |
-| `tsc-rs` 0.6.0 `--fast` (Effect built in) | 9.77s | 4.35× |
-| `tsc-rs` 0.6.0 (Effect built in) | 14.30s | 2.98× |
-| `tsc` 7 + `@effect/tsgo` | 42.55s | baseline |
-| `bun check`, then `effect-tsgo diagnostics` | 59.24s | 0.72× |
-| `tsc` 6 + JavaScript Effect plugin | 191.00s | 0.22× |
+Bar length is in proportion to time.
 
-Bun is fastest without Effect. With Effect, `tsc-rs --fast` is fastest: 4.35× the
-Effect-patched `tsc` 7 and 6.1× Bun followed by the separate Effect pass. On the smallest
-projects (`apps/mobile`, `packages/shared`) `--fast` gains little or nothing.
+| Checker | Time | Relative time | Speed vs `tsc` 7 |
+| --- | ---: | --- | ---: |
+| `tsc-rs` 0.6.0 `--fast` (Effect built in) | 9.77s | ██ | 4.35× |
+| `tsc-rs` 0.6.0 (Effect built in) | 14.30s | ███ | 2.98× |
+| `tsc` 7 + `@effect/tsgo` | 42.55s | ████████ | baseline |
+| `bun check`, then `effect-tsgo diagnostics` | 59.24s | ███████████ | 0.72× |
+| `tsc` 6 + JavaScript Effect plugin | 191.00s | ████████████████████████████████████ | 0.22× |
+
+With Effect, `tsc-rs --fast` is fastest: 4.35× the Effect-patched `tsc` 7 and 6.1× Bun
+followed by the separate Effect pass. On the smallest projects (`apps/mobile`,
+`packages/shared`) `--fast` gains little or nothing.
+
+<details>
+<summary><strong>Without Effect diagnostics</strong></summary>
+
+Bar length is in proportion to time.
+
+| Checker | Time | Relative time | Speed vs `tsc` 7 |
+| --- | ---: | --- | ---: |
+| `bun check` | 6.24s | ███ | 3.12× |
+| `tsc-rs` 0.6.0 `--fast` | 6.91s | ███ | 2.81× |
+| `tsc-rs` 0.6.0 | 7.95s | ███ | 2.45× |
+| `tsc` 7 | 19.45s | ████████ | baseline |
+| `tsc` 6 | 87.87s | ████████████████████████████████████ | 0.22× |
+
+Bun is fastest without Effect.
+
+</details>
 
 Diagnostics matter when comparing these times:
 
