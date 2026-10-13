@@ -2191,8 +2191,8 @@ struct BindQueueState {
     /// that are left. It counts the threads that `spawn_bind_chain` did not
     /// start. That is right: a thread is left out only when no file is left
     /// or the bind stopped, and then no thread reads the count. A thread
-    /// that panics before it binds takes itself and the threads it would
-    /// start out of the count (`UnstartedBinders`).
+    /// that panics takes itself out of the count, and before `run` also the
+    /// threads it would start (`LinkBinders`).
     binders: usize,
     /// Set by the loading thread when it stops at a failed file.
     stop: bool,
@@ -2382,15 +2382,21 @@ fn bind_files_parallel(lineage: &mut Lineage) {
                 state.next += 1;
                 state.binding += 1;
                 drop(state);
-                let before = bind_thread_fingerprint();
+                // The fingerprints are in the catch too: nothing between the
+                // two changes of `binding` can panic, so a panic never
+                // leaves it counted.
                 let result = std::panic::catch_unwind(|| {
-                    let _trace = trace_bind_source_file(file);
-                    let mut file_symbols = SymbolArena::new_file();
-                    let bound = bind_source_file_detached(file, &mut file_symbols);
-                    (bound, file_symbols)
+                    let before = bind_thread_fingerprint();
+                    let bound = {
+                        let _trace = trace_bind_source_file(file);
+                        let mut file_symbols = SymbolArena::new_file();
+                        let bound = bind_source_file_detached(file, &mut file_symbols);
+                        (bound, file_symbols)
+                    };
+                    (bind_thread_fingerprint() == before).then_some(bound)
                 })
                 .ok()
-                .filter(|_| bind_thread_fingerprint() == before);
+                .flatten();
                 state = queue.lock();
                 state.binding -= 1;
                 let Some((bound, file_symbols)) = result else {
@@ -2496,7 +2502,7 @@ fn spawn_bind_chain<'scope, F>(
 {
     let seed = WorkerSeed::take_unbuilt();
     spawn_bind_thread(scope, move || {
-        let mut unstarted = UnstartedBinders {
+        let mut binders = LinkBinders {
             queue,
             count: threads,
         };
@@ -2508,23 +2514,31 @@ fn spawn_bind_chain<'scope, F>(
         if threads > 1 && queue.files_left() {
             spawn_bind_chain(scope, threads - 1, run, queue, sender.clone());
         }
-        unstarted.count = 0;
+        // In `run` the link takes out only itself: the next link takes out
+        // the links after it, and a link that did not start stays in the
+        // count (`BindQueueState::binders`).
+        binders.count = 1;
         run(sender);
+        binders.count = 0;
     });
 }
 
-/// The bind threads of a chain link that panicked before `run`: the link
-/// and the links that it did not start. On drop it takes them out of
-/// `BindQueueState::binders`, so a thread that waits for the files they
-/// would bind does not wait forever (the scope then joins and raises the
-/// panic). 0 once the link runs.
+/// The bind threads that a chain link takes out of
+/// `BindQueueState::binders` when it panics: before `run`, the link and the
+/// links that it did not start; in `run`, the link. On drop it takes them
+/// out, so a thread that waits for the files they would bind does not wait
+/// forever (the scope then joins and raises the panic). 0 once `run`
+/// returns. A link whose bind failed took itself out already, so a panic in
+/// `run` after that takes it out twice. The count is then too low, which
+/// only makes waiting threads leave sooner: a bind with a panic never
+/// returns a result.
 // Not in Go: Go binds each file on its own goroutine.
-struct UnstartedBinders<'a> {
+struct LinkBinders<'a> {
     queue: &'a BindQueue,
     count: usize,
 }
 
-impl Drop for UnstartedBinders<'_> {
+impl Drop for LinkBinders<'_> {
     fn drop(&mut self) {
         if self.count > 0 {
             let mut state = self.queue.lock();
@@ -6135,15 +6149,18 @@ mod tests {
 
     /// Runs a bind chain of `threads` links (`spawn_bind_chain`) on a queue
     /// of `threads` files, with `program` current, on a thread of its own.
-    /// The link that starts with `before_run` threads panics before `run`.
-    /// Each link that runs waits until `binders` counts only the links that
-    /// run, as a thread whose bind failed waits while a thread that can bind
-    /// is counted. Returns whether the chain panicked, `binders` at the end
-    /// and the number of links that ran. Fails when the chain does not end.
+    /// The link that starts with `before_run` threads panics before `run`,
+    /// and the link that reaches `run` as number `in_run` (from 0) panics
+    /// there. Each other link that runs waits until `binders` counts only
+    /// those links, as a thread whose bind failed waits while a thread that
+    /// can bind is counted. Returns whether the chain panicked, `binders` at
+    /// the end and the number of those links. Fails when the chain does not
+    /// end.
     fn run_bind_chain(
         program: &'static GoProgram,
         threads: usize,
         before_run: Option<usize>,
+        in_run: Option<usize>,
     ) -> (bool, usize, usize) {
         let (done, ended) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -6154,9 +6171,13 @@ mod tests {
                 threads,
             );
             queue.panic_before_run = before_run;
-            let ran = AtomicUsize::new(0);
+            let (arrived, ran) = (AtomicUsize::new(0), AtomicUsize::new(0));
             let run = |_| {
                 let mut state = queue.lock();
+                if Some(arrived.fetch_add(1, Ordering::Relaxed)) == in_run {
+                    drop(state);
+                    panic!("test: a bind chain link panics in run");
+                }
                 // Under the queue lock, so no wait misses it.
                 ran.fetch_add(1, Ordering::Relaxed);
                 queue.changed.notify_all();
@@ -6182,19 +6203,22 @@ mod tests {
             .expect("the bind chain does not end")
     }
 
-    // followups61 (R211 reviewer item a): a bind chain link that panics
-    // before `run` takes itself and the links that it did not start out of
-    // `binders` (`UnstartedBinders`). The links that run then stop waiting
-    // for the files of those links, and the chain ends in the panic.
-    // Without the guard they wait forever.
+    // followups61 (R211 reviewer items a and b): a bind chain link that
+    // panics before `run` takes itself and the links that it did not start
+    // out of `binders`, and a link that panics in `run` takes itself out
+    // (`LinkBinders`). The links that run then stop waiting for the files
+    // of those links, and the chain ends in the panic. Without the guard
+    // they wait forever.
     #[test]
     fn a_bind_chain_link_that_panics_leaves_the_binders() {
         let program = small_program("goport-bind-chain");
         // 4 links. The third (2 threads) panics, so it and the fourth leave
         // the count, and the first two run.
-        assert_eq!(run_bind_chain(program, 4, Some(2)), (true, 2, 2));
+        assert_eq!(run_bind_chain(program, 4, Some(2), None), (true, 2, 2));
         // The first link panics: no link runs.
-        assert_eq!(run_bind_chain(program, 3, Some(3)), (true, 0, 0));
+        assert_eq!(run_bind_chain(program, 3, Some(3), None), (true, 0, 0));
+        // 3 links. The second to reach `run` panics there.
+        assert_eq!(run_bind_chain(program, 3, None, Some(1)), (true, 2, 2));
     }
 
     #[test]
