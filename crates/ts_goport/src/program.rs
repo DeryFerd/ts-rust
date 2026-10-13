@@ -1175,6 +1175,16 @@ impl GoProgram {
     pub fn source_file_order(&'static self) -> SourceFileOrder {
         SourceFileOrder(held_tables(self))
     }
+
+    // Go: compiler/program.go:591 (*Program).SingleThreaded
+    // PORT: Go reads `opts.SingleThreaded` first, then the compiler option.
+    // Only test code sets the port's `ProgramConfig::single_threaded`, and
+    // a version keeps only the options, so this reads the option.
+    #[must_use]
+    #[inline]
+    pub fn single_threaded(&self) -> bool {
+        self.options.single_threaded.is_true()
+    }
 }
 
 /// The file ids of a program in Go order (`GoProgram::source_file_order`).
@@ -3164,9 +3174,10 @@ pub fn get_config_file_parsing_diagnostics() -> Vec<Diagnostic> {
     go.get_config_file_parsing_diagnostics()
 }
 
-// Go: compiler/program.go:591 SingleThreaded
+// Go: compiler/program.go:591 SingleThreaded, of the current program. Code
+// that has a program reads `GoProgram::single_threaded` of it.
 pub fn single_threaded() -> bool {
-    prog().options.single_threaded.is_true()
+    prog().single_threaded()
 }
 
 /// A module resolution of the current program (`get_resolved_module`).
