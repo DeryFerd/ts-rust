@@ -276,8 +276,14 @@ struct SlotChunk {
 // PORT: Go's GC frees the nodes of a released program, and nothing names
 // them after.
 // PERF: a read of `near` is one subtraction more than a read of the flat
-// table; a read of `far` is a cold hash lookup. A process that frees no
-// chunk (the command line) never compacts.
+// table; a read of `far` is a cold hash lookup. The command line frees only
+// the print chunks of a to-string call that filled more than one
+// (`take_full_print_chunks`, on a checker thread with no d.ts twin), so it
+// compacts only when those holes are 3/4 of a table. Counted with uprobes
+// on the R209 bins (followups59, `--noEmit`): Excalidraw compacts the slot
+// table 16 times over its checker threads and moves 40 live chunks to
+// `far` (4 times and 28 chunks with `--singleThreaded`); VS Code and Sentry
+// never compact.
 #[derive(Clone)]
 struct ChunkTable<T> {
     /// Chunk `base + i` at `near[i]`; `None` for a freed chunk, or a number
@@ -1365,7 +1371,8 @@ type FreedChunks = (
 
 /// Takes all print chunks but the last of each table out of the tables (the
 /// holes stay `None`, so a read of their entries panics). Each of them is
-/// full, and every call that put entries in it has ended.
+/// full (a push fills the open chunk of its owner, also in `far`), and
+/// every call that put entries in it has ended.
 fn take_full_print_chunks(
     chunks: &mut OwnerChunks,
     slots: &mut ChunkTable<SlotChunk>,
