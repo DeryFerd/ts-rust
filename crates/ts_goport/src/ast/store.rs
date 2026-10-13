@@ -1449,10 +1449,24 @@ pub const DETACHED_STORE_LIMIT: usize = 0x4000_0000;
 pub(crate) const FILE_ID_LIMIT: usize = 1 << 28;
 /// AST node records, step 3: a file id below this has its entry in
 /// `FILE_BLOCKS`; a higher one in a chunk of `HIGH_BLOCKS`.
+#[cfg(not(target_family = "wasm"))]
 const LOW_BLOCKS: usize = 1 << 16;
 /// Entries per `HIGH_BLOCKS` chunk: 1 MiB of entries per chunk, and 16,380
 /// chunk cells (256 KiB of `.data`) up to `FILE_ID_LIMIT`.
+#[cfg(not(target_family = "wasm"))]
 const HIGH_CHUNK: usize = 1 << 14;
+/// wasm: linear memory holds all of `FILE_BLOCKS` from the start, set or
+/// not, so it has 8,192 entries (512 KiB, where 65,536 took 4 MiB). A large
+/// program can have more files (VS Code has 11,014), and file ids are never
+/// used again, so one big program, or `tsc -b` with more programs, goes
+/// past it. Each id from 8,192 on then has its entry in a `HIGH_BLOCKS`
+/// chunk (512 KiB, made on demand) and its reads take the slower path; the
+/// results are the same. Chunks of the same size: 32,767 chunk cells
+/// (256 KiB).
+#[cfg(target_family = "wasm")]
+const LOW_BLOCKS: usize = 1 << 13;
+#[cfg(target_family = "wasm")]
+const HIGH_CHUNK: usize = 1 << 13;
 
 // A real file id is never `LOCAL_STORE`, and the chunks end at the limit.
 const _: () = assert!(FILE_ID_LIMIT <= LOCAL_STORE);
@@ -1731,9 +1745,10 @@ struct BlockEntry(OnceLock<FileBlock>);
 const _: () = assert!(std::mem::size_of::<BlockEntry>() == 64);
 
 /// AST node records, step 3: the entries of the file ids below
-/// `LOW_BLOCKS`. A `OnceLock` is not all zero bytes, so this is 4 MiB of
-/// `.data` in the binary; a page of it costs memory only when an entry in
-/// it is set.
+/// `LOW_BLOCKS`. A `OnceLock` is not all zero bytes, so this is `.data` in
+/// the binary. Native: 4 MiB, and a page of it costs memory only when an
+/// entry in it is set. wasm: 512 KiB, all of it in linear memory from the
+/// start.
 static FILE_BLOCKS: [BlockEntry; LOW_BLOCKS] = [const { BlockEntry(OnceLock::new()) }; LOW_BLOCKS];
 
 /// The entries of the file ids from `LOW_BLOCKS` on, in chunks of
