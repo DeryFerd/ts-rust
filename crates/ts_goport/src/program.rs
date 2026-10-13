@@ -2173,7 +2173,9 @@ struct BindQueueState {
     /// The number of files being bound.
     binding: usize,
     /// The bind threads whose binds have not failed: they take the files
-    /// that are left.
+    /// that are left. It counts the threads that `spawn_bind_chain` did not
+    /// start. That is right: a thread is left out only when no file is left
+    /// or the bind stopped, and then no thread reads the count.
     binders: usize,
     /// Set by the loading thread when it stops at a failed file.
     stop: bool,
@@ -2223,6 +2225,12 @@ impl BindQueue {
     fn stop(&self) {
         self.lock().stop = true;
         self.changed.notify_all();
+    }
+
+    /// Whether a file is left for a bind thread to take.
+    fn files_left(&self) -> bool {
+        let state = self.lock();
+        !state.stop && state.next < state.counts.len()
     }
 }
 
@@ -2409,22 +2417,8 @@ fn bind_files_parallel(lineage: &mut Lineage) {
         // PERF (bindonce1): a seed copies the synthetic nodes of this thread,
         // 0.13 to 1.9 ms each on TypeORM, so 16 seeds took 3.9 ms of this
         // thread before it built the lazy state below. This thread now takes
-        // one, and the first bind thread takes the seeds of the others from
-        // its own copy, which is the same state, and starts them.
-        let seed = WorkerSeed::take_unbuilt();
-        let run = &run;
-        spawn_bind_thread(scope, move || {
-            seed.install();
-            for _ in 1..threads {
-                let seed = WorkerSeed::take_unbuilt();
-                let sender = sender.clone();
-                spawn_bind_thread(scope, move || {
-                    seed.install();
-                    run(sender);
-                });
-            }
-            run(sender);
-        });
+        // one, and the bind threads take the others (`spawn_bind_chain`).
+        spawn_bind_chain(scope, threads, &run, &queue, sender);
         // PERF (progstart1): the bind threads do not read the shared state
         // that the program makes on first use (the symlink cache), so this
         // thread builds it while they bind, not before they start. A later
@@ -2458,6 +2452,37 @@ fn bind_files_parallel(lineage: &mut Lineage) {
         // The serial bind counts the hits of the files that it binds again.
         restore_unported(&unported);
     }
+}
+
+/// Starts `threads` bind threads in `scope` as a chain. Each thread runs
+/// `run` with a clone of `sender`. Before it runs, a thread takes the seed
+/// of the next thread from its own copy of the loading thread's state (the
+/// same state) and starts it, while `queue` has files left. So no thread
+/// copies more than one seed before it binds, and no thread starts when all
+/// the files are taken.
+// PERF (followups57): in bindonce1 the first bind thread took the seeds of
+// all the others before its first bind. On query (8 bind threads) the bind
+// time went from 2.0 to 2.6 ms (int74 timing, dbook-lan). With the chain,
+// query binds in 3.00 ms against 3.45 (R207) and 3.05 (R206): mean of 21,
+// plain release builds, dbook-lan. VS Code (105 ms) and TypeORM (15 ms)
+// keep their bindonce1 bind times.
+fn spawn_bind_chain<'scope, F>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    threads: usize,
+    run: &'scope F,
+    queue: &'scope BindQueue,
+    sender: std::sync::mpsc::Sender<ParallelBind>,
+) where
+    F: Fn(std::sync::mpsc::Sender<ParallelBind>) + Sync,
+{
+    let seed = WorkerSeed::take_unbuilt();
+    spawn_bind_thread(scope, move || {
+        seed.install();
+        if threads > 1 && queue.files_left() {
+            spawn_bind_chain(scope, threads - 1, run, queue, sender.clone());
+        }
+        run(sender);
+    });
 }
 
 /// Starts bind thread `f` in `scope`, with the Go stack size.
