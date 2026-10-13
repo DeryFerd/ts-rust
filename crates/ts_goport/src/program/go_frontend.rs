@@ -304,14 +304,7 @@ pub(super) fn known_symlinks() -> Arc<crate::modulespecifiers::symlinks::KnownSy
     let Some(frontend) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned()) else {
         // A seeded thread: the first one finishes the seed, and a thread
         // that asks meanwhile waits for it (`OnceLock::get_or_init`).
-        return with_go(|go| {
-            Arc::clone(go.known_symlinks.get_or_init(|| {
-                let seed = go.symlink_seed.take().expect(
-                    "the loading thread made the symlink cache seed (`build_lazy_shared_state`)",
-                );
-                Arc::new(seed.finish())
-            }))
-        });
+        return with_go(|go| finish_symlink_seed(go, SymlinkSeed::finish));
     };
     // PORT: the parallel bind seeds threads while the project host still
     // tracks its file system calls, before Go makes any use of the cache. A
@@ -339,6 +332,19 @@ pub(super) fn known_symlinks() -> Arc<crate::modulespecifiers::symlinks::KnownSy
         go.symlink_seed.discard();
         built
     })
+}
+
+/// `known_symlinks` on a seeded thread: the cache, which the first caller
+/// makes with `finish` from the loading thread's seed. A caller that comes
+/// meanwhile waits for it (`OnceLock::get_or_init`).
+fn finish_symlink_seed(
+    go: &GoSharedState,
+    finish: impl FnOnce(SymlinkSeed) -> crate::modulespecifiers::symlinks::KnownSymlinks,
+) -> Arc<crate::modulespecifiers::symlinks::KnownSymlinks> {
+    Arc::clone(
+        go.known_symlinks
+            .get_or_init(|| Arc::new(go.symlink_seed.finish(finish))),
+    )
 }
 
 /// Makes the shared state values that the current program makes on first
@@ -370,39 +376,83 @@ pub(super) fn build_lazy_shared_state() {
 }
 
 /// The symlink cache seed of a program (`SymlinkSeed`), until the first
-/// thread that uses the cache takes it to finish it. A seed that no thread
-/// finishes (the loading thread built the cache itself, or no thread used
-/// it) frees on the free thread (`drop_in_background`), as do the load's
-/// lookups that it keeps: when the cache is built (`discard`), or when the
-/// program's shared state drops.
+/// thread that uses the cache takes it to finish it (`finish`). A seed that
+/// no thread finishes (the loading thread built the cache itself, or no
+/// thread used it) frees on the free thread (`drop_in_background`), as do
+/// the load's lookups that it keeps: when the cache is built (`discard`),
+/// or when the program's shared state drops.
 // PORT: not in Go (see `SymlinkSeed`).
 #[derive(Default)]
-pub(super) struct SymlinkSeedSlot(std::sync::Mutex<Option<SymlinkSeed>>);
+pub(super) struct SymlinkSeedSlot(std::sync::Mutex<SeedState>);
+
+#[derive(Default)]
+enum SeedState {
+    /// The loading thread made no seed yet, or the seed is gone: a thread
+    /// finished it, or the loading thread built the cache.
+    #[default]
+    Empty,
+    Ready(SymlinkSeed),
+    /// The finish of the seed panicked, and this is a copy of its payload.
+    /// The seed is gone, so each later user of the cache raises it again.
+    Panicked(FinishPanic),
+}
 
 impl SymlinkSeedSlot {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<SymlinkSeed>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SeedState> {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// True when the loading thread made the seed and no thread took it.
+    /// True when the loading thread made the seed: it is here, or its
+    /// finish panicked.
     fn is_set(&self) -> bool {
-        self.lock().is_some()
+        !matches!(*self.lock(), SeedState::Empty)
     }
 
     fn set(&self, seed: SymlinkSeed) {
-        *self.lock() = Some(seed);
+        *self.lock() = SeedState::Ready(seed);
     }
 
-    /// The seed, for the thread that finishes it.
-    fn take(&self) -> Option<SymlinkSeed> {
-        self.lock().take()
+    /// The symlink cache: the seed finished with `finish`, for the first
+    /// thread that uses the cache. When `finish` panics, its panic goes on,
+    /// and each later caller raises a copy of it: the seed is gone, and the
+    /// first panic is the cause.
+    fn finish(
+        &self,
+        finish: impl FnOnce(SymlinkSeed) -> crate::modulespecifiers::symlinks::KnownSymlinks,
+    ) -> crate::modulespecifiers::symlinks::KnownSymlinks {
+        let seed = {
+            let mut state = self.lock();
+            match std::mem::take(&mut *state) {
+                SeedState::Ready(seed) => seed,
+                SeedState::Panicked(panic) => {
+                    let again = panic.copy();
+                    *state = SeedState::Panicked(panic);
+                    drop(state);
+                    again.raise()
+                }
+                SeedState::Empty => {
+                    drop(state);
+                    panic!(
+                        "the loading thread made the symlink cache seed (`build_lazy_shared_state`)"
+                    )
+                }
+            }
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| finish(seed))) {
+            Ok(symlinks) => symlinks,
+            Err(payload) => {
+                *self.lock() = SeedState::Panicked(FinishPanic::of(&*payload));
+                std::panic::resume_unwind(payload)
+            }
+        }
     }
 
     /// Frees the seed on the free thread: the cache is built.
     fn discard(&self) {
-        if let Some(seed) = self.take() {
+        let state = std::mem::take(&mut *self.lock());
+        if let SeedState::Ready(seed) = state {
             crate::execute::build::build_task::drop_in_background(seed);
         }
     }
@@ -411,6 +461,51 @@ impl SymlinkSeedSlot {
 impl Drop for SymlinkSeedSlot {
     fn drop(&mut self) {
         self.discard();
+    }
+}
+
+/// A copy of the payload of a panic in `SymlinkSeed::finish`
+/// (`SymlinkSeedSlot::finish`): a Go panic (`GoPanic`), so that the run
+/// ends as Go ends it whichever thread reports it, or the text of any
+/// other panic.
+enum FinishPanic {
+    Go(crate::core::GoPanic),
+    Text(String),
+}
+
+impl FinishPanic {
+    fn of(payload: &(dyn std::any::Any + Send)) -> Self {
+        if let Some(panic) = payload.downcast_ref::<crate::core::GoPanic>() {
+            return FinishPanic::Go(crate::core::GoPanic {
+                message: panic.message.clone(),
+                go_type: panic.go_type,
+                repanicked: panic.repanicked,
+                recovered_before: panic.recovered_before.clone(),
+                fault_address: panic.fault_address,
+                location: panic.location,
+            });
+        }
+        let text = payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            // The text that Rust prints for any other payload.
+            .unwrap_or_else(|| "Box<dyn Any>".to_string());
+        FinishPanic::Text(text)
+    }
+
+    fn copy(&self) -> Self {
+        match self {
+            FinishPanic::Go(panic) => FinishPanic::of(panic),
+            FinishPanic::Text(text) => FinishPanic::Text(text.clone()),
+        }
+    }
+
+    fn raise(self) -> ! {
+        match self {
+            FinishPanic::Go(panic) => std::panic::panic_any(panic),
+            FinishPanic::Text(text) => std::panic::panic_any(text),
+        }
     }
 }
 
@@ -2387,6 +2482,47 @@ pub(super) mod tests {
                 "the symlink cache seed outlived the cache"
             );
         }
+        crate::program::release_program(program);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // followups66: a panic in the finish of the symlink cache seed takes
+    // the seed with it. The next thread that uses the cache raises the same
+    // panic again (here a Go panic, so the run still ends as Go ends it),
+    // not a panic about a missing seed.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_seed_finish_panic_is_raised_again() {
+        let dir = symlinked_package_project("goport-seed-panic");
+        let program = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        let go_panic_message = |result: std::thread::Result<()>| {
+            let payload = result.expect_err("the cache use panics");
+            payload
+                .downcast_ref::<crate::core::GoPanic>()
+                .map(|panic| panic.message.clone())
+                .unwrap_or_else(|| panic!("not a Go panic"))
+        };
+        let (first, again) = {
+            let _scope = crate::core::enter_program(Some(program));
+            type Finish = fn(SymlinkSeed) -> crate::modulespecifiers::symlinks::KnownSymlinks;
+            let use_cache = |finish: Option<Finish>| {
+                crate::program::spawn_seeded_thread(move || {
+                    std::panic::catch_unwind(|| match finish {
+                        Some(finish) => drop(with_go(|go| finish_symlink_seed(go, finish))),
+                        None => drop(crate::program::get_go_symlink_cache()),
+                    })
+                })
+                .join()
+                .expect("the seeded thread ends")
+            };
+            let first = use_cache(Some(|_| {
+                crate::core::go_panic("the first cause".to_string())
+            }));
+            (go_panic_message(first), go_panic_message(use_cache(None)))
+        };
+        assert_eq!(first, "the first cause");
+        assert_eq!(again, "the first cause");
         crate::program::release_program(program);
         let _ = std::fs::remove_dir_all(&dir);
     }
