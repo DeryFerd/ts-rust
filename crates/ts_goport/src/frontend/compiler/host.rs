@@ -341,9 +341,8 @@ impl CompilerHost for CompilerHostImpl {
             match take_prefetched(opts, script_kind, Some(text.as_str())) {
                 Prefetched::Parse(file) => return Some(Rc::new(file)),
                 Prefetched::Text(worker_text) => worker_text,
-                Prefetched::Nothing => {
-                    unpacked_lib_text(&opts.file_name, &text).unwrap_or_else(|| FileText::new(text, freeable))
-                }
+                Prefetched::Nothing => unpacked_lib_text(&opts.file_name, &text)
+                    .unwrap_or_else(|| FileText::new(text, freeable)),
             }
         };
         // Not in Go: while `ast::free_file_versions` is on (`tsc --watch`,

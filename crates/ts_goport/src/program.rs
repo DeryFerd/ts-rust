@@ -477,7 +477,8 @@ impl CheckerPool {
         let count = self.checkers.len();
         let slot = self.checkers.first_mut()?;
         if matches!(slot, InlineChecker::Unmade(_)) {
-            let (checker, ids) = std::mem::replace(slot, InlineChecker::Busy).into_checker(0, count);
+            let (checker, ids) =
+                std::mem::replace(slot, InlineChecker::Busy).into_checker(0, count);
             *slot = InlineChecker::Made(checker, ids);
         }
         match slot {
@@ -4229,7 +4230,10 @@ fn send_thread_job<R: Send + 'static>(
     // runs: a job reads the pool (`checker_index_for_file`).
     let (slot, count) = with_pool(|pool| {
         let count = pool.checkers.len();
-        (std::mem::replace(&mut pool.checkers[index], InlineChecker::Busy), count)
+        (
+            std::mem::replace(&mut pool.checkers[index], InlineChecker::Busy),
+            count,
+        )
     });
     let (checker, mut ids) = slot.into_checker(index, count);
     let (result, checker) = ids.run(|| {
