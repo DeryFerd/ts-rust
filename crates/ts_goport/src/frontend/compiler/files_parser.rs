@@ -362,6 +362,10 @@ pub struct FilesParser {
     pub max_depth: i32,
     /// Go `singleThreaded`: no parse workers.
     pub single_threaded: bool,
+    /// The lookups that the loader and the parse workers of `parse` shared
+    /// (`HostStatCache::Load`), until `get_processed_files` moves them to
+    /// the program.
+    pub(crate) load_stats: Cell<Option<HostStatCache>>,
 }
 
 // PORT: Go's garbage collector frees the parse tasks with the loader. Here
@@ -589,6 +593,13 @@ impl FilesParser {
         drop(prefetch);
         let shared = Arc::clone(&pool.shared);
         drop(pool);
+        // The program keeps the lookups of the plain OS host's load for the
+        // thread that finishes its symlink cache (`HostStatCache`). A `tsc
+        // -b` host keeps its own (`CompilerHost::stat_cache`).
+        if loader.host.is_plain_os_fs() && shared.stats.host.get().is_none() {
+            self.load_stats
+                .set(Some(HostStatCache::Load(Arc::clone(&shared.stats))));
+        }
         // PERF: the workers' state (the resolution cache, the jobs) is freed
         // beside the rest of the load, as Go's GC frees it; this thread has
         // the last reference now. Not in Go. The free thread is one per
@@ -1385,6 +1396,7 @@ impl FilesParser {
 
         ProcessedFiles {
             finished_processing: true,
+            load_stats: LoadStatCache(Cell::new(self.load_stats.take())),
             resolver: loader.resolver.clone(),
             files: all_files,
             duplicate_source_files,
@@ -1736,6 +1748,11 @@ struct PrefetchJob {
     freeable: bool,
     state: Mutex<PrefetchState>,
     done: Condvar,
+    /// Set with `state` locked when a loader waits on `done`
+    /// (`PrefetchJob::wait_done`), so the worker that leaves the job wakes
+    /// it (`PrefetchJob::settle`). A job that no loader waits for wakes
+    /// none: a wake is a syscall even with no waiter.
+    waited: AtomicBool,
     /// What the worker that parsed the file resolved for the loader after
     /// the parse (`FilePrep`), once it is there.
     prep: Mutex<Option<Box<FilePrep>>>,
@@ -1753,6 +1770,34 @@ struct PrefetchJob {
     /// or made none (`set_prep_wait`).
     #[cfg(test)]
     prep_settled: AtomicBool,
+}
+
+impl PrefetchJob {
+    /// Waits on `done` with `state` locked, after it marks that a loader
+    /// waits (`waited`).
+    fn wait_done<'j>(
+        &'j self,
+        state: std::sync::MutexGuard<'j, PrefetchState>,
+    ) -> std::sync::MutexGuard<'j, PrefetchState> {
+        self.waited.store(true, AtomicOrdering::Relaxed);
+        self.done
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sets the state of a job that its worker leaves, and wakes the
+    /// loaders that wait for it (`wait_done`), if any.
+    fn settle(&self, result: Option<PrefetchResult>) {
+        let mut state = lock(&self.state);
+        *state = PrefetchState::Done(result);
+        // `waited` is set with `state` locked, so it is read here with the
+        // same lock.
+        let waited = self.waited.load(AtomicOrdering::Relaxed);
+        drop(state);
+        if waited {
+            self.done.notify_all();
+        }
+    }
 }
 
 /// Sets `PrefetchJob::prep_settled` when the worker leaves the job.
@@ -1935,20 +1980,14 @@ fn take_prefetched_meta(loader: &FileLoader, file_name: &str) -> Option<SourceFi
         match &*state {
             PrefetchState::Running => {
                 waited.get_or_insert_with(std::time::Instant::now);
-                state = job
-                    .done
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = job.wait_done(state);
             }
             // A test can make the loader wait for a job that no worker has
             // started yet (`set_meta_wait`), so the worker finds the
             // metadata whatever the timing.
             #[cfg(test)]
             PrefetchState::Queued if META_WAIT.with(Cell::get) => {
-                state = job
-                    .done
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = job.wait_done(state);
             }
             PrefetchState::Done(Some(result)) => break result.meta.clone(),
             _ => break None,
@@ -2144,6 +2183,9 @@ struct PrefetchQueue {
     redirects: FxHashMap<String, (String, Path)>,
     next_job: usize,
     closed: bool,
+    /// The workers that wait on `PrefetchShared::ready` and no wake has
+    /// reached yet (`PrefetchShared::wake`).
+    sleepers: usize,
     /// True once the workers of `PrefetchPool::add_mapped_workers` start.
     /// They wait on `ready` too (`PrefetchShared::wake`).
     // PORT: not in Go (see `PrefetchJob::mapped`).
@@ -2186,6 +2228,7 @@ impl PrefetchQueue {
             freeable,
             state: Mutex::new(PrefetchState::Queued),
             done: Condvar::new(),
+            waited: AtomicBool::new(false),
             prep: Mutex::new(None),
             mapped,
             queued_at: self.timed.then(std::time::Instant::now),
@@ -2708,7 +2751,9 @@ impl PrefetchShared {
 
     /// Closes the queue: the workers stop after their current job.
     fn close(&self) {
-        lock(&self.queue).closed = true;
+        let mut queue = lock(&self.queue);
+        queue.closed = true;
+        queue.sleepers = 0;
         self.closed.store(true, AtomicOrdering::Relaxed);
         self.ready.notify_all();
     }
@@ -2764,7 +2809,7 @@ impl PrefetchShared {
             return;
         }
         queue.rank = Some((jobs, count));
-        self.wake(&queue, 1);
+        self.wake(&mut queue, 1);
     }
 
     /// Pushes the `count` largest of `jobs` that are still queued on top of
@@ -2784,25 +2829,39 @@ impl PrefetchShared {
         sized.sort_by_key(|(size, _)| *size);
         let largest = sized.split_off(sized.len().saturating_sub(count));
         let mut queue = lock(&self.queue);
+        let mut pushed = 0;
         for (_, job) in largest {
             if queued(&job) {
                 queue.push_pending(job);
+                pushed += 1;
             }
         }
-        drop(queue);
-        self.ready.notify_all();
+        self.wake(&mut queue, pushed);
     }
 
-    /// Queues a parse of `opts.file_name`, unless one is queued already.
-    /// A job that no worker has taken moves up.
+    /// `queue_locked` with its own lock of the queue, and the wake of a
+    /// worker for a new job.
+    #[cfg(test)]
+    fn queue(&self, opts: SourceFileParseOptions, script_kind: ScriptKind) {
+        let mut queue = lock(&self.queue);
+        let new = Self::queue_locked(&mut queue, opts, script_kind);
+        self.wake(&mut queue, usize::from(new));
+    }
+
+    /// Queues a parse of `opts.file_name`, unless one is queued already,
+    /// with the queue lock held. A job that no worker has taken moves up.
+    /// True when it made a new job: the caller wakes a worker for it.
     // PERF (parload2): a worker queues the files that a parse references.
     // The loader loads them right after that file (depth first), so a job
     // that a root file or an earlier parse queued, deep in the list, moves
     // up, as the loader's own batches move up the jobs it reaches
     // (`queue_batch`). Else the loader reaches it first and parses it
     // itself. `GOPORT_PREFETCH_MOVE_UP=0` turns it off.
-    fn queue(&self, opts: SourceFileParseOptions, script_kind: ScriptKind) {
-        let mut queue = lock(&self.queue);
+    fn queue_locked(
+        queue: &mut PrefetchQueue,
+        opts: SourceFileParseOptions,
+        script_kind: ScriptKind,
+    ) -> bool {
         if let Some(job) = queue.by_name.get(&opts.file_name) {
             if queue.move_up
                 && !queue.is_first(job)
@@ -2811,15 +2870,15 @@ impl PrefetchShared {
                 let job = job.clone();
                 queue.push_pending(job);
             }
-            return;
+            return false;
         }
         let Some(job) = queue.add(opts, script_kind, None) else {
-            return;
+            return false;
         };
         if !queue.is_first(&job) {
             queue.pending.push(job);
         }
-        self.wake(&queue, 1);
+        true
     }
 
     /// Queues the parses of one `FilesParser::start` batch: new jobs, and
@@ -2868,37 +2927,57 @@ impl PrefetchShared {
                 queue.push_pending(job);
             }
         }
-        self.wake(&queue, woken);
+        self.wake(&mut queue, woken);
     }
 
-    /// Wakes the workers for `jobs` new jobs, with the queue lock held. Go
-    /// runs each queued task on a goroutine of its own
-    /// (core/workgroup.go:34 parallelWorkGroup.Queue), so a job wakes one
-    /// worker. Once the workers of content-mapped jobs started, they wait on
-    /// `ready` too, and one wake could reach a worker that cannot take the
-    /// job, so all wake. The lock keeps such a worker from starting to wait
-    /// between the check and the wake.
+    /// Wakes the workers for `jobs` new jobs, with the queue lock held: a
+    /// job wakes one sleeping worker, and no wake is made when no worker
+    /// sleeps (`PrefetchQueue::sleepers`), as a wake is a syscall even with
+    /// no waiter. Go runs each queued task on a goroutine of its own
+    /// (core/workgroup.go:34 parallelWorkGroup.Queue), and its scheduler
+    /// wakes an idle thread for a new goroutine only when a thread is idle
+    /// (runtime/proc.go `wakep`). Once the workers of content-mapped jobs
+    /// started, they wait on `ready` too, and one wake could reach a worker
+    /// that cannot take the job, so all wake. The lock keeps a worker from
+    /// starting to wait between the check and the wake.
     // PORT: not in Go (see `PrefetchJob::mapped`).
-    fn wake(&self, queue: &std::sync::MutexGuard<'_, PrefetchQueue>, jobs: usize) {
+    // PERF (syscut1): a VS Code load made about 10,000 wakes with no
+    // worker asleep, most of them the loader's (`queue_batch`).
+    fn wake(&self, queue: &mut PrefetchQueue, jobs: usize) {
+        let woken = jobs.min(queue.sleepers);
+        if woken == 0 {
+            return;
+        }
         if queue.mapped_workers {
-            if jobs > 0 {
-                self.ready.notify_all();
-            }
+            queue.sleepers = 0;
+            self.ready.notify_all();
         } else {
-            for _ in 0..jobs {
+            queue.sleepers -= woken;
+            for _ in 0..woken {
                 self.ready.notify_one();
             }
         }
     }
 
     /// Queues a parse of each file in `names` that the parser can take
-    /// (`parse_request`).
+    /// (`parse_request`), with one lock of the queue.
+    // PERF (syscut1): with a lock per name, the queue lock took 15,000 to
+    // 24,000 futex calls in a VS Code load (testbox, 4 runs), and 7,000 to
+    // 12,000 with one lock per call.
     fn queue_names(&self, names: Vec<String>) {
-        for file_name in names {
-            if let Some((opts, script_kind)) = self.parse_request(file_name) {
-                self.queue(opts, script_kind);
-            }
+        let requests: Vec<_> = names
+            .into_iter()
+            .filter_map(|file_name| self.parse_request(file_name))
+            .collect();
+        if requests.is_empty() {
+            return;
         }
+        let mut queue = lock(&self.queue);
+        let mut new = 0;
+        for (opts, script_kind) in requests {
+            new += usize::from(Self::queue_locked(&mut queue, opts, script_kind));
+        }
+        self.wake(&mut queue, new);
     }
 
     /// The parse options and script kind of a job for `file_name`, when
@@ -2976,11 +3055,9 @@ impl PrefetchShared {
         }
         let count = jobs.len();
         queue.pending.splice(0..0, jobs);
+        self.wake(&mut queue, count);
         drop(queue);
         self.count(|c| c.early_roots = count);
-        if count > 0 {
-            self.ready.notify_all();
-        }
     }
 
     /// Queues the files that a parsed file references, so their parses do
@@ -3226,8 +3303,9 @@ pub fn start_default_lib_prefetch(
         && let Some(resolve) = WorkerResolveConfig::of_config(config)
     {
         let _ = pool.shared.resolve.set(Some(resolve));
-        lock(&pool.shared.queue).roots = Some(config.file_names().to_vec());
-        pool.shared.ready.notify_one();
+        let mut queue = lock(&pool.shared.queue);
+        queue.roots = Some(config.file_names().to_vec());
+        pool.shared.wake(&mut queue, 1);
     }
     pool.shared.queue_names(
         names
@@ -3458,15 +3536,13 @@ impl RunningJob<'_> {
     fn finish(self, result: Option<PrefetchResult>) {
         let job = self.0;
         std::mem::forget(self);
-        *lock(&job.state) = PrefetchState::Done(result);
-        job.done.notify_all();
+        job.settle(result);
     }
 }
 
 impl Drop for RunningJob<'_> {
     fn drop(&mut self) {
-        *lock(&self.0.state) = PrefetchState::Done(None);
-        self.0.done.notify_all();
+        self.0.settle(None);
     }
 }
 
@@ -3535,6 +3611,8 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
                 if let Some(job) = queue.mapped.pop() {
                     break job;
                 }
+                // A wake takes this worker off the count (`wake`).
+                queue.sleepers += 1;
                 queue = shared
                     .ready
                     .wait(queue)
@@ -4129,9 +4207,9 @@ impl<V> Default for StatMap<V> {
 impl<V: Clone> StatMap<V> {
     fn shard(&self, path: &str) -> &Mutex<FxHashMap<String, StatSlot<V>>> {
         use std::hash::BuildHasher;
+        const _: () = assert!(STAT_MAP_SHARDS == 64);
         let hash = rustc_hash::FxBuildHasher.hash_one(path);
-        // The high bits: Fx mixes them best.
-        &self.shards[(hash >> 58) as usize % STAT_MAP_SHARDS]
+        &self.shards[crate::frontend::module::shard_index(hash)]
     }
 
     /// The cached value of `path`.
@@ -4391,7 +4469,7 @@ impl BuildStatCache {
 /// they read what the build has cached, and the host's file system reads
 /// what they found.
 #[derive(Default)]
-struct SharedStatCache {
+pub(crate) struct SharedStatCache {
     own: StatCache,
     host: OnceLock<Arc<BuildStatCache>>,
     /// The package.json texts that the workers' resolvers read
@@ -4408,10 +4486,12 @@ struct SharedStatCache {
     // PORT: Go `cachedvfs` caches `DirectoryExists` and `FileExists` in two
     // maps (cachedvfs.go:49, :65), so Go makes one stat per lookup kind: 2
     // stats for a path that it asks both of. Here the first lookup of a
-    // path fixes both answers for the load, so the port makes fewer stats
-    // than Go. The answers are Go's unless the file system changes during
-    // the load, between Go's two stats of one path. The load writes no
-    // file, so the output is the same.
+    // path fixes both answers for the load, and for the program's symlink
+    // cache, which reads them after the load (`HostStatCache::Load`,
+    // `HostStatFs`). So the port makes fewer stats than Go. The answers
+    // are Go's unless the file system changes between Go's two stats of
+    // one path. The load writes no file, so the output of the load is the
+    // same.
     nodes: StatMap<Option<(bool, i64)>>,
 }
 
@@ -4716,6 +4796,182 @@ impl Fs for LoaderStatFs {
     }
 }
 
+/// The thread-safe lookup cache of a program host's file system, which a
+/// thread other than the loading one can read (`HostStatFs`).
+// PORT: not in Go, where each goroutine reads the host's `cachedvfs`
+// (`p.Host().FS()`). The port's `tsc` host caches in `CachedFs`, which
+// only the loading thread reads. These are the caches that it shares.
+#[derive(Clone)]
+pub(crate) enum HostStatCache {
+    /// The lookups that the loader (`LoaderStatFs`) and the parse workers
+    /// of a load on the plain OS file system made (`SharedStatCache`).
+    /// They answer for the host: every answer is the OS answer, and the
+    /// load writes no file.
+    Load(Arc<SharedStatCache>),
+    /// The cache of the `tsc -b` host (`CompilerHost::stat_cache`).
+    Build(Arc<BuildStatCache>),
+}
+
+impl HostStatCache {
+    /// Lets go of these lookups. A load's lookups go to the free thread
+    /// (`drop_in_background`, which the load started), so this thread does
+    /// not free them; the `tsc -b` host keeps its own.
+    pub(crate) fn free(self) {
+        if let HostStatCache::Load(stats) = self {
+            crate::execute::build::build_task::drop_in_background(stats);
+        }
+    }
+}
+
+/// The lookups of a program's load (`HostStatCache::Load`), until the
+/// thread that finishes the program's symlink cache takes them
+/// (program/go_frontend.rs `SymlinkSeed`). A copy of the files (Go
+/// `UpdateProgram`) has none: the file system can change after the load.
+#[derive(Default)]
+pub struct LoadStatCache(Cell<Option<HostStatCache>>);
+
+impl LoadStatCache {
+    pub(crate) fn take(&self) -> Option<HostStatCache> {
+        self.0.take()
+    }
+}
+
+impl Clone for LoadStatCache {
+    fn clone(&self) -> Self {
+        LoadStatCache::default()
+    }
+}
+
+/// The OS file system of this thread with the `FileExists`,
+/// `DirectoryExists`, `Realpath` and `GetAccessibleEntries` lookups of a
+/// program's host (`HostStatCache`): a lookup that the host made is not
+/// made again, and a new one is stored there, as Go `cachedvfs` does for
+/// each goroutine (cachedvfs.go:49, :65). Every other call goes to the OS
+/// file system.
+pub(crate) struct HostStatFs {
+    fs: Rc<dyn Fs>,
+    cache: HostStatCache,
+}
+
+impl HostStatFs {
+    pub(crate) fn new(cache: HostStatCache) -> Self {
+        HostStatFs {
+            fs: crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs()),
+            cache,
+        }
+    }
+
+    /// `FileExists` (or with `directory`, `DirectoryExists`) of `path`.
+    fn exists(&self, path: &str, directory: bool) -> bool {
+        let load = || {
+            if directory {
+                self.fs.directory_exists(path)
+            } else {
+                self.fs.file_exists(path)
+            }
+        };
+        match &self.cache {
+            HostStatCache::Load(stats) => stats
+                .exists(&*self.fs, path, directory)
+                .unwrap_or_else(load),
+            HostStatCache::Build(stats) if directory => stats.directory_exists(path, load),
+            HostStatCache::Build(stats) => stats.file_exists(path, load),
+        }
+    }
+}
+
+impl Fs for HostStatFs {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.fs.use_case_sensitive_file_names()
+    }
+
+    fn file_exists(&self, path: &str) -> bool {
+        self.exists(path, false)
+    }
+
+    fn read_file(&self, path: &str) -> (String, bool) {
+        self.fs.read_file(path)
+    }
+
+    fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.write_file(path, data)
+    }
+
+    fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.append_file(path, data)
+    }
+
+    fn remove(&self, path: &str) -> Result<(), FsError> {
+        self.fs.remove(path)
+    }
+
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<std::time::SystemTime>,
+        m_time: Option<std::time::SystemTime>,
+    ) -> Result<(), FsError> {
+        self.fs.chtimes(path, a_time, m_time)
+    }
+
+    fn directory_exists(&self, path: &str) -> bool {
+        self.exists(path, true)
+    }
+
+    fn get_accessible_entries(&self, path: &str) -> Entries {
+        let load = || self.fs.get_accessible_entries(path);
+        match &self.cache {
+            HostStatCache::Load(stats) => stats.own.entries(path, load),
+            HostStatCache::Build(stats) => stats.entries(path, load),
+        }
+    }
+
+    fn stat(&self, path: &str) -> Option<FileInfo> {
+        self.fs.stat(path)
+    }
+
+    fn realpath(&self, path: &str) -> String {
+        let load = || self.fs.realpath(path);
+        match &self.cache {
+            HostStatCache::Load(stats) => stats.own.realpath(path, load),
+            HostStatCache::Build(stats) => stats.realpath(path, load),
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_stat_fs_tests {
+    use super::*;
+
+    // syscut1 round 2: the symlink cache's resolver on another thread
+    // reads the lookups of the program's load and makes no call that the
+    // load made (Go: the host's `cachedvfs`), and stores its own there.
+    #[test]
+    fn host_stat_fs_answers_from_the_load() {
+        let dir = std::env::temp_dir().join(format!("goport-host-stat-fs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().replace('\\', "/");
+        let gone = format!("{dir}/node_modules/gone");
+        let stats = Arc::new(SharedStatCache::default());
+        // The load found `gone`, which does not exist now: an answer from
+        // the cache shows that no call was made.
+        stats.nodes.insert_if_absent(&gone, Some((true, 0)));
+        stats
+            .own
+            .realpath
+            .insert_if_absent(&gone, format!("{dir}/real/gone"));
+        let fs = HostStatFs::new(HostStatCache::Load(Arc::clone(&stats)));
+        assert!(fs.directory_exists(&gone));
+        assert!(!fs.file_exists(&gone));
+        assert_eq!(fs.realpath(&gone), format!("{dir}/real/gone"));
+        // A new lookup is stored for the next one.
+        let here = format!("{dir}/node_modules");
+        assert!(!fs.directory_exists(&here));
+        assert_eq!(stats.nodes.get(&here), Some(None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The TS file that a relative import (`./x`, `../x.js`) of `containing`
 /// most likely resolves to: the first existing file in module resolution's
 /// extension order. `None` for other specifiers.
@@ -4886,6 +5142,7 @@ pub(crate) fn take_prefetched_mapped(
     let mut state = lock(&job.state);
     #[cfg(test)]
     if lock(&MAPPED_WAIT_FOR_WORKER).contains(&opts.file_name) {
+        job.waited.store(true, AtomicOrdering::Relaxed);
         let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
         while matches!(*state, PrefetchState::Queued) && std::time::Instant::now() < deadline {
             // A worker sets `Running` without a wake, so this polls.
@@ -4906,10 +5163,7 @@ pub(crate) fn take_prefetched_mapped(
             PrefetchState::Running => {
                 *state = PrefetchState::Running;
                 waited.get_or_insert_with(std::time::Instant::now);
-                state = job
-                    .done
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = job.wait_done(state);
             }
             PrefetchState::Done(result) => break result,
         }
@@ -5008,10 +5262,7 @@ pub fn take_prefetched(
             PrefetchState::Running => {
                 *state = PrefetchState::Running;
                 waited.get_or_insert_with(std::time::Instant::now);
-                state = job
-                    .done
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = job.wait_done(state);
             }
             PrefetchState::Done(result) => break result,
         }
