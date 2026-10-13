@@ -1310,7 +1310,7 @@ const _: () = assert!(std::mem::size_of::<Symbol>() == 56);
 // freed chunks (only in the language service) go out of line.
 // PERF (apisym1c): the parity is in the index, so `get` does not select a
 // part (a second array cost 0.8 to 2.5 percent instructions in a check).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CowChunks<T: 'static> {
     chunks: Vec<Chunk<T>>,
     /// The values from index `chunks.len() * COW_CHUNK_LEN` on. Empty, with
@@ -1321,6 +1321,31 @@ pub struct CowChunks<T: 'static> {
     /// Each sealed chunk is followed by a freed chunk (`new_interleaved`).
     interleaved: bool,
 }
+
+/// A clone copies the owned chunks and the tail, and shares the others
+/// (`CowChunks`). Its chunk list has `CLONE_CHUNK_ROOM` more entries of
+/// room, so the next pushes do not grow it.
+// PERF (edleak3): the binder lineage is a clone after each change that a
+// program shares (`program::Lineage::symbols_mut`). A clone with no room
+// doubled its chunk list at the first new chunk, and the programs then kept
+// those lists with up to half of them unused.
+impl<T: Clone> Clone for CowChunks<T> {
+    fn clone(&self) -> Self {
+        let mut chunks = Vec::with_capacity(self.chunks.len() + CLONE_CHUNK_ROOM);
+        chunks.extend(self.chunks.iter().cloned());
+        Self {
+            chunks,
+            tail: self.tail.clone(),
+            len: self.len,
+            interleaved: self.interleaved,
+        }
+    }
+}
+
+/// The room of a cloned chunk list (`CowChunks::clone`): the chunks of a few
+/// edited file versions (an edit of a query-core file adds about 8 symbol
+/// chunks and 6 table chunks, the odd chunks included).
+const CLONE_CHUNK_ROOM: usize = 64;
 
 const COW_CHUNK_SHIFT: usize = 8;
 const COW_CHUNK_LEN: usize = 1 << COW_CHUNK_SHIFT;
