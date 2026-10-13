@@ -903,7 +903,7 @@ fn replaced_files<'a>(
         // The `redirect_files_by_path` half (Go :371) cannot hold here, and
         // stays as in Go. A redirect path is the path of a package copy that
         // the loader leaves out of the program files (Go
-        // filesparser.go:467-477, the `continue`), and `old_file` is a
+        // filesparser.go:455-484, the `continue`), and `old_file` is a
         // program file. A changed copy at a redirect path takes the full
         // build in `reuse_program` (frontend/compiler/program_new.rs, Go
         // program.go:371), so no reused version gets here with it. Test:

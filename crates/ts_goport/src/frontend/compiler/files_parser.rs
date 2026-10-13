@@ -1465,7 +1465,7 @@ struct FileMaps {
 }
 
 impl FileMaps {
-    /// Adds `entry` as Go `collectFiles` adds it (filesparser.go:467-524).
+    /// Adds `entry` as Go `collectFiles` adds it (filesparser.go:455-548).
     fn add(&mut self, entry: FileMapEntry) {
         match entry {
             FileMapEntry::File {
