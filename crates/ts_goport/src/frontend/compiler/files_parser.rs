@@ -4394,7 +4394,7 @@ struct SharedStatCache {
     /// root file size (`PrefetchShared::rank_largest`) asked for in the load,
     /// as (is a directory, size), when there is no host cache: Go
     /// `vfs.Common` answers both lookups with one stat, so one stat answers
-    /// all three here.
+    /// all three here. Not for the lookups of a bundled path (`exists`).
     nodes: StatMap<Option<(bool, i64)>>,
 }
 
@@ -4422,13 +4422,25 @@ impl SharedStatCache {
         })
     }
 
-    /// Go `vfs.Common.FileExists` and `DirectoryExists` of `path` on `fs`
-    /// (a stat), from `nodes`, or `None` with a host cache: its lookups of
-    /// each kind stay for later programs, so they must not answer each
-    /// other (`BuildStatCache`).
+    /// `FileExists` (or with `directory`, `DirectoryExists`) of `path` on
+    /// `fs`, the bundled wrapper of the OS file system. For an OS path it is
+    /// Go `vfs.Common.FileExists` or `DirectoryExists`, a stat, so one stat
+    /// in `nodes` answers both. A bundled path is answered by `fs` itself
+    /// (no syscall): there the stat and the lookups differ (Go embed.go:66
+    /// and :85: `Stat("bundled:///")` is a directory, but
+    /// `DirectoryExists("bundled:///")` is false). `None` with a host cache:
+    /// its lookups of each kind stay for later programs, so they must not
+    /// answer each other (`BuildStatCache`).
     fn exists(&self, fs: &dyn Fs, path: &str, directory: bool) -> Option<bool> {
         if self.host.get().is_some() {
             return None;
+        }
+        if crate::frontend::bundled::is_bundled(path) {
+            return Some(if directory {
+                fs.directory_exists(path)
+            } else {
+                fs.file_exists(path)
+            });
         }
         Some(
             self.node(fs, path)
@@ -4577,12 +4589,17 @@ impl LoaderStatFs {
     }
 
     /// `FileExists` (or with `directory`, `DirectoryExists`) of `path`
-    /// (see `SharedStatCache::exists`).
+    /// (see `SharedStatCache::exists`), else the call on `fs`.
     fn exists(&self, path: &str, directory: bool) -> bool {
-        match worker_stats() {
-            Some(stats) => stats.exists(&*self.fs, path, directory) == Some(true),
-            None if directory => self.fs.directory_exists(path),
-            None => self.fs.file_exists(path),
+        if let Some(exists) =
+            worker_stats().and_then(|stats| stats.exists(&*self.fs, path, directory))
+        {
+            return exists;
+        }
+        if directory {
+            self.fs.directory_exists(path)
+        } else {
+            self.fs.file_exists(path)
         }
     }
 }
@@ -5035,5 +5052,53 @@ mod move_up_tests {
                 .collect();
             assert_eq!(names, pending, "move-up {on}");
         }
+    }
+}
+
+#[cfg(test)]
+mod stat_cache_tests {
+    use super::*;
+
+    // statcut1 round 2 (skeptic): one stat answers `FileExists` and
+    // `DirectoryExists` only where the file system answers them from that
+    // stat. The bundled wrapper does not for `bundled:///`: its stat is a
+    // directory, but `DirectoryExists` is false (Go embed.go:66, :85). Each
+    // answer of the workers' cache must be the file system's own.
+    #[test]
+    fn one_stat_answers_as_the_file_system() {
+        let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
+        let dir = std::env::temp_dir().join(format!("ts_goport_statcut_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), "").unwrap();
+        let root = normalize_slashes(&dir.to_string_lossy());
+        let lib = format!("{}/lib.es5.d.ts", crate::frontend::bundled::lib_path());
+        let paths = [
+            "bundled:///".to_string(),
+            "bundled:///libs".to_string(),
+            "bundled:///libs/".to_string(),
+            "bundled:///nope".to_string(),
+            lib,
+            root.clone(),
+            format!("{root}/"),
+            format!("{root}/a.ts"),
+            format!("{root}/b.ts"),
+        ];
+        let stats = SharedStatCache::default();
+        for path in &paths {
+            // The stat of a root file size comes first, as in a load
+            // (`PrefetchShared::rank_largest`).
+            let _ = stats.node(&*fs, path);
+            assert_eq!(
+                stats.exists(&*fs, path, false),
+                Some(fs.file_exists(path)),
+                "FileExists({path})"
+            );
+            assert_eq!(
+                stats.exists(&*fs, path, true),
+                Some(fs.directory_exists(path)),
+                "DirectoryExists({path})"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
