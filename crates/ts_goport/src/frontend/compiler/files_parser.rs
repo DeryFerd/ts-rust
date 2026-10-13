@@ -362,6 +362,10 @@ pub struct FilesParser {
     pub max_depth: i32,
     /// Go `singleThreaded`: no parse workers.
     pub single_threaded: bool,
+    /// The lookups that the loader and the parse workers of `parse` shared
+    /// (`HostStatCache::Load`), until `get_processed_files` moves them to
+    /// the program.
+    pub(crate) load_stats: Cell<Option<HostStatCache>>,
 }
 
 // PORT: Go's garbage collector frees the parse tasks with the loader. Here
@@ -589,6 +593,13 @@ impl FilesParser {
         drop(prefetch);
         let shared = Arc::clone(&pool.shared);
         drop(pool);
+        // The program keeps the lookups of the plain OS host's load for the
+        // thread that finishes its symlink cache (`HostStatCache`). A `tsc
+        // -b` host keeps its own (`CompilerHost::stat_cache`).
+        if loader.host.is_plain_os_fs() && shared.stats.host.get().is_none() {
+            self.load_stats
+                .set(Some(HostStatCache::Load(Arc::clone(&shared.stats))));
+        }
         // PERF: the workers' state (the resolution cache, the jobs) is freed
         // beside the rest of the load, as Go's GC frees it; this thread has
         // the last reference now. Not in Go. The free thread is one per
@@ -1385,6 +1396,7 @@ impl FilesParser {
 
         ProcessedFiles {
             finished_processing: true,
+            load_stats: LoadStatCache(Cell::new(self.load_stats.take())),
             resolver: loader.resolver.clone(),
             files: all_files,
             duplicate_source_files,
@@ -4448,7 +4460,7 @@ impl BuildStatCache {
 /// they read what the build has cached, and the host's file system reads
 /// what they found.
 #[derive(Default)]
-struct SharedStatCache {
+pub(crate) struct SharedStatCache {
     own: StatCache,
     host: OnceLock<Arc<BuildStatCache>>,
     /// The package.json texts that the workers' resolvers read
@@ -4736,6 +4748,182 @@ impl Fs for LoaderStatFs {
 
     fn realpath(&self, path: &str) -> String {
         self.shared(|c| &c.realpath, path, || self.fs.realpath(path))
+    }
+}
+
+/// The thread-safe lookup cache of a program host's file system, which a
+/// thread other than the loading one can read (`HostStatFs`).
+// PORT: not in Go, where each goroutine reads the host's `cachedvfs`
+// (`p.Host().FS()`). The port's `tsc` host caches in `CachedFs`, which
+// only the loading thread reads. These are the caches that it shares.
+#[derive(Clone)]
+pub(crate) enum HostStatCache {
+    /// The lookups that the loader (`LoaderStatFs`) and the parse workers
+    /// of a load on the plain OS file system made (`SharedStatCache`).
+    /// They answer for the host: every answer is the OS answer, and the
+    /// load writes no file.
+    Load(Arc<SharedStatCache>),
+    /// The cache of the `tsc -b` host (`CompilerHost::stat_cache`).
+    Build(Arc<BuildStatCache>),
+}
+
+impl HostStatCache {
+    /// Lets go of these lookups. A load's lookups go to the free thread
+    /// (`drop_in_background`, which the load started), so this thread does
+    /// not free them; the `tsc -b` host keeps its own.
+    pub(crate) fn free(self) {
+        if let HostStatCache::Load(stats) = self {
+            crate::execute::build::build_task::drop_in_background(stats);
+        }
+    }
+}
+
+/// The lookups of a program's load (`HostStatCache::Load`), until the
+/// thread that finishes the program's symlink cache takes them
+/// (program/go_frontend.rs `SymlinkSeed`). A copy of the files (Go
+/// `UpdateProgram`) has none: the file system can change after the load.
+#[derive(Default)]
+pub struct LoadStatCache(Cell<Option<HostStatCache>>);
+
+impl LoadStatCache {
+    pub(crate) fn take(&self) -> Option<HostStatCache> {
+        self.0.take()
+    }
+}
+
+impl Clone for LoadStatCache {
+    fn clone(&self) -> Self {
+        LoadStatCache::default()
+    }
+}
+
+/// The OS file system of this thread with the `FileExists`,
+/// `DirectoryExists`, `Realpath` and `GetAccessibleEntries` lookups of a
+/// program's host (`HostStatCache`): a lookup that the host made is not
+/// made again, and a new one is stored there, as Go `cachedvfs` does for
+/// each goroutine (cachedvfs.go:48). Every other call goes to the OS file
+/// system.
+pub(crate) struct HostStatFs {
+    fs: Rc<dyn Fs>,
+    cache: HostStatCache,
+}
+
+impl HostStatFs {
+    pub(crate) fn new(cache: HostStatCache) -> Self {
+        HostStatFs {
+            fs: crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs()),
+            cache,
+        }
+    }
+
+    /// `FileExists` (or with `directory`, `DirectoryExists`) of `path`.
+    fn exists(&self, path: &str, directory: bool) -> bool {
+        let load = || {
+            if directory {
+                self.fs.directory_exists(path)
+            } else {
+                self.fs.file_exists(path)
+            }
+        };
+        match &self.cache {
+            HostStatCache::Load(stats) => stats
+                .exists(&*self.fs, path, directory)
+                .unwrap_or_else(load),
+            HostStatCache::Build(stats) if directory => stats.directory_exists(path, load),
+            HostStatCache::Build(stats) => stats.file_exists(path, load),
+        }
+    }
+}
+
+impl Fs for HostStatFs {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.fs.use_case_sensitive_file_names()
+    }
+
+    fn file_exists(&self, path: &str) -> bool {
+        self.exists(path, false)
+    }
+
+    fn read_file(&self, path: &str) -> (String, bool) {
+        self.fs.read_file(path)
+    }
+
+    fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.write_file(path, data)
+    }
+
+    fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.append_file(path, data)
+    }
+
+    fn remove(&self, path: &str) -> Result<(), FsError> {
+        self.fs.remove(path)
+    }
+
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<std::time::SystemTime>,
+        m_time: Option<std::time::SystemTime>,
+    ) -> Result<(), FsError> {
+        self.fs.chtimes(path, a_time, m_time)
+    }
+
+    fn directory_exists(&self, path: &str) -> bool {
+        self.exists(path, true)
+    }
+
+    fn get_accessible_entries(&self, path: &str) -> Entries {
+        let load = || self.fs.get_accessible_entries(path);
+        match &self.cache {
+            HostStatCache::Load(stats) => stats.own.entries(path, load),
+            HostStatCache::Build(stats) => stats.entries(path, load),
+        }
+    }
+
+    fn stat(&self, path: &str) -> Option<FileInfo> {
+        self.fs.stat(path)
+    }
+
+    fn realpath(&self, path: &str) -> String {
+        let load = || self.fs.realpath(path);
+        match &self.cache {
+            HostStatCache::Load(stats) => stats.own.realpath(path, load),
+            HostStatCache::Build(stats) => stats.realpath(path, load),
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_stat_fs_tests {
+    use super::*;
+
+    // syscut1 round 2: the symlink cache's resolver on another thread
+    // reads the lookups of the program's load and makes no call that the
+    // load made (Go: the host's `cachedvfs`), and stores its own there.
+    #[test]
+    fn host_stat_fs_answers_from_the_load() {
+        let dir = std::env::temp_dir().join(format!("goport-host-stat-fs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().replace('\\', "/");
+        let gone = format!("{dir}/node_modules/gone");
+        let stats = Arc::new(SharedStatCache::default());
+        // The load found `gone`, which does not exist now: an answer from
+        // the cache shows that no call was made.
+        stats.nodes.insert_if_absent(&gone, Some((true, 0)));
+        stats
+            .own
+            .realpath
+            .insert_if_absent(&gone, format!("{dir}/real/gone"));
+        let fs = HostStatFs::new(HostStatCache::Load(Arc::clone(&stats)));
+        assert!(fs.directory_exists(&gone));
+        assert!(!fs.file_exists(&gone));
+        assert_eq!(fs.realpath(&gone), format!("{dir}/real/gone"));
+        // A new lookup is stored for the next one.
+        let here = format!("{dir}/node_modules");
+        assert!(!fs.directory_exists(&here));
+        assert_eq!(stats.nodes.get(&here), Some(None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

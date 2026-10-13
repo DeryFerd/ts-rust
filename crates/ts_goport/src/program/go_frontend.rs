@@ -344,9 +344,9 @@ pub(super) fn known_symlinks() -> Arc<crate::modulespecifiers::symlinks::KnownSy
 /// cannot read the frontend program. For the symlink cache, that is its
 /// seed (`SymlinkSeed`), which makes no file system call, so a program that
 /// never uses the cache makes none of its `realpath` calls, as in Go. Where
-/// a seed cannot be finished on another thread, the cache itself. Does
-/// nothing on another thread, which was seeded after this, or for an
-/// alias resolver program.
+/// a seed cannot be finished on another thread with the host's lookups,
+/// the cache itself. Does nothing on another thread, which was seeded after
+/// this, or for an alias resolver program.
 // PERF (syscut1): the cache took 62 `realpath` calls (open, readlink,
 // close) in a VS Code `--noEmit` check, where Go makes none.
 pub(super) fn build_lazy_shared_state() {
@@ -389,6 +389,9 @@ pub(super) struct SymlinkSeed {
     typings_location: String,
     project_name: String,
     current_directory: String,
+    /// The lookups of the program's host (Go `p.Host().FS()`, a
+    /// `cachedvfs`) that another thread can read.
+    stats: crate::frontend::compiler::HostStatCache,
 }
 
 impl SymlinkSeed {
@@ -396,16 +399,24 @@ impl SymlinkSeed {
     /// cache itself: a host that does not show the plain OS file system (a
     /// new resolver of another thread would not see its files), project
     /// references and content mappers (the program resolver's host maps
-    /// files that the OS file system does not show), and a program that
-    /// emits declarations, which uses the cache: there the program
-    /// resolver's caches answer most lookups of the dependencies.
+    /// files that the OS file system does not show), a program that emits
+    /// declarations, which uses the cache, and a host whose lookups only
+    /// the loading thread can read (a load with no parse workers, as with
+    /// `--singleThreaded`): a resolver of another thread would make each
+    /// lookup of the load again.
     fn of(frontend: &NewProgram) -> Option<Self> {
+        let stats = frontend
+            .host()
+            .stat_cache()
+            .map(crate::frontend::compiler::HostStatCache::Build)
+            .or_else(|| frontend.load_stats.take())?;
         let options = frontend.options();
         if !frontend.host().is_plain_os_fs()
             || !frontend.get_resolved_project_references().is_empty()
             || !frontend.content_mapper_extensions().is_empty()
             || (options.get_emit_declarations() && !options.no_emit.is_true())
         {
+            stats.free();
             return None;
         }
         Some(SymlinkSeed {
@@ -414,12 +425,14 @@ impl SymlinkSeed {
             typings_location: frontend.get_global_typings_cache_location(),
             project_name: frontend.opts.project_name.clone(),
             current_directory: frontend.host().get_current_directory(),
+            stats,
         })
     }
 
     /// The symlink cache: the seed finished with a new resolver of the
-    /// program on the OS file system of this thread (Go `newResolver`,
-    /// program.go:191, on the host's file system).
+    /// program on the OS file system of this thread, with the lookups of
+    /// the host (Go `newResolver`, program.go:191, on the host's
+    /// `cachedvfs`).
     fn finish(self) -> crate::modulespecifiers::symlinks::KnownSymlinks {
         use crate::frontend::module::{ResolutionHost, ResolverOptions, new_resolver};
         struct OsHost {
@@ -434,9 +447,10 @@ impl SymlinkSeed {
                 &self.current_directory
             }
         }
+        let stats = self.stats.clone();
         let resolver = new_resolver(ResolverOptions {
             host: Some(Rc::new(OsHost {
-                fs: bundled::wrap_fs(osvfs_fs()),
+                fs: Rc::new(crate::frontend::compiler::HostStatFs::new(self.stats)),
                 current_directory: self.current_directory,
             })),
             compiler_options: Some(Rc::new(self.options)),
@@ -445,14 +459,17 @@ impl SymlinkSeed {
             extra_extensions: Vec::new(),
             package_json_cache: None,
         });
-        self.seed.finish(|dep, package_json_name| {
+        let symlinks = self.seed.finish(|dep, package_json_name| {
             resolver.resolve_package_directory(
                 dep,
                 package_json_name,
                 crate::options::RESOLUTION_MODE_COMMON_JS,
                 None,
             )
-        })
+        });
+        drop(resolver);
+        stats.free();
+        symlinks
     }
 }
 

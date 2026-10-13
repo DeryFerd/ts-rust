@@ -219,6 +219,10 @@ pub struct ProcessedFiles {
     // Go `moduleResolutionError` (ts#64299) is a `Program` field since
     // ts#64519 (`NewProgram::module_resolution_error`).
     pub finished_processing: bool,
+    /// The lookups of the load on the plain OS file system, for the thread
+    /// that finishes the symlink cache (`LoadStatCache`).
+    // PORT: not in Go (see `HostStatCache`).
+    pub load_stats: super::files_parser::LoadStatCache,
 }
 
 // Go: fileloader.go:161 jsxRuntimeImportSpecifier
@@ -271,6 +275,7 @@ pub fn process_all_program_files(
             task_data_by_path: FxHashMap::default(),
             max_depth: max_node_module_js_depth,
             single_threaded,
+            load_stats: Cell::new(None),
         }),
         root_tasks: Vec::with_capacity(
             root_files.len() + compiler_options.lib.as_ref().map_or(0, Vec::len),
