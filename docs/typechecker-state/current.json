@@ -1052,12 +1052,12 @@
     "passingCredit": false,
     "auditor": {
       "role": "audit_accepted_roster",
-      "agent": "pending-new-auditor",
+      "agent": "a4c727095c7a845f2",
       "verdict": "PENDING"
     },
     "reviewer": {
       "role": "independent_reviewer",
-      "agent": "pending-new-reviewer",
+      "agent": "ac9852a67a71cf00b",
       "verdict": "PENDING"
     },
     "nextPermittedAction": "Run the R209 pipeline (candidate.sh side)."
