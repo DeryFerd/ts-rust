@@ -669,6 +669,9 @@ pub fn release_file_version_pins() {
 /// The pins of this thread, taken out as `release_file_version_pins` drops
 /// them.
 fn take_file_version_pins() -> Vec<(usize, VersionPin)> {
+    // A test waits while another test reads the pin epoch.
+    #[cfg(test)]
+    let _turn = crate::test_lock::pin_release();
     PIN_EPOCH.fetch_add(1, Ordering::AcqRel);
     drop_hot();
     PINS.try_with(|pins| {
@@ -1186,11 +1189,8 @@ mod tests {
 
     // A map keeps the entries of a dead version until its next write, then
     // forgets them and keeps the entries of other files.
-    // It holds the store build lock (`crate::test_lock::hold`): a version
-    // that dies here must not die while another test reads the deaths.
     #[test]
     fn per_file_map_forgets_dead_file_versions() {
-        crate::test_lock::hold();
         const DYING: usize = (1 << 22) - 1;
         const OTHER: usize = DYING - 1;
         let mut map = PerFileMap::new();
@@ -1230,8 +1230,8 @@ mod tests {
     /// identifier per name and pins it. Gives the version (its other
     /// holder) and a weak handle to its text, which goes with its data (its
     /// store). The thread holds the store build lock to its end
-    /// (`crate::test_lock::hold`): the tests read version deaths, pin
-    /// releases and the free thread, which other tests also change.
+    /// (`crate::test_lock::hold`): the tests read the pin epoch and the free
+    /// thread, which other tests also use.
     fn publish_pinned(name: &'static str, names: &[&str]) -> (Arc<FileVersion>, Weak<str>) {
         crate::test_lock::hold();
         let text = FileText::Shared(Arc::from(names.join(";")));
@@ -1412,7 +1412,11 @@ mod tests {
             release_file_version_pins_later();
             assert!(!probe.is_freed(), "the guard keeps the version");
             assert!(lock(&VERSIONS).contains_key(&file), "a live version");
-            assert!(dead_files_since(dead).0.is_empty(), "no version died");
+            // Versions of other tests can die meanwhile.
+            assert!(
+                !dead_files_since(dead).0.contains(&file),
+                "the version did not die"
+            );
             assert_eq!(guard.file(), file);
             drop(guard);
             assert!(probe.is_freed(), "the version dies with the guard");
@@ -1475,7 +1479,12 @@ mod tests {
                 !lock(&VERSIONS).contains_key(&file),
                 "the registry has no entry of the dead version"
             );
-            assert_eq!(dead_files_since(dead).0, [file]);
+            // Versions of other tests can die meanwhile.
+            let (died, _) = dead_files_since(dead);
+            assert!(
+                died.contains(&file) && !died.contains(&shared.file()),
+                "{died:?}"
+            );
             let read = std::panic::catch_unwind(|| pinned_file_version(file).is_some());
             let message = read.expect_err("a read of a dead version panics");
             assert_eq!(
@@ -1505,8 +1514,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "file version 4194301 is released")]
     fn node_id_of_a_dead_file_version_panics() {
-        // Its version dies (`per_file_map_forgets_dead_file_versions`).
-        crate::test_lock::hold();
         const DYING: usize = (1 << 22) - 3;
         const OTHER: usize = DYING - 1;
         let version = FileVersion::new(DYING);

@@ -9044,8 +9044,8 @@ mod tests {
     // one (step 2 skeptic), so this test does, and reads the parents before
     // the publish (the store), after it (the block of a static file and the
     // node shell of a freeable file version), and after that version dies
-    // (its records stay leaked). Its version dies, so it holds the store
-    // build lock (`crate::test_lock::hold`).
+    // (its records stay leaked). Its version dies and gives its block to
+    // the pool, so it holds the store build lock (`crate::test_lock::hold`).
     #[test]
     fn foreign_parents_read_through_the_file_block() {
         crate::test_lock::hold();
