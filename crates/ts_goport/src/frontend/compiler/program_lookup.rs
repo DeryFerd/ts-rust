@@ -471,14 +471,34 @@ impl NewProgram {
 
     /// The value that Go `GetSymlinkCache` computes on first use, without
     /// storing it in the program.
-    // Go: program.go:2301 (the getValue callback)
+    // Go: program.go:2331 (the getValue callback)
+    pub fn build_symlink_cache(&self) -> KnownSymlinks {
+        let resolver = self
+            .processed_files
+            .resolver
+            .as_ref()
+            .expect("program has a resolver");
+        self.symlink_cache_seed().finish(|dep, package_json_name| {
+            resolver.resolve_package_directory(
+                dep,
+                package_json_name,
+                RESOLUTION_MODE_COMMON_JS,
+                None,
+            )
+        })
+    }
+
+    /// The part of `build_symlink_cache` that reads the program and makes
+    /// no file system call (`SymlinkCacheSeed`).
+    // Go: program.go:2331 (the getValue callback, up to the
+    // ResolvePackageDirectory calls)
     // PORT: the host's current directory, as the program's path keys
     // (`to_path`). Go N' KnownSymlinks has no directory (program.go:2333).
-    pub fn build_symlink_cache(&self) -> KnownSymlinks {
-        let mut known_symlinks = KnownSymlinks::new(
-            &self.host().get_current_directory(),
-            self.use_case_sensitive_file_names(),
-        );
+    pub fn symlink_cache_seed(&self) -> SymlinkCacheSeed {
+        let current_directory = self.host().get_current_directory();
+        let use_case_sensitive_file_names = self.use_case_sensitive_file_names();
+        let mut known_symlinks =
+            KnownSymlinks::new(&current_directory, use_case_sensitive_file_names);
 
         // Resolved modules store realpath information when they're resolved inside node_modules
         if !self.processed_files.resolved_modules.is_empty()
@@ -497,12 +517,8 @@ impl NewProgram {
         }
 
         // Check other dependencies for symlinks
-        let resolver = self
-            .processed_files
-            .resolver
-            .as_ref()
-            .expect("program has a resolver");
         let mut seen_package_jsons: FxHashSet<Path> = FxHashSet::default();
+        let mut packages = Vec::new();
         for (file_path, meta) in self.processed_files.source_file_meta_datas.iter() {
             if meta.package_json_directory.is_empty() {
                 continue;
@@ -519,43 +535,18 @@ impl NewProgram {
             let Some(contents) = info.as_ref().and_then(|info| info.get_contents()) else {
                 continue;
             };
-
-            for dep in contents.get_runtime_dependency_names() {
-                // Skip work in common case: we already saved a symlink for this package directory
-                // in the node_modules adjacent to this package.json
-                let possible_directory_path = self.to_path(&combine_paths(
-                    &meta.package_json_directory,
-                    &["node_modules", &dep],
-                ));
-                if known_symlinks.has_directory(&possible_directory_path) {
-                    continue;
-                }
-                if !dep.starts_with("@types") {
-                    let possible_types_directory_path = self.to_path(&combine_paths(
-                        &meta.package_json_directory,
-                        &["node_modules", &get_types_package_name(&dep)],
-                    ));
-                    if known_symlinks.has_directory(&possible_types_directory_path) {
-                        continue;
-                    }
-                }
-
-                if let Some(package_resolution) = resolver.resolve_package_directory(
-                    &dep,
-                    &package_json_name,
-                    RESOLUTION_MODE_COMMON_JS,
-                    None,
-                ) && package_resolution.is_resolved()
-                    && !package_resolution.original_path.is_empty()
-                {
-                    known_symlinks.process_resolution(
-                        &combine_paths(&package_resolution.original_path, &["package.json"]),
-                        &combine_paths(&package_resolution.resolved_file_name, &["package.json"]),
-                    );
-                }
-            }
+            packages.push(SymlinkCachePackage {
+                directory: meta.package_json_directory.clone(),
+                package_json_name,
+                dependencies: contents.get_runtime_dependency_names(),
+            });
         }
-        known_symlinks
+        SymlinkCacheSeed {
+            known_symlinks,
+            packages,
+            current_directory,
+            use_case_sensitive_file_names,
+        }
     }
 
     // Go: program.go:668 (*Program).ModuleResolutionError (ts#64299)
@@ -1130,5 +1121,76 @@ impl NewProgram {
         }
 
         all_files_belong_to_path
+    }
+}
+
+/// Go `GetSymlinkCache` (program.go:2330) up to its `ResolvePackageDirectory`
+/// calls, with no file system call (`NewProgram::symlink_cache_seed`):
+/// the symlinks of the resolutions, and the runtime dependencies of each
+/// package.json of an emitted file. `finish` resolves the dependencies,
+/// which makes the `realpath` calls.
+// PORT: Go builds the cache in one step on first use, on any goroutine. A
+// thread seeded from the loading thread has no frontend program to read, so
+// the loading thread makes the seed, and the thread that first uses the
+// cache finishes it (`go_frontend::known_symlinks`).
+pub struct SymlinkCacheSeed {
+    known_symlinks: KnownSymlinks,
+    packages: Vec<SymlinkCachePackage>,
+    current_directory: String,
+    use_case_sensitive_file_names: bool,
+}
+
+/// A package.json of an emitted file and its runtime dependencies
+/// (`SymlinkCacheSeed`).
+struct SymlinkCachePackage {
+    directory: String,
+    package_json_name: String,
+    dependencies: FxHashSet<String>,
+}
+
+impl SymlinkCacheSeed {
+    /// The cache: the seed's symlinks and those of the dependencies that
+    /// `resolve(dependency, package_json_name)` finds, as Go
+    /// `ResolvePackageDirectory` in CommonJS mode with no redirect.
+    // Go: program.go:2345 (the loop over the dependencies)
+    pub fn finish(self, resolve: impl Fn(&str, &str) -> Option<ResolvedModule>) -> KnownSymlinks {
+        let SymlinkCacheSeed {
+            mut known_symlinks,
+            packages,
+            current_directory,
+            use_case_sensitive_file_names,
+        } = self;
+        let to_path = |name: &str| to_path(name, &current_directory, use_case_sensitive_file_names);
+        for package in packages {
+            for dep in package.dependencies {
+                // Skip work in common case: we already saved a symlink for this package directory
+                // in the node_modules adjacent to this package.json
+                let possible_directory_path =
+                    to_path(&combine_paths(&package.directory, &["node_modules", &dep]));
+                if known_symlinks.has_directory(&possible_directory_path) {
+                    continue;
+                }
+                if !dep.starts_with("@types") {
+                    let possible_types_directory_path = to_path(&combine_paths(
+                        &package.directory,
+                        &["node_modules", &get_types_package_name(&dep)],
+                    ));
+                    if known_symlinks.has_directory(&possible_types_directory_path) {
+                        continue;
+                    }
+                }
+
+                if let Some(package_resolution) = resolve(&dep, &package.package_json_name)
+                    && package_resolution.is_resolved()
+                    && !package_resolution.original_path.is_empty()
+                {
+                    known_symlinks.process_resolution(
+                        &combine_paths(&package_resolution.original_path, &["package.json"]),
+                        &combine_paths(&package_resolution.resolved_file_name, &["package.json"]),
+                    );
+                }
+            }
+        }
+        known_symlinks
     }
 }
