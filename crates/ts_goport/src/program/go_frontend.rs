@@ -690,6 +690,11 @@ fn build_program(
             .map(|file| (file.store, file))
             .collect()
     }
+    // PERF (serialgap1): the checker split of a one-program process runs
+    // beside the build and the bind (`start_checker_associations`).
+    if matches!(entry, Entry::Only) {
+        super::ls_program::start_checker_associations(np);
+    }
     let parsed = match &replaced {
         Some(replaced) => new_files(replaced.iter().map(|r| r.file)),
         None => new_files(files.iter()),
@@ -701,33 +706,43 @@ fn build_program(
             "a program file that no publish has seen was not replaced"
         );
     }
-    let go_files = go_files_of_unpublished_stores(&parsed, &cwd, use_case_sensitive_file_names);
-
     let id = next_program_id();
-    FRONTENDS.with(|frontends| {
-        assert!(
-            frontends.borrow_mut().insert(id, Rc::clone(np)).is_none(),
-            "program {id} already loaded"
-        );
-    });
-    // The stores become read-only here, before the program is installed.
-    publish_file_stores(go_files);
-    // A program file must be published as a source file. A parse that an
-    // earlier publish did not know (see `note_parsed_source_file`) became a
-    // store with no root there, and its bind would fail far from the cause.
-    // The build of the old version checked the files that a new version
-    // shares with it.
-    let assert_published = |file: &Rc<ParsedSourceFile>| {
-        assert!(
-            crate::ast::go_file(file.store).root.is_some(),
-            "program file {} was published as a store that is not a source file",
-            file.file_name()
-        );
+    let publish = || {
+        let go_files = go_files_of_unpublished_stores(&parsed, &cwd, use_case_sensitive_file_names);
+        FRONTENDS.with(|frontends| {
+            assert!(
+                frontends.borrow_mut().insert(id, Rc::clone(np)).is_none(),
+                "program {id} already loaded"
+            );
+        });
+        // The stores become read-only here, before the program is installed.
+        publish_file_stores(go_files);
+        // A program file must be published as a source file. A parse that an
+        // earlier publish did not know (see `note_parsed_source_file`) became a
+        // store with no root there, and its bind would fail far from the cause.
+        // The build of the old version checked the files that a new version
+        // shares with it.
+        let assert_published = |file: &Rc<ParsedSourceFile>| {
+            assert!(
+                crate::ast::go_file(file.store).root.is_some(),
+                "program file {} was published as a store that is not a source file",
+                file.file_name()
+            );
+        };
+        match &replaced {
+            Some(replaced) if !check => replaced.iter().for_each(|r| assert_published(r.file)),
+            _ => files.iter().for_each(assert_published),
+        }
     };
-    match &replaced {
-        Some(replaced) if !check => replaced.iter().for_each(|r| assert_published(r.file)),
-        _ => files.iter().for_each(assert_published),
-    }
+    // PERF (serialgap1): a program that needs its full tables builds their
+    // per-file part on two threads while this thread makes and publishes
+    // the Go files (`TableParts::build`). Port only: Go has no tables.
+    let parts = if replaced.is_none() {
+        Some(TableParts::build(np, publish))
+    } else {
+        publish();
+        None
+    };
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
         id,
         options,
@@ -767,7 +782,8 @@ fn build_program(
             (tables, common_source_directory)
         }
         _ => {
-            let tables = full_tables(np, previous_shared);
+            let parts = parts.unwrap_or_else(|| TableParts::build(np, || ()));
+            let tables = full_tables_of(np, previous_shared, parts);
             let common_source_directory = intern_program_str(&common_source_directory_of(np));
             (tables, common_source_directory)
         }
@@ -916,36 +932,26 @@ fn replaced_files<'a>(
 /// frontend program and shared state of the version that `np` was updated
 /// from (`GoSharedState::new`).
 fn full_tables(np: &NewProgram, previous: Option<(&NewProgram, &GoSharedState)>) -> VersionTables {
-    let files = np.source_files();
-    let source_file_order: Vec<usize> = files.iter().map(|file| file.store).collect();
-    let mut slots = SlotsBuilder::new(&source_file_order);
-    // Every program file path is in `files_by_path` too.
-    let mut file_by_path = FxHashMap::with_capacity_and_hasher(
-        np.files_by_path().len().max(files.len()),
-        Default::default(),
-    );
-    for (slot, file) in files.iter().enumerate() {
-        file_by_path.insert(file.path().0.clone(), slot);
-    }
-    // Go: filesparser.go:480 `filesByPath[task.path] = packageIdFile`. A
-    // package dedup redirect path maps to the first file with the same
-    // package id, so `GetSourceFileByPath` finds that file.
-    // PERF: copies the path only when it adds an entry (`entry` needs an
-    // owned key even when the path is already there).
-    for (path, file) in np.files_by_path() {
-        if !file_by_path.contains_key(&path.0) {
-            file_by_path.insert(path.0.clone(), slots.slot_of(file.store));
-        }
-    }
-    let other_files = slots.other_files;
-    let file_meta = files
-        .iter()
-        .map(|file| file_program_meta(np, file))
-        .collect();
+    full_tables_of(np, previous, TableParts::build(np, || ()))
+}
+
+/// `full_tables` of `np` with its per-file part `parts`.
+fn full_tables_of(
+    np: &NewProgram,
+    previous: Option<(&NewProgram, &GoSharedState)>,
+    parts: TableParts,
+) -> VersionTables {
+    let TableParts {
+        source_file_order,
+        other_files,
+        file_by_path,
+        file_meta,
+    } = parts;
     let go = GoSharedState::new(np, previous, None, &file_by_path);
     VersionTables {
         go: Some(go),
-        file_versions: files
+        file_versions: np
+            .source_files()
             .iter()
             .filter_map(|file| file.version.get().cloned())
             .collect(),
@@ -955,6 +961,117 @@ fn full_tables(np: &NewProgram, previous: Option<(&NewProgram, &GoSharedState)>)
             Arc::new(file_by_path),
             Arc::new(file_meta),
         )
+    }
+}
+
+/// The per-file part of `full_tables`: the file ids in slot order, the
+/// files that are not program files, the slot of each path and the program
+/// fields of each file.
+struct TableParts {
+    source_file_order: Vec<usize>,
+    other_files: Vec<usize>,
+    file_by_path: FxHashMap<String, usize>,
+    file_meta: Vec<FileProgramMeta>,
+}
+
+impl TableParts {
+    /// The table parts of `np`, while this thread runs `beside`. Unless the
+    /// program is single-threaded, the slots of the paths and the program
+    /// fields are built on two threads of their own, from borrowed paths and
+    /// maps that the threads can read; `beside` must not change the program.
+    // PERF (serialgap1): in build_program `beside` makes and publishes the
+    // Go files (VS Code: the two parts took 6.9 ms of the 16 ms build).
+    fn build(np: &NewProgram, beside: impl FnOnce()) -> TableParts {
+        let files = np.source_files();
+        let source_file_order: Vec<usize> = files.iter().map(|file| file.store).collect();
+        let paths: Vec<&GoPath> = files.iter().map(|file| file.path()).collect();
+        let by_path_len = np.files_by_path().len();
+        // Go: filesparser.go:480 `filesByPath[task.path] = packageIdFile`. A
+        // package dedup redirect path maps to the first file with the same
+        // package id, so `GetSourceFileByPath` finds that file. Every
+        // program file path is in `files_by_path` too (`collect_files`
+        // adds each file at its path), so the map has other paths only when
+        // it has more entries than the program has files.
+        let redirects: Vec<(&str, usize)> = if by_path_len > files.len() {
+            np.files_by_path()
+                .iter()
+                .map(|(path, file)| (path.as_str(), file.store))
+                .collect()
+        } else {
+            if check_version_tables() {
+                assert!(
+                    paths
+                        .iter()
+                        .all(|path| np.files_by_path().contains_key(*path)),
+                    "a program file path is not in files_by_path"
+                );
+            }
+            Vec::new()
+        };
+        let metas: &FxHashMap<GoPath, SourceFileMetaData> =
+            &np.processed_files.source_file_meta_datas;
+        let libs: FxHashSet<&str> = np
+            .processed_files
+            .lib_files
+            .keys()
+            .map(|path| path.as_str())
+            .collect();
+        let slots = || {
+            let mut slots = SlotsBuilder::new(&source_file_order);
+            let mut file_by_path = FxHashMap::with_capacity_and_hasher(
+                by_path_len.max(paths.len()),
+                Default::default(),
+            );
+            for (slot, path) in paths.iter().enumerate() {
+                file_by_path.insert(path.0.clone(), slot);
+            }
+            // PERF: copies the path only when it adds an entry (`entry`
+            // needs an owned key even when the path is already there).
+            for &(path, store) in &redirects {
+                if !file_by_path.contains_key(path) {
+                    file_by_path.insert(path.to_string(), slots.slot_of(store));
+                }
+            }
+            (file_by_path, slots.other_files)
+        };
+        // Go `SourceFile.Metadata` and `IsDefaultLibrary` of each file
+        // (`file_program_meta`).
+        let meta = || -> Vec<FileProgramMeta> {
+            paths
+                .iter()
+                .map(|path| FileProgramMeta {
+                    meta_data: metas.get(*path).cloned().unwrap_or_default(),
+                    is_default_library: libs.contains(path.as_str()),
+                })
+                .collect()
+        };
+        let ((file_by_path, other_files), file_meta) =
+            if np.single_threaded() || cfg!(target_family = "wasm") {
+                beside();
+                (slots(), meta())
+            } else {
+                std::thread::scope(|scope| {
+                    let slots = std::thread::Builder::new()
+                        .name("goport-tables".to_string())
+                        .spawn_scoped(scope, slots)
+                        .expect("cannot start a table thread");
+                    let meta = std::thread::Builder::new()
+                        .name("goport-tables".to_string())
+                        .spawn_scoped(scope, meta)
+                        .expect("cannot start a table thread");
+                    beside();
+                    fn join<T>(result: std::thread::Result<T>) -> T {
+                        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    }
+                    (join(slots.join()), join(meta.join()))
+                })
+            };
+        TableParts {
+            source_file_order,
+            other_files,
+            file_by_path,
+            file_meta,
+        }
     }
 }
 
