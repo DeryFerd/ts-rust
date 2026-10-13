@@ -112,6 +112,8 @@ retry() {
   errf=$(mktemp)
   while :; do
     rc=0
+    # A try that prints no error must not reuse the error lines of the try before it.
+    : > "$errf"
     # stdout goes straight through on fd 3. awk copies stderr to errf up to the start marker, and to our stderr
     # without the marker.
     { "$@" 2>&1 1>&3 3>&- 4>&- |
@@ -302,7 +304,7 @@ case "$cmd" in
     rc=0
     job "$run" exec "$@" || rc=$?
     # Quiet: a caller can judge the last output line (for example DONE).
-    ssh_route > /dev/null 2>&1
+    ssh_route > /dev/null 2>&1 4>/dev/null
     $ssh "runner@$host" rm -rf "$remote_root/$run.log" "$remote_root/$run.rc" < /dev/null > /dev/null 2>&1 || true
     exit "$rc"
     ;;
