@@ -4095,9 +4095,9 @@ const STAT_MAP_WAIT: std::time::Duration = std::time::Duration::from_micros(20);
 /// miss marks its path as loading (`StatSlot::Loading`): a thread that asks
 /// for that path meanwhile waits for the answer (`STAT_MAP_WAIT`, spinning:
 /// a lock wait costs more than the call) and makes no call of its own.
-// PORT: Go `cachedvfs` loads outside the map (cachedvfs.go:48), so two
-// goroutines can both call the file system for one path. The answer is
-// the same.
+// PORT: Go `cachedvfs` loads outside the map (cachedvfs.go:56, in
+// `DirectoryExists` at :49), so two goroutines can both call the file
+// system for one path. The answer is the same.
 struct StatMap<V> {
     shards: Box<[Mutex<FxHashMap<String, StatSlot<V>>>]>,
 }
@@ -4268,7 +4268,7 @@ impl StatCache {
 /// program loads.
 ///
 /// PORT: Go parse tasks share the host's cachedvfs, which lasts for the
-/// whole build, and a write does not update it (cachedvfs.go:144). So each
+/// whole build, and a write does not update it (cachedvfs.go:145). So each
 /// lookup that a program makes before the build writes that path stays
 /// for the later programs. The parse workers here also resolve guesses:
 /// imports with a guessed resolution mode, files that the loader may not
