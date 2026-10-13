@@ -1862,6 +1862,10 @@ fn bind_thread_count(files: usize) -> usize {
     if cfg!(target_family = "wasm") {
         return 1;
     }
+    #[cfg(test)]
+    if let Some(count) = TEST_BIND_THREADS.get() {
+        return count;
+    }
     if let Some(count) = std::env::var("GOPORT_BIND_THREADS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -1870,6 +1874,16 @@ fn bind_thread_count(files: usize) -> usize {
     }
     let large = LARGE_LOAD.get() || files >= WIDE_BIND_FILES && wide_cores();
     ThreadBudget::current().bind_threads(large)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// While set, the bind thread count of the binds on this thread
+    /// (`bind_thread_count`), in place of `GOPORT_BIND_THREADS` and the
+    /// thread budget. A test sets it to compare a parallel bind with a
+    /// serial one on any machine.
+    static TEST_BIND_THREADS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// From this many files to bind on, a load binds as a large load on
@@ -6063,6 +6077,8 @@ mod tests {
             }
             result
         }
+        // The parsed files stay unpublished: the test reads them to its end.
+        let _stores = build_stores();
         let parse = |name: &str| {
             let opts = SourceFileParseOptions {
                 file_name: name.to_string(),
@@ -6223,6 +6239,18 @@ mod tests {
         }
     }
 
+    /// Held by each test of this module while it builds node stores: a
+    /// program load, or a parse outside a program. A thread builds its
+    /// stores at the file ids after the published ones, so a load that
+    /// another thread publishes meanwhile takes those ids. The build then
+    /// reads the published files in place of its own, and its own publish
+    /// fails ("another thread published file ids"). With the lock, the
+    /// tests pass on parallel test threads (followups63).
+    fn build_stores() -> std::sync::MutexGuard<'static, ()> {
+        static BUILD_STORES: Mutex<()> = Mutex::new(());
+        BUILD_STORES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// A program version of one empty file, for a test that needs a current
     /// program and reads none of it.
     fn small_program(name: &str) -> &'static GoProgram {
@@ -6235,8 +6263,11 @@ mod tests {
         )
         .unwrap();
         let config = dir.join("tsconfig.json");
-        let program = try_load_version(&config.to_string_lossy(), |_| {})
-            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let program = {
+            let _stores = build_stores();
+            try_load_version(&config.to_string_lossy(), |_| {})
+                .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()))
+        };
         let _ = std::fs::remove_dir_all(&dir);
         program
     }
@@ -6387,6 +6418,94 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(60))
             .expect("the bind chain does not end");
         assert_eq!(result, (true, 0, 1));
+    }
+
+    // followups63 (R214 reviewer item 2): a real bind that fails on a bind
+    // thread. The binder names a pattern ambient module with import
+    // attributes after the node id of the attributes (Go binder.go:311
+    // getDeclarationName, `ast.GetNodeId`). A bind thread would give that
+    // id in its own copy of the loading thread's state, where it is lost
+    // (`bind_thread_fingerprint`), so the bind of the file fails there. That
+    // file and the files after it then bind serially (`bind_all`), and the
+    // result is that of a serial bind.
+    #[test]
+    fn a_bind_that_gives_a_node_id_on_a_bind_thread_matches_the_serial_bind() {
+        let dir = std::env::temp_dir().join(format!("goport-bind-node-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Two files give node ids. A bind thread that kept its ids would give
+        // a name or a next id that the serial bind does not give.
+        let files = [
+            ("a.d.ts", "declare const a: number;\n"),
+            (
+                "b.d.ts",
+                "declare module \"*.b\" with { type: \"b\" } {\n    export const b: number;\n}\n",
+            ),
+            ("c.d.ts", "declare const c: number;\n"),
+            (
+                "d.d.ts",
+                "declare module \"*.d\" with { type: \"d\" } {\n    export const d: number;\n}\n",
+            ),
+            ("e.d.ts", "declare const e: number;\n"),
+        ];
+        for (name, text) in files {
+            std::fs::write(dir.join(name), text).unwrap();
+        }
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "noLib": true, "types": [] },
+                 "files": ["a.d.ts", "b.d.ts", "c.d.ts", "d.d.ts", "e.d.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        // Loads and binds the program on `threads` bind threads. Returns the
+        // locals of each file (names, and symbol ids from the first symbol
+        // of the program: the lineage holds the symbols of earlier loads)
+        // and the fingerprint of the loading thread after the bind. Each
+        // load is on a new thread, so each starts from the same ids.
+        let bind = |threads: usize| {
+            let config = config.clone();
+            std::thread::spawn(move || {
+                TEST_BIND_THREADS.set(Some(threads));
+                let program = {
+                    let _stores = build_stores();
+                    try_load_version(&config.to_string_lossy(), |_| {})
+                        .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()))
+                };
+                let _program = crate::core::enter_program(Some(program));
+                bind_all();
+                let symbols = bound_symbols();
+                let locals: Vec<Vec<(String, u32)>> = program
+                    .source_files()
+                    .map(|file| {
+                        symbols
+                            .iter(file.root.locals())
+                            .map(|(name, symbol)| (name.to_string(), symbol.0))
+                            .collect()
+                    })
+                    .collect();
+                let first = locals.iter().flatten().map(|&(_, id)| id).min().unwrap();
+                let locals: Vec<Vec<(String, u32)>> = locals
+                    .into_iter()
+                    .map(|file| file.into_iter().map(|(n, id)| (n, id - first)).collect())
+                    .collect();
+                (locals, bind_thread_fingerprint())
+            })
+            .join()
+            .unwrap()
+        };
+        let serial = bind(1);
+        let parallel = bind(4);
+        let _ = std::fs::remove_dir_all(&dir);
+        let patterns = serial.0.iter().flatten();
+        assert_eq!(
+            patterns
+                .filter(|(name, _)| name.contains("pattern@"))
+                .count(),
+            2,
+            "the pattern modules are named after node ids: {:?}",
+            serial.0
+        );
+        assert_eq!(parallel, serial);
     }
 
     #[test]
