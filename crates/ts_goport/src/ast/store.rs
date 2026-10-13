@@ -5695,26 +5695,42 @@ impl NodeRef {
 
     /// Go `node.Parent` (`Node::parent`). A parent in the same store keeps
     /// the block; a parent in another store makes its own lookup.
-    #[inline]
+    // PERF: parentname1. The same-store step (and the nil parent at the
+    // root) is always inlined, as Go loads `node.Parent`. A node with no
+    // block and a parent in another store take the cold `parent_far`. In
+    // the PGO build `parent` was out of line, with about 20 instructions of
+    // call overhead per step (checkline1).
+    #[inline(always)]
     #[must_use]
     pub fn parent(self) -> NodeRef {
+        if let Some(b) = self.block {
+            let r = &b.records[slot_index(self.node)];
+            debug_assert!(r.is_node(), "store handle does not name a node slot");
+            let code = r.parent_code();
+            if code & FOREIGN_PARENT == 0 {
+                return NodeRef {
+                    node: local_parent_of_code(code, self.node.file_index()),
+                    block: if code == 0 { None } else { Some(b) },
+                };
+            }
+        }
+        self.parent_far()
+    }
+
+    /// `parent` of a node with no block (nil, synthetic, unpublished) or
+    /// whose parent is in another store (`FOREIGN_PARENT`).
+    #[cold]
+    #[inline(never)]
+    fn parent_far(self) -> NodeRef {
         let Some(b) = self.block else {
-            return NodeRef::new(node_ref_parent(self.node));
+            return NodeRef::new(self.node.parent());
         };
-        let r = &b.records[slot_index(self.node)];
-        debug_assert!(r.is_node(), "store handle does not name a node slot");
-        let code = r.parent_code();
-        let file = self.node.file_index();
-        if code & FOREIGN_PARENT != 0 {
-            return NodeRef::new(frozen_foreign_parent(
-                file,
-                (code & !FOREIGN_PARENT) as usize,
-            ));
-        }
-        NodeRef {
-            node: local_parent_of_code(code, file),
-            block: if code == 0 { None } else { Some(b) },
-        }
+        let code = b.records[slot_index(self.node)].parent_code();
+        debug_assert_ne!(code & FOREIGN_PARENT, 0);
+        NodeRef::new(frozen_foreign_parent(
+            self.node.file_index(),
+            (code & !FOREIGN_PARENT) as usize,
+        ))
     }
 
     /// Go `node.Flags` (`Node::flags`), with the owner check of the binder
@@ -5880,12 +5896,6 @@ impl NodeRef {
 #[inline(never)]
 fn node_ref_kind(n: Node) -> SyntaxKind {
     n.kind()
-}
-
-#[cold]
-#[inline(never)]
-fn node_ref_parent(n: Node) -> Node {
-    n.parent()
 }
 
 #[cold]
