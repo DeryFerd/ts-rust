@@ -3,9 +3,9 @@
 //! - the `crates/ts_goport/libs/lib.*.d.ts` files (not with `noembed`) as one
 //!   LZMA stream to `OUT_DIR/libs.lzma`, and their paths and sizes in stream
 //!   order to `OUT_DIR/libs.rs`. `src/frontend/bundled/embed.rs` unpacks the
-//!   stream up to the last lib that a run reads. One stream is 0.31 MB, where
-//!   one stream per lib was 0.48 MB: lib.webworker.d.ts repeats much of
-//!   lib.dom.d.ts.
+//!   whole stream once, at the first lib that a run reads. One stream is
+//!   0.31 MB, where one stream per lib was 0.48 MB: lib.webworker.d.ts
+//!   repeats much of lib.dom.d.ts.
 //! - the texts of `src/diagnostics/catalog.rs`, in catalog order and ended
 //!   by NUL, as one LZMA stream to `OUT_DIR/diagnostic_texts.lzma`.
 //!   `src/diagnostics/mod.rs` unpacks it on the first text read: 44 KB, not
@@ -32,9 +32,9 @@ fn main() {
     pack_libs();
 }
 
-/// Packs the libs into one stream. The webworker libs come last, so a run
-/// that reads none of them (most do not) unpacks 3.0 of the 3.79 MB. Most
-/// programs read lib.dom.d.ts and nearly all the other libs.
+/// Packs the libs into one stream, the webworker libs last. embed.rs
+/// unpacks all of it (3.79 MB) at the first lib that a run reads, so the
+/// order does not change what a run unpacks.
 fn pack_libs() {
     let libs = PathBuf::from(env("CARGO_MANIFEST_DIR")).join("../../libs");
     println!("cargo:rerun-if-changed={}", libs.display());
