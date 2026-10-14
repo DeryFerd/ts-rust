@@ -33,6 +33,7 @@ pub fn program_to_snapshot(
     snapshot.hash_with_text = hash_with_text;
     snapshot.check_pending = options().no_check.is_true();
     let mut to = ToProgramSnapshot {
+        program,
         old_program,
         snapshot,
         global_file_removed: false,
@@ -50,8 +51,10 @@ pub fn program_to_snapshot(
 }
 
 // Go: incremental/programtosnapshot.go:42 toProgramSnapshot
-// PORT: Go `program` is the current program and is not a field.
+// PORT: Go `program` is the current program. The port reads it through the
+// `program.rs` free functions, except its own flags (`single_threaded`).
 struct ToProgramSnapshot<'a> {
+    program: &'static GoProgram,
     old_program: Option<&'a Program>,
     snapshot: Snapshot,
     global_file_removed: bool,
@@ -134,7 +137,11 @@ impl ToProgramSnapshot<'_> {
         // Here another thread hashes the texts while the files bind and the
         // checkers start (`start_text_hashes`), and the loop takes each hash
         // in file order. The hash values do not depend on the thread.
-        let versions = start_text_hashes(&files, self.snapshot.hash_with_text);
+        let versions = start_text_hashes(
+            &files,
+            self.snapshot.hash_with_text,
+            self.program.single_threaded(),
+        );
         // PORT: perf. Go runs this loop in a WorkGroup. `getReferencedFiles`
         // runs on the file's checker thread (`start_referenced_files_job`),
         // so the jobs of every file are sent first and run in parallel; the
@@ -433,12 +440,19 @@ fn same_references(a: Option<&FxIndexSet<Path>>, b: Option<&FxIndexSet<Path>>) -
 
 /// Starts the Go `t.snapshot.computeHash(versionText)` of each file in
 /// `files`. The receiver gives the hashes in file order as they are ready.
+/// `single_threaded` is the program's own flag (Go
+/// `core.NewWorkGroup(t.program.SingleThreaded())`,
+/// programtosnapshot.go:91).
 // PORT: perf. The hashes run on one new thread, so that they overlap the
 // bind and the checker start in `compute_program_file_changes` (the texts
 // are `'static`, or owned for a content-mapped file). With `--singleThreaded` they run here, before the bind.
 // One thread is enough: it reads each text once (about 16 MB for Effect),
 // which takes much less time than the bind.
-fn start_text_hashes(files: &[Node], hash_with_text: bool) -> std::sync::mpsc::Receiver<String> {
+fn start_text_hashes(
+    files: &[Node],
+    hash_with_text: bool,
+    single_threaded: bool,
+) -> std::sync::mpsc::Receiver<String> {
     let texts: Vec<std::borrow::Cow<'static, str>> = files
         .iter()
         .map(|&file| {
@@ -472,7 +486,7 @@ fn start_text_hashes(files: &[Node], hash_with_text: bool) -> std::sync::mpsc::R
         }
     };
     // wasm has one thread.
-    if single_threaded() || cfg!(target_family = "wasm") {
+    if single_threaded || cfg!(target_family = "wasm") {
         hash_texts();
     } else {
         crate::core::GoThread::new()
