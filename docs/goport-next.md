@@ -4,6 +4,18 @@ Root keeps this queue. In goal mode, when a workflow ends, root starts the top i
 
 Each item: one line of goal, the files or worktree it owns, and what it waits for.
 
+## Handoff (2026-10-14)
+
+This work stopped on Theo's request (state note `theo-winddown-2026-10-14`). Another team takes over. The items below this section are older and partly stale; the state notes are the record.
+
+- **Last accepted revision: R220** (batch 101, `main` 21f48ab67 and later docs commits). Pin N prime fed0bf24149f (`typescript@7.1.0-dev.20261008.1`). Tests 184,773 retained, gate 0 regressions, LSP and API 0 lost, np-suite 954 of 954.
+- **Not landed:**
+  - `goport-followups68` 84e0c707c: panic-in-bind reset test, `remove_node_flags` against Go binder.go:1555 and :1600, the `npm/wasm` `node --test` worker fix. The lane is done but has no skeptic review.
+  - Dropped below the bar because they cost st Bind time in integration timing: nodeinline1 (`goport-nodeinline1`) and propaccess2 (`goport-propaccess2`).
+- **Next pin move (bump E):** survey in `target/continuation-r97-goport/upstream/bumpE/survey.md` (state note `bumpE-survey-2026-10-14`). About 85 port functions and 2.3k to 2.8k Rust lines; target the newest nightly gitHead; no Go test renames.
+- **Open reviewer items:** see the `reviewerItems` of R219 and R220 in `docs/typechecker-batches/` (Go cite fixes, the ci.yml push paths for the wasm job, `release_checker` tests, TypeORM default bind recheck).
+- **Waiting for Theo or the new owner:** honorec1 (Hono record fields), gatecounts1, the TS5033 panic upstream report, PR #81 (TypeScript 6 API package), a one-hash sharded map (needs a `hashbrown` dependency), an unsafe flat arena (flatarena1 round 4).
+
 ## Ready
 
 - **Now (2026-10-12, evening UTC):** R203 (int70) and R204 (int71) accepted; main 4712dcc25. Running: int72 (followups52, flowcost1, identparse1, printfast1 on int71) -> R205; after-r204 (extrabatR204, followups54); edleak2 (round 2: cheap shell kind read); slowproj1 (TypeORM and VS Code default against Go). Next integration int73: followups53 dc5105e58, followups54, edleak2 if it passes. Next perf candidates: the slowproj1 ranking; the relater path under flow narrowing on TypeORM (flowcost1 finding); the intern miss path in core.rs (identparse1 finding). Waits for Theo: Hono record fix (honorec1), gatecounts1. Later: UPSTREAM.json current switch (quiet window), dbook-lan wall A/A, b4-hono #45 flaky_oracle mark, tsrs measurement.
