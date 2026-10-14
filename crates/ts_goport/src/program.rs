@@ -1793,7 +1793,7 @@ pub fn bind_all() {
     let program = prog();
     held_tables(program).bound_symbols.get_or_init(|| {
         with_lineage(|lineage| {
-            if single_threaded() {
+            if program.single_threaded() {
                 bind_files_last_queued_first(lineage);
             } else {
                 bind_files_parallel(lineage);
@@ -3794,7 +3794,7 @@ fn checker_count() -> usize {
     let program = prog();
     let files = program.source_file_order().len();
     let mut checker_count: i64 = 4;
-    if single_threaded() {
+    if program.single_threaded() {
         checker_count = 1;
     } else if let Some(count) = program.options.checkers {
         checker_count = i64::from(count);
