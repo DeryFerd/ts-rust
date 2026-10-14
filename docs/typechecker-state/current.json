@@ -1117,28 +1117,28 @@
         "test": "ast::file_version::tests::a_dropped_kept_parse_dies_before_its_data_goes_to_the_free_thread",
         "change": "the DEAD_FILES assert checks only the test s own versions (DEAD_FILES is global, so other tests on parallel threads add entries); followups65 54b826f22/9b3b9c73d",
         "goEvidence": "port-only test (no Go counterpart)",
-        "review": "pending: independent reviewer of batch 100 (R219)"
+        "review": "independent reviewer ac2091926c7bb9d70 accepted it in the R219 verdict (target/continuation-r219-reviewer-verdict.txt) as a test body change, not an expectation change"
       },
       {
         "suite": "goport_core_lib",
         "test": "ast::file_version::tests::a_pin_release_keeps_a_version_that_a_guard_shares",
         "change": "the DEAD_FILES assert checks only the test s own versions (one died, the shared one did not); followups65",
         "goEvidence": "port-only test (no Go counterpart)",
-        "review": "pending: independent reviewer of batch 100 (R219)"
+        "review": "independent reviewer ac2091926c7bb9d70 accepted it in the R219 verdict (target/continuation-r219-reviewer-verdict.txt) as a test body change, not an expectation change"
       },
       {
         "suite": "goport_core_lib",
         "test": "program::tests::a_bind_that_gives_a_node_id_on_a_bind_thread_matches_the_serial_bind",
         "change": "stricter: asserts the serial fallback ran (TEST_SERIAL_BINDS, followups65 f263f79d6) and that no local symbol id is in an odd chunk (!is_own_index, root f19a72c3d, R218 reviewer item 1)",
         "goEvidence": "port-only test; Go binder.go:310-313",
-        "review": "pending: independent reviewer of batch 100 (R219)"
+        "review": "independent reviewer ac2091926c7bb9d70 accepted it in the R219 verdict (target/continuation-r219-reviewer-verdict.txt) as a test body change, not an expectation change"
       },
       {
         "suite": "goport_core_lib",
-        "test": "lock-only and comment-only body changes (no assert changed): 5 ast/store.rs tests (new_file_ids_stop_at_the_cap, foreign_parents_read_through_the_file_block, pooled_node_blocks_wait_two_releases_and_check_their_owner, node_shells_share_any_equal_kind_column, later_new_kinds_go_in_the_pooled_block_past_the_budget) take test_lock::hold(); 1 ast/file_version.rs test (a_pin_release_at_the_thread_end_frees_in_place) takes the lock and moves its setup into the spawned thread; 1 program.rs test swaps build_stores() for the crate lock; 1 checker_p13.rs test changes a comment only",
+        "test": "lock-only and comment-only body changes (no assert changed): 5 ast/store.rs tests (new_file_ids_stop_at_the_cap, foreign_parents_read_through_the_file_block, pooled_node_blocks_wait_two_releases_and_check_their_owner, node_shells_share_any_equal_kind_column, later_new_kinds_go_in_the_pooled_block_past_the_budget) take test_lock::hold(); 1 ast/file_version.rs test (a_pin_release_at_the_thread_end_frees_in_place) takes the lock and moves its setup into the spawned thread; 1 program.rs test swaps build_stores() for the crate lock; 1 checker_p13.rs test changes a comment only; also lock-only test helpers publish_pinned (takes hold()) and small_program (drops build_stores()), and comment-only changes above a_bind_flag_outside_binder_added_flags_panics_in_every_build, binary_view_reads_what_the_accessors_read, background_pin_release_frees_on_the_free_thread and a_pin_release_takes_a_dying_version_out_of_the_registry",
         "change": "followups65 crate-wide test lock (found by the batch 100 auditor; R216 left the same kind of lock-only change unlisted)",
         "goEvidence": "port-only tests",
-        "review": "pending: independent reviewer of batch 100 (R219)"
+        "review": "independent reviewer ac2091926c7bb9d70 accepted it in the R219 verdict (target/continuation-r219-reviewer-verdict.txt) as a test body change, not an expectation change"
       }
     ]
   },
