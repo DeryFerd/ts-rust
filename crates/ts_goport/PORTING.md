@@ -387,14 +387,21 @@ methods reach the AST through it.
   (`static_ast_node`, `frozen_store_ast_node`) give `NodeData<'static>`.
   The words are atomics that the reads load
   with `Relaxed`. The parse writes them through `get_mut`; after the
-  publish only `BoundFile::install` writes a record (`bind_store_records`:
-  symbol, added flags, `bind`), through a shared ref, before any other
-  thread reads its binder fields. It ORs its bits into `flags`, which
-  `NodeRecord::header` reads, and writes the high half of `up`, whose low
-  half `header` reads; `header` reads each word once, so it never mixes
-  the halves of one word. A live bind hands its builder
-  (`NodeBindBuilder`) to the install; a lib bind snapshot load hands the
-  compact form (`NodeBindParts`), which the lib bind blob keeps.
+  publish only the bind writes a record (symbol, added flags, `bind`),
+  through a shared ref, before any other thread reads its binder fields.
+  It ORs its bits into `flags`, which `NodeRecord::header` reads, and
+  writes the high half of `up`, whose low half `header` reads; `header`
+  reads each word once, so it never mixes the halves of one word. A live
+  bind writes the records while it binds, as Go writes the node
+  (`binder::NodeBindRecords`, `ast::BindRecords`, bindonce2), and keeps the
+  other fields in extras entries that the install moves into the
+  `GoFile`. A bind into a file arena writes its arena's symbol ids, and
+  `BoundFile::remap` moves the records that got a symbol. A bind that is
+  not installed (a panic, or a parallel bind that is dropped) sets the
+  records back on drop (`BindRecords::reset`), so a serial bind of the
+  file finds them as the parse left them. A lib bind snapshot load hands
+  the compact form (`NodeBindParts`), which the lib bind blob keeps, and
+  its install writes the records (`bind_store_records`).
   The kind is a plain `SyntaxKind` column, not a record word (step 4): a
   pooled block takes another file's records through a shared ref, so a
   record word must be an atomic, and safe Rust has no cheap `u16` to
@@ -434,7 +441,8 @@ methods reach the AST through it.
   (`check_block_owner`) in the binder field reads (`frozen_owned_record`:
   the symbol, the flags, the `bind` word with the flow node and the
   extras index, `frozen_store_bind_and_file`, `frozen_store_any_symbol`)
-  and in `bind_store_records`, the one writer of a published record.
+  and in the bind (`bind_records`, `bind_store_records`), the one writer
+  of a published record.
   The check is one load of the nil slot record, a compare and a branch:
   `goport -p` 0.0% to +0.2% instructions, the editor long sessions +0.06%
   to +0.15% (ownercheck1, R147 reviewer option 2; the flags read is about
