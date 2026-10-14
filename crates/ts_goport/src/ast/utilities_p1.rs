@@ -1992,9 +1992,8 @@ mod binary_view_tests {
     /// binderview1: a `BinaryView` holds what the field accessors read:
     /// before the publish (the accessor path), after it in an alias-free
     /// store (`FrozenIds::Direct`) and in a store with an alias slot (a
-    /// synthetic right operand, `FrozenIds::Records`), and with no ids. It
-    /// publishes, so no other test may build or publish stores while it runs
-    /// (the runner uses one thread).
+    /// synthetic right operand, `FrozenIds::Records`), and with no ids. Its
+    /// build takes the store build lock (`crate::test_lock`).
     #[test]
     fn binary_view_reads_what_the_accessors_read() {
         let plain = new_file_store("/binaryview/a.ts", "x = y;");

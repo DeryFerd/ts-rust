@@ -1801,6 +1801,8 @@ pub fn bind_all() {
             for file in program.source_files() {
                 // Go: program.go:601 traces the files that are not bound yet.
                 let _trace = if file.file_bind.get().is_none() {
+                    #[cfg(test)]
+                    TEST_SERIAL_BINDS.with(|files| files.borrow_mut().push(file.root));
                     trace_bind_source_file(file.root)
                 } else {
                     None
@@ -1908,6 +1910,11 @@ thread_local! {
     /// serial one on any machine.
     static TEST_BIND_THREADS: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    /// The files that `bind_all` bound serially on this thread, in order:
+    /// every file of a serial bind, and after a parallel bind the files
+    /// from the first one that it did not bind (`bind_files_parallel`).
+    static TEST_SERIAL_BINDS: std::cell::RefCell<Vec<Node>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// From this many files to bind on, a load binds as a large load on
@@ -6167,8 +6174,8 @@ mod tests {
             }
             result
         }
-        // The parsed files stay unpublished: the test reads them to its end.
-        let _stores = build_stores();
+        // The parsed files stay unpublished: the test reads them to its end
+        // (this thread holds the store build lock, `crate::test_lock`).
         let parse = |name: &str| {
             let opts = SourceFileParseOptions {
                 file_name: name.to_string(),
@@ -6329,18 +6336,6 @@ mod tests {
         }
     }
 
-    /// Held by each test of this module while it builds node stores: a
-    /// program load, or a parse outside a program. A thread builds its
-    /// stores at the file ids after the published ones, so a load that
-    /// another thread publishes meanwhile takes those ids. The build then
-    /// reads the published files in place of its own, and its own publish
-    /// fails ("another thread published file ids"). With the lock, the
-    /// tests pass on parallel test threads (followups63).
-    fn build_stores() -> std::sync::MutexGuard<'static, ()> {
-        static BUILD_STORES: Mutex<()> = Mutex::new(());
-        BUILD_STORES.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// A program version of one empty file, for a test that needs a current
     /// program and reads none of it.
     fn small_program(name: &str) -> &'static GoProgram {
@@ -6353,11 +6348,8 @@ mod tests {
         )
         .unwrap();
         let config = dir.join("tsconfig.json");
-        let program = {
-            let _stores = build_stores();
-            try_load_version(&config.to_string_lossy(), |_| {})
-                .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()))
-        };
+        let program = try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
         let _ = std::fs::remove_dir_all(&dir);
         program
     }
@@ -6549,18 +6541,16 @@ mod tests {
         let config = dir.join("tsconfig.json");
         // Loads and binds the program on `threads` bind threads. Returns the
         // locals of each file (names, and symbol places from the first symbol
-        // of the program) and the fingerprint of the loading thread after
-        // the bind. Each load is on a new thread, so each starts from the
-        // same thread state (node ids).
+        // of the program), the fingerprint of the loading thread after the
+        // bind and the indexes of the files that `bind_all` bound serially.
+        // Each load is on a new thread, so each starts from the same thread
+        // state (node ids).
         let bind = |threads: usize| {
             let config = config.clone();
             std::thread::spawn(move || {
                 TEST_BIND_THREADS.set(Some(threads));
-                let program = {
-                    let _stores = build_stores();
-                    try_load_version(&config.to_string_lossy(), |_| {})
-                        .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()))
-                };
+                let program = try_load_version(&config.to_string_lossy(), |_| {})
+                    .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
                 let _program = crate::core::enter_program(Some(program));
                 bind_all();
                 let symbols = bound_symbols();
@@ -6589,7 +6579,17 @@ mod tests {
                     .into_iter()
                     .map(|file| file.into_iter().map(|(n, id)| (n, place(id))).collect())
                     .collect();
-                (locals, bind_thread_fingerprint())
+                let serial_binds: Vec<usize> = TEST_SERIAL_BINDS
+                    .take()
+                    .into_iter()
+                    .map(|root| {
+                        program
+                            .source_files()
+                            .position(|file| file.root == root)
+                            .unwrap()
+                    })
+                    .collect();
+                (locals, bind_thread_fingerprint(), serial_binds)
             })
             .join()
             .unwrap()
@@ -6606,7 +6606,16 @@ mod tests {
             "the pattern modules are named after node ids: {:?}",
             serial.0
         );
-        assert_eq!(parallel, serial);
+        assert_eq!((&parallel.0, parallel.1), (&serial.0, serial.1));
+        assert_eq!(serial.2, [0, 1, 2, 3, 4], "a serial bind binds every file");
+        // The bind threads bind a.d.ts, and the bind of b.d.ts (the first
+        // pattern module) fails there. bind_all then binds b.d.ts and the
+        // files after it serially: d.d.ts, the other pattern module, too.
+        assert_eq!(
+            parallel.2,
+            [1, 2, 3, 4],
+            "the serial fallback binds both pattern modules"
+        );
     }
 
     #[test]

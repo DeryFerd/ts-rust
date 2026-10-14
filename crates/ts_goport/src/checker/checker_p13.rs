@@ -2015,8 +2015,8 @@ module.exports.k = k;
     // the store when some parent of the store is. Stores `a` and `c` each
     // hold `x;` in a module block; in `a` the parent of that block is a
     // node of store `b`. Both walks end at the block, but only the answer
-    // from `c` is kept. It publishes, so no other test may build or publish
-    // stores while it runs (the runner uses one thread).
+    // from `c` is kept. Its builds take the store build lock
+    // (`crate::test_lock`).
     #[test]
     fn control_flow_container_memo_keeps_only_stores_with_local_parents() {
         let a = new_file_store("/cfcache_local/a.ts", "x;");
