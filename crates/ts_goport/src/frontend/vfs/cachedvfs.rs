@@ -4,7 +4,7 @@ use crate::frontend::prelude::*;
 use std::cell::Cell;
 use std::time::SystemTime;
 
-// Go: cachedvfs.go:11 FS
+// Go: cachedvfs.go:12 FS
 // PORT: the Go type `cachedvfs.FS` is `CachedFs`. `atomic.Bool` and
 // `collections.SyncMap` become `Cell` and `RefCell<FxHashMap>` (the port is
 // single-threaded). The stat cache stores Go nil results as `None`.
@@ -19,7 +19,7 @@ pub struct CachedFs {
     stat_cache: RefCell<FxHashMap<String, Option<FileInfo>>>,
 }
 
-// Go: cachedvfs.go:24 From
+// Go: cachedvfs.go:25 From
 // PORT: the Go package function `cachedvfs.From` is `cachedvfs_from`.
 pub fn cachedvfs_from(fs: Rc<dyn Fs>) -> Rc<CachedFs> {
     let fsys = CachedFs {
@@ -42,7 +42,7 @@ fn cache_load<V: Clone>(cache: &RefCell<FxHashMap<String, V>>, key: &str) -> Opt
 }
 
 impl CachedFs {
-    // Go: cachedvfs.go:30 DisableAndClearCache
+    // Go: cachedvfs.go:31 DisableAndClearCache
     pub fn disable_and_clear_cache(&self) {
         if self.enabled.get() {
             self.enabled.set(false);
@@ -50,12 +50,12 @@ impl CachedFs {
         }
     }
 
-    // Go: cachedvfs.go:36 Enable
+    // Go: cachedvfs.go:37 Enable
     pub fn enable(&self) {
         self.enabled.set(true);
     }
 
-    // Go: cachedvfs.go:40 ClearCache
+    // Go: cachedvfs.go:41 ClearCache
     pub fn clear_cache(&self) {
         self.directory_exists_cache.borrow_mut().clear();
         self.file_exists_cache.borrow_mut().clear();
@@ -95,7 +95,7 @@ impl CachedFs {
 }
 
 impl Fs for CachedFs {
-    // Go: cachedvfs.go:48 DirectoryExists
+    // Go: cachedvfs.go:49 DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {
         if self.enabled.get() {
             if let Some(ret) = cache_load(&self.directory_exists_cache, path) {
@@ -114,7 +114,7 @@ impl Fs for CachedFs {
         ret
     }
 
-    // Go: cachedvfs.go:64 FileExists
+    // Go: cachedvfs.go:65 FileExists
     fn file_exists(&self, path: &str) -> bool {
         if self.enabled.get() {
             if let Some(ret) = cache_load(&self.file_exists_cache, path) {
@@ -133,7 +133,7 @@ impl Fs for CachedFs {
         ret
     }
 
-    // Go: cachedvfs.go:80 GetAccessibleEntries
+    // Go: cachedvfs.go:81 GetAccessibleEntries
     fn get_accessible_entries(&self, path: &str) -> Entries {
         if self.enabled.get() {
             if let Some(ret) = cache_load(&self.get_accessible_entries_cache, path) {
@@ -152,12 +152,12 @@ impl Fs for CachedFs {
         ret
     }
 
-    // Go: cachedvfs.go:96 ReadFile
+    // Go: cachedvfs.go:97 ReadFile
     fn read_file(&self, path: &str) -> (String, bool) {
         self.fs.read_file(path)
     }
 
-    // Go: cachedvfs.go:100 Realpath
+    // Go: cachedvfs.go:101 Realpath
     fn realpath(&self, path: &str) -> String {
         if self.enabled.get() {
             if let Some(ret) = cache_load(&self.realpath_cache, path) {
@@ -176,12 +176,12 @@ impl Fs for CachedFs {
         ret
     }
 
-    // Go: cachedvfs.go:116 Remove
+    // Go: cachedvfs.go:117 Remove
     fn remove(&self, path: &str) -> Result<(), FsError> {
         self.fs.remove(path)
     }
 
-    // Go: cachedvfs.go:120 Chtimes
+    // Go: cachedvfs.go:121 Chtimes
     fn chtimes(
         &self,
         path: &str,
@@ -191,7 +191,7 @@ impl Fs for CachedFs {
         self.fs.chtimes(path, a_time, m_time)
     }
 
-    // Go: cachedvfs.go:124 Stat
+    // Go: cachedvfs.go:125 Stat
     fn stat(&self, path: &str) -> Option<FileInfo> {
         if self.enabled.get() {
             if let Some(ret) = cache_load(&self.stat_cache, path) {
@@ -210,17 +210,17 @@ impl Fs for CachedFs {
         ret
     }
 
-    // Go: cachedvfs.go:140 UseCaseSensitiveFileNames
+    // Go: cachedvfs.go:141 CaseSensitivity
     fn use_case_sensitive_file_names(&self) -> bool {
         self.fs.use_case_sensitive_file_names()
     }
 
-    // Go: cachedvfs.go:144 WriteFile
+    // Go: cachedvfs.go:145 WriteFile
     fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         self.fs.write_file(path, data)
     }
 
-    // Go: cachedvfs.go:148 AppendFile
+    // Go: cachedvfs.go:149 AppendFile
     fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         self.fs.append_file(path, data)
     }

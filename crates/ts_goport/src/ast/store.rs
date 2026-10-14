@@ -84,9 +84,10 @@
 //!   call). Any other id takes one cold call: the detached store, then the
 //!   build stores of this thread.
 //!
-//! AST node records, step 2: the install of the binder output writes the
-//! symbol, the flow node and the added flags of each node into its record
-//! (`bind_store_records`). The other binder fields stay in
+//! AST node records, step 2: the binder writes the symbol, the flow node
+//! and the added flags of each node into its record while it binds
+//! (`BindRecords`, bindonce2; a lib snapshot load writes them at its install,
+//! `bind_store_records`). The other binder fields go to
 //! `GoFile::node_bind`, by the index in the record.
 
 use crate::astdata::{AstData, BoxedData, NodeData};
@@ -601,7 +602,7 @@ impl SlotChildren {
 /// `NodeHeader` is the value form of its parse fields. The words are
 /// atomics that the reads load with `Relaxed` (a plain load on x86-64 and
 /// aarch64). The parse writes them through `get_mut`; the binder writes its
-/// fields into the published record (`bind_store_records`).
+/// fields into the published record (`BindRecords`, `bind_store_records`).
 ///
 /// - The Go `node.Kind` of the slot is not in its record but in the kind
 ///   column (`FileStore::kinds`, `FileBlock::kinds`).
@@ -624,7 +625,8 @@ impl SlotChildren {
 ///
 /// Only the parse and the bind write a record. The bind writes after the
 /// publish, and changes only `flags` (it ORs in the bits it adds, so the
-/// record bits stay), the high half of `up` and `bind`. `header` reads each
+/// record bits stay), the high half of `up` and `bind`; a bind that is not
+/// installed sets them back (`BindRecords::reset`). `header` reads each
 /// word once and takes only
 /// the low half of `up` of a node slot (the bind never writes `up` of the
 /// nil slot or an alias slot), so it sees the parse fields and the flags
@@ -942,8 +944,9 @@ impl NodeRecord {
     /// AST node records, step 2: writes the binder fields of a node slot of
     /// a published store (`bind_store_records`): the symbol into `up`, the
     /// added flags into `flags` (the record bits stay), and the `bind` word.
-    /// The bind is the only writer of a published record, and it writes
-    /// each record once. `added` has no record bit: `bind_store_records`
+    /// The bind is the only writer of a published record, and
+    /// `bind_store_records` writes each record once. `added` has no record
+    /// bit: `bind_store_records`
     /// checks each data entry against `BINDER_ADDED_FLAGS` in release
     /// builds too, and those flags have none (const assert after
     /// `NodeRecord`).
@@ -1182,10 +1185,9 @@ impl SlotLinks {
 /// U1 (e): capacity hints for the binder of a store file, counted from the
 /// slot kinds when the store is frozen (`frozen_store_bind_estimate`).
 /// Only capacities: the binder output does not depend on them.
+// bindonce2: the estimate of the `NodeBindBuilder` entries went with it.
 #[derive(Clone, Copy, Debug, Default)]
 struct BindEstimate {
-    /// `NodeBindBuilder` entries: about the nodes that get binder data.
-    entries: u32,
     /// `Binder::flow_nodes`: about the flow nodes the binder makes.
     flow_nodes: u32,
 }
@@ -1195,35 +1197,21 @@ struct BindEstimate {
 // so the estimate needs no second pass over the kinds.
 #[derive(Default)]
 struct BindCounts {
-    identifiers: usize,
-    others: usize,
     flow_nodes: usize,
 }
 
 impl BindCounts {
     #[inline]
     fn add(&mut self, kind: SyntaxKind) {
-        match kind {
-            // The nil slot and alias slots.
-            SyntaxKind::Unknown => {}
-            SyntaxKind::Identifier => self.identifiers += 1,
-            _ => {
-                self.others += 1;
-                self.flow_nodes += flow_node_weight(kind);
-            }
-        }
+        // The nil slot, alias slots and identifiers make no flow node
+        // (`flow_node_weight` is 0 for them).
+        self.flow_nodes += flow_node_weight(kind);
     }
 
     fn estimate(&self) -> BindEstimate {
-        // Every identifier gets its flow node (binder.go `bind`), and about
-        // one other node in two is a declaration, a container, a statement
-        // or a narrowable reference. An estimate above the count only costs
-        // untouched capacity until the builder is dropped.
-        let entries = self.identifiers + self.others / 2 + 1;
         // The unreachable flow node and the source file start node.
         let flow_nodes = self.flow_nodes + 2;
         BindEstimate {
-            entries: u32::try_from(entries).unwrap_or(u32::MAX),
             flow_nodes: u32::try_from(flow_nodes).unwrap_or(u32::MAX),
         }
     }
@@ -1347,6 +1335,11 @@ impl BuildStores {
     /// The file id of the next store of this thread. Only a publish changes
     /// `PUBLISHED`, so the ids of one build are consecutive.
     fn next_id(&mut self) -> usize {
+        // A test build waits while another test thread builds stores.
+        #[cfg(test)]
+        if self.stores.is_empty() {
+            crate::test_lock::begin_build();
+        }
         let published = PUBLISHED.load(Ordering::Acquire);
         if self.stores.is_empty() {
             self.base = published;
@@ -4866,6 +4859,9 @@ pub fn file_store_parser_flags(file: usize) -> Vec<NodeFlags> {
 // PORT: Go needs no publish; its nodes are heap objects. The publish also
 // computes `NodeHeader::source_file_is_root` for `get_source_file_of_node`.
 pub fn publish_file_stores(go_files: Vec<GoFile>) {
+    // A test build gives the build lock back after the publish.
+    #[cfg(test)]
+    let _build_end = crate::test_lock::BuildEnd;
     // The cells stay leaked and empty. Nothing reads them after this, and
     // the next build stores of this thread reuse them (`build_store_cell`).
     ACTIVE.set(None);
@@ -5465,8 +5461,9 @@ fn frozen_owned_record(n: Node) -> Option<&'static NodeRecord> {
 /// as a read of a dead version's store does ("file version N is
 /// released") when block `b` of file `file` is a pooled block that another
 /// file version took (`block_is_owned`). The binder field reads
-/// (`frozen_owned_record`) and the bind (`bind_store_records`) run it; the
-/// header and kids reads do not (PORTING.md, "AST").
+/// (`frozen_owned_record`) and the bind (`bind_records`,
+/// `bind_store_records`) run it; the header and kids reads do not
+/// (PORTING.md, "AST").
 // PERF: ownercheck1. One load of the owner word (the nil slot record of
 // the block, next to the `records` address that the read loaded), one
 // compare and one branch to a cold call. A hot header read is about 6
@@ -5534,7 +5531,8 @@ pub fn frozen_store_any_symbol(
     })
 }
 
-/// AST node records, step 2 (`BoundFile::install`): writes the binder
+/// AST node records, step 2 (`BoundFile::install` of a lib snapshot load;
+/// a live bind writes the records itself, `BindRecords`): writes the binder
 /// output of published store file `file` into its records (its block: a
 /// static file or the node shell of a freeable file version). `nodes` gives, in slot
 /// order, each node slot that has binder data or a flow node: its slot
@@ -5627,6 +5625,167 @@ pub fn bind_store_records<'d>(
         record.write_bind(symbol, added, bind);
     }
     extras
+}
+
+/// bindonce2: the node records of one published file, as a live bind
+/// writes them (`binder::NodeBindRecords`). Go's binder writes
+/// `node.Symbol`, `node.Flags` and `FlowNode` into the node while it binds
+/// and reads them back from there (binder.go); so does the binder here,
+/// with the layout that `bind_store_records` writes: the symbol in the high
+/// half of `up`, the added flags in `flags`, and the `bind` word. A copy
+/// is valid while the file version is (the binder holds its pin). Index
+/// with `NodeId::index()` of a node slot.
+// PORT: the bind is the only writer of a published record, and only the
+// thread that binds the file writes its records. Its readers start after
+// the install (see `NodeRecord`).
+#[derive(Clone, Copy, Default)]
+pub struct BindRecords(&'static [NodeRecord]);
+
+/// The records of published store file `file` for its bind. Panics when
+/// `file` has no published records, or (as `check_block_owner`) when its
+/// block belongs to another file version.
+#[must_use]
+pub fn bind_records(file: usize) -> BindRecords {
+    let block = file_block(file).unwrap_or_else(|| panic!("file {file} has no published records"));
+    check_block_owner(block, file);
+    BindRecords(block.records)
+}
+
+impl BindRecords {
+    /// The slot count of the file.
+    #[must_use]
+    pub fn len(self) -> usize {
+        self.0.len()
+    }
+
+    /// True for a file with no slots (only the default value).
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Go `node.Symbol()` of node slot `index` while binding.
+    #[inline]
+    #[must_use]
+    pub fn symbol(self, index: usize) -> SymbolId {
+        let record = &self.0[index];
+        debug_assert!(record.is_node(), "binder read of slot {index}, not a node");
+        record.symbol()
+    }
+
+    /// Go `node.DeclarationData().Symbol = symbol` of node slot `index`.
+    /// Returns true when the slot had no symbol before.
+    #[inline]
+    pub fn set_symbol(self, index: usize, symbol: SymbolId) -> bool {
+        let record = &self.0[index];
+        // A symbol goes into `up`, which holds the target of a slot with
+        // no node.
+        assert!(record.is_node(), "binder data on slot {index}, not a node");
+        let up = record.up.load(Ordering::Relaxed);
+        record.up.store(
+            (up & 0xffff_ffff) | (u64::from(symbol.0) << 32),
+            Ordering::Relaxed,
+        );
+        up >> 32 == 0
+    }
+
+    /// Go `node.Flags` of slot `index` while binding: the parser flags and
+    /// the bits the binder added so far.
+    #[inline]
+    #[must_use]
+    pub fn flags(self, index: usize) -> NodeFlags {
+        self.0[index].flags()
+    }
+
+    /// Go `node.Flags |= flags` of slot `index`. `flags` must be in
+    /// `BINDER_ADDED_FLAGS`, which has no record bit (checked in release
+    /// builds too, as `bind_store_records` does).
+    #[inline]
+    pub fn add_flags(self, index: usize, flags: NodeFlags) {
+        assert!(
+            super::node::BINDER_ADDED_FLAGS.contains(flags),
+            "binder added {:#x}, outside BINDER_ADDED_FLAGS",
+            flags.without(super::node::BINDER_ADDED_FLAGS).bits()
+        );
+        assert_ne!(index, NIL_SLOT as usize, "binder data on the nil slot");
+        let record = &self.0[index];
+        let word = record.flags.load(Ordering::Relaxed);
+        record.flags.store(word | flags.0, Ordering::Relaxed);
+    }
+
+    /// Go `node.Flags &^= flags` of slot `index`, for flags in
+    /// `BINDER_ADDED_FLAGS` (the record bits stay).
+    #[inline]
+    pub fn clear_flags(self, index: usize, flags: NodeFlags) {
+        debug_assert!(super::node::BINDER_ADDED_FLAGS.contains(flags));
+        let record = &self.0[index];
+        let word = record.flags.load(Ordering::Relaxed);
+        record.flags.store(
+            word & !(flags.0 & !NodeRecord::RECORD_BITS),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The `bind` word of slot `index` (see `NodeRecord`).
+    #[inline]
+    #[must_use]
+    pub fn bind_word(self, index: usize) -> u32 {
+        self.0[index].bind_word()
+    }
+
+    /// Writes the `bind` word of slot `index`: a flow node of the file (its
+    /// low half) or an extras index with `BIND_EXTRA`. Never the nil slot,
+    /// whose `bind` is the owner word (checked in release builds too).
+    #[inline]
+    pub fn set_bind_word(self, index: usize, word: u32) {
+        assert_ne!(index, NIL_SLOT as usize, "binder data on the nil slot");
+        self.0[index].bind.store(word, Ordering::Relaxed);
+    }
+
+    /// Moves the symbol of each slot of `slots` (slots that `set_symbol`
+    /// gave a symbol) with `f` (`BoundFile::remap`).
+    pub fn map_symbols(self, slots: &[u32], f: impl Fn(SymbolId) -> SymbolId) {
+        for &index in slots {
+            let record = &self.0[index as usize];
+            let up = record.up.load(Ordering::Relaxed);
+            let symbol = f(SymbolId((up >> 32) as u32));
+            record.up.store(
+                (up & 0xffff_ffff) | (u64::from(symbol.0) << 32),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// The binder fields of slot `index` that are in its record: the
+    /// symbol, Go `node.Flags` and the `bind` word. `None` for the nil slot
+    /// and alias slots. The lib snapshot generator reads a live bind back
+    /// with it (`binder::BoundNodes::compact`).
+    #[must_use]
+    pub fn node_fields(self, index: usize) -> Option<(SymbolId, NodeFlags, u32)> {
+        let record = &self.0[index];
+        record
+            .is_node()
+            .then(|| (record.symbol(), record.flags(), record.bind_word()))
+    }
+
+    /// Undoes the writes of a bind that is not installed (a failed or
+    /// panicked bind, `binder::NodeBindRecords`): every slot but the nil
+    /// slot gets its parse state back, with no symbol, a `bind` word of 0
+    /// and only the flags of `parser_flags` (the binder only adds bits to
+    /// them). Runs during unwinding, so it does no lookup that can panic.
+    pub fn reset(self, parser_flags: &[NodeFlags]) {
+        for (index, record) in self.0.iter().enumerate().skip(1) {
+            if record.is_node() {
+                let up = record.up.load(Ordering::Relaxed);
+                record.up.store(up & 0xffff_ffff, Ordering::Relaxed);
+            }
+            record.bind.store(0, Ordering::Relaxed);
+            let parser = parser_flags.get(index).map_or(0, |flags| flags.0);
+            let word = record.flags.load(Ordering::Relaxed);
+            let added = word & super::node::BINDER_ADDED_FLAGS.0 & !parser;
+            record.flags.store(word & !added, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Go `node.Loc` of a published store node (see `frozen_record`).
@@ -6726,15 +6885,12 @@ fn block_ids(b: &FileBlock, file: usize) -> FrozenIds {
     }
 }
 
-/// U1 (e): capacity hints for binding published store file `file`
-/// (`NodeBindBuilder` entries, flow nodes), static or a freeable file
-/// version. `None` for an unpublished store and a file without a store.
+/// U1 (e): the capacity hint for the flow nodes of the bind of published
+/// store file `file`, static or a freeable file version. `None` for an
+/// unpublished store and a file without a store.
 #[must_use]
-pub fn frozen_store_bind_estimate(file: usize) -> Option<(usize, usize)> {
-    with_published_store(file, |store| {
-        let e = store.bind_estimate;
-        (e.entries as usize, e.flow_nodes as usize)
-    })
+pub fn frozen_store_bind_estimate(file: usize) -> Option<usize> {
+    with_published_store(file, |store| store.bind_estimate.flow_nodes as usize)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -9051,10 +9207,11 @@ mod tests {
     // one (step 2 skeptic), so this test does, and reads the parents before
     // the publish (the store), after it (the block of a static file and the
     // node shell of a freeable file version), and after that version dies
-    // (its records stay leaked). It publishes, so no other test may build
-    // or publish stores while it runs (the runner uses one thread).
+    // (its records stay leaked). Its version dies and gives its block to
+    // the pool, so it holds the store build lock (`crate::test_lock::hold`).
     #[test]
     fn foreign_parents_read_through_the_file_block() {
+        crate::test_lock::hold();
         let a = new_file_store("/foreign/a.ts", "x;");
         let b = new_file_store("/foreign/b.ts", "y; w;");
         let c = new_file_store("/foreign/c.ts", "v;");
@@ -9186,13 +9343,14 @@ mod tests {
     }
 
     // fileid1: with a test cap, the last id below the cap is given and
-    // published, and the next new store stops at the cap. It publishes, so
-    // no other test may build or publish stores while it runs (the runner
-    // uses one thread).
+    // published, and the next new store stops at the cap. It reads the
+    // published count, so it holds the store build lock
+    // (`crate::test_lock::hold`).
     #[test]
     fn new_file_ids_stop_at_the_cap() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
         let message = std::thread::spawn(|| {
+            crate::test_lock::hold();
             let cap = PUBLISHED.load(Ordering::Acquire) + 1;
             TEST_FILE_ID_CAP.set(cap);
             let last = new_file_store("/fileidcap/a.ts", "a;");
@@ -9329,9 +9487,8 @@ mod tests {
     // astmem1 P3: the bind ORs its added flags into the `flags` word of a
     // record, whose top bits are the record bits (`RECORD_BITS`). A flag
     // outside `BINDER_ADDED_FLAGS` (a binder bug) stops the bind in every
-    // build, before it writes the record. It publishes, so no other test
-    // may build or publish stores while it runs (the runner uses one
-    // thread).
+    // build, before it writes the record. Its build takes the store build
+    // lock (`crate::test_lock`).
     #[test]
     fn a_bind_flag_outside_binder_added_flags_panics_in_every_build() {
         use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -9372,13 +9529,14 @@ mod tests {
     // and the extras) in every build (`check_block_owner`), every other
     // read with debug assertions. Without them a header read gives the new
     // owner's data (these shells have plain kind columns, which are not
-    // pooled; shells with equal kinds share one: `plain_kinds`). It
-    // publishes, so no other test may build or publish stores while it
-    // runs (the runner uses one thread).
+    // pooled; shells with equal kinds share one: `plain_kinds`). It reads
+    // the block pool and counts pin releases, so it holds the store build
+    // lock (`crate::test_lock::hold`).
     #[test]
     fn pooled_node_blocks_wait_two_releases_and_check_their_owner() {
         use super::super::file_version::{FileVersion, release_file_version_pins};
         use std::panic::{AssertUnwindSafe, catch_unwind};
+        crate::test_lock::hold();
         clear_block_pool();
         // Publishes a freeable version of one identifier per name.
         let identifiers = |name: &'static str, names: &[&str]| {
@@ -9521,11 +9679,12 @@ mod tests {
     // watchfree1: a node shell shares the kind column of any earlier shell
     // with equal kinds, not only of the last few (`plain_kinds`): a
     // `tsc --watch` build after a config change parses every file again.
-    // It publishes, so no other test may build or publish stores while it
-    // runs (the runner uses one thread).
+    // It reads the block pool, so it holds the store build lock
+    // (`crate::test_lock::hold`).
     #[test]
     fn node_shells_share_any_equal_kind_column() {
         use super::super::file_version::FileVersion;
+        crate::test_lock::hold();
         clear_block_pool();
         // Publishes a freeable version of `count` identifiers, and gives
         // the address of its kind column.
@@ -9617,11 +9776,12 @@ mod tests {
     // in its pooled block (`BlockFile::shell_kinds`), and its plain column
     // is the prefix of the newest column of the file that has the same
     // kinds (edleak3). Equal kinds share a plain column at any time. It
-    // publishes, so no other test may build or publish stores while it
-    // runs (the runner uses one thread).
+    // reads the block pool, so it holds the store build lock
+    // (`crate::test_lock::hold`).
     #[test]
     fn later_new_kinds_go_in_the_pooled_block_past_the_budget() {
         use super::super::file_version::FileVersion;
+        crate::test_lock::hold();
         // Empties the pool again when the test ends, after its versions
         // drop (it is made first, so it drops last), so a later test in the
         // process does not start with the budget used up.
