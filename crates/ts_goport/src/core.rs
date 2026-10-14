@@ -3668,7 +3668,9 @@ pub struct NodeBindExtra {
     pub return_flow_node: FlowNodeId,
     /// Go `FlowNodeData().FlowNode` of the node: astmem1 P3, its record
     /// has the extras index in place of the flow node (`ast::BIND_EXTRA`).
-    /// The install sets it (`ast::bind_store_records`); `of` leaves it nil.
+    /// The bind sets it (`binder::NodeBindRecords`, or
+    /// `ast::bind_store_records` for a lib snapshot load); `of` leaves it
+    /// nil.
     pub flow_node: FlowNodeId,
 }
 
@@ -3703,7 +3705,8 @@ impl NodeBindExtra {
 /// file that are not in their records (`NodeBindExtra`). The `bind` word of
 /// a record holds the index + 1 of its entry with `ast::BIND_EXTRA`, or a
 /// flow node (`FileNodeBind::extra`).
-/// `BoundFile::install` makes it (`ast::bind_store_records`).
+/// A live bind makes the entries while it binds (`binder::NodeBindRecords`);
+/// a lib snapshot load makes them at the install (`ast::bind_store_records`).
 #[derive(Debug, Default)]
 pub struct FileNodeBind {
     extras: Box<[NodeBindExtra]>,
@@ -3770,10 +3773,9 @@ impl NodeBindParts {
     /// Compacts the per-node data of a bound file, given in node order.
     /// `None` is a node with no data. At most `max_entries` items are
     /// `Some`.
-    // PERF: bind C. The binder keeps flow nodes in their own per-node array
-    // (`NodeBindBuilder`) and merges them here. A node with no data and no
-    // flow node is `None`, so it costs one test and no 40-byte compare, and
-    // its slot is already `NO_NODE_BIND` from the fill.
+    // PERF: bind C. A node with no data and no flow node is `None`, so it
+    // costs one test and no 40-byte compare, and its slot is already
+    // `NO_NODE_BIND` from the fill.
     #[must_use]
     pub fn new(
         nodes: impl ExactSizeIterator<Item = Option<NodeBindData>>,
