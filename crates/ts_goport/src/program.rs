@@ -6567,6 +6567,15 @@ mod tests {
                             .collect()
                     })
                     .collect();
+                // A bound local is a lineage symbol. The odd chunks hold a
+                // checker's own symbols (`is_own_index`), and `place` does
+                // not count them, so a local there must fail the test.
+                for (name, id) in locals.iter().flatten() {
+                    assert!(
+                        !crate::core::is_own_index(*id),
+                        "local {name} has symbol id {id} in an odd chunk"
+                    );
+                }
                 let first = locals.iter().flatten().map(|&(_, id)| id).min().unwrap();
                 // The lineage holds the symbols of earlier loads, and of the
                 // earlier tests of this process. Its ids skip the odd chunks
