@@ -1122,7 +1122,7 @@
         "test": "program::go_frontend::tests::seeded_thread_finishes_the_symlink_cache",
         "change": "body moved into a shared helper (with the new single_threaded_seeded_thread_finishes_the_symlink_cache test) and one stricter assert added; no assert removed and no expected value changed (followups66 6887edc17; found by the batch 101 auditor)",
         "goEvidence": "port-only test; Go GetSymlinkCache builds on first use (program.go:2330)",
-        "review": "pending: independent reviewer of batch 101 (R220)"
+        "review": "independent reviewer a8d2d587145e79d3f accepted it in the R220 verdict (target/continuation-r220-reviewer-verdict.txt) as a test body change, not an expectation change"
       }
     ]
   },
