@@ -2326,12 +2326,12 @@ fn is_content_mapper_supplemental_build_info_path<'a>(
 /// taken at the write.
 type WrittenBuildInfo = Arc<Mutex<Option<(String, Arc<BuildInfo>, SystemTime)>>>;
 
-// Go: build/buildtask.go:913 (*BuildTask).writeFile
+// Go: build/buildtask.go:914 (*BuildTask).writeFile
 // PORT: emit writes the source outputs on the checker threads, so the
 // callback is `Send` and cannot hold the task, the `Rc` system or the `Rc`
 // file system. Go writes through `orchestrator.host.FS()` (cachedvfs over
 // bundled over osvfs); both wrappers pass a write of a real path to osvfs
-// (cachedvfs.go:144 WriteFile), so this writes with the osvfs of the
+// (cachedvfs.go:145 WriteFile), so this writes with the osvfs of the
 // calling thread. The build info branch keeps what `onBuildInfoEmit` needs
 // in `written`, and `compile_and_emit_finish` calls it after the emit. The
 // watch-only `storeMTime` branch stores into the build host `m_times` at
