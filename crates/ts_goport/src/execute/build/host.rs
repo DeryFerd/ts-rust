@@ -179,7 +179,7 @@ impl Hash for SourceFileCacheKey {
 // `BuildStatCache` that the parse workers of each program load read too
 // (`CompilerHost::stat_cache`), as Go parse tasks share the host's
 // cachedvfs. This cache lasts for the whole build, and a write does not
-// update it (cachedvfs.go:144), so a later program can find a lookup here
+// update it (cachedvfs.go:145), so a later program can find a lookup here
 // that an earlier program made before the build wrote that path. It holds
 // only the lookups that Go makes: the workers' own lookups stay out of it
 // unless the loader uses them (see `BuildStatCache`).
