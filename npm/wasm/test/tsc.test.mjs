@@ -88,6 +88,27 @@ test("checks the DOM lib and a clean program", async () => {
     assert.equal(result.exitCode, 0);
 });
 
+// Issue #83: the wasm checker panicked (flow_p1.rs, index out of bounds) on
+// a narrowing callback whose contextual signature has a type predicate.
+// Native builds were fine. CI runs this file on a wasm build (ci.yml).
+test("checks callbacks typed by a type predicate (#83)", async () => {
+    const run = source => tsc(["--noEmit", "--strict", "a.ts"], { files: { "/r/a.ts": source }, cwd: "/r" });
+    const apply = await run(
+        "declare function apply<S extends number>(f: (o: number) => o is S): void;\napply(o => o !== 1);\n",
+    );
+    assert.equal(apply.stderr, "");
+    assert.equal(apply.exitCode, 2);
+    assert.equal(
+        apply.stdout,
+        "a.ts(2,7): error TS2345: Argument of type '(o: number) => boolean' is not assignable to parameter of type '(o: number) => o is number'.\n"
+            + "  Signature '(o: number): boolean' must be a type predicate.\n",
+    );
+    const filter = await run("const xs: number[] = [1, 2, 3];\nexport const ys = xs.filter(o => o !== 1);\n");
+    assert.equal(filter.stderr, "");
+    assert.equal(filter.exitCode, 0);
+    assert.equal(filter.stdout, "");
+});
+
 test("its types need no lib dom", async () => {
     // A consumer of the package, checked with and without lib dom, the
     // package's .d.ts files included.
