@@ -1259,14 +1259,12 @@ const MANY_REFERENCES_FILES: usize = 300;
 const MANY_REFERENCES_IMPORTS: usize = 120;
 
 /// t3inc2: `tsc -p` with `incremental` and `noEmit` on 300 files with 120
-/// imports each: 36,000 references, enough that `reference_map.rs` makes the
-/// referenced-by lists on threads (`referenced_by_of`). The steps are a
-/// change of the type of `v0` (its importers are checked again), an import
-/// added to `f1.ts` with an error (its references change, which the
-/// referenced files job finds: `ReferencedFiles::same_as_old`), both
-/// reverts and a run with no change. After each step the incremental output
-/// must equal a fresh run.
-// PORT: no Go counterpart; Go makes the lists in one pass.
+/// imports each (36,000 references). The steps are a change of the type of
+/// `v0` (its importers are checked again), an import added to `f1.ts` with an
+/// error (its references change, which the referenced files job finds:
+/// `ReferencedFiles::same_as_old`), both reverts and a run with no change.
+/// After each step the incremental output must equal a fresh run.
+// PORT: no Go counterpart; it pins the reuse of old reference sets.
 #[test]
 fn many_references_report_like_fresh_runs() {
     let root = scratch_dir("many-references");

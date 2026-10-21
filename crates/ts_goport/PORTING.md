@@ -1273,22 +1273,16 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   the wait for the check, less the nested declaration emit time, as in Go.
   "Emit time" is that nested emit time plus the wait for the rest of the
   emit.
-- An incremental program makes its referenced-by lists (Go
-  `referenceMap.getReferencedBy`, one pass under a `sync.Once`) on up to 8
-  threads when it has at least 32,768 references (t3inc2, not in Go;
-  `incremental/reference_map.rs` `referenced_by_of`). Threads make the
-  lists of consecutive files, and the lists of each path are joined in
-  file order, so each list has the same files in the same order as one
-  pass. `--singleThreaded` makes them on the loading thread. In
-  `programToSnapshot` the referenced files job of each file also compares
-  the new set with the old one (`ReferencedFiles::same_as_old`), and it
-  gives back the old set when it has the same program files in another
-  order (`ReferencedFileSet::same_as`): a set read from build info is in
-  file id order, and no reader of a set of program files depends on its
-  order (Go iterates a set in random order). On T3 Code apps/web after a
-  contracts change (327,661 references) the lists took 15 to 21 ms in one
-  pass and 6 to 9 ms on threads, and the loading thread's own work in the
-  change loop went from about 29 ms to about 16 ms.
+- In `programToSnapshot` the referenced files job of each file also
+  compares the new set with the old one (`ReferencedFiles::same_as_old`;
+  t3inc2), as Go does in its per-file work group (programtosnapshot.go:111),
+  not on the loading thread. The job gives back the old set when it has the
+  same program files in another order
+  (`ReferencedFileSet::same_as`): a set read from build info is in file id
+  order, and no reader of a set of program files depends on its order (Go
+  iterates a set in random order). On T3 Code apps/web after a contracts
+  change (327,661 references), the loading thread's own work in the change
+  loop went from about 29 ms to about 16 ms.
 - Transformers return factory (synthetic) SourceFiles. `source_file_info`
   and the printer's identifier set map one to the parsed file with the same
   path (Go `copyFrom`). `get_ecma_line_starts` caches its line map by node,

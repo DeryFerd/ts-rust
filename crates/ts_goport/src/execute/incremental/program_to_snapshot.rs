@@ -31,7 +31,6 @@ pub fn program_to_snapshot(
     }
     let mut snapshot = Snapshot::new(options());
     snapshot.hash_with_text = hash_with_text;
-    snapshot.referenced_map.single_threaded = program.single_threaded();
     snapshot.check_pending = options().no_check.is_true();
     let mut to = ToProgramSnapshot {
         program,
