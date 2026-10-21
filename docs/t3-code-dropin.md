@@ -30,6 +30,9 @@ version that `tsc` reports (7.1.0-dev).
   `@effect/tsgo` and `tsc-rs` devDependencies.
 - Typecheck scripts and the vite-plus typecheck tasks: `tsc-rs --noEmit` becomes `tsc --noEmit`.
 - Docs (`docs/operations/development.md`, AGENTS.md): `typescript` is the tsc-rs drop-in.
+- `.pnpmfile.cjs`: a `readPackage` hook sets vite-plus-core's `typescript` peer range to `*`.
+  Without it, pnpm gave the vite-plus that `@effect/vitest` imports apps/marketing's
+  `typescript@6.0.3`, and every test job failed with two vitest copies (T3 Code CI on #23023).
 - `.vscode/settings.json`: no change.
 
 The npm version (0.8.x) does not satisfy `typescript` peer ranges. pnpm then resolves those peers

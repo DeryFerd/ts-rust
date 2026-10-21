@@ -67,6 +67,25 @@ peerDependencyRules:
     - typescript
 ```
 
+`allowAny` only hides the warning. When a package's peer range does not take the npm version,
+pnpm can resolve that peer to another `typescript` in the workspace, and then install that
+package twice. In T3 Code, vite-plus-core (`typescript: ^5 || ^6 || ^7`) got a second copy with
+another workspace package's TypeScript 6, and the tests loaded two vitest copies. A `readPackage`
+hook in `.pnpmfile.cjs` widens the range (`packageExtensions` does not change an existing one):
+
+```js
+module.exports = {
+  hooks: {
+    readPackage(pkg) {
+      if (pkg.name === "@voidzero-dev/vite-plus-core" && pkg.peerDependencies?.typescript) {
+        pkg.peerDependencies.typescript = "*";
+      }
+      return pkg;
+    },
+  },
+};
+```
+
 ## VS Code
 
 Install the TypeScript 7 extension
