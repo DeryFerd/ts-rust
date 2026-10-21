@@ -1141,17 +1141,19 @@ fn a_serial_bind_with_a_lib_snapshot_in_the_new_lineage_equals_the_parallel_bind
 /// The files that import `src/a.ts` directly in `no_emit_large_project_reports_like_fresh_runs`.
 const NO_EMIT_LARGE_IMPORTERS: usize = 40;
 
-/// t3inc1: `tsc -p` with `incremental` and `noEmit` on a project of 82
-/// files, more than the d.ts walk limit (`affected_files.rs`
-/// `skips_dts_walk`), where 80 files import `src/a.ts` (40 directly). The
-/// steps are a change of `Shape` that gives the 40 indirect importers an
-/// error, its revert, an error in `a.ts` that keeps its d.ts, its fix, a
-/// second change of `Shape`, a change of `b0.ts` (only `c0.ts` imports it)
-/// that gives `c0.ts` an error, its revert and a run with no change. After
-/// each step the incremental output must equal a fresh run of the same
-/// files, and a second project that runs Go's walk
-/// (`GOPORT_DTS_WALK_FALLBACK=0`) must report the same. The two build infos
-/// may differ only in `fileInfos`, where the closures store their versions.
+/// The `compilerOptions` of the project of
+/// `no_emit_large_project_reports_like_fresh_runs`.
+const NO_EMIT_LARGE_OPTIONS: &str =
+    r#"{"incremental":true,"noEmit":true,"strict":true,"skipLibCheck":true,"types":[]}"#;
+
+/// t3inc1, t3inc3: `tsc -p` with `incremental` and `noEmit` on a project of
+/// 85 files, more than the d.ts walk limit (`affected_files.rs`
+/// `skips_dts_walk`), where 81 files import `src/a.ts` (40 directly). The
+/// steps are in `no_emit_large_steps`. After each step the incremental
+/// output must equal a fresh run of the same files, and a second project
+/// that runs Go's walk (`GOPORT_DTS_WALK_FALLBACK=0`) must report the same.
+/// The two build infos may differ only in `fileInfos`, where the closures
+/// store their versions.
 // PORT: no Go counterpart; Go always runs the walk.
 #[test]
 fn no_emit_large_project_reports_like_fresh_runs() {
@@ -1159,46 +1161,9 @@ fn no_emit_large_project_reports_like_fresh_runs() {
     let fallback = root.join("fallback");
     let walk = root.join("walk");
     for project in [&fallback, &walk] {
-        write_no_emit_large_project(project);
+        write_large_project(project, NO_EMIT_LARGE_OPTIONS);
     }
-    // `src/a.ts` with these `Shape` members and this `x` in `make`.
-    let a = |members: &str, x: &str| {
-        format!(
-            "export interface Shape {{ {members} }}\nexport const make = (): Shape => ({{ x: {x} }});\n"
-        )
-    };
-    let (a_ts, b0_ts) = ("src/a.ts", "src/b0.ts");
-    // (step, file, its text, error lines, signatures in the fallback's build info)
-    let steps = [
-        ("cold", a_ts, a("x: number", "1"), 1, 0),
-        (
-            "wide change",
-            a_ts,
-            a("x: string", "\"1\""),
-            1 + NO_EMIT_LARGE_IMPORTERS,
-            1,
-        ),
-        ("revert", a_ts, a("x: number", "1"), 1, 1),
-        ("error in a.ts", a_ts, a("x: number", "\"1\""), 2, 1),
-        ("fix", a_ts, a("x: number", "1"), 1, 1),
-        (
-            "second wide change",
-            a_ts,
-            a("x: number; y?: number", "1"),
-            1,
-            1,
-        ),
-        (
-            "narrow change",
-            b0_ts,
-            "export const v0 = { x: \"0\" };\n".into(),
-            2,
-            1,
-        ),
-        ("narrow revert", b0_ts, no_emit_large_b(0), 1, 1),
-        ("no change", b0_ts, no_emit_large_b(0), 1, 1),
-    ];
-    for (step, file, text, errors, fallback_signatures) in steps {
+    for (step, file, text, errors, fallback_signatures) in no_emit_large_steps() {
         for project in [&fallback, &walk] {
             write(&project.join(file), &text);
         }
@@ -1233,9 +1198,9 @@ fn no_emit_large_project_reports_like_fresh_runs() {
             "{step}: build info outside fileInfos in {at}"
         );
         // The build info writes a signature only where it is not the
-        // version. In the fallback only `a.ts` gets one (`b0.ts` has one
-        // importer, so it uses its version); Go's walk gives one to at least
-        // each importer of `a.ts`.
+        // version. In the fallback only `a.ts` and `g.ts` get one (`b0.ts`
+        // has one importer, so it uses its version); Go's walk gives one to
+        // at least each importer of `a.ts`.
         let signatures = |info: &str| info.matches("\"signature\":").count();
         assert_eq!(
             signatures(&fallback_info),
@@ -1252,14 +1217,120 @@ fn no_emit_large_project_reports_like_fresh_runs() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// The steps of `no_emit_large_project_reports_like_fresh_runs`: (step, file,
+/// its text, error lines, signatures in the fallback's build info).
+///
+/// A change of `Shape` that gives the 40 indirect importers an error, its
+/// revert, an error in `a.ts` that keeps its d.ts, its fix, a second change
+/// of `Shape`, a change of `b0.ts` (only `c0.ts` imports it) that gives
+/// `c0.ts` an error, its revert and a run with no change. Then (t3inc3) a
+/// change of `g.ts`, which affects the global scope, so every file is checked
+/// again and stores its version; its revert; and an edit of `a.ts` that
+/// keeps its d.ts, which the fallback must now check with its whole closure
+/// (its stored signature is its version), where Go checks only `a.ts`.
+fn no_emit_large_steps() -> Vec<(&'static str, &'static str, String, usize, usize)> {
+    let a = no_emit_large_a;
+    let (a_ts, b0_ts, g_ts) = ("src/a.ts", "src/b0.ts", "src/g.ts");
+    let wide = 1 + NO_EMIT_LARGE_IMPORTERS;
+    vec![
+        ("cold", a_ts, a("x: number", "1"), 1, 0),
+        ("wide change", a_ts, a("x: string", "\"1\""), wide, 1),
+        ("revert", a_ts, a("x: number", "1"), 1, 1),
+        ("error in a.ts", a_ts, a("x: number", "\"1\""), 2, 1),
+        ("fix", a_ts, a("x: number", "1"), 1, 1),
+        (
+            "second wide change",
+            a_ts,
+            a("x: number; y?: number", "1"),
+            1,
+            1,
+        ),
+        (
+            "narrow change",
+            b0_ts,
+            "export const v0 = { x: \"0\" };\n".into(),
+            2,
+            1,
+        ),
+        ("narrow revert", b0_ts, no_emit_large_b(0), 1, 1),
+        ("no change", b0_ts, no_emit_large_b(0), 1, 1),
+        ("global change", g_ts, no_emit_large_g("string"), 2, 1),
+        ("global revert", g_ts, no_emit_large_g("number"), 1, 1),
+        ("same d.ts", a_ts, a("x: number; y?: number", "2"), 1, 2),
+    ]
+}
+
+/// t3inc3: an emitting build, `--noEmit` runs, then emitting builds again, on
+/// the project of `no_emit_large_project_reports_like_fresh_runs` with
+/// `declaration` and `outDir` in place of `noEmit`. An emitting build leaves
+/// no file pending, so the `--noEmit` runs must take Go's walk and Go's own
+/// signature of `b0.ts`: else the next build writes more files than Go's
+/// (`c<i>.js` after the change of `Shape`, `c0.js` after the edit of
+/// `b0.ts`). Each run must print what a project that runs Go's walk
+/// (`GOPORT_DTS_WALK_FALLBACK=0`) prints, `--listEmittedFiles` too, and
+/// write the same build info.
+// PORT: no Go counterpart; Go always runs the walk.
+#[test]
+fn no_emit_runs_between_builds_keep_go_emits() {
+    let root = scratch_dir("no-emit-between-builds");
+    let fallback = root.join("fallback");
+    let walk = root.join("walk");
+    for project in [&fallback, &walk] {
+        write_large_project(
+            project,
+            r#"{"incremental":true,"declaration":true,"outDir":"out","strict":true,"skipLibCheck":true,"types":[]}"#,
+        );
+    }
+    let (a, b0_body) = (
+        no_emit_large_a,
+        format!("{}const local = 1;\n", no_emit_large_b(0)),
+    );
+    let (a_ts, b0_ts) = ("src/a.ts", "src/b0.ts");
+    let steps = [
+        ("build", a_ts, a("x: number", "1"), false),
+        ("wide change, --noEmit", a_ts, a("x: string", "\"1\""), true),
+        (
+            "build after the wide change",
+            a_ts,
+            a("x: string", "\"1\""),
+            false,
+        ),
+        ("revert, --noEmit", a_ts, a("x: number", "1"), true),
+        ("b0.ts body, --noEmit", b0_ts, b0_body.clone(), true),
+        ("build after both", b0_ts, b0_body, false),
+    ];
+    for (step, file, text, no_emit) in steps {
+        let args: &[&str] = if no_emit {
+            &["--listEmittedFiles", "--noEmit"]
+        } else {
+            &["--listEmittedFiles"]
+        };
+        let [ours, go] = [(&fallback, false), (&walk, true)].map(|(project, walk)| {
+            write(&project.join(file), &text);
+            let report = tsgo_no_emit(project, args, walk);
+            let stdout = report.stdout.replace(&norm(project), "<project>");
+            let info = read(&project.join("out/tsconfig.tsbuildinfo"));
+            (stdout, report.status, info)
+        });
+        let at = root.display();
+        assert_eq!(ours.0, go.0, "{step}: stdout in {at}");
+        assert_eq!(ours.1, go.1, "{step}: exit code in {at}");
+        assert_eq!(ours.2, go.2, "{step}: build info in {at}");
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// Writes the project of `no_emit_large_project_reports_like_fresh_runs`
-/// without `src/a.ts`: `b<i>.ts` imports `a.ts`, `c<i>.ts` imports
-/// `b<i>.ts`, and `u.ts` has an error.
-fn write_no_emit_large_project(project: &Path) {
+/// with these `compilerOptions`, without `src/a.ts`: `b<i>.ts` imports
+/// `a.ts`, `c<i>.ts` imports `b<i>.ts`, `u.ts` has an error, `g.ts` declares
+/// the global `gv` and `ug.ts` reads it. `d.d.ts` imports `b0.ts`: a file of
+/// the closure of `a.ts` that cannot be emitted, so the build info has no
+/// pending emit for it (t3inc3).
+fn write_large_project(project: &Path, options: &str) {
     fs::create_dir_all(project.join("src")).expect("create src");
     write(
         &project.join("tsconfig.json"),
-        r#"{"compilerOptions":{"incremental":true,"noEmit":true,"strict":true,"skipLibCheck":true,"types":[]},"include":["src"]}"#,
+        &format!(r#"{{"compilerOptions":{options},"include":["src"]}}"#),
     );
     for i in 0..NO_EMIT_LARGE_IMPORTERS {
         write(&project.join(format!("src/b{i}.ts")), &no_emit_large_b(i));
@@ -1272,11 +1343,34 @@ fn write_no_emit_large_project(project: &Path) {
         &project.join("src/u.ts"),
         "export const u: number = \"u\";\n",
     );
+    write(&project.join("src/g.ts"), &no_emit_large_g("number"));
+    write(
+        &project.join("src/ug.ts"),
+        "export const ug: number = gv;\n",
+    );
+    write(
+        &project.join("src/d.d.ts"),
+        "import { v0 } from \"./b0\";\nexport declare const d: typeof v0;\n",
+    );
 }
 
-/// The text of `src/b<i>.ts` in `write_no_emit_large_project`.
+/// The text of `src/a.ts` in the tests of `write_large_project`, with these
+/// `Shape` members and this `x` in `make`.
+fn no_emit_large_a(members: &str, x: &str) -> String {
+    format!(
+        "export interface Shape {{ {members} }}\nexport const make = (): Shape => ({{ x: {x} }});\n"
+    )
+}
+
+/// The text of `src/b<i>.ts` in `write_large_project`.
 fn no_emit_large_b(i: usize) -> String {
     format!("import {{ make }} from \"./a\";\nexport const v{i} = make();\n")
+}
+
+/// The text of `src/g.ts` in `write_large_project`, where the global `gv`
+/// has this type.
+fn no_emit_large_g(gv: &str) -> String {
+    format!("export const g = 1;\ndeclare global {{\n    var gv: {gv};\n}}\n")
 }
 
 /// Runs `tsgo -p tsconfig.json --pretty false <args>` in `project`, with

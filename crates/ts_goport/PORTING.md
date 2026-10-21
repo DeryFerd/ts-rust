@@ -789,36 +789,62 @@ The batch that adds it is not accepted until Theo approves.
   the cold run, because printing the inferred Effect Schema types costs
   more than checking them. The walk does not change which files are
   checked again: Go removes the cached diagnostics of the whole closure
-  anyway. Under `noEmit` it sets only the stored signatures and the JS
-  pending emit. So under `noEmit`, without
+  anyway. Under `noEmit` it sets only the stored signatures and the full
+  pending emit kind of the files that it visits. So under `noEmit`, without
   `assumeChangesOnlyAffectDirectDependencies`, in a program with more than
-  32 source files that are not declaration or JSON files, each file of the
-  closure of a changed file with a new d.ts signature is affected and
-  stores its version as signature, with no d.ts emit. When more than 32
-  files import the changed file (directly or not), its own d.ts signature
-  is still computed: when it did not change, only that file is affected,
-  as in Go. With 32 or fewer, the changed file uses its version too, so its
-  closure is checked again with no d.ts emit, unless it affects the global
-  scope or its stored signature is its version (then its text did not
-  change, and Go's emit decides). In T3 Code packages/contracts the d.ts
-  emit of orchestrationV2.ts alone took 0.63 s, against 0.36 s for a cold
-  run: two of its inferred types exceed the length that the compiler
-  serializes (TS7056). The output and the diagnostics stay Go's.
-  The build info differs from Go's in two places:
-  - `fileInfos`: the closure (and a changed file with few importers)
-    stores versions, where Go stores the d.ts hashes of the files that its
-    walk visits.
-  - `affectedFilesPendingEmit`, only when an emitting build came before:
-    the closure gets the full kind, where Go gives it to the files that its
-    walk visits. A fresh build makes every file pending with that kind,
-    and a `noEmit` build emits nothing.
+  32 source files that are not declaration or JSON files, three rules apply
+  (t3inc1, t3inc3):
+  - Walk skip: each file of the closure of a changed file with a new d.ts
+    signature is affected and stores its version as signature, with no
+    d.ts emit. This gives the full emit kind to each file of the closure.
+    Go gives it to the files that its walk visits, always the direct
+    importers, and gives the d.ts kind of `handleDtsMayChangeOf` (none
+    without declarations) to the deeper files. So the rule applies only
+    when each deeper file that is not a changed file is already pending the
+    JS part of the full kind (`walk_skip_keeps_pending_emit`).
+  - Own signature: when more than 32 files import the changed file
+    (directly or not), its own d.ts signature is still computed: when it
+    did not change, only that file is affected, as in Go. With 32 or fewer,
+    the changed file uses its version too, so its closure is checked again
+    with no d.ts emit, unless it affects the global scope or its stored
+    signature is its version (then its text did not change, and Go's emit
+    decides). Go makes only the changed file pending when its d.ts did not
+    change, so the rule applies only when each file of the closure that is
+    not a changed file is already pending the full kind. In T3 Code
+    packages/contracts the d.ts emit of orchestrationV2.ts alone took
+    0.63 s, against 0.36 s for a cold run: two of its inferred types exceed
+    the length that the compiler serializes (TS7056).
+  - Global scope: when a changed file that affects the global scope gets a
+    new signature, every file is affected, and Go's
+    `handleDtsMayChangeOfAffectedFile` computes the d.ts signature of each
+    one (here one at a time). Each file stores its version instead. Every
+    file gets the full pending emit kind either way. In T3 Code apps/web an
+    edit of a component with `declare global` took 6.5 s, against 3.2 s for
+    a cold run.
 
-  A later change of a closure file that keeps its d.ts then counts as a
-  new signature, so its closure is checked again. Go checks only that
-  file when its walk visited it. Go's tsc, tsbuild and tscWatch baselines
-  never reach the limit: a program has at most 23 such files, and at most
-  6 in a baseline that uses `noEmit`. `GOPORT_DTS_WALK_FALLBACK=0` runs
-  Go's walk.
+  A fresh build makes every file pending with the full kind. A `noEmit`
+  build emits no JS, and with declarations it clears only the d.ts errors
+  part (when the program has no other errors). So in a project that never
+  emits, the walk skip and the global scope rule always apply, and the own
+  signature rule applies when the project has no declarations. After an
+  emitting build the first two give way to Go's walk until the files are
+  pending again. The output, the diagnostics and the pending emit stay
+  Go's. The build info differs from Go's only in what the skipped d.ts
+  emits give Go: in `fileInfos` these files store versions where Go stores
+  d.ts hashes, and `packageJsons` and `missingPackageJsons` lack the
+  package.json files that only those emits look up for module specifiers
+  (T3 Code apps/web, global scope rule: 1 of 2,095 missing package.json
+  files). Both are what a fresh build stores. The package.json lists only
+  feed the up-to-date checks of `tsc -b` and watch. A later change of such a file that keeps its d.ts then counts as a new
+  signature, so its closure is checked again. Go checks only that file.
+  When an emitting build without declarations comes in between (one with
+  declarations stores the d.ts hashes again), that later run takes Go's
+  walk from the versions, so it makes the closure pending, and the next
+  emitting build writes it again (the same bytes). Go writes only that
+  file. Go's tsc, tsbuild and tscWatch baselines never
+  reach the limit: a program has at most 23 such files, and at most 6 in a
+  baseline that uses `noEmit`. `GOPORT_DTS_WALK_FALLBACK=0` runs Go's
+  walk and Go's signatures.
   `scripts/goport/t3-incremental-bench.sh` measures it.
 
 `program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
