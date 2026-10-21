@@ -1252,6 +1252,119 @@ fn no_emit_large_project_reports_like_fresh_runs() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// Files of `many_references_report_like_fresh_runs`.
+const MANY_REFERENCES_FILES: usize = 300;
+
+/// Imports of each file of `many_references_report_like_fresh_runs`.
+const MANY_REFERENCES_IMPORTS: usize = 120;
+
+/// t3inc2: `tsc -p` with `incremental` and `noEmit` on 300 files with 120
+/// imports each: 36,000 references, enough that `reference_map.rs` makes the
+/// referenced-by lists on threads (`referenced_by_of`). The steps are a
+/// change of the type of `v0` (its importers are checked again), an import
+/// added to `f1.ts` with an error (its references change, which the
+/// referenced files job finds: `ReferencedFiles::same_as_old`), both
+/// reverts and a run with no change. After each step the incremental output
+/// must equal a fresh run.
+// PORT: no Go counterpart; Go makes the lists in one pass.
+#[test]
+fn many_references_report_like_fresh_runs() {
+    let root = scratch_dir("many-references");
+    write(
+        &root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"incremental":true,"noEmit":true,"strict":true,"types":[]},"include":["src"]}"#,
+    );
+    fs::create_dir_all(root.join("src")).expect("create src");
+    for i in 0..MANY_REFERENCES_FILES {
+        write(
+            &root.join(format!("src/f{i}.ts")),
+            &many_references_file(i, "number", "1", ""),
+        );
+    }
+    write(&root.join("src/u.ts"), "export const u: number = \"u\";\n");
+    // (step, file, its text, error lines). `u.ts` has an error, the type
+    // change gives one to `f299.ts` (it reads `v0`), and the import gives
+    // one to `f1.ts`.
+    let steps = [
+        ("cold", 0, many_references_file(0, "number", "1", ""), 1),
+        (
+            "type change",
+            0,
+            many_references_file(0, "string", "\"1\"", ""),
+            2,
+        ),
+        (
+            "import added",
+            1,
+            many_references_file(
+                1,
+                "number",
+                "1",
+                "import { u } from \"./u\";\nexport const w1: string = u;\n",
+            ),
+            3,
+        ),
+        (
+            "import revert",
+            1,
+            many_references_file(1, "number", "1", ""),
+            2,
+        ),
+        (
+            "type revert",
+            0,
+            many_references_file(0, "number", "1", ""),
+            1,
+        ),
+        (
+            "no change",
+            0,
+            many_references_file(0, "number", "1", ""),
+            1,
+        ),
+    ];
+    for (step, file, text, errors) in steps {
+        write(&root.join(format!("src/f{file}.ts")), &text);
+        let incremental = tsgo_no_emit(&root, &[], false);
+        let _ = fs::remove_file(root.join("fresh.tsbuildinfo"));
+        let fresh = tsgo_no_emit(&root, &["--tsBuildInfoFile", "fresh.tsbuildinfo"], false);
+        let at = root.display();
+        assert_eq!(
+            incremental, fresh,
+            "{step}: incremental and fresh runs in {at}"
+        );
+        assert_eq!(
+            error_lines(&incremental.stdout).len(),
+            errors,
+            "{step}: errors\n{}",
+            incremental.stdout
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `src/f<i>.ts` of `many_references_report_like_fresh_runs`: it imports the
+/// next `MANY_REFERENCES_IMPORTS` files (in a ring), reads the first one's
+/// value as a number, and exports `v<i>` of type `ty` with value `value`,
+/// then `extra`.
+fn many_references_file(i: usize, ty: &str, value: &str, extra: &str) -> String {
+    use std::fmt::Write as _;
+    let n = MANY_REFERENCES_FILES;
+    let mut text = String::new();
+    for k in 1..=MANY_REFERENCES_IMPORTS {
+        let j = (i + k) % n;
+        writeln!(text, "import {{ v{j} }} from \"./f{j}\";").expect("write to a String");
+    }
+    let first = (i + 1) % n;
+    writeln!(text, "export const v{i}: {ty} = {value};").expect("write to a String");
+    writeln!(text, "export const s{i}: number = v{first};").expect("write to a String");
+    for k in 2..=MANY_REFERENCES_IMPORTS {
+        writeln!(text, "void v{};", (i + k) % n).expect("write to a String");
+    }
+    text.push_str(extra);
+    text
+}
+
 /// Writes the project of `no_emit_large_project_reports_like_fresh_runs`
 /// without `src/a.ts`: `b<i>.ts` imports `a.ts`, `c<i>.ts` imports
 /// `b<i>.ts`, and `u.ts` has an error.
