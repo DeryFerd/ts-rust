@@ -819,12 +819,13 @@ The batch that adds it is not accepted until Theo approves.
 
   A fresh build makes every file pending with the full kind. A `noEmit`
   build emits no JS, and with declarations it clears only the d.ts errors
-  part when the d.ts errors pass runs. So in a project that never emits,
+  part, when its d.ts errors pass runs: Go runs it only when the run reports
+  no other diagnostic (program.go:2082). So in a project that never emits,
   the walk skip always applies. The own signature rule applies when the
   project has no declarations, and with declarations while the d.ts errors
   part stays pending (T3 Code apps/web, `composite`, keeps the full kind on
-  every file). After an emitting build both give way to Go's walk until
-  the files are pending again.
+  every file; its runs report Effect suggestions). After an emitting build
+  both give way to Go's walk until the files are pending again.
 
   In the run that takes a rule, the output, the diagnostics and the pending
   emit are Go's. The build info differs from Go's only in what the skipped
@@ -839,25 +840,27 @@ The batch that adds it is not accepted until Theo approves.
   missing package.json files).
 
   In a later run, a change of a file that stores its version and keeps its
-  d.ts counts as a new signature, so its closure is checked again. Go
-  checks only that file. When that file affects the global scope, every
-  file is checked and computes its d.ts signature (Go's global path): on
-  T3 Code apps/web, after an export change of a utils.ts that skips the
-  walk (2.40 s; main 4.70 s), the next body edit of a file with `declare
-  global` took 4.74 s (main 0.29 s). The diagnostics stay Go's. When an emitting build
-  without declarations came in between (one with declarations stores the
-  d.ts hashes again), that later run takes Go's walk from the versions, so
-  `affectedFilesPendingEmit` also holds the files that import the changed
-  file, and the next emitting build writes them again (the same bytes). Go
-  writes only that file. In the t3inc3 matrix of 5 option sets and 9
-  sequences of `--noEmit` runs and emitting builds on 91 files (EMIT7 to
-  EMIT9: body edits next to a file that affects the global scope), the
-  emitting builds write the same files as main in 43 of 45 cells, and
-  never fewer files in any cell. The other 2 have no declarations (with and without
-  `sourceMap`) and run a fresh `--noEmit` build, a `--noEmit` change of
-  `Shape` that skips the walk, an emitting build, and a `--noEmit` body
-  edit of b5.ts (it imports a.ts). The next emitting build then writes
-  c5.js (it imports b5.ts) again, and its map with `sourceMap`.
+  d.ts counts as a new signature, so its closure is checked again. Go checks
+  only that file. When a file of that closure affects the global scope,
+  every file is checked again, still under a cold run. When the changed file
+  itself affects the global scope, every file also computes its d.ts
+  signature (Go's global path): on T3 Code apps/web, after an export change
+  of a utils.ts that skips the walk (2.40 s; Go's walk 4.70 s), the next
+  body edit of a file with `declare global` took 4.74 s (Go's walk 0.29 s).
+  The diagnostics stay Go's. When an emitting build without declarations
+  came in between (one with declarations stores the d.ts hashes again), that
+  later run takes Go's walk from the versions, so `affectedFilesPendingEmit`
+  also holds the files that import the changed file, and the next emitting
+  build writes them again (the same bytes). Go writes only that file. In the
+  t3inc3 matrix of 5 option sets and 9 sequences of `--noEmit` runs and
+  emitting builds on 91 files (EMIT7 to EMIT9: body edits next to a file
+  that affects the global scope), the emitting builds write the same files
+  as with Go's walk (`GOPORT_DTS_WALK_FALLBACK=0`) in 43 of 45 cells, and
+  never fewer files in any cell. The other 2 have no declarations (with and
+  without `sourceMap`) and run a fresh `--noEmit` build, a `--noEmit` change
+  of `Shape` that skips the walk, an emitting build, and a `--noEmit` body
+  edit of b5.ts (it imports a.ts). The next emitting build then writes c5.js
+  (it imports b5.ts) again, and its map with `sourceMap`.
 
   Go's tsc, tsbuild and tscWatch baselines never reach the limit: a
   program has at most 23 such files, and at most 6 in a baseline that uses

@@ -18,15 +18,16 @@
 //! the package.json files that only those emits look up (`packageJsons`,
 //! `missingPackageJsons`). In a later run, a change of a file that stores
 //! its version and keeps its d.ts counts as a new signature, so its closure
-//! is checked again, where Go checks only that file; when that file affects
-//! the global scope, every file is checked and computes its d.ts signature
-//! (Go's global path, about 2x a cold run on T3 Code apps/web). When an
-//! emitting build without declarations came in between, that run also makes
-//! the files that import it pending (`affectedFilesPendingEmit`; Go: only
-//! that file), and the next emitting build writes them again, with the same
-//! bytes. A change that affects the global scope makes every file compute
-//! its d.ts signature, as in Go, except the files that a rule gave their
-//! version in the same run.
+//! is checked again, where Go checks only that file; when that file or a
+//! file of its closure affects the global scope, every file is checked again
+//! (when the changed file affects it, every file also computes its d.ts
+//! signature, Go's global path, about 2x a cold run on T3 Code apps/web).
+//! When an emitting build without declarations came in between, that run
+//! also makes the files that import it pending (`affectedFilesPendingEmit`;
+//! Go: only that file), and the next emitting build writes them again, with
+//! the same bytes. A change that affects the global scope makes every file
+//! compute its d.ts signature, as in Go, except the files that a rule gave
+//! their version in the same run.
 
 use super::checker_access::*;
 use super::hash::FileInfo;
@@ -999,12 +1000,14 @@ mod tests {
         after_emit: bool,
         /// `b0.ts` declares a global, so it affects the global scope.
         global_importer: bool,
-        /// The edit of `a.ts` keeps its d.ts.
+        /// The edit of `a.ts` keeps its d.ts, after a first edit that
+        /// also keeps it, so that `a.ts` stores its d.ts signature.
         same_dts: bool,
     }
 
-    /// What `collect_all_affected_files` does in `project` when the edit
-    /// gives `a.ts` a new d.ts signature. Returns the signature kind of each
+    /// What `collect_all_affected_files` does in `project` when `a.ts` is
+    /// edited (a new d.ts signature, unless `same_dts`; then after the
+    /// warm-up edit of `same_dts`). Returns the signature kind of each
     /// updated file and the files that keep their semantic diagnostics, by
     /// base name and sorted.
     fn no_emit_change_of_a(
