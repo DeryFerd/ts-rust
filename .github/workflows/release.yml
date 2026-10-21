@@ -22,9 +22,10 @@
 # Windows (x86_64-pc-windows-msvc, aarch64-pc-windows-msvc) builds in Git Bash, with the C runtime
 # linked in (+crt-static), so tsc.exe needs no Visual C++ redistributable. jemalloc does not build
 # there: it uses the system allocator. Each tsc builds natively, so the PGO training runs on its
-# own platform: Blacksmith has no Intel Mac and no arm64 Windows runner, so darwin-x64 builds on
-# GitHub's macos-15-intel (4 vCPU) and
-# win32-arm64 on GitHub's windows-11-arm (4 vCPU).
+# own platform, except darwin-x64: Blacksmith has no Intel Mac, so it cross-builds on Blacksmith's
+# arm64 Mac (as T3 Code's x64 desktop build does) and its PGO training and checks run the x86-64 tsc
+# under Rosetta 2. The verify job still runs it on an Intel Mac (macos-15-intel). Blacksmith has no
+# arm64 Windows runner, so win32-arm64 builds on GitHub's windows-11-arm (4 vCPU).
 name: Release
 
 on:
@@ -95,9 +96,12 @@ jobs:
           - platform: darwin-arm64
             target: aarch64-apple-darwin
             runner: blacksmith-12vcpu-macos-26
+          # Cross-built on arm64: GitHub's 4 vCPU macos-15-intel took 76 minutes (three fat-LTO
+          # builds), the 12 vCPU arm64 Mac takes about 18 for the arm64 tsc.
           - platform: darwin-x64
             target: x86_64-apple-darwin
-            runner: macos-15-intel
+            runner: blacksmith-12vcpu-macos-26
+            rosetta: true
           - platform: win32-x64
             target: x86_64-pc-windows-msvc
             runner: blacksmith-16vcpu-windows-2025
@@ -108,7 +112,7 @@ jobs:
             exe: .exe
             linker: rust-lld
     runs-on: ${{ matrix.runner }}
-    # The 4 vCPU GitHub-hosted runners (darwin-x64, win32-arm64) build slower.
+    # The 4 vCPU GitHub-hosted runner (win32-arm64) builds slower.
     timeout-minutes: 180
     # Git Bash on Windows.
     defaults:
@@ -125,6 +129,13 @@ jobs:
       - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target ${{ matrix.target }} --component llvm-tools
       - if: runner.os == 'Linux'
         run: sudo apt-get update -q && sudo apt-get install -yq musl-tools
+      # darwin-x64 on an arm64 Mac: the PGO training and the checks run the x86-64 tsc, so Rosetta 2
+      # must be there.
+      - name: Rosetta
+        if: matrix.rosetta
+        run: |
+          arch -x86_64 /usr/bin/true 2>/dev/null || sudo softwareupdate --install-rosetta --agree-to-license
+          arch -x86_64 /usr/bin/true
       # win32-arm64 links with rust-lld (lld-link), all three builds. On arm64, link.exe aligns each
       # section contribution to 4 bytes, also the 1-byte start markers of the LLVM profile sections
       # (IMAGE_SCN_ALIGN_1BYTES). The instrumented tsc then wrote 3 zero bytes before the names, and
