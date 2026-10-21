@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# t3-incremental-bench.sh: cold vs incremental tsc times on a T3 Code checkout (t3inc1, 2026-10-21).
+# t3-incremental-bench.sh: cold vs incremental tsc times on a T3 Code checkout (t3inc1, t3inc3, 2026-10-21).
 #
 # Usage:
 #   t3-incremental-bench.sh [-n RUNS] [-c CHANGE] [-p PROJECTS] [-t] [-x FLAGS] <t3code-dir> <tsc> [<tsc>...]
@@ -12,10 +12,14 @@
 #                 contracts-literal packages/contracts/src/baseSchemas.ts: add a DpopFailureReason literal
 #                 contracts-brand   packages/contracts/src/baseSchemas.ts: ThreadId brand "ThreadId" -> "ThreadIdX"
 #                 contracts-field   packages/contracts/src/orchestrationV2.ts: optional field in OrchestrationV2AppThread
+#                 web-global        apps/web/src/browser/HostedBrowserWebview.tsx: a local const in a module
+#                                   with `declare global`, so every file of apps/web is affected (t3inc3).
+#                                   About 2x a cold run: every file makes its d.ts emit, one at a time
+#                                   (PORTING.md, after the noEmit d.ts walk fallback)
 #   -p PROJECTS project dirs to check, comma separated (default: apps/server for server-config,
-#               packages/contracts for the contracts-* edits). The contracts files are external library
-#               files (found through node_modules) in every other project, so only packages/contracts
-#               signs them.
+#               packages/contracts for the contracts-* edits, apps/web for web-global). The contracts files
+#               are external library files (found through node_modules) in every other project, so only
+#               packages/contracts signs them.
 #   -t          T3's own setup: add "incremental": true to tsconfig.base.json and run
 #               `<tsc> --noEmit --extendedDiagnostics` in the project dir, as T3's typecheck script does.
 #               The build info is then <project>/tsconfig.tsbuildinfo; the bench removes it before each
@@ -82,6 +86,11 @@ contracts-field)
 	FROM='export const OrchestrationV2AppThread = Schema.Struct({'
 	TO='export const OrchestrationV2AppThread = Schema.Struct({\n  xBenchField: Schema.optional(Schema.String),'
 	DEFPROJ=packages/contracts ;;
+web-global)
+	FILE=apps/web/src/browser/HostedBrowserWebview.tsx
+	FROM='declare global {'
+	TO='const xBenchLocal = 1;\nvoid xBenchLocal;\n\ndeclare global {'
+	DEFPROJ=apps/web ;;
 *) echo "unknown change: $CHANGE" >&2; exit 2 ;;
 esac
 IFS=, read -ra PROJ <<<"${PROJECTS:-$DEFPROJ}"
