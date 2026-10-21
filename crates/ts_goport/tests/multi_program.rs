@@ -21,6 +21,10 @@
 //! The serial bind test runs `goport_typesyms` and `tsgo` with one bind
 //! thread and with four, and compares their outputs.
 //!
+//! The no-emit test runs `tsgo -p` with `incremental` and `noEmit` through
+//! a sequence of edits, and compares each run with a fresh run and with a
+//! run of Go's d.ts walk.
+//!
 //! `pair` writes these files to its out dir: `a.txt`, `a.status`, `b.txt`,
 //! `b.status`, `b.reused` and, with `--first`, `first.txt`. A status file
 //! holds the decimal exit code. `b.reused` holds `true` or `false`.
@@ -1132,6 +1136,302 @@ fn a_serial_bind_with_a_lib_snapshot_in_the_new_lineage_equals_the_parallel_bind
         assert_eq!(other_check, check, "{} tsgo", side.0);
     }
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// The files that import `src/a.ts` directly in `no_emit_large_project_reports_like_fresh_runs`.
+const NO_EMIT_LARGE_IMPORTERS: usize = 40;
+
+/// t3inc1: `tsc -p` with `incremental` and `noEmit` on a project of 82
+/// files, more than the d.ts walk limit (`affected_files.rs`
+/// `skips_dts_walk`), where 80 files import `src/a.ts` (40 directly). The
+/// steps are a change of `Shape` that gives the 40 indirect importers an
+/// error, its revert, an error in `a.ts` that keeps its d.ts, its fix, a
+/// second change of `Shape`, a change of `b0.ts` (only `c0.ts` imports it)
+/// that gives `c0.ts` an error, its revert and a run with no change. After
+/// each step the incremental output must equal a fresh run of the same
+/// files, and a second project that runs Go's walk
+/// (`GOPORT_DTS_WALK_FALLBACK=0`) must report the same. The two build infos
+/// may differ only in `fileInfos`, where the closures store their versions.
+// PORT: no Go counterpart; Go always runs the walk.
+#[test]
+fn no_emit_large_project_reports_like_fresh_runs() {
+    let root = scratch_dir("no-emit-large");
+    let fallback = root.join("fallback");
+    let walk = root.join("walk");
+    for project in [&fallback, &walk] {
+        write_no_emit_large_project(project);
+    }
+    // `src/a.ts` with these `Shape` members and this `x` in `make`.
+    let a = |members: &str, x: &str| {
+        format!(
+            "export interface Shape {{ {members} }}\nexport const make = (): Shape => ({{ x: {x} }});\n"
+        )
+    };
+    let (a_ts, b0_ts) = ("src/a.ts", "src/b0.ts");
+    // (step, file, its text, error lines, signatures in the fallback's build info)
+    let steps = [
+        ("cold", a_ts, a("x: number", "1"), 1, 0),
+        (
+            "wide change",
+            a_ts,
+            a("x: string", "\"1\""),
+            1 + NO_EMIT_LARGE_IMPORTERS,
+            1,
+        ),
+        ("revert", a_ts, a("x: number", "1"), 1, 1),
+        ("error in a.ts", a_ts, a("x: number", "\"1\""), 2, 1),
+        ("fix", a_ts, a("x: number", "1"), 1, 1),
+        (
+            "second wide change",
+            a_ts,
+            a("x: number; y?: number", "1"),
+            1,
+            1,
+        ),
+        (
+            "narrow change",
+            b0_ts,
+            "export const v0 = { x: \"0\" };\n".into(),
+            2,
+            1,
+        ),
+        ("narrow revert", b0_ts, no_emit_large_b(0), 1, 1),
+        ("no change", b0_ts, no_emit_large_b(0), 1, 1),
+    ];
+    for (step, file, text, errors, fallback_signatures) in steps {
+        for project in [&fallback, &walk] {
+            write(&project.join(file), &text);
+        }
+        let incremental = tsgo_no_emit(&fallback, &[], false);
+        let _ = fs::remove_file(fallback.join("fresh.tsbuildinfo"));
+        let fresh = tsgo_no_emit(
+            &fallback,
+            &["--tsBuildInfoFile", "fresh.tsbuildinfo"],
+            false,
+        );
+        let walked = tsgo_no_emit(&walk, &[], true);
+        let at = root.display();
+        assert_eq!(
+            incremental, fresh,
+            "{step}: incremental and fresh runs in {at}"
+        );
+        assert_eq!(
+            walked, incremental,
+            "{step}: Go's walk and the fallback in {at}"
+        );
+        assert_eq!(
+            error_lines(&incremental.stdout).len(),
+            errors,
+            "{step}: errors\n{}",
+            incremental.stdout
+        );
+        let fallback_info = read(&fallback.join("tsconfig.tsbuildinfo"));
+        let walk_info = read(&walk.join("tsconfig.tsbuildinfo"));
+        assert_eq!(
+            without_file_infos(&fallback_info),
+            without_file_infos(&walk_info),
+            "{step}: build info outside fileInfos in {at}"
+        );
+        // The build info writes a signature only where it is not the
+        // version. In the fallback only `a.ts` gets one (`b0.ts` has one
+        // importer, so it uses its version); Go's walk gives one to at least
+        // each importer of `a.ts`.
+        let signatures = |info: &str| info.matches("\"signature\":").count();
+        assert_eq!(
+            signatures(&fallback_info),
+            fallback_signatures,
+            "{step}: {fallback_info}"
+        );
+        if fallback_signatures > 0 {
+            assert!(
+                signatures(&walk_info) > NO_EMIT_LARGE_IMPORTERS,
+                "{step}: {walk_info}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Files of `many_references_report_like_fresh_runs`.
+const MANY_REFERENCES_FILES: usize = 300;
+
+/// Imports of each file of `many_references_report_like_fresh_runs`.
+const MANY_REFERENCES_IMPORTS: usize = 120;
+
+/// t3inc2: `tsc -p` with `incremental` and `noEmit` on 300 files with 120
+/// imports each (36,000 references). The steps are a change of the type of
+/// `v0` (its importers are checked again), an import added to `f1.ts` with an
+/// error (its references change, which the referenced files job finds:
+/// `ReferencedFiles::same_as_old`), both reverts and a run with no change.
+/// After each step the incremental output must equal a fresh run.
+// PORT: no Go counterpart; it pins the reuse of old reference sets.
+#[test]
+fn many_references_report_like_fresh_runs() {
+    let root = scratch_dir("many-references");
+    write(
+        &root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"incremental":true,"noEmit":true,"strict":true,"types":[]},"include":["src"]}"#,
+    );
+    fs::create_dir_all(root.join("src")).expect("create src");
+    for i in 0..MANY_REFERENCES_FILES {
+        write(
+            &root.join(format!("src/f{i}.ts")),
+            &many_references_file(i, "number", "1", ""),
+        );
+    }
+    write(&root.join("src/u.ts"), "export const u: number = \"u\";\n");
+    // (step, file, its text, error lines). `u.ts` has an error, the type
+    // change gives one to `f299.ts` (it reads `v0`), and the import gives
+    // one to `f1.ts`.
+    let steps = [
+        ("cold", 0, many_references_file(0, "number", "1", ""), 1),
+        (
+            "type change",
+            0,
+            many_references_file(0, "string", "\"1\"", ""),
+            2,
+        ),
+        (
+            "import added",
+            1,
+            many_references_file(
+                1,
+                "number",
+                "1",
+                "import { u } from \"./u\";\nexport const w1: string = u;\n",
+            ),
+            3,
+        ),
+        (
+            "import revert",
+            1,
+            many_references_file(1, "number", "1", ""),
+            2,
+        ),
+        (
+            "type revert",
+            0,
+            many_references_file(0, "number", "1", ""),
+            1,
+        ),
+        (
+            "no change",
+            0,
+            many_references_file(0, "number", "1", ""),
+            1,
+        ),
+    ];
+    for (step, file, text, errors) in steps {
+        write(&root.join(format!("src/f{file}.ts")), &text);
+        let incremental = tsgo_no_emit(&root, &[], false);
+        let _ = fs::remove_file(root.join("fresh.tsbuildinfo"));
+        let fresh = tsgo_no_emit(&root, &["--tsBuildInfoFile", "fresh.tsbuildinfo"], false);
+        let at = root.display();
+        assert_eq!(
+            incremental, fresh,
+            "{step}: incremental and fresh runs in {at}"
+        );
+        assert_eq!(
+            error_lines(&incremental.stdout).len(),
+            errors,
+            "{step}: errors\n{}",
+            incremental.stdout
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `src/f<i>.ts` of `many_references_report_like_fresh_runs`: it imports the
+/// next `MANY_REFERENCES_IMPORTS` files (in a ring), reads the first one's
+/// value as a number, and exports `v<i>` of type `ty` with value `value`,
+/// then `extra`.
+fn many_references_file(i: usize, ty: &str, value: &str, extra: &str) -> String {
+    use std::fmt::Write as _;
+    let n = MANY_REFERENCES_FILES;
+    let mut text = String::new();
+    for k in 1..=MANY_REFERENCES_IMPORTS {
+        let j = (i + k) % n;
+        writeln!(text, "import {{ v{j} }} from \"./f{j}\";").expect("write to a String");
+    }
+    let first = (i + 1) % n;
+    writeln!(text, "export const v{i}: {ty} = {value};").expect("write to a String");
+    writeln!(text, "export const s{i}: number = v{first};").expect("write to a String");
+    for k in 2..=MANY_REFERENCES_IMPORTS {
+        writeln!(text, "void v{};", (i + k) % n).expect("write to a String");
+    }
+    text.push_str(extra);
+    text
+}
+
+/// Writes the project of `no_emit_large_project_reports_like_fresh_runs`
+/// without `src/a.ts`: `b<i>.ts` imports `a.ts`, `c<i>.ts` imports
+/// `b<i>.ts`, and `u.ts` has an error.
+fn write_no_emit_large_project(project: &Path) {
+    fs::create_dir_all(project.join("src")).expect("create src");
+    write(
+        &project.join("tsconfig.json"),
+        r#"{"compilerOptions":{"incremental":true,"noEmit":true,"strict":true,"skipLibCheck":true,"types":[]},"include":["src"]}"#,
+    );
+    for i in 0..NO_EMIT_LARGE_IMPORTERS {
+        write(&project.join(format!("src/b{i}.ts")), &no_emit_large_b(i));
+        write(
+            &project.join(format!("src/c{i}.ts")),
+            &format!("import {{ v{i} }} from \"./b{i}\";\nexport const n{i}: number = v{i}.x;\n"),
+        );
+    }
+    write(
+        &project.join("src/u.ts"),
+        "export const u: number = \"u\";\n",
+    );
+}
+
+/// The text of `src/b<i>.ts` in `write_no_emit_large_project`.
+fn no_emit_large_b(i: usize) -> String {
+    format!("import {{ make }} from \"./a\";\nexport const v{i} = make();\n")
+}
+
+/// Runs `tsgo -p tsconfig.json --pretty false <args>` in `project`, with
+/// `GOPORT_DTS_WALK_FALLBACK=0` when `walk` is true.
+fn tsgo_no_emit(project: &Path, args: &[&str], walk: bool) -> Report {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tsgo"));
+    command
+        .args(["-p", "tsconfig.json", "--pretty", "false"])
+        .args(args)
+        .current_dir(project);
+    if walk {
+        command.env("GOPORT_DTS_WALK_FALLBACK", "0");
+    }
+    let run = command.output().expect("run tsgo");
+    Report {
+        stdout: String::from_utf8(run.stdout).expect("tsgo stdout is UTF-8"),
+        status: run.status.code().expect("tsgo exited with a code"),
+    }
+}
+
+/// `build_info` without the value of its `fileInfos` key, a JSON array.
+fn without_file_infos(build_info: &str) -> String {
+    let key = "\"fileInfos\":";
+    let start = build_info.find(key).expect("build info has fileInfos") + key.len();
+    let bytes = build_info.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'[' | b'{' if !in_string => depth += 1,
+            b']' | b'}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return format!("{}{}", &build_info[..start], &build_info[i + 1..]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    panic!("the fileInfos array of the build info does not end");
 }
 
 /// The diagnostic lines of a tsc report.

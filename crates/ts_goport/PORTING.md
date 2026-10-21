@@ -776,6 +776,50 @@ The batch that adds it is not accepted until Theo approves.
     output where Go reads new in 6 of 6 runs (probe q1b2,
     k2sched/design-a-check.md). Go runs each status check on the builder
     that takes the task.
+- An incremental `noEmit` program of more than 32 files skips Go's d.ts
+  walk (t3inc1, not in Go; `incremental/affected_files.rs`
+  `skips_dts_walk`). When a changed file gets a new d.ts signature, Go's
+  `getFilesAffectedBy` emits the d.ts of each importer, one at a time, to
+  see if its signature changed too. After a fresh build every stored
+  signature is a version, so the walk goes through the whole importer
+  closure. On T3 Code apps/server one edit made 675 serial d.ts emits, and
+  the incremental run took 1.6x the cold run (Go at the pin: 1.4x). A small
+  closure can cost as much: in T3 Code packages/contracts an edit of a file
+  with 11 importers made 11 d.ts emits that took 1.0 s, against 0.35 s for
+  the cold run, because printing the inferred Effect Schema types costs
+  more than checking them. The walk does not change which files are
+  checked again: Go removes the cached diagnostics of the whole closure
+  anyway. Under `noEmit` it sets only the stored signatures and the JS
+  pending emit. So under `noEmit`, without
+  `assumeChangesOnlyAffectDirectDependencies`, in a program with more than
+  32 source files that are not declaration or JSON files, each file of the
+  closure of a changed file with a new d.ts signature is affected and
+  stores its version as signature, with no d.ts emit. When more than 32
+  files import the changed file (directly or not), its own d.ts signature
+  is still computed: when it did not change, only that file is affected,
+  as in Go. With 32 or fewer, the changed file uses its version too, so its
+  closure is checked again with no d.ts emit, unless it affects the global
+  scope or its stored signature is its version (then its text did not
+  change, and Go's emit decides). In T3 Code packages/contracts the d.ts
+  emit of orchestrationV2.ts alone took 0.63 s, against 0.36 s for a cold
+  run: two of its inferred types exceed the length that the compiler
+  serializes (TS7056). The output and the diagnostics stay Go's.
+  The build info differs from Go's in two places:
+  - `fileInfos`: the closure (and a changed file with few importers)
+    stores versions, where Go stores the d.ts hashes of the files that its
+    walk visits.
+  - `affectedFilesPendingEmit`, only when an emitting build came before:
+    the closure gets the full kind, where Go gives it to the files that its
+    walk visits. A fresh build makes every file pending with that kind,
+    and a `noEmit` build emits nothing.
+
+  A later change of a closure file that keeps its d.ts then counts as a
+  new signature, so its closure is checked again. Go checks only that
+  file when its walk visited it. Go's tsc, tsbuild and tscWatch baselines
+  never reach the limit: a program has at most 23 such files, and at most
+  6 in a baseline that uses `noEmit`. `GOPORT_DTS_WALK_FALLBACK=0` runs
+  Go's walk.
+  `scripts/goport/t3-incremental-bench.sh` measures it.
 
 `program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
 `Program` methods as free functions with Go snake names (`get_resolved_module(file, name, mode)` ->
@@ -1229,6 +1273,16 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   the wait for the check, less the nested declaration emit time, as in Go.
   "Emit time" is that nested emit time plus the wait for the rest of the
   emit.
+- In `programToSnapshot` the referenced files job of each file also
+  compares the new set with the old one (`ReferencedFiles::same_as_old`;
+  t3inc2), as Go does in its per-file work group (programtosnapshot.go:111),
+  not on the loading thread. The job gives back the old set when it has the
+  same program files in another order
+  (`ReferencedFileSet::same_as`): a set read from build info is in file id
+  order, and no reader of a set of program files depends on its order (Go
+  iterates a set in random order). On T3 Code apps/web after a contracts
+  change (327,661 references), the loading thread's own work in the change
+  loop went from about 29 ms to about 16 ms.
 - Transformers return factory (synthetic) SourceFiles. `source_file_info`
   and the printer's identifier set map one to the parsed file with the same
   path (Go `copyFrom`). `get_ecma_line_starts` caches its line map by node,
