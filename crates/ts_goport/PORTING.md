@@ -806,9 +806,11 @@ The batch that adds it is not accepted until Theo approves.
     (directly or not), its own d.ts signature is still computed: when it
     did not change, only that file is affected, as in Go. With 32 or fewer,
     the changed file uses its version too, so its closure is checked again
-    with no d.ts emit, unless it affects the global scope or its stored
-    signature is its version (then its text did not change, and Go's emit
-    decides). Go makes only the changed file pending when its d.ts did not
+    with no d.ts emit, unless it or a file of its closure affects the
+    global scope (the version would then make every file of the program
+    affected, where Go's d.ts emit may find no change and affect only the
+    changed file) or its stored signature is its version (then its text did
+    not change, and Go's emit decides). Go makes only the changed file pending when its d.ts did not
     change, so the rule applies only when each file of the closure that is
     not a changed file is already pending the full kind. In T3 Code
     packages/contracts the d.ts emit of orchestrationV2.ts alone took
@@ -836,7 +838,11 @@ The batch that adds it is not accepted until Theo approves.
 
   In a later run, a change of a file that stores its version and keeps its
   d.ts counts as a new signature, so its closure is checked again. Go
-  checks only that file. The diagnostics stay Go's. When an emitting build
+  checks only that file. When that file affects the global scope, every
+  file is checked and computes its d.ts signature (Go's global path): on
+  T3 Code apps/web, after an export change of a utils.ts that skips the
+  walk (2.40 s; main 4.70 s), the next body edit of a file with `declare
+  global` took 4.74 s (main 0.29 s). The diagnostics stay Go's. When an emitting build
   without declarations came in between (one with declarations stores the
   d.ts hashes again), that later run takes Go's walk from the versions, so
   `affectedFilesPendingEmit` also holds the files that import the changed

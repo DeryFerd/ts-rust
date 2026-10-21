@@ -10,15 +10,19 @@
 //! PORT: not in Go (t3inc1, t3inc3). In a `noEmit` program with more than
 //! `DTS_WALK_FILE_LIMIT` files, a changed file with a new d.ts signature
 //! skips Go's d.ts walk over its importers (`skips_dts_walk`), and a changed
-//! file with few importers skips its own d.ts emit
-//! (`uses_version_for_changed_file`), when the pending emit stays Go's
+//! file with few importers, none of which affects the global scope, skips
+//! its own d.ts emit (`uses_version_for_changed_file`), when the pending
+//! emit stays Go's
 //! (`pending_emit_covers`). In the run that takes a rule, the build info
 //! differs from Go's only where Go reads the skipped d.ts emits: the
 //! `fileInfos` signatures (versions, as a fresh build stores) and the
 //! package.json files that only those emits look up (`packageJsons`,
 //! `missingPackageJsons`). In a later run, a change of a file that stores
 //! its version and keeps its d.ts counts as a new signature, so its closure
-//! is checked again, where Go checks only that file. When an emitting build
+//! is checked again, where Go checks only that file; when that file affects
+//! the global scope, every file is checked and computes its d.ts signature
+//! (Go's global path, about 2x a cold run on T3 Code apps/web). When an
+//! emitting build
 //! without declarations came in between, that run also makes the files that
 //! import it pending (`affectedFilesPendingEmit`; Go: only that file), and
 //! the next emitting build writes them again, with the same bytes. A change
@@ -358,8 +362,8 @@ impl<'a> AffectedFilesHandler<'a> {
     /// the changed `file` its version as signature, with no d.ts emit:
     /// `skips_dts_walk` holds, `file` does not affect the global scope, its
     /// stored signature is not its version, at most `DTS_WALK_FILE_LIMIT`
-    /// files import it, directly or not, and each of them is already pending
-    /// the full emit kind. The version then counts as a new signature, so the
+    /// files import it, directly or not, none of them affects the global
+    /// scope, and each of them is already pending the full emit kind. The version then counts as a new signature, so the
     /// closure of `file` is checked again and gets the full pending emit
     /// kind. When the d.ts of `file` did not change, Go's
     /// `getFilesAffectedBy` returns only `file`, and no other file gets a
@@ -405,6 +409,18 @@ impl<'a> AffectedFilesHandler<'a> {
                 let refs = snapshot.referenced_map.get_referenced_by(&path);
                 queue.extend(refs.iter().filter(|r| !seen.contains(*r)).cloned());
             }
+        }
+        // A file of the closure that affects the global scope would make
+        // every file of the program affected (Go
+        // `handleDtsMayChangeOfGlobalScope`), where Go's d.ts emit of `file`
+        // may find no change and affect only `file`.
+        if seen.iter().any(|path| {
+            snapshot
+                .file_infos
+                .get(path)
+                .is_some_and(|info| info.affects_global_scope)
+        }) {
+            return false;
         }
         // `file` is a changed file, so `pending_emit_covers` skips it.
         let files = seen
@@ -983,6 +999,10 @@ mod tests {
         /// The first program has no pending emit, as after an emitting
         /// build.
         after_emit: bool,
+        /// `b0.ts` declares a global, so it affects the global scope.
+        global_importer: bool,
+        /// The edit of `a.ts` keeps its d.ts.
+        same_dts: bool,
     }
 
     /// What `collect_all_affected_files` does in `project` when the edit
@@ -1002,9 +1022,14 @@ mod tests {
             r#"{"compilerOptions":{"incremental":true,"noEmit":true,"skipLibCheck":true,"types":[]},"include":["*.ts"]}"#,
         );
         for i in 0..project.importers {
+            let global = if project.global_importer && i == 0 {
+                "declare global { var gb: number; }\n"
+            } else {
+                ""
+            };
             write(
                 &format!("b{i}.ts"),
-                &format!("import {{ x }} from './a';\nexport const y{i} = x;\n"),
+                &format!("import {{ x }} from './a';\nexport const y{i} = x;\n{global}"),
             );
         }
         for i in 0..project.others {
@@ -1020,7 +1045,12 @@ mod tests {
         } else {
             ""
         };
-        write("a.ts", &format!("export const x = 1;\n{global}"));
+        let (before, after) = if project.same_dts {
+            ("export const x: number = 1;", "export const x: number = 2;")
+        } else {
+            ("export const x = 1;", "export const x = 'a';")
+        };
+        write("a.ts", &format!("{before}\n{global}"));
         let config = format!("{}/tsconfig.json", dir.to_string_lossy().replace('\\', "/"));
         let load = || {
             try_load_version(&config, |_| {})
@@ -1043,7 +1073,7 @@ mod tests {
             }
             old
         };
-        write("a.ts", &format!("export const x = 'a';\n{global}"));
+        write("a.ts", &format!("{after}\n{global}"));
         let second = load();
         let new = {
             let _scope = enter_program(Some(second));
@@ -1256,5 +1286,34 @@ mod tests {
             SignatureUpdateKind::ComputedDts,
             Some(SignatureUpdateKind::ComputedDts),
         );
+    }
+
+    // t3inc3 round 3: `b0.ts`, an importer of `a.ts`, affects the global
+    // scope, so a change of `a.ts` with a new d.ts signature makes every file
+    // affected (Go `handleDtsMayChangeOfGlobalScope`). Its version would
+    // count as such a change, so `a.ts` computes its d.ts signature, as in
+    // Go: the edit keeps the d.ts, so only `a.ts` is checked again.
+    #[test]
+    fn no_emit_narrow_change_near_a_global_file_computes_its_signature() {
+        let importers = 3;
+        let project = Project {
+            importers,
+            others: DTS_WALK_FILE_LIMIT - importers,
+            global_importer: true,
+            same_dts: true,
+            ..Project::default()
+        };
+        let (kinds, kept) = no_emit_change_of_a("no-emit-near-global", project);
+        let kinds: Vec<(String, SignatureUpdateKind)> = kinds.into_iter().collect();
+        assert_eq!(
+            kinds,
+            [("a.ts".to_string(), SignatureUpdateKind::ComputedDts)]
+        );
+        let mut others: Vec<String> = (0..importers)
+            .map(|i| format!("b{i}.ts"))
+            .chain((0..project.others).map(|i| format!("c{i}.ts")))
+            .collect();
+        others.sort();
+        assert_eq!(kept, others);
     }
 }
