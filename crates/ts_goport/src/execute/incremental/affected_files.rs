@@ -12,23 +12,21 @@
 //! skips Go's d.ts walk over its importers (`skips_dts_walk`), and a changed
 //! file with few importers, none of which affects the global scope, skips
 //! its own d.ts emit (`uses_version_for_changed_file`), when the pending
-//! emit stays Go's
-//! (`pending_emit_covers`). In the run that takes a rule, the build info
-//! differs from Go's only where Go reads the skipped d.ts emits: the
-//! `fileInfos` signatures (versions, as a fresh build stores) and the
-//! package.json files that only those emits look up (`packageJsons`,
+//! emit stays Go's (`pending_emit_covers`). In the run that takes a rule,
+//! the build info differs from Go's only where Go reads the skipped d.ts
+//! emits: the `fileInfos` signatures (versions, as a fresh build stores) and
+//! the package.json files that only those emits look up (`packageJsons`,
 //! `missingPackageJsons`). In a later run, a change of a file that stores
 //! its version and keeps its d.ts counts as a new signature, so its closure
 //! is checked again, where Go checks only that file; when that file affects
 //! the global scope, every file is checked and computes its d.ts signature
 //! (Go's global path, about 2x a cold run on T3 Code apps/web). When an
-//! emitting build
-//! without declarations came in between, that run also makes the files that
-//! import it pending (`affectedFilesPendingEmit`; Go: only that file), and
-//! the next emitting build writes them again, with the same bytes. A change
-//! that affects the global scope makes every file compute its d.ts
-//! signature, as in Go, except the files that a rule gave their version in
-//! the same run.
+//! emitting build without declarations came in between, that run also makes
+//! the files that import it pending (`affectedFilesPendingEmit`; Go: only
+//! that file), and the next emitting build writes them again, with the same
+//! bytes. A change that affects the global scope makes every file compute
+//! its d.ts signature, as in Go, except the files that a rule gave their
+//! version in the same run.
 
 use super::checker_access::*;
 use super::hash::FileInfo;
@@ -363,15 +361,15 @@ impl<'a> AffectedFilesHandler<'a> {
     /// `skips_dts_walk` holds, `file` does not affect the global scope, its
     /// stored signature is not its version, at most `DTS_WALK_FILE_LIMIT`
     /// files import it, directly or not, none of them affects the global
-    /// scope, and each of them is already pending the full emit kind. The version then counts as a new signature, so the
-    /// closure of `file` is checked again and gets the full pending emit
-    /// kind. When the d.ts of `file` did not change, Go's
-    /// `getFilesAffectedBy` returns only `file`, and no other file gets a
-    /// pending emit. So the closure must be pending that kind already
-    /// (t3inc3), as after a fresh build, for the pending emit to stay Go's. A
-    /// changed file of the closure is affected in Go too, so it does not
-    /// count. (A file pending the d.ts errors has no cached emit diagnostics,
-    /// so the new pending emit removes none.)
+    /// scope, and each of them is already pending the full emit kind. The
+    /// version then counts as a new signature, so the closure of `file` is
+    /// checked again and gets the full pending emit kind. When the d.ts of
+    /// `file` did not change, Go's `getFilesAffectedBy` returns only `file`,
+    /// and no other file gets a pending emit. So the closure must be pending
+    /// that kind already (t3inc3), as after a fresh build, for the pending
+    /// emit to stay Go's. A changed file of the closure is affected in Go
+    /// too, so it does not count. (A file pending the d.ts errors has no
+    /// cached emit diagnostics, so the new pending emit removes none.)
     ///
     /// Go computes the d.ts signature of each changed file, so that a change
     /// that keeps the d.ts checks only that file again. The emit can cost

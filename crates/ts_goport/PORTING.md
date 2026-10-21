@@ -802,27 +802,29 @@ The batch that adds it is not accepted until Theo approves.
     without declarations) to the deeper files. So the rule applies only
     when each deeper file that is not a changed file is already pending the
     JS part of the full kind (`walk_skip_keeps_pending_emit`).
-  - Own signature: when more than 32 files import the changed file
-    (directly or not), its own d.ts signature is still computed: when it
-    did not change, only that file is affected, as in Go. With 32 or fewer,
-    the changed file uses its version too, so its closure is checked again
-    with no d.ts emit, unless it or a file of its closure affects the
-    global scope (the version would then make every file of the program
-    affected, where Go's d.ts emit may find no change and affect only the
-    changed file) or its stored signature is its version (then its text did
-    not change, and Go's emit decides). Go makes only the changed file pending when its d.ts did not
-    change, so the rule applies only when each file of the closure that is
-    not a changed file is already pending the full kind. In T3 Code
-    packages/contracts the d.ts emit of orchestrationV2.ts alone took
-    0.63 s, against 0.36 s for a cold run: two of its inferred types exceed
-    the length that the compiler serializes (TS7056).
+  - Own signature: when more than 32 files import the changed file (directly
+    or not), its own d.ts signature is still computed: when it did not change,
+    only that file is affected, as in Go. With 32 or fewer, the changed file
+    uses its version too, so its closure is checked again with no d.ts emit,
+    unless it or a file of its closure affects the global scope (the version
+    would then make every file of the program affected, where Go's d.ts emit
+    may find no change and affect only the changed file) or its stored
+    signature is its version (then its text did not change, and Go's emit
+    decides). Go makes only the changed file pending when its d.ts did not
+    change, so the rule applies only when each file of the closure that is not
+    a changed file is already pending the full kind. In T3 Code
+    packages/contracts the d.ts emit of orchestrationV2.ts alone took 0.63 s,
+    against 0.36 s for a cold run: two of its inferred types exceed the length
+    that the compiler serializes (TS7056).
 
   A fresh build makes every file pending with the full kind. A `noEmit`
   build emits no JS, and with declarations it clears only the d.ts errors
-  part (when the program has no other errors). So in a project that never
-  emits, the walk skip always applies, and the own signature rule applies
-  when the project has no declarations. After an emitting build both give
-  way to Go's walk until the files are pending again.
+  part when the d.ts errors pass runs. So in a project that never emits,
+  the walk skip always applies. The own signature rule applies when the
+  project has no declarations, and with declarations while the d.ts errors
+  part stays pending (T3 Code apps/web, `composite`, keeps the full kind on
+  every file). After an emitting build both give way to Go's walk until
+  the files are pending again.
 
   In the run that takes a rule, the output, the diagnostics and the pending
   emit are Go's. The build info differs from Go's only in what the skipped
@@ -847,10 +849,11 @@ The batch that adds it is not accepted until Theo approves.
   d.ts hashes again), that later run takes Go's walk from the versions, so
   `affectedFilesPendingEmit` also holds the files that import the changed
   file, and the next emitting build writes them again (the same bytes). Go
-  writes only that file. In the t3inc3 matrix of 5 option sets and 6
-  sequences of `--noEmit` runs and emitting builds on 91 files, the
-  emitting builds write the same files as Go in 28 cells, and never fewer
-  files in any cell. The other 2 have no declarations (with and without
+  writes only that file. In the t3inc3 matrix of 5 option sets and 9
+  sequences of `--noEmit` runs and emitting builds on 91 files (EMIT7 to
+  EMIT9: body edits next to a file that affects the global scope), the
+  emitting builds write the same files as main in 43 of 45 cells, and
+  never fewer files in any cell. The other 2 have no declarations (with and without
   `sourceMap`) and run a fresh `--noEmit` build, a `--noEmit` change of
   `Shape` that skips the walk, an emitting build, and a `--noEmit` body
   edit of b5.ts (it imports a.ts). The next emitting build then writes
