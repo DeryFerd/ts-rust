@@ -1073,6 +1073,24 @@ mod tests {
             }
             old
         };
+        // `same_dts`: first an edit that keeps the d.ts, so that `a.ts`
+        // stores its d.ts signature, as after a run that computed it. (The
+        // cold program stores none, so its first change always counts as a
+        // new signature, in Go too.)
+        let (old, warm) = if project.same_dts {
+            write("a.ts", &format!("export const x: number = 3;\n{global}"));
+            let warm = load();
+            let next = {
+                let _scope = enter_program(Some(warm));
+                let next = new_program(Some(&old), host(), None, true);
+                let _ = next.get_semantic_diagnostics(Node::NIL);
+                next
+            };
+            drop(old);
+            (next, Some(warm))
+        } else {
+            (old, None)
+        };
         write("a.ts", &format!("{after}\n{global}"));
         let second = load();
         let new = {
@@ -1108,6 +1126,9 @@ mod tests {
         kept.sort();
         drop((old, new));
         release_program(first);
+        if let Some(warm) = warm {
+            release_program(warm);
+        }
         release_program(second);
         let _ = std::fs::remove_dir_all(&dir);
         (kinds, kept)
@@ -1291,8 +1312,9 @@ mod tests {
     // t3inc3 round 3: `b0.ts`, an importer of `a.ts`, affects the global
     // scope, so a change of `a.ts` with a new d.ts signature makes every file
     // affected (Go `handleDtsMayChangeOfGlobalScope`). Its version would
-    // count as such a change, so `a.ts` computes its d.ts signature, as in
-    // Go: the edit keeps the d.ts, so only `a.ts` is checked again.
+    // count as such a change, so `a.ts`, which stores its d.ts signature
+    // after a first edit, computes it again, as in Go: the second edit keeps
+    // the d.ts, so only `a.ts` is checked again.
     #[test]
     fn no_emit_narrow_change_near_a_global_file_computes_its_signature() {
         let importers = 3;
