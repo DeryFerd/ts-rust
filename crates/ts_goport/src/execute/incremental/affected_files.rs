@@ -6,6 +6,10 @@
 //! them, so the handler state is plain fields. Go `dtsMayChange` maps are
 //! shared by reference between the list and the queued call; here the call
 //! gets the index of its map in the list.
+//!
+//! PORT: not in Go (t3inc1). Under `noEmit`, a changed file with a new d.ts
+//! signature and more than `DTS_WALK_FILE_LIMIT` importers skips Go's d.ts
+//! walk over them (`use_versions_for_wide_change`).
 
 use super::checker_access::*;
 use super::hash::FileInfo;
@@ -15,7 +19,22 @@ use super::snapshot::*;
 use crate::emitter::emitter::EmitOnly;
 use crate::emitter::program_emit::{EmitOptions, WriteFile, WriteFileData, emit};
 use crate::frontend::prelude::*;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// PORT: not in Go (t3inc1). The most files that can import a changed file
+/// (directly or not) before `use_versions_for_wide_change` skips the d.ts
+/// walk. In Go's tsc and tsbuild baselines, a step computes at most 5 d.ts
+/// signatures and a `noEmit` program has at most 7 files, so the baselines
+/// never reach it.
+const DTS_WALK_FILE_LIMIT: usize = 32;
+
+/// False when `GOPORT_DTS_WALK_FALLBACK` is `0`: every change then runs Go's
+/// d.ts walk (`use_versions_for_wide_change`). For A/B tests and timing on
+/// one binary. Read once.
+fn dts_walk_fallback_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GOPORT_DTS_WALK_FALLBACK").as_deref() != Ok("0"))
+}
 
 // Go: incremental/affectedfileshandler.go:18 dtsMayChange
 pub type DtsMayChange = FxIndexMap<Path, FileEmitKind>;
@@ -220,6 +239,22 @@ impl<'a> AffectedFilesHandler<'a> {
             return vec![file];
         }
 
+        // PORT: not in Go (t3inc1). Every file that imports `file` is
+        // affected, and its version is its signature (no d.ts emit).
+        if self.use_versions_for_wide_change(file) {
+            return self
+                .for_each_file_referenced_by(file, &mut |handler, current_file, _current_path| {
+                    if current_file.is_nil() {
+                        return (false, false);
+                    }
+                    handler.update_shape_signature(current_file, true);
+                    (true, false)
+                })
+                .into_values()
+                .filter(|file| file.is_some())
+                .collect();
+        }
+
         // Now we need to if each file in the referencedBy list has a shape change as well.
         // Because if so, its own referencedBy files need to be saved as well to make the
         // emitting result consistent with files on disk.
@@ -236,6 +271,62 @@ impl<'a> AffectedFilesHandler<'a> {
             .into_values()
             .filter(|file| file.is_some())
             .collect()
+    }
+
+    /// PORT: not in Go (t3inc1, perf). True when `getFilesAffectedBy` can
+    /// skip the d.ts walk over the files that import `file`: the program has
+    /// `noEmit`, `assumeChangesOnlyAffectDirectDependencies` is off, and more
+    /// than `DTS_WALK_FILE_LIMIT` files import `file`, directly or not. The
+    /// caller has seen that the signature of `file` changed.
+    ///
+    /// Go's walk computes a d.ts signature for each importer, one at a time,
+    /// and goes on to the importers of each file whose signature changed.
+    /// After a fresh build every stored signature is the file version, so the
+    /// first walk goes through the whole closure, and `handleDtsMayChangeOf`
+    /// sets versions again, so later walks do too. On T3 Code apps/server one
+    /// edit gave 675 serial d.ts emits, and the incremental run took 1.6x the
+    /// cold run (Go at the pin: 1.4x; with this rule: 0.8x).
+    ///
+    /// The walk does not change which files are checked again:
+    /// `handleDtsMayChangeOfAffectedFile` removes the semantic diagnostics of
+    /// the whole closure of a changed file with a new signature. Under
+    /// `noEmit` it only sets the stored signatures, and the JS pending emit
+    /// of each file that it visits. So with this rule:
+    /// - the diagnostics are the same;
+    /// - the files of the closure store their version as signature, as after
+    ///   Go's `handleDtsMayChangeOf` (a later change of one of them always
+    ///   counts as a new signature);
+    /// - each file of the closure gets the full pending emit kind, where Go
+    ///   gives it to the files that the walk visits. A fresh build makes every
+    ///   file pending with that kind and a `noEmit` build emits nothing, so
+    ///   this changes the build info only when an emitting build came before.
+    fn use_versions_for_wide_change(&self, file: Node) -> bool {
+        if !dts_walk_fallback_enabled() {
+            return false;
+        }
+        let snapshot = self.program.snapshot.borrow();
+        let options = snapshot.options;
+        if !options.no_emit.is_true()
+            || options
+                .assume_changes_only_affect_direct_dependencies
+                .is_true()
+        {
+            return false;
+        }
+        let start = path_of(file);
+        let mut seen: FxHashSet<Path> = FxHashSet::default();
+        let mut queue = snapshot.referenced_map.get_referenced_by(&start);
+        seen.insert(start);
+        while let Some(path) = queue.pop() {
+            if seen.insert(path.clone()) {
+                // `seen` holds `file` too.
+                if seen.len() > DTS_WALK_FILE_LIMIT + 1 {
+                    return true;
+                }
+                queue.extend(snapshot.referenced_map.get_referenced_by(&path));
+            }
+        }
+        false
     }
 
     // Go: incremental/affectedfileshandler.go:152 forEachFileReferencedBy
@@ -718,5 +809,123 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What `collect_all_affected_files` does in a `noEmit` project where
+    /// `importers` files `b<i>.ts` import `a.ts`, `c.ts` imports nothing,
+    /// and the edit gives `a.ts` a new d.ts signature. Returns the signature
+    /// kind of each updated file and the files that keep their semantic
+    /// diagnostics, by base name.
+    fn no_emit_change_of_a(
+        test: &str,
+        importers: usize,
+    ) -> (FxHashMap<String, SignatureUpdateKind>, Vec<String>) {
+        let dir = std::env::temp_dir().join(format!("goport-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
+        write(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"incremental":true,"noEmit":true,"skipLibCheck":true,"types":[]},"include":["*.ts"]}"#,
+        );
+        for i in 0..importers {
+            write(
+                &format!("b{i}.ts"),
+                &format!("import {{ x }} from './a';\nexport const y{i} = x;\n"),
+            );
+        }
+        write("c.ts", "export const z = 1;\n");
+        write("a.ts", "export const x = 1;\n");
+        let config = format!("{}/tsconfig.json", dir.to_string_lossy().replace('\\', "/"));
+        let load = || {
+            try_load_version(&config, |_| {})
+                .unwrap_or_else(|e| panic!("cannot load {config}: {e}"))
+        };
+        let host = || create_host(go_frontend_program().expect("frontend").host().clone());
+        let first = load();
+        // Both programs are testing programs, so their file versions hash the
+        // same way (`hash_with_text`).
+        let old = {
+            let _scope = enter_program(Some(first));
+            let old = new_program(None, host(), None, true);
+            // The cold check, so every file has cached diagnostics.
+            let _ = old.get_semantic_diagnostics(Node::NIL);
+            old
+        };
+        write("a.ts", "export const x = 'a';\n");
+        let second = load();
+        let new = {
+            let _scope = enter_program(Some(second));
+            let new = new_program(Some(&old), host(), None, true);
+            collect_all_affected_files(&new);
+            new
+        };
+        let base_name = |path: &Path| path.0.rsplit('/').next().unwrap_or_default().to_string();
+        // The project files, not the libs.
+        let ours = |name: &String| {
+            name == "a.ts"
+                || name == "c.ts"
+                || name
+                    .strip_prefix('b')
+                    .and_then(|rest| rest.strip_suffix(".ts"))
+                    .is_some_and(|i| i.parse::<usize>().is_ok())
+        };
+        let kinds = new
+            .get_testing_data()
+            .expect("testing data")
+            .updated_signature_kinds
+            .iter()
+            .map(|(path, kind)| (base_name(path), *kind))
+            .collect();
+        let mut kept: Vec<String> = new
+            .snapshot
+            .borrow()
+            .semantic_diagnostics_per_file
+            .keys()
+            .map(base_name)
+            .filter(ours)
+            .collect();
+        kept.sort();
+        drop((old, new));
+        release_program(first);
+        release_program(second);
+        let _ = std::fs::remove_dir_all(&dir);
+        (kinds, kept)
+    }
+
+    // t3inc1: past `DTS_WALK_FILE_LIMIT` importers, a `noEmit` program gives
+    // each importer its version as signature, with no d.ts emit (Go computes
+    // each one). The same files lose their cached diagnostics as in Go.
+    #[test]
+    fn no_emit_wide_change_uses_file_versions() {
+        let importers = DTS_WALK_FILE_LIMIT + 8;
+        let (kinds, kept) = no_emit_change_of_a("no-emit-wide-change", importers);
+        assert_eq!(kinds.get("a.ts"), Some(&SignatureUpdateKind::ComputedDts));
+        for i in 0..importers {
+            assert_eq!(
+                kinds.get(&format!("b{i}.ts")),
+                Some(&SignatureUpdateKind::UsedVersion),
+                "b{i}.ts"
+            );
+        }
+        assert_eq!(kinds.len(), importers + 1, "{kinds:?}");
+        assert_eq!(kept, ["c.ts"]);
+    }
+
+    // t3inc1: at most `DTS_WALK_FILE_LIMIT` importers, Go's d.ts walk runs.
+    #[test]
+    fn no_emit_narrow_change_computes_signatures() {
+        let importers = 3;
+        let (kinds, kept) = no_emit_change_of_a("no-emit-narrow-change", importers);
+        assert_eq!(kinds.get("a.ts"), Some(&SignatureUpdateKind::ComputedDts));
+        for i in 0..importers {
+            assert_eq!(
+                kinds.get(&format!("b{i}.ts")),
+                Some(&SignatureUpdateKind::ComputedDts),
+                "b{i}.ts"
+            );
+        }
+        assert_eq!(kinds.len(), importers + 1, "{kinds:?}");
+        assert_eq!(kept, ["c.ts"]);
     }
 }

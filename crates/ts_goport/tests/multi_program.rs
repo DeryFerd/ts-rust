@@ -21,6 +21,10 @@
 //! The serial bind test runs `goport_typesyms` and `tsgo` with one bind
 //! thread and with four, and compares their outputs.
 //!
+//! The no-emit test runs `tsgo -p` with `incremental` and `noEmit` through
+//! a sequence of edits, and compares each run with a fresh run and with a
+//! run of Go's d.ts walk.
+//!
 //! `pair` writes these files to its out dir: `a.txt`, `a.status`, `b.txt`,
 //! `b.status`, `b.reused` and, with `--first`, `first.txt`. A status file
 //! holds the decimal exit code. `b.reused` holds `true` or `false`.
@@ -1132,6 +1136,172 @@ fn a_serial_bind_with_a_lib_snapshot_in_the_new_lineage_equals_the_parallel_bind
         assert_eq!(other_check, check, "{} tsgo", side.0);
     }
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// The files that import `src/a.ts` directly in `no_emit_wide_changes_report_like_fresh_runs`.
+const NO_EMIT_WIDE_IMPORTERS: usize = 40;
+
+/// t3inc1: `tsc -p` with `incremental` and `noEmit` on a project where 80
+/// files import `src/a.ts` (40 directly), more than the d.ts walk limit
+/// (`affected_files.rs` `use_versions_for_wide_change`). The steps are a
+/// change of `Shape` that gives the 40 indirect importers an error, its
+/// revert, an error in `a.ts` that keeps its d.ts, its fix, a second change
+/// of `Shape` and a run with no change. After each step the incremental
+/// output must equal a fresh run of the same files, and a second project
+/// that runs Go's walk (`GOPORT_DTS_WALK_FALLBACK=0`) must report the same.
+/// The two build infos may differ only in `fileInfos`, where the closure
+/// stores its versions.
+// PORT: no Go counterpart; Go always runs the walk.
+#[test]
+fn no_emit_wide_changes_report_like_fresh_runs() {
+    let root = scratch_dir("no-emit-wide");
+    let fallback = root.join("fallback");
+    let walk = root.join("walk");
+    for project in [&fallback, &walk] {
+        write_no_emit_wide_project(project);
+    }
+    // `src/a.ts` with these `Shape` members and this `x` in `make`.
+    let a = |members: &str, x: &str| {
+        format!(
+            "export interface Shape {{ {members} }}\nexport const make = (): Shape => ({{ x: {x} }});\n"
+        )
+    };
+    // (step, text of `src/a.ts`, error lines, the fallback runs)
+    let steps = [
+        ("cold", a("x: number", "1"), 1, false),
+        (
+            "wide change",
+            a("x: string", "\"1\""),
+            1 + NO_EMIT_WIDE_IMPORTERS,
+            true,
+        ),
+        ("revert", a("x: number", "1"), 1, true),
+        ("error in a.ts", a("x: number", "\"1\""), 2, false),
+        ("fix", a("x: number", "1"), 1, false),
+        (
+            "second wide change",
+            a("x: number; y?: number", "1"),
+            1,
+            true,
+        ),
+        ("no change", a("x: number; y?: number", "1"), 1, false),
+    ];
+    for (step, text, errors, fallback_runs) in steps {
+        for project in [&fallback, &walk] {
+            write(&project.join("src/a.ts"), &text);
+        }
+        let incremental = tsgo_no_emit(&fallback, &[], false);
+        let _ = fs::remove_file(fallback.join("fresh.tsbuildinfo"));
+        let fresh = tsgo_no_emit(
+            &fallback,
+            &["--tsBuildInfoFile", "fresh.tsbuildinfo"],
+            false,
+        );
+        let walked = tsgo_no_emit(&walk, &[], true);
+        let at = root.display();
+        assert_eq!(
+            incremental, fresh,
+            "{step}: incremental and fresh runs in {at}"
+        );
+        assert_eq!(
+            walked, incremental,
+            "{step}: Go's walk and the fallback in {at}"
+        );
+        assert_eq!(
+            error_lines(&incremental.stdout).len(),
+            errors,
+            "{step}: errors\n{}",
+            incremental.stdout
+        );
+        let fallback_info = read(&fallback.join("tsconfig.tsbuildinfo"));
+        let walk_info = read(&walk.join("tsconfig.tsbuildinfo"));
+        assert_eq!(
+            without_file_infos(&fallback_info),
+            without_file_infos(&walk_info),
+            "{step}: build info outside fileInfos in {at}"
+        );
+        if fallback_runs {
+            // The build info writes a signature only where it is not the
+            // version. Here only `a.ts` has one; Go's walk gives one to at
+            // least each direct importer.
+            let signatures = |info: &str| info.matches("\"signature\":").count();
+            assert_eq!(signatures(&fallback_info), 1, "{step}: {fallback_info}");
+            assert!(
+                signatures(&walk_info) > NO_EMIT_WIDE_IMPORTERS,
+                "{step}: {walk_info}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Writes the project of `no_emit_wide_changes_report_like_fresh_runs`
+/// without `src/a.ts`: `b<i>.ts` imports `a.ts`, `c<i>.ts` imports
+/// `b<i>.ts`, and `u.ts` has an error.
+fn write_no_emit_wide_project(project: &Path) {
+    fs::create_dir_all(project.join("src")).expect("create src");
+    write(
+        &project.join("tsconfig.json"),
+        r#"{"compilerOptions":{"incremental":true,"noEmit":true,"strict":true,"skipLibCheck":true,"types":[]},"include":["src"]}"#,
+    );
+    for i in 0..NO_EMIT_WIDE_IMPORTERS {
+        write(
+            &project.join(format!("src/b{i}.ts")),
+            &format!("import {{ make }} from \"./a\";\nexport const v{i} = make();\n"),
+        );
+        write(
+            &project.join(format!("src/c{i}.ts")),
+            &format!("import {{ v{i} }} from \"./b{i}\";\nexport const n{i}: number = v{i}.x;\n"),
+        );
+    }
+    write(
+        &project.join("src/u.ts"),
+        "export const u: number = \"u\";\n",
+    );
+}
+
+/// Runs `tsgo -p tsconfig.json --pretty false <args>` in `project`, with
+/// `GOPORT_DTS_WALK_FALLBACK=0` when `walk` is true.
+fn tsgo_no_emit(project: &Path, args: &[&str], walk: bool) -> Report {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tsgo"));
+    command
+        .args(["-p", "tsconfig.json", "--pretty", "false"])
+        .args(args)
+        .current_dir(project);
+    if walk {
+        command.env("GOPORT_DTS_WALK_FALLBACK", "0");
+    }
+    let run = command.output().expect("run tsgo");
+    Report {
+        stdout: String::from_utf8(run.stdout).expect("tsgo stdout is UTF-8"),
+        status: run.status.code().expect("tsgo exited with a code"),
+    }
+}
+
+/// `build_info` without the value of its `fileInfos` key, a JSON array.
+fn without_file_infos(build_info: &str) -> String {
+    let key = "\"fileInfos\":";
+    let start = build_info.find(key).expect("build info has fileInfos") + key.len();
+    let bytes = build_info.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'[' | b'{' if !in_string => depth += 1,
+            b']' | b'}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return format!("{}{}", &build_info[..start], &build_info[i + 1..]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    panic!("the fileInfos array of the build info does not end");
 }
 
 /// The diagnostic lines of a tsc report.

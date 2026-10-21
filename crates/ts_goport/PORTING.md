@@ -776,6 +776,35 @@ The batch that adds it is not accepted until Theo approves.
     output where Go reads new in 6 of 6 runs (probe q1b2,
     k2sched/design-a-check.md). Go runs each status check on the builder
     that takes the task.
+- An incremental `noEmit` program skips Go's d.ts walk for a wide change
+  (t3inc1, not in Go; `incremental/affected_files.rs`
+  `use_versions_for_wide_change`). When a changed file gets a new d.ts
+  signature, Go's `getFilesAffectedBy` emits the d.ts of each importer,
+  one at a time, to see if its signature changed too. After a fresh build
+  every stored signature is a version, so the walk goes through the whole
+  importer closure. `handleDtsMayChangeOf` then sets versions again, so
+  later walks do the same. On T3 Code apps/server one edit made 675 serial
+  d.ts emits, and the incremental run took 1.6x the cold run (Go at the
+  pin: 1.4x; with this rule: 0.8x). The walk does not change which files
+  are checked again: Go removes the cached diagnostics of the whole
+  closure anyway. Under `noEmit` it sets only the stored signatures and
+  the JS pending emit. So
+  under `noEmit`, without `assumeChangesOnlyAffectDirectDependencies`,
+  when more than 32 files import the changed file (directly or not), each
+  file of the closure is affected and stores its version as signature,
+  with no d.ts emit. The output and the diagnostics stay Go's. The build
+  info differs from Go's in two places:
+  - `fileInfos`: the closure stores versions, where Go stores the d.ts
+    hashes of the files that its walk visits.
+  - `affectedFilesPendingEmit`, only when an emitting build came before:
+    the closure gets the full kind, where Go gives it to the files that its
+    walk visits. A fresh build makes every file pending with that kind,
+    and a `noEmit` build emits nothing.
+
+  Go's tsc and tsbuild baselines never reach the limit: a step computes at
+  most 5 d.ts signatures, and a `noEmit` program has at most 7 files.
+  `GOPORT_DTS_WALK_FALLBACK=0` runs Go's walk.
+  `scripts/goport/t3-incremental-bench.sh` measures it.
 
 `program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
 `Program` methods as free functions with Go snake names (`get_resolved_module(file, name, mode)` ->
