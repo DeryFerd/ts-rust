@@ -792,7 +792,7 @@ The batch that adds it is not accepted until Theo approves.
   anyway. Under `noEmit` it sets only the stored signatures and the full
   pending emit kind of the files that it visits. So under `noEmit`, without
   `assumeChangesOnlyAffectDirectDependencies`, in a program with more than
-  32 source files that are not declaration or JSON files, three rules apply
+  32 source files that are not declaration or JSON files, two rules apply
   (t3inc1, t3inc3):
   - Walk skip: each file of the closure of a changed file with a new d.ts
     signature is affected and stores its version as signature, with no
@@ -814,38 +814,53 @@ The batch that adds it is not accepted until Theo approves.
     packages/contracts the d.ts emit of orchestrationV2.ts alone took
     0.63 s, against 0.36 s for a cold run: two of its inferred types exceed
     the length that the compiler serializes (TS7056).
-  - Global scope: when a changed file that affects the global scope gets a
-    new signature, every file is affected, and Go's
-    `handleDtsMayChangeOfAffectedFile` computes the d.ts signature of each
-    one (here one at a time). Each file stores its version instead. Every
-    file gets the full pending emit kind either way. In T3 Code apps/web an
-    edit of a component with `declare global` took 6.5 s, against 3.2 s for
-    a cold run.
 
   A fresh build makes every file pending with the full kind. A `noEmit`
   build emits no JS, and with declarations it clears only the d.ts errors
   part (when the program has no other errors). So in a project that never
-  emits, the walk skip and the global scope rule always apply, and the own
-  signature rule applies when the project has no declarations. After an
-  emitting build the first two give way to Go's walk until the files are
-  pending again. The output, the diagnostics and the pending emit stay
-  Go's. The build info differs from Go's only in what the skipped d.ts
-  emits give Go: in `fileInfos` these files store versions where Go stores
-  d.ts hashes, and `packageJsons` and `missingPackageJsons` lack the
-  package.json files that only those emits look up for module specifiers
-  (T3 Code apps/web, global scope rule: 1 of 2,095 missing package.json
-  files). Both are what a fresh build stores. The package.json lists only
-  feed the up-to-date checks of `tsc -b` and watch. A later change of such a file that keeps its d.ts then counts as a new
-  signature, so its closure is checked again. Go checks only that file.
-  When an emitting build without declarations comes in between (one with
-  declarations stores the d.ts hashes again), that later run takes Go's
-  walk from the versions, so it makes the closure pending, and the next
-  emitting build writes it again (the same bytes). Go writes only that
-  file. Go's tsc, tsbuild and tscWatch baselines never
-  reach the limit: a program has at most 23 such files, and at most 6 in a
-  baseline that uses `noEmit`. `GOPORT_DTS_WALK_FALLBACK=0` runs Go's
-  walk and Go's signatures.
-  `scripts/goport/t3-incremental-bench.sh` measures it.
+  emits, the walk skip always applies, and the own signature rule applies
+  when the project has no declarations. After an emitting build both give
+  way to Go's walk until the files are pending again.
+
+  In the run that takes a rule, the output, the diagnostics and the pending
+  emit are Go's. The build info differs from Go's only in what the skipped
+  d.ts emits give Go: in `fileInfos` these files store versions where Go
+  stores d.ts hashes, and `packageJsons` and `missingPackageJsons` lack the
+  package.json files that only those emits look up for module specifiers.
+  Both are what a fresh build stores. The package.json lists only feed the
+  up-to-date checks of `tsc -b` and watch. A change that affects the global
+  scope makes every file compute its d.ts signature, as in Go, except the
+  files that a rule gave their version in the same run (T3 Code apps/web, a
+  global edit and a contracts edit in one run: 1,447 files, and 1 of 2,095
+  missing package.json files).
+
+  In a later run, a change of a file that stores its version and keeps its
+  d.ts counts as a new signature, so its closure is checked again. Go
+  checks only that file. The diagnostics stay Go's. When an emitting build
+  without declarations came in between (one with declarations stores the
+  d.ts hashes again), that later run takes Go's walk from the versions, so
+  `affectedFilesPendingEmit` also holds the files that import the changed
+  file, and the next emitting build writes them again (the same bytes). Go
+  writes only that file. In the t3inc3 matrix of 5 option sets and 6
+  sequences of `--noEmit` runs and emitting builds on 91 files, the
+  emitting builds write the same files as Go in 28 cells, and never fewer
+  files in any cell. The other 2 have no declarations (with and without
+  `sourceMap`) and run a fresh `--noEmit` build, a `--noEmit` change of
+  `Shape` that skips the walk, an emitting build, and a `--noEmit` body
+  edit of b5.ts (it imports a.ts). The next emitting build then writes
+  c5.js (it imports b5.ts) again, and its map with `sourceMap`.
+
+  Go's tsc, tsbuild and tscWatch baselines never reach the limit: a
+  program has at most 23 such files, and at most 6 in a baseline that uses
+  `noEmit`. `GOPORT_DTS_WALK_FALLBACK=0` runs Go's walk and Go's
+  signatures. `scripts/goport/t3-incremental-bench.sh` measures it.
+- When a changed file that affects the global scope gets a new d.ts
+  signature, every file makes its d.ts emit (Go
+  `handleDtsMayChangeOfAffectedFile`), one at a time, where Go runs them on
+  a work group (`collectAllAffectedFiles` loop 2). In T3 Code apps/web an
+  edit of a component with `declare global` takes about 2x a cold run, on
+  main and with the fallback (`t3-incremental-bench.sh -c web-global`, wall
+  medians of 5 runs: 2.40 -> 4.97 s on main, 2.42 -> 5.18 s with it).
 
 `program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
 `Program` methods as free functions with Go snake names (`get_resolved_module(file, name, mode)` ->

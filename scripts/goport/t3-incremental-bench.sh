@@ -13,7 +13,9 @@
 #                 contracts-brand   packages/contracts/src/baseSchemas.ts: ThreadId brand "ThreadId" -> "ThreadIdX"
 #                 contracts-field   packages/contracts/src/orchestrationV2.ts: optional field in OrchestrationV2AppThread
 #                 web-global        apps/web/src/browser/HostedBrowserWebview.tsx: a local const in a module
-#                                   with `declare global`, so every file of apps/web is affected (t3inc3)
+#                                   with `declare global`, so every file of apps/web is affected (t3inc3).
+#                                   About 2x a cold run: every file makes its d.ts emit, one at a time
+#                                   (PORTING.md, after the noEmit d.ts walk fallback)
 #   -p PROJECTS project dirs to check, comma separated (default: apps/server for server-config,
 #               packages/contracts for the contracts-* edits, apps/web for web-global). The contracts files
 #               are external library files (found through node_modules) in every other project, so only

@@ -9,17 +9,22 @@
 //!
 //! PORT: not in Go (t3inc1, t3inc3). In a `noEmit` program with more than
 //! `DTS_WALK_FILE_LIMIT` files, a changed file with a new d.ts signature
-//! skips Go's d.ts walk over its importers (`skips_dts_walk`), a changed
+//! skips Go's d.ts walk over its importers (`skips_dts_walk`), and a changed
 //! file with few importers skips its own d.ts emit
-//! (`uses_version_for_changed_file`), and a change that affects the global
-//! scope gives each file its version as signature
-//! (`handle_dts_may_change_of_affected_file`). The first two apply only when
-//! the pending emit stays Go's (`pending_emit_covers`); the third cannot
-//! change it, as every file is affected. So the build info differs from
-//! Go's only where Go reads the skipped d.ts emits: the `fileInfos`
-//! signatures, and the package.json files that only those emits look up
-//! (`packageJsons`, `missingPackageJsons`; T3 Code apps/web: 1 of 2,095).
-//! Both are what a fresh build stores.
+//! (`uses_version_for_changed_file`), when the pending emit stays Go's
+//! (`pending_emit_covers`). In the run that takes a rule, the build info
+//! differs from Go's only where Go reads the skipped d.ts emits: the
+//! `fileInfos` signatures (versions, as a fresh build stores) and the
+//! package.json files that only those emits look up (`packageJsons`,
+//! `missingPackageJsons`). In a later run, a change of a file that stores
+//! its version and keeps its d.ts counts as a new signature, so its closure
+//! is checked again, where Go checks only that file. When an emitting build
+//! without declarations came in between, that run also makes the files that
+//! import it pending (`affectedFilesPendingEmit`; Go: only that file), and
+//! the next emitting build writes them again, with the same bytes. A change
+//! that affects the global scope makes every file compute its d.ts
+//! signature, as in Go, except the files that a rule gave their version in
+//! the same run.
 
 use super::checker_access::*;
 use super::hash::FileInfo;
@@ -508,16 +513,7 @@ impl<'a> AffectedFilesHandler<'a> {
             // When a change affects the global scope, all files are considered to be affected without updating their signature
             // That means when affected file is handled, its signature can be out of date
             // To avoid this, ensure that we update the signature for any affected file in this scenario.
-            // PORT: not in Go (t3inc3, perf). Under `skips_dts_walk` the
-            // version is the signature, with no d.ts emit. Go emits the d.ts
-            // of every file here, on a work group; here they would run one at
-            // a time (T3 Code apps/web: 6.5 s against 3.2 s for a cold run).
-            // Every file is affected, so every file is checked again and gets
-            // the full pending emit kind either way: only the stored
-            // signatures differ from Go. They are versions, as after a fresh
-            // build, so a later change of a file always counts as a new
-            // signature.
-            self.update_shape_signature(affected_file, self.skips_dts_walk());
+            self.update_shape_signature(affected_file, false);
             return;
         }
 
@@ -1241,24 +1237,24 @@ mod tests {
     }
 
     // t3inc3: a change of `a.ts`, which affects the global scope, makes every
-    // file affected. Each one then gets its version as signature, where Go
-    // computes its d.ts. Every file gets the full pending emit kind either
-    // way, so this holds after an emit too.
+    // file affected, and each one computes its d.ts signature, as in Go
+    // (`handleDtsMayChangeOfAffectedFile`), also where every file is pending
+    // and the other rules apply. A later change of a file that keeps its d.ts
+    // then checks only that file.
     #[test]
-    fn no_emit_global_change_uses_versions() {
+    fn no_emit_global_change_computes_signatures() {
         let project = Project {
             importers: 3,
             others: DTS_WALK_FILE_LIMIT,
             global: true,
-            after_emit: true,
             ..Project::default()
         };
         check_no_emit_change_of_a(
             "no-emit-global",
             project,
             SignatureUpdateKind::ComputedDts,
-            SignatureUpdateKind::UsedVersion,
-            Some(SignatureUpdateKind::UsedVersion),
+            SignatureUpdateKind::ComputedDts,
+            Some(SignatureUpdateKind::ComputedDts),
         );
     }
 }

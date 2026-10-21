@@ -1153,7 +1153,8 @@ const NO_EMIT_LARGE_OPTIONS: &str =
 /// output must equal a fresh run of the same files, and a second project
 /// that runs Go's walk (`GOPORT_DTS_WALK_FALLBACK=0`) must report the same.
 /// The two build infos may differ only in `fileInfos`, where the closures
-/// store their versions.
+/// store their versions, until a global change makes every file compute its
+/// d.ts signature.
 // PORT: no Go counterpart; Go always runs the walk.
 #[test]
 fn no_emit_large_project_reports_like_fresh_runs() {
@@ -1198,10 +1199,14 @@ fn no_emit_large_project_reports_like_fresh_runs() {
             "{step}: build info outside fileInfos in {at}"
         );
         // The build info writes a signature only where it is not the
-        // version. In the fallback only `a.ts` and `g.ts` get one (`b0.ts`
-        // has one importer, so it uses its version); Go's walk gives one to
-        // at least each importer of `a.ts`.
+        // version. Until the global change, only `a.ts` gets one in the
+        // fallback (`b0.ts` has one importer, so it uses its version); Go's
+        // walk gives one to at least each importer of `a.ts`.
         let signatures = |info: &str| info.matches("\"signature\":").count();
+        let Some(fallback_signatures) = fallback_signatures else {
+            assert_eq!(fallback_info, walk_info, "{step}: build info in {at}");
+            continue;
+        };
         assert_eq!(
             signatures(&fallback_info),
             fallback_signatures,
@@ -1218,45 +1223,46 @@ fn no_emit_large_project_reports_like_fresh_runs() {
 }
 
 /// The steps of `no_emit_large_project_reports_like_fresh_runs`: (step, file,
-/// its text, error lines, signatures in the fallback's build info).
+/// its text, error lines, signatures in the fallback's build info). `None`:
+/// the whole build info is Go's, the signatures too.
 ///
 /// A change of `Shape` that gives the 40 indirect importers an error, its
 /// revert, an error in `a.ts` that keeps its d.ts, its fix, a second change
 /// of `Shape`, a change of `b0.ts` (only `c0.ts` imports it) that gives
 /// `c0.ts` an error, its revert and a run with no change. Then (t3inc3) a
 /// change of `g.ts`, which affects the global scope, so every file is checked
-/// again and stores its version; its revert; and an edit of `a.ts` that
-/// keeps its d.ts, which the fallback must now check with its whole closure
-/// (its stored signature is its version), where Go checks only `a.ts`.
-fn no_emit_large_steps() -> Vec<(&'static str, &'static str, String, usize, usize)> {
+/// again and computes its d.ts signature, as in Go; its revert; and an edit
+/// of `a.ts` that keeps its d.ts, which then checks only `a.ts`, as in Go (a
+/// walk skip would store the versions of its closure).
+fn no_emit_large_steps() -> Vec<(&'static str, &'static str, String, usize, Option<usize>)> {
     let a = no_emit_large_a;
     let (a_ts, b0_ts, g_ts) = ("src/a.ts", "src/b0.ts", "src/g.ts");
     let wide = 1 + NO_EMIT_LARGE_IMPORTERS;
     vec![
-        ("cold", a_ts, a("x: number", "1"), 1, 0),
-        ("wide change", a_ts, a("x: string", "\"1\""), wide, 1),
-        ("revert", a_ts, a("x: number", "1"), 1, 1),
-        ("error in a.ts", a_ts, a("x: number", "\"1\""), 2, 1),
-        ("fix", a_ts, a("x: number", "1"), 1, 1),
+        ("cold", a_ts, a("x: number", "1"), 1, Some(0)),
+        ("wide change", a_ts, a("x: string", "\"1\""), wide, Some(1)),
+        ("revert", a_ts, a("x: number", "1"), 1, Some(1)),
+        ("error in a.ts", a_ts, a("x: number", "\"1\""), 2, Some(1)),
+        ("fix", a_ts, a("x: number", "1"), 1, Some(1)),
         (
             "second wide change",
             a_ts,
             a("x: number; y?: number", "1"),
             1,
-            1,
+            Some(1),
         ),
         (
             "narrow change",
             b0_ts,
             "export const v0 = { x: \"0\" };\n".into(),
             2,
-            1,
+            Some(1),
         ),
-        ("narrow revert", b0_ts, no_emit_large_b(0), 1, 1),
-        ("no change", b0_ts, no_emit_large_b(0), 1, 1),
-        ("global change", g_ts, no_emit_large_g("string"), 2, 1),
-        ("global revert", g_ts, no_emit_large_g("number"), 1, 1),
-        ("same d.ts", a_ts, a("x: number; y?: number", "2"), 1, 2),
+        ("narrow revert", b0_ts, no_emit_large_b(0), 1, Some(1)),
+        ("no change", b0_ts, no_emit_large_b(0), 1, Some(1)),
+        ("global change", g_ts, no_emit_large_g("string"), 2, None),
+        ("global revert", g_ts, no_emit_large_g("number"), 1, None),
+        ("same d.ts", a_ts, a("x: number; y?: number", "2"), 1, None),
     ]
 }
 
