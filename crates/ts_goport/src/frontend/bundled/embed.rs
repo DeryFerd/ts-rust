@@ -18,19 +18,19 @@ use crate::frontend::prelude::*;
 use std::sync::OnceLock;
 use std::time::SystemTime;
 
-// Go: embed.go:13 embedded
+// Go: embed.go:14 embedded
 // PORT: renamed; the Go names `Embedded` and `embedded` share a snake name.
 pub(super) const EMBEDDED_UNEXPORTED: bool = true;
 
-// Go: embed.go:15 scheme
+// Go: embed.go:16 scheme
 const SCHEME: &str = "bundled:///";
 
-// Go: embed.go:17 splitPath
+// Go: embed.go:18 splitPath
 fn split_path(path: &str) -> Option<&str> {
     path.strip_prefix(SCHEME)
 }
 
-// Go: embed.go:21 libPath
+// Go: embed.go:22 libPath
 pub fn lib_path() -> String {
     format!("{SCHEME}libs")
 }
@@ -43,7 +43,7 @@ pub fn bundled_text(path: &str) -> Option<&'static str> {
     embedded_contents(split_path(path)?)
 }
 
-// Go: embed.go:25 IsBundled
+// Go: embed.go:26 IsBundled
 pub fn is_bundled(path: &str) -> bool {
     split_path(path).is_some()
 }
@@ -96,7 +96,7 @@ pub fn bundled_lib_name(path: &str) -> Option<&str> {
 // what go:embed does under the hood, but going through fs.FS will cause
 // copying to []byte and back.
 
-// Go: embed.go:35 wrappedFS
+// Go: embed.go:36 wrappedFS
 struct WrappedFs {
     fs: Rc<dyn Fs>,
 }
@@ -107,7 +107,7 @@ thread_local! {
     static WRAPPED_OS_FS: std::cell::OnceCell<Rc<dyn Fs>> = const { std::cell::OnceCell::new() };
 }
 
-// Go: embed.go:41 wrapFS
+// Go: embed.go:42 wrapFS
 // PERF: the wrapper of the OS file system is one value per thread, so
 // `is_wrapped_os_fs` can know it (see there).
 pub fn wrap_fs(fs: Rc<dyn Fs>) -> Rc<dyn Fs> {
@@ -128,12 +128,12 @@ pub fn is_wrapped_os_fs(fs: &Rc<dyn Fs>) -> bool {
 }
 
 impl Fs for WrappedFs {
-    // Go: embed.go:45 UseCaseSensitiveFileNames
+    // Go: embed.go:45 UseCaseSensitiveFileNames (at 673a5f17d713; ts#64159 makes it CaseSensitivity, bundled/embed.go:46)
     fn use_case_sensitive_file_names(&self) -> bool {
         self.fs.use_case_sensitive_file_names()
     }
 
-    // Go: embed.go:49 FileExists
+    // Go: embed.go:50 FileExists
     fn file_exists(&self, path: &str) -> bool {
         if let Some(rest) = split_path(path) {
             return embedded_len(rest).is_some();
@@ -141,7 +141,7 @@ impl Fs for WrappedFs {
         self.fs.file_exists(path)
     }
 
-    // Go: embed.go:57 ReadFile
+    // Go: embed.go:58 ReadFile
     // PORT: Go returns the embedded string without a copy. The `Fs` trait
     // returns an owned String, so the text is copied.
     fn read_file(&self, path: &str) -> (String, bool) {
@@ -154,7 +154,7 @@ impl Fs for WrappedFs {
         self.fs.read_file(path)
     }
 
-    // Go: embed.go:65 DirectoryExists
+    // Go: embed.go:66 DirectoryExists
     fn directory_exists(&self, path: &str) -> bool {
         if let Some(rest) = split_path(path) {
             return rest == "libs";
@@ -162,7 +162,7 @@ impl Fs for WrappedFs {
         self.fs.directory_exists(path)
     }
 
-    // Go: embed.go:72 GetAccessibleEntries
+    // Go: embed.go:73 GetAccessibleEntries
     // PORT: Go leaves `Symlinks` nil here; that is `None`.
     fn get_accessible_entries(&self, path: &str) -> Entries {
         let mut result = Entries::default();
@@ -177,7 +177,7 @@ impl Fs for WrappedFs {
         self.fs.get_accessible_entries(path)
     }
 
-    // Go: embed.go:84 Stat
+    // Go: embed.go:85 Stat
     fn stat(&self, path: &str) -> Option<FileInfo> {
         if let Some(rest) = split_path(path) {
             if rest.is_empty() || rest == "libs" {
@@ -192,7 +192,7 @@ impl Fs for WrappedFs {
         self.fs.stat(path)
     }
 
-    // Go: embed.go:98 Realpath
+    // Go: embed.go:99 Realpath
     fn realpath(&self, path: &str) -> String {
         if split_path(path).is_some() {
             return path.to_string();
@@ -200,7 +200,7 @@ impl Fs for WrappedFs {
         self.fs.realpath(path)
     }
 
-    // Go: embed.go:105 WriteFile
+    // Go: embed.go:106 WriteFile
     fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         if split_path(path).is_some() {
             panic!("cannot write to embedded file system");
@@ -208,7 +208,7 @@ impl Fs for WrappedFs {
         self.fs.write_file(path, data)
     }
 
-    // Go: embed.go:112 AppendFile
+    // Go: embed.go:113 AppendFile
     fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
         if split_path(path).is_some() {
             panic!("cannot write to embedded file system");
@@ -216,7 +216,7 @@ impl Fs for WrappedFs {
         self.fs.append_file(path, data)
     }
 
-    // Go: embed.go:119 Remove
+    // Go: embed.go:120 Remove
     fn remove(&self, path: &str) -> Result<(), FsError> {
         if split_path(path).is_some() {
             panic!("cannot remove from embedded file system");
@@ -224,7 +224,7 @@ impl Fs for WrappedFs {
         self.fs.remove(path)
     }
 
-    // Go: embed.go:126 Chtimes
+    // Go: embed.go:127 Chtimes
     fn chtimes(
         &self,
         path: &str,
@@ -238,7 +238,7 @@ impl Fs for WrappedFs {
     }
 }
 
-// Go: embed.go:133 fileInfo
+// Go: embed.go:134 fileInfo
 // PORT: the Go `fileInfo` type is the shared `FileInfo` value. Its
 // `ModTime` is the Go zero time (`None`) and `Info()` returns itself
 // (`DirEntryInfo::Known`).
@@ -251,7 +251,7 @@ fn new_file_info(name: &str, mode: FileMode, size: i64) -> FileInfo {
     }
 }
 
-// Go: embed_generated.go:238 embeddedContents
+// Go: embed_generated.go:242 embeddedContents
 // PORT: the Go map is built once from `EMBEDDED_CONTENTS`.
 #[cfg(not(target_family = "wasm"))]
 fn embedded_contents(rest: &str) -> Option<&'static str> {
@@ -266,40 +266,34 @@ fn embedded_contents(rest: &str) -> Option<&'static str> {
     .copied()
 }
 
-// Go: embed_generated.go:238 embeddedContents
+// Go: embed_generated.go:242 embeddedContents
 // PORT: wasm unpacks the one stream of build.rs (`libs.lzma`, the libs in
-// `PACKED_LIBS` order) up to lib `rest`, and keeps each text it unpacks for
-// the life of the process. The reader stays too, with its 3.8 MB window
-// (one stream per lib needed at most 2.35 MB, for lib.dom.d.ts, at a time).
+// `PACKED_LIBS` order) on first use, all of it, and keeps the texts for the
+// life of the process. The reader goes with its 3.8 MB window. Unpacking
+// only up to the lib asked for kept the reader, and saved little: lib.es5,
+// which every program reads, is near the end of the stream.
 #[cfg(target_family = "wasm")]
 fn embedded_contents(rest: &str) -> Option<&'static str> {
     use std::io::Read;
-    use std::sync::{Mutex, PoisonError};
-    struct Unpacked {
-        reader: lzma_rust2::LzmaReader<&'static [u8]>,
-        texts: Vec<&'static str>,
-    }
-    static UNPACKED: Mutex<Option<Unpacked>> = Mutex::new(None);
+    static TEXTS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     let index = packed_lib_index(rest)?;
-    let mut unpacked = UNPACKED.lock().unwrap_or_else(PoisonError::into_inner);
-    let unpacked = unpacked.get_or_insert_with(|| {
+    let texts = TEXTS.get_or_init(|| {
         let packed: &'static [u8] = include_bytes!(concat!(env!("OUT_DIR"), "/libs.lzma"));
-        Unpacked {
-            reader: lzma_rust2::LzmaReader::new_mem_limit(packed, u32::MAX, None)
-                .expect("build.rs packs the libs"),
-            texts: Vec::new(),
-        }
-    });
-    while unpacked.texts.len() <= index {
-        let mut text = vec![0; PACKED_LIBS[unpacked.texts.len()].1];
-        unpacked
-            .reader
-            .read_exact(&mut text)
+        let mut reader = lzma_rust2::LzmaReader::new_mem_limit(packed, u32::MAX, None)
             .expect("build.rs packs the libs");
-        let text = String::from_utf8(text).expect("a lib is UTF-8");
-        unpacked.texts.push(Box::leak(text.into_boxed_str()));
-    }
-    Some(unpacked.texts[index])
+        PACKED_LIBS
+            .iter()
+            .map(|&(_, len)| {
+                let mut text = vec![0; len];
+                reader
+                    .read_exact(&mut text)
+                    .expect("build.rs packs the libs");
+                let text = String::from_utf8(text).expect("a lib is UTF-8");
+                &*Box::leak(text.into_boxed_str())
+            })
+            .collect()
+    });
+    Some(texts[index])
 }
 
 /// The size of lib `rest` (`embedded_contents`) in bytes.
@@ -494,6 +488,8 @@ static EMBEDDED_CONTENTS: &[EmbeddedLib] = &[
     bundled_lib!("lib.esnext.disposable.d.ts"),
     bundled_lib!("lib.esnext.full.d.ts"),
     bundled_lib!("lib.esnext.intl.d.ts"),
+    bundled_lib!("lib.esnext.modulesource.d.ts"),
+    bundled_lib!("lib.esnext.promise.d.ts"),
     bundled_lib!("lib.esnext.sharedmemory.d.ts"),
     bundled_lib!("lib.esnext.temporal.d.ts"),
     bundled_lib!("lib.scripthost.d.ts"),

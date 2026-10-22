@@ -507,8 +507,11 @@ impl dirty::Cloneable for Rc<RefCell<Directory>> {
     }
 }
 
-// Go: ls/autoimport/registry.go:328 Registry
+// Go: ls/autoimport/registry.go:327 Registry
 // PORT: Go `func(fileName string) tspath.Path` is `Rc<dyn Fn(&str) -> tspath::Path>`.
+// ts#64159 (behavior only) replaces `toPath` with `caseSensitivity`
+// (registry.go:328) and `caseSensitivity.PathKey(...)`; `to_path` gives the
+// same key for the rooted names the registry reads.
 // Go `*collections.SyncMap[tspath.Path, string]` specifier caches are
 // `Rc<RefCell<FxHashMap<tspath::Path, String>>>` (shared between registries).
 pub struct Registry {
@@ -734,12 +737,15 @@ impl Registry {
     }
 }
 
-// Go: ls/autoimport/registry.go:487 RegistryChange
+// Go: ls/autoimport/registry.go:486 RegistryChange
 // PORT: Go `collections.Set[lsproto.DocumentUri]` values are `FxHashSet`;
 // Go `*lsutil.UserPreferences` is `Option` (nil is `None`).
 #[derive(Clone, Debug, Default)]
 pub struct RegistryChange {
     pub requested_file: tspath::Path,
+    // ts#64554: the file name of `requested_file`; its directories are needed
+    // (registry.go:488, :590).
+    pub requested_file_name: String,
     pub open_files: FxHashMap<tspath::Path, String>,
     pub changed: FxHashSet<lsproto::DocumentUri>,
     pub created: FxHashSet<lsproto::DocumentUri>,
@@ -770,7 +776,12 @@ pub fn should_stop_build(ctx: &Context) -> bool {
 
 // Go: ls/autoimport/registry.go:500 RegistryCloneHost
 // PORT: Go embeds `module.ResolutionHost` and repeats its `FS()`; both come
-// from the supertrait (`fs`, `get_current_directory`). Go
+// from the supertrait (`fs`, `get_current_directory`). ts#64159 drops the
+// embedded host: `Registry.Clone` takes the current directory
+// (registry.go:392, project/snapshot.go:669 `store.options.CurrentDirectory`)
+// and the builder resolves through `resolutionHost{fs, currentDirectory}`.
+// The project host's `get_current_directory` is that same directory
+// (project/autoimport.rs), so the port keeps the supertrait. Go
 // `*compiler.Program` is `Rc<compiler::NewProgram>` (nil is `None`), Go
 // `*packagejson.InfoCacheEntry` is `Option<Rc<..>>`, and Go `*ast.SourceFile`
 // is `Node` (`Node::NIL` for nil). The project area implements it
@@ -870,27 +881,38 @@ impl RegistryBuilder {
         let start = Instant::now();
         let mut needed_projects: FxHashMap<ProjectID, ()> = FxHashMap::default();
         let mut needed_directories: FxHashMap<tspath::Path, String> = FxHashMap::default();
-        for (path, file_name) in &change.open_files {
-            if let (Some(project_id), _) = self.host.get_default_project(path) {
-                needed_projects.insert(project_id, ());
-            }
+        // Go: ls/autoimport/registry.go:558 addNeededDirectories (ts#64554)
+        let add_needed_directories = |needed_directories: &mut FxHashMap<tspath::Path, String>,
+                                      path: &tspath::Path,
+                                      file_name: &str| {
             if tspath::is_dynamic_file_name(file_name) {
-                continue;
+                return;
             }
-            let mut dir = file_name.clone();
-            let mut dir_path = path.clone();
+            // ts#64159: registry.go:562-575 walks the file's directory and its
+            // parents, the key and the name side by side.
+            let mut dir = tspath::get_directory_path(file_name);
+            let mut dir_path = path.get_directory_path();
             loop {
-                dir = tspath::get_directory_path(&dir);
-                let last_dir_path = dir_path.clone();
-                dir_path = dir_path.get_directory_path();
-                if dir_path == last_dir_path {
-                    break;
-                }
                 if needed_directories.contains_key(&dir_path) {
                     break;
                 }
                 needed_directories.insert(dir_path.clone(), dir.clone());
+                let parent_path = dir_path.get_directory_path();
+                let parent_dir = tspath::get_directory_path(&dir);
+                if parent_path == dir_path || parent_dir == dir {
+                    break;
+                }
+                dir_path = parent_path;
+                dir = parent_dir;
             }
+        };
+        for (path, file_name) in &change.open_files {
+            if let (Some(project_id), _) = self.host.get_default_project(path) {
+                needed_projects.insert(project_id, ());
+            }
+            // ts#64159: a dynamic open file gets a specifier cache too
+            // (registry.go:578-587); `add_needed_directories` skips it.
+            add_needed_directories(&mut needed_directories, path, file_name);
 
             if !self.specifier_cache.has(path) {
                 self.specifier_cache
@@ -899,6 +921,12 @@ impl RegistryBuilder {
         }
 
         if !change.requested_file.is_empty() {
+            // ts#64554: registry.go:590
+            add_needed_directories(
+                &mut needed_directories,
+                &change.requested_file,
+                &change.requested_file_name,
+            );
             if let (Some(project_id), _) = self.host.get_default_project(&change.requested_file) {
                 needed_projects.insert(project_id, ());
             }
@@ -1136,9 +1164,13 @@ impl RegistryBuilder {
                     // For node_modules, mark the bucket dirty if anything changes in the directory.
                     // The path could be either a symlink path (containing /node_modules/) or a realpath
                     // (for symlinked project references). Both are recorded in Paths for granular updates.
-                    if let Some(node_modules_index) = path.find("/node_modules/") {
-                        let dir_path =
-                            tspath::Path(path.as_str()[..node_modules_index].to_string());
+                    // ts#64159: registry.go:749 `SplitAtCanonicalComponent`: a
+                    // "node_modules" component, also the last one (a deleted
+                    // node_modules directory), below the root.
+                    if let Some(dir_path) =
+                        split_before_canonical_component(&path.0, "node_modules")
+                    {
+                        let dir_path = tspath::Path(dir_path.to_string());
                         if clean_node_modules_buckets.contains(&dir_path) {
                             let entry = self
                                 .node_modules
@@ -1639,7 +1671,9 @@ impl RegistryBuilder {
                         &program
                             .as_deref()
                             .unwrap_or_else(|| crate::core::go_nil_dereference())
-                            .get_current_directory(),
+                            // ts#64159 (R1): registry.go:1050, the program's
+                            // base directory.
+                            .base_directory(),
                     ),
                 );
                 // Go: wg.Go(func() {...})
@@ -1740,9 +1774,13 @@ impl RegistryBuilder {
                     .possible_failed_ambient_module_lookup_sources
                     .as_ref()
                     .unwrap_or_else(|| crate::core::go_nil_dereference());
-                // PORT: Go reads each source file after NewChecker. Here they
-                // are read first, so the checker's arena holds them
-                // (`AliasResolver::new_checker`).
+                // PORT: Go reads each source file after NewChecker
+                // (registry.go:1122). Here they are read first, and the
+                // checker's program keeps them live with the root files
+                // (`AliasResolver::new_checker`), so the extraction reads
+                // them with no catch-up of the checker's arena. The order
+                // does not change the set of file system calls: each
+                // distinct call reaches the client once per clone.
                 let source_files: Vec<Node> = sources
                     .values()
                     .map(|source| alias_resolver.get_source_file(&source.borrow().file_name))
@@ -1791,6 +1829,35 @@ impl RegistryBuilder {
             }
             node_modules_logger.logf(&format!("Total: {:?}", discovery_start.elapsed()));
         }
+    }
+}
+
+// Go: tspath/pathkey.go:122 PathKey.SplitAtCanonicalComponent (ts#64159)
+/// The key before the first `component` below the root that is followed by a
+/// separator or the end, or `None`. Go also returns the key through it; the
+/// registry reads only this part.
+// PORT: a private copy until tspath has the ts#64159 typed path helpers.
+fn split_before_canonical_component<'a>(path: &'a str, component: &str) -> Option<&'a str> {
+    if component.is_empty()
+        || component.contains(['/', '\\'])
+        || component == "."
+        || component == ".."
+    {
+        crate::core::go_panic("invalid canonical path component".to_string());
+    }
+    let needle = format!("/{component}");
+    let root_length = tspath::get_root_length(path);
+    if root_length == 0 {
+        return None;
+    }
+    let mut offset = root_length - 1;
+    loop {
+        let index = path[offset..].find(&needle)? + offset;
+        let end = index + needle.len();
+        if end == path.len() || path.as_bytes()[end] == b'/' {
+            return Some(&path[..index.max(root_length)]);
+        }
+        offset = end;
     }
 }
 
@@ -1866,6 +1933,9 @@ pub fn has_symlink_to_node_modules(
     let directories_by_realpath = symlink_cache.directories_by_realpath();
     let mut found = false;
     file_path.for_each_ancestor_directory(|dir_path: tspath::Path| -> ((), bool) {
+        // PORT: Go N' (ts#64159, registry.go:1199) keys the directory links
+        // without a trailing separator; the Rust `KnownSymlinks` still keys
+        // them with one (modulespecifiers/symlinks.rs `set_directory`).
         let Some(symlink_paths) =
             directories_by_realpath.get(&dir_path.ensure_trailing_directory_separator())
         else {
@@ -1965,7 +2035,8 @@ impl RegistryBuilder {
             .get_program_for_project(project_id)
             .unwrap_or_else(|| crate::core::go_nil_dereference());
         let program = &*program;
-        let project_root_path = (self.base.to_path)(&program.get_current_directory());
+        // ts#64159 (R1): registry.go:1261, the program's base directory.
+        let project_root_path = (self.base.to_path)(&program.base_directory());
         let symlink_cache = program.get_symlink_cache();
         let (get_checker, close_pool, checker_count) = create_checker_pool(program);
         // PORT: Go map order is random; insertion (program file) order here.
@@ -2235,6 +2306,11 @@ impl RegistryBuilder {
                     .fs()
                     .realpath(&types_package_json.package_directory);
             }
+            // PORT: Go N' (ts#64159, registry.go:1428) compares path keys
+            // (`PathKey.ContainsPath`) of the builder's current directory and
+            // the realpath. Both are rooted and normalized, so the N
+            // `tspath.ContainsPath` gives the same answer; the host's current
+            // directory is the builder's (see `RegistryCloneHost`).
             let is_local = !realpath.is_empty()
                 && !realpath.contains("/node_modules/")
                 && tspath::contains_path(
@@ -2314,8 +2390,18 @@ impl RegistryBuilder {
             return None;
         }
 
-        // PORT: `result` is made for each checker below.
-        let mut is_symlinked = false;
+        let mut result = PerPackageExtractionResult {
+            package_files: FxHashMap::default(),
+            entrypoints: package_entrypoints.clone(),
+            exports: IndexMap::new(),
+            ambient_modules: FxHashMap::default(),
+            stats_exports: 0,
+            stats_used_checker: 0,
+            skipped_entrypoints,
+            is_symlinked: false,
+            failed_ambient_module_lookup_sources: Rc::new(RefCell::new(IndexMap::new())),
+            failed_ambient_module_lookup_targets: Rc::new(RefCell::new(IndexSet::new())),
+        };
 
         // Resolve entrypoint source files and build the alias resolver.
         let mut seen_files: FxHashSet<tspath::Path> = FxHashSet::default();
@@ -2346,7 +2432,7 @@ impl RegistryBuilder {
                         file_name: file_name.clone(),
                     },
                 );
-                is_symlinked = true;
+                result.is_symlinked = true;
             }
             // PORT: Go parses these files on goroutines, so a request never
             // waits for them. Here they run on the dispatch thread, and the
@@ -2370,135 +2456,98 @@ impl RegistryBuilder {
         }
         // Go: wg.Wait()
         root_files.retain(|f| f.is_some());
-        // PORT: see the check in the loop above. `new_checker` also reads the
-        // files that the root files import.
+        // PORT: see the check in the loop above.
         if ctx.err().is_some() {
             return None;
         }
 
-        // PERF: a checker with the narrow walk first
-        // (`AliasResolver::new_narrow_checker`). When it asks for a file
-        // outside the walk, that checker and every result of it are dropped,
-        // and the package is extracted again with the full walk. A narrow
-        // checker with no miss gives the results of the full walk.
-        for narrow in [true, false] {
-            let mut result = PerPackageExtractionResult {
-                package_files: FxHashMap::default(),
-                entrypoints: package_entrypoints.clone(),
-                exports: IndexMap::new(),
-                ambient_modules: FxHashMap::default(),
-                stats_exports: 0,
-                stats_used_checker: 0,
-                skipped_entrypoints,
-                is_symlinked,
-                failed_ambient_module_lookup_sources: Rc::new(RefCell::new(IndexMap::new())),
-                failed_ambient_module_lookup_targets: Rc::new(RefCell::new(IndexSet::new())),
-            };
-            let failed_targets = result.failed_ambient_module_lookup_targets.clone();
-            let failed_sources = result.failed_ambient_module_lookup_sources.clone();
-            let alias_resolver = new_alias_resolver(
-                root_files.clone(),
-                symlinks.clone(),
-                self.host.clone(),
-                resolver.clone(),
-                self.base.to_path.clone(),
-                Rc::new(move |source: &dyn HasFileName, module_name: &str| {
-                    failed_targets.borrow_mut().insert(module_name.to_string());
-                    let source_path = source.path();
-                    let exists = failed_sources.borrow().contains_key(&source_path);
-                    if !exists {
-                        failed_sources.borrow_mut().insert(
-                            source_path,
-                            Rc::new(RefCell::new(FailedAmbientModuleLookupSource {
-                                file_name: source.file_name(),
-                                package_name: String::new(),
-                            })),
-                        );
-                    }
-                }),
-            );
+        let failed_targets = result.failed_ambient_module_lookup_targets.clone();
+        let failed_sources = result.failed_ambient_module_lookup_sources.clone();
+        let alias_resolver = new_alias_resolver(
+            root_files,
+            symlinks,
+            self.host.clone(),
+            resolver.clone(),
+            self.base.to_path.clone(),
+            Rc::new(move |source: &dyn HasFileName, module_name: &str| {
+                failed_targets.borrow_mut().insert(module_name.to_string());
+                let source_path = source.path();
+                let exists = failed_sources.borrow().contains_key(&source_path);
+                if !exists {
+                    failed_sources.borrow_mut().insert(
+                        source_path,
+                        Rc::new(RefCell::new(FailedAmbientModuleLookupSource {
+                            file_name: source.file_name(),
+                            package_name: String::new(),
+                        })),
+                    );
+                }
+            }),
+        );
 
-            // PORT: `None` only for a stopped build (`should_stop_build`).
-            let (ch, _alias_program) = if narrow {
-                alias_resolver.new_narrow_checker(ctx)?
-            } else {
-                alias_resolver.new_checker(ctx, &[])?
-            };
-            let mut ch_ref = ch.borrow_mut();
-            let mut extractor = self.new_export_extractor(
-                package_name,
-                &mut ch_ref,
-                resolver.clone(),
-                Some(to_realpath.clone()),
-            );
+        // PORT: `None` only for a stopped build (`should_stop_build`).
+        let (ch, _alias_program) = alias_resolver.new_checker(ctx, &[])?;
+        let mut ch_ref = ch.borrow_mut();
+        let mut extractor =
+            self.new_export_extractor(package_name, &mut ch_ref, resolver, Some(to_realpath));
 
-            let mut non_module_files: FxHashSet<tspath::Path> = FxHashSet::default();
-            for entrypoint in alias_resolver.root_files.clone() {
-                if ctx.err().is_some() {
-                    return None;
-                }
-                let file_exports = extractor.extract_from_file(entrypoint);
-                if alias_resolver.missed.get() {
-                    break;
-                }
-                let entrypoint_path = tspath::Path(source_file_info(entrypoint).path.clone());
-                let entrypoint_file_name = source_file_file_name(entrypoint).to_string();
-                for name in &source_file_info(entrypoint).ambient_module_names {
-                    result
-                        .ambient_modules
-                        .entry(name.clone())
-                        .or_default()
-                        .push(entrypoint_file_name.clone());
-                }
+        let mut non_module_files: FxHashSet<tspath::Path> = FxHashSet::default();
+        for entrypoint in alias_resolver.root_files.clone() {
+            if ctx.err().is_some() {
+                return None;
+            }
+            let file_exports = extractor.extract_from_file(entrypoint);
+            let entrypoint_path = tspath::Path(source_file_info(entrypoint).path.clone());
+            let entrypoint_file_name = source_file_file_name(entrypoint).to_string();
+            for name in &source_file_info(entrypoint).ambient_module_names {
+                result
+                    .ambient_modules
+                    .entry(name.clone())
+                    .or_default()
+                    .push(entrypoint_file_name.clone());
+            }
+            result
+                .package_files
+                .insert(entrypoint_path.clone(), entrypoint_file_name.clone());
+            let symlink = alias_resolver.symlinks.get(&entrypoint_path).cloned();
+            if let Some(symlink) = &symlink {
                 result
                     .package_files
-                    .insert(entrypoint_path.clone(), entrypoint_file_name.clone());
-                let symlink = alias_resolver.symlinks.get(&entrypoint_path).cloned();
+                    .insert(symlink.path.clone(), symlink.file_name.clone());
+            }
+
+            let external_module_indicator = source_file_info(entrypoint).external_module_indicator;
+            let mut has_exports = !file_exports.is_empty() && external_module_indicator.is_some();
+            let source = result
+                .failed_ambient_module_lookup_sources
+                .borrow()
+                .get(&entrypoint_path)
+                .cloned();
+            if let Some(source) = source {
+                source.borrow_mut().package_name = package_name.to_string();
+                has_exports = external_module_indicator.is_some();
+            } else {
+                result.exports.insert(entrypoint_path.clone(), file_exports);
+            }
+
+            if !has_exports {
+                non_module_files.insert(entrypoint_path.clone());
                 if let Some(symlink) = &symlink {
-                    result
-                        .package_files
-                        .insert(symlink.path.clone(), symlink.file_name.clone());
-                }
-
-                let external_module_indicator =
-                    source_file_info(entrypoint).external_module_indicator;
-                let mut has_exports =
-                    !file_exports.is_empty() && external_module_indicator.is_some();
-                let source = result
-                    .failed_ambient_module_lookup_sources
-                    .borrow()
-                    .get(&entrypoint_path)
-                    .cloned();
-                if let Some(source) = source {
-                    source.borrow_mut().package_name = package_name.to_string();
-                    has_exports = external_module_indicator.is_some();
-                } else {
-                    result.exports.insert(entrypoint_path.clone(), file_exports);
-                }
-
-                if !has_exports {
-                    non_module_files.insert(entrypoint_path.clone());
-                    if let Some(symlink) = &symlink {
-                        non_module_files.insert(symlink.path.clone());
-                    }
+                    non_module_files.insert(symlink.path.clone());
                 }
             }
-            if alias_resolver.missed.get() {
-                continue;
-            }
-
-            // Discard entrypoints for non-module files and empty modules.
-            // Go: slices.DeleteFunc
-            result.entrypoints.retain(|ep| {
-                !non_module_files.contains(&(self.base.to_path)(&ep.resolved_file_name))
-            });
-
-            let stats = extractor.stats();
-            result.stats_exports = stats.exports.get();
-            result.stats_used_checker = stats.used_checker.get();
-            return Some(Rc::new(result));
         }
-        unreachable!("a checker with the full walk sets no miss")
+
+        // Discard entrypoints for non-module files and empty modules.
+        // Go: slices.DeleteFunc, by `ResolvedPath` (registry.go:1569)
+        result
+            .entrypoints
+            .retain(|ep| !non_module_files.contains(&ep.resolved_path));
+
+        let stats = extractor.stats();
+        result.stats_exports = stats.exports.get();
+        result.stats_used_checker = stats.used_checker.get();
+        Some(Rc::new(result))
     }
 }
 
@@ -2685,10 +2734,10 @@ impl RegistryBuilder {
         }
         for entrypoint_set in &extraction.entrypoints {
             for entrypoint in entrypoint_set {
-                let path = (self.base.to_path)(&entrypoint.resolved_file_name);
+                // ts#64159 (registry.go:1687): Go keys by `ResolvedPath`.
                 result
                     .entrypoints
-                    .entry(path)
+                    .entry(entrypoint.resolved_path.clone())
                     .or_default()
                     .push(entrypoint.clone());
             }
@@ -2845,9 +2894,9 @@ impl RegistryBuilder {
             FxHashMap::default();
         for entrypoint_set in &extraction.entrypoints {
             for entrypoint in entrypoint_set {
-                let path = (self.base.to_path)(&entrypoint.resolved_file_name);
+                // ts#64159 (registry.go:1800): Go keys by `ResolvedPath`.
                 new_entrypoints
-                    .entry(path)
+                    .entry(entrypoint.resolved_path.clone())
                     .or_default()
                     .push(entrypoint.clone());
             }

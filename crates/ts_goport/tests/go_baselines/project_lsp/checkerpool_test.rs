@@ -165,7 +165,7 @@ child_test! {
 }
 
 child_test! {
-    // Go: checkerpool_test.go:87 TestCheckerPoolRequestAffinity
+    // Go: checkerpool_test.go:88 TestCheckerPoolRequestAffinity (ts#64543)
     fn request_affinity() {
         let (_session, pool) = setup_checker_pool_session(opts(4, 10));
 
@@ -175,18 +175,69 @@ child_test! {
         // First call acquires.
         let (c1, release1) = pool.get_checker(&ctx, NIL);
 
-        // Second call with same request ID while still held returns same checker (noop release).
-        let (c2, release2) = pool.get_checker(&ctx, NIL);
-        release2.call();
         release1.call();
 
-        assert!(same(&c1, &c2), "same request ID should return the same checker while held");
-
         // After release, same request should still get the same checker (cross-release affinity).
-        let (c3, release3) = pool.get_checker(&ctx, NIL);
-        release3.call();
+        let (c2, release2) = pool.get_checker(&ctx, NIL);
+        release2.call();
 
-        assert!(same(&c1, &c3), "same request ID should return the same checker after release");
+        assert!(same(&c1, &c2), "same request ID should return the same checker after release");
+        cancel();
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:109 TestCheckerPoolSameRequestContention (ts#64543)
+    // PORT: one thread. Go's second acquisition blocks in a goroutine until
+    // the first is released; here it is `unreachable!` on the full
+    // semaphore (the persistent one for "api"), so the test checks that it
+    // does not return the held checker, then that the acquisition after the
+    // release gets the same checker. Go runs the subtests in parallel.
+    fn same_request_contention() {
+        let (session, _) = setup_checker_pool_session(opts(2, 10));
+        let p = program(&session, "file:///src/index.ts");
+        for (name, lifetime) in [
+            ("diagnostics", CheckerLifetime::DIAGNOSTICS),
+            ("query", CheckerLifetime::TEMPORARY),
+            ("api", CheckerLifetime::API),
+        ] {
+            let pool = new_test_checker_pool(&p, opts(2, 0));
+            let (req_ctx, cancel) = context::with_cancel(&bg());
+            let ctx = req(&req_ctx, "same-request", lifetime);
+
+            let (c1, release1) = pool.get_checker(&ctx, NIL);
+            let blocked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pool.get_checker(&ctx, NIL)
+            }));
+            assert!(
+                blocked.is_err(),
+                "{name}: the request ID must not bypass exclusive acquisition"
+            );
+            release1.call();
+            let (c2, release2) = pool.get_checker(&ctx, NIL);
+            assert!(same(&c1, &c2), "{name}");
+            release2.call();
+            cancel();
+        }
+    }
+}
+
+child_test! {
+    // Go: checkerpool_test.go:151 TestCheckerPoolSameRequestConcurrentQueries (ts#64543)
+    // PORT: the semaphore is private; Go's `len(pool.querySem) == 2` is
+    // checked as two held query slots.
+    fn same_request_concurrent_queries() {
+        let (_session, pool) = setup_checker_pool_session(opts(3, 10));
+        let (req_ctx, cancel) = context::with_cancel(&bg());
+        let ctx = req(&req_ctx, "same-request", CheckerLifetime::TEMPORARY);
+
+        let (c1, release1) = pool.get_checker(&ctx, NIL);
+        let (c2, release2) = pool.get_checker(&ctx, NIL);
+        assert!(!same(&c1, &c2), "overlapping acquisitions must use different checkers");
+        let held = pool.held_by.borrow().iter().skip(1).filter(|h| !h.is_empty()).count();
+        assert_eq!(held, 2, "each acquisition must hold its own slot");
+        release2.call();
+        release1.call();
         cancel();
     }
 }
@@ -813,7 +864,7 @@ child_test! {
 /// The idle timeout of the timer tests. Go uses 5 s and 10 s of fake time.
 /// It is long enough that a loaded host does not reach it between a release
 /// and the next check.
-const IDLE: Duration = Duration::from_millis(1000);
+const IDLE: Duration = Duration::from_secs(1);
 
 fn idle_opts(max_checkers: i32, idle_timeout: Duration) -> CheckerPoolOptions {
     CheckerPoolOptions {

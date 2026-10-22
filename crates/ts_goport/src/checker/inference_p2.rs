@@ -149,7 +149,8 @@ impl Checker {
         if source.is_nil() || target.is_nil() || constraint.is_nil() {
             // Go reads `source.id`, `target.id` and `constraint.id`: a
             // reverse mapped symbol of another checker has no links here.
-            go_nil_dereference();
+            // Go N' loads `id` (offset 8) of each: addr=0x8 (inference.go:1078).
+            crate::core::go_nil_dereference_at(0x8);
         }
         let key = ReverseMappedTypeKey {
             source_id: source,
@@ -855,11 +856,15 @@ impl Checker {
                 let non_fixing_mapper = self.inference_context(n).non_fixing_mapper;
                 let instantiated_constraint = self.instantiate_type(constraint, non_fixing_mapper);
                 let compare_types = self.inference_context(n).compare_types.clone();
+                // A pure return type inference is still filtered in a recursive call resolution, whose result can become the type of the enclosing declaration.
+                // (ts#64530, Go N' inference.go:1393)
                 if inferred_type.is_some()
-                    && !self
+                    && (!self
                         .inference_context(n)
                         .flags
                         .intersects(InferenceFlags::NO_CONSTRAINT_CHECKS)
+                        || self.inference_context(n).inferences[index].priority
+                            == InferencePriority::RETURN_TYPE)
                 {
                     let constraint_with_this = self.get_type_with_this_argument(
                         instantiated_constraint,
@@ -1334,6 +1339,8 @@ pub fn clone_inference_info(info: &InferenceInfo) -> InferenceInfo {
     InferenceInfo {
         type_parameter: info.type_parameter,
         candidate_lists: info.candidate_lists.clone(),
+        first_candidate: info.first_candidate,
+        first_is_contra: info.first_is_contra,
         inferred_type: info.inferred_type,
         priority: info.priority,
         top_level: info.top_level,

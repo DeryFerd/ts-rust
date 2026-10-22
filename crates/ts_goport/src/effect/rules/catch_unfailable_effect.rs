@@ -7,13 +7,13 @@ use crate::effect::typeparser::*;
 use crate::prelude::*;
 
 /// Go `catchFunctions`: the Effect module catch functions to check (V3 and V4).
-static CATCH_FUNCTIONS: &[&str] = &[
-    "catch",
-    "catchAll",
-    "catchIf",
-    "catchSome",
-    "catchTag",
-    "catchTags",
+static CATCH_FUNCTIONS: [ExportMember; 6] = [
+    ExportMember::new("catch"),
+    ExportMember::new("catchAll"),
+    ExportMember::new("catchIf"),
+    ExportMember::new("catchSome"),
+    ExportMember::new("catchTag"),
+    ExportMember::new("catchTags"),
 ];
 
 // Go: rules.CatchUnfailableEffect
@@ -82,7 +82,7 @@ fn run_catch_unfailable_effect(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic>
 // Go: rules.isCatchCallee
 /// isCatchCallee checks if a node references one of the Effect module catch functions.
 fn is_catch_callee(tp: &mut TypeParser<'_>, node: Node) -> bool {
-    for name in CATCH_FUNCTIONS {
+    for name in &CATCH_FUNCTIONS {
         if tp.is_node_reference_to_effect_module_api(node, name) {
             return true;
         }

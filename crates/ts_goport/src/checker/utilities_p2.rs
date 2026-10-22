@@ -74,8 +74,11 @@ pub fn is_variable_declaration_in_variable_statement(node: Node) -> bool {
 
 impl Checker {
     // Go: checker/utilities.go:1018 IsKnownSymbol
+    // PERF: intern1 fix 2. A name that is not internal is not late bound,
+    // with no text read.
     pub fn is_known_symbol(&self, symbol: SymbolId) -> bool {
-        is_late_bound_name(&self.sym(symbol).name)
+        let name = &self.sym(symbol).name;
+        name.is_internal() && is_late_bound_name(name)
     }
 
     // Go: checker/utilities.go:1022 IsPrivateIdentifierSymbol
@@ -350,15 +353,26 @@ pub fn get_members_of_declaration(node: Node) -> Vec<Node> {
 }
 
 // Go: checker/utilities.go:1150 isInRightSideOfImportOrExportAssignment
-pub fn is_in_right_side_of_import_or_export_assignment(mut node: Node) -> bool {
-    while node.parent().kind() == SyntaxKind::QualifiedName {
-        node = node.parent();
+// PERF: noderef1 G1. The parents are read through views (`NodeRef`): one
+// registry lookup for the node, none for a parent in its store.
+pub fn is_in_right_side_of_import_or_export_assignment(node: Node) -> bool {
+    is_in_right_side_of_import_or_export_assignment_ref(NodeRef::new(node))
+}
+
+/// `is_in_right_side_of_import_or_export_assignment` on the view of the
+/// node.
+pub fn is_in_right_side_of_import_or_export_assignment_ref(mut node: NodeRef) -> bool {
+    let mut parent = node.parent();
+    while parent.kind() == SyntaxKind::QualifiedName {
+        node = parent;
+        parent = node.parent();
     }
 
-    node.parent().kind() == SyntaxKind::ImportEqualsDeclaration
-        && node.parent().module_reference() == node
-        || node.parent().kind() == SyntaxKind::ExportAssignment
-            && node.parent().expression() == node
+    match parent.kind() {
+        SyntaxKind::ImportEqualsDeclaration => parent.node().module_reference() == node.node(),
+        SyntaxKind::ExportAssignment => parent.expression() == node.node(),
+        _ => false,
+    }
 }
 
 // Go: checker/utilities.go:1159 isJsxIntrinsicTagName
@@ -384,32 +398,49 @@ pub fn get_containing_object_literal(f: Node) -> Node {
 }
 
 // Go: checker/utilities.go:1174 isImportTypeQualifierPart
-pub fn is_import_type_qualifier_part(mut node: Node) -> Node {
+pub fn is_import_type_qualifier_part(node: Node) -> Node {
+    is_import_type_qualifier_part_ref(NodeRef::new(node))
+}
+
+/// `is_import_type_qualifier_part` on the view of the node.
+pub fn is_import_type_qualifier_part_ref(mut node: NodeRef) -> Node {
     let mut parent = node.parent();
-    while is_qualified_name(parent) {
+    while parent.kind() == SyntaxKind::QualifiedName {
         node = parent;
         parent = parent.parent();
     }
 
-    if parent.is_some() && parent.kind() == SyntaxKind::ImportType && parent.qualifier() == node {
-        return parent;
+    if parent.is_some()
+        && parent.kind() == SyntaxKind::ImportType
+        && parent.node().qualifier() == node.node()
+    {
+        return parent.node();
     }
 
     Node::NIL
 }
 
 // Go: checker/utilities.go:1188 isInNameOfExpressionWithTypeArgumentsOrHeritageTypeReference
-pub fn is_in_name_of_expression_with_type_arguments_or_heritage_type_reference(
-    mut node: Node,
+pub fn is_in_name_of_expression_with_type_arguments_or_heritage_type_reference(node: Node) -> bool {
+    is_in_name_of_expression_with_type_arguments_or_heritage_type_reference_ref(NodeRef::new(node))
+}
+
+/// `is_in_name_of_expression_with_type_arguments_or_heritage_type_reference`
+/// on the view of the node.
+pub fn is_in_name_of_expression_with_type_arguments_or_heritage_type_reference_ref(
+    mut node: NodeRef,
 ) -> bool {
-    while node.parent().kind() == SyntaxKind::PropertyAccessExpression
-        || node.parent().kind() == SyntaxKind::QualifiedName
-    {
-        node = node.parent();
+    let mut parent = node.parent();
+    while matches!(
+        parent.kind(),
+        SyntaxKind::PropertyAccessExpression | SyntaxKind::QualifiedName
+    ) {
+        node = parent;
+        parent = node.parent();
     }
 
-    node.parent().kind() == SyntaxKind::ExpressionWithTypeArguments
-        || is_name_of_heritage_clause_type_reference(node)
+    parent.kind() == SyntaxKind::ExpressionWithTypeArguments
+        || is_name_of_heritage_clause_type_reference_ref(node)
 }
 
 impl Checker {
@@ -512,9 +543,15 @@ fn get_super_container(mut node: Node, stop_on_functions: bool) -> Node {
 }
 
 // Go: checker/utilities.go:1264 forEachYieldExpression
+// PERF: deferbody1. Go reads `node.Kind` as a field in the switch, in
+// `IsFunctionLike` and in `IsPartOfTypeNode`. Here each read was a registry
+// lookup, so the walk reads the node's view and kind once and passes them on
+// (`is_part_of_type_node_of`). The walk and its order are Go's.
 pub fn for_each_yield_expression(body: Node, visitor: &mut dyn FnMut(Node) -> bool) -> bool {
     fn traverse(node: Node, visitor: &mut dyn FnMut(Node) -> bool) -> bool {
-        match node.kind() {
+        let view = NodeRef::new(node);
+        let kind = view.kind();
+        match kind {
             SyntaxKind::YieldExpression => {
                 if visitor(node) {
                     return true;
@@ -532,14 +569,24 @@ pub fn for_each_yield_expression(body: Node, visitor: &mut dyn FnMut(Node) -> bo
                 // These are not allowed inside a generator now, but eventually they may be allowed
                 // as local types. Regardless, skip them to avoid the work.
             }
+            // PERF: deferbody1. A token (identifiers, literals, keywords and
+            // punctuation) has no children: Go `ForEachChild` has no case for
+            // its kind (ast_generated.go:8693) and returns false, and a token
+            // is not function-like. Go gets false through `IsPartOfTypeNode`,
+            // which reads the parent of an identifier, and then the empty
+            // child walk; here the walk returns false at once. Those reads
+            // have no effect.
+            _ if kind.is_token() => {}
             _ => {
-                if is_function_like(node) {
+                // PORT: Go `IsFunctionLike` also tests `node != nil`; the kind
+                // read above has already failed for nil, as Go's switch does.
+                if is_function_like_kind(kind) {
                     if node.name().is_some() && is_computed_property_name(node.name()) {
                         // Note that we will not include methods/accessors of a class because they would require
                         // first descending into the class. This is by design.
                         return traverse(node.name().expression(), visitor);
                     }
-                } else if !is_part_of_type_node(node) {
+                } else if !is_part_of_type_node_of(view, kind) {
                     // This is the general case, which should include mostly expressions and statements.
                     // Also includes NodeArrays.
                     return node.for_each_child(&mut |child: Node| traverse(child, visitor));

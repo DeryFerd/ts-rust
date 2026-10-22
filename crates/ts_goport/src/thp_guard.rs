@@ -53,6 +53,12 @@
 //! cell, and tsgo -b query chain got about 90 to 130 huge pages, not 56 to
 //! 99, with no compaction stall.
 //!
+//! The guard opens `/proc/buddyinfo` once. The watcher reads the open file
+//! again from its start for each read (`read_from_start`): a procfs file
+//! makes its text again on each read from offset 0. An open for each read
+//! made 26 to 354 opens per run (syscut1: TypeORM, VS Code single
+//! threaded).
+//!
 //! `GOPORT_THP_GUARD` selects the mode: `0` does nothing, `force` always
 //! turns THP off, `start` does the start check but starts no watcher, and
 //! any other value (or no value) does both. `GOPORT_THP_GUARD_MIB` changes
@@ -92,7 +98,7 @@ const MAX_FALL_PER_MS: u64 = 32 << 20;
 
 /// The watcher stops after this time, so a long run does not read the
 /// memory for its whole life. The longest run of the perf13 grid took 1.2 s.
-const WATCH_FOR: Duration = Duration::from_secs(60);
+const WATCH_FOR: Duration = Duration::from_mins(1);
 
 /// The buffer for `/proc/buddyinfo`: about 110 bytes per zone, so room for
 /// 70 nodes of 4 zones.
@@ -163,10 +169,13 @@ pub fn thp_guard() -> bool {
         let mut enabled = [0; 128];
         let mut defrag = [0; 128];
         let mut buddyinfo = [0; BUDDYINFO_BYTES];
+        let buddyinfo_file = std::fs::File::open("/proc/buddyinfo").ok();
         let (Some(enabled), Some(defrag), Some(buddyinfo)) = (
             read_small("/sys/kernel/mm/transparent_hugepage/enabled", &mut enabled),
             read_small("/sys/kernel/mm/transparent_hugepage/defrag", &mut defrag),
-            read_small("/proc/buddyinfo", &mut buddyinfo),
+            buddyinfo_file
+                .as_ref()
+                .and_then(|file| read_from_start(file, &mut buddyinfo)),
         ) else {
             say(
                 debug,
@@ -185,8 +194,10 @@ pub fn thp_guard() -> bool {
         let step = start_step(enabled, defrag, free, min_free);
         let failed = step == Start::Off && set_thp_disable(true).is_err();
         let no_watcher = step == Start::Watch && watcher && long_running();
-        let watching =
-            step == Start::Watch && watcher && !no_watcher && start_watcher(min_free, free, debug);
+        let watching = step == Start::Watch
+            && watcher
+            && !no_watcher
+            && buddyinfo_file.is_some_and(|file| start_watcher(file, min_free, free, debug));
         let huge = failed || huge_pages(step, enabled, free, min_free);
         say(
             debug,
@@ -241,30 +252,36 @@ fn say(debug: bool, args: std::fmt::Arguments<'_>) {
     }
 }
 
-/// Starts the `watch` thread. `free` is the start check's read. False when
-/// the thread cannot start. The buddyinfo buffer is made here, on the heap:
-/// glibc puts the static TLS (79 to 99 KiB in perf13b) at the top of each
-/// thread stack, so a small stack (a 128 KiB one, or `RUST_MIN_STACK`) had
-/// too little room for it.
+/// Starts the `watch` thread on `file`, the open `/proc/buddyinfo`. `free`
+/// is the start check's read. False when the thread cannot start. The
+/// buddyinfo buffer is made here, on the heap: glibc puts the static TLS
+/// (79 to 99 KiB in perf13b) at the top of each thread stack, so a small
+/// stack (a 128 KiB one, or `RUST_MIN_STACK`) had too little room for it.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn start_watcher(min_free: u64, free: u64, debug: bool) -> bool {
+fn start_watcher(file: std::fs::File, min_free: u64, free: u64, debug: bool) -> bool {
     let buddyinfo = vec![0; BUDDYINFO_BYTES];
     std::thread::Builder::new()
         .name("thp-guard".into())
-        .spawn(move || watch(min_free, next_poll(free, min_free), debug, buddyinfo))
+        .spawn(move || watch(&file, min_free, next_poll(free, min_free), debug, buddyinfo))
         .is_ok()
 }
 
-/// The watcher thread: waits `wait`, reads `/proc/buddyinfo` into
-/// `buddyinfo` and follows `watch_step`, again and again. It turns THP off
-/// at most once, then ends. It allocates nothing.
+/// The watcher thread: waits `wait`, reads `file` (the open
+/// `/proc/buddyinfo`) into `buddyinfo` and follows `watch_step`, again and
+/// again. It turns THP off at most once, then ends. It allocates nothing.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn watch(min_free: u64, mut wait: Duration, debug: bool, mut buddyinfo: Vec<u8>) {
+fn watch(
+    file: &std::fs::File,
+    min_free: u64,
+    mut wait: Duration,
+    debug: bool,
+    mut buddyinfo: Vec<u8>,
+) {
     let start = std::time::Instant::now();
     let mut reads = 0u32;
     loop {
         std::thread::sleep(wait);
-        let free = read_small("/proc/buddyinfo", &mut buddyinfo).and_then(free_huge_bytes);
+        let free = read_from_start(file, &mut buddyinfo).and_then(free_huge_bytes);
         let elapsed = start.elapsed();
         reads += 1;
         match (watch_step(elapsed, free, min_free), free) {
@@ -414,6 +431,26 @@ fn read_small<'a>(path: &str, buf: &'a mut [u8]) -> Option<&'a str> {
     let mut len = 0;
     loop {
         match file.read(&mut buf[len..]).ok()? {
+            0 => break,
+            n => len += n,
+        }
+        if len == buf.len() {
+            return None;
+        }
+    }
+    std::str::from_utf8(&buf[..len]).ok()
+}
+
+/// The text of `file` from its start, read into `buf` with `pread` and
+/// without a heap allocation, so an open procfs file gives its text of now
+/// on each call. None when the file cannot be read, is not UTF-8, or does
+/// not fit in `buf`.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn read_from_start<'a>(file: &std::fs::File, buf: &'a mut [u8]) -> Option<&'a str> {
+    use std::os::unix::fs::FileExt;
+    let mut len = 0;
+    loop {
+        match file.read_at(&mut buf[len..], len as u64).ok()? {
             0 => break,
             n => len += n,
         }

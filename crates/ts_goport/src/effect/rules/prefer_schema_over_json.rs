@@ -24,28 +24,20 @@ fn run_prefer_schema_over_json(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic>
     let mut diags = Vec::new();
     let is_v4 = ctx.tp.supported_effect_version() == EffectMajorVersion::V4;
 
-    fn walk(
-        ctx: &mut RuleContext<'_, '_>,
-        diags: &mut Vec<Diagnostic>,
-        is_v4: bool,
-        n: Node,
-    ) -> bool {
-        if n.is_nil() {
-            return false;
-        }
-
+    fn visit(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, is_v4: bool, n: Node) {
         if n.kind() == SyntaxKind::CallExpression {
             if let Some(d) = check_prefer_schema_over_json(ctx, n, is_v4) {
                 diags.push(d);
             }
         }
-
-        n.for_each_child(|child| walk(ctx, diags, is_v4, child));
-        false
     }
 
     let sf = ctx.source_file;
-    walk(ctx, &mut diags, is_v4, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(sf).nodes() {
+        visit(ctx, &mut diags, is_v4, n);
+    }
     diags
 }
 
@@ -153,7 +145,7 @@ fn check_effect_try_simple(tp: &mut TypeParser<'_>, node: Node, is_v4: bool) -> 
     let call = node;
 
     // Check callee is Effect.try
-    if !tp.is_node_reference_to_effect_module_api(call.expression(), "try") {
+    if !tp.is_node_reference_to_effect_module_api(call.expression(), member!("try")) {
         return Node::NIL;
     }
 
@@ -179,7 +171,7 @@ fn check_effect_try_object(tp: &mut TypeParser<'_>, node: Node) -> Node {
     let call = node;
 
     // Check callee is Effect.try
-    if !tp.is_node_reference_to_effect_module_api(call.expression(), "try") {
+    if !tp.is_node_reference_to_effect_module_api(call.expression(), member!("try")) {
         return Node::NIL;
     }
 

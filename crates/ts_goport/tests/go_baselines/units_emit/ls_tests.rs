@@ -57,7 +57,7 @@ fn parse(name: &str, text: &str, kind: ScriptKind) -> Node {
 // ls/format_test.go
 // ---------------------------------------------------------------------------
 
-// Go: ls/format.go:97 getFormattingEditsAfterKeystroke
+// Go: ls/format.go:226 getFormattingEditsAfterKeystroke
 // PORT: the Go tests call the unexported LanguageService method with a nil
 // program; the Rust method is private. The method only reads its arguments,
 // so this is its body, with the same public format entry points.
@@ -85,7 +85,7 @@ fn get_formatting_edits_after_keystroke(
     Vec::new()
 }
 
-// Go: ls/format.go:78 getFormattingEditsForRange
+// Go: ls/format.go:207 getFormattingEditsForRange
 // PORT: see `get_formatting_edits_after_keystroke`.
 fn get_formatting_edits_for_range(
     file: Node,
@@ -100,7 +100,7 @@ fn get_formatting_edits_for_range(
     format::format_selection(ctx, file, r.pos(), r.end())
 }
 
-// Go: ls/format_test.go:15 TestGetFormattingEditsAfterKeystroke_EmptyFile
+// Go: ls/format_test.go:59 TestGetFormattingEditsAfterKeystroke_EmptyFile
 /// Test for issue: Panic Handling textDocument/onTypeFormatting
 /// This reproduces the panic when pressing enter in an empty file
 #[test]
@@ -120,7 +120,7 @@ fn test_get_formatting_edits_after_keystroke_empty_file() {
     );
 }
 
-// Go: ls/format_test.go:45 TestGetFormattingEditsAfterKeystroke_SimpleStatement
+// Go: ls/format_test.go:89 TestGetFormattingEditsAfterKeystroke_SimpleStatement
 /// Test with a simple statement
 #[test]
 fn test_get_formatting_edits_after_keystroke_simple_statement() {
@@ -138,7 +138,7 @@ fn test_get_formatting_edits_after_keystroke_simple_statement() {
     );
 }
 
-// Go: ls/format_test.go:76 TestGetFormattingEditsForRange_FunctionBody
+// Go: ls/format_test.go:120 TestGetFormattingEditsForRange_FunctionBody
 /// Test for issue: Crash in range formatting when requested on a line that is different from the containing function
 /// This reproduces the panic when formatting a range inside a function body
 #[test]
@@ -192,7 +192,7 @@ fn test_get_formatting_edits_for_range_function_body() {
 // ls/lsconv/converters_test.go
 // ---------------------------------------------------------------------------
 
-// Go: ls/lsconv/converters_test.go:17 TestDocumentURIToFileName
+// Go: ls/lsconv/converters_test.go:22 TestDocumentURIToFileName
 #[test]
 fn test_document_uri_to_file_name() {
     #[rustfmt::skip]
@@ -209,15 +209,16 @@ fn test_document_uri_to_file_name() {
         ("file:///c:/test %25/path", "c:/test %/path"),
         // {"file:?q", "/"},
         ("file:///_:/path", "/_:/path"),
-        ("file:///users/me/c%23-projects/", "/users/me/c#-projects/"),
+        ("file:///users/me/c%23-projects/", "/users/me/c#-projects"),
+        ("file:///a/../b.ts", "/b.ts"),
         ("file://localhost/c%24/GitDevelopment/express", "//localhost/c$/GitDevelopment/express"),
         ("file:///c%3A/test%20with%20%2525/c%23code", "c:/test with %25/c#code"),
 
-        ("untitled:Untitled-1", "^/untitled/ts-nul-authority/Untitled-1"),
-        ("untitled:Untitled-1#fragment", "^/untitled/ts-nul-authority/Untitled-1#fragment"),
-        ("untitled:c:/Users/jrieken/Code/abc.txt", "^/untitled/ts-nul-authority/c:/Users/jrieken/Code/abc.txt"),
-        ("untitled:C:/Users/jrieken/Code/abc.txt", "^/untitled/ts-nul-authority/C:/Users/jrieken/Code/abc.txt"),
-        ("untitled://wsl%2Bubuntu/home/jabaile/work/TypeScript-go/newfile.ts", "^/untitled/wsl%2Bubuntu/home/jabaile/work/TypeScript-go/newfile.ts"),
+        ("untitled:Untitled-1", "^/~ts-uri~/untitled/ts-nul-authority/Untitled-1"),
+        ("untitled:Untitled-1#fragment", "^/~ts-uri~/untitled/ts-nul-authority/~ts-uri-escape~556e7469746c65642d310023667261676d656e74~"),
+        ("untitled:c:/Users/jrieken/Code/abc.txt", "^/~ts-uri~/untitled/ts-nul-authority/~ts-uri-escape~633a~/Users/jrieken/Code/abc.txt"),
+        ("untitled:C:/Users/jrieken/Code/abc.txt", "^/~ts-uri~/untitled/ts-nul-authority/~ts-uri-escape~433a~/Users/jrieken/Code/abc.txt"),
+        ("untitled://wsl%2Bubuntu/home/jabaile/work/TypeScript/newfile.ts", "^/~ts-uri~/untitled/wsl%2Bubuntu/home/jabaile/work/TypeScript/newfile.ts"),
     ];
     let mut t = Subtests::new("TestDocumentURIToFileName");
     for &(uri, file_name) in tests {
@@ -232,7 +233,83 @@ fn test_document_uri_to_file_name() {
     t.finish();
 }
 
-// Go: ls/lsconv/converters_test.go:55 TestFileNameToDocumentURI
+// Go: ls/lsconv/converters_test.go:97 TestNonFileDocumentURIRoundTripsThroughNormalizedFileName (ts#64544)
+// PORT: the Directory and PathKey asserts (:117-189) need the typed
+// RootedFilePath methods; the port compares the file names.
+#[test]
+fn test_non_file_document_uri_round_trips_through_normalized_file_name() {
+    let file_name = |uri: &str| lsproto::DocumentUri(uri.to_string()).file_name();
+    assert_eq!(
+        file_name("custom:folder/../~ts-uri~/caf\u{e9}\\file.ts"),
+        "^/~ts-uri~/custom/ts-nul-authority/folder/~ts-uri-escape~2e2e~/~ts-uri~/~ts-uri-escape~636166c3a95c66696c65~.ts"
+    );
+    assert_eq!(
+        file_name("custom:.git/file.ts"),
+        "^/~ts-uri~/custom/ts-nul-authority/.git/file.ts"
+    );
+    assert_eq!(
+        file_name("custom:~ts-uri-escape~dir.js/file.ts?x=1"),
+        "^/~ts-uri~/custom/ts-nul-authority/~ts-uri-escape~7e74732d7572692d6573636170657e6469722e6a73~/~ts-uri-escape~66696c65003f783d31~.ts"
+    );
+    let mut t = Subtests::new("TestNonFileDocumentURIRoundTripsThroughNormalizedFileName");
+    for uri in [
+        "untitled:folder/../file.ts",
+        "vscode-vfs://github/path//file.ts",
+        "custom:/path/./file.ts/",
+        "custom:",
+        "custom:///path",
+        "custom://authority",
+        "custom://authority/",
+        "custom:path/file.ts?rev=a/b#frag/c",
+        "custom://authority/path/file.ts#frag/a",
+        "custom:path\\file.ts",
+        "custom:.git/file.ts",
+        "custom:..hidden/file.ts",
+        "custom://~ts-uri~/path",
+        "custom://ts-nul-authority/path",
+        "custom:~ts-uri-escape~file.ts",
+        "custom:~ts-uri-escape~no-path",
+        "custom://authority/~ts-uri-no-path~~",
+        "custom:~ts-uri-spec~666f6f~/file.ts?x=1",
+        "custom:folder/../~ts-uri~/caf\u{e9}\\file.ts",
+        "custom:name.ts\\",
+        "custom:name..ts",
+    ] {
+        t.run(uri, || {
+            assert_equal(
+                file_name_to_document_uri(&file_name(uri)).0.as_str(),
+                uri,
+                "lsconv.FileNameToDocumentURI(uri.FileName())",
+            )
+        });
+    }
+    t.finish();
+    for uri in [
+        "custom:path\\file.ts",
+        "custom:~ts-uri~file.ts",
+        "custom:~ts-uri-escape~file.ts",
+    ] {
+        assert_eq!(
+            ts_goport::frontend::tspath::try_get_extension_from_path(&file_name(uri)),
+            ".ts",
+            "{uri}"
+        );
+    }
+    assert!(file_name("custom:~ts-uri-escape~types.d.css.ts").ends_with(".d.css.ts"));
+    // Go :191-203: a dynamic name without the `~ts-uri~` part keeps its
+    // escape text, and an escape that is not UTF-8 stays an escape.
+    assert_eq!(
+        file_name_to_document_uri("^/custom/ts-nul-authority/~ts-uri-escape~666f6f~.ts").0,
+        "custom:~ts-uri-escape~666f6f~.ts"
+    );
+    assert_eq!(
+        file_name_to_document_uri("^/~ts-uri~/custom/ts-nul-authority/~ts-uri-escape~ff~").0,
+        "custom:~ts-uri-escape~ff~"
+    );
+    assert_ne!(file_name("custom:name.ts\\"), file_name("custom:name..ts"));
+}
+
+// Go: ls/lsconv/converters_test.go:61 TestFileNameToDocumentURI
 #[test]
 fn test_file_name_to_document_uri() {
     #[rustfmt::skip]
@@ -249,13 +326,15 @@ fn test_file_name_to_document_uri() {
         ("c:/test %/path", "file:///c%3A/test%20%25/path"),
         ("/", "file:///"),
         ("/_:/path", "file:///_%3A/path"),
-        ("/users/me/c#-projects/", "file:///users/me/c%23-projects/"),
+        // PORT: Go N' passes RootedFilePathFromAbsolute("/users/me/c#-projects/"),
+        // which drops the trailing separator (ts#64159).
+        ("/users/me/c#-projects", "file:///users/me/c%23-projects"),
         ("//localhost/c$/GitDevelopment/express", "file://localhost/c%24/GitDevelopment/express"),
         ("c:/test with %25/c#code", "file:///c%3A/test%20with%20%2525/c%23code"),
 
         ("^/untitled/ts-nul-authority/Untitled-1", "untitled:Untitled-1"),
         ("^/untitled/ts-nul-authority/c:/Users/jrieken/Code/abc.txt", "untitled:c:/Users/jrieken/Code/abc.txt"),
-        ("^/untitled/ts-nul-authority///wsl%2Bubuntu/home/jabaile/work/TypeScript-go/newfile.ts", "untitled://wsl%2Bubuntu/home/jabaile/work/TypeScript-go/newfile.ts"),
+        ("^/untitled/wsl%2Bubuntu/home/jabaile/work/TypeScript/newfile.ts", "untitled://wsl%2Bubuntu/home/jabaile/work/TypeScript/newfile.ts"),
     ];
     let mut t = Subtests::new("TestFileNameToDocumentURI");
     for &(file_name, uri) in tests {
@@ -285,7 +364,7 @@ impl Script for TestScript {
     }
 }
 
-// Go: ls/lsconv/converters_test.go:99 newTestConverters
+// Go: ls/lsconv/converters_test.go:232 newTestConverters
 fn new_test_converters(text: &str) -> (Rc<Converters>, TestScript) {
     let script = TestScript {
         name: "test.ts".to_string(),
@@ -319,7 +398,7 @@ fn from_lsp_position_all(
     }
 }
 
-// Go: ls/lsconv/converters_test.go:159 TestConvertersInvalidUTF8
+// Go: ls/lsconv/converters_test.go:279 TestConvertersInvalidUTF8
 /// TestConvertersInvalidUTF8 verifies behavior on text containing invalid UTF-8
 /// sequences (e.g. lone continuation bytes). Node's TextDecoder substitutes such
 /// bytes with U+FFFD, so the JS-reference test cannot cover this; we assert the
@@ -384,7 +463,7 @@ fn test_converters_invalid_utf8() {
     assert!(errors.is_empty(), "{}", errors.join("\n"));
 }
 
-// Go: ls/lsconv/converters_test.go:170 jsReferenceScript
+// Go: ls/lsconv/converters_test.go:340 jsReferenceScript
 /// jsReferenceScript is a Node.js script that, given a list of UTF-8 byte buffers,
 /// computes the authoritative mapping between (line, character in UTF-16 code units)
 /// and UTF-8 byte offsets. See the Go file for the full description.
@@ -460,7 +539,7 @@ function utf8SeqLen(b) {
 /// Go `jsTuple`: (bytePos, line, char).
 type JsTuple = (i32, u32, u32);
 
-// Go: ls/lsconv/converters_test.go:245 runJSReference
+// Go: ls/lsconv/converters_test.go:415 runJSReference
 /// None when node is not available (Go `t.Skipf`).
 fn run_js_reference(texts: &[&str]) -> Option<Vec<Vec<JsTuple>>> {
     // Build a length-prefixed binary stream of the raw UTF-8 bytes:
@@ -540,7 +619,7 @@ fn run_js_reference(texts: &[&str]) -> Option<Vec<Vec<JsTuple>>> {
     Some(out)
 }
 
-// Go: ls/lsconv/converters_test.go:329 TestConvertersAgainstJSReference
+// Go: ls/lsconv/converters_test.go:449 TestConvertersAgainstJSReference
 /// TestConvertersAgainstJSReference cross-checks the Go UTF-16 conversions against
 /// authoritative results computed by Node.js using real UTF-16 string semantics.
 #[test]
@@ -737,8 +816,8 @@ fn test_resolve_organize_imports_sort() {
 // ls/lsutil/userpreferences_test.go
 // ---------------------------------------------------------------------------
 
-// Go: ls/lsutil/userpreferences_test.go:13 fillNonZeroValues
-// Go: ls/lsutil/userpreferences_test.go:40 getValidStringValue
+// Go: ls/lsutil/userpreferences_test.go:101 fillNonZeroValues
+// Go: ls/lsutil/userpreferences_test.go:128 getValidStringValue
 // PORT: Go fills every settable field by reflection: bool true, ints 1,
 // unsigned ints (core.Tristate) 1 (TSFalse), a valid value for the string
 // enums, "test" for other strings, []string{"test"}, and nested structs the
@@ -828,7 +907,8 @@ fn fill_non_zero_values() -> UserPreferences {
         },
         prefer_go_to_source_definition: true,
         exclude_library_symbols_in_nav_to: f,
-        workspace_symbols_scope: lsutil::WorkspaceSymbolsScope("test".into()),
+        // ts#64554: Go getValidStringValue gives lsutil.WorkspaceSymbolsScope a valid value.
+        workspace_symbols_scope: lsutil::WorkspaceSymbolsScope::ALL_OPEN_PROJECTS,
         enable_formatting: f,
         enable_validation: f,
         disable_suggestions: f,
@@ -842,7 +922,7 @@ fn fill_non_zero_values() -> UserPreferences {
     }
 }
 
-// Go: ls/lsutil/userpreferences_test.go:60 TestUserPreferencesRoundtrip
+// Go: ls/lsutil/userpreferences_test.go:150 TestUserPreferencesRoundtrip
 // PORT: the `withConfig` subtest is not ported (see the module comment).
 #[test]
 fn test_user_preferences_roundtrip() {
@@ -886,7 +966,7 @@ fn object<'a>(
     }
 }
 
-// Go: ls/lsutil/userpreferences_test.go:87 TestUserPreferencesSerialize
+// Go: ls/lsutil/userpreferences_test.go:177 TestUserPreferencesSerialize
 #[test]
 fn test_user_preferences_serialize() {
     let mut t = Subtests::new("TestUserPreferencesSerialize");
@@ -995,7 +1075,7 @@ fn items(entries: &[(&str, LspAny)]) -> IndexMap<String, LspAny> {
     }
 }
 
-// Go: ls/lsutil/userpreferences_test.go:429 TestUserPreferencesLocale
+// Go: ls/lsutil/userpreferences_test.go:517 TestUserPreferencesLocale
 #[test]
 fn test_user_preferences_locale() {
     let prefs = parse_user_preferences(&items(&[
@@ -1009,7 +1089,7 @@ fn test_user_preferences_locale() {
     assert_eq!(prefs.locale, "fr");
 }
 
-// Go: ls/lsutil/userpreferences_test.go:427 TestUserPreferencesReportStyleChecksAsWarnings
+// Go: ls/lsutil/userpreferences_test.go:532 TestUserPreferencesReportStyleChecksAsWarnings
 #[test]
 fn test_user_preferences_report_style_checks_as_warnings() {
     let mut t = Subtests::new("TestUserPreferencesReportStyleChecksAsWarnings");
@@ -1053,7 +1133,7 @@ fn test_user_preferences_report_style_checks_as_warnings() {
     t.finish();
 }
 
-// Go: ls/lsutil/userpreferences_test.go:328 TestUserPreferencesParseATA
+// Go: ls/lsutil/userpreferences_test.go:711 TestUserPreferencesParseATA
 #[test]
 fn test_user_preferences_parse_ata() {
     let mut t = Subtests::new("TestUserPreferencesParseATA");
@@ -1138,7 +1218,7 @@ fn test_user_preferences_parse_ata() {
     t.finish();
 }
 
-// Go: ls/lsutil/userpreferences_test.go:531 TestParseUserPreferencesEditorFormatting
+// Go: ls/lsutil/userpreferences_test.go:619 TestParseUserPreferencesEditorFormatting
 // PORT: Go writes the numbers as Go `int`; a JSON number is `LspAny::Number`.
 #[test]
 fn test_parse_user_preferences_editor_formatting() {

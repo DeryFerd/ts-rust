@@ -8,6 +8,9 @@
 #        testbox.sh run <command...>          sync this worktree, then run the command with the testbox env
 #                                             (e.g. run scripts/run-cargo-capped.sh build --release -p ts_goport --bins).
 #                                             Arguments keep their boundaries; use run bash -c '...' for pipes and &&
+#        testbox.sh job <command...>          as run, but detached from the SSH session (testbox-remote.sh start): a
+#                                             dropped SSH session does not stop it, and it keeps the testbox alive. Its
+#                                             output comes back as it grows; the exit code is the command's
 #        testbox.sh get <remote> [local]      copy a file or dir back with rsync (remote path absolute or relative
 #                                             to the repo root; a trailing / copies a dir's contents)
 #        testbox.sh push <path>...            copy zbook files or dirs to the same absolute paths (e.g. a bins dir)
@@ -26,6 +29,11 @@
 #        testbox.sh pin [KEY...]              check out each pin's Go repo at its zbook path, with npm ci node_modules
 #                                             (default: the batch pin, which warmup checks out). KEY comes from this
 #                                             worktree's UPSTREAM.json
+#        testbox.sh oracle [KEY]              push zbook's recorded oracle of the pin when the testbox's copy differs
+#        testbox.sh source <checkout>         the checkout at its own zbook path on the testbox: a git worktree at its
+#                                             HEAD (with a git bundle of the commits that origin lacks), then a copy of
+#                                             each modified or untracked file. Stops unless fp.py gives the same
+#                                             fingerprint on both sides. candidate.sh side --host testbox uses it
 #        testbox.sh tests [--pin KEY] OUT BASE
 #                                             the protected test suite at HEAD: build-goport-tests.sh and
 #                                             goport-tests.sh on the testbox (pushes the pin oracle first when the
@@ -37,22 +45,93 @@
 #                                             a stable release tsgo and np-suite.sh run LABEL on the testbox, fetched to
 #                                             the main checkout's np-suite dir (LABEL must not exist), then
 #                                             np-suite.sh diff BASE LABEL
+#        testbox.sh perf [--mode M] [--rounds N] LABEL BIN... [-- TSGO_ARG...]
+#                                             perf.sh on the testbox (default --mode both, 3 rounds): pushes the
+#                                             bins, fetches the result to the main checkout's perf dir (LABEL must
+#                                             not exist). Without a saved testbox it warms one up (TESTBOX_IDLE 30)
+#                                             and stops it at the end. Read instructions:u and RSS; wall is not valid.
+#                                             The variables of `perf.sh env` pass on to perf.sh there
+#        testbox.sh release-build OUT [NAME=VALUE...]
+#                                             crates/ts_goport/scripts/build-release.sh at HEAD with
+#                                             RELEASE_BOLT_PROFILE=instrument (the guest has no branch sampling) and the
+#                                             NAME=VALUE variables (RELEASE_*, BOLT_*, PGO_*), fetch <out>/bin (with COMMIT
+#                                             and bins.sha256) and the logs to OUT (must not exist). HEAD must be pushed;
+#                                             crates/, Cargo.toml and Cargo.lock must be clean
 # The gate and the oracles run as on zbook: the testbox env sets HOME=/home/theo and the workflow binds the
 # workspace on /home/theo/Code/sandbox/ts-rust (testbox-data.sh). Fetch a commit that the bins name before a
 # gate: run git fetch --depth=1 origin <sha>.
 # KEY defaults to the batch pin (docs/typechecker-state/current.json batch.upstreamPin.to).
-# TESTBOX_ID overrides the saved ID. TESTBOX_IDLE: idle minutes before the testbox stops (default 15).
+# TESTBOX_ID overrides the saved ID. TESTBOX_ID_FILE: the file of the saved ID (default target/testbox-id of
+# this worktree). TESTBOX_IDLE: idle minutes before the testbox stops (default 15).
 # TESTBOX_REF: the ref the workflow runs from (default main: the workflow must be on the default branch).
+# Retries: after a transient failure (a DNS, connect or TLS error or a request timeout), these steps run again,
+# up to 6 tries in all: warmup, status, stop and list (blacksmith API calls), the rsync of push, get, source and
+# the fetch of a job's results, and the start of run and job. Each retry prints one line on stderr. A command
+# that started on the testbox never runs again (job handles a dropped SSH session), and a nonzero exit of the
+# command or of a build is not a transient failure. A warmup whose answer was lost can leave one extra testbox
+# that ends at its idle timeout. TESTBOX_RETRY_WAITS: the seconds before each retry (default "5 10 20 30 30";
+# "" turns retries off).
 # Auth: `blacksmith auth login` once per host (`blacksmith auth status` shows it).
 # scripts/goport/testbox-remote.sh holds the steps that run on the testbox.
 set -euo pipefail
 case "${1:-help}" in help | -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; esac
 
 repo_root="$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
-id_file="$repo_root/target/testbox-id"
+id_file="${TESTBOX_ID_FILE:-$repo_root/target/testbox-id}"
 # The synced repo root on the testbox, relative to the SSH login dir (/home/runner).
 remote_root=_work/ts-rust/ts-rust
 cd "$repo_root"
+
+# Transient failures of the blacksmith API, ssh and rsync (2026-10-13: "request timed out after 30s", "net/http:
+# TLS handshake timeout", "Could not resolve hostname ...: Name or service not known").
+transient_re='request timed out|TLS handshake timeout|i/o timeout|Client\.Timeout exceeded|context deadline exceeded'
+transient_re+='|connection reset by peer|connection refused|no such host|server misbehaving|unexpected EOF'
+transient_re+='|temporary failure in name resolution|could not resolve hostname|name or service not known'
+transient_re+='|network is unreachable|no route to host|connection timed out|connection closed by|closed by remote host'
+transient_re+='|kex_exchange_identification|broken pipe|handshake failed: EOF|502 Bad Gateway|503 Service Unavailable'
+transient_re+='|504 Gateway Timeout'
+read -ra retry_waits <<<"${TESTBOX_RETRY_WAITS-5 10 20 30 30}"
+[[ ${retry_waits[*]} =~ ^[0-9\ ]*$ ]] ||
+  { echo "TESTBOX_RETRY_WAITS: whole seconds, for example '5 10 20 30 30'" >&2; exit 2; }
+# remote prints this line on the testbox's stderr just before the command. retry takes it out of the output.
+start_marker="testbox.sh:start:$$:$RANDOM$RANDOM"
+# Retry notices go to fd 4, this script's stderr, also from inside $(... 2>&1).
+exec 4>&2
+
+# retry KIND CMD...: run CMD, and run it again after each wait of retry_waits while it fails for a transient
+# reason. CMD's stderr passes through and is checked for transient_re. Returns CMD's last exit code. KIND:
+#   api  a blacksmith API call (warmup, status, stop, list): any nonzero exit.
+#   net  ssh or rsync: exit 255 (ssh) or rsync's 12, 30 or 35 (the stream closed or timed out). Use it only for a
+#        step that is safe to repeat.
+#   run  blacksmith testbox run: only before the start marker, so a command that started never runs again.
+retry() {
+  local kind=$1 try=1 rc errf what line
+  shift
+  what=${1##*/}
+  [[ $what != blacksmith ]] || what+=" $2 $3"
+  errf=$(mktemp)
+  while :; do
+    rc=0
+    # A try that prints no error must not reuse the error lines of the try before it.
+    : > "$errf"
+    # stdout goes straight through on fd 3. awk copies stderr to errf up to the start marker, and to our stderr
+    # without the marker.
+    { "$@" 2>&1 1>&3 3>&- 4>&- |
+        awk -v m="$start_marker" -v f="$errf" '!s {print > f; fflush(f)} $0 == m {s = 1; close(f); next} {print; fflush()}' >&2 3>&- 4>&- ||
+        rc=${PIPESTATUS[0]}; } 3>&1
+    ((rc != 0 && try <= ${#retry_waits[@]})) || break
+    case $kind in
+      net) ((rc == 255 || rc == 12 || rc == 30 || rc == 35)) || break ;;
+      run) ! grep -qxF -- "$start_marker" "$errf" || break ;;
+    esac
+    line=$(grep -m1 -iE -- "$transient_re" "$errf" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\r//g') || break
+    echo "testbox.sh: $what failed (rc $rc: ${line:0:160}); try $((try + 1)) of $((${#retry_waits[@]} + 1)) in ${retry_waits[try - 1]} s" >&4
+    sleep "${retry_waits[try - 1]}"
+    try=$((try + 1))
+  done
+  rm -f "$errf"
+  return "$rc"
+}
 
 saved_id() {
   local id="${TESTBOX_ID:-$(cat "$id_file" 2>/dev/null || true)}"
@@ -62,13 +141,15 @@ saved_id() {
 batch_pin() { jq -r '.batch.upstreamPin.to // empty' docs/typechecker-state/current.json; }
 
 # remote <command...>: sync this worktree, run the command in the testbox's repo root with the testbox env.
+# A transient failure before the command starts (the CLI's status wait, DNS, the sync) runs it again.
 remote() {
-  local remote_cmd
+  local remote_cmd id
+  id="$(saved_id)"
   printf -v remote_cmd '%q ' "$@"
   # A subshell: the CLI touches ~/.testbox-last-activity after the command in this shell, and testbox.env sets
   # HOME=/home/theo. Outside the subshell that touch would miss the marker, and the idle time would count from
   # the start of a long command.
-  blacksmith testbox run --id "$(saved_id)" "(. ~/testbox.env && $remote_cmd)"
+  retry run blacksmith testbox run --id "$id" "(echo $start_marker >&2; . ~/testbox.env && $remote_cmd)"
 }
 
 # ssh_route: sets host and ssh for rsync over the CLI's own SSH route (port 64000 and the key that warmup
@@ -78,7 +159,7 @@ ssh_route() {
   local id key
   id="$(saved_id)"
   # --wait: a testbox that is not ready yet has no IP, and its row has the workflow path in that column.
-  host="$(blacksmith testbox status --id "$id" --wait --wait-timeout 15m | awk -v id="$id" '$1 == id && $2 == "ready" {print $3}')"
+  host="$(retry api blacksmith testbox status --id "$id" --wait --wait-timeout 15m | awk -v id="$id" '$1 == id && $2 == "ready" {print $3}')"
   key="$HOME/.blacksmith/testboxes/$id/id_ed25519"
   # A host with a / would make rsync copy to a local path.
   [[ -n "$host" && $host != */* && -f "$key" ]] || { echo "no SSH route to $id (host '$host', key $key)" >&2; exit 1; }
@@ -99,8 +180,8 @@ push_paths() {
     p="$(realpath -s "$p")"
     echo "push $p"
     # A file of testbox-data.txt is a bind mount there: write it in place, not by rename.
-    if [[ -d "$p" ]]; then rsync -aH --mkpath --compress --compress-choice=zstd -e "$ssh" "$p/" "runner@$host:$p/"
-    else rsync -aHL --mkpath --inplace --compress --compress-choice=zstd -e "$ssh" "$p" "runner@$host:$p"; fi
+    if [[ -d "$p" ]]; then retry net rsync -aH --mkpath --compress --compress-choice=zstd -e "$ssh" "$p/" "runner@$host:$p/"
+    else retry net rsync -aHL --mkpath --inplace --compress --compress-choice=zstd -e "$ssh" "$p" "runner@$host:$p"; fi
   done
   # A caller can run on for minutes (tests): stop the keepalive now.
   kill "$keep" 2>/dev/null || true
@@ -130,7 +211,20 @@ job() {
   local run=$1 host ssh t size=0 fails=0 rc
   # exit, not return: callers run job in a || list (no set -e there), and then fetch RUN, which must not
   # take another job's run.
-  remote scripts/goport/testbox-remote.sh start "$@" || exit
+  # Exit 255 is the SSH session of the CLI, not the step (a side run on 2026-10-11 lost its testbox run this way
+  # with the testbox up): start once more, unless the first start made RUN.log.
+  remote scripts/goport/testbox-remote.sh start "$@" || {
+    rc=$?
+    ((rc == 255)) || exit "$rc"
+    ssh_route
+    sleep 5
+    if $ssh "runner@$host" test -e "$remote_root/$run.log" < /dev/null; then
+      echo "testbox $(saved_id): $run started (SSH rc 255)" >&2
+    else
+      echo "testbox $(saved_id): SSH rc 255 at the start of $run; start again" >&2
+      remote scripts/goport/testbox-remote.sh start "$@" || exit
+    fi
+  }
   ssh_route
   t=$(mktemp -d)
   while :; do
@@ -159,17 +253,18 @@ fetch() {
   local host ssh t
   ssh_route
   t=$(mktemp -d)
-  rsync -a -e "$ssh" "runner@$host:$remote_root/$1/out.tar.gz" "$t/" || {
+  retry net rsync -a -e "$ssh" "runner@$host:$remote_root/$1/out.tar.gz" "$t/" || {
     rm -rf "$t"
     echo "no $1/out.tar.gz on the testbox (the job log above has its error; $1.log stays there)" >&2
     return 1
   }
-  rsync -a -e "$ssh" "runner@$host:$remote_root/$1.log" "$t/testbox.log"
+  retry net rsync -a -e "$ssh" "runner@$host:$remote_root/$1.log" "$t/testbox.log"
   mkdir -p "$2"
   tar -xzf "$t/out.tar.gz" -C "$2"
   mv "$t/testbox.log" "$2/"
   rm -rf "$t"
-  $ssh "runner@$host" rm -rf "$remote_root/$1" "$remote_root/$1.log" "$remote_root/$1.rc" < /dev/null
+  # shellcheck disable=SC2086 # $ssh is the ssh command and its options
+  retry net $ssh "runner@$host" rm -rf "$remote_root/$1" "$remote_root/$1.log" "$remote_root/$1.rc" < /dev/null
 }
 
 cmd="$1"
@@ -184,20 +279,77 @@ pin_key=${pin_key:-$(batch_pin)}
 case "$cmd" in
   warmup)
     rc=0
-    out="$(blacksmith testbox warmup testbox.yml --ref "${TESTBOX_REF:-main}" --idle-timeout "${TESTBOX_IDLE:-15}" 2>&1)" || rc=$?
+    out="$(retry api blacksmith testbox warmup testbox.yml --ref "${TESTBOX_REF:-main}" --idle-timeout "${TESTBOX_IDLE:-15}" 2>&1)" || rc=$?
     echo "$out"
     ((rc == 0)) || exit "$rc"
-    id="$(grep -oE 'tbx_[A-Za-z0-9_-]+' <<<"$out" | head -1)"
+    # The last ID: $out also holds the errors of failed tries, and those can name a testbox.
+    id="$(grep -oE 'tbx_[A-Za-z0-9_-]+' <<<"$out" | tail -1)"
     [[ -n "$id" ]] || { echo "warmup printed no testbox ID" >&2; exit 1; }
     mkdir -p "$(dirname "$id_file")"
     echo "$id" >"$id_file"
-    echo "testbox $id (saved to target/testbox-id)"
+    echo "testbox $id (saved to $id_file)"
     ;;
   run)
     (($#)) || { echo "usage: testbox.sh run <command...>" >&2; exit 2; }
     remote "$@"
     ;;
   pin) remote scripts/goport/testbox-remote.sh pin "$@" ;;
+  oracle)
+    (($# <= 1)) || { echo "usage: testbox.sh oracle [KEY]" >&2; exit 2; }
+    push_oracle "${1:-$pin_key}"
+    ;;
+  job)
+    (($#)) || { echo "usage: testbox.sh job <command...>" >&2; exit 2; }
+    run=target/testbox-runs/job-$(date -u +%Y%m%dT%H%M%S)-$$
+    rc=0
+    job "$run" exec "$@" || rc=$?
+    # Quiet: a caller can judge the last output line (for example DONE).
+    ssh_route > /dev/null 2>&1 4>/dev/null
+    $ssh "runner@$host" rm -rf "$remote_root/$run.log" "$remote_root/$run.rc" < /dev/null > /dev/null 2>&1 || true
+    exit "$rc"
+    ;;
+  source)
+    (($# == 1)) || { echo "usage: testbox.sh source <checkout>" >&2; exit 2; }
+    co=$(realpath -- "$1")
+    [[ $co == /home/theo/Code/sandbox/ts-rust/target/* ]] ||
+      { echo "$co is not under /home/theo/Code/sandbox/ts-rust/target (the testbox makes it there)" >&2; exit 2; }
+    head=$(git -C "$co" rev-parse HEAD)
+    t=$(mktemp -d /tmp/testbox-source.XXXXXX)
+    # shellcheck disable=SC2064 # expand now
+    trap "rm -rf '$t'" EXIT
+    bundle=
+    # The commits of HEAD that no origin branch has (as zbook last saw origin) go in a bundle; the testbox
+    # fetches the bundle's prerequisites from origin.
+    if [[ -n $(git -C "$co" rev-list -n 1 HEAD --not --remotes=origin) ]]; then
+      bundle=$t/source.bundle
+      git -C "$co" bundle create "$bundle" HEAD --not --remotes=origin
+      push_paths "$bundle"
+      # push_paths clears the EXIT trap.
+      # shellcheck disable=SC2064
+      trap "rm -rf '$t'" EXIT
+    fi
+    remote scripts/goport/testbox-remote.sh source "$co" "$head" $bundle
+    [[ -z $bundle ]] || { ssh_route; $ssh "runner@$host" rm -f "$bundle" < /dev/null || true; }
+    # Each file that differs from HEAD or is untracked (not ignored), with a new mtime (no -t: cargo judges by
+    # mtime), and each deleted file.
+    git -C "$co" diff -z --name-only --no-renames --diff-filter=D HEAD > "$t/deleted"
+    { git -C "$co" diff -z --name-only --no-renames --diff-filter=d HEAD; git -C "$co" ls-files -z -o --exclude-standard; } > "$t/files"
+    ssh_route
+    if [[ -s $t/files ]]; then
+      echo "copy $(tr -cd '\0' < "$t/files" | wc -c) modified or untracked files"
+      retry net rsync -rlpH --from0 --files-from="$t/files" -e "$ssh" "$co/" "runner@$host:$co/"
+    fi
+    if [[ -s $t/deleted ]]; then
+      # NUL-separated to the end: a file name can hold a newline.
+      while IFS= read -r -d '' f; do printf '%s\0' "$co/$f"; done < "$t/deleted" > "$t/deleted.list"
+      $ssh "runner@$host" "xargs -0 rm -f" < "$t/deleted.list"
+    fi
+    here_fp=$(python3 scripts/goport/fp.py "$co" | cut -d' ' -f1)
+    # shellcheck disable=SC2086 # $ssh is the ssh command and its options
+    there_fp=$(retry net $ssh "runner@$host" "cd $remote_root && python3 scripts/goport/fp.py $(printf %q "$co")" < /dev/null | cut -d' ' -f1)
+    [[ $here_fp == "$there_fp" ]] || { echo "fp.py $co: zbook $here_fp, testbox $there_fp" >&2; exit 1; }
+    echo "source $co ${head:0:12} on the testbox, fp ${here_fp:0:12}"
+    ;;
   tests)
     (($# == 2)) || { echo "usage: testbox.sh tests [--pin KEY] OUT BASE" >&2; exit 2; }
     out=$(realpath -m -- "$1") base=$(realpath -- "$2")
@@ -243,13 +395,80 @@ case "$cmd" in
     [[ -z ${2:-} ]] || scripts/goport/np-suite.sh diff "$2" "$1" | tail -20
     exit "$rc"
     ;;
+  perf)
+    args=("$@")
+    opts=(--mode both)
+    while [[ ${1:-} == --mode || ${1:-} == --rounds ]]; do
+      (($# >= 2)) || { echo "usage: testbox.sh perf [--mode M] [--rounds N] LABEL BIN... [-- TSGO_ARG...]" >&2; exit 2; }
+      opts+=("$1" "$2")
+      shift 2
+    done
+    (($# >= 2)) || { echo "usage: testbox.sh perf [--mode M] [--rounds N] LABEL BIN... [-- TSGO_ARG...]" >&2; exit 2; }
+    label=$1
+    shift
+    [[ -n $label && $label != */* && $label != .* ]] || { echo "LABEL must be a dir name: $label" >&2; exit 2; }
+    pd=/home/theo/Code/sandbox/ts-rust/target/continuation-r97-goport/perf
+    [[ ! -e $pd/$label ]] || { echo "$pd/$label exists (results are never replaced)" >&2; exit 2; }
+    bins=() targs=()
+    while (($#)); do
+      # The rest, with the --, goes to perf.sh: tsgo arguments such as --noEmit.
+      [[ $1 != -- ]] || { targs=("$@"); break; }
+      [[ -f $1 && -x $1 ]] || { echo "not an executable file: $1" >&2; exit 2; }
+      bins+=("$(realpath -s -- "$1")")
+      shift
+    done
+    if [[ -z ${TESTBOX_ID:-} && ! -s $id_file ]]; then
+      # A new process: push_paths replaces the EXIT trap, and set -e is off on the left of ||.
+      TESTBOX_IDLE=${TESTBOX_IDLE:-30} "$0" warmup
+      rc=0
+      "$0" perf "${args[@]}" || rc=$?
+      "$0" stop
+      exit "$rc"
+    fi
+    # The same absolute paths there, so bins.txt names the zbook files.
+    push_paths "${bins[@]}"
+    run=target/testbox-runs/perf-$(date -u +%Y%m%dT%H%M%S)-$label
+    # The caller's GOPORT_* and allocator variables: perf.sh there passes them on to tsgo.
+    mapfile -t envs < <(scripts/goport/perf.sh env)
+    rc=0
+    job "$run" perf "$run" "$label" "${envs[@]}" "${opts[@]}" "$label" "${bins[@]}" "${targs[@]}" || rc=$?
+    mkdir -p "$pd" target
+    tmp=$(mktemp -d "$repo_root/target/testbox-perf.XXXXXX")
+    fetch "$run" "$tmp" || exit 1
+    [[ -d $tmp/$label ]] || { echo "no perf.sh result (rc $rc): $tmp/testbox.log" >&2; exit 1; }
+    mv "$tmp/$label" "$pd/$label"
+    mv "$tmp/testbox.log" "$pd/$label/"
+    rmdir "$tmp"
+    echo "results $pd/$label (perf.sh compare <base> $label compares with another run)"
+    exit "$rc"
+    ;;
+  release-build)
+    (($# >= 1)) || { echo "usage: testbox.sh release-build OUT [NAME=VALUE...]" >&2; exit 2; }
+    out=$(realpath -m -- "$1")
+    shift
+    [[ ! -e $out ]] || { echo "$out exists (results are never replaced)" >&2; exit 2; }
+    for a in "$@"; do [[ $a =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || { echo "not NAME=VALUE: $a" >&2; exit 2; }; done
+    [[ -z $(git status --porcelain --untracked-files=all -- crates Cargo.toml Cargo.lock) ]] ||
+      { echo "crates/, Cargo.toml or Cargo.lock has changes: commit them (the build is of HEAD)" >&2; exit 2; }
+    head=$(git rev-parse HEAD)
+    git branch -r --contains "$head" | grep -q . ||
+      echo "warning: no remote branch here has HEAD ${head:0:12}; the testbox fetches it from origin" >&2
+    run=target/testbox-runs/release-$(date -u +%Y%m%dT%H%M%S)-${head:0:9}
+    rc=0
+    job "$run" release-build "$head" "$run" "$@" || rc=$?
+    fetch "$run" "$out" || exit 1
+    [[ -f $out/bin/BUILD.txt ]] || { echo "no release bins (rc $rc): see $out/build.log" >&2; exit 1; }
+    (cd "$out/bin" && echo "$head" > COMMIT && find . -maxdepth 1 -type f -perm -u+x -printf '%f\n' | sort | xargs sha256sum > bins.sha256)
+    echo "release bins $out/bin (BUILD.txt, COMMIT, bins.sha256)"
+    exit "$rc"
+    ;;
   get)
     # rsync, not `blacksmith testbox download`: that timed out after 5 minutes on a 124 MB results dir.
     (($# == 1 || $# == 2)) || { echo "usage: testbox.sh get <remote> [local]" >&2; exit 2; }
     ssh_route
     src="$1"
     [[ "$src" == /* ]] || src="$remote_root/$src"
-    rsync -aH --compress --compress-choice=zstd -e "$ssh" "runner@$host:$src" "${2:-.}"
+    retry net rsync -aH --compress --compress-choice=zstd -e "$ssh" "runner@$host:$src" "${2:-.}"
     ;;
   push)
     (($#)) || { echo "usage: testbox.sh push <path>..." >&2; exit 2; }
@@ -262,11 +481,11 @@ case "$cmd" in
     ((${#paths[@]})) || { echo "no seed paths for: ${*:-inputs pin}" >&2; exit 2; }
     push_paths "${paths[@]}"
     ;;
-  status) blacksmith testbox status --id "$(saved_id)" "$@" ;;
+  status) retry api blacksmith testbox status --id "$(saved_id)" "$@" ;;
   stop | release)
     id="$(saved_id)"
     if [[ $cmd == stop ]]; then
-      blacksmith testbox stop --id "$id"
+      retry api blacksmith testbox stop --id "$id"
     else
       echo "testbox $id: released; it ends at its idle timeout and requests a commit of its sticky disks"
       echo "(TESTBOX_ID=$id scripts/goport/testbox.sh status shows when it completed)"
@@ -274,6 +493,6 @@ case "$cmd" in
     # Keep the saved ID when TESTBOX_ID named another testbox.
     [[ "$(cat "$id_file" 2>/dev/null || true)" != "$id" ]] || rm -f "$id_file"
     ;;
-  list) blacksmith testbox list "$@" ;;
+  list) retry api blacksmith testbox list "$@" ;;
   *) echo "unknown command: $cmd (testbox.sh help)" >&2; exit 2 ;;
 esac

@@ -7,9 +7,10 @@ use crate::prelude::*;
 
 // PORT: Binder storage used by this file. Go stores binder output on the AST
 // nodes and flow nodes directly. The Rust `Binder` (defined in binder_p1)
-// holds that output until `bind_source_file` fills the `GoFile` cells:
+// writes the node records and holds the rest until `bind_source_file` fills
+// the `GoFile` cells:
 // - `self.flow_nodes: Vec<FlowNode>`, indexed by `FlowNodeId::local_index()`.
-// - `self.node_bind: NodeBindBuilder`, indexed by `node.node_id().index()`.
+// - `self.node_bind: NodeBindRecords`, indexed by `node.node_id().index()`.
 // - `self.file_bind: FileBindData` (bind diagnostics and the other file data).
 // - `self.symbols: SymbolArena` (Go `symbolArena`).
 // - `self.active_label_list: Option<Rc<RefCell<ActiveLabel>>>`.
@@ -28,16 +29,8 @@ impl Binder {
         self.flow_nodes[flow.local_index()].antecedents = antecedents;
     }
 
-    fn p3_node_bind_mut(&mut self, node: Node) -> &mut NodeBindData {
-        debug_assert!(
-            node.file_index() == self.file.file_index(),
-            "binder data for a node in another file"
-        );
-        self.node_bind.get_mut(node.node_id().index())
-    }
-
-    /// Writes the `flow_node` of a node. Flow nodes are kept apart from the
-    /// other node data while binding (`NodeBindBuilder::set_flow_node`).
+    /// Writes the `flow_node` of a node: its record, or its extras entry
+    /// (`NodeBindRecords::set_flow_node`).
     fn p3_set_node_flow(&mut self, node: Node, flow: FlowNodeId) {
         debug_assert!(
             node.file_index() == self.file.file_index(),
@@ -265,12 +258,21 @@ impl Binder {
         let then_label = self.create_branch_label();
         let else_label = self.create_branch_label();
         let post_if_label = self.create_branch_label();
+        // PERF: noderead2. Both branches from one node data read (Go
+        // `node.AsIfStatement()` fields).
+        let (then_statement, else_statement) = match frozen_data_ids(node) {
+            Some((NodeData::IfStatement(d), ids)) => (
+                ids.node(d.then_statement),
+                d.else_statement.map_or(Node::NIL, |id| ids.node(id)),
+            ),
+            _ => (node.then_statement(), node.else_statement()),
+        };
         self.bind_condition(node.expression(), then_label, else_label);
         self.current_flow = self.finish_flow_label(then_label);
-        self.bind(node.then_statement());
+        self.bind(then_statement);
         self.add_antecedent(post_if_label, self.current_flow);
         self.current_flow = self.finish_flow_label(else_label);
-        self.bind(node.else_statement());
+        self.bind(else_statement);
         self.add_antecedent(post_if_label, self.current_flow);
         self.current_flow = self.finish_flow_label(post_if_label);
     }
@@ -577,7 +579,7 @@ impl Binder {
         let active = self.active_label_list.clone().expect("active label list");
         if !active.borrow().referenced {
             // Mark the label as unused; the checker will decide whether to report it
-            self.p3_node_bind_mut(label).added_flags |= NodeFlags::UNREACHABLE;
+            self.add_node_flags(label, NodeFlags::UNREACHABLE);
         }
         self.active_label_list = active.borrow().next.clone();
         self.add_antecedent(post_statement_label, self.current_flow);
@@ -1013,7 +1015,7 @@ impl Binder {
             | SyntaxKind::FunctionDeclaration
             | SyntaxKind::FunctionExpression
             | SyntaxKind::ClassStaticBlockDeclaration => {
-                self.p3_node_bind_mut(node).return_flow_node = return_flow_node;
+                self.set_node_return_flow_node(node, return_flow_node);
             }
             _ => {}
         }
@@ -1030,58 +1032,120 @@ impl Binder {
     pub fn add_to_container_chain(&mut self, next: Node) {
         if self.last_container.is_some() {
             let last_container = self.last_container;
-            self.p3_node_bind_mut(last_container).next_container = next;
+            self.set_next_container(last_container, next);
         }
         self.last_container = next;
     }
 
     // Go: binder/binder.go:2542 addDeclarationToSymbol
+    // PERF: one `&mut Symbol` for the whole function, as Go writes the fields
+    // of one struct (5 to 7 arena lookups before). The single declaration is
+    // pushed in place: built in a local and stored, the 16-byte list went
+    // through the stack with two 8-byte stores and one 16-byte load (a store
+    // forwarding stall on every new symbol).
     pub fn add_declaration_to_symbol(
         &mut self,
         symbol: SymbolId,
         node: Node,
         symbol_flags: SymbolFlags,
     ) {
-        self.symbols.sym_mut(symbol).flags |= symbol_flags;
-        self.p3_node_bind_mut(node).symbol = symbol;
-        if self.symbols.sym(symbol).declarations.is_empty() {
-            let declarations = self.new_single_declaration(node);
-            self.symbols.sym_mut(symbol).declarations = declarations;
-        } else {
-            // Go core.AppendIfUnique
-            let declarations = &mut self.symbols.sym_mut(symbol).declarations;
-            if !declarations.contains(&node) {
-                declarations.push(node);
-            }
+        self.set_node_symbol(node, symbol);
+        let s = self.symbols.sym_mut(symbol);
+        s.flags |= symbol_flags;
+        // PORT: Go `newSingleDeclaration` for a nil list, else
+        // `core.AppendIfUnique`. A push on the empty list makes the same
+        // single declaration (`new_single_declaration`).
+        if !s.declarations.contains(&node) {
+            s.declarations.push(node);
         }
         // On merge of const enum module with class or function, reset const enum only flag (namespaces will already recalculate)
-        let flags = self.symbols.sym(symbol).flags;
-        if flags.intersects(SymbolFlags::CONST_ENUM_ONLY_MODULE)
-            && flags
+        if s.flags.intersects(SymbolFlags::CONST_ENUM_ONLY_MODULE)
+            && s.flags
                 .intersects(SymbolFlags::FUNCTION | SymbolFlags::CLASS | SymbolFlags::REGULAR_ENUM)
         {
-            let s = self.symbols.sym_mut(symbol);
             s.flags = s.flags.without(SymbolFlags::CONST_ENUM_ONLY_MODULE);
             self.not_const_enum_only_modules.insert(symbol);
         }
-        if symbol_flags.intersects(SymbolFlags::VALUE) {
-            set_value_declaration(&mut self.symbols, symbol, node);
+        // Go `SetValueDeclaration(symbol, node)`.
+        if symbol_flags.intersects(SymbolFlags::VALUE)
+            && takes_value_declaration(s.value_declaration, node)
+        {
+            s.value_declaration = node;
         }
     }
 }
 
-// Go: binder/binder.go:2560 SetValueDeclaration
+impl Binder {
+    /// Go `newSymbol(flags, name)`, then `addDeclarationToSymbol(symbol,
+    /// node, includes)` and `symbol.Parent = parent`: `declare_symbol_ex`
+    /// for a name that its table does not hold yet. The caller writes the
+    /// table.
+    // PERF: parsefast1 item 2. The symbol is pushed with all its fields, as
+    // Go writes the fields of one struct, and not made empty and then
+    // written field by field through the arena.
+    pub(crate) fn new_declared_symbol(
+        &mut self,
+        name: Name,
+        flags: SymbolFlags,
+        node: Node,
+        includes: SymbolFlags,
+        parent: SymbolId,
+    ) -> SymbolId {
+        self.symbol_count += 1;
+        let mut flags = flags | includes;
+        // On merge of const enum module with class or function, reset const enum only flag (namespaces will already recalculate)
+        let const_enum_reset = flags.intersects(SymbolFlags::CONST_ENUM_ONLY_MODULE)
+            && flags
+                .intersects(SymbolFlags::FUNCTION | SymbolFlags::CLASS | SymbolFlags::REGULAR_ENUM);
+        if const_enum_reset {
+            flags = flags.without(SymbolFlags::CONST_ENUM_ONLY_MODULE);
+        }
+        let declarations = self.new_single_declaration(node);
+        // Go `SetValueDeclaration` on a symbol with no value declaration.
+        let value_declaration = if includes.intersects(SymbolFlags::VALUE) {
+            node
+        } else {
+            Node::NIL
+        };
+        let symbol = self.symbols.push_symbol(Symbol {
+            flags,
+            name,
+            declarations,
+            value_declaration,
+            parent,
+            ..Symbol::default()
+        });
+        if const_enum_reset {
+            self.not_const_enum_only_modules.insert(symbol);
+        }
+        self.set_node_symbol(node, symbol);
+        symbol
+    }
+}
+
+// Go: binder/binder.go:2559 SetValueDeclaration
 pub fn set_value_declaration(symbols: &mut SymbolArena, symbol: SymbolId, node: Node) {
-    let value_declaration = symbols.sym(symbol).value_declaration;
-    if value_declaration.is_nil()
-        || is_assignment_declaration(value_declaration) && !is_assignment_declaration(node)
-        || value_declaration.kind() != node.kind()
-            && is_effective_module_declaration(value_declaration)
-    {
-        // Non-assignment declarations take precedence over assignment declarations and
-        // non-namespace declarations take precedence over namespace declarations.
+    if takes_value_declaration(symbols.sym(symbol).value_declaration, node) {
         symbols.sym_mut(symbol).value_declaration = node;
     }
+}
+
+/// The test of Go `SetValueDeclaration`: whether `node` replaces the value
+/// declaration `value_declaration` of its symbol.
+// Go: binder/binder.go:2559 SetValueDeclaration
+// PERF: reads each node kind once (Go reads `Kind` fields; a port kind read
+// goes through the node store).
+#[inline]
+fn takes_value_declaration(value_declaration: Node, node: Node) -> bool {
+    if value_declaration.is_nil() {
+        return true;
+    }
+    let value_kind = value_declaration.kind();
+    let node_kind = node.kind();
+    // Non-assignment declarations take precedence over assignment declarations and
+    // non-namespace declarations take precedence over namespace declarations.
+    is_assignment_declaration_kind(value_kind) && !is_assignment_declaration_kind(node_kind)
+        || value_kind != node_kind && is_effective_module_declaration_kind(value_kind)
 }
 
 // Go: binder/binder.go:2580 GetContainerFlags
@@ -1438,28 +1502,51 @@ pub fn is_statement_condition(node: Node) -> bool {
 }
 
 // Go: binder/binder.go:2789 isTopLevelLogicalExpression
+// PERF: parsefast1 item 2. Each parent is read once (Go reads the
+// `Parent` field each time).
 pub fn is_top_level_logical_expression(node: Node) -> bool {
     let mut node = node;
-    while is_parenthesized_expression(node.parent())
-        || is_prefix_unary_expression(node.parent())
-            && node.parent().operator() == SyntaxKind::ExclamationToken
+    let mut parent = node.parent();
+    while is_parenthesized_expression(parent)
+        || is_prefix_unary_expression(parent) && parent.operator() == SyntaxKind::ExclamationToken
     {
-        node = node.parent();
+        node = parent;
+        parent = node.parent();
     }
     !is_statement_condition(node)
-        && !is_logical_expression(node.parent())
-        && !(is_optional_chain(node.parent()) && node.parent().expression() == node)
+        && !is_logical_expression(parent)
+        && !(is_optional_chain(parent) && parent.expression() == node)
 }
 
-// Go: binder/binder.go:2796 isAssignmentDeclaration
+// Go: binder/binder.go:2795 isAssignmentDeclaration
 pub fn is_assignment_declaration(decl: Node) -> bool {
-    is_binary_expression(decl)
-        || is_access_expression(decl)
-        || is_identifier(decl)
-        || is_call_expression(decl)
+    is_assignment_declaration_kind(decl.kind())
 }
 
-// Go: binder/binder.go:2800 isEffectiveModuleDeclaration
+/// `is_assignment_declaration` of a node of kind `kind`: binary, access,
+/// identifier or call expression.
+// Go: binder/binder.go:2795 isAssignmentDeclaration
+// Go: ast/utilities.go:479 IsAccessExpression
+#[inline]
+fn is_assignment_declaration_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::BinaryExpression
+            | SyntaxKind::PropertyAccessExpression
+            | SyntaxKind::ElementAccessExpression
+            | SyntaxKind::Identifier
+            | SyntaxKind::CallExpression
+    )
+}
+
+// Go: binder/binder.go:2799 isEffectiveModuleDeclaration
 pub fn is_effective_module_declaration(node: Node) -> bool {
-    is_module_declaration(node) || is_identifier(node)
+    is_effective_module_declaration_kind(node.kind())
+}
+
+/// `is_effective_module_declaration` of a node of kind `kind`.
+// Go: binder/binder.go:2799 isEffectiveModuleDeclaration
+#[inline]
+fn is_effective_module_declaration_kind(kind: SyntaxKind) -> bool {
+    matches!(kind, SyntaxKind::ModuleDeclaration | SyntaxKind::Identifier)
 }

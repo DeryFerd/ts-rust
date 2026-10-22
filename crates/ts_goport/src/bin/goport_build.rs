@@ -7,7 +7,8 @@
 //!   loop (Go `WatchManager.RunLoop`) until the process is killed: there is
 //!   no signal handling (plan D-W3), so the loop never ends by itself.
 //!   Output goes to stdout as it is written. Every project compiles in
-//!   this process, as in Go.
+//!   this process, as in Go. `--fast` and `GOPORT_FAST=1` work as with
+//!   `tsgo -b` (`fast_mode::take_flag`).
 //!
 //! Only build mode is ported. Other command lines (Go `tscCompilation`)
 //! exit with `EXIT_UNPORTED` (70).
@@ -23,7 +24,7 @@ use std::any::Any;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use ts_goport::execute::execute_tsc::tsc_build_compilation;
+use ts_goport::execute::execute_tsc::{is_build_flag, tsc_build_compilation};
 use ts_goport::execute::tsc::compile::{
     EXIT_UNPORTED, ExitStatus, System, new_os_system, write_go_output,
 };
@@ -53,12 +54,20 @@ fn main() {
     let budget = ThreadBudget::WIDE;
     set_malloc_tunables(&budget);
     budget.install();
-    let args: Vec<String> = ts_goport::frontend::vfs::os_args();
+    let mut args: Vec<String> = ts_goport::frontend::vfs::os_args();
     install_panic_hook();
     let work = std::thread::Builder::new()
         .name("goport_build".to_string())
         .stack_size(ts_goport::gostd::stack::max_stack_size())
-        .spawn(move || run(&args));
+        .spawn(move || {
+            // PORT: not in Go (fastmode1). As the tsc bin (`tsgo.rs`
+            // `run_main`): `--fast` turns fast mode on, and the build flag
+            // keeps Go's 4 checkers in fast mode (`fast_mode::checker_count`),
+            // with `GOPORT_FAST=1` too. On the work thread, after the panic
+            // hook, so a panic here exits 70, as one in the build does.
+            ts_goport::fast_mode::take_flag(&mut args);
+            run(&args)
+        });
     let code = if let Ok(Ok(code)) = work.map(std::thread::JoinHandle::join) {
         code
     } else {
@@ -119,13 +128,7 @@ fn run(args: &[String]) -> i32 {
     let sys: Rc<dyn System> = Rc::new(sys.with_writer(Rc::new(RefCell::new(StreamingStdout))));
 
     // Go: execute/tsc.go:53 CommandLine
-    let is_build = args.first().is_some_and(|arg| {
-        matches!(
-            arg.to_lowercase().as_str(),
-            "-b" | "--b" | "-build" | "--build"
-        )
-    });
-    if !is_build {
+    if !args.first().is_some_and(|arg| is_build_flag(arg)) {
         eprintln!("goport_build: only build mode (-b) is ported");
         return EXIT_UNPORTED;
     }
@@ -205,7 +208,7 @@ fn install_panic_hook() {
         }
         let location = info
             .location()
-            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .map(|l| format!(" at {}:{}", go_site_file(l.file()), l.line()))
             .unwrap_or_default();
         eprintln!("goport_build: panic{location}: {message}");
         if std::env::var_os("GOPORT_TRACE").is_some() {

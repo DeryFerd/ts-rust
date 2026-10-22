@@ -10,7 +10,7 @@ use crate::diagnostics::Message;
 use crate::prelude::*;
 use std::cell::Cell;
 
-// Go: checker/checker.go:1128 createFileIndexMap
+// Go: checker/checker.go:1131 createFileIndexMap
 pub fn create_file_index_map(files: &[Node]) -> FxHashMap<Node, i32> {
     let mut result: FxHashMap<Node, i32> = FxHashMap::default();
     result.reserve(files.len());
@@ -21,7 +21,7 @@ pub fn create_file_index_map(files: &[Node]) -> FxHashMap<Node, i32> {
 }
 
 impl Checker {
-    // Go: checker/checker.go:1136 countGlobalSymbols
+    // Go: checker/checker.go:1139 countGlobalSymbols
     // PORT: Go reads `len(file.Locals)` directly; the symbol tables live in the
     // checker's symbol arena, so this is a `Checker` method.
     pub fn count_global_symbols(&self, files: &[Node]) -> i32 {
@@ -34,7 +34,7 @@ impl Checker {
         count
     }
 
-    // Go: checker/checker.go:1146 reportUnreliableWorker
+    // Go: checker/checker.go:1149 reportUnreliableWorker
     pub fn report_unreliable_worker(&mut self, t: TypeId) -> TypeId {
         if t == self.marker_super_type || t == self.marker_sub_type || t == self.marker_other_type {
             self.reliability_flags |= RelationComparisonResult::REPORTS_UNRELIABLE;
@@ -42,7 +42,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:1153 reportUnmeasurableWorker
+    // Go: checker/checker.go:1156 reportUnmeasurableWorker
     pub fn report_unmeasurable_worker(&mut self, t: TypeId) -> TypeId {
         if t == self.marker_super_type || t == self.marker_sub_type || t == self.marker_other_type {
             self.reliability_flags |= RelationComparisonResult::REPORTS_UNMEASURABLE;
@@ -50,7 +50,7 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:1161 getGlobalTypeResolver
+    // Go: checker/checker.go:1164 getGlobalTypeResolver
     // Resolve to the global class or interface by the given name and arity, or emptyObjectType/emptyGenericType otherwise
     // PORT: Go `core.Memoize` becomes a closure over a `Cell` cache. Like Go,
     // the value is computed on the first call and returned afterwards.
@@ -72,7 +72,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:1168 getGlobalTypeAliasResolver
+    // Go: checker/checker.go:1171 getGlobalTypeAliasResolver
     // Resolve to the global type alias symbol by the given name and arity, or nil otherwise
     pub fn get_global_type_alias_resolver(
         &self,
@@ -92,7 +92,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:1175 getGlobalValueSymbolResolver
+    // Go: checker/checker.go:1178 getGlobalValueSymbolResolver
     // Resolve to the global value symbol by the given name, or nil otherwise
     pub fn get_global_value_symbol_resolver(
         &self,
@@ -119,7 +119,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:1181 getGlobalTypeSymbolResolver
+    // Go: checker/checker.go:1184 getGlobalTypeSymbolResolver
     pub fn get_global_type_symbol_resolver(
         &self,
         name: &str,
@@ -145,7 +145,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:1187 getGlobalTypesResolver
+    // Go: checker/checker.go:1190 getGlobalTypesResolver
     pub fn get_global_types_resolver(
         &self,
         names: &[&str],
@@ -167,7 +167,7 @@ impl Checker {
         })
     }
 
-    // Go: checker/checker.go:1195 getGlobalTypeAliasSymbol
+    // Go: checker/checker.go:1198 getGlobalTypeAliasSymbol
     pub fn get_global_type_alias_symbol(
         &mut self,
         name: &str,
@@ -209,7 +209,7 @@ impl Checker {
         symbol
     }
 
-    // Go: checker/checker.go:1212 GetTypeAliasTypeParameters
+    // Go: checker/checker.go:1215 GetTypeAliasTypeParameters
     pub fn get_type_alias_type_parameters(&mut self, symbol: SymbolId) -> Vec<TypeId> {
         if !self.sym(symbol).flags.intersects(SymbolFlags::TYPE_ALIAS) {
             panic!("Attempted to fetch type alias parameters for non-type-alias symbol");
@@ -218,7 +218,7 @@ impl Checker {
         self.type_alias_links.get(symbol).type_parameters.clone()
     }
 
-    // Go: checker/checker.go:1220 getGlobalType
+    // Go: checker/checker.go:1223 getGlobalType
     pub fn get_global_type(&mut self, name: &str, arity: i32, report_errors: bool) -> TypeId {
         let symbol = self.get_global_symbol(
             name,
@@ -264,7 +264,7 @@ impl Checker {
         self.empty_object_type
     }
 
-    // Go: checker/checker.go:1241 getGlobalTypeDeclaration
+    // Go: checker/checker.go:1244 getGlobalTypeDeclaration
     // PORT: Go package function reading `symbol.Declarations`; it needs the
     // symbol arena, so it is a `Checker` method.
     pub fn get_global_type_declaration(&self, symbol: SymbolId) -> Node {
@@ -280,7 +280,7 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:1251 getGlobalSymbol
+    // Go: checker/checker.go:1254 getGlobalSymbol
     // PORT: the nil-able Go `*diagnostics.Message` is `Option<&'static Message>`.
     pub fn get_global_symbol(
         &mut self,
@@ -301,7 +301,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:1256 initializeClosures
+    // Go: checker/checker.go:1259 initializeClosures
     pub fn initialize_closures(&mut self) {
         self.is_primitive_or_object_or_empty_type = Rc::new(|c: &mut Checker, t: TypeId| -> bool {
             c.ty(t)
@@ -326,7 +326,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/checker.go:1269 initializeIterationResolvers
+    // Go: checker/checker.go:1272 initializeIterationResolvers
     pub fn initialize_iteration_resolvers(&mut self) {
         let sync_builtin = self.get_global_types_resolver(
             &[
@@ -387,7 +387,7 @@ impl Checker {
         });
     }
 
-    // Go: checker/checker.go:1306 initializeChecker
+    // Go: checker/checker.go:1309 initializeChecker
     pub fn initialize_checker(&mut self) {
         // Initialize global symbol table
         let mut ambient_module_symbols: Vec<SymbolId> = Vec::new();
@@ -531,7 +531,7 @@ impl Checker {
         self.globals_complete = true;
     }
 
-    // Go: checker/checker.go:1397 mergeGlobalSymbol
+    // Go: checker/checker.go:1400 mergeGlobalSymbol
     pub fn merge_global_symbol(&mut self, symbol: SymbolId) {
         let name = self.sym(symbol).name.clone();
         // PERF: `get_name` finds the name by id with the interner's hash;
@@ -546,7 +546,7 @@ impl Checker {
         self.symbols.set(self.globals, name, merged);
     }
 
-    // Go: checker/checker.go:1409 mergePatternAmbientModules
+    // Go: checker/checker.go:1412 mergePatternAmbientModules
     // Pattern ambient modules are merged together if they have the same pattern and identical import attributes type.
     // PORT: Go `module.Pattern.Text` is the prefix, the star and the suffix
     // (`PatternAmbientModule` stores the prefix and suffix).
@@ -597,7 +597,7 @@ impl Checker {
         self.pattern_ambient_modules = grouped;
     }
 
-    // Go: checker/checker.go:1436 mergeModuleAugmentation
+    // Go: checker/checker.go:1439 mergeModuleAugmentation
     pub fn merge_module_augmentation(&mut self, module_name: Node) {
         let module_node = module_name.parent();
         let module_augmentation_symbol = module_node.symbol();
@@ -713,7 +713,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:1493 addUndefinedToGlobalsOrErrorOnRedeclaration
+    // Go: checker/checker.go:1496 addUndefinedToGlobalsOrErrorOnRedeclaration
     pub fn add_undefined_to_globals_or_error_on_redeclaration(&mut self) {
         let name = self.sym(self.undefined_symbol).name.clone();
         let target_symbol = self.symbols.get(self.globals, &name);
@@ -734,7 +734,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:1507 createNameResolver
+    // Go: checker/checker.go:1510 createNameResolver
     // PORT: Go binds checker methods as closures. Here each callback takes the
     // checker as its first argument (see `nameresolver.rs`). Go
     // `c.compilerOptions` is `program.Options()`, which is `self.compiler_options`.
@@ -829,7 +829,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:1525 createNameResolverForSuggestion
+    // Go: checker/checker.go:1528 createNameResolverForSuggestion
     pub fn create_name_resolver_for_suggestion(&self) -> NameResolver {
         let get_symbol_of_declaration: NameResolverGetSymbolOfDeclarationFn =
             Rc::new(|c: &mut Checker, node: Node| -> SymbolId {
@@ -880,22 +880,22 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:1540 symbolReferenced
+    // Go: checker/checker.go:1543 symbolReferenced
     pub fn symbol_referenced(&mut self, symbol: SymbolId, meaning: SymbolFlags) {
         self.symbol_reference_links.get(symbol).reference_kinds |= meaning;
     }
 
-    // Go: checker/checker.go:1544 getRequiresScopeChangeCache
+    // Go: checker/checker.go:1547 getRequiresScopeChangeCache
     pub fn get_requires_scope_change_cache(&mut self, node: Node) -> Tristate {
         self.node_links.get(node).declaration_requires_scope_change
     }
 
-    // Go: checker/checker.go:1548 setRequiresScopeChangeCache
+    // Go: checker/checker.go:1551 setRequiresScopeChangeCache
     pub fn set_requires_scope_change_cache(&mut self, node: Node, value: Tristate) {
         self.node_links.get(node).declaration_requires_scope_change = value;
     }
 
-    // Go: checker/checker.go:1555 checkAndReportErrorForInvalidInitializer
+    // Go: checker/checker.go:1558 checkAndReportErrorForInvalidInitializer
     // The invalid initializer error is needed in two situation:
     // 1. When result is undefined, after checking for a missing "this."
     // 2. When result is defined
@@ -936,7 +936,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:1573 checkAndReportErrorForMissingPrefix
+    // Go: checker/checker.go:1576 checkAndReportErrorForMissingPrefix
     pub fn check_and_report_error_for_missing_prefix(
         &mut self,
         error_location: Node,
@@ -993,7 +993,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:1605 onFailedToResolveSymbol
+    // Go: checker/checker.go:1608 onFailedToResolveSymbol
     pub fn on_failed_to_resolve_symbol(
         &mut self,
         error_location: Node,
@@ -1097,7 +1097,7 @@ impl Checker {
         );
     }
 
-    // Go: checker/checker.go:1649 checkAndReportErrorForUsingTypeAsNamespace
+    // Go: checker/checker.go:1652 checkAndReportErrorForUsingTypeAsNamespace
     pub fn check_and_report_error_for_using_type_as_namespace(
         &mut self,
         error_location: Node,
@@ -1146,7 +1146,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:1670 checkAndReportErrorForExportingPrimitiveType
+    // Go: checker/checker.go:1673 checkAndReportErrorForExportingPrimitiveType
     pub fn check_and_report_error_for_exporting_primitive_type(
         &mut self,
         error_location: Node,
@@ -1166,13 +1166,13 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:1678 isPrimitiveTypeName
+// Go: checker/checker.go:1681 isPrimitiveTypeName
 pub fn is_primitive_type_name(s: &str) -> bool {
     s == "any" || s == "string" || s == "number" || s == "boolean" || s == "never" || s == "unknown"
 }
 
 impl Checker {
-    // Go: checker/checker.go:1682 checkAndReportErrorForUsingNamespaceAsTypeOrValue
+    // Go: checker/checker.go:1685 checkAndReportErrorForUsingNamespaceAsTypeOrValue
     pub fn check_and_report_error_for_using_namespace_as_type_or_value(
         &mut self,
         error_location: Node,
@@ -1227,7 +1227,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:1703 checkAndReportErrorForUsingTypeAsValue
+    // Go: checker/checker.go:1706 checkAndReportErrorForUsingTypeAsValue
     pub fn check_and_report_error_for_using_type_as_value(
         &mut self,
         error_location: Node,
@@ -1323,13 +1323,13 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:1745 isES2015OrLaterConstructorName
+// Go: checker/checker.go:1748 isES2015OrLaterConstructorName
 pub fn is_es2015_or_later_constructor_name(s: &str) -> bool {
     s == "Promise" || s == "Symbol" || s == "Map" || s == "WeakMap" || s == "Set" || s == "WeakSet"
 }
 
 impl Checker {
-    // Go: checker/checker.go:1749 maybeMappedType
+    // Go: checker/checker.go:1752 maybeMappedType
     pub fn maybe_mapped_type(&mut self, node: Node, symbol: SymbolId) -> bool {
         let mut node = node;
         loop {
@@ -1350,7 +1350,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:1763 checkAndReportErrorForUsingValueAsType
+    // Go: checker/checker.go:1766 checkAndReportErrorForUsingValueAsType
     pub fn check_and_report_error_for_using_value_as_type(
         &mut self,
         error_location: Node,
@@ -1381,7 +1381,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:1774 getSuggestedLibForNonExistentName
+    // Go: checker/checker.go:1777 getSuggestedLibForNonExistentName
     pub fn get_suggested_lib_for_non_existent_name(&mut self, name: &str) -> String {
         let feature_map = get_feature_map();
         if let Some(type_features) = feature_map.get(name) {
@@ -1390,7 +1390,7 @@ impl Checker {
         String::new()
     }
 
-    // Go: checker/checker.go:1782 getSuggestedSymbolForNonexistentSymbol
+    // Go: checker/checker.go:1785 getSuggestedSymbolForNonexistentSymbol
     pub fn get_suggested_symbol_for_nonexistent_symbol(
         &mut self,
         location: Node,
@@ -1405,8 +1405,8 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:1786 primitiveTypeAliasSuggestions
-    // Go: checker/checker.go:1804 getPrimitiveTypeAliasSuggestions
+    // Go: checker/checker.go:1789 primitiveTypeAliasSuggestions
+    // Go: checker/checker.go:1807 getPrimitiveTypeAliasSuggestions
     // PORT: Go builds the six transient suggestion symbols once per process
     // (`sync.OnceValue`) and yields those whose builtin name is present in
     // `symbols`, in random map order. Symbols live in the checker's arena
@@ -1433,7 +1433,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:1816 getSuggestionForSymbolNameLookup
+    // Go: checker/checker.go:1819 getSuggestionForSymbolNameLookup
     // PORT: the name is a `TableKey` because this is a `NameResolver` lookup
     // callback (see `NameResolverLookupFn`).
     // PERF: the globals table gives the same suggestion for the same name and
@@ -1461,8 +1461,8 @@ impl Checker {
     //   result is not kept. A target can still change after a kept scan
     //   read it, with no merge: a nested resolution (after
     //   `get_resolved_signature` moves `resolution_start`, Go
-    //   checker.go:8591) sets it, and the outer one (checker.go:16603 to
-    //   16606) writes it again, so a kept entry can have seen `unknown`
+    //   checker.go:8624) sets it, and the outer one (checker.go:16670 to
+    //   16673) writes it again, so a kept entry can have seen `unknown`
     //   where a late member is now. Both are Property-like value symbols,
     //   so no meaning that a name lookup asks for tells them apart (spell1
     //   skeptic case c17 matches Go).
@@ -1527,7 +1527,7 @@ impl Checker {
         best
     }
 
-    // Go: checker/checker.go:1841 getSpellingSuggestionForName
+    // Go: checker/checker.go:1844 getSpellingSuggestionForName
     // Given a name and a list of symbols whose names are *not* equal to the name, return a spelling suggestion if there is
     // one that is close enough. Names less than length 3 only check for case-insensitive equality, not levenshtein distance.
     //
@@ -1599,7 +1599,7 @@ impl Checker {
         best
     }
 
-    // Go: checker/checker.go:1842 getSpellingSuggestionForName.getCandidateName
+    // Go: checker/checker.go:1845 getSpellingSuggestionForName.getCandidateName
     // PORT: Go closure inside getSpellingSuggestionForName.
     fn get_candidate_name_for_spelling_suggestion(
         &mut self,
@@ -1642,7 +1642,7 @@ impl Checker {
         ""
     }
 
-    // Go: checker/checker.go:1861 onSuccessfullyResolvedSymbol
+    // Go: checker/checker.go:1864 onSuccessfullyResolvedSymbol
     pub fn on_successfully_resolved_symbol(
         &mut self,
         error_location: Node,
@@ -1813,7 +1813,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:1929 checkResolvedBlockScopedVariable
+    // Go: checker/checker.go:1932 checkResolvedBlockScopedVariable
     pub fn check_resolved_block_scoped_variable(&mut self, result: SymbolId, error_location: Node) {
         let result_flags = self.sym(result).flags;
         debug_assert!(
@@ -1886,7 +1886,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:1963 isBlockScopedNameDeclaredBeforeUse
+    // Go: checker/checker.go:1966 isBlockScopedNameDeclaredBeforeUse
     pub fn is_block_scoped_name_declared_before_use(
         &mut self,
         declaration: Node,
@@ -2029,7 +2029,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:2052 isUsedInFunctionOrInstanceProperty
+    // Go: checker/checker.go:2055 isUsedInFunctionOrInstanceProperty
     pub fn is_used_in_function_or_instance_property(
         &mut self,
         usage: Node,

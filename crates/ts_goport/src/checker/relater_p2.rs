@@ -254,7 +254,9 @@ pub trait Discriminator {
     /// Number of discriminant properties
     fn len(&self) -> i32;
     /// Property name of index-th discriminator
-    fn name(&self, c: &Checker, index: i32) -> String;
+    // PERF (jsxname1): a `Name`, not a `String` copy of its text, so the
+    // property lookups compare name ids.
+    fn name(&self, c: &Checker, index: i32) -> Name;
     /// True if index-th discriminator matches the given type
     fn matches(&mut self, c: &mut Checker, index: i32, t: TypeId) -> bool;
 }
@@ -275,8 +277,8 @@ impl<'a> Discriminator for TypeDiscriminator<'a> {
     }
 
     // Go: checker/relater.go:1040 TypeDiscriminator.name
-    fn name(&self, c: &Checker, index: i32) -> String {
-        c.sym(self.props[index as usize]).name.to_string()
+    fn name(&self, c: &Checker, index: i32) -> Name {
+        c.sym(self.props[index as usize]).name.clone()
     }
 
     // Go: checker/relater.go:1044 TypeDiscriminator.matches
@@ -345,8 +347,13 @@ impl Checker {
     }
 
     // Go: checker/relater.go:1080 isDiscriminantProperty
-    pub fn is_discriminant_property(&mut self, t: TypeId, name: &str) -> bool {
-        self.is_discriminant_property_key(t, TableKey::Text(name))
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`).
+    pub fn is_discriminant_property<'a>(
+        &mut self,
+        t: TypeId,
+        name: impl Into<TableKey<'a>>,
+    ) -> bool {
+        self.is_discriminant_property_key(t, name.into())
     }
 
     /// `is_discriminant_property` by `TableKey`.
@@ -563,9 +570,12 @@ impl Checker {
             // have non-matching discriminants. This ensures that we ignore erroneous discriminators and gradually
             // refine the target set without eliminating every constituent (which would lead to `never`).
             let mut matched = false;
+            // PERF (jsxname1): Go reads `discriminator.name(n)` for each
+            // constituent. The name does not change in this loop, so it is
+            // read once.
+            let name = discriminator.name(self, n);
             for i in 0..types.len() {
                 if include[i] != Ternary::FALSE {
-                    let name = discriminator.name(self, n);
                     let target_type =
                         self.get_type_of_property_or_index_signature_of_type(types[i], &name);
                     if target_type.is_some() {

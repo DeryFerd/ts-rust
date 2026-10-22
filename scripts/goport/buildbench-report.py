@@ -5,7 +5,8 @@ usage: buildbench-report.py <runs-dir>...
 
 Reads every <runs-dir>/results.tsv and the cargo timing pages in <runs-dir>/logs/. One row per
 cell (label without its -rN suffix); each value column lists the runs as "a / b". "lib" is the
-ts_goport lib unit time, "front" its time to metadata (the frontend part, before codegen).
+ts_goport lib unit time, "front" its time to metadata (the frontend part, before codegen). "peak
+GiB" is the peak memory of the whole build's cgroup ("-" in runs from before it was recorded).
 """
 import csv
 import json
@@ -46,15 +47,21 @@ for d in map(Path, sys.argv[1:]):
         lib, front = lib_times(d / "logs" / f"{row['label']}.html")
         cells.setdefault(cell, []).append((row, lib, front))
 
-print("| cell | toolchain | profile | RUSTFLAGS | incr | runs | wall s | user s | sys s | max RSS GiB | lib s | front s | rc |")
-print("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+def gib(kib):
+    return "-" if not kib or kib == "0" else f"{int(kib) / 1048576:.1f}"
+
+
+print("| cell | toolchain | profile | cmd | RUSTFLAGS | incr | runs | wall s | user s | sys s | max RSS GiB | peak GiB | lib s | front s | rc |")
+print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
 for cell, runs in cells.items():
     r0 = runs[0][0]
     print(
-        f"| {cell} | {r0['toolchain']} | {r0['profile']} | {r0['rustflags']} | {r0['incr']} | {len(runs)} | "
+        f"| {cell} | {r0['toolchain']} | {r0['profile']} | {r0.get('cmd') or 'build --bins'} | {r0['rustflags']} | {r0['incr']} | {len(runs)} | "
         f"{fmt(float(r['wall_s']) for r, _, _ in runs)} | {fmt(float(r['user_s']) for r, _, _ in runs)} | "
         f"{fmt(float(r['sys_s']) for r, _, _ in runs)} | "
-        + " / ".join(f"{int(r['maxrss_kib']) / 1048576:.1f}" for r, _, _ in runs)
+        + " / ".join(gib(r["maxrss_kib"]) for r, _, _ in runs)
+        + " | "
+        + " / ".join(gib(r.get("peak_kib")) for r, _, _ in runs)
         + f" | {fmt(l for _, l, _ in runs)} | {fmt(f for _, _, f in runs)} | "
         + ",".join(r["rc"] for r, _, _ in runs)
         + " |"

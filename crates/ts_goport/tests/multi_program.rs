@@ -21,6 +21,10 @@
 //! The serial bind test runs `goport_typesyms` and `tsgo` with one bind
 //! thread and with four, and compares their outputs.
 //!
+//! The no-emit test runs `tsgo -p` with `incremental` and `noEmit` through
+//! a sequence of edits, and compares each run with a fresh run and with a
+//! run of Go's d.ts walk.
+//!
 //! `pair` writes these files to its out dir: `a.txt`, `a.status`, `b.txt`,
 //! `b.status`, `b.reused` and, with `--first`, `first.txt`. A status file
 //! holds the decimal exit code. `b.reused` holds `true` or `false`.
@@ -800,7 +804,9 @@ fn watch_build_frees_file_versions() {
 /// `tsgo-oracle-673a5f17d713 -w -p tsconfig.json --pretty` for the same
 /// edits. The outputs equal Go's (`expected-out`): the last edit emits
 /// each file again, with its comments and LF line ends, and the source
-/// maps of the crlf build stay.
+/// maps of the crlf build stay. The `expected-out` source maps are from
+/// `tsgo-oracle-fed0bf24149f` (pin N'), which omits an empty `sourceRoot`
+/// (ts#64544); its watch output and other outputs are the same as pin N's.
 // PORT: no Go counterpart; the output is Go's.
 #[test]
 fn watch_config_edits_of_emit_options_print_like_go() {
@@ -836,7 +842,9 @@ fn build_watch_config_edits_of_emit_options_print_like_go() {
 /// keeps the old version of `a.d.ts` and no signature for `index.ts`.
 /// `expected.txt` (the output up to the end of the second build) and
 /// `expected-app.tsbuildinfo.json` are from `tsgo-oracle-673a5f17d713` for
-/// the same steps (10 of 10 runs).
+/// the same steps (10 of 10 runs). At the bump D pin the build info is from
+/// `tsgo-oracle-fed0bf24149f` (3 of 3 runs): only the versions of the changed
+/// libs `lib.dom.d.ts` and `lib.es2022.array.d.ts` differ.
 // PORT: no Go counterpart; the output is Go's.
 #[test]
 fn build_watch_keeps_the_first_dts_parse_of_a_cycle() {
@@ -1130,6 +1138,291 @@ fn a_serial_bind_with_a_lib_snapshot_in_the_new_lineage_equals_the_parallel_bind
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The files that import `src/a.ts` directly in `no_emit_large_project_reports_like_fresh_runs`.
+const NO_EMIT_LARGE_IMPORTERS: usize = 40;
+
+/// The `compilerOptions` of the project of
+/// `no_emit_large_project_reports_like_fresh_runs`.
+const NO_EMIT_LARGE_OPTIONS: &str =
+    r#"{"incremental":true,"noEmit":true,"strict":true,"skipLibCheck":true,"types":[]}"#;
+
+/// t3inc1, t3inc3: `tsc -p` with `incremental` and `noEmit` on a project of
+/// 85 files, more than the d.ts walk limit (`affected_files.rs`
+/// `skips_dts_walk`), where 81 files import `src/a.ts` (40 directly). The
+/// steps are in `no_emit_large_steps`. After each step the incremental
+/// output must equal a fresh run of the same files, and a second project
+/// that runs Go's walk (`GOPORT_DTS_WALK_FALLBACK=0`) must report the same.
+/// The two build infos may differ only in `fileInfos`, where the closures
+/// store their versions, until a global change makes every file compute its
+/// d.ts signature.
+// PORT: no Go counterpart; Go always runs the walk.
+#[test]
+fn no_emit_large_project_reports_like_fresh_runs() {
+    let root = scratch_dir("no-emit-large");
+    let fallback = root.join("fallback");
+    let walk = root.join("walk");
+    for project in [&fallback, &walk] {
+        write_large_project(project, NO_EMIT_LARGE_OPTIONS);
+    }
+    for (step, file, text, errors, fallback_signatures) in no_emit_large_steps() {
+        for project in [&fallback, &walk] {
+            write(&project.join(file), &text);
+        }
+        let incremental = tsgo_no_emit(&fallback, &[], false);
+        let _ = fs::remove_file(fallback.join("fresh.tsbuildinfo"));
+        let fresh = tsgo_no_emit(
+            &fallback,
+            &["--tsBuildInfoFile", "fresh.tsbuildinfo"],
+            false,
+        );
+        let walked = tsgo_no_emit(&walk, &[], true);
+        let at = root.display();
+        assert_eq!(
+            incremental, fresh,
+            "{step}: incremental and fresh runs in {at}"
+        );
+        assert_eq!(
+            walked, incremental,
+            "{step}: Go's walk and the fallback in {at}"
+        );
+        assert_eq!(
+            error_lines(&incremental.stdout).len(),
+            errors,
+            "{step}: errors\n{}",
+            incremental.stdout
+        );
+        let fallback_info = read(&fallback.join("tsconfig.tsbuildinfo"));
+        let walk_info = read(&walk.join("tsconfig.tsbuildinfo"));
+        assert_eq!(
+            without_file_infos(&fallback_info),
+            without_file_infos(&walk_info),
+            "{step}: build info outside fileInfos in {at}"
+        );
+        // The build info writes a signature only where it is not the
+        // version. Until the global change, only `a.ts` gets one in the
+        // fallback (`b0.ts` has one importer, so it uses its version); Go's
+        // walk gives one to at least each importer of `a.ts`.
+        let signatures = |info: &str| info.matches("\"signature\":").count();
+        let Some(fallback_signatures) = fallback_signatures else {
+            assert_eq!(fallback_info, walk_info, "{step}: build info in {at}");
+            continue;
+        };
+        assert_eq!(
+            signatures(&fallback_info),
+            fallback_signatures,
+            "{step}: {fallback_info}"
+        );
+        if fallback_signatures > 0 {
+            assert!(
+                signatures(&walk_info) > NO_EMIT_LARGE_IMPORTERS,
+                "{step}: {walk_info}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The steps of `no_emit_large_project_reports_like_fresh_runs`: (step, file,
+/// its text, error lines, signatures in the fallback's build info). `None`:
+/// the whole build info is Go's, the signatures too.
+///
+/// A change of `Shape` that gives the 40 indirect importers an error, its
+/// revert, an error in `a.ts` that keeps its d.ts, its fix, a second change
+/// of `Shape`, a change of `b0.ts` (only `c0.ts` imports it) that gives
+/// `c0.ts` an error, its revert and a run with no change. Then (t3inc3) a
+/// change of `g.ts`, which affects the global scope, so every file is checked
+/// again and computes its d.ts signature, as in Go; its revert; and an edit
+/// of `a.ts` that keeps its d.ts, which then checks only `a.ts`, as in Go (a
+/// walk skip would store the versions of its closure).
+fn no_emit_large_steps() -> Vec<(&'static str, &'static str, String, usize, Option<usize>)> {
+    let a = no_emit_large_a;
+    let (a_ts, b0_ts, g_ts) = ("src/a.ts", "src/b0.ts", "src/g.ts");
+    let wide = 1 + NO_EMIT_LARGE_IMPORTERS;
+    vec![
+        ("cold", a_ts, a("x: number", "1"), 1, Some(0)),
+        ("wide change", a_ts, a("x: string", "\"1\""), wide, Some(1)),
+        ("revert", a_ts, a("x: number", "1"), 1, Some(1)),
+        ("error in a.ts", a_ts, a("x: number", "\"1\""), 2, Some(1)),
+        ("fix", a_ts, a("x: number", "1"), 1, Some(1)),
+        (
+            "second wide change",
+            a_ts,
+            a("x: number; y?: number", "1"),
+            1,
+            Some(1),
+        ),
+        (
+            "narrow change",
+            b0_ts,
+            "export const v0 = { x: \"0\" };\n".into(),
+            2,
+            Some(1),
+        ),
+        ("narrow revert", b0_ts, no_emit_large_b(0), 1, Some(1)),
+        ("no change", b0_ts, no_emit_large_b(0), 1, Some(1)),
+        ("global change", g_ts, no_emit_large_g("string"), 2, None),
+        ("global revert", g_ts, no_emit_large_g("number"), 1, None),
+        ("same d.ts", a_ts, a("x: number; y?: number", "2"), 1, None),
+    ]
+}
+
+/// t3inc3: an emitting build, `--noEmit` runs, then emitting builds again, on
+/// the project of `no_emit_large_project_reports_like_fresh_runs` with
+/// `declaration` and `outDir` in place of `noEmit`. An emitting build leaves
+/// no file pending, so the `--noEmit` runs must take Go's walk and Go's own
+/// signature of `b0.ts`: else the next build writes more files than Go's
+/// (`c<i>.js` after the change of `Shape`, `c0.js` after the edit of
+/// `b0.ts`). Each run must print what a project that runs Go's walk
+/// (`GOPORT_DTS_WALK_FALLBACK=0`) prints, `--listEmittedFiles` too, and
+/// write the same build info.
+// PORT: no Go counterpart; Go always runs the walk.
+#[test]
+fn no_emit_runs_between_builds_keep_go_emits() {
+    let root = scratch_dir("no-emit-between-builds");
+    let fallback = root.join("fallback");
+    let walk = root.join("walk");
+    for project in [&fallback, &walk] {
+        write_large_project(
+            project,
+            r#"{"incremental":true,"declaration":true,"outDir":"out","strict":true,"skipLibCheck":true,"types":[]}"#,
+        );
+    }
+    let (a, b0_body) = (
+        no_emit_large_a,
+        format!("{}const local = 1;\n", no_emit_large_b(0)),
+    );
+    let (a_ts, b0_ts) = ("src/a.ts", "src/b0.ts");
+    let steps = [
+        ("build", a_ts, a("x: number", "1"), false),
+        ("wide change, --noEmit", a_ts, a("x: string", "\"1\""), true),
+        (
+            "build after the wide change",
+            a_ts,
+            a("x: string", "\"1\""),
+            false,
+        ),
+        ("revert, --noEmit", a_ts, a("x: number", "1"), true),
+        ("b0.ts body, --noEmit", b0_ts, b0_body.clone(), true),
+        ("build after both", b0_ts, b0_body, false),
+    ];
+    for (step, file, text, no_emit) in steps {
+        let args: &[&str] = if no_emit {
+            &["--listEmittedFiles", "--noEmit"]
+        } else {
+            &["--listEmittedFiles"]
+        };
+        let [ours, go] = [(&fallback, false), (&walk, true)].map(|(project, walk)| {
+            write(&project.join(file), &text);
+            let report = tsgo_no_emit(project, args, walk);
+            let stdout = report.stdout.replace(&norm(project), "<project>");
+            let info = read(&project.join("out/tsconfig.tsbuildinfo"));
+            (stdout, report.status, info)
+        });
+        let at = root.display();
+        assert_eq!(ours.0, go.0, "{step}: stdout in {at}");
+        assert_eq!(ours.1, go.1, "{step}: exit code in {at}");
+        assert_eq!(ours.2, go.2, "{step}: build info in {at}");
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Writes the project of `no_emit_large_project_reports_like_fresh_runs`
+/// with these `compilerOptions`, without `src/a.ts`: `b<i>.ts` imports
+/// `a.ts`, `c<i>.ts` imports `b<i>.ts`, `u.ts` has an error, `g.ts` declares
+/// the global `gv` and `ug.ts` reads it. `d.d.ts` imports `b0.ts`: a file of
+/// the closure of `a.ts` that cannot be emitted, so the build info has no
+/// pending emit for it (t3inc3).
+fn write_large_project(project: &Path, options: &str) {
+    fs::create_dir_all(project.join("src")).expect("create src");
+    write(
+        &project.join("tsconfig.json"),
+        &format!(r#"{{"compilerOptions":{options},"include":["src"]}}"#),
+    );
+    for i in 0..NO_EMIT_LARGE_IMPORTERS {
+        write(&project.join(format!("src/b{i}.ts")), &no_emit_large_b(i));
+        write(
+            &project.join(format!("src/c{i}.ts")),
+            &format!("import {{ v{i} }} from \"./b{i}\";\nexport const n{i}: number = v{i}.x;\n"),
+        );
+    }
+    write(
+        &project.join("src/u.ts"),
+        "export const u: number = \"u\";\n",
+    );
+    write(&project.join("src/g.ts"), &no_emit_large_g("number"));
+    write(
+        &project.join("src/ug.ts"),
+        "export const ug: number = gv;\n",
+    );
+    write(
+        &project.join("src/d.d.ts"),
+        "import { v0 } from \"./b0\";\nexport declare const d: typeof v0;\n",
+    );
+}
+
+/// The text of `src/a.ts` in the tests of `write_large_project`, with these
+/// `Shape` members and this `x` in `make`.
+fn no_emit_large_a(members: &str, x: &str) -> String {
+    format!(
+        "export interface Shape {{ {members} }}\nexport const make = (): Shape => ({{ x: {x} }});\n"
+    )
+}
+
+/// The text of `src/b<i>.ts` in `write_large_project`.
+fn no_emit_large_b(i: usize) -> String {
+    format!("import {{ make }} from \"./a\";\nexport const v{i} = make();\n")
+}
+
+/// The text of `src/g.ts` in `write_large_project`, where the global `gv`
+/// has this type.
+fn no_emit_large_g(gv: &str) -> String {
+    format!("export const g = 1;\ndeclare global {{\n    var gv: {gv};\n}}\n")
+}
+
+/// Runs `tsgo -p tsconfig.json --pretty false <args>` in `project`, with
+/// `GOPORT_DTS_WALK_FALLBACK=0` when `walk` is true.
+fn tsgo_no_emit(project: &Path, args: &[&str], walk: bool) -> Report {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tsgo"));
+    command
+        .args(["-p", "tsconfig.json", "--pretty", "false"])
+        .args(args)
+        .current_dir(project);
+    if walk {
+        command.env("GOPORT_DTS_WALK_FALLBACK", "0");
+    }
+    let run = command.output().expect("run tsgo");
+    Report {
+        stdout: String::from_utf8(run.stdout).expect("tsgo stdout is UTF-8"),
+        status: run.status.code().expect("tsgo exited with a code"),
+    }
+}
+
+/// `build_info` without the value of its `fileInfos` key, a JSON array.
+fn without_file_infos(build_info: &str) -> String {
+    let key = "\"fileInfos\":";
+    let start = build_info.find(key).expect("build info has fileInfos") + key.len();
+    let bytes = build_info.as_bytes();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'[' | b'{' if !in_string => depth += 1,
+            b']' | b'}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return format!("{}{}", &build_info[..start], &build_info[i + 1..]);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    panic!("the fileInfos array of the build info does not end");
+}
+
 /// The diagnostic lines of a tsc report.
 fn error_lines(report: &str) -> Vec<&str> {
     report
@@ -1421,4 +1714,115 @@ fn read(path: &Path) -> String {
 
 fn write(path: &Path, text: &str) {
     fs::write(path, text).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+}
+
+/// Files of `many_references_report_like_fresh_runs`.
+const MANY_REFERENCES_FILES: usize = 300;
+
+/// Imports of each file of `many_references_report_like_fresh_runs`.
+const MANY_REFERENCES_IMPORTS: usize = 120;
+
+/// t3inc2: `tsc -p` with `incremental` and `noEmit` on 300 files with 120
+/// imports each (36,000 references). The steps are a change of the type of
+/// `v0` (its importers are checked again), an import added to `f1.ts` with an
+/// error (its references change, which the referenced files job finds:
+/// `ReferencedFiles::same_as_old`), both reverts and a run with no change.
+/// After each step the incremental output must equal a fresh run.
+// PORT: no Go counterpart; it pins the reuse of old reference sets.
+#[test]
+fn many_references_report_like_fresh_runs() {
+    let root = scratch_dir("many-references");
+    write(
+        &root.join("tsconfig.json"),
+        r#"{"compilerOptions":{"incremental":true,"noEmit":true,"strict":true,"types":[]},"include":["src"]}"#,
+    );
+    fs::create_dir_all(root.join("src")).expect("create src");
+    for i in 0..MANY_REFERENCES_FILES {
+        write(
+            &root.join(format!("src/f{i}.ts")),
+            &many_references_file(i, "number", "1", ""),
+        );
+    }
+    write(&root.join("src/u.ts"), "export const u: number = \"u\";\n");
+    // (step, file, its text, error lines). `u.ts` has an error, the type
+    // change gives one to `f299.ts` (it reads `v0`), and the import gives
+    // one to `f1.ts`.
+    let steps = [
+        ("cold", 0, many_references_file(0, "number", "1", ""), 1),
+        (
+            "type change",
+            0,
+            many_references_file(0, "string", "\"1\"", ""),
+            2,
+        ),
+        (
+            "import added",
+            1,
+            many_references_file(
+                1,
+                "number",
+                "1",
+                "import { u } from \"./u\";\nexport const w1: string = u;\n",
+            ),
+            3,
+        ),
+        (
+            "import revert",
+            1,
+            many_references_file(1, "number", "1", ""),
+            2,
+        ),
+        (
+            "type revert",
+            0,
+            many_references_file(0, "number", "1", ""),
+            1,
+        ),
+        (
+            "no change",
+            0,
+            many_references_file(0, "number", "1", ""),
+            1,
+        ),
+    ];
+    for (step, file, text, errors) in steps {
+        write(&root.join(format!("src/f{file}.ts")), &text);
+        let incremental = tsgo_no_emit(&root, &[], false);
+        let _ = fs::remove_file(root.join("fresh.tsbuildinfo"));
+        let fresh = tsgo_no_emit(&root, &["--tsBuildInfoFile", "fresh.tsbuildinfo"], false);
+        let at = root.display();
+        assert_eq!(
+            incremental, fresh,
+            "{step}: incremental and fresh runs in {at}"
+        );
+        assert_eq!(
+            error_lines(&incremental.stdout).len(),
+            errors,
+            "{step}: errors\n{}",
+            incremental.stdout
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// `src/f<i>.ts` of `many_references_report_like_fresh_runs`: it imports the
+/// next `MANY_REFERENCES_IMPORTS` files (in a ring), reads the first one's
+/// value as a number, and exports `v<i>` of type `ty` with value `value`,
+/// then `extra`.
+fn many_references_file(i: usize, ty: &str, value: &str, extra: &str) -> String {
+    use std::fmt::Write as _;
+    let n = MANY_REFERENCES_FILES;
+    let mut text = String::new();
+    for k in 1..=MANY_REFERENCES_IMPORTS {
+        let j = (i + k) % n;
+        writeln!(text, "import {{ v{j} }} from \"./f{j}\";").expect("write to a String");
+    }
+    let first = (i + 1) % n;
+    writeln!(text, "export const v{i}: {ty} = {value};").expect("write to a String");
+    writeln!(text, "export const s{i}: number = v{first};").expect("write to a String");
+    for k in 2..=MANY_REFERENCES_IMPORTS {
+        writeln!(text, "void v{};", (i + k) % n).expect("write to a String");
+    }
+    text.push_str(extra);
+    text
 }

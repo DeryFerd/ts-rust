@@ -64,7 +64,7 @@ pub fn analyze_flat_map_ignored_param_to_and_then(
             let callee = transformation.callee;
             if callee.is_nil()
                 || transformation.args.len() != 1
-                || !tp.is_node_reference_to_effect_module_api(callee, "flatMap")
+                || !tp.is_node_reference_to_effect_module_api(callee, member!("flatMap"))
             {
                 continue;
             }

@@ -7,7 +7,12 @@ use crate::effect::typeparser::*;
 use crate::prelude::*;
 
 /// Go `globalErrorCatchApis`: the Effect module APIs that have a catch callback parameter.
-static GLOBAL_ERROR_CATCH_APIS: &[&str] = &["tryPromise", "try", "tryMap", "tryMapPromise"];
+static GLOBAL_ERROR_CATCH_APIS: [ExportMember; 4] = [
+    ExportMember::new("tryPromise"),
+    ExportMember::new("try"),
+    ExportMember::new("tryMap"),
+    ExportMember::new("tryMapPromise"),
+];
 
 // Go: rules.GlobalErrorInEffectCatch
 /// GlobalErrorInEffectCatch detects when catch callbacks in Effect APIs return the global 'Error'
@@ -26,24 +31,21 @@ fn run_global_error_in_effect_catch(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagno
     let mut diags = Vec::new();
 
     let source_file = ctx.source_file;
-    walk(ctx, &mut diags, source_file);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(source_file).nodes() {
+        visit(ctx, &mut diags, n);
+    }
 
     diags
 }
 
-fn walk(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, n: Node) -> bool {
-    if n.is_nil() {
-        return false;
-    }
-
+fn visit(ctx: &mut RuleContext<'_, '_>, diags: &mut Vec<Diagnostic>, n: Node) {
     if n.kind() == SyntaxKind::CallExpression {
         if let Some(diag) = check_global_error_in_effect_catch(ctx, n) {
             diags.push(diag);
         }
     }
-
-    n.for_each_child(|child| walk(ctx, diags, child));
-    false
 }
 
 // Go: rules.checkGlobalErrorInEffectCatch
@@ -132,7 +134,7 @@ fn check_global_error_in_effect_catch(
 // Go: rules.isGlobalErrorCatchCallee
 /// isGlobalErrorCatchCallee checks if a node references one of the Effect module catch APIs.
 fn is_global_error_catch_callee(tp: &mut TypeParser<'_>, node: Node) -> bool {
-    for name in GLOBAL_ERROR_CATCH_APIS {
+    for name in &GLOBAL_ERROR_CATCH_APIS {
         if tp.is_node_reference_to_effect_module_api(node, name) {
             return true;
         }

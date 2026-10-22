@@ -6,7 +6,6 @@
 //! `ModifierList`, and Go `nil` is the `NIL` value of each. Nodes go to the
 //! factory target (synthetic arena or the store of the parsed file).
 
-use crate::astdata::NodeData as D;
 use crate::frontend::prelude::*;
 
 /// Go `TokenFlagsNone` in astdata form.
@@ -16,8 +15,9 @@ impl NodeFactory {
     // Go: ast/ast.go:2526 NewSourceFile
     // PORT: Go stores `fileName`, `parseOptions` and `text` on the
     // SourceFile data. Here the file name and text live in the node store
-    // (`new_file_store`) and the parse options in `ParsedSourceFile`, so only
-    // the Go check on the file name is kept.
+    // (`new_file_store`) and the parse options in `ParsedSourceFile`.
+    // ts#64159 removes the Go check on the file name (normalized and
+    // absolute): `opts.FileName` is a `RootedFilePath` now.
     // PORT: named `new_parsed_source_file` because `ast/factory.rs` has the
     // synthetic form of Go NewSourceFile with a different signature.
     pub fn new_parsed_source_file(
@@ -27,25 +27,13 @@ impl NodeFactory {
         statements: NodeList,
         end_of_file_token: Node,
     ) -> Node {
-        let _ = text;
-        if get_encoded_root_length(&opts.file_name) == 0
-            || opts.file_name != normalize_path(&opts.file_name)
-        {
-            panic!(
-                "fileName should be normalized and absolute: {:?}",
-                opts.file_name
-            );
-        }
+        let _ = (opts, text);
         self.new_node(
             SyntaxKind::SourceFile,
-            D::SourceFile(Box::new(crate::astdata::SourceFileData {
+            crate::astdata::SourceFileData {
                 end_of_file_token: self.id(end_of_file_token),
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
                 statements: self.req_list(statements),
-                symbol: None,
-                facts: 0,
-            })),
+            },
         )
     }
 

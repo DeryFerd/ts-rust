@@ -12,7 +12,8 @@ use crate::ipc::prelude::*;
 
 use crate::gostd::{GoError, errors};
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 
 /// Go `io.ReadWriteCloser` for an API connection.
 pub trait ReadWriteCloser: Send + Sync {
@@ -143,7 +144,7 @@ impl StdioTransport {
         }
         self.used = true;
         Ok(Arc::new(StdioConn {
-            stdin: Mutex::new(StdioFile::new(self.stdin.take())),
+            stdin: StdioIn::new(self.stdin.take()),
             stdout: Mutex::new(StdioFile::new(self.stdout.take())),
         }))
     }
@@ -169,8 +170,71 @@ impl Transport for StdioTransport {
 // PORT: Go embeds the reader and writer; here each sits behind a mutex so
 // the connection can be shared (`ReadWriteCloser` takes `&self`).
 struct StdioConn {
-    stdin: Mutex<StdioFile<Box<dyn Read + Send>>>,
+    stdin: StdioIn,
     stdout: Mutex<StdioFile<Box<dyn Write + Send>>>,
+}
+
+/// The stdin of a `StdioConn`. Go's `os.Stdin` is a blocking file (Go
+/// polls only a file that is already non-blocking: os/file_unix.go
+/// newFile). Its `Close` does not wait for a `Read` on another goroutine
+/// (internal/poll/fd_unix.go `FD.Close`: no wait when `isBlocking`): it
+/// marks the file closed at once, the pending read still returns what it
+/// reads, a later read fails, and the descriptor closes when that read
+/// ends. `AsyncConn::read_on_thread` reads on a thread that holds `file`
+/// while it reads, so `close` sets `closed` and does not wait for `file`:
+/// a request error (Go conn_async.go:102) closes the connection on the
+/// dispatch thread while the reader thread waits for stdin.
+struct StdioIn {
+    file: Mutex<StdioFile<Box<dyn Read + Send>>>,
+    closed: AtomicBool,
+}
+
+impl StdioIn {
+    fn new(file: Option<Box<dyn Read + Send>>) -> StdioIn {
+        StdioIn {
+            file: Mutex::new(StdioFile::new(file)),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut file = lock(&self.file);
+        let result = if self.closed.load(Ordering::SeqCst) {
+            // Nil is never closed: its `close` panics.
+            Err(already_closed("read", STDIN_NAME))
+        } else {
+            file.file("read", STDIN_NAME)
+                .and_then(|file| file.read(buf))
+        };
+        // Go: the last reference closes the descriptor. A `close` while
+        // this read held `file` left that to this read.
+        if self.closed.load(Ordering::SeqCst) {
+            *file = StdioFile::Closed;
+        }
+        result
+    }
+
+    fn close(&self) -> Result<(), GoError> {
+        let file = match self.file.try_lock() {
+            Ok(file) => Some(file),
+            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        match file {
+            // Go `f.Close()`: a nil file panics, and an open file closes.
+            Some(mut file) if !self.closed.load(Ordering::SeqCst) => {
+                let result = file.close(STDIN_NAME);
+                self.closed.store(true, Ordering::SeqCst);
+                result
+            }
+            // A read holds the file. It is not nil (a read of a nil file
+            // panics at once), and the read drops it when it ends.
+            None if !self.closed.swap(true, Ordering::SeqCst) => Ok(()),
+            _ => Err(errors::new(format!(
+                "close {STDIN_NAME}: file already closed"
+            ))),
+        }
+    }
 }
 
 /// One file of a `StdioConn`: Go's nil interface, an open file, or a file
@@ -193,11 +257,11 @@ impl<T> StdioFile<T> {
     // (the text of os.File `wrapErr(op, ErrClosed)`).
     fn file(&mut self, op: &str, name: &str) -> std::io::Result<&mut T> {
         match self {
-            StdioFile::Nil => crate::core::go_nil_dereference(),
+            // Go N' loads `Read` or `Write` from the method table of the nil `io.Reader` or
+            // `io.Writer`: addr=0x18.
+            StdioFile::Nil => crate::core::go_nil_dereference_at(0x18),
             StdioFile::Open(file) => Ok(file),
-            StdioFile::Closed => Err(std::io::Error::other(format!(
-                "{op} {name}: file already closed"
-            ))),
+            StdioFile::Closed => Err(already_closed(op, name)),
         }
     }
 
@@ -205,7 +269,9 @@ impl<T> StdioFile<T> {
     // or `Stdout` leaves the process stream open and reports no error.
     fn close(&mut self, name: &str) -> Result<(), GoError> {
         match self {
-            StdioFile::Nil => crate::core::go_nil_dereference(),
+            // Go N' loads `Close` from the method table of the nil `io.ReadCloser` or
+            // `io.WriteCloser`: addr=0x18 (transport.go:89, :90).
+            StdioFile::Nil => crate::core::go_nil_dereference_at(0x18),
             StdioFile::Open(_) => {
                 *self = StdioFile::Closed;
                 Ok(())
@@ -219,12 +285,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+// The text of os.File `wrapErr(op, ErrClosed)`.
+fn already_closed(op: &str, name: &str) -> std::io::Error {
+    std::io::Error::other(format!("{op} {name}: file already closed"))
+}
+
 const STDIN_NAME: &str = "/dev/stdin";
 const STDOUT_NAME: &str = "/dev/stdout";
 
 impl ReadWriteCloser for StdioConn {
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        lock(&self.stdin).file("read", STDIN_NAME)?.read(buf)
+        self.stdin.read(buf)
     }
 
     fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
@@ -243,7 +314,7 @@ impl ReadWriteCloser for StdioConn {
 
     // Go: ipc/transport.go:88 Close
     fn close(&self) -> Result<(), GoError> {
-        let err1 = lock(&self.stdin).close(STDIN_NAME);
+        let err1 = self.stdin.close();
         let err2 = lock(&self.stdout).close(STDOUT_NAME);
         err1?;
         err2
@@ -487,5 +558,59 @@ mod tests {
         assert_eq!(err.to_string(), "write /dev/stdout: file already closed");
         let err = conn.close().expect_err("close again");
         assert_eq!(err.error(), "close /dev/stdin: file already closed");
+    }
+
+    // PORT: no Go test. Go's `Close` of a blocking `os.Stdin` does not wait
+    // for a read on another goroutine (internal/poll/fd_unix.go FD.Close).
+    // The read returns what it reads, a later read fails, and the
+    // descriptor closes when the read ends (the writer then gets EPIPE).
+    #[test]
+    fn stdio_close_does_not_wait_for_a_read() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Tells the test when the read of the pipe starts.
+        struct Entered(std::io::PipeReader, mpsc::Sender<()>);
+        impl Read for Entered {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.1.send(());
+                self.0.read(buf)
+            }
+        }
+
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let (entered_tx, entered) = mpsc::channel();
+        let conn = new_stdio_transport(
+            Some(Box::new(Entered(reader, entered_tx))),
+            Some(Box::new(std::io::sink())),
+        )
+        .accept()
+        .expect("accept");
+        let read_conn = conn.clone();
+        let read = std::thread::spawn(move || {
+            let mut buf = [0; 8];
+            let n = read_conn.read(&mut buf).expect("the pending read");
+            (
+                buf[..n].to_vec(),
+                read_conn.read(&mut buf).map_err(|e| e.to_string()),
+            )
+        });
+        entered.recv().expect("the read starts");
+
+        let (closed_tx, closed) = mpsc::channel();
+        let close_conn = conn.clone();
+        std::thread::spawn(move || closed_tx.send(close_conn.close().is_ok()));
+        let close_result = closed.recv_timeout(Duration::from_secs(10));
+        writer.write_all(b"abc").expect("write to the reader");
+        assert_eq!(close_result, Ok(true), "close waited for the read");
+
+        let (data, next) = read.join().expect("the read thread");
+        assert_eq!(data, b"abc");
+        assert_eq!(
+            next,
+            Err("read /dev/stdin: file already closed".to_string())
+        );
+        let err = writer.write_all(b"x").expect_err("the read end is closed");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 }

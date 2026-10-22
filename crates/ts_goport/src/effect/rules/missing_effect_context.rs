@@ -156,7 +156,8 @@ fn find_related_provide_location(
         let mut i = error_transformation_index - 1;
         while i >= 0 {
             let transformation = &flow.transformations[i as usize];
-            if !tp.is_node_reference_to_effect_module_api(transformation.callee, "provide") {
+            if !tp.is_node_reference_to_effect_module_api(transformation.callee, member!("provide"))
+            {
                 i -= 1;
                 continue;
             }

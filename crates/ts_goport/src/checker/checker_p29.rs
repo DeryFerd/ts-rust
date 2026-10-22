@@ -1,7 +1,7 @@
 use crate::prelude::*;
 
 impl Checker {
-    // Go: checker/checker.go:26489 intersectTypes
+    // Go: checker/checker.go:26558 intersectTypes
     pub fn intersect_types(&mut self, type1: TypeId, type2: TypeId) -> TypeId {
         if type1.is_nil() {
             return type2;
@@ -22,12 +22,12 @@ impl Checker {
     // a type alias of the form "type List<T> = T & { next: List<T> }" cannot be reduced during its declaration.
     // Also, unlike union types, the order of the constituent types is preserved in order that overload resolution
     // for intersections of types with signatures can be deterministic.
-    // Go: checker/checker.go:26517 getIntersectionType
+    // Go: checker/checker.go:26586 getIntersectionType
     pub fn get_intersection_type(&mut self, types: &[TypeId]) -> TypeId {
         self.get_intersection_type_ex(types, IntersectionFlags::NONE, None /*alias*/)
     }
 
-    // Go: checker/checker.go:26521 getIntersectionTypeEx
+    // Go: checker/checker.go:26590 getIntersectionTypeEx
     // PORT: Go `orderedSet[*Type]` is a stack `TypeSet` here. It keeps
     // insertion order and `contains`/`add` match Go (Go only adds values it
     // has not seen). Intersections are small, so a linear `contains` is
@@ -300,7 +300,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:26690 isUnionWithUndefined
+    // Go: checker/checker.go:26759 isUnionWithUndefined
     pub fn is_union_with_undefined(&self, t: TypeId) -> bool {
         self.ty(t).flags.intersects(TypeFlags::UNION)
             && self
@@ -309,7 +309,7 @@ impl Checker {
                 .intersects(TypeFlags::UNDEFINED)
     }
 
-    // Go: checker/checker.go:26694 isUnionWithNull
+    // Go: checker/checker.go:26763 isUnionWithNull
     pub fn is_union_with_null(&self, t: TypeId) -> bool {
         self.ty(t).flags.intersects(TypeFlags::UNION)
             && (self
@@ -322,31 +322,31 @@ impl Checker {
                     .intersects(TypeFlags::NULL))
     }
 
-    // Go: checker/checker.go:26698 isIntersectionType
+    // Go: checker/checker.go:26767 isIntersectionType
     pub fn is_intersection_type(&self, t: TypeId) -> bool {
         self.ty(t).flags.intersects(TypeFlags::INTERSECTION)
     }
 
-    // Go: checker/checker.go:26702 isPrimitiveUnion
+    // Go: checker/checker.go:26771 isPrimitiveUnion
     pub fn is_primitive_union(&self, t: TypeId) -> bool {
         self.ty(t)
             .object_flags
             .intersects(ObjectFlags::PRIMITIVE_UNION)
     }
 
-    // Go: checker/checker.go:26706 isNotUndefinedType
+    // Go: checker/checker.go:26775 isNotUndefinedType
     pub fn is_not_undefined_type(&self, t: TypeId) -> bool {
         !self.ty(t).flags.intersects(TypeFlags::UNDEFINED)
     }
 
-    // Go: checker/checker.go:26710 isNotNullType
+    // Go: checker/checker.go:26779 isNotNullType
     pub fn is_not_null_type(&self, t: TypeId) -> bool {
         !self.ty(t).flags.intersects(TypeFlags::NULL)
     }
 
     // Add the given types to the given type set. Order is preserved, freshness is removed from literal
     // types, duplicates are removed, and nested types of the given kind are flattened into the set.
-    // Go: checker/checker.go:26716 addTypesToIntersection
+    // Go: checker/checker.go:26785 addTypesToIntersection
     pub fn add_types_to_intersection(
         &mut self,
         type_set: &mut TypeSet,
@@ -361,7 +361,7 @@ impl Checker {
         includes
     }
 
-    // Go: checker/checker.go:26723 addTypeToIntersection
+    // Go: checker/checker.go:26792 addTypeToIntersection
     pub fn add_type_to_intersection(
         &mut self,
         type_set: &mut TypeSet,
@@ -416,7 +416,7 @@ impl Checker {
         includes
     }
 
-    // Go: checker/checker.go:26760 removeRedundantSupertypes
+    // Go: checker/checker.go:26829 removeRedundantSupertypes
     // PORT: Go returns the filtered slice; Rust filters `types` in place.
     pub fn remove_redundant_supertypes(&mut self, types: &mut TypeSet, includes: TypeFlags) {
         let mut i = types.len();
@@ -449,7 +449,7 @@ impl Checker {
      * Returns true if the intersection of the template literals and string literals is the empty set,
      * for example `get${string}` & "setX", and should reduce to never.
      */
-    // Go: checker/checker.go:26782 extractRedundantTemplateLiterals
+    // Go: checker/checker.go:26851 extractRedundantTemplateLiterals
     // PORT: Go returns the filtered slice and the flag; Rust filters `types`
     // in place and returns the flag.
     pub fn extract_redundant_template_literals(&mut self, types: &mut TypeSet) -> bool {
@@ -486,7 +486,7 @@ impl Checker {
     // If the given list of types contains more than one union of primitive types, replace the
     // first with a union containing an intersection of those primitive types, then remove the
     // other unions and return true. Otherwise, do nothing and return false.
-    // Go: checker/checker.go:26808 intersectUnionsOfPrimitiveTypes
+    // Go: checker/checker.go:26877 intersectUnionsOfPrimitiveTypes
     // PORT: Go returns the new slice and the flag; Rust changes `types` in
     // place and returns the flag.
     pub fn intersect_unions_of_primitive_types(&mut self, types: &mut TypeSet) -> bool {
@@ -559,7 +559,7 @@ impl Checker {
     // Check that the given type has a match in every union. A given type is matched by
     // an identical type, and a literal type is additionally matched by its corresponding
     // primitive type, and missingType is matched by undefinedType (and vice versa).
-    // Go: checker/checker.go:26861 eachUnionContains
+    // Go: checker/checker.go:26930 eachUnionContains
     pub fn each_union_contains(&self, union_types: &[TypeId], t: TypeId) -> bool {
         for &u in union_types {
             if !self.union_contains_type(u, t, true /*matchSymbol*/) {
@@ -569,7 +569,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:26870 unionContainsType
+    // Go: checker/checker.go:26939 unionContainsType
     pub fn union_contains_type(&self, union: TypeId, t: TypeId, match_symbol: bool) -> bool {
         let types = self.ty(union).types();
         if self.contains_type(types, t) {
@@ -595,7 +595,7 @@ impl Checker {
         primitive.is_some() && self.contains_type(types, primitive)
     }
 
-    // Go: checker/checker.go:26895 getCrossProductIntersections
+    // Go: checker/checker.go:26964 getCrossProductIntersections
     pub fn get_cross_product_intersections(
         &mut self,
         types: &[TypeId],
@@ -625,7 +625,7 @@ impl Checker {
         intersections
     }
 
-    // Go: checker/checker.go:26917 getConstituentCount
+    // Go: checker/checker.go:26986 getConstituentCount
     pub fn get_constituent_count(&self, t: TypeId) -> i32 {
         let ty = self.ty(t);
         if !ty.flags.intersects(TypeFlags::UNION_OR_INTERSECTION) || ty.alias.is_some() {
@@ -637,7 +637,7 @@ impl Checker {
         self.get_constituent_count_of_types(ty.types())
     }
 
-    // Go: checker/checker.go:26927 getConstituentCountOfTypes
+    // Go: checker/checker.go:26996 getConstituentCountOfTypes
     pub fn get_constituent_count_of_types(&self, types: &[TypeId]) -> i32 {
         let mut n = 0;
         for &t in types {
@@ -646,7 +646,7 @@ impl Checker {
         n
     }
 
-    // Go: checker/checker.go:26935 filterTypes
+    // Go: checker/checker.go:27004 filterTypes
     // PORT: Go writes into the caller's slice, so the parameter is `&mut [TypeId]`.
     pub fn filter_types(
         &mut self,
@@ -658,7 +658,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:26941 IsEmptyAnonymousObjectType
+    // Go: checker/checker.go:27010 IsEmptyAnonymousObjectType
     pub fn is_empty_anonymous_object_type(&mut self, t: TypeId) -> bool {
         let object_flags = self.ty(t).object_flags;
         let symbol = self.ty(t).symbol;
@@ -673,7 +673,7 @@ impl Checker {
                     })
     }
 
-    // Go: checker/checker.go:26946 isEmptyResolvedType
+    // Go: checker/checker.go:27015 isEmptyResolvedType
     // PORT: Go takes the `*StructuredType` of a type. Every Go caller passes
     // `t.AsStructuredType()` or `resolveStructuredTypeMembers(t)` (which is
     // `t.AsStructuredType()` after resolving), so this takes the type `t` and
@@ -686,7 +686,7 @@ impl Checker {
             && s.index_infos().is_empty()
     }
 
-    // Go: checker/checker.go:26950 isEmptyObjectType
+    // Go: checker/checker.go:27019 isEmptyObjectType
     pub fn is_empty_object_type(&mut self, t: TypeId) -> bool {
         let flags = self.ty(t).flags;
         if flags.intersects(TypeFlags::OBJECT) {
@@ -720,7 +720,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:26964 isPatternLiteralPlaceholderType
+    // Go: checker/checker.go:27033 isPatternLiteralPlaceholderType
     pub fn is_pattern_literal_placeholder_type(&self, t: TypeId) -> bool {
         if self.ty(t).flags.intersects(TypeFlags::INTERSECTION) {
             // Return true if the intersection consists of one or more placeholders and zero or
@@ -746,7 +746,7 @@ impl Checker {
             || self.is_pattern_literal_type(t)
     }
 
-    // Go: checker/checker.go:26981 isPatternLiteralType
+    // Go: checker/checker.go:27050 isPatternLiteralType
     pub fn is_pattern_literal_type(&self, t: TypeId) -> bool {
         // A pattern literal type is a template literal or a string mapping type that contains only
         // non-generic pattern literal placeholders.
@@ -762,7 +762,7 @@ impl Checker {
                 && self.is_pattern_literal_placeholder_type(self.ty(t).target())
     }
 
-    // Go: checker/checker.go:26988 isGenericStringLikeType
+    // Go: checker/checker.go:27057 isGenericStringLikeType
     pub fn is_generic_string_like_type(&self, t: TypeId) -> bool {
         self.ty(t)
             .flags
@@ -770,7 +770,7 @@ impl Checker {
             && !self.is_pattern_literal_type(t)
     }
 
-    // Go: checker/checker.go:26992 forEachType
+    // Go: checker/checker.go:27061 forEachType
     pub fn for_each_type(&mut self, t: TypeId, f: &mut dyn FnMut(&mut Checker, TypeId)) {
         if self.ty(t).flags.intersects(TypeFlags::UNION) {
             for i in 0..self.ty(t).types().len() {
@@ -782,7 +782,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:27002 someType
+    // Go: checker/checker.go:27071 someType
     pub fn some_type(
         &mut self,
         t: TypeId,
@@ -800,7 +800,7 @@ impl Checker {
         f(self, t)
     }
 
-    // Go: checker/checker.go:27009 everyType
+    // Go: checker/checker.go:27078 everyType
     pub fn every_type(
         &mut self,
         t: TypeId,
@@ -818,7 +818,7 @@ impl Checker {
         f(self, t)
     }
 
-    // Go: checker/checker.go:27016 everyContainedType
+    // Go: checker/checker.go:27085 everyContainedType
     pub fn every_contained_type(
         &mut self,
         t: TypeId,
@@ -840,7 +840,7 @@ impl Checker {
         f(self, t)
     }
 
-    // Go: checker/checker.go:27023 filterType
+    // Go: checker/checker.go:27092 filterType
     pub fn filter_type(
         &mut self,
         t: TypeId,
@@ -908,7 +908,7 @@ impl Checker {
         self.never_type
     }
 
-    // Go: checker/checker.go:27059 removeType
+    // Go: checker/checker.go:27128 removeType
     pub fn remove_type(&mut self, t: TypeId, target_type: TypeId) -> TypeId {
         if !self.ty(t).flags.intersects(TypeFlags::UNION) {
             if t == target_type {
@@ -944,12 +944,12 @@ impl Checker {
         t
     }
 
-    // Go: checker/checker.go:27081 containsType
+    // Go: checker/checker.go:27150 containsType
     pub fn contains_type(&self, types: &[TypeId], t: TypeId) -> bool {
         self.search_union_types(types, t).1
     }
 
-    // Go: checker/checker.go:27086 insertType
+    // Go: checker/checker.go:27155 insertType
     // PORT: Go returns the (possibly grown) slice; Rust returns a new Vec.
     pub fn insert_type(&self, types: &[TypeId], t: TypeId) -> (Vec<TypeId>, bool) {
         match self.search_union_types(types, t) {
@@ -962,7 +962,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:27093 countTypes
+    // Go: checker/checker.go:27162 countTypes
     pub fn count_types(&self, t: TypeId) -> i32 {
         let ty = self.ty(t);
         if ty.flags.intersects(TypeFlags::UNION) {
@@ -974,7 +974,7 @@ impl Checker {
         1
     }
 
-    // Go: checker/checker.go:27103 isErrorType
+    // Go: checker/checker.go:27172 isErrorType
     pub fn is_error_type(&self, t: TypeId) -> bool {
         // The only 'any' types that have alias symbols are those manufactured by getTypeFromTypeAliasReference for
         // a reference to an unresolved symbol. We want those to behave like the errorType.
@@ -983,13 +983,13 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:27109 compareTypeIds
+// Go: checker/checker.go:27178 compareTypeIds
 pub fn compare_type_ids(t1: TypeId, t2: TypeId) -> i32 {
     t1.index() as i32 - t2.index() as i32
 }
 
 impl Checker {
-    // Go: checker/checker.go:27113 checkCrossProductUnion
+    // Go: checker/checker.go:27182 checkCrossProductUnion
     pub fn check_cross_product_union(&mut self, types: &[TypeId]) -> bool {
         let size = self.get_cross_product_union_size(types);
         if size >= 100_000 {
@@ -1011,7 +1011,7 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:27125 getCrossProductUnionSize
+    // Go: checker/checker.go:27194 getCrossProductUnionSize
     // PORT: Go `int` is `i32` (PORTING.md), so the overflow cap is `i32::MAX`
     // in place of `math.MaxInt`. Both are far above the 100_000 limit.
     pub fn get_cross_product_union_size(&self, types: &[TypeId]) -> i32 {
@@ -1034,12 +1034,12 @@ impl Checker {
         size
     }
 
-    // Go: checker/checker.go:27145 getIndexType
+    // Go: checker/checker.go:27214 getIndexType
     pub fn get_index_type(&mut self, t: TypeId) -> TypeId {
         self.get_index_type_ex(t, IndexFlags::NONE)
     }
 
-    // Go: checker/checker.go:27149 getIndexTypeEx
+    // Go: checker/checker.go:27218 getIndexTypeEx
     pub fn get_index_type_ex(&mut self, t: TypeId, index_flags: IndexFlags) -> TypeId {
         let t = self.get_reduced_type(t);
         if self.is_no_infer_type(t) {
@@ -1094,7 +1094,7 @@ impl Checker {
         self.get_literal_type_from_properties(t, include, index_flags == IndexFlags::NONE)
     }
 
-    // Go: checker/checker.go:27174 getExtractStringType
+    // Go: checker/checker.go:27243 getExtractStringType
     pub fn get_extract_string_type(&mut self, t: TypeId) -> TypeId {
         let get_global_extract_symbol = self.get_global_extract_symbol.clone();
         let extract_type_alias = get_global_extract_symbol(self);
@@ -1105,7 +1105,7 @@ impl Checker {
         self.string_type
     }
 
-    // Go: checker/checker.go:27182 getLiteralTypeFromProperties
+    // Go: checker/checker.go:27251 getLiteralTypeFromProperties
     pub fn get_literal_type_from_properties(
         &mut self,
         t: TypeId,
@@ -1152,7 +1152,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:27211 getLiteralTypeFromProperty
+    // Go: checker/checker.go:27280 getLiteralTypeFromProperty
     pub fn get_literal_type_from_property(
         &mut self,
         prop: SymbolId,
@@ -1170,7 +1170,8 @@ impl Checker {
                 .get_by_id(&self.symbols, late_bound)
                 .name_type;
             if t.is_nil() {
-                if self.sym(prop).name == INTERNAL_SYMBOL_NAME_DEFAULT {
+                // PERF: intern1 fix 2. An id compare, with no text read.
+                if self.sym(prop).name.is_default_symbol_name() {
                     t = self.get_string_literal_type("default");
                 } else {
                     let name = get_name_of_declaration(self.sym(prop).value_declaration);
@@ -1190,7 +1191,7 @@ impl Checker {
         self.never_type
     }
 
-    // Go: checker/checker.go:27234 getLiteralTypeFromPropertyName
+    // Go: checker/checker.go:27303 getLiteralTypeFromPropertyName
     pub fn get_literal_type_from_property_name(&mut self, name: Node) -> TypeId {
         if is_private_identifier(name) {
             return self.never_type;
@@ -1216,7 +1217,7 @@ impl Checker {
         self.never_type
     }
 
-    // Go: checker/checker.go:27254 isKeyTypeIncluded
+    // Go: checker/checker.go:27323 isKeyTypeIncluded
     pub fn is_key_type_included(&self, key_type: TypeId, include: TypeFlags) -> bool {
         let ty = self.ty(key_type);
         ty.flags.intersects(include)
@@ -1228,7 +1229,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:27261 isInvalidComputedPropertyName
+// Go: checker/checker.go:27330 isInvalidComputedPropertyName
 pub fn is_invalid_computed_property_name(node: Node) -> bool {
     let grandparent = node.parent().parent();
     (is_type_literal_node(grandparent)
@@ -1240,7 +1241,7 @@ pub fn is_invalid_computed_property_name(node: Node) -> bool {
 }
 
 impl Checker {
-    // Go: checker/checker.go:27267 checkComputedPropertyName
+    // Go: checker/checker.go:27336 checkComputedPropertyName
     // PORT: Go holds a pointer to the links; here each access reads
     // `self.type_node_links.get(node)` again.
     pub fn check_computed_property_name(&mut self, node: Node) -> TypeId {
@@ -1276,7 +1277,7 @@ impl Checker {
         self.type_node_links.get(node).resolved_type
     }
 
-    // Go: checker/checker.go:27287 isNoInferType
+    // Go: checker/checker.go:27356 isNoInferType
     pub fn is_no_infer_type(&self, t: TypeId) -> bool {
         // A NoInfer<T> type is represented as a substitution type with a TypeFlags.Unknown constraint.
         self.ty(t).flags.intersects(TypeFlags::SUBSTITUTION)
@@ -1286,7 +1287,7 @@ impl Checker {
                 .intersects(TypeFlags::UNKNOWN)
     }
 
-    // Go: checker/checker.go:27292 getSubstitutionIntersection
+    // Go: checker/checker.go:27361 getSubstitutionIntersection
     pub fn get_substitution_intersection(&mut self, t: TypeId) -> TypeId {
         if self.is_no_infer_type(t) {
             return self.ty(t).as_substitution_type().base_type;
@@ -1296,7 +1297,7 @@ impl Checker {
         self.get_intersection_type(&[constraint, base_type])
     }
 
-    // Go: checker/checker.go:27299 shouldDeferIndexType
+    // Go: checker/checker.go:27368 shouldDeferIndexType
     pub fn should_defer_index_type(&mut self, t: TypeId, index_flags: IndexFlags) -> bool {
         let flags = self.ty(t).flags;
         flags.intersects(TypeFlags::INSTANTIABLE_NON_PRIMITIVE)
@@ -1313,7 +1314,7 @@ impl Checker {
                 }
     }
 
-    // Go: checker/checker.go:27307 getMappedTypeNameTypeKind
+    // Go: checker/checker.go:27376 getMappedTypeNameTypeKind
     pub fn get_mapped_type_name_type_kind(&mut self, t: TypeId) -> MappedTypeNameTypeKind {
         let name_type = self.get_name_type_from_mapped_type(t);
         if name_type.is_nil() {
@@ -1326,7 +1327,7 @@ impl Checker {
         MappedTypeNameTypeKind::REMAPPING
     }
 
-    // Go: checker/checker.go:27318 getIndexTypeForGenericType
+    // Go: checker/checker.go:27387 getIndexTypeForGenericType
     pub fn get_index_type_for_generic_type(
         &mut self,
         t: TypeId,
@@ -1355,7 +1356,7 @@ impl Checker {
     // and mapping the `constraintType` directly ignores how mapped types map _properties_ and not keys (thus ignoring subtype
     // reduction in the constraintType) when possible.
     // @param noIndexSignatures Indicates if _string_ index signatures should be elided. (other index signatures are always reported)
-    // Go: checker/checker.go:27336 getIndexTypeForMappedType
+    // Go: checker/checker.go:27405 getIndexTypeForMappedType
     pub fn get_index_type_for_mapped_type(&mut self, t: TypeId, index_flags: IndexFlags) -> TypeId {
         let type_parameter = self.get_type_parameter_from_mapped_type(t);
         let constraint_type = self.get_constraint_type_from_mapped_type(t);
@@ -1431,12 +1432,12 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:27388 getIndexedAccessType
+    // Go: checker/checker.go:27457 getIndexedAccessType
     pub fn get_indexed_access_type(&mut self, object_type: TypeId, index_type: TypeId) -> TypeId {
         self.get_indexed_access_type_ex(object_type, index_type, AccessFlags::NONE, Node::NIL, None)
     }
 
-    // Go: checker/checker.go:27392 getIndexedAccessTypeEx
+    // Go: checker/checker.go:27461 getIndexedAccessTypeEx
     pub fn get_indexed_access_type_ex(
         &mut self,
         object_type: TypeId,
@@ -1462,7 +1463,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:27400 getIndexedAccessTypeOrUndefined
+    // Go: checker/checker.go:27469 getIndexedAccessTypeOrUndefined
     // Returns `TypeId::NIL` where Go returns nil.
     pub fn get_indexed_access_type_or_undefined(
         &mut self,

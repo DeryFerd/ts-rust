@@ -5,6 +5,7 @@
 
 import { statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 export { memoryFileSystem, runTsc, runTscAsync } from "./core.js";
 
@@ -15,9 +16,12 @@ const STACK_SIZE_MB = 256;
 
 let modulePromise;
 
-/** The compiled module, compiled on first use. */
+/** The compiled module, compiled on first use. Failed loads can be retried. */
 export function loadModule() {
-    modulePromise ??= readFile(wasmUrl).then(bytes => WebAssembly.compile(bytes));
+    modulePromise ??= readFile(wasmUrl).then(bytes => WebAssembly.compile(bytes)).catch(error => {
+        modulePromise = undefined;
+        throw error;
+    });
     return modulePromise;
 }
 
@@ -26,9 +30,11 @@ export function loadModule() {
  *
  * Without `options.files`, it reads and writes the real file system from
  * `options.cwd` (default: the current directory as `getwd` gives it, the
- * same path as the native tsgo). With `options.files` (path to
+ * same path as the native tsgo). A relative `options.cwd` is resolved
+ * against that directory. With `options.files` (path to
  * text, absolute paths), it reads only those files, and `result.files`
- * holds every file after the run, emitted ones included.
+ * holds every file after the run, emitted ones included. In-memory runs
+ * default to `/` as their current directory.
  *
  * Returns `{ exitCode, stdout, stderr, diagnostics?, files? }`.
  * `options.diagnostics: "json"` returns the diagnostics as objects in
@@ -44,7 +50,9 @@ export async function tsc(args, options = {}) {
     const request = {
         module,
         args,
-        cwd: toPosix(options.cwd ?? getwd()),
+        // tsc needs an absolute current directory: a relative one ends the
+        // run with a panic ("vfs: path ... is not absolute").
+        cwd: toPosix(files === undefined ? resolve(getwd(), options.cwd ?? ".") : options.cwd ?? "/"),
         files,
         env: options.env ?? {},
         diagnosticsJson: options.diagnostics === "json",
@@ -59,6 +67,9 @@ export async function tsc(args, options = {}) {
     }
     const worker = new Worker(new URL("./node-worker.js", import.meta.url), {
         workerData: request,
+        execArgv: process.execArgv.filter((arg, index, args) =>
+            arg !== "--input-type" && !arg.startsWith("--input-type=") && args[index - 1] !== "--input-type"
+        ),
         resourceLimits: { stackSizeMb: options.stackSizeMb ?? STACK_SIZE_MB },
         stdout: !options.stream,
         stderr: !options.stream,

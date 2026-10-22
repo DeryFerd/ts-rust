@@ -824,7 +824,7 @@ fn end_of(mut child: Child, case: &str) -> (ExitStatus, String) {
 }
 
 /// How long a test waits for output or for the end of a run.
-const LIMIT: Duration = Duration::from_secs(60);
+const LIMIT: Duration = Duration::from_mins(1);
 
 /// The `depth` of `signal_run` that sends a signal to the process group of
 /// the started process.

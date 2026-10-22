@@ -171,9 +171,9 @@ pub struct Parser<'a> {
     pub not_parenthesized_arrow: FxHashSet<i32>,
     pub jsdoc_infos: Vec<JsDocInfo>,
     pub possible_await_spans: Vec<i32>,
-    pub jsdoc_comments_space: Vec<String>,
+    pub jsdoc_comments_space: Vec<std::borrow::Cow<'a, str>>,
     pub jsdoc_comment_ranges_space: Vec<CommentRange>,
-    pub jsdoc_tag_comments_space: Vec<String>,
+    pub jsdoc_tag_comments_space: Vec<std::borrow::Cow<'a, str>>,
     pub jsdoc_tag_comments_parts_space: Vec<Node>,
     pub reparse_list: Vec<Node>,
 
@@ -296,7 +296,10 @@ pub fn parse_source_file(
         .and_then(|text| super::lib_parse_snapshot::load(p.store, opts, text, script_kind));
     let result = match loaded {
         Some(loaded) => loaded.file,
-        None => p.parse_into_store(),
+        None => {
+            p.skip_go_string_marker_scans();
+            p.parse_into_store()
+        }
     };
     // PORT: only the tsconfig parser reads this table, and it parses no
     // file of the parse cache. A freeable parse (an edited source file)
@@ -339,6 +342,20 @@ pub fn parse_source_file_detached(
     source_text: impl Into<FileText>,
     script_kind: ScriptKind,
 ) -> DetachedParse {
+    parse_source_file_detached_reading(job, opts, source_text, script_kind, |_| ()).0
+}
+
+/// `parse_source_file_detached`, and what `read` reads of the parse while
+/// its nodes are on this thread (the parse workers' import names,
+/// `ImportNames`).
+#[must_use]
+pub fn parse_source_file_detached_reading<R>(
+    job: usize,
+    opts: &SourceFileParseOptions,
+    source_text: impl Into<FileText>,
+    script_kind: ScriptKind,
+    read: impl FnOnce(&ParsedSourceFile) -> R,
+) -> (DetachedParse, R) {
     let source_text: FileText = source_text.into();
     let jsdoc_cut_text = OnceCell::new();
     let mut p = new_parser();
@@ -361,23 +378,28 @@ pub fn parse_source_file_detached(
         .as_static()
         .and_then(|text| super::lib_parse_snapshot::load(p.store, opts, text, script_kind))
     {
-        return DetachedParse {
+        let read = read(&loaded.file);
+        let parse = DetachedParse {
             file: loaded.file,
             store: take_detached_file_store().expect("the detached store of the parse"),
             read_module_indicator_options: false,
             import_specifiers: loaded.import_specifiers,
             freeable,
         };
+        return (parse, read);
     }
+    p.skip_go_string_marker_scans();
     let file = p.parse_into_store();
     let import_specifiers = file.imports.iter().map(|n| n.text().to_string()).collect();
-    DetachedParse {
+    let read = read(&file);
+    let parse = DetachedParse {
         file,
         store: take_detached_file_store().expect("the detached store of the parse"),
         read_module_indicator_options: module_indicator_options_read(),
         import_specifiers,
         freeable,
-    }
+    };
+    (parse, read)
 }
 
 /// Makes a detached parse part of the program on the loading thread, as if
@@ -634,6 +656,21 @@ impl<'a> Parser<'a> {
         self.scanner.set_language_variant(self.language_variant);
     }
 
+    /// Scans the whole text once for `GO_STRING_MARKER` and tells the
+    /// scanner, so string token values skip the scan of each value
+    /// (`Scanner::set_text_has_no_go_string_marker`). A whole-file parse
+    /// calls it right before `parse_into_store`, not for a lib that loads
+    /// from the snapshot: the scan would read the whole lib text, which
+    /// the snapshot load does not (2.3 MiB more RSS on query-core, mostly
+    /// lib.dom.d.ts). A lazy JSDoc parse (`parse_js_doc_for_node`) does not
+    /// call it either: it reads a few values of a file that it would scan
+    /// whole on each call.
+    // PERF: parsefast2. Go uses the slice as is.
+    fn skip_go_string_marker_scans(&mut self) {
+        let no_marker = !crate::scanner_util::contains_go_string_marker(self.source_text);
+        self.scanner.set_text_has_no_go_string_marker(no_marker);
+    }
+
     // Go: parser.go:322 parseErrorAt
     pub fn parse_error_at(
         &mut self,
@@ -805,7 +842,7 @@ impl<'a> Parser<'a> {
             panic!("Expected end of file token from scanner.");
         }
         if !self.reparse_list.is_empty() {
-            statements.append(&mut self.reparse_list);
+            statements.extend(self.reparse_list.drain(..));
         }
         let list = self.new_node_list(TextRange::new(pos, end), &statements);
         let node = self
@@ -1026,15 +1063,18 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:613 parseListIndex
+    // PERF: identparse1. Go's `make([]*ast.Node, 0, 16)` stays on the stack
+    // (the list is cloned into the arena at the end), so the scratch list is
+    // a `SmallVec` of 16, not a heap `Vec` per list.
     pub fn parse_list_index(
         &mut self,
         kind: ParsingContext,
         mut parse_element: impl FnMut(&mut Parser<'a>, i32) -> Node,
-    ) -> Vec<Node> {
+    ) -> SmallVec<[Node; 16]> {
         let save_parsing_contexts = self.parsing_contexts;
         self.parsing_contexts |= 1 << (kind as i32);
         let mut outer_reparse_list = std::mem::take(&mut self.reparse_list);
-        let mut list: Vec<Node> = Vec::with_capacity(16);
+        let mut list: SmallVec<[Node; 16]> = SmallVec::new();
         while !self.is_list_terminator(kind) {
             if self.is_list_element(kind, false /*inErrorRecovery*/) {
                 let elt = parse_element(self, list.len() as i32);
@@ -1587,6 +1627,9 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:1005 parseExpectedWithDiagnostic
+    // PERF: parsefast2. The matched token is inline; the error is out of
+    // line (`parse_expected_failed`).
+    #[inline]
     pub fn parse_expected_with_diagnostic(
         &mut self,
         kind: SyntaxKind,
@@ -1599,6 +1642,16 @@ impl<'a> Parser<'a> {
             }
             return true;
         }
+        self.parse_expected_failed(kind, message)
+    }
+
+    /// The error of `parse_expected_with_diagnostic`.
+    #[inline(never)]
+    fn parse_expected_failed(
+        &mut self,
+        kind: SyntaxKind,
+        message: Option<&'static crate::diagnostics::Message>,
+    ) -> bool {
         // Report specific message if provided with one.  Otherwise, report generic fallback message.
         match message {
             Some(message) => {

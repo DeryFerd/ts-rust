@@ -899,7 +899,7 @@ static TYPE_SCRIPT_VERSION: LazyLock<Version> =
 pub struct PackageJson {
     pub fields: Fields,
     pub parseable: bool,
-    pub(crate) version_paths: OnceCell<(VersionPaths, Vec<DiagnosticAndArgs>)>,
+    pub version_paths: OnceCell<(VersionPaths, Vec<DiagnosticAndArgs>)>,
 }
 
 impl std::ops::Deref for PackageJson {
@@ -1107,7 +1107,7 @@ impl InfoCacheEntry {
 // first read of a load is the cache entry. A worker's entry has `Rc`
 // contents on the worker's thread, so the loader keeps the text and parses
 // it only when a lookup asks for the entry (`InfoCache::get`).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PendingInfo {
     pub package_directory: String,
     pub directory_exists: bool,
@@ -1158,6 +1158,22 @@ pub fn new_info_cache(current_directory: &str, use_case_sensitive_file_names: bo
         pending: RefCell::new(FxHashMap::default()),
         current_directory: current_directory.to_string(),
         use_case_sensitive_file_names,
+    }
+}
+
+// Go: packagejson/cache.go:230 (*InfoCache).Clone (ts#64519)
+/// A new cache table with the entries of this one. The entries are shared;
+/// later entries of either cache are not in the other.
+// PORT: the pending reads of the parse workers (`add_pending`) are copied
+// too: Go's cache already holds them as entries.
+impl Clone for InfoCache {
+    fn clone(&self) -> Self {
+        InfoCache {
+            cache: RefCell::new(self.cache.borrow().clone()),
+            pending: RefCell::new(self.pending.borrow().clone()),
+            current_directory: self.current_directory.clone(),
+            use_case_sensitive_file_names: self.use_case_sensitive_file_names,
+        }
     }
 }
 
@@ -1328,5 +1344,34 @@ mod info_cache_tests {
             true
         });
         assert_eq!(entries, 3);
+    }
+}
+
+// PORT: Go decodes `packagejson.DependencyFields` by reflection with the
+// JSON v2 default struct rules (PORTING "JSON"). Only this file decodes that
+// struct on its own (project/ata/discovertypings.rs). The impl is here, with the
+// type: project is in the upper crate (orphan rule). The four fields
+// are `packagejson.Expected`, which never fails.
+impl UnmarshalerFrom for DependencyFields {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object =
+            unmarshal_struct_fields(dec, "packagejson.DependencyFields", |name, dec| {
+                match name {
+                    "dependencies" => json_unmarshal_decode(dec, &mut self.dependencies)?,
+                    "devDependencies" => json_unmarshal_decode(dec, &mut self.dev_dependencies)?,
+                    "peerDependencies" => {
+                        json_unmarshal_decode(dec, &mut self.peer_dependencies)?;
+                    }
+                    "optionalDependencies" => {
+                        json_unmarshal_decode(dec, &mut self.optional_dependencies)?;
+                    }
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            })?;
+        if !is_object {
+            *self = DependencyFields::default();
+        }
+        Ok(())
     }
 }

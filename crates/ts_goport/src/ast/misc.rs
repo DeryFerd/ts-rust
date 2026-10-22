@@ -10,6 +10,45 @@ use crate::prelude::*;
 // symbol.go
 // ---------------------------------------------------------------------------
 
+// Go: ast/symbol.go:28 GetSourceFileOfSymbol (ts#64518)
+// GetSourceFileOfSymbol returns the owning file of a published binder symbol, or
+// nil for a non-file-owned symbol, even if it borrows declarations from a file.
+// Ownership recovery walks only the first declaration's AST parents.
+// PORT: Go reads `symbol.Parent` directly; here the arena that owns the
+// symbol is passed in. The result is the SourceFile node (`Node::NIL` for
+// Go nil).
+#[must_use]
+pub fn get_source_file_of_symbol(symbols: &SymbolArena, symbol: SymbolId) -> Node {
+    go_assert!(symbol.is_some(), "Expected a symbol");
+    let mut s = symbols.sym(symbol);
+    if s.flags.intersects(SymbolFlags::TRANSIENT) {
+        return Node::NIL;
+    }
+    if s.declarations.is_empty() {
+        // A class's implicit prototype has no declaration of its own.
+        go_assert!(
+            s.flags.intersects(SymbolFlags::PROTOTYPE),
+            "File-bound symbol has no declarations"
+        );
+        go_assert!(
+            s.parent.is_some() && symbols.sym(s.parent).flags.intersects(SymbolFlags::CLASS),
+            "Prototype has no declaring class"
+        );
+        s = symbols.sym(s.parent);
+        go_assert!(
+            !s.flags.intersects(SymbolFlags::TRANSIENT),
+            "Prototype parent is not file-bound"
+        );
+        go_assert!(
+            !s.declarations.is_empty(),
+            "Prototype parent has no declarations"
+        );
+    }
+    let file = get_source_file_of_node(s.declarations[0]);
+    go_assert!(file.is_some(), "File-bound declaration has no source file");
+    file
+}
+
 impl Symbol {
     // Go: ast/symbol.go:23 IsExternalModule
     #[must_use]
@@ -66,6 +105,11 @@ pub const INTERNAL_SYMBOL_NAME_INSTANTIATION_EXPRESSION: &str =
     "\u{FDD0}\u{10F7FE}instantiationExpression"; // Instantiation expressions
 pub const INTERNAL_SYMBOL_NAME_IMPORT_ATTRIBUTES: &str = "\u{FDD0}\u{10F7FE}importAttributes";
 pub const INTERNAL_SYMBOL_NAME_EXPORT_EQUALS: &str = "export="; // Export assignment symbol
+/// `INTERNAL_SYMBOL_NAME_EXPORT_EQUALS` as a `Name`, interned once, so a
+/// table lookup of it compares ids and hashes no text.
+// PERF (jsxname1): the module resolution lookups of `export=`.
+pub static EXPORT_EQUALS_NAME: std::sync::LazyLock<Name> =
+    std::sync::LazyLock::new(|| Name::from(INTERNAL_SYMBOL_NAME_EXPORT_EQUALS));
 pub const INTERNAL_SYMBOL_NAME_DEFAULT: &str = "default"; // Default export symbol (technically not wholly internal, but included here for usability)
 pub const INTERNAL_SYMBOL_NAME_THIS: &str = "this";
 pub const INTERNAL_SYMBOL_NAME_MODULE_EXPORTS: &str = "module.exports";
@@ -73,13 +117,22 @@ pub const INTERNAL_SYMBOL_NAME_MODULE_EXPORTS: &str = "module.exports";
 // Go: ast/symbol.go:72 SymbolName
 #[must_use]
 pub fn symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
+    symbol_name_str(symbols, symbol).to_string()
+}
+
+/// `symbol_name` as the interned text, with no new String.
+// PERF: printfast1. Go `SymbolName` returns a string header; callers that
+// only read the text (the node builder's `len(ast.SymbolName(...))`) use
+// this.
+#[must_use]
+pub fn symbol_name_str(symbols: &SymbolArena, symbol: SymbolId) -> &'static str {
     let s = symbols.sym(symbol);
     if s.value_declaration.is_some()
         && is_private_identifier_class_element_declaration(s.value_declaration)
     {
-        return s.value_declaration.name().text().to_string();
+        return s.value_declaration.name().text();
     }
-    s.name.to_string()
+    s.name.as_str()
 }
 
 // Go: ast/symbol.go:80 EscapeAllInternalSymbolNames
@@ -1478,7 +1531,16 @@ pub fn get_leftmost_expression(mut node: Node, stop_at_call_expressions: bool) -
 // Gets the precedence of a TypeNode
 #[must_use]
 pub fn get_type_node_precedence(n: Node) -> TypePrecedence {
-    match n.kind() {
+    type_node_precedence_of_kind(n, n.kind())
+}
+
+/// `get_type_node_precedence` of `n`, whose kind `kind` the caller has read.
+// PERF: printfast1. A factory node reads its kind in the thread's arena;
+// `Printer::emit_type_node` reads it once for this and its switch.
+#[must_use]
+pub fn type_node_precedence_of_kind(n: Node, kind: SyntaxKind) -> TypePrecedence {
+    debug_assert_eq!(kind, n.kind());
+    match kind {
         SyntaxKind::ConditionalType => TypePrecedence::CONDITIONAL,
         SyntaxKind::JsDocOptionalType | SyntaxKind::JsDocVariadicType => TypePrecedence::JS_DOC,
         SyntaxKind::FunctionType | SyntaxKind::ConstructorType => TypePrecedence::FUNCTION,
@@ -1611,38 +1673,141 @@ pub fn new_flow_reduce_label_data(
 // functionflags.go (FunctionFlags consts are in `crate::flags`)
 // ---------------------------------------------------------------------------
 
+/// Go `*ast.BodyBase` of a node (`body_data`), with the node's kind.
+#[derive(Clone, Copy, Debug)]
+pub struct BodyData {
+    pub kind: SyntaxKind,
+    pub asterisk_token: Node,
+    pub body: Node,
+}
+
+/// The fields of Go `*ast.ParameterDeclaration` that the grammar and arity
+/// checks read (`parameter_parts`).
+#[derive(Clone, Copy, Debug)]
+pub struct ParameterParts {
+    pub dot_dot_dot_token: Node,
+    pub question_token: Node,
+    pub initializer: Node,
+}
+
+/// Go `nil` for an optional child id of the node data of a node in `file`.
+fn child_node(file: usize, id: Option<crate::astdata::NodeId>) -> Node {
+    id.map_or(Node::NIL, |id| Node::new(file, id))
+}
+
+// Go: ast.go:220 BodyData (read by ast/functionflags.go:17 GetFunctionFlags)
+/// Go `node.BodyData()`: the kind, `AsteriskToken` and `Body` of a node that
+/// embeds `BodyBase`, from one node data load. `None` for any other node (Go
+/// `BodyData()` is nil).
+// PERF: portonly1 item 3. `get_function_flags` read the kind, the asterisk
+// and the body with one lookup each. Go reads one struct.
+// PORT: here, not in `node.rs`: `node.rs` is a key source of the lib blobs.
+#[must_use]
+pub fn body_data(node: Node) -> Option<BodyData> {
+    use crate::ast::synthetic::with_data;
+    use crate::astdata::NodeData;
+    let file = node.file_index();
+    let parts = |kind, asterisk, body| {
+        Some(BodyData {
+            kind,
+            asterisk_token: child_node(file, asterisk),
+            body: child_node(file, body),
+        })
+    };
+    let data = with_data!(node, |d| match d {
+        NodeData::FunctionDeclaration(d) => {
+            parts(SyntaxKind::FunctionDeclaration, d.asterisk_token, d.body)
+        }
+        NodeData::MethodDeclaration(d) => {
+            parts(SyntaxKind::MethodDeclaration, d.asterisk_token, d.body)
+        }
+        NodeData::ConstructorDeclaration(d) => {
+            parts(SyntaxKind::Constructor, d.asterisk_token, d.body)
+        }
+        NodeData::GetAccessorDeclaration(d) => {
+            parts(SyntaxKind::GetAccessor, d.asterisk_token, d.body)
+        }
+        NodeData::SetAccessorDeclaration(d) => {
+            parts(SyntaxKind::SetAccessor, d.asterisk_token, d.body)
+        }
+        NodeData::FunctionExpression(d) => {
+            parts(
+                SyntaxKind::FunctionExpression,
+                d.asterisk_token,
+                Some(d.body),
+            )
+        }
+        NodeData::ArrowFunction(d) => {
+            parts(SyntaxKind::ArrowFunction, d.asterisk_token, Some(d.body))
+        }
+        NodeData::ModuleDeclaration(d) => {
+            parts(SyntaxKind::ModuleDeclaration, d.asterisk_token, d.body)
+        }
+        _ => None,
+    });
+    debug_assert!(
+        data.is_none_or(|d| d.kind == node.kind()
+            && d.body == node.body()
+            && d.asterisk_token == node.asterisk_token()),
+        "body data"
+    );
+    data
+}
+
+// Go: ast/ast_generated.go:9158 AsParameterDeclaration (its DotDotDotToken,
+// QuestionToken and Initializer fields)
+/// Go `node.AsParameterDeclaration()`: its `DotDotDotToken`, `QuestionToken`
+/// and `Initializer`, from one node data load. `None` when the node data is
+/// not a parameter declaration.
+// PERF: portonly1 item 3. `check_grammar_parameter_list` and
+// `is_arity_smaller` read the three fields of each parameter with one lookup
+// each. Go reads one struct.
+// PORT: here, not in `node.rs`: `node.rs` is a key source of the lib blobs.
+#[must_use]
+pub fn parameter_parts(node: Node) -> Option<ParameterParts> {
+    use crate::ast::synthetic::with_data;
+    use crate::astdata::NodeData;
+    let file = node.file_index();
+    let parts = with_data!(node, |d| match d {
+        NodeData::ParameterDeclaration(d) => Some(ParameterParts {
+            dot_dot_dot_token: child_node(file, d.dot_dot_dot_token),
+            question_token: child_node(file, d.question_token),
+            initializer: child_node(file, d.initializer),
+        }),
+        _ => None,
+    });
+    debug_assert!(
+        parts.is_none_or(|p| p.dot_dot_dot_token == node.dot_dot_dot_token()
+            && p.question_token == node.question_token()
+            && p.initializer == node.initializer()),
+        "parameter parts"
+    );
+    parts
+}
+
 // Go: ast/functionflags.go:13 GetFunctionFlags
+// PERF: portonly1 item 3. Go reads `node.BodyData()` once (functionflags.go:17)
+// and then its `AsteriskToken` and `Body` fields. `body_data` reads the kind,
+// the asterisk and the body with one node data load, not one lookup each.
 #[must_use]
 pub fn get_function_flags(node: Node) -> FunctionFlags {
     if node.is_nil() {
         return FunctionFlags::INVALID;
     }
-    // PORT: Go `node.BodyData()` is non-nil exactly for the kinds that embed
+    // Go `node.BodyData()` is non-nil exactly for the kinds that embed
     // `BodyBase` (FunctionDeclaration, MethodDeclaration, Constructor,
     // Get/SetAccessor, FunctionExpression, ArrowFunction, ModuleDeclaration).
-    // `data.AsteriskToken` / `data.Body` are read with the field accessors.
-    let has_body_data = matches!(
-        node.kind(),
-        SyntaxKind::FunctionDeclaration
-            | SyntaxKind::MethodDeclaration
-            | SyntaxKind::Constructor
-            | SyntaxKind::GetAccessor
-            | SyntaxKind::SetAccessor
-            | SyntaxKind::FunctionExpression
-            | SyntaxKind::ArrowFunction
-            | SyntaxKind::ModuleDeclaration
-    );
-    if !has_body_data {
+    let Some(data) = body_data(node) else {
         return FunctionFlags::INVALID;
-    }
+    };
     let mut flags = FunctionFlags::NORMAL;
-    match node.kind() {
+    match data.kind {
         SyntaxKind::FunctionDeclaration
         | SyntaxKind::FunctionExpression
         | SyntaxKind::MethodDeclaration
         | SyntaxKind::ArrowFunction => {
             // Go: generator check, then `fallthrough` to the ArrowFunction case.
-            if node.kind() != SyntaxKind::ArrowFunction && node.asterisk_token().is_some() {
+            if data.kind != SyntaxKind::ArrowFunction && data.asterisk_token.is_some() {
                 flags |= FunctionFlags::GENERATOR;
             }
             if has_syntactic_modifier(node, ModifierFlags::ASYNC) {
@@ -1651,7 +1816,7 @@ pub fn get_function_flags(node: Node) -> FunctionFlags {
         }
         _ => {}
     }
-    if node.body().is_nil() {
+    if data.body.is_nil() {
         flags |= FunctionFlags::INVALID;
     }
     flags
@@ -1817,6 +1982,28 @@ impl PositionMap {
 }
 
 // ---------------------------------------------------------------------------
+// ast_generated.go As* type assertions
+// ---------------------------------------------------------------------------
+
+/// Go `node.AsX()` on a node whose data is not an `X`: the type assertion
+/// `n.data.(*X)` panics with the Go runtime text, for example
+/// `interface conversion: ast.nodeData is *ast.CatchClause, not
+/// *ast.VariableDeclarationList`. `go_type` is the Go struct name `X`. A
+/// nil node is a nil dereference in Go.
+#[cold]
+#[inline(never)]
+#[track_caller]
+pub fn go_node_as_panic(node: Node, go_type: &str) -> ! {
+    if node.is_nil() {
+        crate::core::go_nil_dereference();
+    }
+    let have = crate::ast::synthetic::with_ast_data(node, |d| d.schema_name());
+    crate::core::go_panic(format!(
+        "interface conversion: ast.nodeData is *ast.{have}, not *ast.{go_type}"
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // ids.go
 // ---------------------------------------------------------------------------
 
@@ -1828,6 +2015,27 @@ impl PositionMap {
 mod tests {
     use super::*;
     use std::panic::AssertUnwindSafe;
+
+    // Go `n.data.(*X)` (ast_generated.go `AsX`) on other data panics with
+    // the runtime's type assertion text, which a Go LSP request recover
+    // sends back in its internal error.
+    #[test]
+    fn go_node_as_panic_names_both_go_types() {
+        let f = NodeFactory::new();
+        let block = f.new_block(f.new_node_list(&[]), false);
+        let payload = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            go_node_as_panic(block, "VariableDeclarationList")
+        }))
+        .expect_err("no panic");
+        assert_eq!(
+            payload
+                .downcast_ref::<crate::core::GoPanic>()
+                .map(|p| p.message.as_str()),
+            Some(
+                "interface conversion: ast.nodeData is *ast.Block, not *ast.VariableDeclarationList"
+            )
+        );
+    }
 
     // Go prints `%v` of the Kind in this panic (ast/precedence.go:715
     // `panic(fmt.Sprintf("unhandled TypeNode: %v", n.Kind))`), which is

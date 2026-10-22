@@ -12,7 +12,7 @@
 #   open <rev> <branch> --hypothesis TEXT --change TEXT [--message TEXT] [--new-batch ID --origin TEXT]
 #                          check, apply <branch> to the checkout (paths in scope, one commit), fp.py, and
 #                          open_revision.py last (the only state write). A new batch has protectedSet goport.
-#   side <rev|label> [--checkout DIR] [--gate-host HOST|local] [--name-map TSV]
+#   side <rev|label> [--checkout DIR] [--gate-host HOST|local | --host testbox] [--name-map TSV]
 #                          In systemd user unit ts-rust-side-<label>, log
 #                          target/continuation-r97-goport/quality-<label>-side.log: release bins in the
 #                          shared target runtime/cargo-target; goport tests (build-goport-tests.sh,
@@ -20,8 +20,9 @@
 #                          or renamed tests); two bound runs; the full gate and gate-compare.py against the
 #                          base gate manifest; the LSP and API oracles, each compared per request with the
 #                          base results (oracle-compare.py); rustfmt and clippy on ts_goport and the kept
-#                          crates. The gate and the oracles run on --gate-host (default dbook-lan, which
-#                          remote.sh keeps for this; REMOTE_USE_RESERVED=1 is set below). The base
+#                          crates (clippy target: the checkout's target/candidate-clippy; the record is reused
+#                          only for the checkout's fp.py). The gate and the oracles run on --gate-host (default
+#                          dbook-lan, which remote.sh keeps for this; REMOTE_USE_RESERVED=1 is set below). The base
 #                          is the last accepted revision (open_revision.py --base). Each step is cached by
 #                          source under evidence-cache/<key>/ and reused. The oracle compares use the answer
 #                          sets of the base (protectedBase.oracleAnswers) and of the batch (batch.oracleAnswers)
@@ -32,6 +33,19 @@
 #                          move the old <kind>.json, <kind>-fail.json and <kind>-compare.json aside and run side
 #                          with a new label: the oracle runs stay in lsp-run and api-run, so no oracle runs
 #                          again. Check first with --dry-run that every other step says "reuse".
+#                          --host testbox runs the heavy steps on one Blacksmith testbox (testbox.sh) instead:
+#                          the release bins, test bins, goport tests, bound runs, gate, LSP and API oracles and
+#                          clippy, with the same commands and paths. The testbox workspace is this checkout
+#                          (TOOLS); `testbox.sh source` puts the checkout at its own path there (fp.py must
+#                          match). The results come back to the same zbook paths (bins and test bins with
+#                          their sha256 checked); the compares, rustfmt and the records stay on zbook. The key
+#                          and the cache are the same, so either host reuses the other's steps. The copies and
+#                          the testbox ID go to sync.log; the unit stops the testbox at its end. After a testbox
+#                          failure, run side again without --host testbox (dbook-lan) to finish.
+#                          Host kinds (testbox, or ssh: zbook and the SSH hosts): with batch.oracleRebase, the
+#                          rebase runs and this source's oracle runs must be of one kind (side stops before the
+#                          build otherwise). A gate on another kind than the base's gate fails the side run
+#                          when an editor long growth is within 0.15 MiB/edit of its cap.
 #                          An integration runs `side int<N> --checkout <its worktree>` in its checks step. The
 #                          revision's side run then reuses its bins, test run, gate run and oracle runs (same
 #                          crates tree, so same key) and runs only the bound runs. A tests or gate compare
@@ -48,6 +62,12 @@
 # (a timeout is "FAIL rc=124"). A killed unit prints nothing, so also stop when the unit is gone:
 #   until grep -qE '^SIDE (DONE|FAIL)' LOG || ! systemctl --user is-active -q UNIT; do sleep 30; done
 set -euo pipefail
+
+# Evidence builds (release bins, test bins, the evidence key and the quality step's rustfmt and
+# clippy) use the shipped toolchain of build-release.sh and release.yml, not the host default. On
+# alvin, 1.93.0 took about twice as long and gave the same output (scripts/goport/README.md,
+# "Build toolchain"). Install it with: rustup toolchain install 1.95.0 --profile minimal -c rustfmt,clippy
+export RUSTUP_TOOLCHAIN=1.95.0
 
 ROOT=/home/theo/Code/sandbox/ts-rust
 R=$ROOT/target/continuation-r97-goport
@@ -299,6 +319,7 @@ cmd_side() {
   ! systemctl --user is-active -q "$unit" || need "$unit is running"
   local -a env=(--setenv=PATH="$PATH" --setenv=HOME="$HOME")
   [[ -z ${SSH_AUTH_SOCK:-} ]] || env+=(--setenv=SSH_AUTH_SOCK="$SSH_AUTH_SOCK")
+  [[ -z ${CANDIDATE_EVIDENCE:-} ]] || env+=(--setenv=CANDIDATE_EVIDENCE="$CANDIDATE_EVIDENCE")
   say "side $label in unit $unit, log $log"
   run systemd-run --user --collect --unit="$unit" --working-directory="$ROOT" "${env[@]}" \
     bash -c "exec bash $SELF _side-unit $label $wt ${pin:--} $HOST ${NAME_MAP:--} >> $log 2>&1"
@@ -308,6 +329,36 @@ cmd_side() {
 
 # free_name <dir> <name>: <name>, or <name>-2, -3, ... when <dir>/<name> exists (gate labels are never reused).
 free_name() { local n=$2 i=2; while [[ -e $1/$n ]]; do n=$2-$i i=$((i + 1)); done; echo "$n"; }
+
+# The testbox of side --host testbox (testbox.sh, the copy of TOOLS: the testbox workspace is that checkout).
+# side_unit sets TBX_LOG (its sync.log) and TESTBOX_ID_FILE. tbx_up starts the testbox once: warmup, the checkout
+# at its own path (testbox.sh source), the Go pin checkout and oracle and the pin cache. tbx_down stops it (never
+# release: a release commits the shared warm target).
+TB=$G/testbox.sh TBX_UP=0 TBX_LOG=/dev/null
+tbx_up() {
+  ((TBX_UP == 0)) || return 0
+  TBX_UP=1
+  say "$(date -u +%FT%TZ) testbox: warmup, source $1, pin ${2:-current}"
+  run_sh "$TB warmup >> $TBX_LOG 2>&1"
+  run_sh "$TB source $1 >> $TBX_LOG 2>&1"
+  if [[ -n $2 ]]; then
+    run_sh "$TB pin $2 >> $TBX_LOG 2>&1 && $TB oracle $2 >> $TBX_LOG 2>&1"
+    run_sh "$TB push $(jq -r .pinRoot "$ROOT/UPSTREAM.json")/$2 >> $TBX_LOG 2>&1"
+  fi
+  [[ $DRY == 1 ]] || say "testbox $(cat "$TESTBOX_ID_FILE")"
+}
+tbx_down() { if ((TBX_UP)) && [[ $DRY == 0 ]]; then "$TB" stop >> "$TBX_LOG" 2>&1 || true; fi; }
+# tbx_job <log> <command text>: runs the command on the testbox in the zbook path of the main checkout ($ROOT
+# there is the TOOLS workspace), as a detached job; its output goes to the log.
+tbx_job() { run_sh "$TB job bash -c $(printf %q "cd $ROOT && $2") < /dev/null > $1 2>&1"; }
+# tbx_get <testbox dir> <zbook dir>: copies a dir back; the zbook dir must not exist (results are never replaced).
+tbx_get() {
+  [[ $DRY == 1 || ! -e $2 ]] || die "$2 exists (results are never replaced)"
+  run_sh "$TB get $1/ $2/ >> $TBX_LOG 2>&1"
+}
+# tbx_have <dir>: copies a zbook dir (bins, test bins) to the testbox once per side run.
+declare -A TBX_HAVE=()
+tbx_have() { [[ -n ${TBX_HAVE[$1]:-} ]] || { run_sh "$TB push $1 >> $TBX_LOG 2>&1"; TBX_HAVE[$1]=1; }; }
 
 # side_unit <label> <checkout> <pin|-> <host|local> <name map|->: body of the side unit. Each finished step
 # is a file in the cache dir (bins/, testbin/, tests-run/, tests.json, bound.json, gate.json,
@@ -323,10 +374,15 @@ side_unit() {
   local label=$1 wt=$2 pin=${3#-} host=$4 map=${5#-} key C B commit fp n r gl ll al rc oracle lock synced=0 g l fails='' base old
   local bt bts bg bgs bl ba
   local -a pinexec=()
-  [[ $DRY == 1 ]] || trap 'rc=$?; if ((rc)); then echo "SIDE FAIL rc=$rc"; else echo "SIDE DONE"; fi' EXIT
+  [[ $DRY == 1 ]] || trap 'rc=$?; tbx_down; if ((rc)); then echo "SIDE FAIL rc=$rc"; else echo "SIDE DONE"; fi' EXIT
   [[ -z $pin ]] || pinexec=(env GOPORT_PIN="$pin" python3 "$ROOT/scripts/upstream/pin.py" exec --)
   key=$(evidence_key "$wt" "$pin") C=$EVIDENCE/$key B=$EVIDENCE/$key/bins
   commit=$(git -C "$wt" rev-parse HEAD) lock=/tmp/goport-remote-${host%-lan}.lock
+  local tbx=0 on=''
+  if [[ $host == testbox ]]; then
+    tbx=1 on=' on the testbox' TBX_LOG=$C/sync.log
+    export TESTBOX_ID_FILE=$R/runtime/testbox-side-$label.id TESTBOX_IDLE=${TESTBOX_IDLE:-30}
+  fi
   say "$(date -u +%FT%TZ) side $label: $wt ${commit:0:9}, crates tree $(git -C "$wt" rev-parse HEAD:crates | cut -c1-12), pin ${pin:-current}, evidence $C"
   # The base: the last accepted revision's goport test results and gate manifest, pinned by sha256.
   # The base LSP and API results are results dirs (bl, ba), compared per request.
@@ -340,6 +396,19 @@ side_unit() {
     need "no protected base (open_revision.py --base)"
     bt='<base results.json>' bg='<base gate manifest>' bl='<base LSP results>' ba='<base API results>'
   fi
+  # A pin rebase (batch.oracleRebase) needs "the same host setup" for its base runs and the candidate's oracle runs
+  # (ruling 10 condition 1). Testbox bins and hosts differ from zbook and the SSH hosts, so both sides use one host
+  # kind: testbox, or ssh (zbook and the SSH hosts). A reused oracle run counts with the host it ran on
+  # (<kind>-run.host; a run without one predates --host testbox, so it is ssh). oracle-rebase.sh runs on the SSH
+  # hosts. This stops before any build.
+  local k rk ok
+  while read -r k rk; do
+    ok=$host
+    [[ ! -f $C/$k-run ]] || ok=$(cat "$C/$k-run.host" 2> /dev/null || echo ssh)
+    [[ $ok == testbox ]] || ok=ssh
+    [[ $rk == "$ok" ]] || die "batch.oracleRebase $k runs ran on $rk hosts, and this source's $k oracle runs on $ok: ruling 10 needs one host kind for both (oracle-rebase.sh runs on the SSH hosts, so run side without --host testbox)"
+  done < <(node scripts/state.mjs export | jq -r '(.batch.oracleRebase // {}) | to_entries[] | select(.key == "lsp" or .key == "api")
+    | "\(.key) \([(.value.runs // [])[] | if .host == "testbox" then "testbox" else "ssh" end] | unique | join(","))"')
   run mkdir -p "$C"
 
   # Bins (release profile). The target lock keeps another side run from replacing the target's bins
@@ -351,14 +420,32 @@ side_unit() {
     # checker-port build and be linked as stale code (R132 side try 1: goport_util from goport-legacy1).
     local target=$TARGET
     [[ $(realpath "$wt") == "$(realpath "$CHECKER_PORT")" ]] || target=$wt/target/candidate-side
-    say "$(date -u +%FT%TZ) build release bins in $target"
-    if [[ $DRY == 0 ]]; then exec 8> /tmp/ts-rust-candidate-target.lock; flock 8; fi
-    # Evidence bins: the shipped toolchain (not the nightly edit-loop default) and no incremental cache.
-    # Units whose dep-info names another checkout's files (a crate with sources outside its package dir,
-    # like goport_util) are removed first, so cargo builds them again from this checkout.
-    run_sh "python3 $G/purge-foreign-fingerprints.py $target $wt > $C/purge.log 2>&1"
-    run_sh "cd $wt && TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=12 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$target $ROOT/scripts/run-cargo-capped.sh build --locked --release -p ts_goport ${BINS[*]/#/--bin } > $C/build.log 2>&1"
-    run_sh "rm -rf $B.new && mkdir $B.new && cd $target/release && cp ${BINS[*]} $B.new/ && cd $B.new && sha256sum ${BINS[*]} > bins.sha256 && echo $commit > COMMIT"
+    if ((tbx)); then
+      # The same build on the testbox (32 jobs), in the same target path there; its purge output goes to
+      # build.log. The bins come back to B.new with their sha256 checked, and the testbox's rustc must be zbook's
+      # (the evidence key names zbook's).
+      tbx_up "$wt" "$pin"
+      say "$(date -u +%FT%TZ) build release bins in $target on the testbox"
+      tbx_job "$C/build.log" "mkdir -p $C && python3 scripts/goport/purge-foreign-fingerprints.py $target $wt && cd $wt && echo \"toolchain: \$(rustc --version)\" && TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=32 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$target $ROOT/scripts/run-cargo-capped.sh build --locked --release -p ts_goport ${BINS[*]/#/--bin } && rm -rf $B $B.new && mkdir $B.new && cd $target/release && cp ${BINS[*]} $B.new/ && cd $B.new && sha256sum ${BINS[*]} > bins.sha256 && echo $commit > COMMIT && mv $B.new $B"
+      run_sh "rm -rf $B.new"
+      tbx_get "$B" "$B.new"
+      run_sh "cd $B.new && sha256sum --quiet -c bins.sha256"
+      TBX_HAVE[$B]=1
+      if [[ $DRY == 0 ]]; then
+        [[ $(grep -m 1 '^toolchain: ' "$C/build.log" | cut -d' ' -f2-) == "$(rustc --version 2> /dev/null)" ]] ||
+          die "the testbox built with $(grep -m 1 '^toolchain: ' "$C/build.log"), the evidence key names $(rustc --version 2> /dev/null)"
+      fi
+    else
+      say "$(date -u +%FT%TZ) build release bins in $target"
+      if [[ $DRY == 0 ]]; then exec 8> /tmp/ts-rust-candidate-target.lock; flock 8; fi
+      # Evidence bins: the shipped toolchain (RUSTUP_TOOLCHAIN above, not the nightly edit-loop default) and
+      # no incremental cache.
+      # Units whose dep-info names another checkout's files (a crate with sources outside its package dir,
+      # like goport_util) are removed first, so cargo builds them again from this checkout.
+      run_sh "python3 $G/purge-foreign-fingerprints.py $target $wt > $C/purge.log 2>&1"
+      run_sh "cd $wt && TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=12 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$target $ROOT/scripts/run-cargo-capped.sh build --locked --release -p ts_goport ${BINS[*]/#/--bin } > $C/build.log 2>&1"
+      run_sh "rm -rf $B.new && mkdir $B.new && cd $target/release && cp ${BINS[*]} $B.new/ && cd $B.new && sha256sum ${BINS[*]} > bins.sha256 && echo $commit > COMMIT"
+    fi
     if [[ $DRY == 0 ]]; then
       exec 8>&-
       [[ $(evidence_key "$wt" "$pin") == "$key" ]] || die "the source changed during the build; $B.new is not cached"
@@ -380,14 +467,46 @@ side_unit() {
       run mv "$C/tests.json" "$C/tests-base-$old.json"
       run mv "$C/tests-compare.json" "$C/tests-compare-base-$old.json"
     fi
-    if [[ -f $C/testbin/bins.sha256 ]]; then say "reuse test bins $C/testbin (built from $(cat "$C/testbin/COMMIT"))"; else
+    if [[ -f $C/testbin/bins.sha256 ]]; then say "reuse test bins $C/testbin (built from $(cat "$C/testbin/COMMIT"))"
+    elif ((tbx)); then
+      # On the testbox at the checkout's own path, so BUILD_ROOT and BUILD_TARGET are the zbook paths. The dir
+      # comes back (binaries too) with its sha256 checked.
+      tbx_up "$wt" "$pin"
+      say "$(date -u +%FT%TZ) build test bins on the testbox"
+      tbx_job "$C/testbin-build.log" "mkdir -p $C && rm -rf $C/testbin $C/testbin.new && scripts/goport/build-goport-tests.sh $wt $C/testbin" ||
+        die "test bin build failed (log $C/testbin-build.log)"
+      run_sh "rm -rf $C/testbin.new"
+      tbx_get "$C/testbin" "$C/testbin.new"
+      run_sh "cd $C/testbin.new && sha256sum --quiet -c bins.sha256 && cd .. && mv testbin.new testbin"
+      TBX_HAVE[$C/testbin]=1
+    else
       say "$(date -u +%FT%TZ) build test bins"
       run_sh "$G/build-goport-tests.sh $wt $C/testbin > $C/testbin-build.log 2>&1" || die "test bin build failed (log $C/testbin-build.log)"
     fi
     if [[ -f $C/tests-run/results.json ]]; then say "reuse test run $C/tests-run"; else
-      say "$(date -u +%FT%TZ) goport tests"
+      say "$(date -u +%FT%TZ) goport tests$on"
       rc=0
-      run_sh "rm -rf $C/tests-run.new && mkdir $C/tests-run.new && $G/goport-tests.sh $C/testbin $C/tests-run.new ${pin:+--pin $pin} > $C/tests-run.log 2>&1" || rc=$?
+      if ((tbx)); then
+        tbx_up "$wt" "$pin"
+        tbx_have "$C/testbin"
+        # The test bins can come from another checkout or commit (an integration's side run). goport-tests.sh binds
+        # a git archive of their COMMIT's crates over BUILD_ROOT/crates and relbin/ over BUILD_TARGET/release, so on
+        # the testbox those two paths need only exist, and COMMIT must be in the testbox repo: from the bundle of
+        # testbox.sh source (an ancestor of the checkout's HEAD that origin lacks) or else from origin.
+        local tbc tbroot tbtarget
+        tbc=$(cat "$C/testbin/COMMIT" 2> /dev/null || echo "<COMMIT>") tbroot=$(cat "$C/testbin/BUILD_ROOT" 2> /dev/null || echo "$wt")
+        tbtarget=$(cat "$C/testbin/BUILD_TARGET" 2> /dev/null || echo "$wt/target/goport-tests")
+        [[ $tbroot == "$ROOT"/target/?* && $tbtarget == "$ROOT"/target/?* ]] ||
+          die "test bins $C/testbin: BUILD_ROOT $tbroot or BUILD_TARGET $tbtarget is not under $ROOT/target"
+        tbx_job "$C/tests-run.log" "{ git cat-file -e $tbc^{commit} 2> /dev/null || git fetch -q --depth=1 origin $tbc ||
+          { echo 'test bin commit $tbc (built in $tbroot) is not in the testbox repo or on origin: push it, or run side without --host testbox'; exit 3; }; } &&
+          mkdir -p $tbroot/crates $tbtarget/release && rm -rf $C/tests-run.new && mkdir -p $C/tests-run.new &&
+          scripts/goport/goport-tests.sh $C/testbin $C/tests-run.new ${pin:+--pin $pin}" || rc=$?
+        run_sh "rm -rf $C/tests-run.new"
+        tbx_get "$C/tests-run.new" "$C/tests-run.new" || ((rc)) || die "no tests-run.new on the testbox"
+      else
+        run_sh "rm -rf $C/tests-run.new && mkdir $C/tests-run.new && $G/goport-tests.sh $C/testbin $C/tests-run.new ${pin:+--pin $pin} > $C/tests-run.log 2>&1" || rc=$?
+      fi
       if [[ $DRY == 0 ]]; then
         [[ $rc == 0 && $(tail -n 1 "$C/tests-run.log") == DONE && -f $C/tests-run.new/results.json ]] ||
           die "goport tests rc $rc, last line '$(tail -n 1 "$C/tests-run.log")' (log $C/tests-run.log)"
@@ -420,8 +539,16 @@ side_unit() {
       for r in "$R"/measure/r*; do r=${r##*/r}; if [[ $r =~ ^[0-9]+$ ]] && ((r > n)); then n=$r; fi; done
       n=r$((n + 1))
       for r in "$n" "${n}b"; do
-        say "$(date -u +%FT%TZ) bound run $r"
-        run_sh "GOPORT_REL=$B ${pinexec[*]} bash $G/bound2.sh $r > $C/bound-$r.log 2>&1"
+        say "$(date -u +%FT%TZ) bound run $r$on"
+        if ((tbx)); then
+          # bound2.sh measures the testbox copy of the checker-port checkout (testbox.sh source: the same fp.py).
+          tbx_up "$wt" "$pin"
+          tbx_have "$B"
+          tbx_job "$C/bound-$r.log" "GOPORT_REL=$B ${pinexec[*]} bash scripts/goport/bound2.sh $r"
+          tbx_get "$R/measure/$r" "$R/measure/$r"
+        else
+          run_sh "GOPORT_REL=$B ${pinexec[*]} bash $G/bound2.sh $r > $C/bound-$r.log 2>&1"
+        fi
       done
       if [[ $DRY == 0 ]]; then
         ! grep -HE 'DIFF|INCOMPLETE' "$R/measure/$n"/summary-*.txt "$R/measure/${n}b"/summary-*.txt || die "bound runs $n, ${n}b: not all MATCH"
@@ -434,20 +561,26 @@ side_unit() {
     fi
   fi
 
-  # Remote runs: pin, scripts and bins go to the host first, once.
+  # Remote runs: pin, scripts and bins go to the host first, once. A testbox has the pin from tbx_up and the
+  # scripts from its sync.
   remote_sync() {
     [[ $host != local && $synced == 0 ]] || return 0
     synced=1
+    if ((tbx)); then tbx_up "$wt" "$pin"; tbx_have "$B"; return 0; fi
     [[ -z $pin ]] || run_sh "scripts/goport/remote.sh sync-pin $host $pin >> $C/sync.log 2>&1"
     run_sh "scripts/goport/remote.sh sync-scripts $host >> $C/sync.log 2>&1"
     run_sh "scripts/goport/remote.sh sync-bins $host $B >> $C/sync.log 2>&1"
   }
-  # on_host <GOPORT_PIN value> <command text> <log>: runs the command in the repo root, on zbook or under
-  # the host lock.
+  # on_host <GOPORT_PIN value> <command text> <log>: runs the command in the repo root, on zbook, under the host
+  # lock or on the testbox.
   on_host() {
     if [[ $host == local ]]; then run_sh "export GOPORT_PIN=$1; ($2) < /dev/null > $3 2>&1"
+    elif ((tbx)); then tbx_job "$3" "export GOPORT_PIN=$1; ($2)"
     else run_sh "flock $lock env GOPORT_PIN=$1 scripts/goport/remote.sh run $host $(printf %q "$2") < /dev/null > $3 2>&1"; fi
   }
+  # host_push <path>, host_fetch <dir>: copies to the host, and a result dir back to zbook.
+  host_push() { if ((tbx)); then run_sh "$TB push $1 >> $C/sync.log 2>&1"; else run_sh "scripts/goport/remote.sh push $host $1 >> $C/sync.log 2>&1"; fi; }
+  host_fetch() { if ((tbx)); then tbx_get "$1" "$1"; else run_sh "scripts/goport/remote.sh fetch $host $1 >> $C/sync.log 2>&1"; fi; }
 
   # Gate (full). The record is kept whatever its verdict: gate-compare.py below judges it.
   if [[ -f $C/gate.json ]]; then say "reuse gate $(jq -r '"\(.label) \(.verdict)"' "$C/gate.json")"; else
@@ -455,7 +588,7 @@ side_unit() {
     remote_sync
     say "$(date -u +%FT%TZ) gate $gl on $host"
     on_host "$pin" "bash scripts/goport/gate.sh $gl --full --bins $B --commit $commit" "$C/gate-$gl.log" || rc=$?
-    [[ $host == local ]] || run_sh "scripts/goport/remote.sh fetch $host $R/compat/gate/$gl >> $C/sync.log 2>&1"
+    [[ $host == local ]] || host_fetch "$R/compat/gate/$gl"
     if [[ $DRY == 0 ]]; then
       tail -n 3 "$C/gate-$gl.log"
       [[ -f $R/compat/gate/$gl/manifest.json ]] || die "gate $gl rc $rc and no manifest (log $C/gate-$gl.log)"
@@ -497,14 +630,49 @@ side_unit() {
     fi
   fi
 
+  # Editor items of two host kinds (tbxside1 skeptic: peak RSS 2 to 4 percent higher on a testbox). The gate judges
+  # each editor item against Go in the same run on the same host, and no rule judges peak RSS. The one value that
+  # gate-compare.py compares across runs is the Rust growth of editor/<project>/long against its cap, and on the R190
+  # bins it was the same on a testbox and on dbook-lan (within 0.05 MiB/edit, as two runs on one kind). So a base and
+  # a candidate of two host kinds count only while each long growth is at least 0.15 MiB/edit under its cap. Else
+  # move gate.json and gate-compare.json aside and run the gate again on the base's kind. Checked on every run.
+  if [[ $DRY == 0 && -f $C/gate.json && -f $C/gate-compare.json ]]; then
+    local eh erc=0
+    eh=$(python3 - "$bg" "$(jq -r .manifest "$C/gate.json")" "$C/gate-compare.json" <<'PY'
+import json, os, re, sys
+def run(manifest):
+    try:
+        return json.load(open(os.path.join(os.path.dirname(manifest), 'runs', 'editor', 'result.json')))
+    except (OSError, ValueError):
+        return {}
+# A Blacksmith testbox has an EC2 hostname, ip-<a>-<b>-<c>-<d>; zbook and the SSH hosts have their own names.
+kind = lambda r: 'testbox' if re.fullmatch(r'ip(-[0-9]+){4}', r.get('host') or '') else 'ssh'
+long_growth = lambda r: {s.get('project'): (((s.get('rust') or {}).get('cand') or {}).get('summary') or {}).get('growthMiBPerEdit')
+                         for s in r.get('sessions') or [] if s.get('scenario') == 'long'}
+b, n = run(sys.argv[1]), run(sys.argv[2])
+caps = json.load(open(sys.argv[3])).get('longCaps') or {}
+near = [f"{p} {side} {g:.2f} (cap {c['cap']:.2f})" for p, c in caps.items()
+        for side, g in (('base', long_growth(b).get(p)), ('new', long_growth(n).get(p))) if g is not None and g > c['cap'] - 0.15]
+print(f"editor hosts: base {b.get('host')} ({kind(b)}), new {n.get('host')} ({kind(n)})"
+      + (f"; long growth within 0.15 of the cap: {', '.join(near)}" if near else ''))
+sys.exit(3 if near and kind(b) != kind(n) else 0)
+PY
+    ) || erc=$?
+    echo "   $eh"
+    ((erc == 0 || erc == 3)) || die "editor host check rc $erc"
+    ((erc == 0)) || fails+="${fails:+; }gate: $eh, on two host kinds (run the gate again on the base's kind)"
+  fi
+
   # oracle_json <kind> <out-root> <label> <base results dirs> <record>: compares the results of <label> with the
   # base per request (oracle-compare.py with OARGS, see oracle_setup) and writes <record>.json, or
   # <record>-fail.json on a loss, a parity problem, a rebase run that is not the base bins at the batch pin, or
   # without a base; the other one goes, as it is not the last compare. Exit 2 (bad input or a refused answer set)
   # stops the side run. The finished run's label stays in <record>-run, so a rerun only compares again.
   oracle_json() {
-    local kind=$1 root=$2 lab=$3 base=$4 rec=$5 rc=0 prc=0 out
-    [[ $DRY == 1 ]] || echo "$lab" > "$C/$rec-run"
+    local kind=$1 root=$2 lab=$3 base=$4 rec=$5 rc=0 prc=0 out rhost
+    # A new run records its host next to its label; a reused run keeps the host it ran on (none before --host testbox).
+    if [[ $DRY == 0 && ! -f $C/$rec-run ]]; then echo "$lab" > "$C/$rec-run"; echo "$host" > "$C/$rec-run.host"; fi
+    rhost=$(cat "$C/$rec-run.host" 2> /dev/null || echo unrecorded)
     if [[ -z $base ]]; then
       # The other steps still run. The first goport batch needs the rule's apiBaseline (an API run of the R131 bins).
       echo "   no base $kind results (open_revision.py --base .$rec.dir); $lab is kept, a rerun compares it"
@@ -518,7 +686,7 @@ side_unit() {
     mv "$C/$rec-compare.new.json" "$C/$rec-compare.json"
     out=$C/$rec.json
     ((rc == 0)) || { out=$C/$rec-fail.json; fails+="${fails:+; }$kind oracle: oracle-compare.py rc $rc ($C/$rec-compare.json)"; }
-    python3 - "$kind" "$root/results/$lab" "$lab" "$host" "${OKEY[$rec]}" "$C/$rec-compare.json" "${OREBASE[$rec]:-null}" "$bg" > "$C/$rec.new.json" <<'PY' || prc=$?
+    python3 - "$kind" "$root/results/$lab" "$lab" "$rhost" "${OKEY[$rec]}" "$C/$rec-compare.json" "${OREBASE[$rec]:-null}" "$bg" > "$C/$rec.new.json" <<'PY' || prc=$?
 import collections, json, sys
 kind, rdir, label, host, key, cmp_path, rebase, gate = sys.argv[1:]
 s, c, rebase = json.load(open(f'{rdir}/summary.json')), json.load(open(cmp_path)), json.loads(rebase)
@@ -580,12 +748,12 @@ PY
     oracle=$(python3 scripts/upstream/pin.py path oracle ${pin:+"$pin"})
     remote_sync
     # The goldens of this oracle (golden/<oracle sha256 prefix>) are not in every host mirror (R131: cup2).
-    [[ $host == local ]] || run_sh "scripts/goport/remote.sh push $host $R/ls-oracle/battery/golden/$(sha256sum "$oracle" | cut -c1-12) >> $C/sync.log 2>&1"
+    [[ $host == local ]] || host_push "$R/ls-oracle/battery/golden/$(sha256sum "$oracle" | cut -c1-12)"
     say "$(date -u +%FT%TZ) LSP oracle $ll on $host"
     l="python3 scripts/goport/lsp_oracle.py check --out-root $R/ls-oracle/battery"
     l+=" --battery $LSP_BATTERIES --goport $B/tsgo --oracle $oracle --label $ll --jobs 12"
     on_host "" "$l" "$C/lsp-$ll.log" || rc=$?  # the oracle path carries the pin
-    [[ $host == local ]] || run_sh "scripts/goport/remote.sh fetch $host $R/ls-oracle/battery/results/$ll >> $C/sync.log 2>&1"
+    [[ $host == local ]] || host_fetch "$R/ls-oracle/battery/results/$ll"
     [[ $DRY == 1 || $rc == 0 ]] || die "LSP oracle $ll rc $rc (log $C/lsp-$ll.log)"
     oracle_json LSP "$R/ls-oracle/battery" "$ll" "${OBASE[lsp]}" lsp
   fi
@@ -600,8 +768,8 @@ PY
     oracle=$(python3 scripts/upstream/pin.py path oracle ${pin:+"$pin"})
     remote_sync
     if [[ $host != local ]]; then
-      run_sh "scripts/goport/remote.sh push $host $R/tests2/api/golden/$(sha256sum "$oracle" | cut -c1-12) >> $C/sync.log 2>&1"
-      [[ -n $pin ]] || run_sh "scripts/goport/remote.sh push $host $R/tests2/api/traces >> $C/sync.log 2>&1"
+      host_push "$R/tests2/api/golden/$(sha256sum "$oracle" | cut -c1-12)"
+      [[ -n $pin ]] || host_push "$R/tests2/api/traces"
     fi
     local -a batteries=("${API_BATTERIES[@]}")
     [[ " ${API_NO_EXT_ORACLES[*]} " == *" $(sha256sum "$oracle" | cut -c1-12) "* ]] || batteries+=("${API_EXT_BATTERIES[@]}")
@@ -609,31 +777,58 @@ PY
     l="set -e; for b in ${batteries[*]}; do python3 scripts/goport/api_oracle.py check --battery \$b"
     l+=" --goport $B/tsgo --oracle $oracle --label $al --jobs 12; done"
     on_host "$pin" "$l" "$C/api-$al.log" || rc=$?
-    [[ $host == local ]] || run_sh "scripts/goport/remote.sh fetch $host $R/tests2/api/results/$al >> $C/sync.log 2>&1"
+    [[ $host == local ]] || host_fetch "$R/tests2/api/results/$al"
     [[ $DRY == 1 || $rc == 0 ]] || die "API oracle $al rc $rc (log $C/api-$al.log)"
     oracle_json API "$R/tests2/api" "$al" "${OBASE[api]}" api
   fi
 
   # Quality on the checkout: rustfmt and clippy (R114 and R124 were refused for quality alone).
-  # Fingerprint before and after.
-  # A record without .crates predates the kept crate check (R131 and older), so it runs again.
-  if [[ -f $C/quality.json ]] && jq -e .crates "$C/quality.json" > /dev/null; then say "reuse quality $(jq -c . "$C/quality.json")"; else
-    say "$(date -u +%FT%TZ) quality: rustfmt and clippy"
+  # Fingerprint before and after. The record is reused only for the same source fingerprint (fp.py of the whole
+  # checkout): an integration's record names its worktree, and the revision checkout has the same crates tree (the
+  # same key) but another fingerprint, which accept_revision.py refuses (R195, state note
+  # candidate-quality-reuse-defect-2026-10-11). A record of another fingerprint stays as quality.json.fp-<fp>, with
+  # its logs. A record without .crates predates the kept crate check (R131 and older), so it runs again.
+  # Each checkout has its own clippy target, reused by its next runs and removed with its worktree. One shared
+  # dir let clippy check another checkout's goport_util (R190 side run 1, state note
+  # clippy-shared-target-2026-10-11), for the reason that the release build above names.
+  local clippy_target=$wt/target/candidate-clippy fpq
+  fpq=$(python3 "$G/fp.py" "$wt" | cut -d' ' -f1)
+  if [[ -f $C/quality.json ]] && jq -e .crates "$C/quality.json" > /dev/null &&
+    [[ $(jq -r .sourceFingerprint "$C/quality.json") == "$fpq" ]]; then say "reuse quality $(jq -c . "$C/quality.json")"; else
+    if [[ -f $C/quality.json ]]; then
+      old=$(jq -r '.sourceFingerprint // "none"' "$C/quality.json" | cut -c1-12)
+      say "quality: the cached record is of source $old, not ${fpq:0:12}; keep it as quality.json.fp-$old and run again"
+      for g in quality.json clippy.log rustfmt.log; do
+        [[ ! -f $C/$g ]] || run mv "$C/$g" "$C/$(free_name "$C" "$g.fp-$old")"
+      done
+    fi
+    say "$(date -u +%FT%TZ) quality: rustfmt and clippy$on (clippy target $clippy_target)"
     if [[ $DRY == 0 ]]; then
       local fpa fpb fmt=0 cl=0 warn
-      fpb=$(python3 "$G/fp.py" "$wt" | cut -d' ' -f1)
-      # After split step 1 (R131), goport_util and goport_lsproto are workspace crates built from ts_goport files.
+      fpb=$fpq
+      # After split steps 1 (R131) and 2, goport_core, goport_util and goport_lsproto are workspace crates built
+      # from ts_goport files. clippy lints only the packages it names, so each one is named.
       # The kept crates that are still workspace members (stages 5 and 6 move some into goport) count too.
       local pkgs=(-p ts_goport) dirs=(crates/ts_goport) p
-      for p in goport_util goport_lsproto; do grep -q "\"crates/ts_goport/parts/$p\"" "$wt/Cargo.toml" && pkgs+=(-p "$p"); done
+      for p in goport_core goport_util goport_lsproto; do grep -q "\"crates/ts_goport/parts/$p\"" "$wt/Cargo.toml" && pkgs+=(-p "$p"); done
       for p in "${KEPT_CRATES[@]}"; do grep -q "\"crates/$p\"" "$wt/Cargo.toml" && pkgs+=(-p "$p") dirs+=("crates/$p"); done
       (cd "$wt" && rustfmt --edition 2024 --check $(git ls-files "${dirs[@]/%//**/*.rs}") > "$C/rustfmt.log" 2>&1) || fmt=$?
-      (cd "$wt" && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$R/runtime/cargo-r113-clippy \
-        "$ROOT/scripts/run-cargo-capped.sh" clippy --locked "${pkgs[@]}" --all-targets > "$C/clippy.log" 2>&1) || cl=$?
+      if ((tbx)); then
+        # clippy on the testbox copy of the checkout (the same fp.py), in the same target path there (32 jobs: the
+        # default off zbook is 1).
+        tbx_up "$wt" "$pin"
+        tbx_job "$C/clippy.log" "cd $wt && CARGO_TERM_COLOR=never TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=32 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$clippy_target $ROOT/scripts/run-cargo-capped.sh clippy --locked ${pkgs[*]} --all-targets" || cl=$?
+      else
+        (cd "$wt" && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$clippy_target \
+          "$ROOT/scripts/run-cargo-capped.sh" clippy --locked "${pkgs[@]}" --all-targets > "$C/clippy.log" 2>&1) || cl=$?
+      fi
       fpa=$(python3 "$G/fp.py" "$wt" | cut -d' ' -f1)
-      local kept
-      warn=$(grep -E '^(warning|error)' -A4 "$C/clippy.log" | grep -c -- '--> crates/ts_goport' || true)
-      kept=$(grep -E '^(warning|error)' -A4 "$C/clippy.log" | grep -cE -- "--> crates/($(IFS='|'; echo "${KEPT_CRATES[*]}"))/" || true)
+      local kept plain
+      # Count on the log without ANSI color codes: the testbox sets CARGO_TERM_COLOR=always, and a colored
+      # "warning" line matched neither grep, so warnings counted 0 (R197 reviewer).
+      plain=$(sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$C/clippy.log")
+      warn=$(grep -E '^(warning|error)' -A4 <<< "$plain" | grep -c -- '--> crates/ts_goport' || true)
+      kept=$(grep -E '^(warning|error)' -A4 <<< "$plain" | grep -cE -- "--> crates/($(IFS='|'; echo "${KEPT_CRATES[*]}"))/" || true)
       jq -n --arg fp "$fpa" --argjson fmt "$fmt" --argjson cl "$cl" --argjson w "$warn" --argjson k "$kept" \
         --argjson same "$([[ $fpa == "$fpb" ]] && echo true || echo false)" --arg dirs "${dirs[*]}" \
         '{sourceFingerprint: $fp, rustfmtExit: $fmt, clippyExit: $cl, tsGoportWarnings: $w, keptCrateWarnings: $k,
@@ -826,7 +1021,7 @@ if missing:
 PY
 }
 
-DRY=0 HYP='' CHANGE='' MESSAGE='' NEW_BATCH='' ORIGIN='' CHECKOUT='' HOST=dbook-lan NAME_MAP=''
+DRY=0 HYP='' CHANGE='' MESSAGE='' NEW_BATCH='' ORIGIN='' CHECKOUT='' HOST=dbook-lan NAME_MAP='' GATE_HOST=''
 args=()
 while (($#)); do
   case $1 in
@@ -839,7 +1034,11 @@ while (($#)); do
     --origin) ORIGIN=${2:?--origin needs a value}; shift 2 ;;
     --checkout) CHECKOUT=${2:?--checkout needs a value}; shift 2 ;;
     --name-map) NAME_MAP=$(realpath "${2:?--name-map needs a value}"); [[ -f $NAME_MAP ]] || die "no name map $2"; shift 2 ;;
-    --gate-host) HOST=${2:?--gate-host needs a value}; [[ $HOST != auto ]] || die "--gate-host auto is not supported (sync-pin and fetch need one host); pick a free one with remote.sh status"; shift 2 ;;
+    # The last --gate-host wins, as before --host existed. --host testbox excludes any --gate-host.
+    --gate-host) v=${2:?--gate-host needs a value}; [[ $v != auto ]] || die "--gate-host auto is not supported (sync-pin and fetch need one host); pick a free one with remote.sh status"
+      [[ $v != testbox ]] || die "use --host testbox"; [[ $HOST != testbox ]] || die "--gate-host and --host exclude each other"; HOST=$v GATE_HOST=1; shift 2 ;;
+    --host) [[ ${2:-} == testbox ]] || die "--host takes testbox (the default runs the gate and oracles on dbook-lan)"
+      [[ -z $GATE_HOST ]] || die "--gate-host and --host exclude each other"; HOST=testbox; shift 2 ;;
     --*) die "unknown option $1" ;;
     *) args+=("$1"); shift ;;
   esac

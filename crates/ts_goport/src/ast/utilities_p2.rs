@@ -20,6 +20,23 @@ pub fn find_ancestor(mut node: Node, mut callback: impl FnMut(Node) -> bool) -> 
     Node::NIL
 }
 
+/// `find_ancestor` whose callback gets the view of each node (`NodeRef`):
+/// a parent in the same store, and the kind and parent reads of the
+/// callback, cost no registry lookup. Same nodes, same order.
+// PERF: checkid1. For the hot walks of the identifier and property access
+// checks, which go to the root or near it.
+#[inline]
+pub fn find_ancestor_ref(node: Node, mut callback: impl FnMut(NodeRef) -> bool) -> Node {
+    let mut node = NodeRef::new(node);
+    while node.is_some() {
+        if callback(node) {
+            return node.node();
+        }
+        node = node.parent();
+    }
+    Node::NIL
+}
+
 // Go: ast/utilities.go:921 FindManyAncestors
 /// Walks up the parents of `node` once. Slot `i` of the result is the nearest
 /// ancestor that `callbacks[i]` matches, or nil. A node fills at most one
@@ -72,10 +89,13 @@ pub fn find_ancestor_with_kind(
 
 // Go: ast/utilities.go:941 FindAncestorKind
 /// Walks up the parents of a node to find the ancestor that matches the kind.
-pub fn find_ancestor_kind(mut node: Node, kind: SyntaxKind) -> Node {
+// PERF: noderef1 G2. Through views (`NodeRef`): no registry lookup for a
+// parent in the same store.
+pub fn find_ancestor_kind(node: Node, kind: SyntaxKind) -> Node {
+    let mut node = NodeRef::new(node);
     while node.is_some() {
         if node.kind() == kind {
-            return node;
+            return node.node();
         }
         node = node.parent();
     }
@@ -108,10 +128,32 @@ pub fn find_ancestor_or_quit(
     Node::NIL
 }
 
-// Go: ast/utilities.go:980 IsNodeDescendantOf
-pub fn is_node_descendant_of(mut node: Node, ancestor: Node) -> bool {
+/// `find_ancestor_or_quit` whose callback gets the view of each node
+/// (`NodeRef`), as `find_ancestor_ref`.
+#[inline]
+pub fn find_ancestor_or_quit_ref(
+    node: Node,
+    mut callback: impl FnMut(NodeRef) -> FindAncestorResult,
+) -> Node {
+    let mut node = NodeRef::new(node);
     while node.is_some() {
-        if node == ancestor {
+        let result = callback(node);
+        if result == FindAncestorResult::FIND_ANCESTOR_QUIT {
+            return Node::NIL;
+        } else if result == FindAncestorResult::FIND_ANCESTOR_TRUE {
+            return node.node();
+        }
+        node = node.parent();
+    }
+    Node::NIL
+}
+
+// Go: ast/utilities.go:980 IsNodeDescendantOf
+// PERF: checkid1. Parent steps through views, as `find_ancestor_ref`.
+pub fn is_node_descendant_of(node: Node, ancestor: Node) -> bool {
+    let mut node = NodeRef::new(node);
+    while node.is_some() {
+        if node.node() == ancestor {
             return true;
         }
         node = node.parent();
@@ -389,7 +431,11 @@ pub fn get_root_declaration(mut node: Node) -> Node {
 // walk and the flag reads are the same as Go. A nil node fails the Go
 // `node != nil` tests, so it returns early. The same holds for
 // `get_combined_node_flags` and `get_combined_parser_flags`.
-pub fn get_combined_modifier_flags(mut node: Node) -> ModifierFlags {
+// PERF: checkid1. The nodes, kinds, parents and modifier flags are read
+// through views (`NodeRef`): a parent in the same store costs no registry
+// lookup. The same holds for `get_combined_parser_flags`.
+pub fn get_combined_modifier_flags(node: Node) -> ModifierFlags {
+    let mut node = NodeRef::new(node);
     let mut kind = node.kind();
     while kind == SyntaxKind::BindingElement {
         node = node.parent().parent();
@@ -451,7 +497,8 @@ pub fn get_combined_node_flags(mut node: Node) -> NodeFlags {
 // PERF: U4 (CH7). The same walk as `get_combined_node_flags`, without the
 // binder data of each node. `(a | b | c) & mask` is
 // `(a & mask) | (b & mask) | (c & mask)`.
-pub fn get_combined_parser_flags(mut node: Node, mask: NodeFlags) -> NodeFlags {
+pub fn get_combined_parser_flags(node: Node, mask: NodeFlags) -> NodeFlags {
+    let mut node = NodeRef::new(node);
     let mut kind = node.kind();
     while kind == SyntaxKind::BindingElement {
         node = node.parent().parent();
@@ -602,37 +649,74 @@ pub fn is_in_js_file(node: Node) -> bool {
 
 // Go: ast/utilities.go:1302 IsDeclaration
 pub fn is_declaration(node: Node) -> bool {
+    is_declaration_ref(NodeRef::new(node))
+}
+
+/// `is_declaration` on the view of the node.
+// PERF: noderef1 G1. The predicates of the declaration-name family read
+// the kind, the parent and the data of a node through one view
+// (`NodeRef`), with one registry lookup per node.
+#[inline]
+pub fn is_declaration_ref(node: NodeRef) -> bool {
     if node.kind() == SyntaxKind::TypeParameter {
         return node.parent().is_some();
     }
-    is_declaration_node(node)
+    is_declaration_node_ref(node)
 }
 
 // Go: ast/utilities.go:1310 IsDeclarationName
 /// True if `name` is the name of a declaration node.
 pub fn is_declaration_name(name: Node) -> bool {
-    !is_source_file(name)
-        && !is_binding_pattern(name)
-        && is_declaration(name.parent())
-        && name.parent().name() == name
+    is_declaration_name_ref(NodeRef::new(name))
+}
+
+/// `is_declaration_name` on the view of the name.
+pub fn is_declaration_name_ref(name: NodeRef) -> bool {
+    !matches!(
+        name.kind(),
+        SyntaxKind::SourceFile | SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern
+    ) && {
+        let parent = name.parent();
+        is_declaration_ref(parent) && parent.name() == name.node()
+    }
 }
 
 // Go: ast/utilities.go:1315 IsDeclarationNameOrImportPropertyName
 /// Like 'isDeclarationName', but returns true for LHS of `import { x as y }` or `export { x as y }`.
 pub fn is_declaration_name_or_import_property_name(name: Node) -> bool {
+    is_declaration_name_or_import_property_name_ref(NodeRef::new(name))
+}
+
+/// `is_declaration_name_or_import_property_name` on the view of the name.
+pub fn is_declaration_name_or_import_property_name_ref(name: NodeRef) -> bool {
     match name.parent().kind() {
         SyntaxKind::ImportSpecifier | SyntaxKind::ExportSpecifier => {
-            is_identifier(name) || name.kind() == SyntaxKind::StringLiteral
+            matches!(
+                name.kind(),
+                SyntaxKind::Identifier | SyntaxKind::StringLiteral
+            )
         }
-        _ => is_declaration_name(name),
+        _ => is_declaration_name_ref(name),
     }
 }
 
 // Go: ast/utilities.go:1324 IsLiteralComputedPropertyDeclarationName
 pub fn is_literal_computed_property_declaration_name(node: Node) -> bool {
-    is_string_or_numeric_literal_like(node)
-        && node.parent().kind() == SyntaxKind::ComputedPropertyName
-        && is_declaration(node.parent().parent())
+    is_literal_computed_property_declaration_name_ref(NodeRef::new(node))
+}
+
+/// `is_literal_computed_property_declaration_name` on the view of the
+/// node.
+pub fn is_literal_computed_property_declaration_name_ref(node: NodeRef) -> bool {
+    matches!(
+        node.kind(),
+        SyntaxKind::StringLiteral
+            | SyntaxKind::NoSubstitutionTemplateLiteral
+            | SyntaxKind::NumericLiteral
+    ) && {
+        let parent = node.parent();
+        parent.kind() == SyntaxKind::ComputedPropertyName && is_declaration_ref(parent.parent())
+    }
 }
 
 // Go: ast/utilities.go:1330 IsExternalModuleImportEqualsDeclaration
@@ -655,11 +739,17 @@ pub fn is_literal_import_type_node(node: Node) -> bool {
 
 // Go: ast/utilities.go:1342 IsJsxTagName
 pub fn is_jsx_tag_name(node: Node) -> bool {
-    let parent = node.parent();
+    is_jsx_tag_name_of(node, NodeRef::new(node).parent())
+}
+
+/// `is_jsx_tag_name(node)`, where `parent` is the view of the parent of
+/// `node`.
+#[inline]
+pub fn is_jsx_tag_name_of(node: Node, parent: NodeRef) -> bool {
     match parent.kind() {
         SyntaxKind::JsxOpeningElement
         | SyntaxKind::JsxClosingElement
-        | SyntaxKind::JsxSelfClosingElement => parent.tag_name() == node,
+        | SyntaxKind::JsxSelfClosingElement => parent.node().tag_name() == node,
         _ => false,
     }
 }
@@ -1276,13 +1366,20 @@ pub fn get_heritage_clause_element_name(node: Node) -> Node {
 }
 
 // Go: ast/utilities.go:1766 IsNameOfHeritageClauseTypeReference
-pub fn is_name_of_heritage_clause_type_reference(mut node: Node) -> bool {
-    while is_qualified_name(node.parent()) {
-        node = node.parent();
+pub fn is_name_of_heritage_clause_type_reference(node: Node) -> bool {
+    is_name_of_heritage_clause_type_reference_ref(NodeRef::new(node))
+}
+
+/// `is_name_of_heritage_clause_type_reference` on the view of the node.
+pub fn is_name_of_heritage_clause_type_reference_ref(mut node: NodeRef) -> bool {
+    let mut parent = node.parent();
+    while parent.kind() == SyntaxKind::QualifiedName {
+        node = parent;
+        parent = node.parent();
     }
-    is_type_reference_node(node.parent())
-        && node.parent().type_name() == node
-        && is_heritage_clause(node.parent().parent())
+    parent.kind() == SyntaxKind::TypeReference
+        && parent.type_name() == node.node()
+        && parent.parent().kind() == SyntaxKind::HeritageClause
 }
 
 // Go: ast/utilities.go:1775 GetHeritageClause

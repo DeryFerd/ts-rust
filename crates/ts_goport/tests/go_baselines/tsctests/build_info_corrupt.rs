@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// The longest run. Without the fix, a negative `pos` spins forever.
-const LIMIT: Duration = Duration::from_secs(60);
+const LIMIT: Duration = Duration::from_mins(1);
 
 /// A new empty dir under the system temp dir; removed on drop.
 struct TmpDir(PathBuf);

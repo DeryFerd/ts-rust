@@ -11,7 +11,7 @@ use crate::frontend::prelude::*;
 // Go `[][]string` extension groups are `Vec<Vec<String>>`. Go `int` is
 // `i32`.
 
-// Go: tsoptions/tsconfigparsing.go:941 getDefaultTypeAcquisition
+// Go: tsoptions/options_generated.go:313 getDefaultTypeAcquisition (ts#64457 generates it)
 pub fn get_default_type_acquisition(config_file_name: &str) -> TypeAcquisition {
     let mut options = TypeAcquisition::default();
     if !config_file_name.is_empty() && get_base_file_name(config_file_name) == "jsconfig.json" {
@@ -20,7 +20,7 @@ pub fn get_default_type_acquisition(config_file_name: &str) -> TypeAcquisition {
     options
 }
 
-// Go: tsoptions/tsconfigparsing.go:949 convertCompilerOptionsFromJsonWorker
+// Go: tsoptions/tsconfigparsing.go:825 convertCompilerOptionsFromJsonWorker
 fn convert_compiler_options_from_json_worker(
     json_options: &CompilerOptionsValue,
     base_path: &str,
@@ -41,7 +41,7 @@ fn convert_compiler_options_from_json_worker(
     (options, errors)
 }
 
-// Go: tsoptions/tsconfigparsing.go:958 convertTypeAcquisitionFromJsonWorker
+// Go: tsoptions/tsconfigparsing.go:837 convertTypeAcquisitionFromJsonWorker
 fn convert_type_acquisition_from_json_worker(
     json_options: &CompilerOptionsValue,
     base_path: &str,
@@ -59,7 +59,7 @@ fn convert_type_acquisition_from_json_worker(
     (options, errors)
 }
 
-// Go: tsoptions/tsconfigparsing.go:964 parseOwnConfigOfJson
+// Go: tsoptions/tsconfigparsing.go:843 parseOwnConfigOfJson
 // PORT: Go stores a `[]string` (maybe nil) in the `any` field, so the field
 // is never Go nil. It is always `Some` here.
 // PORT: Go sets the converted `compileOnSave` in the caller's map, which
@@ -128,7 +128,7 @@ fn parse_own_config_of_json(
     (parsed_config, errors)
 }
 
-// Go: tsoptions/tsconfigparsing.go:996 readJsonConfigFile
+// Go: tsoptions/tsconfigparsing.go:875 readJsonConfigFile
 // PORT: the parser keeps source text for the program, so the text and the
 // file name are leaked. The empty file gets its own node store, like the
 // parsed one.
@@ -183,7 +183,7 @@ fn read_json_config_file(
     }
 }
 
-// Go: tsoptions/tsconfigparsing.go:1015 getExtendedConfig
+// Go: tsoptions/tsconfigparsing.go:894 getExtendedConfig
 fn get_extended_config(
     source_file: Option<&TsConfigSourceFile>,
     extended_config_file_name: &str,
@@ -239,7 +239,7 @@ fn get_extended_config(
     (cache_entry.extended_config.clone(), errors)
 }
 
-// Go: tsoptions/tsconfigparsing.go:1052 ParseExtendedConfig
+// Go: tsoptions/tsconfigparsing.go:931 ParseExtendedConfig
 // PORT: Go returns a pointer; this returns the value. Callers wrap it in
 // `Rc` where Go shares it.
 pub fn parse_extended_config(
@@ -302,7 +302,7 @@ fn raw_as_map_mut(raw: &mut CompilerOptionsValue) -> &mut IndexMap<String, Compi
 
 // parseConfig just extracts options/include/exclude/files out of a config file.
 // It does not resolve the included files.
-// Go: tsoptions/tsconfigparsing.go:1082 parseConfig
+// Go: tsoptions/tsconfigparsing.go:961 parseConfig
 // PORT: Go `json` is a nilable map pointer (`Option`, owned). Go
 // `sourceFile` is a nilable pointer that this function changes, so it is
 // `Option<&mut TsConfigSourceFile>`. The Go `applyExtendedConfig` closure
@@ -528,10 +528,10 @@ pub fn parse_config(
     (own_config, errors)
 }
 
-// Go: tsoptions/tsconfigparsing.go:1219 defaultIncludeSpec
+// Go: tsoptions/tsconfigparsing.go:1100 defaultIncludeSpec
 pub const DEFAULT_INCLUDE_SPEC: &str = "**/*";
 
-// Go: tsoptions/tsconfigparsing.go:1221 propOfRaw
+// Go: tsoptions/tsconfigparsing.go:1102 propOfRaw
 // PORT: Go nil `sliceValue` is `None`.
 struct PropOfRaw {
     slice_value: Option<Vec<CompilerOptionsValue>>,
@@ -603,7 +603,7 @@ fn is_map_element(element: &CompilerOptionsValue) -> bool {
     matches!(element, CompilerOptionsValue::Map(_))
 }
 
-// Go: tsoptions/tsconfigparsing.go:1226 isStringValue
+// Go: tsoptions/tsconfigparsing.go:1107 isStringValue
 fn is_string_value(element: &CompilerOptionsValue) -> bool {
     matches!(element, CompilerOptionsValue::String(_))
 }
@@ -679,7 +679,7 @@ pub(crate) fn stringify_json(value: &CompilerOptionsValue, out: &mut String) {
 // host: Instance of ParseConfigHost used to enumerate files in folder.
 // basePath: A root directory to resolve relative path entries in the config file to. e.g. outDir
 // resolutionStack: Only present for backwards-compatibility. Should be empty.
-// Go: tsoptions/tsconfigparsing.go:1237 parseJsonConfigFileContentWorker
+// Go: tsoptions/tsconfigparsing.go:1118 parseJsonConfigFileContentWorker
 // PORT: Go `sourceFile` is a pointer that the result keeps, so it moves in
 // and into `ParsedCommandLine.config_file`. The Go `getFileNames` and
 // `getProjectReferences` closures run inline, in Go order. When `parseConfig`
@@ -782,7 +782,8 @@ pub fn parse_json_config_file_content_worker(
                     for_each_tsconfig_prop_array(source_file.source_file, "files", |property| {
                         Some(property.initializer())
                     })
-                    .unwrap_or_else(|| crate::core::go_nil_dereference());
+                    // Go N' loads `node.Loc.Pos()` (offset 8): addr=0x8 (errors.go:93).
+                    .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x8));
                 errors.push(create_diagnostic_for_node_in_source_file(
                     source_file.source_file,
                     node_value,
@@ -1180,14 +1181,14 @@ pub fn parse_json_config_file_content_worker(
     }
 }
 
-// Go: tsoptions/tsconfigparsing.go:1536 canJsonReportNoInputFiles
+// Go: tsoptions/tsconfigparsing.go:1435 canJsonReportNoInputFiles
 fn can_json_report_no_input_files(raw_config: &IndexMap<String, CompilerOptionsValue>) -> bool {
     let files_exists = raw_config.contains_key("files");
     let references_exists = raw_config.contains_key("references");
     !files_exists && !references_exists
 }
 
-// Go: tsoptions/tsconfigparsing.go:1542 shouldReportNoInputFiles
+// Go: tsoptions/tsconfigparsing.go:1441 shouldReportNoInputFiles
 fn should_report_no_input_files(
     file_names: &[String],
     can_json_report_no_input_files: bool,
@@ -1196,7 +1197,7 @@ fn should_report_no_input_files(
     file_names.is_empty() && can_json_report_no_input_files && resolution_stack.is_empty()
 }
 
-// Go: tsoptions/tsconfigparsing.go:1546 validateSpecs
+// Go: tsoptions/tsconfigparsing.go:1445 validateSpecs
 // PORT: Go `specs any` always holds a `[]any`, so it is a slice here.
 fn validate_specs(
     specs: &[CompilerOptionsValue],
@@ -1229,7 +1230,7 @@ fn validate_specs(
     (final_specs, errors)
 }
 
-// Go: tsoptions/tsconfigparsing.go:1572 specToDiagnostic
+// Go: tsoptions/tsconfigparsing.go:1471 specToDiagnostic
 pub(crate) fn spec_to_diagnostic(
     spec: &str,
     disallow_trailing_recursion: bool,
@@ -1245,7 +1246,7 @@ pub(crate) fn spec_to_diagnostic(
     None
 }
 
-// Go: tsoptions/tsconfigparsing.go:1582 invalidTrailingRecursion
+// Go: tsoptions/tsconfigparsing.go:1481 invalidTrailingRecursion
 fn invalid_trailing_recursion(spec: &str) -> bool {
     // Matches **, /**, **/, and /**/, but not a**b.
     // Strip optional trailing slash, then check if it ends with /** or is just **
@@ -1253,7 +1254,7 @@ fn invalid_trailing_recursion(spec: &str) -> bool {
     s == "**" || s.ends_with("/**")
 }
 
-// Go: tsoptions/tsconfigparsing.go:1589 invalidDotDotAfterRecursiveWildcard
+// Go: tsoptions/tsconfigparsing.go:1488 invalidDotDotAfterRecursiveWildcard
 // PORT: Go string indexes are byte offsets, as are Rust `find` results.
 fn invalid_dot_dot_after_recursive_wildcard(s: &str) -> bool {
     // We used to use the regex /(^|\/)\*\*\/(.*\/)?\.\.($|\/)/ to check for this case, but
@@ -1277,7 +1278,7 @@ fn invalid_dot_dot_after_recursive_wildcard(s: &str) -> bool {
     last_dot_index > wildcard_index
 }
 
-// Go: tsoptions/tsconfigparsing.go:1613 GetTsConfigPropArrayElementValue
+// Go: tsoptions/tsconfigparsing.go:1512 GetTsConfigPropArrayElementValue
 // PORT: Go returns `*ast.StringLiteral`; that is a `Node` (`NIL` for nil).
 pub fn get_tsconfig_prop_array_element_value(
     tsconfig_source_file: Node,
@@ -1291,7 +1292,7 @@ pub fn get_tsconfig_prop_array_element_value(
     .unwrap_or(Node::NIL)
 }
 
-// Go: tsoptions/tsconfigparsing.go:1623 ForEachTsConfigPropArray
+// Go: tsoptions/tsconfigparsing.go:1522 ForEachTsConfigPropArray
 // PORT: Go `*T` results are `Option<T>`.
 pub fn for_each_tsconfig_prop_array<T>(
     tsconfig_source_file: Node,
@@ -1309,20 +1310,16 @@ pub fn for_each_tsconfig_prop_array<T>(
     None
 }
 
-// Go: tsoptions/tsconfigparsing.go:1630 CreateDiagnosticAtReferenceSyntax
-// PORT: Go returns a nilable `*ast.Diagnostic`; that is `Option`. Go reads
-// `config.ConfigFile.SourceFile`, which panics for a nil `ConfigFile`.
+// Go: tsoptions/tsconfigparsing.go:1529 CreateDiagnosticAtReferenceSyntax
+// PORT: Go returns a nilable `*ast.Diagnostic`; that is `Option`.
+// ts#64637: a command line with no config file has no reference syntax.
 pub fn create_diagnostic_at_reference_syntax(
     config: &ParsedCommandLine,
     index: usize,
     message: &'static Message,
     args: Vec<String>,
 ) -> Option<Diagnostic> {
-    let source_file = config
-        .config_file
-        .as_ref()
-        .expect("nil pointer dereference: config.ConfigFile")
-        .source_file;
+    let source_file = config.config_file.as_ref()?.source_file;
     for_each_tsconfig_prop_array(source_file, "references", |property| {
         if is_array_literal_expression(property.initializer()) {
             let value = property.initializer().elements();
@@ -1339,7 +1336,7 @@ pub fn create_diagnostic_at_reference_syntax(
     })
 }
 
-// Go: tsoptions/tsconfigparsing.go:1642 createDiagnosticAtProjectReferenceProperty
+// Go: tsoptions/tsconfigparsing.go:1544 createDiagnosticAtProjectReferenceProperty
 // PORT: Go `*TsConfigSourceFile` is `Option<&TsConfigSourceFile>`; the Go
 // variadic `args` is a `Vec`.
 fn create_diagnostic_at_project_reference_property(
@@ -1378,7 +1375,7 @@ fn create_diagnostic_at_project_reference_property(
     )
 }
 
-// Go: tsoptions/tsconfigparsing.go:1663 GetCallbackForFindingPropertyAssignmentByValue
+// Go: tsoptions/tsconfigparsing.go:1565 GetCallbackForFindingPropertyAssignmentByValue
 pub fn get_callback_for_finding_property_assignment_by_value(
     value: &str,
 ) -> impl Fn(Node) -> Option<Node> + use<> {
@@ -1395,7 +1392,7 @@ pub fn get_callback_for_finding_property_assignment_by_value(
     }
 }
 
-// Go: tsoptions/tsconfigparsing.go:1674 GetOptionsSyntaxByArrayElementValue
+// Go: tsoptions/tsconfigparsing.go:1576 GetOptionsSyntaxByArrayElementValue
 pub fn get_options_syntax_by_array_element_value(
     object_literal: Node,
     prop_key: &str,
@@ -1410,7 +1407,7 @@ pub fn get_options_syntax_by_array_element_value(
     .unwrap_or(Node::NIL)
 }
 
-// Go: tsoptions/tsconfigparsing.go:1682 getContentMapperSyntax (tsgo#4712)
+// Go: tsoptions/tsconfigparsing.go:1584 getContentMapperSyntax (tsgo#4712)
 // getContentMapperSyntax returns the tsconfig JSON node to attribute a diagnostic about the content
 // mapper at index to: the value of subKey within that mapper's object (when subKey is non-empty),
 // falling back to the mapper element, then to the "contentMappers" array. An index outside the array
@@ -1447,7 +1444,7 @@ fn get_content_mapper_syntax(source_file: Node, index: i32, sub_key: &str) -> No
     .unwrap_or(Node::NIL)
 }
 
-// Go: tsoptions/tsconfigparsing.go:1706 GetContentMapperOptionDiagnosticLocation (tsgo#4712)
+// Go: tsoptions/tsconfigparsing.go:1608 GetContentMapperOptionDiagnosticLocation (tsgo#4712)
 // PORT: Go returns `(*ast.SourceFile, core.TextRange)`; the file is a
 // `Node` (`Node::NIL` for nil). Go `slices.Index` compares the mapper
 // pointers (`Rc::ptr_eq`). Go indexes the array with a negative
@@ -1506,7 +1503,7 @@ pub fn get_content_mapper_option_diagnostic_location(
     )
 }
 
-// Go: tsoptions/tsconfigparsing.go:1743 getContentMappersKeySyntax (tsgo#4712)
+// Go: tsoptions/tsconfigparsing.go:1645 getContentMappersKeySyntax (tsgo#4712)
 // getContentMappersKeySyntax returns the "contentMappers" property key node, used to attribute a
 // diagnostic about the setting as a whole rather than a specific mapper.
 fn get_content_mappers_key_syntax(source_file: Node) -> Node {
@@ -1519,7 +1516,7 @@ fn get_content_mappers_key_syntax(source_file: Node) -> Node {
     .unwrap_or(Node::NIL)
 }
 
-// Go: tsoptions/tsconfigparsing.go:1754 getContentMapperExtensionSyntax (tsgo#4712)
+// Go: tsoptions/tsconfigparsing.go:1656 getContentMapperExtensionSyntax (tsgo#4712)
 // getContentMapperExtensionSyntax returns the node for a specific extension string within the content
 // mapper at index, falling back to the "extensions" array or the mapper element.
 fn get_content_mapper_extension_syntax(source_file: Node, index: i32, ext: &str) -> Node {
@@ -1536,7 +1533,7 @@ fn get_content_mapper_extension_syntax(source_file: Node, index: i32, ext: &str)
     node
 }
 
-// Go: tsoptions/tsconfigparsing.go:1769 setContentMapperDiagnosticLocation (tsgo#4712)
+// Go: tsoptions/tsconfigparsing.go:1671 setContentMapperDiagnosticLocation (tsgo#4712)
 // setContentMapperDiagnosticLocation attaches a source location to a content mapper diagnostic when a
 // tsconfig source file and node are available (the jsonSourceFile API), leaving it as a location-less
 // compiler diagnostic otherwise (the JSON API).
@@ -1555,7 +1552,7 @@ fn set_content_mapper_diagnostic_location(
     diagnostic
 }
 
-// Go: tsoptions/tsconfigparsing.go:1777 ForEachPropertyAssignment
+// Go: tsoptions/tsconfigparsing.go:1679 ForEachPropertyAssignment
 // PORT: Go `*T` results are `Option<T>`. The Go variadic `key2` is a slice.
 pub fn for_each_property_assignment<T>(
     object_literal: Node,
@@ -1577,7 +1574,7 @@ pub fn for_each_property_assignment<T>(
     None
 }
 
-// Go: tsoptions/tsconfigparsing.go:1793 getTsConfigObjectLiteralExpression
+// Go: tsoptions/tsconfigparsing.go:1695 getTsConfigObjectLiteralExpression
 fn get_tsconfig_object_literal_expression(tsconfig_source_file: Node) -> Node {
     if tsconfig_source_file.is_some() {
         let statements = tsconfig_source_file.statements();
@@ -1591,12 +1588,15 @@ fn get_tsconfig_object_literal_expression(tsconfig_source_file: Node) -> Node {
     Node::NIL
 }
 
-// Go: tsoptions/tsconfigparsing.go:1803 getSubstitutedPathWithConfigDirTemplate
-fn get_substituted_path_with_config_dir_template(value: &str, base_path: &str) -> String {
+// Go: tsoptions/tsconfigparsing.go:1705 getSubstitutedPathWithConfigDirTemplate
+pub(crate) fn get_substituted_path_with_config_dir_template(
+    value: &str,
+    base_path: &str,
+) -> String {
     get_normalized_absolute_path(&value.replacen(CONFIG_DIR_TEMPLATE, "./", 1), base_path)
 }
 
-// Go: tsoptions/tsconfigparsing.go:1807 getSubstitutedStringArrayWithConfigDirTemplate
+// Go: tsoptions/tsconfigparsing.go:1710 getSubstitutedStringArrayWithConfigDirTemplate
 // PORT: Go returns a nil slice for "no change"; that is `None`. Go passes
 // the string as `any` to `startsWithConfigDirTemplate`.
 fn get_substituted_string_array_with_config_dir_template(
@@ -1613,7 +1613,7 @@ fn get_substituted_string_array_with_config_dir_template(
     result
 }
 
-// Go: tsoptions/tsconfigparsing.go:1823 handleOptionConfigDirTemplateSubstitution
+// Go: tsoptions/options_generated.go:1332 handleOptionConfigDirTemplateSubstitution (ts#64457 generates it)
 // PORT: Go clones the shared `Paths` map before the first change (tsgo#4362)
 // so a cached extended config keeps its value. Each options value here owns
 // its `paths`, so no clone is needed.
@@ -1733,7 +1733,7 @@ impl<'e> ExtensionPriority<'e> {
 
 // hasFileWithHigherPriorityExtension determines whether a literal or wildcard file has already been included that has a higher extension priority.
 // file is the path to the file.
-// Go: tsoptions/tsconfigparsing.go:1875 hasFileWithHigherPriorityExtension
+// Go: tsoptions/tsconfigparsing.go:1728 hasFileWithHigherPriorityExtension
 // PORT: `priority` has the file's extension group (`ExtensionPriority::start`).
 fn has_file_with_higher_priority_extension(
     file: &str,
@@ -1770,7 +1770,7 @@ fn has_file_with_higher_priority_extension(
 
 // Removes files included via wildcard expansion with a lower extension priority that have already been included.
 // file is the path to the file.
-// Go: tsoptions/tsconfigparsing.go:1907 removeWildcardFilesWithLowerPriorityExtension
+// Go: tsoptions/tsconfigparsing.go:1760 removeWildcardFilesWithLowerPriorityExtension
 // PORT: `priority` has the file's extension group (`ExtensionPriority::start`).
 fn remove_wildcard_files_with_lower_priority_extension(
     file: &str,
@@ -1802,7 +1802,7 @@ fn remove_wildcard_files_with_lower_priority_extension(
 // options is the Compiler options.
 // host is the host used to resolve files and directories.
 // extraExtensions are additional file extensions (e.g. from content mappers) to treat as supported.
-// Go: tsoptions/tsconfigparsing.go:1934 getFileNamesFromConfigSpecs
+// Go: tsoptions/tsconfigparsing.go:1787 getFileNamesFromConfigSpecs
 // PORT: Go `options` can be nil only after a config cycle; Go
 // `GetSupportedExtensions` then panics on the nil pointer, and so does this
 // port.
@@ -1847,9 +1847,13 @@ pub(crate) fn get_file_names_from_config_specs(
         );
     // Literal files are always included verbatim. An "include" or "exclude" specification cannot
     // remove a literal file.
+    // ts#64159 (tsconfigparsing.go:1820): the key is the PathKey of the
+    // resolved file name (validatedFileNames), not the spec text, so
+    // "./src/a.ts" and "src//a.ts" are one root file, and "include" does not
+    // add a "files" entry again.
     for file_name in validated_files_spec {
         let file = get_normalized_absolute_path(file_name, &base_path);
-        literal_file_map.insert(key_mappper(file_name), file);
+        literal_file_map.insert(key_mappper(&file), file);
     }
 
     let mut json_only_include_matchers: Option<SpecMatcher> = None;
@@ -1955,7 +1959,7 @@ fn owned_groups(groups: &[&[&str]]) -> Vec<Vec<String>> {
         .collect()
 }
 
-// Go: tsoptions/tsconfigparsing.go:2026 GetSupportedExtensions
+// Go: tsoptions/tsconfigparsing.go:1882 GetSupportedExtensions
 // PORT: Go returns the shared tspath tables; this returns owned copies.
 // tsgo#4712: the extra extensions are plain extension strings.
 pub fn get_supported_extensions(
@@ -1986,7 +1990,7 @@ pub fn get_supported_extensions(
     extensions
 }
 
-// Go: tsoptions/tsconfigparsing.go:2050 GetSupportedExtensionsWithJsonIfResolveJsonModule
+// Go: tsoptions/tsconfigparsing.go:1906 GetSupportedExtensionsWithJsonIfResolveJsonModule
 // PORT: Go `core.Same` compares slice identity. Content equality gives the
 // same result here: a new Go slice equal to a tspath table gets `.json`
 // appended, which equals the matching `WITH_JSON` table.
@@ -2012,7 +2016,7 @@ pub fn get_supported_extensions_with_json_if_resolve_json_module(
 }
 
 // Reads the config file and reports errors.
-// Go: tsoptions/tsconfigparsing.go:2064 GetParsedCommandLineOfConfigFile
+// Go: tsoptions/tsconfigparsing.go:1920 GetParsedCommandLineOfConfigFile
 // PORT: Go returns a nilable `*ParsedCommandLine`; that is `Option`.
 pub fn get_parsed_command_line_of_config_file(
     config_file_name: &str,
@@ -2038,7 +2042,7 @@ pub fn get_parsed_command_line_of_config_file(
     )
 }
 
-// Go: tsoptions/tsconfigparsing.go:2075 GetParsedCommandLineOfConfigFilePath
+// Go: tsoptions/tsconfigparsing.go:1930 GetParsedCommandLineOfConfigFilePath
 pub fn get_parsed_command_line_of_config_file_path(
     config_file_name: &str,
     path: Path,
@@ -2171,5 +2175,83 @@ mod top_level_array_tests {
             panic.message,
             "runtime error: invalid memory address or nil pointer dereference"
         );
+    }
+}
+
+/// Option names and the `${configDir}` template with U+0130 (İ). Go
+/// `strings.ToLower` maps it to 'i' (`decls::strings_to_lower`), and Rust
+/// `to_lowercase` maps it to two chars. The expected values come from
+/// tsgo-oracle-fed0bf24149f.
+#[cfg(test)]
+mod go_lower_tests {
+    use super::*;
+    use crate::frontend::vfs::osvfs_fs;
+
+    struct Host(String);
+
+    impl ParseConfigHost for Host {
+        fn fs(&self) -> Rc<dyn Fs> {
+            osvfs_fs()
+        }
+        fn get_current_directory(&self) -> String {
+            self.0.clone()
+        }
+    }
+
+    fn command_line(args: &[&str]) -> ParsedCommandLine {
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        parse_command_line(&args, &Host("/p".to_string()))
+    }
+
+    // Go: `tsgo --noImplİcitReturns` reports TS7030 (the option is on), and
+    // `tsgo -p tsconfig.json --buİld` reports TS6369. Option names used
+    // `strings_to_lower` before the `${configDir}` fix too, so this passed
+    // there: it guards the name lookup (`NameMap::get`), and it fails when
+    // `strings_to_lower` is Rust `to_lowercase` (followups53).
+    #[test]
+    fn option_names_lower_like_go() {
+        let parsed = command_line(&["--noImplİcitReturns"]);
+        assert!(parsed.errors.is_empty());
+        assert_eq!(
+            parsed.compiler_options().no_implicit_returns,
+            Tristate::True
+        );
+        let parsed = command_line(&["-p", "tsconfig.json", "--buİld"]);
+        let codes: Vec<i32> = parsed.errors.iter().map(Diagnostic::code).collect();
+        assert_eq!(codes, [6369]);
+    }
+
+    // Go: base/tsconfig.base.json sets `"outDir": "${confİgDir}/out"`, and
+    // app/tsconfig.json extends it. The value starts with the template
+    // (tsconfigparsing.go:358), so it stays relative until the template
+    // substitution (:1705), which replaces only the exact case and then
+    // makes it absolute from app/: `tsgo --listEmittedFiles` in app/ prints
+    // `TSFILE: <dir>/app/${confİgDir}/out/a.js`.
+    #[test]
+    fn config_dir_template_lowers_like_go() {
+        let dir = std::env::temp_dir().join(format!("goport_go_lower_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("base")).unwrap();
+        std::fs::create_dir_all(dir.join("app")).unwrap();
+        std::fs::write(
+            dir.join("base/tsconfig.base.json"),
+            r#"{ "compilerOptions": { "outDir": "${confİgDir}/out" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("app/tsconfig.json"),
+            r#"{ "extends": "../base/tsconfig.base.json", "files": [] }"#,
+        )
+        .unwrap();
+        let root = normalize_slashes(dir.to_str().unwrap());
+        let host = Host(format!("{root}/app"));
+        let (parsed, errors) =
+            get_parsed_command_line_of_config_file("tsconfig.json", None, None, &host, None);
+        assert!(errors.is_empty());
+        assert_eq!(
+            parsed.unwrap().compiler_options().out_dir,
+            format!("{root}/app/${{confİgDir}}/out")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

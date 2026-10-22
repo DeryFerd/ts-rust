@@ -29,6 +29,9 @@ use crate::gostd::errors;
 /// (`Arc::ptr_eq`). Go sets `closer` after the watch starts, so it sits in a
 /// `Mutex` (`None` is a nil closer).
 pub struct WatchedDir {
+    /// ts#64159: the spelling of the watched directory (the map key is its
+    /// path key).
+    pub dir: String,
     pub closer: Mutex<Option<Box<dyn fswatch::Watch>>>,
     pub recursive: bool,
 }
@@ -42,13 +45,21 @@ impl WatchedDir {
     }
 }
 
-// Go: watchmanager.go:20 dirWatchUpdate
+// Go: watchmanager.go:21 dirWatchUpdate
+// ts#64159: `key` is the path key of `dir`.
+#[derive(Clone)]
 struct DirWatchUpdate {
+    key: String,
     dir: String,
     recursive: bool,
 }
 
-// Go: watchmanager.go:33 WatchManager
+/// Go `CaseSensitivity.PathKey` of a rooted, normalized directory.
+fn path_key(dir: &str, use_case_sensitive_file_names: bool) -> String {
+    tspath::to_path(dir, "", use_case_sensitive_file_names).0
+}
+
+// Go: watchmanager.go:35 WatchManager
 /// WatchManager manages fswatch directory watches, event accumulation,
 /// and DoCycle signaling. It is shared by the CLI watcher and the build
 /// mode orchestrator.
@@ -68,6 +79,8 @@ pub struct WatchManager {
     /// comment).
     pub warn_writer: Writer,
     pub dir_exists: Box<dyn Fn(&str) -> bool>,
+    /// Go `caseSensitivity` (ts#64159): `true` is case-sensitive.
+    pub use_case_sensitive_file_names: bool,
 
     /// PORT: the fields the callback thread shares (see the file comment).
     pub shared: Arc<WatchManagerShared>,
@@ -79,7 +92,8 @@ pub struct WatchManagerShared {
     /// Go `mu`. Go locks it in `Lock` and unlocks it in `Unlock`.
     pub mu: GoMutex,
     /// Go `watchedDirs` (guarded by `mu` in Go; the `Mutex` is Rust's
-    /// data lock, taken only for short reads and writes).
+    /// data lock, taken only for short reads and writes). ts#64159: keyed
+    /// by the path key of the directory.
     pub watched_dirs: Mutex<FxHashMap<String, Arc<WatchedDir>>>,
     /// Go `doCycleCh` (see `DoCycleCh`).
     pub do_cycle_ch: DoCycleCh,
@@ -130,7 +144,8 @@ impl GoMutex {
 /// while the receiver waits hands the value to it and leaves the buffer
 /// empty, so a second send fits before the receiver runs. A std
 /// `sync_channel(1)` keeps the first value in its slot until the receiver
-/// thread runs, and then drops the second send.
+/// thread runs, and then drops the second send. `recv` is the whole
+/// `RunLoop` select, with the `ctx.Done()` case (`wake`).
 #[derive(Default)]
 pub struct DoCycleCh {
     state: Mutex<DoCycleState>,
@@ -139,13 +154,22 @@ pub struct DoCycleCh {
 
 #[derive(Default)]
 struct DoCycleState {
-    /// Values sent and not received yet: one handed to the waiting
-    /// receiver and one in the buffer at most.
-    pending: u8,
-    /// The receiver waits in `recv`.
+    /// A value is in the buffer.
+    buffered: bool,
+    /// The receiver waits in `recv` and no case has reached it yet.
     waiting: bool,
-    /// The context of `run_loop` is done (`wake`): `recv` waits no more.
+    /// The case that reached the waiting receiver first (Go: the send or
+    /// close that wakes a goroutine parked in a select completes that
+    /// select with its own case).
+    handed: Option<DoCycleCase>,
+    /// The context of `run_loop` is done (`wake`).
     woken: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DoCycleCase {
+    Value,
+    Done,
 }
 
 impl DoCycleCh {
@@ -153,39 +177,52 @@ impl DoCycleCh {
     /// value does not fit.
     pub fn try_send(&self) -> bool {
         let mut state = self.state.lock().unwrap();
-        let capacity = if state.waiting { 2 } else { 1 };
-        if state.pending >= capacity {
+        if state.waiting {
+            state.waiting = false;
+            state.handed = Some(DoCycleCase::Value);
+        } else if state.buffered {
             return false;
+        } else {
+            state.buffered = true;
         }
-        state.pending += 1;
         self.cond.notify_one();
         true
     }
 
     /// Go `select { case <-ctx.Done(): ...; case <-ch: ... }` of
-    /// `RunLoop`: waits for a value or for `wake` (the `ctx.Done()` case).
-    /// True when a value came.
+    /// `RunLoop`, where `wake` is the `ctx.Done()` case: waits until a case
+    /// is ready. True when the select takes a value. When both cases are
+    /// ready, it picks one at random, as Go does (`go_select_picks_first`).
+    /// A wait ends with the case that came first.
     pub fn recv(&self) -> bool {
         let mut state = self.state.lock().unwrap();
-        if state.pending == 0 && !state.woken {
+        if !state.buffered && !state.woken {
             state.waiting = true;
             state = self
                 .cond
-                .wait_while(state, |state| state.pending == 0 && !state.woken)
+                .wait_while(state, |state| state.handed.is_none())
                 .unwrap();
-            state.waiting = false;
         }
-        if state.pending == 0 {
+        if let Some(case) = state.handed.take() {
+            return case == DoCycleCase::Value;
+        }
+        if !state.buffered || (state.woken && go_select_picks_first()) {
             return false;
         }
-        state.pending -= 1;
+        state.buffered = false;
         true
     }
 
     /// The `ctx.Done()` case of the `RunLoop` select: ends the wait in
-    /// `recv`, and each later one until `reset_wake`.
+    /// `recv`, and makes the case ready for each later one until
+    /// `reset_wake`.
     pub fn wake(&self) {
-        self.state.lock().unwrap().woken = true;
+        let mut state = self.state.lock().unwrap();
+        state.woken = true;
+        if state.waiting {
+            state.waiting = false;
+            state.handed = Some(DoCycleCase::Done);
+        }
         self.cond.notify_all();
     }
 
@@ -197,25 +234,33 @@ impl DoCycleCh {
     /// Go `select { case <-ch: return true; default: return false }`.
     #[cfg(test)]
     fn try_recv(&self) -> bool {
-        let mut state = self.state.lock().unwrap();
-        if state.pending == 0 {
-            return false;
-        }
-        state.pending -= 1;
-        true
+        std::mem::take(&mut self.state.lock().unwrap().buffered)
     }
 }
 
-// Go: watchmanager.go:50 NewWatchManager
+/// Go `selectgo` (runtime/select.go) polls the cases of a select in a
+/// random order (`cheaprandn`), so when two cases are ready, each is taken
+/// half the time. True for the first case of `RunLoop`'s select
+/// (`ctx.Done()`).
+fn go_select_picks_first() -> bool {
+    use std::hash::BuildHasher;
+    // `RandomState::new` gives new keys on each call.
+    std::collections::hash_map::RandomState::new().hash_one(()) & 1 == 0
+}
+
+// Go: watchmanager.go:53 NewWatchManager
+// ts#64159: the watches are keyed by path key under `use_case_sensitive_file_names`.
 pub fn new_watch_manager(
     warn_writer: Writer,
     dir_exists: Box<dyn Fn(&str) -> bool>,
+    use_case_sensitive_file_names: bool,
 ) -> WatchManager {
     WatchManager {
         backend: None,
         debug_log: None,
         warn_writer,
         dir_exists,
+        use_case_sensitive_file_names,
         shared: Arc::new(WatchManagerShared {
             mu: GoMutex::default(),
             watched_dirs: Mutex::new(FxHashMap::default()),
@@ -226,17 +271,17 @@ pub fn new_watch_manager(
 }
 
 impl WatchManager {
-    // Go: watchmanager.go:59 WatchManager.SetBackend
+    // Go: watchmanager.go:63 WatchManager.SetBackend
     pub fn set_backend(&mut self, b: Rc<dyn WatchBackend>) {
         self.backend = Some(b);
     }
 
-    // Go: watchmanager.go:61 WatchManager.Backend
+    // Go: watchmanager.go:65 WatchManager.Backend
     pub fn backend(&self) -> Option<Rc<dyn WatchBackend>> {
         self.backend.clone()
     }
 
-    // Go: watchmanager.go:63 WatchManager.EnsureDefaultBackend
+    // Go: watchmanager.go:67 WatchManager.EnsureDefaultBackend
     pub fn ensure_default_backend(&mut self) {
         if self.backend.is_none() {
             let fsw = fswatch::default();
@@ -250,22 +295,22 @@ impl WatchManager {
         }
     }
 
-    // Go: watchmanager.go:73 WatchManager.Lock
+    // Go: watchmanager.go:77 WatchManager.Lock
     pub fn lock(&self) {
         self.shared.mu.lock();
     }
 
-    // Go: watchmanager.go:75 WatchManager.Unlock
+    // Go: watchmanager.go:79 WatchManager.Unlock
     pub fn unlock(&self) {
         self.shared.mu.unlock();
     }
 
-    // Go: watchmanager.go:77 WatchManager.DoCycleCh
+    // Go: watchmanager.go:81 WatchManager.DoCycleCh
     pub fn do_cycle_ch(&self) -> &DoCycleCh {
         &self.shared.do_cycle_ch
     }
 
-    // Go: watchmanager.go:79 WatchManager.DrainEvents
+    // Go: watchmanager.go:83 WatchManager.DrainEvents
     /// PORT: Go returns a nil map when nothing changed; the port returns an
     /// empty map.
     pub fn drain_events(&self) -> (FxHashMap<String, fswatch::EventKind>, bool) {
@@ -277,13 +322,13 @@ impl WatchManager {
         (changed_paths, overflow)
     }
 
-    // Go: watchmanager.go:89 WatchManager.ForceOverflow
+    // Go: watchmanager.go:93 WatchManager.ForceOverflow
     pub fn force_overflow(&self) {
         let mut changed = self.shared.changed_mu.lock().unwrap();
         changed.changed_overflow = true;
     }
 
-    // Go: watchmanager.go:167 WatchManager.CloseAllWatches
+    // Go: watchmanager.go:171 WatchManager.CloseAllWatches
     pub fn close_all_watches(&self) {
         self.shared.mu.lock();
         let closers: Vec<Arc<WatchedDir>> = {
@@ -300,27 +345,27 @@ impl WatchManager {
         }
     }
 
-    // Go: watchmanager.go:180 WatchManager.createDirWatchRequest
+    // Go: watchmanager.go:184 WatchManager.createDirWatchRequest
     fn create_dir_watch_request(
         &self,
-        dir: &str,
+        update: &DirWatchUpdate,
         entry: &Arc<WatchedDir>,
     ) -> WatchDirectoryRequest {
         let shared = self.shared.clone();
         let identity = entry.clone();
-        let cb_dir = dir.to_string();
+        let key = update.key.clone();
         // PORT: the callback runs on the fswatch debouncer thread; it logs
         // to stdout when DebugLog was set when the watch was made (Go reads
         // DebugLog at event time; callers set it before the first watch).
         let debug_log = self.debug_log.is_some();
         WatchDirectoryRequest {
-            dir: dir.to_string(),
+            dir: update.dir.clone(),
             recursive: entry.recursive,
             ignore: Some(Arc::new(should_ignore_watch_path)),
             callback: Arc::new(move |events: Vec<fswatch::Event>, err: Option<GoError>| {
                 if let Some(e) = &err {
                     if errors::is(e, &fswatch::ERR_WATCH_TERMINATED) {
-                        shared.handle_watch_terminated(debug_log, &cb_dir, &identity);
+                        shared.handle_watch_terminated(debug_log, &key, &identity);
                         return;
                     }
                 }
@@ -329,14 +374,22 @@ impl WatchManager {
         }
     }
 
-    // Go: watchmanager.go:195 WatchManager.ResolveDesiredDirs
+    // Go: watchmanager.go:199 WatchManager.ResolveDesiredDirs
     pub fn resolve_desired_dirs(
         &self,
         desired_dirs: &FxHashMap<String, bool>,
     ) -> FxHashMap<String, bool> {
-        let mut resolved: FxHashMap<String, bool> =
+        // ts#64159: ancestors that differ only in case are one watch.
+        let mut resolved_by_path: FxHashMap<String, DirWatchUpdate> =
             FxHashMap::with_capacity_and_hasher(desired_dirs.len(), Default::default());
         for (dir, recursive) in desired_dirs {
+            // ts#64366: Only directories on disk can be watched. The embedded libs (bundled:///libs) exist in the FS but not on disk.
+            if !tspath::is_rooted_disk_path(dir) {
+                if let Some(debug_log) = &self.debug_log {
+                    write_str(debug_log, &format!("[watch] not a disk path: {dir}\n"));
+                }
+                continue;
+            }
             let mut watch_dir = dir.clone();
             let mut watch_recursive = *recursive;
             while !(self.dir_exists)(&watch_dir) {
@@ -347,7 +400,12 @@ impl WatchManager {
                 watch_dir = parent;
                 watch_recursive = false; // ancestor fallbacks are always non-recursive
             }
-            if !(self.dir_exists)(&watch_dir) || !can_watch_directory(&watch_dir) {
+            // ts#64366: CanWatchDirectory only guards against falling back to an ancestor that is too generic to watch
+            // (/, /home, ...). A directory that exists and was asked for is watched at any depth, otherwise a
+            // project that lives near the filesystem root (say /app or /srv/app) would never be watched.
+            if !(self.dir_exists)(&watch_dir)
+                || (watch_dir != *dir && !can_watch_directory(&watch_dir))
+            {
                 if let Some(debug_log) = &self.debug_log {
                     write_str(
                         debug_log,
@@ -364,16 +422,29 @@ impl WatchManager {
                     );
                 }
             }
-            if let Some(existing) = resolved.get(&watch_dir).copied() {
-                resolved.insert(watch_dir, existing || watch_recursive);
+            let key = path_key(&watch_dir, self.use_case_sensitive_file_names);
+            if let Some(existing) = resolved_by_path.get_mut(&key) {
+                existing.recursive = existing.recursive || watch_recursive;
             } else {
-                resolved.insert(watch_dir, watch_recursive);
+                resolved_by_path.insert(
+                    key.clone(),
+                    DirWatchUpdate {
+                        key,
+                        dir: watch_dir,
+                        recursive: watch_recursive,
+                    },
+                );
             }
+        }
+        let mut resolved: FxHashMap<String, bool> =
+            FxHashMap::with_capacity_and_hasher(resolved_by_path.len(), Default::default());
+        for watch in resolved_by_path.into_values() {
+            resolved.insert(watch.dir, watch.recursive);
         }
         resolved
     }
 
-    // Go: watchmanager.go:226 WatchManager.ReconcileWatches
+    // Go: watchmanager.go:246 WatchManager.ReconcileWatches
     // PORT: Go ranges over `wm.watchedDirs` while the callbacks delete
     // entries (Go allows that). The port passes a copy of the map and the
     // callbacks change the live map.
@@ -382,56 +453,71 @@ impl WatchManager {
             return Ok(());
         }
 
+        // ts#64159: the watches are keyed by path key, so a change of case
+        // only does not close and open a watch.
+        let mut desired_by_path: FxHashMap<String, DirWatchUpdate> =
+            FxHashMap::with_capacity_and_hasher(desired_dirs.len(), Default::default());
+        for (dir, recursive) in desired_dirs {
+            let key = path_key(dir, self.use_case_sensitive_file_names);
+            if let Some(existing) = desired_by_path.get_mut(&key) {
+                existing.recursive = existing.recursive || *recursive;
+            } else {
+                desired_by_path.insert(
+                    key.clone(),
+                    DirWatchUpdate {
+                        key,
+                        dir: dir.clone(),
+                        recursive: *recursive,
+                    },
+                );
+            }
+        }
+
         let mut additions: Vec<DirWatchUpdate> = Vec::new();
         let mut changes: Vec<DirWatchUpdate> = Vec::new();
 
         let watched_dirs: FxHashMap<String, Arc<WatchedDir>> =
             self.shared.watched_dirs.lock().unwrap().clone();
-        let mut on_added = |dir: &String, recursive: &bool| {
-            let recursive = *recursive;
-            if let Some(debug_log) = &self.debug_log {
-                write_str(
-                    debug_log,
-                    &format!("[watch] watching directory {dir} (recursive={recursive})\n"),
-                );
-            }
-            additions.push(DirWatchUpdate {
-                dir: dir.clone(),
-                recursive,
-            });
-        };
-        let mut on_removed = |dir: &String, wd: &Arc<WatchedDir>| {
-            if let Some(debug_log) = &self.debug_log {
-                write_str(
-                    debug_log,
-                    &format!("[watch] closing stale dir watch: {dir}\n"),
-                );
-            }
-            wd.close_closer();
-            self.shared.watched_dirs.lock().unwrap().remove(dir);
-        };
-        let mut on_changed = |dir: &String, wd: &Arc<WatchedDir>, recursive: &bool| {
-            let recursive = *recursive;
+        let mut on_added = |_key: &String, desired: &DirWatchUpdate| {
             if let Some(debug_log) = &self.debug_log {
                 write_str(
                     debug_log,
                     &format!(
-                        "[watch] recreating dir watch {dir} (recursive {}→{recursive})\n",
-                        wd.recursive
+                        "[watch] watching directory {} (recursive={})\n",
+                        desired.dir, desired.recursive
+                    ),
+                );
+            }
+            additions.push(desired.clone());
+        };
+        let mut on_removed = |key: &String, wd: &Arc<WatchedDir>| {
+            if let Some(debug_log) = &self.debug_log {
+                write_str(
+                    debug_log,
+                    &format!("[watch] closing stale dir watch: {}\n", wd.dir),
+                );
+            }
+            wd.close_closer();
+            self.shared.watched_dirs.lock().unwrap().remove(key);
+        };
+        let mut on_changed = |key: &String, wd: &Arc<WatchedDir>, desired: &DirWatchUpdate| {
+            if let Some(debug_log) = &self.debug_log {
+                write_str(
+                    debug_log,
+                    &format!(
+                        "[watch] recreating dir watch {} (recursive {}→{})\n",
+                        wd.dir, wd.recursive, desired.recursive
                     ),
                 );
             }
             wd.close_closer();
-            self.shared.watched_dirs.lock().unwrap().remove(dir);
-            changes.push(DirWatchUpdate {
-                dir: dir.clone(),
-                recursive,
-            });
+            self.shared.watched_dirs.lock().unwrap().remove(key);
+            changes.push(desired.clone());
         };
-        core_ls_ext::diff_maps_func::<String, Arc<WatchedDir>, bool>(
+        core_ls_ext::diff_maps_func::<String, Arc<WatchedDir>, DirWatchUpdate>(
             &watched_dirs,
-            desired_dirs,
-            |wd: &Arc<WatchedDir>, recursive: &bool| wd.recursive == *recursive,
+            &desired_by_path,
+            |wd: &Arc<WatchedDir>, desired: &DirWatchUpdate| wd.recursive == desired.recursive,
             Some(&mut on_added),
             Some(&mut on_removed),
             Some(&mut on_changed),
@@ -440,7 +526,7 @@ impl WatchManager {
         self.create_dir_watches(additions)
     }
 
-    // Go: watchmanager.go:264 WatchManager.createDirWatches
+    // Go: watchmanager.go:295 WatchManager.createDirWatches
     fn create_dir_watches(&self, updates: Vec<DirWatchUpdate>) -> Result<(), GoError> {
         if updates.is_empty() {
             return Ok(());
@@ -449,10 +535,11 @@ impl WatchManager {
         let mut entries: Vec<Arc<WatchedDir>> = Vec::with_capacity(updates.len());
         for update in &updates {
             let entry = Arc::new(WatchedDir {
+                dir: update.dir.clone(),
                 closer: Mutex::new(None),
                 recursive: update.recursive,
             });
-            requests.push(self.create_dir_watch_request(&update.dir, &entry));
+            requests.push(self.create_dir_watch_request(update, &entry));
             entries.push(entry);
         }
         let backend = self.backend.as_ref().expect("watchmanager: backend is set");
@@ -469,7 +556,7 @@ impl WatchManager {
                 }
                 let mut watched_dirs = self.shared.watched_dirs.lock().unwrap();
                 for (update, entry) in updates.into_iter().zip(entries) {
-                    watched_dirs.insert(update.dir, entry);
+                    watched_dirs.insert(update.key, entry);
                 }
                 return Ok(());
             }
@@ -490,62 +577,68 @@ impl WatchManager {
         Err(err)
     }
 
-    // Go: watchmanager.go:345 WatchManager.IsPathUnderWatch
-    pub fn is_path_under_watch(&self, path: &str, opts: &tspath::ComparePathsOptions) -> bool {
+    // Go: watchmanager.go:373 WatchManager.IsPathUnderWatch
+    // ts#64159: Go `CaseSensitivity.ContainsPath` on the watched spelling,
+    // under the manager's case sensitivity.
+    pub fn is_path_under_watch(&self, path: &str) -> bool {
         let watched_dirs = self.shared.watched_dirs.lock().unwrap();
-        for dir in watched_dirs.keys() {
-            if tspath::contains_path(dir, path, opts) {
+        for watch in watched_dirs.values() {
+            if tspath::relative_path_within_directory(
+                &watch.dir,
+                path,
+                self.use_case_sensitive_file_names,
+            )
+            .is_some()
+            {
                 return true;
             }
         }
         false
     }
 
-    // Go: watchmanager.go:354 WatchManager.RunLoop
+    // Go: watchmanager.go:382 WatchManager.RunLoop
     // PORT: Go selects on `ctx.Done()` and `doCycleCh`. Here a waker on
-    // `ctx.Done()` ends the wait on the channel (`DoCycleCh::wake`), so a
-    // SIGINT or SIGTERM ends the loop at once, as in Go (a wait with a
-    // 50 ms timeout ended it up to 50 ms later). When both cases are ready
-    // Go picks one at random; the port takes the context. `doCycle` is the
-    // caller's DoCycle method value. After a signal, the cycle waits until
-    // the debouncer has delivered the fire that sent it
-    // (`fswatch::wait_for_fires`), as Go's does: otherwise it can drain a
-    // deleted directory's event before that fire's "watch terminated"
-    // overflow, and then build a second time.
+    // `ctx.Done()` makes that case ready in the channel
+    // (`DoCycleCh::wake`), so a SIGINT or SIGTERM ends a wait at once, as
+    // in Go, and `recv` is the whole select: when both cases are ready it
+    // picks one at random, as Go does. `doCycle` is the caller's DoCycle
+    // method value. After a signal, the cycle waits until the debouncer has
+    // delivered the fire that sent it (`fswatch::wait_for_fires`), as Go's
+    // does: otherwise it can drain a deleted directory's event before that
+    // fire's "watch terminated" overflow, and then build a second time.
     pub fn run_loop(&self, ctx: &Context, do_cycle: &mut dyn FnMut()) {
-        self.shared.do_cycle_ch.reset_wake();
+        let do_cycle_ch = &self.shared.do_cycle_ch;
+        do_cycle_ch.reset_wake();
         let done = ctx.done();
-        // `None`: the context is never done (a nil channel), or it is done
-        // already, which the first check below sees.
-        let waker = done.as_ref().and_then(|done| {
+        // `None` from `register_waker`: the context is done already. A nil
+        // channel (`done` is `None`) is never ready.
+        let waker = done.as_ref().map(|done| {
             let shared = self.shared.clone();
             done.register_waker(move || shared.do_cycle_ch.wake())
         });
-        loop {
-            if ctx.err().is_some() {
-                if let (Some(done), Some(id)) = (&done, waker) {
-                    done.unregister_waker(id);
-                }
-                self.close_all_watches();
-                return;
-            }
-            if self.shared.do_cycle_ch.recv() {
-                fswatch::wait_for_fires();
-                do_cycle();
-            }
+        if let Some(None) = waker {
+            do_cycle_ch.wake();
         }
+        while do_cycle_ch.recv() {
+            fswatch::wait_for_fires();
+            do_cycle();
+        }
+        if let (Some(done), Some(Some(id))) = (&done, waker) {
+            done.unregister_waker(id);
+        }
+        self.close_all_watches();
     }
 }
 
 impl WatchManagerShared {
-    // Go: watchmanager.go:95 WatchManager.signalDoCycle
+    // Go: watchmanager.go:99 WatchManager.signalDoCycle
     pub fn signal_do_cycle(&self) {
         // Signal sent; the DoCycle loop will pick it up. Or a signal is
         // already pending; coalesced.
         let _ = self.do_cycle_ch.try_send();
     }
 
-    // Go: watchmanager.go:104 WatchManager.onWatchEvents
+    // Go: watchmanager.go:108 WatchManager.onWatchEvents
     // PORT: runs on the fswatch callback thread. `debug_log` is whether Go
     // `wm.DebugLog` is non-nil; the text goes to the process stdout, as does
     // the `warnWriter` warning (see the file comment).
@@ -600,20 +693,21 @@ impl WatchManagerShared {
         }
     }
 
-    // Go: watchmanager.go:147 WatchManager.handleWatchTerminated
+    // Go: watchmanager.go:151 WatchManager.handleWatchTerminated
     // PORT: runs on the fswatch callback thread (see onWatchEvents).
-    pub fn handle_watch_terminated(&self, debug_log: bool, dir: &str, identity: &Arc<WatchedDir>) {
+    // ts#64159: `key` is the path key of the watch.
+    pub fn handle_watch_terminated(&self, debug_log: bool, key: &str, identity: &Arc<WatchedDir>) {
         if debug_log {
-            write_stdout(&format!("[watch] watch terminated: {dir}\n"));
+            write_stdout(&format!("[watch] watch terminated: {}\n", identity.dir));
         }
         let mut stale_closer: Option<Arc<WatchedDir>> = None;
         self.mu.lock();
         {
             let mut watched_dirs = self.watched_dirs.lock().unwrap();
-            if let Some(wd) = watched_dirs.get(dir) {
+            if let Some(wd) = watched_dirs.get(key) {
                 if Arc::ptr_eq(wd, identity) {
                     stale_closer = Some(wd.clone());
-                    watched_dirs.remove(dir);
+                    watched_dirs.remove(key);
                 }
             }
         }
@@ -629,7 +723,7 @@ impl WatchManagerShared {
     }
 }
 
-// Go: watchmanager.go:295 DirWatchSet
+// Go: watchmanager.go:326 DirWatchSet
 /// DirWatchSet accumulates the set of directories that should be watched while
 /// answering coverage queries efficiently. A directory is "covered" when it is
 /// already present in the set, or when it is contained within a recursive watch
@@ -642,7 +736,7 @@ pub struct DirWatchSet {
     names: FxHashMap<String, String>,
 }
 
-// Go: watchmanager.go:301 NewDirWatchSet
+// Go: watchmanager.go:331 NewDirWatchSet
 pub fn new_dir_watch_set(opts: tspath::ComparePathsOptions) -> DirWatchSet {
     DirWatchSet {
         opts,
@@ -652,12 +746,13 @@ pub fn new_dir_watch_set(opts: tspath::ComparePathsOptions) -> DirWatchSet {
 }
 
 impl DirWatchSet {
-    // Go: watchmanager.go:309 DirWatchSet.canonical
+    // Go: watchmanager.go:309 DirWatchSet.canonical (at 673a5f17d713;
+    // ts#64159 uses CaseSensitivity.PathKey, watchmanager.go:339 in Set)
     fn canonical(&self, dir: &str) -> String {
-        tspath::get_canonical_file_name(dir, self.opts.use_case_sensitive_file_names)
+        path_key(dir, self.opts.use_case_sensitive_file_names)
     }
 
-    // Go: watchmanager.go:313 DirWatchSet.Set (ts#64210)
+    // Go: watchmanager.go:338 DirWatchSet.Set (ts#64210)
     pub fn set(&mut self, dir: &str, recursive: bool) {
         let original = dir;
         let dir = self.canonical(dir);
@@ -668,7 +763,7 @@ impl DirWatchSet {
         *entry = *entry || recursive;
     }
 
-    // Go: watchmanager.go:322 DirWatchSet.Covered
+    // Go: watchmanager.go:348 DirWatchSet.Covered
     pub fn covered(&self, dir: &str) -> bool {
         let mut dir = self.canonical(dir);
         if self.dirs.contains_key(&dir) {
@@ -684,7 +779,7 @@ impl DirWatchSet {
         false
     }
 
-    // Go: watchmanager.go:337 DirWatchSet.Dirs (ts#64210)
+    // Go: watchmanager.go:365 DirWatchSet.Dirs (ts#64210)
     // PORT: Go ranges over a map; the result is a map, so the order does
     // not matter.
     pub fn dirs(&self) -> FxHashMap<String, bool> {
@@ -711,6 +806,35 @@ fn write_stdout(text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// The longest wait for a step that ends at once when it works. A lost
+    /// send or wake fails the test at this limit and does not hang it.
+    const LIMIT: Duration = Duration::from_secs(20);
+
+    /// Runs `ch.recv()` on a new thread. `recv_timeout(LIMIT)` on the
+    /// result gives what `recv` returned, so a lost send or wake fails the
+    /// test and does not hang it.
+    fn recv_on_thread(ch: &Arc<DoCycleCh>) -> mpsc::Receiver<bool> {
+        let (tx, rx) = mpsc::channel();
+        let receiver = ch.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(receiver.recv());
+        });
+        rx
+    }
+
+    /// `recv_on_thread`, and returns once that `recv` waits.
+    fn waiting_receiver(ch: &Arc<DoCycleCh>) -> mpsc::Receiver<bool> {
+        let rx = recv_on_thread(ch);
+        let end = Instant::now() + LIMIT;
+        while !ch.state.lock().unwrap().waiting {
+            assert!(Instant::now() < end, "the receiver does not wait");
+            std::thread::yield_now();
+        }
+        rx
+    }
 
     // PORT: not in Go. `DoCycleCh` keeps the Go channel rule: without a
     // waiting receiver one value fits; a waiting receiver takes the first
@@ -723,17 +847,11 @@ mod tests {
         assert!(ch.try_recv());
         assert!(!ch.try_recv());
 
-        let receiver = {
-            let ch = ch.clone();
-            std::thread::spawn(move || ch.recv())
-        };
-        while !ch.state.lock().unwrap().waiting {
-            std::thread::yield_now();
-        }
+        let receiver = waiting_receiver(&ch);
         assert!(ch.try_send());
         assert!(ch.try_send());
         assert!(!ch.try_send());
-        assert!(receiver.join().unwrap());
+        assert_eq!(receiver.recv_timeout(LIMIT), Ok(true));
         assert!(ch.try_recv());
         assert!(!ch.try_recv());
     }
@@ -743,19 +861,53 @@ mod tests {
     #[test]
     fn do_cycle_ch_wake_ends_the_wait() {
         let ch = Arc::new(DoCycleCh::default());
-        let receiver = {
-            let ch = ch.clone();
-            std::thread::spawn(move || ch.recv())
-        };
-        while !ch.state.lock().unwrap().waiting {
-            std::thread::yield_now();
-        }
+        let receiver = waiting_receiver(&ch);
         ch.wake();
-        assert!(!receiver.join().unwrap());
-        assert!(!ch.recv());
+        assert_eq!(receiver.recv_timeout(LIMIT), Ok(false));
+        assert_eq!(recv_on_thread(&ch).recv_timeout(LIMIT), Ok(false));
         ch.reset_wake();
         assert!(ch.try_send());
-        assert!(ch.recv());
+        assert_eq!(recv_on_thread(&ch).recv_timeout(LIMIT), Ok(true));
+    }
+
+    // Go `selectgo` (runtime/select.go) polls the ready cases in a random
+    // order. With a value and the context both ready, `recv` takes each
+    // about half the time: in 200 tries each comes 60 to 140 times (more
+    // than 5 standard deviations from 100).
+    #[test]
+    fn do_cycle_ch_picks_a_ready_case_at_random() {
+        let ch = DoCycleCh::default();
+        ch.wake();
+        let mut values = 0;
+        for _ in 0..200 {
+            ch.try_send();
+            if ch.recv() {
+                values += 1;
+            }
+        }
+        assert!((60..=140).contains(&values), "{values} values of 200");
+    }
+
+    // In Go, the send or close that finds the receiver parked in the
+    // select completes the select with its own case. The other case that
+    // comes before the receiver runs does not change it: a send stays in
+    // the buffer.
+    #[test]
+    fn do_cycle_ch_wait_ends_with_the_case_that_came_first() {
+        let ch = Arc::new(DoCycleCh::default());
+        let receiver = waiting_receiver(&ch);
+        assert!(ch.try_send());
+        ch.wake();
+        assert_eq!(receiver.recv_timeout(LIMIT), Ok(true));
+        assert!(!ch.try_recv());
+
+        ch.reset_wake();
+        let receiver = waiting_receiver(&ch);
+        ch.wake();
+        assert!(ch.try_send());
+        assert!(!ch.try_send());
+        assert_eq!(receiver.recv_timeout(LIMIT), Ok(false));
+        assert!(ch.try_recv());
     }
 
     // PORT: not in Go. A cancel ends a waiting `run_loop` at once, as Go's
@@ -768,6 +920,7 @@ mod tests {
         let wm = new_watch_manager(
             std::rc::Rc::new(std::cell::RefCell::new(Vec::<u8>::new())),
             Box::new(|_| false),
+            true,
         );
         let mut took = Vec::new();
         for _ in 0..20 {

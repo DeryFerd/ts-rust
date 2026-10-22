@@ -181,7 +181,36 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:4373 tryParseParenthesizedArrowFunctionExpression
+    // PERF: parsefast2. isParenthesizedArrowFunctionExpression is False at
+    // once for any token but `(`, `<`, `async` and `=>`, which is nearly
+    // every expression. That test is inline; the rest is out of line.
+    #[inline]
     pub fn try_parse_parenthesized_arrow_function_expression(
+        &mut self,
+        allow_return_type_in_arrow_function: bool,
+    ) -> Node {
+        if !matches!(
+            self.token,
+            SyntaxKind::OpenParenToken
+                | SyntaxKind::LessThanToken
+                | SyntaxKind::AsyncKeyword
+                | SyntaxKind::EqualsGreaterThanToken
+        ) {
+            debug_assert_eq!(
+                self.is_parenthesized_arrow_function_expression(),
+                Tristate::False
+            );
+            return Node::NIL;
+        }
+        self.try_parse_parenthesized_arrow_function_expression_at_start(
+            allow_return_type_in_arrow_function,
+        )
+    }
+
+    /// `try_parse_parenthesized_arrow_function_expression` at a token that
+    /// can start one.
+    #[inline(never)]
+    fn try_parse_parenthesized_arrow_function_expression_at_start(
         &mut self,
         allow_return_type_in_arrow_function: bool,
     ) -> Node {
@@ -525,7 +554,29 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:4605 parseConditionalExpressionRest
+    // PERF: parsefast2. Most expressions are not conditional: the test of
+    // the token is inline (parseOptionalToken takes nothing at another
+    // token), and the rest is out of line.
+    #[inline]
     pub fn parse_conditional_expression_rest(
+        &mut self,
+        left_operand: Node,
+        pos: i32,
+        allow_return_type_in_arrow_function: bool,
+    ) -> Node {
+        if self.token != SyntaxKind::QuestionToken {
+            return left_operand;
+        }
+        self.parse_conditional_expression_rest_at_question(
+            left_operand,
+            pos,
+            allow_return_type_in_arrow_function,
+        )
+    }
+
+    /// `parse_conditional_expression_rest` at a `?` token.
+    #[inline(never)]
+    fn parse_conditional_expression_rest_at_question(
         &mut self,
         left_operand: Node,
         pos: i32,
@@ -1405,7 +1456,7 @@ impl<'a> Parser<'a> {
         self.finish_node(node, pos)
     }
 
-    // Go: parser.go:5201 parseLeftHandSideExpressionOrHigher
+    // Go: parser.go:5222 parseLeftHandSideExpressionOrHigher
     pub fn parse_left_hand_side_expression_or_higher(&mut self) -> Node {
         // Original Ecma:
         // LeftHandSideExpression: See 11.2
@@ -1453,12 +1504,12 @@ impl<'a> Parser<'a> {
                 // This is an 'import.*' metaproperty (i.e. 'import.meta')
                 self.next_token(); // advance past the 'import'
                 self.next_token(); // advance past the dot
-                let name = self.parse_identifier_name();
+                let name = self.parse_import_meta_property_name();
                 let node = self
                     .factory
                     .new_meta_property(SyntaxKind::ImportKeyword, name);
                 expression = self.finish_node(node, pos);
-                if expression.text() == "defer" {
+                if is_import_phase_meta_property(expression) {
                     if self.token == SyntaxKind::OpenParenToken
                         || self.token == SyntaxKind::LessThanToken
                     {
@@ -1483,9 +1534,24 @@ impl<'a> Parser<'a> {
         self.parse_call_expression_rest(pos, expression)
     }
 
-    // Go: parser.go:5270 nextTokenIsDot
+    // Go: parser.go:5291 nextTokenIsDot
     pub fn next_token_is_dot(&mut self) -> bool {
         self.next_token() == SyntaxKind::DotToken
+    }
+
+    // Go: parser.go:5295 parseImportMetaPropertyName (ts#63915)
+    pub fn parse_import_meta_property_name(&mut self) -> Node {
+        if matches!(
+            self.token,
+            SyntaxKind::DeferKeyword | SyntaxKind::SourceKeyword
+        ) && self.current_import_phase_modifier() == SyntaxKind::Unknown
+        {
+            self.parse_error_at_current_token(
+                diag::Keywords_cannot_contain_escape_characters,
+                args![],
+            );
+        }
+        self.parse_identifier_name()
     }
 
     // Go: parser.go:5274 parseSuperExpression
@@ -1545,6 +1611,11 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:5301 tryParseTypeArgumentsInExpression
+    // PERF: parsefast2. The member and call expression loops call this for
+    // nearly every expression, and nearly every call returns at the first
+    // test. The test is inline and the speculative parse is out of line, so
+    // that return does not pay for the large frame of the parse.
+    #[inline]
     pub fn try_parse_type_arguments_in_expression(&mut self) -> NodeList {
         // TypeArguments must not be parsed in JavaScript files to avoid ambiguity with binary operators.
         // Check the cheap preconditions before saving the parser state: unless the current token is `<`
@@ -1556,6 +1627,13 @@ impl<'a> Parser<'a> {
         {
             return NodeList::NIL;
         }
+        self.try_parse_type_arguments_in_expression_at_less_than()
+    }
+
+    /// The part of `try_parse_type_arguments_in_expression` after its first
+    /// test.
+    #[inline(never)]
+    fn try_parse_type_arguments_in_expression_at_less_than(&mut self) -> NodeList {
         let state = self.mark();
         if self.re_scan_less_than_token() == SyntaxKind::LessThanToken {
             self.next_token();
@@ -1763,8 +1841,12 @@ impl<'a> Parser<'a> {
             true, /*allowPrivateIdentifiers*/
             true, /*allowUnicodeEscapeSequenceInIdentifierName*/
         );
-        let is_optional_chain =
-            question_dot_token.is_some() || self.try_reparse_optional_chain(expression);
+        // PERF: parsefast2. One store read for the Go reads of
+        // `expression.Flags` and `expression.Kind` below. The kind of a node
+        // does not change.
+        let (expression_kind, expression_flags) = parsed_kind_and_flags(expression);
+        let is_optional_chain = question_dot_token.is_some()
+            || self.try_reparse_optional_chain_of(expression, expression_kind, expression_flags);
         let property_access = self.factory.new_property_access_expression(
             expression,
             question_dot_token,
@@ -1783,7 +1865,7 @@ impl<'a> Parser<'a> {
                 args![],
             );
         }
-        if is_expression_with_type_arguments(expression) {
+        if expression_kind == SyntaxKind::ExpressionWithTypeArguments {
             let type_arguments = expression.type_argument_list();
             if type_arguments.is_some() {
                 let loc = TextRange::new(
@@ -1801,12 +1883,26 @@ impl<'a> Parser<'a> {
     }
 
     // Go: parser.go:5473 tryReparseOptionalChain
-    pub fn try_reparse_optional_chain(&mut self, mut node: Node) -> bool {
-        if node.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
+    pub fn try_reparse_optional_chain(&mut self, node: Node) -> bool {
+        let (kind, flags) = parsed_kind_and_flags(node);
+        self.try_reparse_optional_chain_of(node, kind, flags)
+    }
+
+    /// `try_reparse_optional_chain` of `node`, whose Go `Kind` is `kind` and
+    /// `Flags` are `flags`.
+    // PERF: parsefast2. The callers read the kind and flags once
+    // (`parsed_kind_and_flags`) and use the kind again.
+    pub fn try_reparse_optional_chain_of(
+        &mut self,
+        mut node: Node,
+        kind: SyntaxKind,
+        flags: NodeFlags,
+    ) -> bool {
+        if flags.intersects(NodeFlags::OPTIONAL_CHAIN) {
             return true;
         }
         // check for an optional chain in a non-null expression
-        if is_non_null_expression(node) {
+        if kind == SyntaxKind::NonNullExpression {
             let mut expr = node.expression();
             while is_non_null_expression(expr)
                 && !expr.flags().intersects(NodeFlags::OPTIONAL_CHAIN)
@@ -1880,17 +1976,22 @@ impl<'a> Parser<'a> {
                 }
             }
             if type_arguments.is_some() || self.token == SyntaxKind::OpenParenToken {
+                // PERF: parsefast2. One store read for the Go reads of
+                // `expression.Kind` here and `expression.Flags` in
+                // tryReparseOptionalChain. The argument list does not change
+                // the flags of `expression`.
+                let (mut kind, mut flags) = parsed_kind_and_flags(expression);
                 // Absorb type arguments into CallExpression when preceding expression is ExpressionWithTypeArguments
-                if question_dot_token.is_nil()
-                    && expression.kind() == SyntaxKind::ExpressionWithTypeArguments
-                {
+                if question_dot_token.is_nil() && kind == SyntaxKind::ExpressionWithTypeArguments {
                     type_arguments = expression.type_argument_list();
                     expression = expression.expression();
+                    (kind, flags) = parsed_kind_and_flags(expression);
                 }
                 let inner = expression;
                 let argument_list = self.parse_argument_list();
-                let is_optional_chain =
-                    question_dot_token.is_some() || self.try_reparse_optional_chain(expression);
+                debug_assert_eq!(flags, expression.flags());
+                let is_optional_chain = question_dot_token.is_some()
+                    || self.try_reparse_optional_chain_of(expression, kind, flags);
                 let node = self.factory.new_call_expression(
                     expression,
                     question_dot_token,
@@ -1904,7 +2005,19 @@ impl<'a> Parser<'a> {
                 );
                 let node = self.finish_node(node, pos);
                 expression = self.check_js_syntax(node);
-                self.unparse_expression_with_type_arguments(inner, type_arguments, expression);
+                // PERF: parsefast2. Go runs unparseExpressionWithTypeArguments
+                // here. `inner` and the type arguments are children of the
+                // call, so `finish_node` (overrideParentInImmediateChildren)
+                // already set their parents to it, and the Go writes keep
+                // them. Each write is a store access here, so it is skipped.
+                debug_assert!(
+                    inner.parent() == expression
+                        && (type_arguments.is_nil()
+                            || type_arguments
+                                .nodes()
+                                .iter()
+                                .all(|a| a.parent() == expression))
+                );
                 continue;
             }
             if question_dot_token.is_some() {

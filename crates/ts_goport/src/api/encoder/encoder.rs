@@ -544,6 +544,18 @@ pub fn source_file_hash(source_file: Node) -> String {
     format!("{:016x}{:016x}", h.hi, h.lo)
 }
 
+/// Go `SourceFileHash(sourceFile)` of the file of a parse record that the
+/// caller holds (a lease, ts#64518). A lease's file can be in no program, so
+/// the hash comes from the record, as `encode_parsed_source_file` reads it.
+pub fn parsed_source_file_hash(parsed: &ParsedSourceFile) -> String {
+    let h = if parsed.hash.get().is_some() {
+        parse_cache_hash(parsed)
+    } else {
+        source_file_content_hash(parsed.root)
+    };
+    format!("{:016x}{:016x}", h.hi, h.lo)
+}
+
 // Go: api/encoder/encoder.go:318 encodeParseOptions
 /// encodeParseOptions encodes the per-file ExternalModuleIndicatorOptions as a uint32 bitmask.
 fn encode_parse_options(opts: ExternalModuleIndicatorOptions) -> u32 {
@@ -740,6 +752,13 @@ fn encode_source_file_of(
 pub fn set_source_file_lease(data: &mut [u8], lease: u64) {
     data[HEADER_OFFSET_SOURCE_FILE_LEASE..HEADER_OFFSET_SOURCE_FILE_LEASE + 8]
         .copy_from_slice(&lease.to_le_bytes());
+}
+
+// Go: api/encoder/encoder.go:439 SetSourceFileID (ts#64518)
+/// SetSourceFileID sets the source file node ID used to validate remote references.
+pub fn set_source_file_id(data: &mut [u8], id: u64) {
+    data[HEADER_OFFSET_SOURCE_FILE_ID..HEADER_OFFSET_SOURCE_FILE_ID + 8]
+        .copy_from_slice(&id.to_le_bytes());
 }
 
 // Go: api/encoder/encoder.go:442 EncodeNode
@@ -1110,7 +1129,7 @@ fn store_node_data<'f>(
     node: Node,
     kind: SyntaxKind,
     fast: Option<&StoreFile<'f>>,
-) -> Option<&'f NodeData> {
+) -> Option<NodeData<'f>> {
     let fast = fast?;
     if node.file_index() != fast.file || !walks_node_data(kind) {
         return None;
@@ -1181,7 +1200,7 @@ fn encode_visit(node: Node, visitor: &mut EncodeVisitor<'_>, fast: Option<&Store
     st.parent_index = current_index;
     match (data_node, fast) {
         (Some(data), Some(fast)) => {
-            let mask = encode_store_children(kind, data, visitor, fast);
+            let mask = encode_store_children(node, kind, data, visitor, fast);
             if data_word & NODE_DATA_TYPE_MASK == NODE_DATA_TYPE_CHILDREN {
                 // The low byte of the data word (`NODE_DATA_CHILD_MASK`).
                 visitor.ctx.nodes[current_index as usize * NODE_SIZE + NODE_OFFSET_DATA] |= mask;
@@ -1210,7 +1229,7 @@ fn encode_visit(node: Node, visitor: &mut EncodeVisitor<'_>, fast: Option<&Store
 fn store_node_data_word(
     node: Node,
     kind: SyntaxKind,
-    data: &NodeData,
+    data: NodeData<'_>,
     pos: i32,
     end: i32,
     st: &mut EncodeTreeState,
@@ -1299,7 +1318,7 @@ fn encode_each_child(node: Node, visitor: &mut EncodeVisitor<'_>, fast: Option<&
     let kind = node.kind();
     match (store_node_data(node, kind, fast), fast) {
         (Some(data), Some(fast)) => {
-            encode_store_children(kind, data, visitor, fast);
+            encode_store_children(node, kind, data, visitor, fast);
         }
         _ => {
             visitor.visit_each_child(node);
@@ -1315,8 +1334,9 @@ fn encode_each_child(node: Node, visitor: &mut EncodeVisitor<'_>, fast: Option<&
 /// modifier list that is not empty, Go `hasModifiers`). `FullSignature` has
 /// no bit.
 fn encode_store_children(
+    node: Node,
     kind: SyntaxKind,
-    data: &NodeData,
+    data: NodeData<'_>,
     visitor: &mut EncodeVisitor<'_>,
     fast: &StoreFile<'_>,
 ) -> u8 {
@@ -1329,7 +1349,7 @@ fn encode_store_children(
         }
         bit += 1;
     };
-    for_each_child_field(kind, fast.file, data, |child| match child {
+    for_each_child_field(kind, node, data, |child| match child {
         // Go `v.visitNode(child)`.
         ChildField::Node(child) => {
             field(child.is_some());
@@ -1345,16 +1365,16 @@ fn encode_store_children(
         // Go `v.visitNodes(list)`: the VisitNodes hook.
         ChildField::List(list) => {
             field(list.is_some());
-            if let Some(list) = list {
+            if list.is_some() {
                 encode_store_list(list, visitor, fast);
             }
         }
         // Go `v.visitModifiers(modifiers)`: the VisitModifiers hook.
         ChildField::Modifiers(modifiers) => {
-            let modifiers = modifiers.filter(|modifiers| !modifiers.list.nodes.is_empty());
-            field(modifiers.is_some());
-            if let Some(modifiers) = modifiers {
-                encode_store_list(&modifiers.list, visitor, fast);
+            let present = modifiers.is_some() && !modifiers.nodes().is_empty();
+            field(present);
+            if present {
+                encode_store_list(modifiers.node_list(), visitor, fast);
             }
         }
         ChildField::Ids(_) => unreachable!("a SyntaxList or a JSDoc node takes the visitor"),
@@ -1395,32 +1415,20 @@ fn encode_visit_nodes(
 
 /// `encode_visit_nodes` for a non-nil list of the node data of store file
 /// `fast`.
-fn encode_store_list(
-    list: &crate::astdata::NodeList,
-    visitor: &mut EncodeVisitor<'_>,
-    fast: &StoreFile<'_>,
-) {
-    let file = fast.file;
+fn encode_store_list(list: NodeList, visitor: &mut EncodeVisitor<'_>, fast: &StoreFile<'_>) {
     // Go `NodeList.Loc` and `HasTrailingComma` (the last node ends before
     // the list).
-    let (pos, end) = (list.range.start.get() as i32, list.range.end.get() as i32);
-    let has_trailing_comma = list
-        .nodes
-        .last()
-        .is_some_and(|&last| Node::new(file, last).end() < end);
-    let current_index = begin_node_list(
-        &mut visitor.ctx,
-        pos,
-        end,
-        list.nodes.len(),
-        has_trailing_comma,
-    );
+    let (pos, end) = (list.pos(), list.end());
+    let nodes = list.nodes();
+    let has_trailing_comma = nodes.last().is_some_and(|last| last.end() < end);
+    let current_index =
+        begin_node_list(&mut visitor.ctx, pos, end, nodes.len(), has_trailing_comma);
     let save_parent_index = visitor.ctx.parent_index;
     visitor.ctx.prev_index = 0;
     visitor.ctx.parent_index = current_index;
     // Go `visitor.VisitSlice(nodeList.Nodes)`.
-    for &id in &list.nodes {
-        encode_visit(Node::new(file, id), visitor, Some(fast));
+    for child in nodes {
+        encode_visit(child, visitor, Some(fast));
     }
     visitor.ctx.prev_index = current_index;
     visitor.ctx.parent_index = save_parent_index;

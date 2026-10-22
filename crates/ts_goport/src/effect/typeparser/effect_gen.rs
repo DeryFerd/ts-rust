@@ -39,7 +39,7 @@ impl TypeParser<'_> {
             let gen_fn = body_arg;
 
             let expr = call.expression();
-            if expr.is_nil() || !self.is_node_reference_to_effect_module_api(expr, "gen") {
+            if expr.is_nil() || !self.is_node_reference_to_effect_module_api(expr, member!("gen")) {
                 break 'compute None;
             }
 

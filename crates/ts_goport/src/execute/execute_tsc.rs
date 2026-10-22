@@ -175,6 +175,18 @@ fn stop_tracing(sys: &dyn System) {
     }
 }
 
+/// True when `arg`, the first command-line argument, starts build mode:
+/// `-b`, `--b`, `-build` or `--build` in any case.
+// Go: execute/tsc.go:55 `switch strings.ToLower(commandLineArgs[0]) { case "-b", "--b", "-build", "--build":`
+// PORT: Go `strings.ToLower` maps each rune with `unicode.ToLower`, so
+// `-buİld` (U+0130) is build mode, and the build parser finds the option
+// (tsoptions `NameMap`). Rust `str::to_lowercase` maps U+0130 to two chars.
+#[must_use]
+pub fn is_build_flag(arg: &str) -> bool {
+    let lower = crate::frontend::tsoptions::decls::strings_to_lower(arg);
+    matches!(lower.as_str(), "-b" | "--b" | "-build" | "--build")
+}
+
 // Go: execute/tsc.go:53 CommandLine
 // PORT: Go parses the build command line here and passes it on; the port
 // passes the arguments, because `goport_build` calls
@@ -189,17 +201,15 @@ pub fn command_line(
     // Effect-TS/tsgo patch 009: Effect rules know they run under tsc.
     let _effect_cli_mode = crate::effect::etscore::enter_command_line_mode();
     if let Some(first) = command_line_args.first() {
-        match first.to_lowercase().as_str() {
-            "-b" | "--b" | "-build" | "--build" => {
-                if !hooks.build_mode() {
-                    unported!("tscBuildCompilation");
-                }
-                return tsc_build_compilation(ctx, sys, command_line_args, hooks.testing());
+        // Go: switch strings.ToLower(commandLineArgs[0])
+        if is_build_flag(first) {
+            if !hooks.build_mode() {
+                unported!("tscBuildCompilation");
             }
-            // case "-f":
-            // 	return fmtMain(sys, commandLineArgs[1], commandLineArgs[1])
-            _ => {}
+            return tsc_build_compilation(ctx, sys, command_line_args, hooks.testing());
         }
+        // case "-f":
+        // 	return fmtMain(sys, commandLineArgs[1], commandLineArgs[1])
     }
 
     let mut parsed = parse_command_line(command_line_args, &SystemParseConfigHost(&*sys));
@@ -211,7 +221,7 @@ pub fn command_line(
 // PORT: not ported. Its only call (the `-f` case in `CommandLine`) is
 // commented out in Go, so it is dead code, and the formatter is not ported.
 
-// Go: execute/tsc.go:91 tscBuildCompilation
+// Go: execute/tsc.go:92 tscBuildCompilation
 // PORT: Go `CommandLine` parses the build command line and passes it in;
 // here it is the first step, which runs in the same order.
 // `command_line_args` is the full command line (Go `commandLineArgs`).
@@ -277,7 +287,7 @@ pub fn tsc_build_compilation(
     orchestrator.start_exported(ctx)
 }
 
-// Go: execute/tsc.go:122 tscCompilation
+// Go: execute/tsc.go:123 tscCompilation
 // PORT: `hooks.prepare_compilation` is the bin's step (not in Go).
 pub fn tsc_compilation(
     ctx: &Context,
@@ -533,7 +543,7 @@ pub fn tsc_compilation(
     )
 }
 
-// Go: execute/tsc.go:269 findConfigFile
+// Go: execute/tsc.go:274 findConfigFile
 fn find_config_file(
     search_path: &str,
     file_exists: impl Fn(&str) -> bool,
@@ -552,7 +562,7 @@ fn find_config_file(
     result
 }
 
-// Go: execute/tsc.go:283 getTraceFromSys
+// Go: execute/tsc.go:288 getTraceFromSys
 pub(crate) fn get_trace_from_sys(
     sys: &dyn System,
     locale: crate::locale::Locale,
@@ -604,7 +614,7 @@ fn program_options(host: Rc<dyn CompilerHost>, config: Rc<ParsedCommandLine>) ->
     }
 }
 
-// Go: execute/tsc.go:287 performIncrementalCompilation
+// Go: execute/tsc.go:292 performIncrementalCompilation
 // PORT: the incremental program reads back the installed program. A bin
 // that replaces the program (`TscCompilationHooks::program_like`) skips
 // `incremental.ReadBuildInfoProgram` and `incremental.NewProgram`: `goport`
@@ -636,7 +646,7 @@ fn perform_incremental_compilation(
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
     let sys: &dyn System = &**sys_rc;
-    start_lib_prefetch(sys, &config, testing.is_some());
+    start_lib_prefetch(sys, &config, testing.is_some(), true);
     let content_mapper_host = new_content_mapper_host(ctx, sys_rc, config.compiler_options());
     let content_mapper_project = get_content_mapper_project(content_mapper_host.as_ref(), &config);
     let _close_content_mapper_project = CloseContentMapperProject(content_mapper_project.clone());
@@ -726,7 +736,7 @@ fn perform_incremental_compilation(
     result(emit_result.status)
 }
 
-// Go: execute/tsc.go:345 performCompilation
+// Go: execute/tsc.go:356 performCompilation
 // PORT: `sys_rc` is the `Rc` so that the content mapper host can keep
 // `sys` as its spawner. The body uses `sys: &dyn System`.
 fn perform_compilation(
@@ -741,7 +751,7 @@ fn perform_compilation(
     hooks: &dyn TscCompilationHooks,
 ) -> CommandLineResult {
     let sys: &dyn System = &**sys_rc;
-    start_lib_prefetch(sys, &config, testing.is_some());
+    start_lib_prefetch(sys, &config, testing.is_some(), true);
     let content_mapper_host = new_content_mapper_host(ctx, sys_rc, config.compiler_options());
     let content_mapper_project = get_content_mapper_project(content_mapper_host.as_ref(), &config);
     let _close_content_mapper_project = CloseContentMapperProject(content_mapper_project.clone());
@@ -788,12 +798,18 @@ fn perform_compilation(
 
 /// Starts the parse of the default lib files of `config` on the parse
 /// workers, before the compiler host, the build info read and the loader
-/// setup (`start_default_lib_prefetch`). The program loaded next on this
-/// thread takes the parses; its loader checks each one. `tsc -b` calls it
-/// too (`BuildTask::compile_and_emit_start`).
+/// setup (`start_default_lib_prefetch`), and with `roots` the parse of its
+/// root files. The program loaded next on this thread takes the parses; its
+/// loader checks each one. `tsc -b` calls it too, without `roots`: its host
+/// has a stat cache (`BuildTask::compile_and_emit_start`).
 // PORT: not in Go (see `start_default_lib_prefetch`). A test run
 // (`testing`) keeps the Go order.
-pub(crate) fn start_lib_prefetch(sys: &dyn System, config: &ParsedCommandLine, testing: bool) {
+pub(crate) fn start_lib_prefetch(
+    sys: &dyn System,
+    config: &ParsedCommandLine,
+    testing: bool,
+    roots: bool,
+) {
     if testing {
         return;
     }
@@ -802,6 +818,7 @@ pub(crate) fn start_lib_prefetch(sys: &dyn System, config: &ParsedCommandLine, t
         &sys.get_current_directory(),
         sys.fs().use_case_sensitive_file_names(),
         &sys.default_library_path(),
+        roots,
     );
 }
 
@@ -817,7 +834,7 @@ impl Drop for CloseContentMapperProject {
     }
 }
 
-// Go: execute/tsc.go:394 getContentMapperProject (tsgo#4712)
+// Go: execute/tsc.go:411 getContentMapperProject (tsgo#4712)
 fn get_content_mapper_project(
     host: Option<&Rc<dyn ContentMapperHost>>,
     config: &ParsedCommandLine,
@@ -833,7 +850,7 @@ fn get_content_mapper_project(
     })
 }
 
-// Go: execute/tsc.go:405 showConfig
+// Go: execute/tsc.go:422 showConfig
 fn show_config(sys: &dyn System, config: &ParsedCommandLine, config_file_name: &str) {
     let ts_config = convert_to_ts_config(config, config_file_name);
     let writer = sys.writer();
@@ -843,12 +860,12 @@ fn show_config(sys: &dyn System, config: &ParsedCommandLine, config_file_name: &
 }
 
 // PORT: added for `GoTsc`. Go passes no `WriteFile`, so `emitHost.WriteFile`
-// (compiler/emitHost.go:120) writes through `program.Host().FS()`
+// (compiler/emitHost.go:126) writes through `program.Host().FS()`
 // (cachedvfs over bundled over osvfs). The port's emit host refuses a
 // write without a callback (program.rs emitHost `write_file`), and emit
 // runs on the checker threads, so the callback must be `Send` and cannot
 // hold the `Rc` file system. Both wrappers pass a write of a real path to
-// osvfs (cachedvfs.go:144 WriteFile), so this writes with the osvfs of the
+// osvfs (cachedvfs.go:145 WriteFile), so this writes with the osvfs of the
 // calling thread, like `new_task_write_file` in build/build_task.rs without
 // the build info tracking. There is no outDir or input guard: tsgo writes
 // next to the sources or into outDir, as Go does.
@@ -860,4 +877,22 @@ pub(crate) fn os_write_file() -> WriteFile {
                 .map_err(|err| fs_error_text(&err))
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_build_flag;
+
+    /// Go `strings.ToLower` of the first argument (execute/tsc.go:55).
+    #[test]
+    fn build_flag_spellings_are_go_s() {
+        for arg in [
+            "-b", "--b", "-build", "--build", "-B", "--B", "-Build", "--BUILD", "-buİld",
+        ] {
+            assert!(is_build_flag(arg), "{arg}");
+        }
+        for arg in ["", "b", "build", "---b", "-bu", "--fast", "-b ", "--builds"] {
+            assert!(!is_build_flag(arg), "{arg}");
+        }
+    }
 }

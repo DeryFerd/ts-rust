@@ -27,6 +27,14 @@ impl TextWriter {
     // Go: printer/textwriter.go:97 updateLineCountAndPosFor
     // `s` is the text that the caller just pushed to `builder`.
     fn update_line_count_and_pos_for(&mut self, s: &str) {
+        // PERF: printfast1. Most writes are short ASCII texts with no line
+        // break (a name, a keyword, a punctuation). One pass over their
+        // bytes finds that case without the `memchr` setup and the second
+        // ASCII pass. A line break in ASCII is `\n` or `\r`.
+        if s.len() <= 32 && s.bytes().all(|b| b.is_ascii() && b != b'\n' && b != b'\r') {
+            self.line_start = false;
+            return;
+        }
         // PORT: Go counts the values of `core.ComputeECMALineStartsSeq(s)`
         // and keeps the last one. `scan_line_breaks` gives the same count
         // (minus 1) and last value in one scan with no Vec.

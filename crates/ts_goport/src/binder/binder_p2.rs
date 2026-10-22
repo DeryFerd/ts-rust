@@ -1,12 +1,13 @@
 //! Go `binder/binder.go` lines 911-1816 (bindFunctionExpression .. bindIterativeStatement).
 //!
 //! PORT: Go writes binder results straight onto AST nodes and the `SourceFile`.
-//! Our AST is read-only while binding, so this file assumes these `Binder`
-//! fields (defined in binder_p1.rs) hold the per-file results until
-//! `bind_source_file` stores them in the `GoFile` OnceCells:
-//! - `node_bind: NodeBindBuilder` indexed by `NodeId::index()` of `self.file` nodes
-//!   (Go `node.Symbol`, `node.Locals`, `FlowNodeData().FlowNode`, `EndFlowNode`, and
-//!   the binder-added bits of `node.Flags` in `added_flags`).
+//! This file reads and writes them through these `Binder` fields (defined in
+//! binder_p1.rs) until `bind_source_file` stores the rest in the `GoFile`
+//! OnceCells:
+//! - `node_bind: NodeBindRecords`, indexed by `NodeId::index()` of `self.file`
+//!   nodes: Go `node.Symbol`, `node.Flags` and `FlowNodeData().FlowNode` in the
+//!   node records, `node.Locals`, `EndFlowNode` and the other fields in its
+//!   extras (`node_symbol`, `node_locals`, `add_node_flags`, ...).
 //! - `flow_node_arena: Vec<FlowNode>` indexed by `FlowNodeId::local_index()`.
 //! - `symbol_arena` (Go `symbolArena`): the `SymbolArena` (owned or `&mut`).
 //! - `common_js_module_indicator: Node` (Go `file.CommonJSModuleIndicator`, set by the binder).
@@ -18,19 +19,6 @@ use crate::prelude::*;
 // ---------------------------------------------------------------------------
 // Module-private access helpers (not Go functions).
 // ---------------------------------------------------------------------------
-
-/// Binder data for a node of the file being bound (Go reads it from the node).
-fn bound(b: &Binder, node: Node) -> &NodeBindData {
-    debug_assert!(node.is_some(), "nil node dereference");
-    debug_assert_eq!(node.file_index(), b.file.file_index());
-    b.node_bind.get(node.node_id().index())
-}
-
-fn bound_mut(b: &mut Binder, node: Node) -> &mut NodeBindData {
-    debug_assert!(node.is_some(), "nil node dereference");
-    debug_assert_eq!(node.file_index(), b.file.file_index());
-    b.node_bind.get_mut(node.node_id().index())
-}
 
 /// Go `node.Flags` during binding: parser flags plus the flags the binder added so far.
 #[inline]
@@ -187,7 +175,7 @@ impl Binder {
             }
             _ => {}
         }
-        let symbol = bound(self, node).symbol;
+        let symbol = self.node_symbol(node);
         // TypeScript 1.0 spec (April 2014): 8.4
         // Every class automatically contains a static property member named 'prototype', the
         // type of which is an instantiation of the class type with type Any supplied as a type
@@ -297,7 +285,7 @@ impl Binder {
             } else {
                 SymbolFlags::PROPERTY
             };
-            let container_symbol = bound(self, container).symbol;
+            let container_symbol = self.node_symbol(container);
             let exports = binder_get_exports(self, container_symbol);
             let symbol =
                 self.declare_symbol(exports, container_symbol, node, flags, SymbolFlags::NONE);
@@ -419,7 +407,7 @@ impl Binder {
             } else {
                 SymbolFlags::FUNCTION_SCOPED_VARIABLE
             };
-            let container_symbol = bound(self, container).symbol;
+            let container_symbol = self.node_symbol(container);
             let exports = binder_get_exports(self, container_symbol);
             self.declare_symbol(
                 exports,
@@ -454,12 +442,12 @@ pub fn get_initializer_symbol(b: &Binder, symbol: SymbolId) -> SymbolId {
     {
         let initializer = declaration.initializer();
         if is_expando_initializer(declaration, initializer) {
-            return bound(b, initializer).symbol;
+            return b.node_symbol(initializer);
         }
     } else if is_binary_expression(declaration) && is_in_js_file(declaration) {
         let initializer = declaration.right();
         if is_expando_initializer(declaration, initializer) {
-            return bound(b, initializer).symbol;
+            return b.node_symbol(initializer);
         }
     }
     SymbolId::NIL
@@ -531,7 +519,7 @@ impl Binder {
             | SyntaxKind::ClassStaticBlockDeclaration => {
                 // this.property assignment in class member -- bind to the containing class
                 let this_container = self.this_container;
-                class_symbol = bound(self, this_container.parent()).symbol;
+                class_symbol = self.node_symbol(this_container.parent());
                 if is_static(this_container) {
                     symbol_table = binder_get_exports(self, class_symbol);
                 } else {
@@ -562,8 +550,10 @@ impl Binder {
 
     // Go: binder/binder.go:1172 bindVariableDeclarationOrBindingElement
     pub fn bind_variable_declaration_or_binding_element(&mut self, node: Node) {
-        self.check_strict_mode_eval_or_arguments(node, node.name());
+        // PERF: parsefast1 item 2. The name is read once (Go reads the field
+        // twice).
         let name = node.name();
+        self.check_strict_mode_eval_or_arguments(node, name);
         if name.is_some() && !is_binding_pattern(name) {
             if is_variable_declaration_initialized_to_require(node) {
                 self.declare_symbol_and_add_to_symbol_table(
@@ -647,7 +637,7 @@ impl Binder {
                 } else {
                     SymbolFlags::NONE
                 };
-            let class_symbol = bound(self, class_declaration).symbol;
+            let class_symbol = self.node_symbol(class_declaration);
             let members = binder_get_members(self, class_symbol);
             self.declare_symbol(
                 members,
@@ -704,7 +694,7 @@ impl Binder {
         let symbol = self.new_symbol(symbol_flags, name);
         if symbol_flags.intersects(SymbolFlags::ENUM_MEMBER | SymbolFlags::CLASS_MEMBER) {
             let container = self.container;
-            let container_symbol = bound(self, container).symbol;
+            let container_symbol = self.node_symbol(container);
             self.symbols.sym_mut(symbol).parent = container_symbol;
         }
         self.add_declaration_to_symbol(symbol, node, symbol_flags);
@@ -806,7 +796,7 @@ impl Binder {
     pub fn lookup_name(&self, name: &str, container: Node) -> SymbolId {
         // PORT: Go checks `LocalsContainerData() != nil` and `DeclarationData() != nil`; every
         // node has a NodeBindData here, and nodes without that Go data keep nil locals/symbol.
-        let locals = bound(self, container).locals;
+        let locals = self.node_locals(container);
         if locals.is_some() {
             let local = self.symbols.get(locals, name);
             if local.is_some() {
@@ -818,7 +808,7 @@ impl Binder {
                 };
             }
         }
-        let declaration_symbol = bound(self, container).symbol;
+        let declaration_symbol = self.node_symbol(container);
         if declaration_symbol.is_some() {
             let exports = self.symbols.sym(declaration_symbol).exports;
             return self.symbols.get(exports, name);
@@ -1180,34 +1170,30 @@ impl Binder {
             self.seen_this_keyword = false;
             self.bind_children_of_kind(node, kind, None);
             // Reset flags (for incremental scenarios)
-            {
-                let data = bound_mut(self, node);
-                data.added_flags = data
-                    .added_flags
-                    .without(NodeFlags::REACHABILITY_AND_EMIT_FLAGS | NodeFlags::CONTAINS_THIS);
-            }
+            self.remove_node_flags(
+                node,
+                NodeFlags::REACHABILITY_AND_EMIT_FLAGS | NodeFlags::CONTAINS_THIS,
+            );
             if !flow_data(self, self.current_flow)
                 .flags
                 .intersects(FlowFlags::UNREACHABLE)
                 && container_flags.intersects(ContainerFlags::IS_FUNCTION_LIKE)
             {
                 if has_body_data(node) && node_is_present(node.body()) {
-                    let has_explicit_return = self.has_explicit_return;
-                    let current_flow = self.current_flow;
-                    let data = bound_mut(self, node);
-                    data.added_flags |= NodeFlags::HAS_IMPLICIT_RETURN;
-                    if has_explicit_return {
-                        data.added_flags |= NodeFlags::HAS_EXPLICIT_RETURN;
+                    self.add_node_flags(node, NodeFlags::HAS_IMPLICIT_RETURN);
+                    if self.has_explicit_return {
+                        self.add_node_flags(node, NodeFlags::HAS_EXPLICIT_RETURN);
                     }
-                    data.end_flow_node = current_flow;
+                    let current_flow = self.current_flow;
+                    self.set_end_flow_node(node, current_flow);
                 }
             }
             if self.seen_this_keyword {
-                bound_mut(self, node).added_flags |= NodeFlags::CONTAINS_THIS;
+                self.add_node_flags(node, NodeFlags::CONTAINS_THIS);
             }
             if kind == SyntaxKind::SourceFile {
                 let emit_flags = self.emit_flags;
-                bound_mut(self, node).added_flags |= emit_flags;
+                self.add_node_flags(node, emit_flags);
             }
             if self.current_return_target.is_some() {
                 let current_return_target = self.current_return_target;
@@ -1240,12 +1226,10 @@ impl Binder {
             self.seen_this_keyword = false;
             self.bind_children_of_kind(node, kind, None);
             // ContainsThis cannot overlap with HasExtendedUnicodeEscape on Identifier
-            let seen_this_keyword = self.seen_this_keyword;
-            let data = bound_mut(self, node);
-            if seen_this_keyword {
-                data.added_flags |= NodeFlags::CONTAINS_THIS;
+            if self.seen_this_keyword {
+                self.add_node_flags(node, NodeFlags::CONTAINS_THIS);
             } else {
-                data.added_flags = data.added_flags.without(NodeFlags::CONTAINS_THIS);
+                self.remove_node_flags(node, NodeFlags::CONTAINS_THIS);
             }
             self.seen_this_keyword = save_seen_this_keyword;
         } else {
@@ -1273,7 +1257,7 @@ impl Binder {
         if is_source_file(node) && binder_is_external_or_common_js_module(self)
             || is_ambient_module(node)
         {
-            let node_symbol = bound(self, node).symbol;
+            let node_symbol = self.node_symbol(node);
             self.bind_common_js_type_exports(node_symbol);
         }
         self.container = save_container;
@@ -1340,7 +1324,7 @@ impl Binder {
             // is exactly `setFlowNode(node, nil)`.
             self.set_flow_node(node, FlowNodeId::NIL);
             if is_potentially_executable_node(node) {
-                bound_mut(self, node).added_flags |= NodeFlags::UNREACHABLE;
+                self.add_node_flags(node, NodeFlags::UNREACHABLE);
             }
             self.bind_each_child(node);
             self.in_assignment_pattern = save_in_assignment_pattern;

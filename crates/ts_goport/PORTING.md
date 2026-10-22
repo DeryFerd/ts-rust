@@ -179,9 +179,12 @@ Go `t.id` equals the arena index, so Go's per-checker `TypeId` counter order
 is kept. Link stores: `mapped_symbol_links: LinkStore<SymbolId, MappedSymbolLinks>`
 etc. with the Go field names (`value_symbol_links` is a
 `ValueSymbolLinkStore`, whose reads give symbol ids; see Threads). A store
-keeps its values in 64-key pages, so a value over 32 bytes (a compile-time
-check in `LinkStore`), or one that few keys have, goes in a `Box`
-(`type_node_links: LinkStore<Node, Box<TypeNodeLinks>>`).
+keeps its values in 64-key pages. A `LinkStore` page holds a value for each
+key, used or not, so a value over 32 bytes (a compile-time check in
+`LinkStore`) goes in a `Box`. A `SparseLinkStore` page holds only the
+values that its keys have, of any size, so a store whose values few keys
+have uses it (lspage1: `type_node_links: SparseLinkStore<Node,
+TypeNodeLinks>`).
 
 `checker/mapper.rs` defines `TypeMapper` (an enum over the Go mapper kinds)
 and its constructors. Go `m.Map(t)` -> `self.mapper_map(m, t)`,
@@ -202,9 +205,11 @@ new field that few values set goes in the box.
   first write (`rare_mut`). Their accessors (`return_mapper()` and the
   others) give Go's zero values while it is absent. `inferences` is a boxed
   slice: its length never changes.
-- `InferenceInfo` is 32 bytes. Its two candidate lists are in one box
-  (`candidate_lists`) that the first candidate makes. `candidates()` and
-  `contra_candidates()` give Go's nil lists while it is absent.
+- `InferenceInfo` is 32 bytes. Its first candidate is inline
+  (`first_candidate`), and the second moves both into one box of the two
+  candidate lists (`candidate_lists`). `candidates()` and
+  `contra_candidates()` give Go's lists from either, and Go's nil lists
+  while there is no candidate.
 
 ## AST (owned by ast/node.rs, ast/fields.rs, ast/misc.rs, ast/utilities_*)
 
@@ -269,16 +274,19 @@ methods reach the AST through it.
   `pos()`, `end()`, `loc()`, `has_trailing_comma()`, `is_nil()`.
   `ModifierList` has `.nodes()`, `.modifier_flags()`, `is_nil()`.
 - `NodeList`, `ModifierList` and `NodeSlice` are Copy handles defined in
-  `ast/node.rs`. A list of parsed data points at its astdata list (it lives
-  for the process). A list of synthetic data is an index into the thread's
-  synthetic arena (`SyntheticList`), so it is valid only on the thread
-  that made it, like a synthetic `Node`. A list of a store that owns its
-  nodes (a freeable parse, lsshells M3c) is a `StoreList` handle (file,
-  node data cell or pending list, and the id of its selector,
-  `SelectorSite`), read at each use; it is valid on any thread while its
-  file version lives, and its `list_ptr` address can repeat after the
-  version is freed, so keep that address only for keys of one request.
-  Equality is Go pointer equality.
+  `ast/node.rs`. Node data holds a list field as a 4-byte index into the
+  list table of its owner (`astdata::NodeList`, astshrink1); read it with
+  `list_of!` or `data_list`, not in place. A list of a static store points
+  at its `StaticList` (it lives for the process); the parser's list and the
+  same list read from node data are one list, like the Go pointer. A list
+  of synthetic data is an index into the thread's synthetic arena
+  (`SyntheticList`), so it is valid only on the thread that made it, like a
+  synthetic `Node`. A list of a store that owns its nodes (a freeable
+  parse, lsshells M3c) is a `StoreList` handle (file and list table entry),
+  read at each use; it is valid on any thread while its file version lives,
+  and its `list_ptr` address can repeat after the version is freed, so keep
+  that address only for keys of one request. Equality is Go pointer
+  equality.
 - Node factory (`c.factory.NewX`) is unported for now: `unported!("NewX")`.
 - Go `ast.IsX(node)` predicates -> `is_x(n)` free functions.
 - Node data reads are scoped, because a thread owns its synthetic nodes
@@ -305,6 +313,20 @@ methods reach the AST through it.
   files published outside a program) opens `enter_base_synthetic_owner()`
   so they belong to the thread. `GOPORT_SYNTHETIC_OWNERS=0` turns owners
   off.
+- Print scopes (n1free): Go `getNodeBuilder` returns `release`
+  (`Factory.ReleaseArenas`), which the to-string entries of
+  `checker/printer.go` defer. Here those entries open a `PrintScope`
+  (`checker/printer_impl.rs`): the checker's to-string factory
+  (`NodeFactory::set_print_owned`) puts its nodes and lists in the print
+  owner of the thread, and the end of the outermost scope frees them in
+  place (a later read panics), with their emit records, idToSymbol
+  entries, fake scope records and the nil-key serialized types. A store
+  in the serialized type cache under an enclosing declaration pins the
+  call: its nodes go to the current owner. `GOPORT_N1=0` turns print
+  scopes off. Go N' also releases the arenas of the emitter's per-file
+  emit context and of the hover and signature help display builders; the
+  port keeps those nodes with their thread or program version (PORT notes
+  at each site).
 - Store columns and the other registry tables of a published file are read
   through one file lookup, `file_block` in `ast/store.rs` (AST node records
   step 3). Each published file id has one block (`FileBlock`: kinds,
@@ -354,20 +376,32 @@ methods reach the AST through it.
   `TEXT_IS_KEYWORD`, `NO_NODE`) are bits 29 to 31 of `flags`: Go
   `NodeFlags` ends at bit 28. `NodeRecord::flags` masks them, and a parse
   flags write checks that no Go flag is in them (`checked_flags`). The
-  node column (`FileStore::nodes`, `BlockFile`) names a leaked `NodeData`
-  (16 bytes) for each node slot, not a whole `astdata::Node` (astmem1
-  P1): the kind is in the kind column and the header in the record, so no
-  read needs the rest. The node reads (`static_ast_node`,
-  `frozen_store_ast_node`) give `&NodeData`. The words are atomics that the reads load
+  node column (`FileStore::nodes`, `BlockFile`) holds a `NodeData<'static>`
+  for each node slot, not a whole `astdata::Node` (astmem1 P1): the kind
+  is in the kind column and the header in the record, so no read needs
+  the rest. `NodeData<'a>` is a tag and a reference (16 bytes), as Go's
+  `nodeData` interface word; a static parse moves the data struct into the
+  AST arena (`alloc_store_slot`, astchunks2), as Go's typed arenas. Owned
+  versions and synthetic nodes keep the boxed form, `BoxedData` (same
+  tags and layout, so `BoxedData::view` is a copy). The node reads
+  (`static_ast_node`, `frozen_store_ast_node`) give `NodeData<'static>`.
+  The words are atomics that the reads load
   with `Relaxed`. The parse writes them through `get_mut`; after the
-  publish only `BoundFile::install` writes a record (`bind_store_records`:
-  symbol, added flags, `bind`), through a shared ref, before any other
-  thread reads its binder fields. It ORs its bits into `flags`, which
-  `NodeRecord::header` reads, and writes the high half of `up`, whose low
-  half `header` reads; `header` reads each word once, so it never mixes
-  the halves of one word. A live bind hands its builder
-  (`NodeBindBuilder`) to the install; a lib bind snapshot load hands the
-  compact form (`NodeBindParts`), which the lib bind blob keeps.
+  publish only the bind writes a record (symbol, added flags, `bind`),
+  through a shared ref, before any other thread reads its binder fields.
+  It ORs its bits into `flags`, which `NodeRecord::header` reads, and
+  writes the high half of `up`, whose low half `header` reads; `header`
+  reads each word once, so it never mixes the halves of one word. A live
+  bind writes the records while it binds, as Go writes the node
+  (`binder::NodeBindRecords`, `ast::BindRecords`, bindonce2), and keeps the
+  other fields in extras entries that the install moves into the
+  `GoFile`. A bind into a file arena writes its arena's symbol ids, and
+  `BoundFile::remap` moves the records that got a symbol. A bind that is
+  not installed (a panic, or a parallel bind that is dropped) sets the
+  records back on drop (`BindRecords::reset`), so a serial bind of the
+  file finds them as the parse left them. A lib bind snapshot load hands
+  the compact form (`NodeBindParts`), which the lib bind blob keeps, and
+  its install writes the records (`bind_store_records`).
   The kind is a plain `SyntaxKind` column, not a record word (step 4): a
   pooled block takes another file's records through a shared ref, so a
   record word must be an atomic, and safe Rust has no cheap `u16` to
@@ -377,8 +411,15 @@ methods reach the AST through it.
   +1.1%; `SyntaxKind::try_from` is a 351-case switch until late in LLVM's
   pipeline, so the inliner left it or `frozen_store_kind` out of line at
   thousands of call sites (+3% to +7.6%). The column costs 2 bytes per
-  slot, and a node shell leaks its column unless one of the last 4 shells
-  had the same kinds (`shell_kinds`). A new per-slot field of the hot reads goes into a record or kids
+  slot. A node shell has a plain column too, which it leaks
+  (`plain_kinds`): shells with equal kinds share one, and each file gets
+  one. A later version with new kinds gets one only while those of later
+  versions stay in 4 MiB (`LATER_KINDS_BUDGET`, edleak1); past that, its
+  kinds go in an atomic column of its pooled block
+  (`BlockFile::shell_kinds`), read through one cold call
+  (`FileBlock::kind`). Before the budget a long editor session leaked
+  about 0.4 columns per edit; with every shell pooled, a 400-edit
+  query-core session cost +4.2% instructions. A new per-slot field of the hot reads goes into a record or kids
   word, not a new column. Debug builds check the records and kids against
   the node data at freeze (`debug_check_kids`), and each parent write
   against its stored form.
@@ -400,7 +441,8 @@ methods reach the AST through it.
   (`check_block_owner`) in the binder field reads (`frozen_owned_record`:
   the symbol, the flags, the `bind` word with the flow node and the
   extras index, `frozen_store_bind_and_file`, `frozen_store_any_symbol`)
-  and in `bind_store_records`, the one writer of a published record.
+  and in the bind (`bind_records`, `bind_store_records`), the one writer
+  of a published record.
   The check is one load of the nil slot record, a compare and a branch:
   `goport -p` 0.0% to +0.2% instructions, the editor long sessions +0.06%
   to +0.15% (ownercheck1, R147 reviewer option 2; the flags read is about
@@ -408,9 +450,15 @@ methods reach the AST through it.
   name, modifier flags) are not checked in a release build (they are
   about 6 instructions). So a stale read of those gives the values of
   that node while its block waits, and the new owner's data after a
-  reuse, never undefined behavior. Its kind column is never reused, so a
-  stale kind read gives the old kind. Its store, `GoFile`, extras, flow,
-  node data and list reads panic. Every holder of a node of a version
+  reuse, never undefined behavior. A plain kind column is never reused,
+  so a stale kind read gives the old kind. A node shell with no leaked
+  node column and no foreign parents takes the `BlockFile` of its pooled
+  block (edleak1 part 2), and each shell that takes the block sets its
+  facts and root (`node_shell`). So after a reuse a stale read of the
+  pooled kinds (past the budget), of the facts (`block_resolve_slot`,
+  `frozen_store_facts`) or of the root (`frozen_source_file_of_node`)
+  gives the new owner's value too. Reads of the version's store,
+  `GoFile`, extras, flow, node data and lists panic. Every holder of a node of a version
   holds the version, so a correct reader never sees a reuse. No standing
   run has debug assertions: the protected tests run `--release`
   (`build-goport-tests.sh`), and the corpus, editor and oracle runs use
@@ -573,7 +621,7 @@ The batch that adds it is not accepted until Theo approves.
   default in a language server or API process since M3g,
   `GOPORT_OWNED_NODES=0` turns them off) its parse was a freeable parse
   (`enter_freeable_parse`, opened by the parse cache), so its store owns
-  its astdata nodes, pending lists, JSDoc cache and parse diagnostics
+  its astdata nodes, list table, JSDoc cache and parse diagnostics
   (`OwnedAst`), and they are freed with its store, when the version dies
   or after it on a free thread (`FileVersion::take_data`); its node data
   reads are pinned reads, and its lists are `StoreList` handles. Only with
@@ -626,7 +674,25 @@ The batch that adds it is not accepted until Theo approves.
   started projects work at the same time, like Go's goroutines. A
   project's emit starts behind its check when `Program::start_emit`
   allows it, and its writes wait in a buffer
-  (`buffer_early_emit_writes`) until the task finishes. A task finishes
+  (`buffer_early_emit_writes`) until the task finishes. The flush makes
+  each write once, as Go's emit goroutines do, also after a failed write.
+  When one failed, the files emit again from the start state and each
+  write gives the flush's result with no write (`emit_files::Writes`), so
+  the TS5033s, the emitted files, the d.ts signatures and the build info
+  are Go's. The API build flushes on its orchestrator thread only
+  (`flush_writes_on_this_thread`). Only that thread reaches its file
+  system, so an API build emit with no early emit (noEmitOnError, F1 to
+  F4, `GOPORT_EARLY_EMIT=0`, or no incremental state) also keeps its
+  writes, and that thread flushes them when the emit ends, with the same
+  replay (`EmitFilesHandler::emit_with_writes_here`). So a TS5033 is in
+  its file's result, sorted and in `emitDiagnosticsPerFile`, as in Go.
+  `tsc -b` and `tsc -p` write at once there. When each API write is a
+  client `writeFile` call (`System::client_writes`), and the build is not
+  single-threaded, the flush writes in rounds (each file's outputs before
+  its declarations first), and after a failed write whose file's d.ts
+  signature then panics it makes only the writes that Go's race mostly
+  makes before that panic (`emit_files::flush_client_writes`, see Exit
+  codes). A task finishes
   when its check and its early emit (when it has one) have ended (the
   barrier jobs behind them also
   wait for the d.ts twins and the emit pool,
@@ -679,7 +745,7 @@ The batch that adds it is not accepted until Theo approves.
     other `early_emit_options_allow` cases: `preserveSymlinks` (F4),
     `outFile`, `--generateTrace`, and every project with
     `GOPORT_EARLY_EMIT=0`. `--singleThreaded` is not a gap: Go's build
-    then runs one task at a time (execute/build/orchestrator.go:925
+    then runs one task at a time (execute/build/orchestrator.go:919
     `rangeTasks`).
   - C1 rate shift (int56; state note `int56-decision-2026-10-09`). C1
     makes a task with early emit finish when its emit pool jobs and d.ts
@@ -710,6 +776,103 @@ The batch that adds it is not accepted until Theo approves.
     output where Go reads new in 6 of 6 runs (probe q1b2,
     k2sched/design-a-check.md). Go runs each status check on the builder
     that takes the task.
+- An incremental `noEmit` program of more than 32 files skips Go's d.ts
+  walk (t3inc1, not in Go; `incremental/affected_files.rs`
+  `skips_dts_walk`). When a changed file gets a new d.ts signature, Go's
+  `getFilesAffectedBy` emits the d.ts of each importer, one at a time, to
+  see if its signature changed too. After a fresh build every stored
+  signature is a version, so the walk goes through the whole importer
+  closure. On T3 Code apps/server one edit made 675 serial d.ts emits, and
+  the incremental run took 1.6x the cold run (Go at the pin: 1.4x). A small
+  closure can cost as much: in T3 Code packages/contracts an edit of a file
+  with 11 importers made 11 d.ts emits that took 1.0 s, against 0.35 s for
+  the cold run, because printing the inferred Effect Schema types costs
+  more than checking them. The walk does not change which files are
+  checked again: Go removes the cached diagnostics of the whole closure
+  anyway. Under `noEmit` it sets only the stored signatures and the full
+  pending emit kind of the files that it visits. So under `noEmit`, without
+  `assumeChangesOnlyAffectDirectDependencies`, in a program with more than
+  32 source files that are not declaration or JSON files, two rules apply
+  (t3inc1, t3inc3):
+  - Walk skip: each file of the closure of a changed file with a new d.ts
+    signature is affected and stores its version as signature, with no
+    d.ts emit. This gives the full emit kind to each file of the closure.
+    Go gives it to the files that its walk visits, always the direct
+    importers, and gives the d.ts kind of `handleDtsMayChangeOf` (none
+    without declarations) to the deeper files. So the rule applies only
+    when each deeper file that is not a changed file is already pending the
+    JS part of the full kind (`walk_skip_keeps_pending_emit`).
+  - Own signature: when more than 32 files import the changed file (directly
+    or not), its own d.ts signature is still computed: when it did not change,
+    only that file is affected, as in Go. With 32 or fewer, the changed file
+    uses its version too, so its closure is checked again with no d.ts emit,
+    unless it or a file of its closure affects the global scope (the version
+    would then make every file of the program affected, where Go's d.ts emit
+    may find no change and affect only the changed file) or its stored
+    signature is its version (then its text did not change, and Go's emit
+    decides). Go makes only the changed file pending when its d.ts did not
+    change, so the rule applies only when each file of the closure that is not
+    a changed file is already pending the full kind. In T3 Code
+    packages/contracts the d.ts emit of orchestrationV2.ts alone took 0.63 s,
+    against 0.36 s for a cold run: two of its inferred types exceed the length
+    that the compiler serializes (TS7056).
+
+  A fresh build makes every file pending with the full kind. A `noEmit`
+  build emits no JS, and with declarations it clears only the d.ts errors
+  part, when its d.ts errors pass runs: Go runs it only when the run reports
+  no other diagnostic (program.go:2082). So in a project that never emits,
+  the walk skip always applies. The own signature rule applies when the
+  project has no declarations, and with declarations while the d.ts errors
+  part stays pending (T3 Code apps/web, `composite`, keeps the full kind on
+  every file; its runs report Effect suggestions). After an emitting build
+  both give way to Go's walk until the files are pending again.
+
+  In the run that takes a rule, the output, the diagnostics and the pending
+  emit are Go's. The build info differs from Go's only in what the skipped
+  d.ts emits give Go: in `fileInfos` these files store versions where Go
+  stores d.ts hashes, and `packageJsons` and `missingPackageJsons` lack the
+  package.json files that only those emits look up for module specifiers.
+  Both are what a fresh build stores. The package.json lists only feed the
+  up-to-date checks of `tsc -b` and watch. A change that affects the global
+  scope makes every file compute its d.ts signature, as in Go, except the
+  files that a rule gave their version in the same run (T3 Code apps/web, a
+  global edit and a contracts edit in one run: 1,447 files, and 1 of 2,095
+  missing package.json files).
+
+  In a later run, a change of a file that stores its version and keeps its
+  d.ts counts as a new signature, so its closure is checked again. Go checks
+  only that file. When a file of that closure affects the global scope,
+  every file is checked again, still under a cold run. When the changed file
+  itself affects the global scope, every file also computes its d.ts
+  signature (Go's global path): on T3 Code apps/web, after an export change
+  of a utils.ts that skips the walk (2.40 s; Go's walk 4.70 s), the next
+  body edit of a file with `declare global` took 4.74 s (Go's walk 0.29 s).
+  The diagnostics stay Go's. When an emitting build without declarations
+  came in between (one with declarations stores the d.ts hashes again), that
+  later run takes Go's walk from the versions, so `affectedFilesPendingEmit`
+  also holds the files that import the changed file, and the next emitting
+  build writes them again (the same bytes). Go writes only that file. In the
+  t3inc3 matrix of 5 option sets and 9 sequences of `--noEmit` runs and
+  emitting builds on 91 files (EMIT7 to EMIT9: body edits next to a file
+  that affects the global scope), the emitting builds write the same files
+  as with Go's walk (`GOPORT_DTS_WALK_FALLBACK=0`) in 43 of 45 cells, and
+  never fewer files in any cell. The other 2 have no declarations (with and
+  without `sourceMap`) and run a fresh `--noEmit` build, a `--noEmit` change
+  of `Shape` that skips the walk, an emitting build, and a `--noEmit` body
+  edit of b5.ts (it imports a.ts). The next emitting build then writes c5.js
+  (it imports b5.ts) again, and its map with `sourceMap`.
+
+  Go's tsc, tsbuild and tscWatch baselines never reach the limit: a
+  program has at most 23 such files, and at most 6 in a baseline that uses
+  `noEmit`. `GOPORT_DTS_WALK_FALLBACK=0` runs Go's walk and Go's
+  signatures. `scripts/goport/t3-incremental-bench.sh` measures it.
+- When a changed file that affects the global scope gets a new d.ts
+  signature, every file makes its d.ts emit (Go
+  `handleDtsMayChangeOfAffectedFile`), one at a time, where Go runs them on
+  a work group (`collectAllAffectedFiles` loop 2). In T3 Code apps/web an
+  edit of a component with `declare global` takes about 2x a cold run, on
+  main and with the fallback (`t3-incremental-bench.sh -c web-global`, wall
+  medians of 5 runs: 2.40 -> 4.97 s on main, 2.42 -> 5.18 s with it).
 
 `program.rs` defines `SourceFileInfo`, `load`, `bind_all`, the Go
 `Program` methods as free functions with Go snake names (`get_resolved_module(file, name, mode)` ->
@@ -748,7 +911,70 @@ runs `f` under `core::go_wait_group_task`. Where the port runs it inline
 inside work that a Go `recover()` guards (the auto-import registry build
 under a request), it runs `f` under `core::go_wait_group_goroutine`: a Go
 panic ends the process there, because Go's recover sees only its own
-goroutine.
+goroutine. Go's `Program.Emit` emits each file on a work group goroutine
+unless the program is single-threaded. The port waits for its emit jobs
+under `core::go_work_group_task` (`program_emit::wait_emit_jobs`), so a Go
+panic in an emit (an `es_decorator` nil dereference, or the d.ts signature
+of a file after a failed write, incremental/snapshot.go:411) gets the
+suffix in `tsc -p`, `tsc -w`, `tsc -b` (also with `--builders 1`) and the
+API build, and in the API build it ends the process with no answer and
+exit 2, as Go does. With `--singleThreaded` Go emits on the caller's
+goroutine: no suffix, and the API answers the request with the panic.
+`tsc -b` also adds the suffix for its builder goroutine
+(`BuildTask::keep_go_panic`).
+
+A Go nil dereference is a SIGSEGV that the runtime turns into a panic,
+so Go prints a second line, `[signal SIGSEGV: segmentation violation
+code=0x1 addr=<fault address> pc=<pc>]` (runtime `dopanic_m`), before the
+goroutine trace. A site that knows Go's fault address uses
+`core::go_nil_dereference_at(address)`, and the port prints the line with
+`pc=0x0`: Go's `pc` is an instruction of its own binary (0xc5efe9 in
+tsgo-oracle-fed0bf24149f). The d.ts signature site
+(`diagnostic_to_string_builder`) has it (0x68). gopanicout2 gave 39 more
+sites their address: the CLI, build, checker, transformer, API and IPC
+sites, and the LSP sites that a client message reaches (a nil element in
+`changes` or `files`, a code lens without `data`). gopanicout3 gave the 2
+sites of `initialized` theirs: before `initialize`, and a null workspace
+folder (server.go:1716 and 1752). Each address is the
+first load through the nil pointer in Go's compiled code, read from
+`go tool objdump` of the pinned oracle; 6 of them are checked against
+Go's own output (tests/go_nil_signal.rs). The other `go_nil_dereference()`
+sites print no signal line: the `checker::types` accessors (Go returns a
+nil pointer there, and the fault address is the field that each caller
+reads) and LSP and project sites that no known input reaches (Go N'
+answers a request or notification whose `params` is null with
+InvalidParams, so the `params` sites are not reached). The signal stays with the goroutine
+until a recovery completes, so a panic in the deferred function that
+recovered a nil dereference keeps the line (`core::go_after_recover`).
+
+In that panic case Go's other emit goroutines go on until the process
+ends, so which of their outputs exist varies by timing (a file can also be
+cut to 0 bytes). The port's written files are one of the sets that Go N'
+gave in repeated runs (gopanicout1 `go-model.md`): in the CLI modes, and
+in the API build without the `writeFile` callback or single-threaded,
+every other file in full (the flush leaves out only the panicking d.ts).
+In the API build with the callback each write waits for a client answer,
+so the panic mostly wins. Both the client's calls and the written files
+are one of Go's results (gopanicout2 `go-model.md`). After the failed
+write, `flush_client_writes` makes the other outputs before the
+declarations and, for a failed declaration output, the rest of its round,
+and no other declaration (`--async`). With sync msgpack, whose calls go
+one at a time, every file's first output is called; a failure there
+writes the next file's first output too, and a later failure calls and
+writes the next file's output of its round, and the round's earlier
+writes are lost (`flush_serialized_client_writes`). A failed OS write
+after a `useOS` answer dooms its file one round later, because Go tries
+that write again after it makes the directory: in the next round the
+file's output is called and written, and the next file's output is called
+without its write (gopanicout3 `go-model.md`).
+
+The LSP request recover (`Server::recover_guard`) and the API session
+recover are `core::go_recover`: a Go `recover()` sees only its own
+goroutine, so a Go panic in a work group task under a request ends the
+process. The recover logs the port site of a Go panic in place of Go's
+`debug.Stack()` text (`core::go_recovered_stack`), and so does the
+recover of a cross-project queued function
+(`ls::crossproject::panic_occured_text`).
 
 ## Process start
 
@@ -1019,7 +1245,11 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   cannot change an output. The binder reference resolver reads the
   program's binder symbols (`transformers::reference_resolver::BinderSymbols`),
   on every thread. A d.ts part waits for its file's JS part before it
-  writes, so a file's outputs are written in Go's order. The pool is off
+  writes, so a file's outputs are written in Go's order. It also waits for
+  the JS transforms before its own transforms, and imports what they wrote
+  on parse-tree nodes (ts#64649: Go runs both parts of a file in one emit
+  context; `printer::emit_context::ParseEmitNodes`). A file whose two
+  parts run on its checker (the twins below) does the same. The pool is off
   with `--singleThreaded`, `--generateTrace`, an emit called on a checker
   thread and `GOPORT_EMIT_THREADS=0` (the variable sets the thread count,
   also when no core is spare).
@@ -1096,6 +1326,16 @@ process (bin/tsgo.rs `unblock_go_signals`, `go_runtime_start`).
   the wait for the check, less the nested declaration emit time, as in Go.
   "Emit time" is that nested emit time plus the wait for the rest of the
   emit.
+- In `programToSnapshot` the referenced files job of each file also
+  compares the new set with the old one (`ReferencedFiles::same_as_old`;
+  t3inc2), as Go does in its per-file work group (programtosnapshot.go:111),
+  not on the loading thread. The job gives back the old set when it has the
+  same program files in another order
+  (`ReferencedFileSet::same_as`): a set read from build info is in file id
+  order, and no reader of a set of program files depends on its order (Go
+  iterates a set in random order). On T3 Code apps/web after a contracts
+  change (327,661 references), the loading thread's own work in the change
+  loop went from about 29 ms to about 16 ms.
 - Transformers return factory (synthetic) SourceFiles. `source_file_info`
   and the printer's identifier set map one to the parsed file with the same
   path (Go `copyFrom`). `get_ecma_line_starts` caches its line map by node,
@@ -1570,11 +1810,11 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
 - The end of a run: when SIGINT, SIGTERM, the parent watchdog or the end
   of stdin ends the context while the dispatch thread runs work that Go
   runs on a goroutine (the async part of a request, an API session), Go's
-  `Run` (`lsp/server.go:859`) returns without that work and the process
+  `Run` (`lsp/server.go:895`) returns without that work and the process
   ends at once. The port waits until that work ends, then ends with Go's
   exit code and message. A request that the end cancels can also log
   "error handling method" on stderr. Go and the port both wait for the
-  sync part of a handler (`server.go:1013`).
+  sync part of a handler (`lsp/server.go:1049`).
   - A fix ends the run from a watcher thread while the dispatch thread is
     in Go's goroutine work. So it tracks the phase of Go's dispatch
     goroutine: in `requestQueue.Get`, in the sync part of a handler, or in
@@ -1608,35 +1848,98 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   - `--api --async` and the API sessions run requests one at a time
     (`ipc/conn_async.rs`). A pipelined request sees the result of the one
     before it. Go runs them at the same time.
-  - The async connection reads its next message only after the running
+  - The API sessions read their next message only after the running
     request. So the end of the input during a request does not cancel the
     request's context: Go's read loop sees the end at once and returns
     (`ipc/conn_async.go:89-91`), and its deferred `cancelHandlers` (`:73`)
     cancels it, so a long check answers early with what it has. The port
-    answers in full and then ends, with Go's exit code.
-  - The end on SIGINT or SIGTERM in `--api --async` is an open Go
-    difference (state note `r187-repair-withdraw-2026-10-09`, lane
-    apisig4). Go's read loop checks the context at the top of each turn
-    (`ipc/conn_async.go:83`) and then waits in the read while a request
-    runs on its own goroutine (`:98`). The port runs the request inline
-    and checks the context after it (`run_loop`). The cases:
-    - A signal during a request: Go answers it, then ends after the next
-      message (it answers that message too) or at the end of the input.
-      The port ends right after the answer and reads no more.
-    - Pipelined requests: a signal during request 1 while request 2 is
-      already sent. Go answers both (2 first) and then waits for the next
-      message. The port answers request 1 and ends: request 2 gets no
-      answer.
-    - A signal while a request waits for a client callback: Go's `Call`
-      returns the context error at once (`:290`), so request 1 is answered
-      at the signal. The port's `call` waits in its read, so it answers
-      request 1 after the next message. Both end after that message.
-  - apisig2 (R187) moved the run's check before an inline request to
-    match the first case. The run then read until the end of the input in
-    the callback case. Its repair apisig3 closed the pending calls at the
-    signal, so the callbacks that a handler makes after the signal
-    (writeFile, removeFile) lost their requests. Both are withdrawn, and
-    `ipc/conn_async.rs` is R186's code.
+    answers in full and then ends, with Go's exit code. `--api --async`
+    reads on a thread of its own (`read_on_thread`) and cancels it as Go.
+  - SIGINT and SIGTERM in `--api --async` end the run as in Go (lane
+    apisig4, tests in `tests/tsgo_stdio_end.rs`). The read thread checks
+    the context before each read (`ipc/conn_async.go:83`), and a `call`
+    waits on the inbox and the context, as Go's `select` (`:289-303`).
+    Equal to Go:
+    - Phase A, until the next client message: a callback that waits
+      returns `context canceled` at once, and a later one writes its
+      request and returns it too. So a request answers at the signal
+      (readFile, fileExists, getAccessibleEntries, realpath,
+      resolveModuleName, writeFile, removeFile), and a callback that
+      panics on a worker goroutine (directoryExists, readFile of a source
+      file) ends the process with exit code 2 at the signal.
+    - Exactly 1 message is read after the signal, also after a request
+      that makes no callback.
+    - Phase B: that message runs after Go's deferred `closePendingCalls`
+      (a Go race that the deferred function wins in practice), so its
+      callbacks write nothing and fail with `ipc: connection closed` and
+      `context canceled`. The run ends with exit code 0.
+    - The end of the input after the signal; a second signal does
+      nothing.
+    - A request that the port holds keeps Go's phase for each callback,
+      except in the window under "Still different". The port holds a
+      request that waits in a callback while a nested request runs
+      (until that one returns), and a request read while another one
+      runs (until that one returns). Go's goroutines go on at once. So
+      each request has a Go clock: the port time less the time that the
+      port held it (`ipc/conn_async.rs`, file header). A callback that
+      Go made before the read loop ended writes its request and returns
+      Go's error (`context canceled` after a signal, else
+      `ipc: connection closed`), also when the port makes it after the
+      end. A callback that Go made after the end writes nothing (Phase
+      B). A reply that the port read before the end goes to its call,
+      also when a nested request holds that call at the end (Go's `Run`
+      gives each reply to its call when it reads it).
+  - Still different in `--api --async` (the requests run one at a time):
+    - A held request answers, writes its later callback requests and
+      crashes (a worker callback) only after the request that held it
+      answers. Go does it at once: at the signal, or at the reply to its
+      callback. So:
+      - The answers come in another order (Go answers request 2 of a
+        pipelined pair first, and a held request before the nested one).
+      - When Go's held worker callback panics (at the signal, or at the
+        end of the read loop), Go ends at once with exit code 2, and the
+        nested request never goes on. The port runs the nested request to
+        its answer (with its callbacks), then the worker panics and the
+        port ends with exit code 2.
+      - A callback request that the port writes after the end of the
+        read loop gets no reply (the read loop has ended). Go wrote it
+        earlier, and its client could answer it before the end.
+    - Go's races give more outcomes than the port: a reply that comes
+      just before the signal, and a signal less than about 0.5 ms before
+      the end of the read loop. There the port mostly gives one of Go's
+      outcomes. Not for a held cleanBuild with SIGINT and EOF 0.25 ms
+      apart (mini-743d): Go wrote only the removeFile of a.js (10 of 10
+      runs), the port also that of b.js (9 of 10; R188 10 of 10).
+    - A held build in a window of about 0.25 to 1.5 ms gives an outcome
+      that Go and R188 mostly do not give. The build waits in its first
+      writeFile, a nested request holds it, and SIGINT or SIGTERM and
+      then the end of the read loop (EOF or a read error) come 0.25 to
+      1.5 ms apart. Go and R188 fail both writes with `context canceled`.
+      The port fails them with `ipc: connection closed`: Go wrote the
+      later writeFile requests before the signal, from concurrent emit
+      workers, but the port's held worker hands over its writes one at a
+      time after the hold, and the Go clock adds that work, so the later
+      writes come after the end (Phase B). Runs outside Go's outcomes of
+      10 per cell (the apisig4 skeptics' `heldbuild.py` and
+      `heldwin.py`): SIGINT and EOF: 0.5 ms: 10 on alvin, 10 on cup2, 4
+      to 5 on mini-743d; 0.75 ms: 10 on alvin, 5 on cup2, 0 on
+      mini-743d; 1 ms: 2 to 3 on alvin, 0 on mini-743d; 1.5 ms: 1 on
+      cup2. SIGINT and a read error (mini-743d): 0.25 ms: 10; 0.5 ms: 3.
+      SIGTERM and EOF (mini-743d), 0.5 ms: 4. Go itself gave
+      `ipc: connection closed` in a few cup2 runs (2 of 10 at 1 ms, 1 of
+      10 at 2 ms), and in 2 runs the port gave a mixed outcome that Go
+      did not give (b.js `context canceled`, a.js
+      `ipc: connection closed`). At 0.25 ms (SIGINT and EOF) Go gives
+      both outcomes and the port only `ipc: connection closed`.
+    - A worker makes one callback at a time, so fewer directoryExists or
+      writeFile requests are out at the signal (Go: 2 or more). The
+      answers are the same. The apisig4 probes K14 and K17 found a build
+      that wrote its outputs again after a failed write (with no signal
+      too, and in R188); since emitretry1 the build makes each write
+      once (see the flush in the build emit notes).
+    - On wasm, which has no threads, the reads stay on the dispatch
+      thread: a waiting callback wakes only at the next message, and
+      there is no Phase B.
 - Go runtime profiles (pprof) have no samples: the port writes Go's file
   names, errors and log lines and valid empty profiles. `runtime.GC` is a
   no-op. `runtime/metrics` reads as `KindBad`, so the Go runtime fields of

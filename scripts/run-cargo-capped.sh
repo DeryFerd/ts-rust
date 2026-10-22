@@ -5,12 +5,13 @@
 #        scripts/run-cargo-capped.sh help                       this text
 # - Target: <worktree>/target, with sccache when installed. Do not set CARGO_TARGET_DIR (TS_CARGO_SEPARATE_TARGET=1
 #   with its own CARGO_TARGET_DIR only for a deliberate fresh-target reproduction).
-# - TS_CARGO_JOBS: build jobs (16 on zbook, 1 elsewhere). TS_CARGO_MEMORY_LIMIT_KIB: the memory cap of the run.
+# - TS_CARGO_JOBS: build jobs (the core count, at most 16). TS_CARGO_MEMORY_LIMIT_KIB: the memory cap of the run.
 # - TS_CARGO_SLOTS: Cargo runs at a time (2 on zbook, 1 elsewhere). A run takes the first free slot lock
 #   (/tmp/ts-rust-cargo-<id>.lock, then <id>-1.lock, ...); slot 0 keeps the old single-lock name.
 # - Edit-loop builds (build, check, test, run, bench without --profile goport) use nightly -Zthreads=8 and
 #   incremental ts_goport. TS_CARGO_NIGHTLY=0 TS_CARGO_INCREMENTAL=0 gives a stable build (for timing, or after an
-#   internal compiler error). --profile goport (fat LTO, 7 to 20 minutes) stays on 1.93.0: timing and shipped bins.
+#   internal compiler error). Without the nightly installed they stop with the install command.
+#   --profile goport (fat LTO, 7 to 20 minutes) keeps the default toolchain: timing and shipped bins.
 set -euo pipefail
 case "${1:-}" in help | -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;; esac
 
@@ -20,22 +21,67 @@ case "${1:-}" in help | -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; ex
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 
-# Build jobs. TS_CARGO_JOBS overrides the per-host default: 16 on zbook (32
-# cores, 94 GB), 1 elsewhere. Tests keep one thread either way.
-case "$(hostname)" in
-  zbook) default_jobs=16 ;;
-  *) default_jobs=1 ;;
-esac
+# Build jobs. TS_CARGO_JOBS overrides the default: the core count, at most 16
+# (16 on zbook's 32 cores and alvin's 24). Until 2026-10-10 every host but zbook
+# got 1 job. Tests keep one thread either way.
+cores="$(nproc 2>/dev/null || echo 1)"
+default_jobs=$((cores < 16 ? cores : 16))
 jobs="${TS_CARGO_JOBS:-$default_jobs}"
 if [[ ! "$jobs" =~ ^[1-9][0-9]*$ ]]; then
   echo "TS_CARGO_JOBS must be a positive integer" >&2
   exit 2
 fi
 
+# Edit-loop builds (build, check, test, run, bench) use a pinned nightly with the
+# parallel frontend, and build ts_goport incrementally. On dbook-lan a ts_goport
+# rebuild took 75 s on 1.93.0 and 43 s on the nightly with -Zthreads=8, and a
+# one-line edit 32 s with incremental. Program output and the quick gate were
+# equal (target/continuation-r97-goport/buildspeed/bench.md).
+# - TS_CARGO_NIGHTLY=0 keeps the default toolchain. `--profile goport` (shipped
+#   and timing bins: build-release.sh, build-pgo.sh), RUSTUP_TOOLCHAIN and a
+#   `+toolchain` argument keep it too. -Zthreads is the job count, at most 8.
+# - When the nightly is not installed, an edit-loop build stops here with the
+#   install command: a quiet fallback to the default toolchain made builds
+#   slower with no error.
+# - TS_CARGO_INCREMENTAL unset: incremental ts_goport and its parts (goport_core,
+#   goport_util, goport_lsproto) in edit-loop builds only.
+#   Other crates stay non-incremental, so sccache still caches them. 0 turns it
+#   off, 1 turns it on for every workspace crate.
+goport_profile=0
+previous_arg=""
+for arg in "$@"; do
+  [[ "$arg" != -- ]] || break
+  if [[ "$arg" == --profile=goport || ("$previous_arg" == --profile && "$arg" == goport) ]]; then
+    goport_profile=1
+  fi
+  previous_arg="$arg"
+done
+edit_loop=0
+case "${1:-}" in
+  build | b | check | c | test | t | run | r | bench) ((goport_profile)) || edit_loop=1 ;;
+esac
+
+nightly="${TS_CARGO_NIGHTLY:-1}"
+nightly_toolchain="${TS_CARGO_NIGHTLY_TOOLCHAIN:-nightly-2026-06-17}"
+if [[ "$nightly" != 0 && "$nightly" != 1 ]]; then
+  echo "TS_CARGO_NIGHTLY must be 0 or 1" >&2
+  exit 2
+fi
+use_nightly=0
+if ((edit_loop && nightly)) && [[ -z "${RUSTUP_TOOLCHAIN:-}" ]]; then
+  if ! rustup toolchain list 2>/dev/null | grep -q "^${nightly_toolchain}-"; then
+    echo "run-cargo-capped.sh: edit-loop builds use ${nightly_toolchain}, and it is not installed." >&2
+    echo "  Install it: rustup toolchain install ${nightly_toolchain} --profile minimal" >&2
+    echo "  Or build with the default toolchain (slower): TS_CARGO_NIGHTLY=0 $0 $*" >&2
+    exit 2
+  fi
+  use_nightly=1
+fi
+
 # A virtual-memory limit applies per process. The slot locks below keep separate
 # rustc and test processes from multiplying that limit beyond TS_CARGO_SLOTS runs.
-# Allow 8 GiB for one job and 4 GiB per job above that, capped at three quarters
-# of available memory.
+# Allow 8 GiB for one job and 4 GiB per job for more jobs, capped at three
+# quarters of available memory.
 default_memory_limit_kib=$((jobs == 1 ? 8388608 : jobs * 4194304))
 if [[ -r /proc/meminfo ]]; then
   available_memory_kib="$(awk '$1 == "MemAvailable:" { print $2; exit }' /proc/meminfo)"
@@ -140,48 +186,11 @@ if ((jobs == 1)); then
   thread_flags=" -C llvm-args=--threads=1 -C link-arg=-Wl,--threads=1"
 fi
 
-# Edit-loop builds (build, check, test, run, bench) use a pinned nightly with the
-# parallel frontend, and build ts_goport incrementally. On dbook-lan a ts_goport
-# rebuild took 75 s on 1.93.0 and 43 s on the nightly with -Zthreads=8, and a
-# one-line edit 32 s with incremental. Program output and the quick gate were
-# equal (target/continuation-r97-goport/buildspeed/bench.md).
-# - TS_CARGO_NIGHTLY=0 keeps the default toolchain. `--profile goport` (shipped
-#   and timing bins: build-release.sh, build-pgo.sh), RUSTUP_TOOLCHAIN and a
-#   `+toolchain` argument keep it too. -Zthreads is the job count, at most 8.
-# - TS_CARGO_INCREMENTAL unset: incremental ts_goport and its parts (goport_util,
-#   goport_lsproto) in edit-loop builds only.
-#   Other crates stay non-incremental, so sccache still caches them. 0 turns it
-#   off, 1 turns it on for every workspace crate.
-goport_profile=0
-previous_arg=""
-for arg in "$@"; do
-  [[ "$arg" != -- ]] || break
-  if [[ "$arg" == --profile=goport || ("$previous_arg" == --profile && "$arg" == goport) ]]; then
-    goport_profile=1
-  fi
-  previous_arg="$arg"
-done
-edit_loop=0
-case "${1:-}" in
-  build | b | check | c | test | t | run | r | bench) ((goport_profile)) || edit_loop=1 ;;
-esac
-
 cargo_args=()
-nightly="${TS_CARGO_NIGHTLY:-1}"
-nightly_toolchain="${TS_CARGO_NIGHTLY_TOOLCHAIN:-nightly-2026-06-17}"
-if [[ "$nightly" != 0 && "$nightly" != 1 ]]; then
-  echo "TS_CARGO_NIGHTLY must be 0 or 1" >&2
-  exit 2
-fi
-if ((edit_loop && nightly)) && [[ -z "${RUSTUP_TOOLCHAIN:-}" ]]; then
-  if rustup toolchain list 2>/dev/null | grep -q "^${nightly_toolchain}-"; then
-    cargo_args+=("+${nightly_toolchain}")
-    if ((jobs > 1)); then
-      thread_flags+=" -Zthreads=$((jobs < 8 ? jobs : 8))"
-    fi
-  else
-    echo "run-cargo-capped.sh: ${nightly_toolchain} is not installed; using the default toolchain." >&2
-    echo "  Install it with: rustup toolchain install ${nightly_toolchain} --profile minimal" >&2
+if ((use_nightly)); then
+  cargo_args+=("+${nightly_toolchain}")
+  if ((jobs > 1)); then
+    thread_flags+=" -Zthreads=$((jobs < 8 ? jobs : 8))"
   fi
 fi
 export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C debuginfo=0${thread_flags}"
@@ -207,6 +216,8 @@ case "$incremental" in
       --config profile.release.package.goport_util.incremental=true
       --config profile.dev.package.goport_lsproto.incremental=true
       --config profile.release.package.goport_lsproto.incremental=true
+      --config profile.dev.package.goport_core.incremental=true
+      --config profile.release.package.goport_core.incremental=true
     )
     ;;
   *)

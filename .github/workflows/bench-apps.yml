@@ -1,0 +1,262 @@
+# Build once, cache prepared inputs, and time each case on a separate runner.
+# Every case keeps all compilers together on the same runner.
+name: App benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        type: choice
+        description: Benchmark suite
+        default: all
+        options: [all, apps, t3]
+  pull_request:
+    types: [opened]
+    paths:
+      - ".github/workflows/bench-apps.yml"
+      - "scripts/bench-apps/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-apps-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUSTUP_TOOLCHAIN: 1.95.0
+  CARGO_INCREMENTAL: 0
+  TS_CARGO_CGROUP_ACTIVE: 1
+  TS_CARGO_JOBS: 16
+  TS_CARGO_SLOTS: 1
+  TS_CARGO_NIGHTLY: 0
+  TS_CARGO_INCREMENTAL: 0
+  RUNS: 5
+  BUN_SHA256: 48518754e373029cb0c147ad9e6b604c13df0e209552d20ab8ebc0f2b250a941
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      prepare: ${{ steps.plan.outputs.prepare }}
+      bench: ${{ steps.plan.outputs.bench }}
+      suite: ${{ steps.plan.outputs.suite }}
+      compiler-key: ${{ steps.plan.outputs.compiler-key }}
+      inputs-key: ${{ steps.plan.outputs.inputs-key }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - id: plan
+        env:
+          SUITE: ${{ inputs.suite || 'all' }}
+          COMPILER_HASH: ${{ hashFiles('Cargo.toml', 'Cargo.lock', 'crates/ts_goport/**', 'scripts/run-cargo-capped.sh', 'scripts/goport/pgo-train.sh', '.github/workflows/bench-apps.yml') }}
+          INPUTS_HASH: ${{ hashFiles('scripts/bench-apps/setup.sh', 'scripts/bench-apps/t3code.sh') }}
+        run: |
+          {
+            python3 scripts/bench-apps/matrix.py "$SUITE"
+            echo "suite=$SUITE"
+            echo "compiler-key=bench-compiler-v1-linux-x64-rust1.95.0-$COMPILER_HASH"
+            echo "inputs-key=bench-inputs-v1-linux-x64-node24.19.0-$BUN_SHA256-$INPUTS_HASH"
+          } >> "$GITHUB_OUTPUT"
+
+  compiler:
+    needs: plan
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.19.0
+      - uses: actions/cache/restore@v4
+        id: compiler
+        with:
+          path: ${{ runner.temp }}/current
+          key: ${{ needs.plan.outputs.compiler-key }}
+      - name: Build tools
+        if: steps.compiler.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -yq musl-tools
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl --component llvm-tools
+      - uses: Swatinem/rust-cache@v2
+        if: steps.compiler.outputs.cache-hit != 'true'
+        with:
+          key: bench-apps-musl
+          save-if: ${{ github.event_name == 'workflow_dispatch' }}
+      - name: Build release reference
+        if: steps.compiler.outputs.cache-hit != 'true'
+        run: |
+          conf=$(sed -n 's/^const JEMALLOC_CONF: &str = "\([^"]*\)";$/\1/p' crates/ts_goport/src/bin/tsgo.rs | head -1)
+          [[ -n $conf ]]
+          echo "JEMALLOC_SYS_WITH_MALLOC_CONF=$conf" >> "$GITHUB_ENV"
+          export JEMALLOC_SYS_WITH_MALLOC_CONF=$conf CC_x86_64_unknown_linux_musl=musl-gcc
+          export RUSTFLAGS="-C target-feature=+crt-static -C relocation-model=static"
+          scripts/run-cargo-capped.sh build --profile goport --locked -p ts_goport --bin tsgo --features noembed --target x86_64-unknown-linux-musl
+          mkdir -p "$RUNNER_TEMP/plain"
+          cp target/x86_64-unknown-linux-musl/goport/tsgo "$RUNNER_TEMP/plain/tsc"
+      - name: Build and verify PGO compiler
+        if: steps.compiler.outputs.cache-hit != 'true'
+        env:
+          PGO_TARGET: x86_64-unknown-linux-musl
+          PGO_LINK: static
+          PGO_BINS: tsgo
+          CARGO_FEATURES: --features noembed
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          COMPILER_KEY: ${{ needs.plan.outputs.compiler-key }}
+        run: |
+          scripts/goport/pgo-train.sh setup "$RUNNER_TEMP/train"
+          PGO_TRAIN="scripts/goport/pgo-train.sh run $RUNNER_TEMP/train" crates/ts_goport/scripts/build-pgo.sh "$RUNNER_TEMP/pgo"
+          scripts/goport/pgo-train.sh compare "$RUNNER_TEMP/train" "$RUNNER_TEMP/plain/tsc" "$RUNNER_TEMP/pgo/target-use/goport/tsgo"
+          mkdir -p "$RUNNER_TEMP/current"
+          crates/ts_goport/scripts/copy-libs.sh "$RUNNER_TEMP/current"
+          cp "$RUNNER_TEMP/pgo/target-use/goport/tsgo" "$RUNNER_TEMP/current/tsc"
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'current'
+          data = {'cacheKey': os.environ['COMPILER_KEY'],
+                  'source': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                  'compilerTree': subprocess.check_output(['git', 'rev-parse', 'HEAD:crates/ts_goport'], text=True).strip(),
+                  'rust': subprocess.check_output(['rustc', '-vV'], text=True),
+                  'build': 'release PGO, static musl, no BOLT'}
+          (out / 'build.json').write_text(json.dumps(data, indent=2) + '\n')
+          PY
+          (cd "$RUNNER_TEMP/current" && sha256sum tsc lib*.d.ts build.json > SHA256SUMS)
+      - uses: actions/cache/save@v4
+        if: steps.compiler.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/current
+          key: ${{ needs.plan.outputs.compiler-key }}
+      # Publish immediately: a later benchmark failure cannot discard this build.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-compiler-${{ github.run_id }}
+          path: ${{ runner.temp }}/current
+          if-no-files-found: error
+          retention-days: 90
+
+  prepare:
+    needs: plan
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.prepare) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.19.0
+      - uses: actions/cache/restore@v4
+        id: inputs
+        with:
+          path: ${{ runner.temp }}/bench.noindex
+          key: ${{ needs.plan.outputs.inputs-key }}-${{ matrix.project }}
+      - name: Prepare project and tools
+        if: steps.inputs.outputs.cache-hit != 'true'
+        env:
+          BENCH_APPS: ${{ matrix.project }}
+        run: |
+          npm install -g pnpm@11.10.0 corepack@0.34.5 --force
+          scripts/bench-apps/setup.sh "$RUNNER_TEMP/bench.noindex"
+          if [[ $BENCH_APPS == t3code ]]; then
+            PREPARE_ONLY=1 scripts/bench-apps/t3code.sh "$RUNNER_TEMP/bench.noindex"
+          fi
+      - uses: actions/cache/save@v4
+        if: steps.inputs.outputs.cache-hit != 'true'
+        with:
+          path: ${{ runner.temp }}/bench.noindex
+          key: ${{ needs.plan.outputs.inputs-key }}-${{ matrix.project }}
+
+  benchmark:
+    needs: [plan, compiler, prepare]
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.bench) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.19.0
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/bench.noindex
+          key: ${{ needs.plan.outputs.inputs-key }}-${{ matrix.project }}
+          fail-on-cache-miss: true
+      - uses: actions/download-artifact@v5
+        with:
+          name: benchmark-compiler-${{ github.run_id }}
+          path: ${{ runner.temp }}/current
+      - name: Check compiler and install timer
+        run: |
+          (cd "$RUNNER_TEMP/current" && sha256sum -c SHA256SUMS)
+          chmod +x "$RUNNER_TEMP/current/tsc"
+          echo "RS_BIN=$RUNNER_TEMP/current/tsc" >> "$GITHUB_ENV"
+          sudo apt-get update -qq
+          sudo apt-get install -yq hyperfine
+      - name: Measure one case
+        env:
+          BENCH_CASE: ${{ matrix.case }}
+          PROJECT: ${{ matrix.project }}
+          T3_PROJECTS: ${{ matrix.path }}
+          T3_MODES: ${{ matrix.mode }}
+        run: |
+          if [[ $PROJECT == t3code ]]; then
+            scripts/bench-apps/t3code.sh "$RUNNER_TEMP/bench.noindex"
+          else
+            scripts/bench-apps/run.sh "$RUNNER_TEMP/bench.noindex" "$BENCH_CASE"
+          fi
+          python3 scripts/bench-apps/verify.py "$RUNNER_TEMP/bench.noindex" --case "$BENCH_CASE"
+      - name: Record source, tools and runner
+        if: always()
+        env:
+          BENCH_CASE: ${{ matrix.case }}
+        run: python3 scripts/bench-apps/metadata.py "$RUNNER_TEMP/bench.noindex"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-result-${{ matrix.case }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/bench.noindex/results
+          if-no-files-found: error
+          retention-days: 90
+
+  summary:
+    needs: [plan, benchmark]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: benchmark-result-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/bench.noindex/results
+          merge-multiple: true
+      - name: Verify and summarize
+        env:
+          SUITE: ${{ needs.plan.outputs.suite }}
+        run: |
+          python3 scripts/bench-apps/verify.py "$RUNNER_TEMP/bench.noindex" --suite "$SUITE"
+          python3 scripts/bench-apps/summary.py "$RUNNER_TEMP/bench.noindex" | tee "$RUNNER_TEMP/bench.noindex/results/summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: app-benchmarks-${{ github.run_id }}
+          path: ${{ runner.temp }}/bench.noindex/results
+          if-no-files-found: error
+          retention-days: 90

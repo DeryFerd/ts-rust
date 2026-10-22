@@ -93,17 +93,43 @@ pub struct SymbolTable;
 #[derive(Clone, Debug, Default)]
 pub struct OpaqueValue;
 
-#[derive(Clone, Debug, Default)]
-pub struct NodeList {
-    pub range: TextRange,
-    pub nodes: Vec<NodeId>,
-    pub has_trailing_comma: bool,
+/// A list field of node data: entry `index()` of the list table of the owner
+/// of the data (a file store, or the synthetic arena of a thread). The entry
+/// holds the Go `Loc`, the node ids, the missing-list bit and, for a modifier
+/// list, Go `ModifiersToFlags`. Go stores a `*NodeList`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NodeList(std::num::NonZeroU32);
+
+impl NodeList {
+    /// The list field of table entry `index`.
+    #[must_use]
+    pub const fn new(index: u32) -> Self {
+        match std::num::NonZeroU32::new(index.wrapping_add(1)) {
+            Some(n) => Self(n),
+            None => panic!("list table index out of range"),
+        }
+    }
+
+    /// The table entry.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        (self.0.get() - 1) as usize
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+/// A modifier list field: the list of its table entry (Go `ModifierList`
+/// embeds its `NodeList`).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ModifierList {
     pub list: NodeList,
-    pub flags: ModifierFlags,
+}
+
+/// A direct child that `NodeData::try_for_each_child` visits: a child node
+/// id, or a list field (whose ids are in the list table of the data's owner).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Child {
+    Node(NodeId),
+    List(NodeList),
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +138,7 @@ pub struct Node {
     pub flags: NodeFlags,
     pub range: TextRange,
     pub parent: Option<NodeId>,
-    pub data: NodeData,
+    pub data: BoxedData,
 }
 
 #[derive(Debug)]
@@ -261,7 +287,6 @@ impl NodeArena {
 pub struct ArrayLiteralExpressionData {
     pub elements: NodeList,
     pub multi_line: bool,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -273,17 +298,11 @@ pub struct ArrayTypeNodeData {
 pub struct ArrowFunctionData {
     pub asterisk_token: Option<NodeId>,
     pub body: NodeId,
-    pub end_flow_node: Option<FlowNodeId>,
     pub equals_greater_than_token: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
@@ -309,43 +328,31 @@ pub struct BinaryExpressionData {
     pub left: NodeId,
     pub operator_token: NodeId,
     pub right: NodeId,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BindingElementData {
     pub dot_dot_dot_token: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub initializer: Option<NodeId>,
-    pub local_symbol: Option<SymbolId>,
     pub property_name: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BindingPatternData {
     pub elements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct BlockData {
-    pub flow_node: Option<FlowNodeId>,
-    pub locals: SymbolTable,
     pub multi_line: bool,
-    pub next_container: Option<NodeId>,
     pub statements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct BreakStatementData {
-    pub flow_node: Option<FlowNodeId>,
     pub label: Option<NodeId>,
 }
 
@@ -354,18 +361,13 @@ pub struct CallExpressionData {
     pub arguments: NodeList,
     pub expression: NodeId,
     pub question_dot_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct CallSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
 }
@@ -373,39 +375,25 @@ pub struct CallSignatureDeclarationData {
 #[derive(Clone, Debug)]
 pub struct CaseBlockData {
     pub clauses: NodeList,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct CaseOrDefaultClauseData {
     pub expression: NodeId,
-    pub fallthrough_flow_node: Option<FlowNodeId>,
     pub statements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct CatchClauseData {
     pub block: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub variable_declaration: Option<NodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ClassDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
     pub heritage_clauses: Option<NodeList>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
     pub members: NodeList,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -413,13 +401,8 @@ pub struct ClassDeclarationData {
 #[derive(Clone, Debug)]
 pub struct ClassExpressionData {
     pub heritage_clauses: Option<NodeList>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
     pub members: NodeList,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -427,18 +410,12 @@ pub struct ClassExpressionData {
 #[derive(Clone, Debug)]
 pub struct ClassStaticBlockDeclarationData {
     pub body: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ComputedPropertyNameData {
     pub expression: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -448,7 +425,6 @@ pub struct ConditionalExpressionData {
     pub question_token: NodeId,
     pub when_false: NodeId,
     pub when_true: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -456,18 +432,13 @@ pub struct ConditionalTypeNodeData {
     pub check_type: NodeId,
     pub extends_type: NodeId,
     pub false_type: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub true_type: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct ConstructSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
 }
@@ -476,26 +447,17 @@ pub struct ConstructSignatureDeclarationData {
 pub struct ConstructorDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ConstructorTypeNodeData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -503,19 +465,15 @@ pub struct ConstructorTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct ContinueStatementData {
-    pub flow_node: Option<FlowNodeId>,
     pub label: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
-pub struct DebuggerStatementData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct DebuggerStatementData;
 
 #[derive(Clone, Debug)]
 pub struct DecoratorData {
     pub expression: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -526,32 +484,22 @@ pub struct DeleteExpressionData {
 #[derive(Clone, Debug)]
 pub struct DoStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ElementAccessExpressionData {
     pub argument_expression: NodeId,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub question_dot_token: Option<NodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
-pub struct EmptyStatementData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct EmptyStatementData;
 
 #[derive(Clone, Debug)]
 pub struct EnumDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub local_symbol: Option<SymbolId>,
     pub members: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -560,8 +508,6 @@ pub struct EnumDeclarationData {
 pub struct EnumMemberData {
     pub initializer: Option<NodeId>,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -569,11 +515,8 @@ pub struct EnumMemberData {
 #[derive(Clone, Debug)]
 pub struct ExportAssignmentData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub is_export_equals: bool,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
@@ -581,35 +524,27 @@ pub struct ExportAssignmentData {
 pub struct ExportDeclarationData {
     pub attributes: Option<NodeId>,
     pub export_clause: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub is_type_only: bool,
     pub module_specifier: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExportSpecifierData {
     pub is_type_only: bool,
-    pub local_symbol: Option<SymbolId>,
     pub property_name: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExpressionStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExpressionWithTypeArgumentsData {
     pub expression: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -621,42 +556,26 @@ pub struct ExternalModuleReferenceData {
 pub struct ForInOrOfStatementData {
     pub await_modifier: Option<NodeId>,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub initializer: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ForStatementData {
     pub condition: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub incrementor: Option<NodeId>,
     pub initializer: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct FunctionDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -665,17 +584,10 @@ pub struct FunctionDeclarationData {
 pub struct FunctionExpressionData {
     pub asterisk_token: Option<NodeId>,
     pub body: NodeId,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub return_flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: Option<NodeId>,
 }
@@ -683,10 +595,7 @@ pub struct FunctionExpressionData {
 #[derive(Clone, Debug)]
 pub struct FunctionTypeNodeData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -696,17 +605,11 @@ pub struct FunctionTypeNodeData {
 pub struct GetAccessorDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -715,12 +618,10 @@ pub struct GetAccessorDeclarationData {
 pub struct HeritageClauseData {
     pub token: SyntaxKind,
     pub types: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct IdentifierData {
-    pub flow_node: Option<FlowNodeId>,
     pub text: String,
 }
 
@@ -728,15 +629,12 @@ pub struct IdentifierData {
 pub struct IfStatementData {
     pub else_statement: Option<NodeId>,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub then_statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportAttributeData {
     pub value: NodeId,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -745,38 +643,27 @@ pub struct ImportAttributesData {
     pub attributes: NodeList,
     pub multi_line: bool,
     pub token: SyntaxKind,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportClauseData {
-    pub local_symbol: Option<SymbolId>,
     pub named_bindings: Option<NodeId>,
     pub phase_modifier: Option<SyntaxKind>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: Option<NodeId>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportDeclarationData {
     pub attributes: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub import_clause: Option<NodeId>,
     pub module_specifier: NodeId,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportEqualsDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
     pub is_type_only: bool,
-    pub local_symbol: Option<SymbolId>,
     pub module_reference: NodeId,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -784,10 +671,7 @@ pub struct ImportEqualsDeclarationData {
 #[derive(Clone, Debug)]
 pub struct ImportSpecifierData {
     pub is_type_only: bool,
-    pub local_symbol: Option<SymbolId>,
     pub property_name: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -803,10 +687,7 @@ pub struct ImportTypeNodeData {
 #[derive(Clone, Debug)]
 pub struct IndexSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -825,11 +706,8 @@ pub struct InferTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct InterfaceDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
     pub heritage_clauses: Option<NodeList>,
-    pub local_symbol: Option<SymbolId>,
     pub members: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
@@ -995,10 +873,7 @@ pub struct JsDocSeeTagData {
 #[derive(Clone, Debug)]
 pub struct JsDocSignatureData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
 }
@@ -1039,7 +914,6 @@ pub struct JsDocTypeExpressionData {
 pub struct JsDocTypeLiteralData {
     pub is_array_type: bool,
     pub js_doc_property_tags: Option<Vec<NodeId>>,
-    pub symbol: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1071,16 +945,12 @@ pub struct JsDocVariadicTypeData {
 #[derive(Clone, Debug)]
 pub struct JsxAttributeData {
     pub initializer: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct JsxAttributesData {
     pub properties: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1096,7 +966,6 @@ pub struct JsxElementData {
     pub children: NodeList,
     pub closing_element: NodeId,
     pub opening_element: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1110,13 +979,11 @@ pub struct JsxFragmentData {
     pub children: NodeList,
     pub closing_fragment: NodeId,
     pub opening_fragment: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct JsxNamespacedNameData {
     pub namespace: NodeId,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -1125,7 +992,6 @@ pub struct JsxOpeningElementData {
     pub attributes: NodeId,
     pub tag_name: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1136,7 +1002,6 @@ pub struct JsxSelfClosingElementData {
     pub attributes: NodeId,
     pub tag_name: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1152,16 +1017,13 @@ pub struct JsxTextData {
 }
 
 #[derive(Clone, Debug)]
-pub struct KeywordExpressionData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct KeywordExpressionData;
 
 #[derive(Clone, Debug)]
 pub struct KeywordTypeNodeData;
 
 #[derive(Clone, Debug)]
 pub struct LabeledStatementData {
-    pub flow_node: Option<FlowNodeId>,
     pub label: NodeId,
     pub statement: NodeId,
 }
@@ -1173,22 +1035,17 @@ pub struct LiteralTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct MappedTypeNodeData {
-    pub locals: SymbolTable,
     pub members: Option<NodeList>,
     pub name_type: Option<NodeId>,
-    pub next_container: Option<NodeId>,
     pub question_token: Option<NodeId>,
     pub readonly_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameter: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct MetaPropertyData {
-    pub flow_node: Option<FlowNodeId>,
     pub keyword_token: SyntaxKind,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -1196,17 +1053,11 @@ pub struct MetaPropertyData {
 pub struct MethodDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1214,11 +1065,8 @@ pub struct MethodDeclarationData {
 #[derive(Clone, Debug)]
 pub struct MethodSignatureDeclarationData {
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -1227,16 +1075,12 @@ pub struct MethodSignatureDeclarationData {
 
 #[derive(Clone, Debug)]
 pub struct MissingDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub modifiers: Option<ModifierList>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ModuleBlockData {
-    pub flow_node: Option<FlowNodeId>,
     pub statements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1244,14 +1088,7 @@ pub struct ModuleDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub attributes: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub keyword: SyntaxKind,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1259,42 +1096,34 @@ pub struct ModuleDeclarationData {
 #[derive(Clone, Debug)]
 pub struct NamedExportsData {
     pub elements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamedImportsData {
     pub elements: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamedTupleMemberData {
     pub dot_dot_dot_token: Option<NodeId>,
     pub question_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamespaceExportData {
-    pub symbol: Option<SymbolId>,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamespaceExportDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub symbol: Option<SymbolId>,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct NamespaceImportData {
-    pub local_symbol: Option<SymbolId>,
-    pub symbol: Option<SymbolId>,
     pub name: NodeId,
 }
 
@@ -1303,13 +1132,11 @@ pub struct NewExpressionData {
     pub arguments: Option<NodeList>,
     pub expression: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct NoSubstitutionTemplateLiteralData {
     pub raw_text: String,
-    pub symbol: Option<SymbolId>,
     pub template_flags: TokenFlags,
     pub text: String,
     pub token_flags: TokenFlags,
@@ -1321,9 +1148,7 @@ pub struct NonNullExpressionData {
 }
 
 #[derive(Clone, Debug)]
-pub struct NotEmittedStatementData {
-    pub flow_node: Option<FlowNodeId>,
-}
+pub struct NotEmittedStatementData;
 
 #[derive(Clone, Debug)]
 pub struct NotEmittedTypeElementData;
@@ -1338,8 +1163,6 @@ pub struct NumericLiteralData {
 pub struct ObjectLiteralExpressionData {
     pub multi_line: bool,
     pub properties: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1355,9 +1178,7 @@ pub struct ParameterDeclarationData {
     pub dot_dot_dot_token: Option<NodeId>,
     pub initializer: Option<NodeId>,
     pub question_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1397,9 +1218,7 @@ pub struct PrivateIdentifierData {
 #[derive(Clone, Debug)]
 pub struct PropertyAccessExpressionData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub question_dot_token: Option<NodeId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
@@ -1407,9 +1226,7 @@ pub struct PropertyAccessExpressionData {
 pub struct PropertyAssignmentData {
     pub initializer: NodeId,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1418,9 +1235,7 @@ pub struct PropertyAssignmentData {
 pub struct PropertyDeclarationData {
     pub initializer: Option<NodeId>,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1429,7 +1244,6 @@ pub struct PropertyDeclarationData {
 pub struct PropertySignatureDeclarationData {
     pub initializer: NodeId,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
@@ -1437,10 +1251,8 @@ pub struct PropertySignatureDeclarationData {
 
 #[derive(Clone, Debug)]
 pub struct QualifiedNameData {
-    pub flow_node: Option<FlowNodeId>,
     pub left: NodeId,
     pub right: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1457,8 +1269,6 @@ pub struct RestTypeNodeData {
 #[derive(Clone, Debug)]
 pub struct ReturnStatementData {
     pub expression: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1468,25 +1278,17 @@ pub struct SatisfiesExpressionData {
 }
 
 #[derive(Clone, Debug)]
-pub struct SemicolonClassElementData {
-    pub symbol: Option<SymbolId>,
-}
+pub struct SemicolonClassElementData;
 
 #[derive(Clone, Debug)]
 pub struct SetAccessorDeclarationData {
     pub asterisk_token: Option<NodeId>,
     pub body: Option<NodeId>,
-    pub end_flow_node: Option<FlowNodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub full_signature: Option<NodeId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub parameters: NodeList,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
     pub type_parameters: Option<NodeList>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1496,9 +1298,7 @@ pub struct ShorthandPropertyAssignmentData {
     pub equals_token: Option<NodeId>,
     pub object_assignment_initializer: Option<NodeId>,
     pub postfix_token: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1506,17 +1306,12 @@ pub struct ShorthandPropertyAssignmentData {
 #[derive(Clone, Debug)]
 pub struct SourceFileData {
     pub end_of_file_token: NodeId,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
     pub statements: NodeList,
-    pub symbol: Option<SymbolId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct SpreadAssignmentData {
     pub expression: NodeId,
-    pub symbol: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1534,8 +1329,6 @@ pub struct StringLiteralData {
 pub struct SwitchStatementData {
     pub case_block: NodeId,
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1562,14 +1355,12 @@ pub struct TaggedTemplateExpressionData {
     pub tag: NodeId,
     pub template: NodeId,
     pub type_arguments: Option<NodeList>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct TemplateExpressionData {
     pub head: NodeId,
     pub template_spans: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1620,8 +1411,6 @@ pub struct ThisTypeNodeData;
 #[derive(Clone, Debug)]
 pub struct ThrowStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1631,9 +1420,7 @@ pub struct TokenData;
 pub struct TryStatementData {
     pub catch_clause: Option<NodeId>,
     pub finally_block: Option<NodeId>,
-    pub flow_node: Option<FlowNodeId>,
     pub try_block: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1643,11 +1430,6 @@ pub struct TupleTypeNodeData {
 
 #[derive(Clone, Debug)]
 pub struct TypeAliasDeclarationData {
-    pub flow_node: Option<FlowNodeId>,
-    pub local_symbol: Option<SymbolId>,
-    pub locals: SymbolTable,
-    pub next_container: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub type_: NodeId,
     pub type_parameters: Option<NodeList>,
     pub modifiers: Option<ModifierList>,
@@ -1663,7 +1445,6 @@ pub struct TypeAssertionData {
 #[derive(Clone, Debug)]
 pub struct TypeLiteralNodeData {
     pub members: NodeList,
-    pub symbol: Option<SymbolId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1682,7 +1463,6 @@ pub struct TypeParameterDeclarationData {
     pub constraint: Option<NodeId>,
     pub default_type: Option<NodeId>,
     pub expression: Option<NodeId>,
-    pub symbol: Option<SymbolId>,
     pub modifiers: Option<ModifierList>,
     pub name: NodeId,
 }
@@ -1715,24 +1495,18 @@ pub struct UnionTypeNodeData {
 pub struct VariableDeclarationData {
     pub exclamation_token: Option<NodeId>,
     pub initializer: Option<NodeId>,
-    pub local_symbol: Option<SymbolId>,
-    pub symbol: Option<SymbolId>,
     pub type_: Option<NodeId>,
-    pub facts: u32,
     pub name: NodeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct VariableDeclarationListData {
     pub declarations: NodeList,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct VariableStatementData {
     pub declaration_list: NodeId,
-    pub flow_node: Option<FlowNodeId>,
-    pub facts: u32,
     pub modifiers: Option<ModifierList>,
 }
 
@@ -1744,17 +1518,13 @@ pub struct VoidExpressionData {
 #[derive(Clone, Debug)]
 pub struct WhileStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct WithStatementData {
     pub expression: NodeId,
-    pub flow_node: Option<FlowNodeId>,
     pub statement: NodeId,
-    pub facts: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1763,8 +1533,11 @@ pub struct YieldExpressionData {
     pub expression: Option<NodeId>,
 }
 
+/// The owning node data: one box per payload. Owned file versions (LSP)
+/// and synthetic nodes keep their data in it. Readers match its `view`.
 #[derive(Clone, Debug)]
-pub enum NodeData {
+#[repr(u8)]
+pub enum BoxedData {
     ArrayLiteralExpression(Box<ArrayLiteralExpressionData>),
     ArrayTypeNode(Box<ArrayTypeNodeData>),
     ArrowFunction(Box<ArrowFunctionData>),
@@ -1959,7 +1732,409 @@ pub enum NodeData {
     YieldExpression(Box<YieldExpressionData>),
 }
 
-impl NodeData {
+/// The node data that readers match: a tag and a reference (16 B), as Go's
+/// `nodeData` interface word. Same tags and order as `BoxedData`.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum NodeData<'a> {
+    ArrayLiteralExpression(&'a ArrayLiteralExpressionData),
+    ArrayTypeNode(&'a ArrayTypeNodeData),
+    ArrowFunction(&'a ArrowFunctionData),
+    AsExpression(&'a AsExpressionData),
+    AwaitExpression(&'a AwaitExpressionData),
+    BigIntLiteral(&'a BigIntLiteralData),
+    BinaryExpression(&'a BinaryExpressionData),
+    BindingElement(&'a BindingElementData),
+    BindingPattern(&'a BindingPatternData),
+    Block(&'a BlockData),
+    BreakStatement(&'a BreakStatementData),
+    CallExpression(&'a CallExpressionData),
+    CallSignatureDeclaration(&'a CallSignatureDeclarationData),
+    CaseBlock(&'a CaseBlockData),
+    CaseOrDefaultClause(&'a CaseOrDefaultClauseData),
+    CatchClause(&'a CatchClauseData),
+    ClassDeclaration(&'a ClassDeclarationData),
+    ClassExpression(&'a ClassExpressionData),
+    ClassStaticBlockDeclaration(&'a ClassStaticBlockDeclarationData),
+    ComputedPropertyName(&'a ComputedPropertyNameData),
+    ConditionalExpression(&'a ConditionalExpressionData),
+    ConditionalTypeNode(&'a ConditionalTypeNodeData),
+    ConstructSignatureDeclaration(&'a ConstructSignatureDeclarationData),
+    ConstructorDeclaration(&'a ConstructorDeclarationData),
+    ConstructorTypeNode(&'a ConstructorTypeNodeData),
+    ContinueStatement(&'a ContinueStatementData),
+    DebuggerStatement(&'a DebuggerStatementData),
+    Decorator(&'a DecoratorData),
+    DeleteExpression(&'a DeleteExpressionData),
+    DoStatement(&'a DoStatementData),
+    ElementAccessExpression(&'a ElementAccessExpressionData),
+    EmptyStatement(&'a EmptyStatementData),
+    EnumDeclaration(&'a EnumDeclarationData),
+    EnumMember(&'a EnumMemberData),
+    ExportAssignment(&'a ExportAssignmentData),
+    ExportDeclaration(&'a ExportDeclarationData),
+    ExportSpecifier(&'a ExportSpecifierData),
+    ExpressionStatement(&'a ExpressionStatementData),
+    ExpressionWithTypeArguments(&'a ExpressionWithTypeArgumentsData),
+    ExternalModuleReference(&'a ExternalModuleReferenceData),
+    ForInOrOfStatement(&'a ForInOrOfStatementData),
+    ForStatement(&'a ForStatementData),
+    FunctionDeclaration(&'a FunctionDeclarationData),
+    FunctionExpression(&'a FunctionExpressionData),
+    FunctionTypeNode(&'a FunctionTypeNodeData),
+    GetAccessorDeclaration(&'a GetAccessorDeclarationData),
+    HeritageClause(&'a HeritageClauseData),
+    Identifier(&'a IdentifierData),
+    IfStatement(&'a IfStatementData),
+    ImportAttribute(&'a ImportAttributeData),
+    ImportAttributes(&'a ImportAttributesData),
+    ImportClause(&'a ImportClauseData),
+    ImportDeclaration(&'a ImportDeclarationData),
+    ImportEqualsDeclaration(&'a ImportEqualsDeclarationData),
+    ImportSpecifier(&'a ImportSpecifierData),
+    ImportTypeNode(&'a ImportTypeNodeData),
+    IndexSignatureDeclaration(&'a IndexSignatureDeclarationData),
+    IndexedAccessTypeNode(&'a IndexedAccessTypeNodeData),
+    InferTypeNode(&'a InferTypeNodeData),
+    InterfaceDeclaration(&'a InterfaceDeclarationData),
+    IntersectionTypeNode(&'a IntersectionTypeNodeData),
+    JsDoc(&'a JsDocData),
+    JsDocAllType(&'a JsDocAllTypeData),
+    JsDocAugmentsTag(&'a JsDocAugmentsTagData),
+    JsDocCallbackTag(&'a JsDocCallbackTagData),
+    JsDocDeprecatedTag(&'a JsDocDeprecatedTagData),
+    JsDocImplementsTag(&'a JsDocImplementsTagData),
+    JsDocImportTag(&'a JsDocImportTagData),
+    JsDocLink(&'a JsDocLinkData),
+    JsDocLinkCode(&'a JsDocLinkCodeData),
+    JsDocLinkPlain(&'a JsDocLinkPlainData),
+    JsDocNameReference(&'a JsDocNameReferenceData),
+    JsDocNonNullableType(&'a JsDocNonNullableTypeData),
+    JsDocNullableType(&'a JsDocNullableTypeData),
+    JsDocOptionalType(&'a JsDocOptionalTypeData),
+    JsDocOverloadTag(&'a JsDocOverloadTagData),
+    JsDocOverrideTag(&'a JsDocOverrideTagData),
+    JsDocParameterOrPropertyTag(&'a JsDocParameterOrPropertyTagData),
+    JsDocPrivateTag(&'a JsDocPrivateTagData),
+    JsDocProtectedTag(&'a JsDocProtectedTagData),
+    JsDocPublicTag(&'a JsDocPublicTagData),
+    JsDocReadonlyTag(&'a JsDocReadonlyTagData),
+    JsDocReturnTag(&'a JsDocReturnTagData),
+    JsDocSatisfiesTag(&'a JsDocSatisfiesTagData),
+    JsDocSeeTag(&'a JsDocSeeTagData),
+    JsDocSignature(&'a JsDocSignatureData),
+    JsDocTemplateTag(&'a JsDocTemplateTagData),
+    JsDocText(&'a JsDocTextData),
+    JsDocThisTag(&'a JsDocThisTagData),
+    JsDocThrowsTag(&'a JsDocThrowsTagData),
+    JsDocTypeExpression(&'a JsDocTypeExpressionData),
+    JsDocTypeLiteral(&'a JsDocTypeLiteralData),
+    JsDocTypeTag(&'a JsDocTypeTagData),
+    JsDocTypedefTag(&'a JsDocTypedefTagData),
+    JsDocUnknownTag(&'a JsDocUnknownTagData),
+    JsDocVariadicType(&'a JsDocVariadicTypeData),
+    JsxAttribute(&'a JsxAttributeData),
+    JsxAttributes(&'a JsxAttributesData),
+    JsxClosingElement(&'a JsxClosingElementData),
+    JsxClosingFragment(&'a JsxClosingFragmentData),
+    JsxElement(&'a JsxElementData),
+    JsxExpression(&'a JsxExpressionData),
+    JsxFragment(&'a JsxFragmentData),
+    JsxNamespacedName(&'a JsxNamespacedNameData),
+    JsxOpeningElement(&'a JsxOpeningElementData),
+    JsxOpeningFragment(&'a JsxOpeningFragmentData),
+    JsxSelfClosingElement(&'a JsxSelfClosingElementData),
+    JsxSpreadAttribute(&'a JsxSpreadAttributeData),
+    JsxText(&'a JsxTextData),
+    KeywordExpression(&'a KeywordExpressionData),
+    KeywordTypeNode(&'a KeywordTypeNodeData),
+    LabeledStatement(&'a LabeledStatementData),
+    LiteralTypeNode(&'a LiteralTypeNodeData),
+    MappedTypeNode(&'a MappedTypeNodeData),
+    MetaProperty(&'a MetaPropertyData),
+    MethodDeclaration(&'a MethodDeclarationData),
+    MethodSignatureDeclaration(&'a MethodSignatureDeclarationData),
+    MissingDeclaration(&'a MissingDeclarationData),
+    ModuleBlock(&'a ModuleBlockData),
+    ModuleDeclaration(&'a ModuleDeclarationData),
+    NamedExports(&'a NamedExportsData),
+    NamedImports(&'a NamedImportsData),
+    NamedTupleMember(&'a NamedTupleMemberData),
+    NamespaceExport(&'a NamespaceExportData),
+    NamespaceExportDeclaration(&'a NamespaceExportDeclarationData),
+    NamespaceImport(&'a NamespaceImportData),
+    NewExpression(&'a NewExpressionData),
+    NoSubstitutionTemplateLiteral(&'a NoSubstitutionTemplateLiteralData),
+    NonNullExpression(&'a NonNullExpressionData),
+    NotEmittedStatement(&'a NotEmittedStatementData),
+    NotEmittedTypeElement(&'a NotEmittedTypeElementData),
+    NumericLiteral(&'a NumericLiteralData),
+    ObjectLiteralExpression(&'a ObjectLiteralExpressionData),
+    OmittedExpression(&'a OmittedExpressionData),
+    OptionalTypeNode(&'a OptionalTypeNodeData),
+    ParameterDeclaration(&'a ParameterDeclarationData),
+    ParenthesizedExpression(&'a ParenthesizedExpressionData),
+    ParenthesizedTypeNode(&'a ParenthesizedTypeNodeData),
+    PartiallyEmittedExpression(&'a PartiallyEmittedExpressionData),
+    PostfixUnaryExpression(&'a PostfixUnaryExpressionData),
+    PrefixUnaryExpression(&'a PrefixUnaryExpressionData),
+    PrivateIdentifier(&'a PrivateIdentifierData),
+    PropertyAccessExpression(&'a PropertyAccessExpressionData),
+    PropertyAssignment(&'a PropertyAssignmentData),
+    PropertyDeclaration(&'a PropertyDeclarationData),
+    PropertySignatureDeclaration(&'a PropertySignatureDeclarationData),
+    QualifiedName(&'a QualifiedNameData),
+    RegularExpressionLiteral(&'a RegularExpressionLiteralData),
+    RestTypeNode(&'a RestTypeNodeData),
+    ReturnStatement(&'a ReturnStatementData),
+    SatisfiesExpression(&'a SatisfiesExpressionData),
+    SemicolonClassElement(&'a SemicolonClassElementData),
+    SetAccessorDeclaration(&'a SetAccessorDeclarationData),
+    ShorthandPropertyAssignment(&'a ShorthandPropertyAssignmentData),
+    SourceFile(&'a SourceFileData),
+    SpreadAssignment(&'a SpreadAssignmentData),
+    SpreadElement(&'a SpreadElementData),
+    StringLiteral(&'a StringLiteralData),
+    SwitchStatement(&'a SwitchStatementData),
+    SyntaxList(&'a SyntaxListData),
+    SyntheticExpression(&'a SyntheticExpressionData),
+    SyntheticReferenceExpression(&'a SyntheticReferenceExpressionData),
+    TaggedTemplateExpression(&'a TaggedTemplateExpressionData),
+    TemplateExpression(&'a TemplateExpressionData),
+    TemplateHead(&'a TemplateHeadData),
+    TemplateLiteralTypeNode(&'a TemplateLiteralTypeNodeData),
+    TemplateLiteralTypeSpan(&'a TemplateLiteralTypeSpanData),
+    TemplateMiddle(&'a TemplateMiddleData),
+    TemplateSpan(&'a TemplateSpanData),
+    TemplateTail(&'a TemplateTailData),
+    ThisTypeNode(&'a ThisTypeNodeData),
+    ThrowStatement(&'a ThrowStatementData),
+    Token(&'a TokenData),
+    TryStatement(&'a TryStatementData),
+    TupleTypeNode(&'a TupleTypeNodeData),
+    TypeAliasDeclaration(&'a TypeAliasDeclarationData),
+    TypeAssertion(&'a TypeAssertionData),
+    TypeLiteralNode(&'a TypeLiteralNodeData),
+    TypeOfExpression(&'a TypeOfExpressionData),
+    TypeOperatorNode(&'a TypeOperatorNodeData),
+    TypeParameterDeclaration(&'a TypeParameterDeclarationData),
+    TypePredicateNode(&'a TypePredicateNodeData),
+    TypeQueryNode(&'a TypeQueryNodeData),
+    TypeReferenceNode(&'a TypeReferenceNodeData),
+    UnionTypeNode(&'a UnionTypeNodeData),
+    VariableDeclaration(&'a VariableDeclarationData),
+    VariableDeclarationList(&'a VariableDeclarationListData),
+    VariableStatement(&'a VariableStatementData),
+    VoidExpression(&'a VoidExpressionData),
+    WhileStatement(&'a WhileStatementData),
+    WithStatement(&'a WithStatementData),
+    YieldExpression(&'a YieldExpressionData),
+}
+
+impl BoxedData {
+    /// The view of the data. A 16 B copy: the two enums have one layout.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn view(&self) -> NodeData<'_> {
+        match self {
+            Self::ArrayLiteralExpression(d) => NodeData::ArrayLiteralExpression(d),
+            Self::ArrayTypeNode(d) => NodeData::ArrayTypeNode(d),
+            Self::ArrowFunction(d) => NodeData::ArrowFunction(d),
+            Self::AsExpression(d) => NodeData::AsExpression(d),
+            Self::AwaitExpression(d) => NodeData::AwaitExpression(d),
+            Self::BigIntLiteral(d) => NodeData::BigIntLiteral(d),
+            Self::BinaryExpression(d) => NodeData::BinaryExpression(d),
+            Self::BindingElement(d) => NodeData::BindingElement(d),
+            Self::BindingPattern(d) => NodeData::BindingPattern(d),
+            Self::Block(d) => NodeData::Block(d),
+            Self::BreakStatement(d) => NodeData::BreakStatement(d),
+            Self::CallExpression(d) => NodeData::CallExpression(d),
+            Self::CallSignatureDeclaration(d) => NodeData::CallSignatureDeclaration(d),
+            Self::CaseBlock(d) => NodeData::CaseBlock(d),
+            Self::CaseOrDefaultClause(d) => NodeData::CaseOrDefaultClause(d),
+            Self::CatchClause(d) => NodeData::CatchClause(d),
+            Self::ClassDeclaration(d) => NodeData::ClassDeclaration(d),
+            Self::ClassExpression(d) => NodeData::ClassExpression(d),
+            Self::ClassStaticBlockDeclaration(d) => NodeData::ClassStaticBlockDeclaration(d),
+            Self::ComputedPropertyName(d) => NodeData::ComputedPropertyName(d),
+            Self::ConditionalExpression(d) => NodeData::ConditionalExpression(d),
+            Self::ConditionalTypeNode(d) => NodeData::ConditionalTypeNode(d),
+            Self::ConstructSignatureDeclaration(d) => NodeData::ConstructSignatureDeclaration(d),
+            Self::ConstructorDeclaration(d) => NodeData::ConstructorDeclaration(d),
+            Self::ConstructorTypeNode(d) => NodeData::ConstructorTypeNode(d),
+            Self::ContinueStatement(d) => NodeData::ContinueStatement(d),
+            Self::DebuggerStatement(d) => NodeData::DebuggerStatement(d),
+            Self::Decorator(d) => NodeData::Decorator(d),
+            Self::DeleteExpression(d) => NodeData::DeleteExpression(d),
+            Self::DoStatement(d) => NodeData::DoStatement(d),
+            Self::ElementAccessExpression(d) => NodeData::ElementAccessExpression(d),
+            Self::EmptyStatement(d) => NodeData::EmptyStatement(d),
+            Self::EnumDeclaration(d) => NodeData::EnumDeclaration(d),
+            Self::EnumMember(d) => NodeData::EnumMember(d),
+            Self::ExportAssignment(d) => NodeData::ExportAssignment(d),
+            Self::ExportDeclaration(d) => NodeData::ExportDeclaration(d),
+            Self::ExportSpecifier(d) => NodeData::ExportSpecifier(d),
+            Self::ExpressionStatement(d) => NodeData::ExpressionStatement(d),
+            Self::ExpressionWithTypeArguments(d) => NodeData::ExpressionWithTypeArguments(d),
+            Self::ExternalModuleReference(d) => NodeData::ExternalModuleReference(d),
+            Self::ForInOrOfStatement(d) => NodeData::ForInOrOfStatement(d),
+            Self::ForStatement(d) => NodeData::ForStatement(d),
+            Self::FunctionDeclaration(d) => NodeData::FunctionDeclaration(d),
+            Self::FunctionExpression(d) => NodeData::FunctionExpression(d),
+            Self::FunctionTypeNode(d) => NodeData::FunctionTypeNode(d),
+            Self::GetAccessorDeclaration(d) => NodeData::GetAccessorDeclaration(d),
+            Self::HeritageClause(d) => NodeData::HeritageClause(d),
+            Self::Identifier(d) => NodeData::Identifier(d),
+            Self::IfStatement(d) => NodeData::IfStatement(d),
+            Self::ImportAttribute(d) => NodeData::ImportAttribute(d),
+            Self::ImportAttributes(d) => NodeData::ImportAttributes(d),
+            Self::ImportClause(d) => NodeData::ImportClause(d),
+            Self::ImportDeclaration(d) => NodeData::ImportDeclaration(d),
+            Self::ImportEqualsDeclaration(d) => NodeData::ImportEqualsDeclaration(d),
+            Self::ImportSpecifier(d) => NodeData::ImportSpecifier(d),
+            Self::ImportTypeNode(d) => NodeData::ImportTypeNode(d),
+            Self::IndexSignatureDeclaration(d) => NodeData::IndexSignatureDeclaration(d),
+            Self::IndexedAccessTypeNode(d) => NodeData::IndexedAccessTypeNode(d),
+            Self::InferTypeNode(d) => NodeData::InferTypeNode(d),
+            Self::InterfaceDeclaration(d) => NodeData::InterfaceDeclaration(d),
+            Self::IntersectionTypeNode(d) => NodeData::IntersectionTypeNode(d),
+            Self::JsDoc(d) => NodeData::JsDoc(d),
+            Self::JsDocAllType(d) => NodeData::JsDocAllType(d),
+            Self::JsDocAugmentsTag(d) => NodeData::JsDocAugmentsTag(d),
+            Self::JsDocCallbackTag(d) => NodeData::JsDocCallbackTag(d),
+            Self::JsDocDeprecatedTag(d) => NodeData::JsDocDeprecatedTag(d),
+            Self::JsDocImplementsTag(d) => NodeData::JsDocImplementsTag(d),
+            Self::JsDocImportTag(d) => NodeData::JsDocImportTag(d),
+            Self::JsDocLink(d) => NodeData::JsDocLink(d),
+            Self::JsDocLinkCode(d) => NodeData::JsDocLinkCode(d),
+            Self::JsDocLinkPlain(d) => NodeData::JsDocLinkPlain(d),
+            Self::JsDocNameReference(d) => NodeData::JsDocNameReference(d),
+            Self::JsDocNonNullableType(d) => NodeData::JsDocNonNullableType(d),
+            Self::JsDocNullableType(d) => NodeData::JsDocNullableType(d),
+            Self::JsDocOptionalType(d) => NodeData::JsDocOptionalType(d),
+            Self::JsDocOverloadTag(d) => NodeData::JsDocOverloadTag(d),
+            Self::JsDocOverrideTag(d) => NodeData::JsDocOverrideTag(d),
+            Self::JsDocParameterOrPropertyTag(d) => NodeData::JsDocParameterOrPropertyTag(d),
+            Self::JsDocPrivateTag(d) => NodeData::JsDocPrivateTag(d),
+            Self::JsDocProtectedTag(d) => NodeData::JsDocProtectedTag(d),
+            Self::JsDocPublicTag(d) => NodeData::JsDocPublicTag(d),
+            Self::JsDocReadonlyTag(d) => NodeData::JsDocReadonlyTag(d),
+            Self::JsDocReturnTag(d) => NodeData::JsDocReturnTag(d),
+            Self::JsDocSatisfiesTag(d) => NodeData::JsDocSatisfiesTag(d),
+            Self::JsDocSeeTag(d) => NodeData::JsDocSeeTag(d),
+            Self::JsDocSignature(d) => NodeData::JsDocSignature(d),
+            Self::JsDocTemplateTag(d) => NodeData::JsDocTemplateTag(d),
+            Self::JsDocText(d) => NodeData::JsDocText(d),
+            Self::JsDocThisTag(d) => NodeData::JsDocThisTag(d),
+            Self::JsDocThrowsTag(d) => NodeData::JsDocThrowsTag(d),
+            Self::JsDocTypeExpression(d) => NodeData::JsDocTypeExpression(d),
+            Self::JsDocTypeLiteral(d) => NodeData::JsDocTypeLiteral(d),
+            Self::JsDocTypeTag(d) => NodeData::JsDocTypeTag(d),
+            Self::JsDocTypedefTag(d) => NodeData::JsDocTypedefTag(d),
+            Self::JsDocUnknownTag(d) => NodeData::JsDocUnknownTag(d),
+            Self::JsDocVariadicType(d) => NodeData::JsDocVariadicType(d),
+            Self::JsxAttribute(d) => NodeData::JsxAttribute(d),
+            Self::JsxAttributes(d) => NodeData::JsxAttributes(d),
+            Self::JsxClosingElement(d) => NodeData::JsxClosingElement(d),
+            Self::JsxClosingFragment(d) => NodeData::JsxClosingFragment(d),
+            Self::JsxElement(d) => NodeData::JsxElement(d),
+            Self::JsxExpression(d) => NodeData::JsxExpression(d),
+            Self::JsxFragment(d) => NodeData::JsxFragment(d),
+            Self::JsxNamespacedName(d) => NodeData::JsxNamespacedName(d),
+            Self::JsxOpeningElement(d) => NodeData::JsxOpeningElement(d),
+            Self::JsxOpeningFragment(d) => NodeData::JsxOpeningFragment(d),
+            Self::JsxSelfClosingElement(d) => NodeData::JsxSelfClosingElement(d),
+            Self::JsxSpreadAttribute(d) => NodeData::JsxSpreadAttribute(d),
+            Self::JsxText(d) => NodeData::JsxText(d),
+            Self::KeywordExpression(d) => NodeData::KeywordExpression(d),
+            Self::KeywordTypeNode(d) => NodeData::KeywordTypeNode(d),
+            Self::LabeledStatement(d) => NodeData::LabeledStatement(d),
+            Self::LiteralTypeNode(d) => NodeData::LiteralTypeNode(d),
+            Self::MappedTypeNode(d) => NodeData::MappedTypeNode(d),
+            Self::MetaProperty(d) => NodeData::MetaProperty(d),
+            Self::MethodDeclaration(d) => NodeData::MethodDeclaration(d),
+            Self::MethodSignatureDeclaration(d) => NodeData::MethodSignatureDeclaration(d),
+            Self::MissingDeclaration(d) => NodeData::MissingDeclaration(d),
+            Self::ModuleBlock(d) => NodeData::ModuleBlock(d),
+            Self::ModuleDeclaration(d) => NodeData::ModuleDeclaration(d),
+            Self::NamedExports(d) => NodeData::NamedExports(d),
+            Self::NamedImports(d) => NodeData::NamedImports(d),
+            Self::NamedTupleMember(d) => NodeData::NamedTupleMember(d),
+            Self::NamespaceExport(d) => NodeData::NamespaceExport(d),
+            Self::NamespaceExportDeclaration(d) => NodeData::NamespaceExportDeclaration(d),
+            Self::NamespaceImport(d) => NodeData::NamespaceImport(d),
+            Self::NewExpression(d) => NodeData::NewExpression(d),
+            Self::NoSubstitutionTemplateLiteral(d) => NodeData::NoSubstitutionTemplateLiteral(d),
+            Self::NonNullExpression(d) => NodeData::NonNullExpression(d),
+            Self::NotEmittedStatement(d) => NodeData::NotEmittedStatement(d),
+            Self::NotEmittedTypeElement(d) => NodeData::NotEmittedTypeElement(d),
+            Self::NumericLiteral(d) => NodeData::NumericLiteral(d),
+            Self::ObjectLiteralExpression(d) => NodeData::ObjectLiteralExpression(d),
+            Self::OmittedExpression(d) => NodeData::OmittedExpression(d),
+            Self::OptionalTypeNode(d) => NodeData::OptionalTypeNode(d),
+            Self::ParameterDeclaration(d) => NodeData::ParameterDeclaration(d),
+            Self::ParenthesizedExpression(d) => NodeData::ParenthesizedExpression(d),
+            Self::ParenthesizedTypeNode(d) => NodeData::ParenthesizedTypeNode(d),
+            Self::PartiallyEmittedExpression(d) => NodeData::PartiallyEmittedExpression(d),
+            Self::PostfixUnaryExpression(d) => NodeData::PostfixUnaryExpression(d),
+            Self::PrefixUnaryExpression(d) => NodeData::PrefixUnaryExpression(d),
+            Self::PrivateIdentifier(d) => NodeData::PrivateIdentifier(d),
+            Self::PropertyAccessExpression(d) => NodeData::PropertyAccessExpression(d),
+            Self::PropertyAssignment(d) => NodeData::PropertyAssignment(d),
+            Self::PropertyDeclaration(d) => NodeData::PropertyDeclaration(d),
+            Self::PropertySignatureDeclaration(d) => NodeData::PropertySignatureDeclaration(d),
+            Self::QualifiedName(d) => NodeData::QualifiedName(d),
+            Self::RegularExpressionLiteral(d) => NodeData::RegularExpressionLiteral(d),
+            Self::RestTypeNode(d) => NodeData::RestTypeNode(d),
+            Self::ReturnStatement(d) => NodeData::ReturnStatement(d),
+            Self::SatisfiesExpression(d) => NodeData::SatisfiesExpression(d),
+            Self::SemicolonClassElement(d) => NodeData::SemicolonClassElement(d),
+            Self::SetAccessorDeclaration(d) => NodeData::SetAccessorDeclaration(d),
+            Self::ShorthandPropertyAssignment(d) => NodeData::ShorthandPropertyAssignment(d),
+            Self::SourceFile(d) => NodeData::SourceFile(d),
+            Self::SpreadAssignment(d) => NodeData::SpreadAssignment(d),
+            Self::SpreadElement(d) => NodeData::SpreadElement(d),
+            Self::StringLiteral(d) => NodeData::StringLiteral(d),
+            Self::SwitchStatement(d) => NodeData::SwitchStatement(d),
+            Self::SyntaxList(d) => NodeData::SyntaxList(d),
+            Self::SyntheticExpression(d) => NodeData::SyntheticExpression(d),
+            Self::SyntheticReferenceExpression(d) => NodeData::SyntheticReferenceExpression(d),
+            Self::TaggedTemplateExpression(d) => NodeData::TaggedTemplateExpression(d),
+            Self::TemplateExpression(d) => NodeData::TemplateExpression(d),
+            Self::TemplateHead(d) => NodeData::TemplateHead(d),
+            Self::TemplateLiteralTypeNode(d) => NodeData::TemplateLiteralTypeNode(d),
+            Self::TemplateLiteralTypeSpan(d) => NodeData::TemplateLiteralTypeSpan(d),
+            Self::TemplateMiddle(d) => NodeData::TemplateMiddle(d),
+            Self::TemplateSpan(d) => NodeData::TemplateSpan(d),
+            Self::TemplateTail(d) => NodeData::TemplateTail(d),
+            Self::ThisTypeNode(d) => NodeData::ThisTypeNode(d),
+            Self::ThrowStatement(d) => NodeData::ThrowStatement(d),
+            Self::Token(d) => NodeData::Token(d),
+            Self::TryStatement(d) => NodeData::TryStatement(d),
+            Self::TupleTypeNode(d) => NodeData::TupleTypeNode(d),
+            Self::TypeAliasDeclaration(d) => NodeData::TypeAliasDeclaration(d),
+            Self::TypeAssertion(d) => NodeData::TypeAssertion(d),
+            Self::TypeLiteralNode(d) => NodeData::TypeLiteralNode(d),
+            Self::TypeOfExpression(d) => NodeData::TypeOfExpression(d),
+            Self::TypeOperatorNode(d) => NodeData::TypeOperatorNode(d),
+            Self::TypeParameterDeclaration(d) => NodeData::TypeParameterDeclaration(d),
+            Self::TypePredicateNode(d) => NodeData::TypePredicateNode(d),
+            Self::TypeQueryNode(d) => NodeData::TypeQueryNode(d),
+            Self::TypeReferenceNode(d) => NodeData::TypeReferenceNode(d),
+            Self::UnionTypeNode(d) => NodeData::UnionTypeNode(d),
+            Self::VariableDeclaration(d) => NodeData::VariableDeclaration(d),
+            Self::VariableDeclarationList(d) => NodeData::VariableDeclarationList(d),
+            Self::VariableStatement(d) => NodeData::VariableStatement(d),
+            Self::VoidExpression(d) => NodeData::VoidExpression(d),
+            Self::WhileStatement(d) => NodeData::WhileStatement(d),
+            Self::WithStatement(d) => NodeData::WithStatement(d),
+            Self::YieldExpression(d) => NodeData::YieldExpression(d),
+        }
+    }
+}
+
+impl<'a> NodeData<'a> {
     pub const SCHEMA_NODE_COUNT: usize = 192;
     pub const SCHEMA_BASE_COUNT: usize = 35;
     pub const SCHEMA_NODE_ALIAS_COUNT: usize = 72;
@@ -1967,7 +2142,7 @@ impl NodeData {
 
     #[must_use]
     #[allow(clippy::too_many_lines)]
-    pub const fn schema_name(&self) -> &'static str {
+    pub const fn schema_name(self) -> &'static str {
         match self {
             Self::ArrayLiteralExpression(..) => "ArrayLiteralExpression",
             Self::ArrayTypeNode(..) => "ArrayTypeNode",
@@ -2168,35 +2343,35 @@ impl NodeData {
     ///
     /// Returning [`std::ops::ControlFlow::Break`] stops traversal immediately.
     #[allow(clippy::match_same_arms, clippy::too_many_lines)]
-    pub fn try_for_each_child<B, F>(&self, visitor: &mut F) -> std::ops::ControlFlow<B>
+    pub fn try_for_each_child<B, F>(self, visitor: &mut F) -> std::ops::ControlFlow<B>
     where
-        F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+        F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
     {
         // BEGIN schema-exhaustive direct child visitor
         match self {
-            Self::ArrayLiteralExpression(node) => visit_node_list(visitor, &node.elements),
-            Self::ArrayTypeNode(node) => visitor(node.element_type),
+            Self::ArrayLiteralExpression(node) => visitor(Child::List(node.elements)),
+            Self::ArrayTypeNode(node) => visitor(Child::Node(node.element_type)),
             Self::ArrowFunction(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
-                visitor(node.equals_greater_than_token)?;
-                visitor(node.body)
+                visitor(Child::Node(node.equals_greater_than_token))?;
+                visitor(Child::Node(node.body))
             }
             Self::AsExpression(node) => {
-                visitor(node.expression)?;
-                visitor(node.type_)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.type_))
             }
-            Self::AwaitExpression(node) => visitor(node.expression),
+            Self::AwaitExpression(node) => visitor(Child::Node(node.expression)),
             Self::BigIntLiteral(..) => std::ops::ControlFlow::Continue(()),
             Self::BinaryExpression(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.left)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.left))?;
                 visit_optional_child(visitor, node.type_)?;
-                visitor(node.operator_token)?;
-                visitor(node.right)
+                visitor(Child::Node(node.operator_token))?;
+                visitor(Child::Node(node.right))
             }
             Self::BindingElement(node) => {
                 visit_optional_child(visitor, node.dot_dot_dot_token)?;
@@ -2204,642 +2379,640 @@ impl NodeData {
                 visit_optional_child(visitor, node.name)?;
                 visit_optional_child(visitor, node.initializer)
             }
-            Self::BindingPattern(node) => visit_node_list(visitor, &node.elements),
-            Self::Block(node) => visit_node_list(visitor, &node.statements),
+            Self::BindingPattern(node) => visitor(Child::List(node.elements)),
+            Self::Block(node) => visitor(Child::List(node.statements)),
             Self::BreakStatement(node) => visit_optional_child(visitor, node.label),
             Self::CallExpression(node) => {
-                visitor(node.expression)?;
+                visitor(Child::Node(node.expression))?;
                 visit_optional_child(visitor, node.question_dot_token)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())?;
-                visit_node_list(visitor, &node.arguments)
+                visit_optional_node_list(visitor, node.type_arguments)?;
+                visitor(Child::List(node.arguments))
             }
             Self::CallSignatureDeclaration(node) => {
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
-            Self::CaseBlock(node) => visit_node_list(visitor, &node.clauses),
+            Self::CaseBlock(node) => visitor(Child::List(node.clauses)),
             Self::CaseOrDefaultClause(node) => {
-                visitor(node.expression)?;
-                visit_node_list(visitor, &node.statements)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::List(node.statements))
             }
             Self::CatchClause(node) => {
                 visit_optional_child(visitor, node.variable_declaration)?;
-                visitor(node.block)
+                visitor(Child::Node(node.block))
             }
             Self::ClassDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_optional_node_list(visitor, node.heritage_clauses.as_ref())?;
-                visit_node_list(visitor, &node.members)
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visit_optional_node_list(visitor, node.heritage_clauses)?;
+                visitor(Child::List(node.members))
             }
             Self::ClassExpression(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_optional_node_list(visitor, node.heritage_clauses.as_ref())?;
-                visit_node_list(visitor, &node.members)
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visit_optional_node_list(visitor, node.heritage_clauses)?;
+                visitor(Child::List(node.members))
             }
             Self::ClassStaticBlockDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.body)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.body))
             }
-            Self::ComputedPropertyName(node) => visitor(node.expression),
+            Self::ComputedPropertyName(node) => visitor(Child::Node(node.expression)),
             Self::ConditionalExpression(node) => {
-                visitor(node.condition)?;
-                visitor(node.question_token)?;
-                visitor(node.when_true)?;
-                visitor(node.colon_token)?;
-                visitor(node.when_false)
+                visitor(Child::Node(node.condition))?;
+                visitor(Child::Node(node.question_token))?;
+                visitor(Child::Node(node.when_true))?;
+                visitor(Child::Node(node.colon_token))?;
+                visitor(Child::Node(node.when_false))
             }
             Self::ConditionalTypeNode(node) => {
-                visitor(node.check_type)?;
-                visitor(node.extends_type)?;
-                visitor(node.true_type)?;
-                visitor(node.false_type)
+                visitor(Child::Node(node.check_type))?;
+                visitor(Child::Node(node.extends_type))?;
+                visitor(Child::Node(node.true_type))?;
+                visitor(Child::Node(node.false_type))
             }
             Self::ConstructSignatureDeclaration(node) => {
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
             Self::ConstructorDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
                 visit_optional_child(visitor, node.body)
             }
             Self::ConstructorTypeNode(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
             Self::ContinueStatement(node) => visit_optional_child(visitor, node.label),
             Self::DebuggerStatement(..) => std::ops::ControlFlow::Continue(()),
-            Self::Decorator(node) => visitor(node.expression),
-            Self::DeleteExpression(node) => visitor(node.expression),
+            Self::Decorator(node) => visitor(Child::Node(node.expression)),
+            Self::DeleteExpression(node) => visitor(Child::Node(node.expression)),
             Self::DoStatement(node) => {
-                visitor(node.statement)?;
-                visitor(node.expression)
+                visitor(Child::Node(node.statement))?;
+                visitor(Child::Node(node.expression))
             }
             Self::ElementAccessExpression(node) => {
-                visitor(node.expression)?;
+                visitor(Child::Node(node.expression))?;
                 visit_optional_child(visitor, node.question_dot_token)?;
-                visitor(node.argument_expression)
+                visitor(Child::Node(node.argument_expression))
             }
             Self::EmptyStatement(..) => std::ops::ControlFlow::Continue(()),
             Self::EnumDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visit_node_list(visitor, &node.members)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visitor(Child::List(node.members))
             }
             Self::EnumMember(node) => {
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.initializer)
             }
             Self::ExportAssignment(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.type_)?;
-                visitor(node.expression)
+                visitor(Child::Node(node.expression))
             }
             Self::ExportDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.export_clause)?;
                 visit_optional_child(visitor, node.module_specifier)?;
                 visit_optional_child(visitor, node.attributes)
             }
             Self::ExportSpecifier(node) => {
                 visit_optional_child(visitor, node.property_name)?;
-                visitor(node.name)
+                visitor(Child::Node(node.name))
             }
-            Self::ExpressionStatement(node) => visitor(node.expression),
+            Self::ExpressionStatement(node) => visitor(Child::Node(node.expression)),
             Self::ExpressionWithTypeArguments(node) => {
-                visitor(node.expression)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())
+                visitor(Child::Node(node.expression))?;
+                visit_optional_node_list(visitor, node.type_arguments)
             }
-            Self::ExternalModuleReference(node) => visitor(node.expression),
+            Self::ExternalModuleReference(node) => visitor(Child::Node(node.expression)),
             Self::ForInOrOfStatement(node) => {
                 visit_optional_child(visitor, node.await_modifier)?;
-                visitor(node.initializer)?;
-                visitor(node.expression)?;
-                visitor(node.statement)
+                visitor(Child::Node(node.initializer))?;
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.statement))
             }
             Self::ForStatement(node) => {
                 visit_optional_child(visitor, node.initializer)?;
                 visit_optional_child(visitor, node.condition)?;
                 visit_optional_child(visitor, node.incrementor)?;
-                visitor(node.statement)
+                visitor(Child::Node(node.statement))
             }
             Self::FunctionDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.asterisk_token)?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
                 visit_optional_child(visitor, node.body)
             }
             Self::FunctionExpression(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.asterisk_token)?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
-                visitor(node.body)
+                visitor(Child::Node(node.body))
             }
             Self::FunctionTypeNode(node) => {
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
             Self::GetAccessorDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
                 visit_optional_child(visitor, node.body)
             }
-            Self::HeritageClause(node) => visit_node_list(visitor, &node.types),
+            Self::HeritageClause(node) => visitor(Child::List(node.types)),
             Self::Identifier(..) => std::ops::ControlFlow::Continue(()),
             Self::IfStatement(node) => {
-                visitor(node.expression)?;
-                visitor(node.then_statement)?;
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.then_statement))?;
                 visit_optional_child(visitor, node.else_statement)
             }
             Self::ImportAttribute(node) => {
-                visitor(node.name)?;
-                visitor(node.value)
+                visitor(Child::Node(node.name))?;
+                visitor(Child::Node(node.value))
             }
-            Self::ImportAttributes(node) => visit_node_list(visitor, &node.attributes),
+            Self::ImportAttributes(node) => visitor(Child::List(node.attributes)),
             Self::ImportClause(node) => {
                 visit_optional_child(visitor, node.name)?;
                 visit_optional_child(visitor, node.named_bindings)
             }
             Self::ImportDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.import_clause)?;
-                visitor(node.module_specifier)?;
+                visitor(Child::Node(node.module_specifier))?;
                 visit_optional_child(visitor, node.attributes)
             }
             Self::ImportEqualsDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visitor(node.module_reference)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visitor(Child::Node(node.module_reference))
             }
             Self::ImportSpecifier(node) => {
                 visit_optional_child(visitor, node.property_name)?;
-                visitor(node.name)
+                visitor(Child::Node(node.name))
             }
             Self::ImportTypeNode(node) => {
-                visitor(node.argument)?;
+                visitor(Child::Node(node.argument))?;
                 visit_optional_child(visitor, node.attributes)?;
                 visit_optional_child(visitor, node.qualifier)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())
+                visit_optional_node_list(visitor, node.type_arguments)
             }
             Self::IndexSignatureDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
-                visitor(node.type_)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::List(node.parameters))?;
+                visitor(Child::Node(node.type_))
             }
             Self::IndexedAccessTypeNode(node) => {
-                visitor(node.object_type)?;
-                visitor(node.index_type)
+                visitor(Child::Node(node.object_type))?;
+                visitor(Child::Node(node.index_type))
             }
-            Self::InferTypeNode(node) => visitor(node.type_parameter),
+            Self::InferTypeNode(node) => visitor(Child::Node(node.type_parameter)),
             Self::InterfaceDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_optional_node_list(visitor, node.heritage_clauses.as_ref())?;
-                visit_node_list(visitor, &node.members)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visit_optional_node_list(visitor, node.heritage_clauses)?;
+                visitor(Child::List(node.members))
             }
-            Self::IntersectionTypeNode(node) => visit_node_list(visitor, &node.types),
+            Self::IntersectionTypeNode(node) => visitor(Child::List(node.types)),
             Self::JsDoc(node) => {
-                visit_node_list(visitor, &node.comment)?;
-                visit_optional_node_list(visitor, node.tags.as_ref())
+                visitor(Child::List(node.comment))?;
+                visit_optional_node_list(visitor, node.tags)
             }
             Self::JsDocAllType(..) => std::ops::ControlFlow::Continue(()),
             Self::JsDocAugmentsTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.class_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.class_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocCallbackTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.type_expression)?;
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.type_expression))?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocDeprecatedTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocImplementsTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.class_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.class_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocImportTag(node) => {
-                visitor(node.tag_name)?;
+                visitor(Child::Node(node.tag_name))?;
                 visit_optional_child(visitor, node.import_clause)?;
-                visitor(node.module_specifier)?;
+                visitor(Child::Node(node.module_specifier))?;
                 visit_optional_child(visitor, node.attributes)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocLink(node) => visit_optional_child(visitor, node.name),
             Self::JsDocLinkCode(node) => visit_optional_child(visitor, node.name),
             Self::JsDocLinkPlain(node) => visit_optional_child(visitor, node.name),
-            Self::JsDocNameReference(node) => visitor(node.name),
-            Self::JsDocNonNullableType(node) => visitor(node.type_),
-            Self::JsDocNullableType(node) => visitor(node.type_),
-            Self::JsDocOptionalType(node) => visitor(node.type_),
+            Self::JsDocNameReference(node) => visitor(Child::Node(node.name)),
+            Self::JsDocNonNullableType(node) => visitor(Child::Node(node.type_)),
+            Self::JsDocNullableType(node) => visitor(Child::Node(node.type_)),
+            Self::JsDocOptionalType(node) => visitor(Child::Node(node.type_)),
             Self::JsDocOverloadTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.type_expression))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocOverrideTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocParameterOrPropertyTag(node) => {
-                visitor(node.tag_name)?;
+                visitor(Child::Node(node.tag_name))?;
                 if node.is_name_first {
-                    visitor(node.name)?;
+                    visitor(Child::Node(node.name))?;
                     visit_optional_child(visitor, node.type_expression)?;
                 } else {
                     visit_optional_child(visitor, node.type_expression)?;
-                    visitor(node.name)?;
+                    visitor(Child::Node(node.name))?;
                 }
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocPrivateTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocProtectedTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocPublicTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocReadonlyTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocReturnTag(node) => {
-                visitor(node.tag_name)?;
+                visitor(Child::Node(node.tag_name))?;
                 visit_optional_child(visitor, node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocSatisfiesTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.type_expression))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocSeeTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.name_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.name_expression))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocSignature(node) => {
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
             Self::JsDocTemplateTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.constraint)?;
-                visit_node_list(visitor, &node.type_parameters)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.constraint))?;
+                visitor(Child::List(node.type_parameters))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocText(..) => std::ops::ControlFlow::Continue(()),
             Self::JsDocThisTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.type_expression))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocThrowsTag(node) => {
-                visitor(node.tag_name)?;
+                visitor(Child::Node(node.tag_name))?;
                 visit_optional_child(visitor, node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
-            Self::JsDocTypeExpression(node) => visitor(node.type_),
+            Self::JsDocTypeExpression(node) => visitor(Child::Node(node.type_)),
             Self::JsDocTypeLiteral(node) => {
                 visit_optional_children(visitor, node.js_doc_property_tags.as_deref())
             }
             Self::JsDocTypeTag(node) => {
-                visitor(node.tag_name)?;
-                visitor(node.type_expression)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visitor(Child::Node(node.type_expression))?;
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocTypedefTag(node) => {
-                visitor(node.tag_name)?;
+                visitor(Child::Node(node.tag_name))?;
                 visit_optional_child(visitor, node.type_expression)?;
                 visit_optional_child(visitor, node.name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visit_optional_node_list(visitor, node.comment)
             }
             Self::JsDocUnknownTag(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.comment.as_ref())
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.comment)
             }
-            Self::JsDocVariadicType(node) => visitor(node.type_),
+            Self::JsDocVariadicType(node) => visitor(Child::Node(node.type_)),
             Self::JsxAttribute(node) => {
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.initializer)
             }
-            Self::JsxAttributes(node) => visit_node_list(visitor, &node.properties),
-            Self::JsxClosingElement(node) => visitor(node.tag_name),
+            Self::JsxAttributes(node) => visitor(Child::List(node.properties)),
+            Self::JsxClosingElement(node) => visitor(Child::Node(node.tag_name)),
             Self::JsxClosingFragment(..) => std::ops::ControlFlow::Continue(()),
             Self::JsxElement(node) => {
-                visitor(node.opening_element)?;
-                visit_node_list(visitor, &node.children)?;
-                visitor(node.closing_element)
+                visitor(Child::Node(node.opening_element))?;
+                visitor(Child::List(node.children))?;
+                visitor(Child::Node(node.closing_element))
             }
             Self::JsxExpression(node) => {
                 visit_optional_child(visitor, node.dot_dot_dot_token)?;
                 visit_optional_child(visitor, node.expression)
             }
             Self::JsxFragment(node) => {
-                visitor(node.opening_fragment)?;
-                visit_node_list(visitor, &node.children)?;
-                visitor(node.closing_fragment)
+                visitor(Child::Node(node.opening_fragment))?;
+                visitor(Child::List(node.children))?;
+                visitor(Child::Node(node.closing_fragment))
             }
             Self::JsxNamespacedName(node) => {
-                visitor(node.namespace)?;
-                visitor(node.name)
+                visitor(Child::Node(node.namespace))?;
+                visitor(Child::Node(node.name))
             }
             Self::JsxOpeningElement(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())?;
-                visitor(node.attributes)
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.type_arguments)?;
+                visitor(Child::Node(node.attributes))
             }
             Self::JsxOpeningFragment(..) => std::ops::ControlFlow::Continue(()),
             Self::JsxSelfClosingElement(node) => {
-                visitor(node.tag_name)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())?;
-                visitor(node.attributes)
+                visitor(Child::Node(node.tag_name))?;
+                visit_optional_node_list(visitor, node.type_arguments)?;
+                visitor(Child::Node(node.attributes))
             }
-            Self::JsxSpreadAttribute(node) => visitor(node.expression),
+            Self::JsxSpreadAttribute(node) => visitor(Child::Node(node.expression)),
             Self::JsxText(..) => std::ops::ControlFlow::Continue(()),
             Self::KeywordExpression(..) => std::ops::ControlFlow::Continue(()),
             Self::KeywordTypeNode(..) => std::ops::ControlFlow::Continue(()),
             Self::LabeledStatement(node) => {
-                visitor(node.label)?;
-                visitor(node.statement)
+                visitor(Child::Node(node.label))?;
+                visitor(Child::Node(node.statement))
             }
-            Self::LiteralTypeNode(node) => visitor(node.literal),
+            Self::LiteralTypeNode(node) => visitor(Child::Node(node.literal)),
             Self::MappedTypeNode(node) => {
                 visit_optional_child(visitor, node.readonly_token)?;
-                visitor(node.type_parameter)?;
+                visitor(Child::Node(node.type_parameter))?;
                 visit_optional_child(visitor, node.name_type)?;
                 visit_optional_child(visitor, node.question_token)?;
                 visit_optional_child(visitor, node.type_)?;
-                visit_optional_node_list(visitor, node.members.as_ref())
+                visit_optional_node_list(visitor, node.members)
             }
-            Self::MetaProperty(node) => visitor(node.name),
+            Self::MetaProperty(node) => visitor(Child::Node(node.name)),
             Self::MethodDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.asterisk_token)?;
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
                 visit_optional_child(visitor, node.body)
             }
             Self::MethodSignatureDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)
             }
-            Self::MissingDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())
-            }
-            Self::ModuleBlock(node) => visit_node_list(visitor, &node.statements),
+            Self::MissingDeclaration(node) => visit_optional_modifier_list(visitor, node.modifiers),
+            Self::ModuleBlock(node) => visitor(Child::List(node.statements)),
             Self::ModuleDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.attributes)?;
                 visit_optional_child(visitor, node.body)
             }
-            Self::NamedExports(node) => visit_node_list(visitor, &node.elements),
-            Self::NamedImports(node) => visit_node_list(visitor, &node.elements),
+            Self::NamedExports(node) => visitor(Child::List(node.elements)),
+            Self::NamedImports(node) => visitor(Child::List(node.elements)),
             Self::NamedTupleMember(node) => {
                 visit_optional_child(visitor, node.dot_dot_dot_token)?;
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.question_token)?;
-                visitor(node.type_)
+                visitor(Child::Node(node.type_))
             }
-            Self::NamespaceExport(node) => visitor(node.name),
+            Self::NamespaceExport(node) => visitor(Child::Node(node.name)),
             Self::NamespaceExportDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))
             }
-            Self::NamespaceImport(node) => visitor(node.name),
+            Self::NamespaceImport(node) => visitor(Child::Node(node.name)),
             Self::NewExpression(node) => {
-                visitor(node.expression)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())?;
-                visit_optional_node_list(visitor, node.arguments.as_ref())
+                visitor(Child::Node(node.expression))?;
+                visit_optional_node_list(visitor, node.type_arguments)?;
+                visit_optional_node_list(visitor, node.arguments)
             }
             Self::NoSubstitutionTemplateLiteral(..) => std::ops::ControlFlow::Continue(()),
-            Self::NonNullExpression(node) => visitor(node.expression),
+            Self::NonNullExpression(node) => visitor(Child::Node(node.expression)),
             Self::NotEmittedStatement(..) => std::ops::ControlFlow::Continue(()),
             Self::NotEmittedTypeElement(..) => std::ops::ControlFlow::Continue(()),
             Self::NumericLiteral(..) => std::ops::ControlFlow::Continue(()),
-            Self::ObjectLiteralExpression(node) => visit_node_list(visitor, &node.properties),
+            Self::ObjectLiteralExpression(node) => visitor(Child::List(node.properties)),
             Self::OmittedExpression(..) => std::ops::ControlFlow::Continue(()),
-            Self::OptionalTypeNode(node) => visitor(node.type_),
+            Self::OptionalTypeNode(node) => visitor(Child::Node(node.type_)),
             Self::ParameterDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
                 visit_optional_child(visitor, node.dot_dot_dot_token)?;
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.question_token)?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.initializer)
             }
-            Self::ParenthesizedExpression(node) => visitor(node.expression),
-            Self::ParenthesizedTypeNode(node) => visitor(node.type_),
-            Self::PartiallyEmittedExpression(node) => visitor(node.expression),
-            Self::PostfixUnaryExpression(node) => visitor(node.operand),
-            Self::PrefixUnaryExpression(node) => visitor(node.operand),
+            Self::ParenthesizedExpression(node) => visitor(Child::Node(node.expression)),
+            Self::ParenthesizedTypeNode(node) => visitor(Child::Node(node.type_)),
+            Self::PartiallyEmittedExpression(node) => visitor(Child::Node(node.expression)),
+            Self::PostfixUnaryExpression(node) => visitor(Child::Node(node.operand)),
+            Self::PrefixUnaryExpression(node) => visitor(Child::Node(node.operand)),
             Self::PrivateIdentifier(..) => std::ops::ControlFlow::Continue(()),
             Self::PropertyAccessExpression(node) => {
-                visitor(node.expression)?;
+                visitor(Child::Node(node.expression))?;
                 visit_optional_child(visitor, node.question_dot_token)?;
-                visitor(node.name)
+                visitor(Child::Node(node.name))
             }
             Self::PropertyAssignment(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
                 visit_optional_child(visitor, node.type_)?;
-                visitor(node.initializer)
+                visitor(Child::Node(node.initializer))
             }
             Self::PropertyDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.initializer)
             }
             Self::PropertySignatureDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
-                visitor(node.type_)?;
-                visitor(node.initializer)
+                visitor(Child::Node(node.type_))?;
+                visitor(Child::Node(node.initializer))
             }
             Self::QualifiedName(node) => {
-                visitor(node.left)?;
-                visitor(node.right)
+                visitor(Child::Node(node.left))?;
+                visitor(Child::Node(node.right))
             }
             Self::RegularExpressionLiteral(..) => std::ops::ControlFlow::Continue(()),
-            Self::RestTypeNode(node) => visitor(node.type_),
+            Self::RestTypeNode(node) => visitor(Child::Node(node.type_)),
             Self::ReturnStatement(node) => visit_optional_child(visitor, node.expression),
             Self::SatisfiesExpression(node) => {
-                visitor(node.expression)?;
-                visitor(node.type_)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.type_))
             }
             Self::SemicolonClassElement(..) => std::ops::ControlFlow::Continue(()),
             Self::SetAccessorDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visit_node_list(visitor, &node.parameters)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::List(node.parameters))?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.full_signature)?;
                 visit_optional_child(visitor, node.body)
             }
             Self::ShorthandPropertyAssignment(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.postfix_token)?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.equals_token)?;
                 visit_optional_child(visitor, node.object_assignment_initializer)
             }
             Self::SourceFile(node) => {
-                visit_node_list(visitor, &node.statements)?;
-                visitor(node.end_of_file_token)
+                visitor(Child::List(node.statements))?;
+                visitor(Child::Node(node.end_of_file_token))
             }
-            Self::SpreadAssignment(node) => visitor(node.expression),
-            Self::SpreadElement(node) => visitor(node.expression),
+            Self::SpreadAssignment(node) => visitor(Child::Node(node.expression)),
+            Self::SpreadElement(node) => visitor(Child::Node(node.expression)),
             Self::StringLiteral(..) => std::ops::ControlFlow::Continue(()),
             Self::SwitchStatement(node) => {
-                visitor(node.expression)?;
-                visitor(node.case_block)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.case_block))
             }
             Self::SyntaxList(node) => visit_children(visitor, &node.children),
             Self::SyntheticExpression(node) => {
                 visit_optional_child(visitor, node.tuple_name_source)
             }
             Self::SyntheticReferenceExpression(node) => {
-                visitor(node.expression)?;
-                visitor(node.this_arg)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.this_arg))
             }
             Self::TaggedTemplateExpression(node) => {
-                visitor(node.tag)?;
+                visitor(Child::Node(node.tag))?;
                 visit_optional_child(visitor, node.question_dot_token)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())?;
-                visitor(node.template)
+                visit_optional_node_list(visitor, node.type_arguments)?;
+                visitor(Child::Node(node.template))
             }
             Self::TemplateExpression(node) => {
-                visitor(node.head)?;
-                visit_node_list(visitor, &node.template_spans)
+                visitor(Child::Node(node.head))?;
+                visitor(Child::List(node.template_spans))
             }
             Self::TemplateHead(..) => std::ops::ControlFlow::Continue(()),
             Self::TemplateLiteralTypeNode(node) => {
-                visitor(node.head)?;
-                visit_node_list(visitor, &node.template_spans)
+                visitor(Child::Node(node.head))?;
+                visitor(Child::List(node.template_spans))
             }
             Self::TemplateLiteralTypeSpan(node) => {
-                visitor(node.type_)?;
-                visitor(node.literal)
+                visitor(Child::Node(node.type_))?;
+                visitor(Child::Node(node.literal))
             }
             Self::TemplateMiddle(..) => std::ops::ControlFlow::Continue(()),
             Self::TemplateSpan(node) => {
-                visitor(node.expression)?;
-                visitor(node.literal)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.literal))
             }
             Self::TemplateTail(..) => std::ops::ControlFlow::Continue(()),
             Self::ThisTypeNode(..) => std::ops::ControlFlow::Continue(()),
-            Self::ThrowStatement(node) => visitor(node.expression),
+            Self::ThrowStatement(node) => visitor(Child::Node(node.expression)),
             Self::Token(..) => std::ops::ControlFlow::Continue(()),
             Self::TryStatement(node) => {
-                visitor(node.try_block)?;
+                visitor(Child::Node(node.try_block))?;
                 visit_optional_child(visitor, node.catch_clause)?;
                 visit_optional_child(visitor, node.finally_block)
             }
-            Self::TupleTypeNode(node) => visit_node_list(visitor, &node.elements),
+            Self::TupleTypeNode(node) => visitor(Child::List(node.elements)),
             Self::TypeAliasDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
-                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;
-                visitor(node.type_)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
+                visit_optional_node_list(visitor, node.type_parameters)?;
+                visitor(Child::Node(node.type_))
             }
             Self::TypeAssertion(node) => {
-                visitor(node.type_)?;
-                visitor(node.expression)
+                visitor(Child::Node(node.type_))?;
+                visitor(Child::Node(node.expression))
             }
-            Self::TypeLiteralNode(node) => visit_node_list(visitor, &node.members),
-            Self::TypeOfExpression(node) => visitor(node.expression),
-            Self::TypeOperatorNode(node) => visitor(node.type_),
+            Self::TypeLiteralNode(node) => visitor(Child::List(node.members)),
+            Self::TypeOfExpression(node) => visitor(Child::Node(node.expression)),
+            Self::TypeOperatorNode(node) => visitor(Child::Node(node.type_)),
             Self::TypeParameterDeclaration(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.name)?;
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.constraint)?;
                 visit_optional_child(visitor, node.expression)?;
                 visit_optional_child(visitor, node.default_type)
             }
             Self::TypePredicateNode(node) => {
                 visit_optional_child(visitor, node.asserts_modifier)?;
-                visitor(node.parameter_name)?;
+                visitor(Child::Node(node.parameter_name))?;
                 visit_optional_child(visitor, node.type_)
             }
             Self::TypeQueryNode(node) => {
-                visitor(node.expr_name)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())
+                visitor(Child::Node(node.expr_name))?;
+                visit_optional_node_list(visitor, node.type_arguments)
             }
             Self::TypeReferenceNode(node) => {
-                visitor(node.type_name)?;
-                visit_optional_node_list(visitor, node.type_arguments.as_ref())
+                visitor(Child::Node(node.type_name))?;
+                visit_optional_node_list(visitor, node.type_arguments)
             }
-            Self::UnionTypeNode(node) => visit_node_list(visitor, &node.types),
+            Self::UnionTypeNode(node) => visitor(Child::List(node.types)),
             Self::VariableDeclaration(node) => {
-                visitor(node.name)?;
+                visitor(Child::Node(node.name))?;
                 visit_optional_child(visitor, node.exclamation_token)?;
                 visit_optional_child(visitor, node.type_)?;
                 visit_optional_child(visitor, node.initializer)
             }
-            Self::VariableDeclarationList(node) => visit_node_list(visitor, &node.declarations),
+            Self::VariableDeclarationList(node) => visitor(Child::List(node.declarations)),
             Self::VariableStatement(node) => {
-                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;
-                visitor(node.declaration_list)
+                visit_optional_modifier_list(visitor, node.modifiers)?;
+                visitor(Child::Node(node.declaration_list))
             }
-            Self::VoidExpression(node) => visitor(node.expression),
+            Self::VoidExpression(node) => visitor(Child::Node(node.expression)),
             Self::WhileStatement(node) => {
-                visitor(node.expression)?;
-                visitor(node.statement)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.statement))
             }
             Self::WithStatement(node) => {
-                visitor(node.expression)?;
-                visitor(node.statement)
+                visitor(Child::Node(node.expression))?;
+                visitor(Child::Node(node.statement))
             }
             Self::YieldExpression(node) => {
                 visit_optional_child(visitor, node.asterisk_token)?;
@@ -2848,24 +3021,901 @@ impl NodeData {
         }
         // END schema-exhaustive direct child visitor
     }
+
+    /// Visits every list field of the data, also the ones that
+    /// `try_for_each_child` skips, as Go `ForEachChild` does.
+    #[allow(clippy::too_many_lines)]
+    pub fn for_each_list(self, mut visitor: impl FnMut(NodeList)) {
+        let mut visit = |list: Option<NodeList>| {
+            if let Some(list) = list {
+                visitor(list);
+            }
+        };
+        match self {
+            Self::ArrayLiteralExpression(node) => visit(Some(node.elements)),
+            Self::ArrowFunction(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::BinaryExpression(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::BindingPattern(node) => visit(Some(node.elements)),
+            Self::Block(node) => visit(Some(node.statements)),
+            Self::CallExpression(node) => {
+                visit(Some(node.arguments));
+                visit(node.type_arguments);
+            }
+            Self::CallSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+            }
+            Self::CaseBlock(node) => visit(Some(node.clauses)),
+            Self::CaseOrDefaultClause(node) => visit(Some(node.statements)),
+            Self::ClassDeclaration(node) => {
+                visit(node.heritage_clauses);
+                visit(Some(node.members));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ClassExpression(node) => {
+                visit(node.heritage_clauses);
+                visit(Some(node.members));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ClassStaticBlockDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ConstructSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+            }
+            Self::ConstructorDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ConstructorTypeNode(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::EnumDeclaration(node) => {
+                visit(Some(node.members));
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::EnumMember(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ExportAssignment(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ExportDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ExpressionWithTypeArguments(node) => visit(node.type_arguments),
+            Self::FunctionDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::FunctionExpression(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::FunctionTypeNode(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::GetAccessorDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::HeritageClause(node) => visit(Some(node.types)),
+            Self::ImportAttributes(node) => visit(Some(node.attributes)),
+            Self::ImportDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ImportEqualsDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ImportTypeNode(node) => visit(node.type_arguments),
+            Self::IndexSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::InterfaceDeclaration(node) => {
+                visit(node.heritage_clauses);
+                visit(Some(node.members));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::IntersectionTypeNode(node) => visit(Some(node.types)),
+            Self::JsDoc(node) => {
+                visit(Some(node.comment));
+                visit(node.tags);
+            }
+            Self::JsDocAugmentsTag(node) => visit(node.comment),
+            Self::JsDocCallbackTag(node) => visit(node.comment),
+            Self::JsDocDeprecatedTag(node) => visit(node.comment),
+            Self::JsDocImplementsTag(node) => visit(node.comment),
+            Self::JsDocImportTag(node) => visit(node.comment),
+            Self::JsDocOverloadTag(node) => visit(node.comment),
+            Self::JsDocOverrideTag(node) => visit(node.comment),
+            Self::JsDocParameterOrPropertyTag(node) => visit(node.comment),
+            Self::JsDocPrivateTag(node) => visit(node.comment),
+            Self::JsDocProtectedTag(node) => visit(node.comment),
+            Self::JsDocPublicTag(node) => visit(node.comment),
+            Self::JsDocReadonlyTag(node) => visit(node.comment),
+            Self::JsDocReturnTag(node) => visit(node.comment),
+            Self::JsDocSatisfiesTag(node) => visit(node.comment),
+            Self::JsDocSeeTag(node) => visit(node.comment),
+            Self::JsDocSignature(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+            }
+            Self::JsDocTemplateTag(node) => {
+                visit(node.comment);
+                visit(Some(node.type_parameters));
+            }
+            Self::JsDocThisTag(node) => visit(node.comment),
+            Self::JsDocThrowsTag(node) => visit(node.comment),
+            Self::JsDocTypeTag(node) => visit(node.comment),
+            Self::JsDocTypedefTag(node) => visit(node.comment),
+            Self::JsDocUnknownTag(node) => visit(node.comment),
+            Self::JsxAttributes(node) => visit(Some(node.properties)),
+            Self::JsxElement(node) => visit(Some(node.children)),
+            Self::JsxFragment(node) => visit(Some(node.children)),
+            Self::JsxOpeningElement(node) => visit(node.type_arguments),
+            Self::JsxSelfClosingElement(node) => visit(node.type_arguments),
+            Self::MappedTypeNode(node) => visit(node.members),
+            Self::MethodDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::MethodSignatureDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::MissingDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::ModuleBlock(node) => visit(Some(node.statements)),
+            Self::ModuleDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::NamedExports(node) => visit(Some(node.elements)),
+            Self::NamedImports(node) => visit(Some(node.elements)),
+            Self::NamespaceExportDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::NewExpression(node) => {
+                visit(node.arguments);
+                visit(node.type_arguments);
+            }
+            Self::ObjectLiteralExpression(node) => visit(Some(node.properties)),
+            Self::ParameterDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::PropertyAssignment(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::PropertyDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::PropertySignatureDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::SetAccessorDeclaration(node) => {
+                visit(Some(node.parameters));
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::ShorthandPropertyAssignment(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::SourceFile(node) => visit(Some(node.statements)),
+            Self::TaggedTemplateExpression(node) => visit(node.type_arguments),
+            Self::TemplateExpression(node) => visit(Some(node.template_spans)),
+            Self::TemplateLiteralTypeNode(node) => visit(Some(node.template_spans)),
+            Self::TupleTypeNode(node) => visit(Some(node.elements)),
+            Self::TypeAliasDeclaration(node) => {
+                visit(node.type_parameters);
+                visit(node.modifiers.map(|m| m.list));
+            }
+            Self::TypeLiteralNode(node) => visit(Some(node.members)),
+            Self::TypeParameterDeclaration(node) => visit(node.modifiers.map(|m| m.list)),
+            Self::TypeQueryNode(node) => visit(node.type_arguments),
+            Self::TypeReferenceNode(node) => visit(node.type_arguments),
+            Self::UnionTypeNode(node) => visit(Some(node.types)),
+            Self::VariableDeclarationList(node) => visit(Some(node.declarations)),
+            Self::VariableStatement(node) => visit(node.modifiers.map(|m| m.list)),
+            _ => {}
+        }
+    }
+
+    /// An owning copy of the data in a new box.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn to_boxed(self) -> BoxedData {
+        match self {
+            Self::ArrayLiteralExpression(d) => {
+                BoxedData::ArrayLiteralExpression(Box::new(d.clone()))
+            }
+            Self::ArrayTypeNode(d) => BoxedData::ArrayTypeNode(Box::new(d.clone())),
+            Self::ArrowFunction(d) => BoxedData::ArrowFunction(Box::new(d.clone())),
+            Self::AsExpression(d) => BoxedData::AsExpression(Box::new(d.clone())),
+            Self::AwaitExpression(d) => BoxedData::AwaitExpression(Box::new(d.clone())),
+            Self::BigIntLiteral(d) => BoxedData::BigIntLiteral(Box::new(d.clone())),
+            Self::BinaryExpression(d) => BoxedData::BinaryExpression(Box::new(d.clone())),
+            Self::BindingElement(d) => BoxedData::BindingElement(Box::new(d.clone())),
+            Self::BindingPattern(d) => BoxedData::BindingPattern(Box::new(d.clone())),
+            Self::Block(d) => BoxedData::Block(Box::new(d.clone())),
+            Self::BreakStatement(d) => BoxedData::BreakStatement(Box::new(d.clone())),
+            Self::CallExpression(d) => BoxedData::CallExpression(Box::new(d.clone())),
+            Self::CallSignatureDeclaration(d) => {
+                BoxedData::CallSignatureDeclaration(Box::new(d.clone()))
+            }
+            Self::CaseBlock(d) => BoxedData::CaseBlock(Box::new(d.clone())),
+            Self::CaseOrDefaultClause(d) => BoxedData::CaseOrDefaultClause(Box::new(d.clone())),
+            Self::CatchClause(d) => BoxedData::CatchClause(Box::new(d.clone())),
+            Self::ClassDeclaration(d) => BoxedData::ClassDeclaration(Box::new(d.clone())),
+            Self::ClassExpression(d) => BoxedData::ClassExpression(Box::new(d.clone())),
+            Self::ClassStaticBlockDeclaration(d) => {
+                BoxedData::ClassStaticBlockDeclaration(Box::new(d.clone()))
+            }
+            Self::ComputedPropertyName(d) => BoxedData::ComputedPropertyName(Box::new(d.clone())),
+            Self::ConditionalExpression(d) => BoxedData::ConditionalExpression(Box::new(d.clone())),
+            Self::ConditionalTypeNode(d) => BoxedData::ConditionalTypeNode(Box::new(d.clone())),
+            Self::ConstructSignatureDeclaration(d) => {
+                BoxedData::ConstructSignatureDeclaration(Box::new(d.clone()))
+            }
+            Self::ConstructorDeclaration(d) => {
+                BoxedData::ConstructorDeclaration(Box::new(d.clone()))
+            }
+            Self::ConstructorTypeNode(d) => BoxedData::ConstructorTypeNode(Box::new(d.clone())),
+            Self::ContinueStatement(d) => BoxedData::ContinueStatement(Box::new(d.clone())),
+            Self::DebuggerStatement(d) => BoxedData::DebuggerStatement(Box::new(d.clone())),
+            Self::Decorator(d) => BoxedData::Decorator(Box::new(d.clone())),
+            Self::DeleteExpression(d) => BoxedData::DeleteExpression(Box::new(d.clone())),
+            Self::DoStatement(d) => BoxedData::DoStatement(Box::new(d.clone())),
+            Self::ElementAccessExpression(d) => {
+                BoxedData::ElementAccessExpression(Box::new(d.clone()))
+            }
+            Self::EmptyStatement(d) => BoxedData::EmptyStatement(Box::new(d.clone())),
+            Self::EnumDeclaration(d) => BoxedData::EnumDeclaration(Box::new(d.clone())),
+            Self::EnumMember(d) => BoxedData::EnumMember(Box::new(d.clone())),
+            Self::ExportAssignment(d) => BoxedData::ExportAssignment(Box::new(d.clone())),
+            Self::ExportDeclaration(d) => BoxedData::ExportDeclaration(Box::new(d.clone())),
+            Self::ExportSpecifier(d) => BoxedData::ExportSpecifier(Box::new(d.clone())),
+            Self::ExpressionStatement(d) => BoxedData::ExpressionStatement(Box::new(d.clone())),
+            Self::ExpressionWithTypeArguments(d) => {
+                BoxedData::ExpressionWithTypeArguments(Box::new(d.clone()))
+            }
+            Self::ExternalModuleReference(d) => {
+                BoxedData::ExternalModuleReference(Box::new(d.clone()))
+            }
+            Self::ForInOrOfStatement(d) => BoxedData::ForInOrOfStatement(Box::new(d.clone())),
+            Self::ForStatement(d) => BoxedData::ForStatement(Box::new(d.clone())),
+            Self::FunctionDeclaration(d) => BoxedData::FunctionDeclaration(Box::new(d.clone())),
+            Self::FunctionExpression(d) => BoxedData::FunctionExpression(Box::new(d.clone())),
+            Self::FunctionTypeNode(d) => BoxedData::FunctionTypeNode(Box::new(d.clone())),
+            Self::GetAccessorDeclaration(d) => {
+                BoxedData::GetAccessorDeclaration(Box::new(d.clone()))
+            }
+            Self::HeritageClause(d) => BoxedData::HeritageClause(Box::new(d.clone())),
+            Self::Identifier(d) => BoxedData::Identifier(Box::new(d.clone())),
+            Self::IfStatement(d) => BoxedData::IfStatement(Box::new(d.clone())),
+            Self::ImportAttribute(d) => BoxedData::ImportAttribute(Box::new(d.clone())),
+            Self::ImportAttributes(d) => BoxedData::ImportAttributes(Box::new(d.clone())),
+            Self::ImportClause(d) => BoxedData::ImportClause(Box::new(d.clone())),
+            Self::ImportDeclaration(d) => BoxedData::ImportDeclaration(Box::new(d.clone())),
+            Self::ImportEqualsDeclaration(d) => {
+                BoxedData::ImportEqualsDeclaration(Box::new(d.clone()))
+            }
+            Self::ImportSpecifier(d) => BoxedData::ImportSpecifier(Box::new(d.clone())),
+            Self::ImportTypeNode(d) => BoxedData::ImportTypeNode(Box::new(d.clone())),
+            Self::IndexSignatureDeclaration(d) => {
+                BoxedData::IndexSignatureDeclaration(Box::new(d.clone()))
+            }
+            Self::IndexedAccessTypeNode(d) => BoxedData::IndexedAccessTypeNode(Box::new(d.clone())),
+            Self::InferTypeNode(d) => BoxedData::InferTypeNode(Box::new(d.clone())),
+            Self::InterfaceDeclaration(d) => BoxedData::InterfaceDeclaration(Box::new(d.clone())),
+            Self::IntersectionTypeNode(d) => BoxedData::IntersectionTypeNode(Box::new(d.clone())),
+            Self::JsDoc(d) => BoxedData::JsDoc(Box::new(d.clone())),
+            Self::JsDocAllType(d) => BoxedData::JsDocAllType(Box::new(d.clone())),
+            Self::JsDocAugmentsTag(d) => BoxedData::JsDocAugmentsTag(Box::new(d.clone())),
+            Self::JsDocCallbackTag(d) => BoxedData::JsDocCallbackTag(Box::new(d.clone())),
+            Self::JsDocDeprecatedTag(d) => BoxedData::JsDocDeprecatedTag(Box::new(d.clone())),
+            Self::JsDocImplementsTag(d) => BoxedData::JsDocImplementsTag(Box::new(d.clone())),
+            Self::JsDocImportTag(d) => BoxedData::JsDocImportTag(Box::new(d.clone())),
+            Self::JsDocLink(d) => BoxedData::JsDocLink(Box::new(d.clone())),
+            Self::JsDocLinkCode(d) => BoxedData::JsDocLinkCode(Box::new(d.clone())),
+            Self::JsDocLinkPlain(d) => BoxedData::JsDocLinkPlain(Box::new(d.clone())),
+            Self::JsDocNameReference(d) => BoxedData::JsDocNameReference(Box::new(d.clone())),
+            Self::JsDocNonNullableType(d) => BoxedData::JsDocNonNullableType(Box::new(d.clone())),
+            Self::JsDocNullableType(d) => BoxedData::JsDocNullableType(Box::new(d.clone())),
+            Self::JsDocOptionalType(d) => BoxedData::JsDocOptionalType(Box::new(d.clone())),
+            Self::JsDocOverloadTag(d) => BoxedData::JsDocOverloadTag(Box::new(d.clone())),
+            Self::JsDocOverrideTag(d) => BoxedData::JsDocOverrideTag(Box::new(d.clone())),
+            Self::JsDocParameterOrPropertyTag(d) => {
+                BoxedData::JsDocParameterOrPropertyTag(Box::new(d.clone()))
+            }
+            Self::JsDocPrivateTag(d) => BoxedData::JsDocPrivateTag(Box::new(d.clone())),
+            Self::JsDocProtectedTag(d) => BoxedData::JsDocProtectedTag(Box::new(d.clone())),
+            Self::JsDocPublicTag(d) => BoxedData::JsDocPublicTag(Box::new(d.clone())),
+            Self::JsDocReadonlyTag(d) => BoxedData::JsDocReadonlyTag(Box::new(d.clone())),
+            Self::JsDocReturnTag(d) => BoxedData::JsDocReturnTag(Box::new(d.clone())),
+            Self::JsDocSatisfiesTag(d) => BoxedData::JsDocSatisfiesTag(Box::new(d.clone())),
+            Self::JsDocSeeTag(d) => BoxedData::JsDocSeeTag(Box::new(d.clone())),
+            Self::JsDocSignature(d) => BoxedData::JsDocSignature(Box::new(d.clone())),
+            Self::JsDocTemplateTag(d) => BoxedData::JsDocTemplateTag(Box::new(d.clone())),
+            Self::JsDocText(d) => BoxedData::JsDocText(Box::new(d.clone())),
+            Self::JsDocThisTag(d) => BoxedData::JsDocThisTag(Box::new(d.clone())),
+            Self::JsDocThrowsTag(d) => BoxedData::JsDocThrowsTag(Box::new(d.clone())),
+            Self::JsDocTypeExpression(d) => BoxedData::JsDocTypeExpression(Box::new(d.clone())),
+            Self::JsDocTypeLiteral(d) => BoxedData::JsDocTypeLiteral(Box::new(d.clone())),
+            Self::JsDocTypeTag(d) => BoxedData::JsDocTypeTag(Box::new(d.clone())),
+            Self::JsDocTypedefTag(d) => BoxedData::JsDocTypedefTag(Box::new(d.clone())),
+            Self::JsDocUnknownTag(d) => BoxedData::JsDocUnknownTag(Box::new(d.clone())),
+            Self::JsDocVariadicType(d) => BoxedData::JsDocVariadicType(Box::new(d.clone())),
+            Self::JsxAttribute(d) => BoxedData::JsxAttribute(Box::new(d.clone())),
+            Self::JsxAttributes(d) => BoxedData::JsxAttributes(Box::new(d.clone())),
+            Self::JsxClosingElement(d) => BoxedData::JsxClosingElement(Box::new(d.clone())),
+            Self::JsxClosingFragment(d) => BoxedData::JsxClosingFragment(Box::new(d.clone())),
+            Self::JsxElement(d) => BoxedData::JsxElement(Box::new(d.clone())),
+            Self::JsxExpression(d) => BoxedData::JsxExpression(Box::new(d.clone())),
+            Self::JsxFragment(d) => BoxedData::JsxFragment(Box::new(d.clone())),
+            Self::JsxNamespacedName(d) => BoxedData::JsxNamespacedName(Box::new(d.clone())),
+            Self::JsxOpeningElement(d) => BoxedData::JsxOpeningElement(Box::new(d.clone())),
+            Self::JsxOpeningFragment(d) => BoxedData::JsxOpeningFragment(Box::new(d.clone())),
+            Self::JsxSelfClosingElement(d) => BoxedData::JsxSelfClosingElement(Box::new(d.clone())),
+            Self::JsxSpreadAttribute(d) => BoxedData::JsxSpreadAttribute(Box::new(d.clone())),
+            Self::JsxText(d) => BoxedData::JsxText(Box::new(d.clone())),
+            Self::KeywordExpression(d) => BoxedData::KeywordExpression(Box::new(d.clone())),
+            Self::KeywordTypeNode(d) => BoxedData::KeywordTypeNode(Box::new(d.clone())),
+            Self::LabeledStatement(d) => BoxedData::LabeledStatement(Box::new(d.clone())),
+            Self::LiteralTypeNode(d) => BoxedData::LiteralTypeNode(Box::new(d.clone())),
+            Self::MappedTypeNode(d) => BoxedData::MappedTypeNode(Box::new(d.clone())),
+            Self::MetaProperty(d) => BoxedData::MetaProperty(Box::new(d.clone())),
+            Self::MethodDeclaration(d) => BoxedData::MethodDeclaration(Box::new(d.clone())),
+            Self::MethodSignatureDeclaration(d) => {
+                BoxedData::MethodSignatureDeclaration(Box::new(d.clone()))
+            }
+            Self::MissingDeclaration(d) => BoxedData::MissingDeclaration(Box::new(d.clone())),
+            Self::ModuleBlock(d) => BoxedData::ModuleBlock(Box::new(d.clone())),
+            Self::ModuleDeclaration(d) => BoxedData::ModuleDeclaration(Box::new(d.clone())),
+            Self::NamedExports(d) => BoxedData::NamedExports(Box::new(d.clone())),
+            Self::NamedImports(d) => BoxedData::NamedImports(Box::new(d.clone())),
+            Self::NamedTupleMember(d) => BoxedData::NamedTupleMember(Box::new(d.clone())),
+            Self::NamespaceExport(d) => BoxedData::NamespaceExport(Box::new(d.clone())),
+            Self::NamespaceExportDeclaration(d) => {
+                BoxedData::NamespaceExportDeclaration(Box::new(d.clone()))
+            }
+            Self::NamespaceImport(d) => BoxedData::NamespaceImport(Box::new(d.clone())),
+            Self::NewExpression(d) => BoxedData::NewExpression(Box::new(d.clone())),
+            Self::NoSubstitutionTemplateLiteral(d) => {
+                BoxedData::NoSubstitutionTemplateLiteral(Box::new(d.clone()))
+            }
+            Self::NonNullExpression(d) => BoxedData::NonNullExpression(Box::new(d.clone())),
+            Self::NotEmittedStatement(d) => BoxedData::NotEmittedStatement(Box::new(d.clone())),
+            Self::NotEmittedTypeElement(d) => BoxedData::NotEmittedTypeElement(Box::new(d.clone())),
+            Self::NumericLiteral(d) => BoxedData::NumericLiteral(Box::new(d.clone())),
+            Self::ObjectLiteralExpression(d) => {
+                BoxedData::ObjectLiteralExpression(Box::new(d.clone()))
+            }
+            Self::OmittedExpression(d) => BoxedData::OmittedExpression(Box::new(d.clone())),
+            Self::OptionalTypeNode(d) => BoxedData::OptionalTypeNode(Box::new(d.clone())),
+            Self::ParameterDeclaration(d) => BoxedData::ParameterDeclaration(Box::new(d.clone())),
+            Self::ParenthesizedExpression(d) => {
+                BoxedData::ParenthesizedExpression(Box::new(d.clone()))
+            }
+            Self::ParenthesizedTypeNode(d) => BoxedData::ParenthesizedTypeNode(Box::new(d.clone())),
+            Self::PartiallyEmittedExpression(d) => {
+                BoxedData::PartiallyEmittedExpression(Box::new(d.clone()))
+            }
+            Self::PostfixUnaryExpression(d) => {
+                BoxedData::PostfixUnaryExpression(Box::new(d.clone()))
+            }
+            Self::PrefixUnaryExpression(d) => BoxedData::PrefixUnaryExpression(Box::new(d.clone())),
+            Self::PrivateIdentifier(d) => BoxedData::PrivateIdentifier(Box::new(d.clone())),
+            Self::PropertyAccessExpression(d) => {
+                BoxedData::PropertyAccessExpression(Box::new(d.clone()))
+            }
+            Self::PropertyAssignment(d) => BoxedData::PropertyAssignment(Box::new(d.clone())),
+            Self::PropertyDeclaration(d) => BoxedData::PropertyDeclaration(Box::new(d.clone())),
+            Self::PropertySignatureDeclaration(d) => {
+                BoxedData::PropertySignatureDeclaration(Box::new(d.clone()))
+            }
+            Self::QualifiedName(d) => BoxedData::QualifiedName(Box::new(d.clone())),
+            Self::RegularExpressionLiteral(d) => {
+                BoxedData::RegularExpressionLiteral(Box::new(d.clone()))
+            }
+            Self::RestTypeNode(d) => BoxedData::RestTypeNode(Box::new(d.clone())),
+            Self::ReturnStatement(d) => BoxedData::ReturnStatement(Box::new(d.clone())),
+            Self::SatisfiesExpression(d) => BoxedData::SatisfiesExpression(Box::new(d.clone())),
+            Self::SemicolonClassElement(d) => BoxedData::SemicolonClassElement(Box::new(d.clone())),
+            Self::SetAccessorDeclaration(d) => {
+                BoxedData::SetAccessorDeclaration(Box::new(d.clone()))
+            }
+            Self::ShorthandPropertyAssignment(d) => {
+                BoxedData::ShorthandPropertyAssignment(Box::new(d.clone()))
+            }
+            Self::SourceFile(d) => BoxedData::SourceFile(Box::new(d.clone())),
+            Self::SpreadAssignment(d) => BoxedData::SpreadAssignment(Box::new(d.clone())),
+            Self::SpreadElement(d) => BoxedData::SpreadElement(Box::new(d.clone())),
+            Self::StringLiteral(d) => BoxedData::StringLiteral(Box::new(d.clone())),
+            Self::SwitchStatement(d) => BoxedData::SwitchStatement(Box::new(d.clone())),
+            Self::SyntaxList(d) => BoxedData::SyntaxList(Box::new(d.clone())),
+            Self::SyntheticExpression(d) => BoxedData::SyntheticExpression(Box::new(d.clone())),
+            Self::SyntheticReferenceExpression(d) => {
+                BoxedData::SyntheticReferenceExpression(Box::new(d.clone()))
+            }
+            Self::TaggedTemplateExpression(d) => {
+                BoxedData::TaggedTemplateExpression(Box::new(d.clone()))
+            }
+            Self::TemplateExpression(d) => BoxedData::TemplateExpression(Box::new(d.clone())),
+            Self::TemplateHead(d) => BoxedData::TemplateHead(Box::new(d.clone())),
+            Self::TemplateLiteralTypeNode(d) => {
+                BoxedData::TemplateLiteralTypeNode(Box::new(d.clone()))
+            }
+            Self::TemplateLiteralTypeSpan(d) => {
+                BoxedData::TemplateLiteralTypeSpan(Box::new(d.clone()))
+            }
+            Self::TemplateMiddle(d) => BoxedData::TemplateMiddle(Box::new(d.clone())),
+            Self::TemplateSpan(d) => BoxedData::TemplateSpan(Box::new(d.clone())),
+            Self::TemplateTail(d) => BoxedData::TemplateTail(Box::new(d.clone())),
+            Self::ThisTypeNode(d) => BoxedData::ThisTypeNode(Box::new(d.clone())),
+            Self::ThrowStatement(d) => BoxedData::ThrowStatement(Box::new(d.clone())),
+            Self::Token(d) => BoxedData::Token(Box::new(d.clone())),
+            Self::TryStatement(d) => BoxedData::TryStatement(Box::new(d.clone())),
+            Self::TupleTypeNode(d) => BoxedData::TupleTypeNode(Box::new(d.clone())),
+            Self::TypeAliasDeclaration(d) => BoxedData::TypeAliasDeclaration(Box::new(d.clone())),
+            Self::TypeAssertion(d) => BoxedData::TypeAssertion(Box::new(d.clone())),
+            Self::TypeLiteralNode(d) => BoxedData::TypeLiteralNode(Box::new(d.clone())),
+            Self::TypeOfExpression(d) => BoxedData::TypeOfExpression(Box::new(d.clone())),
+            Self::TypeOperatorNode(d) => BoxedData::TypeOperatorNode(Box::new(d.clone())),
+            Self::TypeParameterDeclaration(d) => {
+                BoxedData::TypeParameterDeclaration(Box::new(d.clone()))
+            }
+            Self::TypePredicateNode(d) => BoxedData::TypePredicateNode(Box::new(d.clone())),
+            Self::TypeQueryNode(d) => BoxedData::TypeQueryNode(Box::new(d.clone())),
+            Self::TypeReferenceNode(d) => BoxedData::TypeReferenceNode(Box::new(d.clone())),
+            Self::UnionTypeNode(d) => BoxedData::UnionTypeNode(Box::new(d.clone())),
+            Self::VariableDeclaration(d) => BoxedData::VariableDeclaration(Box::new(d.clone())),
+            Self::VariableDeclarationList(d) => {
+                BoxedData::VariableDeclarationList(Box::new(d.clone()))
+            }
+            Self::VariableStatement(d) => BoxedData::VariableStatement(Box::new(d.clone())),
+            Self::VoidExpression(d) => BoxedData::VoidExpression(Box::new(d.clone())),
+            Self::WhileStatement(d) => BoxedData::WhileStatement(Box::new(d.clone())),
+            Self::WithStatement(d) => BoxedData::WithStatement(Box::new(d.clone())),
+            Self::YieldExpression(d) => BoxedData::YieldExpression(Box::new(d.clone())),
+        }
+    }
+
+    /// The address of the data. Data of a zero-size type can share an
+    /// address with other data: `same` also compares the tag.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn addr(self) -> *const () {
+        match self {
+            Self::ArrayLiteralExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::ArrayTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::ArrowFunction(d) => std::ptr::from_ref(d).cast(),
+            Self::AsExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::AwaitExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::BigIntLiteral(d) => std::ptr::from_ref(d).cast(),
+            Self::BinaryExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::BindingElement(d) => std::ptr::from_ref(d).cast(),
+            Self::BindingPattern(d) => std::ptr::from_ref(d).cast(),
+            Self::Block(d) => std::ptr::from_ref(d).cast(),
+            Self::BreakStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::CallExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::CallSignatureDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::CaseBlock(d) => std::ptr::from_ref(d).cast(),
+            Self::CaseOrDefaultClause(d) => std::ptr::from_ref(d).cast(),
+            Self::CatchClause(d) => std::ptr::from_ref(d).cast(),
+            Self::ClassDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::ClassExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::ClassStaticBlockDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::ComputedPropertyName(d) => std::ptr::from_ref(d).cast(),
+            Self::ConditionalExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::ConditionalTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::ConstructSignatureDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::ConstructorDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::ConstructorTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::ContinueStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::DebuggerStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::Decorator(d) => std::ptr::from_ref(d).cast(),
+            Self::DeleteExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::DoStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::ElementAccessExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::EmptyStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::EnumDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::EnumMember(d) => std::ptr::from_ref(d).cast(),
+            Self::ExportAssignment(d) => std::ptr::from_ref(d).cast(),
+            Self::ExportDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::ExportSpecifier(d) => std::ptr::from_ref(d).cast(),
+            Self::ExpressionStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::ExpressionWithTypeArguments(d) => std::ptr::from_ref(d).cast(),
+            Self::ExternalModuleReference(d) => std::ptr::from_ref(d).cast(),
+            Self::ForInOrOfStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::ForStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::FunctionDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::FunctionExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::FunctionTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::GetAccessorDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::HeritageClause(d) => std::ptr::from_ref(d).cast(),
+            Self::Identifier(d) => std::ptr::from_ref(d).cast(),
+            Self::IfStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::ImportAttribute(d) => std::ptr::from_ref(d).cast(),
+            Self::ImportAttributes(d) => std::ptr::from_ref(d).cast(),
+            Self::ImportClause(d) => std::ptr::from_ref(d).cast(),
+            Self::ImportDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::ImportEqualsDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::ImportSpecifier(d) => std::ptr::from_ref(d).cast(),
+            Self::ImportTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::IndexSignatureDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::IndexedAccessTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::InferTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::InterfaceDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::IntersectionTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDoc(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocAllType(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocAugmentsTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocCallbackTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocDeprecatedTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocImplementsTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocImportTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocLink(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocLinkCode(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocLinkPlain(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocNameReference(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocNonNullableType(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocNullableType(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocOptionalType(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocOverloadTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocOverrideTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocParameterOrPropertyTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocPrivateTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocProtectedTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocPublicTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocReadonlyTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocReturnTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocSatisfiesTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocSeeTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocSignature(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocTemplateTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocText(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocThisTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocThrowsTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocTypeExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocTypeLiteral(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocTypeTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocTypedefTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocUnknownTag(d) => std::ptr::from_ref(d).cast(),
+            Self::JsDocVariadicType(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxAttribute(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxAttributes(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxClosingElement(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxClosingFragment(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxElement(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxFragment(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxNamespacedName(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxOpeningElement(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxOpeningFragment(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxSelfClosingElement(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxSpreadAttribute(d) => std::ptr::from_ref(d).cast(),
+            Self::JsxText(d) => std::ptr::from_ref(d).cast(),
+            Self::KeywordExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::KeywordTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::LabeledStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::LiteralTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::MappedTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::MetaProperty(d) => std::ptr::from_ref(d).cast(),
+            Self::MethodDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::MethodSignatureDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::MissingDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::ModuleBlock(d) => std::ptr::from_ref(d).cast(),
+            Self::ModuleDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::NamedExports(d) => std::ptr::from_ref(d).cast(),
+            Self::NamedImports(d) => std::ptr::from_ref(d).cast(),
+            Self::NamedTupleMember(d) => std::ptr::from_ref(d).cast(),
+            Self::NamespaceExport(d) => std::ptr::from_ref(d).cast(),
+            Self::NamespaceExportDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::NamespaceImport(d) => std::ptr::from_ref(d).cast(),
+            Self::NewExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::NoSubstitutionTemplateLiteral(d) => std::ptr::from_ref(d).cast(),
+            Self::NonNullExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::NotEmittedStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::NotEmittedTypeElement(d) => std::ptr::from_ref(d).cast(),
+            Self::NumericLiteral(d) => std::ptr::from_ref(d).cast(),
+            Self::ObjectLiteralExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::OmittedExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::OptionalTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::ParameterDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::ParenthesizedExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::ParenthesizedTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::PartiallyEmittedExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::PostfixUnaryExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::PrefixUnaryExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::PrivateIdentifier(d) => std::ptr::from_ref(d).cast(),
+            Self::PropertyAccessExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::PropertyAssignment(d) => std::ptr::from_ref(d).cast(),
+            Self::PropertyDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::PropertySignatureDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::QualifiedName(d) => std::ptr::from_ref(d).cast(),
+            Self::RegularExpressionLiteral(d) => std::ptr::from_ref(d).cast(),
+            Self::RestTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::ReturnStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::SatisfiesExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::SemicolonClassElement(d) => std::ptr::from_ref(d).cast(),
+            Self::SetAccessorDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::ShorthandPropertyAssignment(d) => std::ptr::from_ref(d).cast(),
+            Self::SourceFile(d) => std::ptr::from_ref(d).cast(),
+            Self::SpreadAssignment(d) => std::ptr::from_ref(d).cast(),
+            Self::SpreadElement(d) => std::ptr::from_ref(d).cast(),
+            Self::StringLiteral(d) => std::ptr::from_ref(d).cast(),
+            Self::SwitchStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::SyntaxList(d) => std::ptr::from_ref(d).cast(),
+            Self::SyntheticExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::SyntheticReferenceExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::TaggedTemplateExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::TemplateExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::TemplateHead(d) => std::ptr::from_ref(d).cast(),
+            Self::TemplateLiteralTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::TemplateLiteralTypeSpan(d) => std::ptr::from_ref(d).cast(),
+            Self::TemplateMiddle(d) => std::ptr::from_ref(d).cast(),
+            Self::TemplateSpan(d) => std::ptr::from_ref(d).cast(),
+            Self::TemplateTail(d) => std::ptr::from_ref(d).cast(),
+            Self::ThisTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::ThrowStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::Token(d) => std::ptr::from_ref(d).cast(),
+            Self::TryStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::TupleTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::TypeAliasDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::TypeAssertion(d) => std::ptr::from_ref(d).cast(),
+            Self::TypeLiteralNode(d) => std::ptr::from_ref(d).cast(),
+            Self::TypeOfExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::TypeOperatorNode(d) => std::ptr::from_ref(d).cast(),
+            Self::TypeParameterDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::TypePredicateNode(d) => std::ptr::from_ref(d).cast(),
+            Self::TypeQueryNode(d) => std::ptr::from_ref(d).cast(),
+            Self::TypeReferenceNode(d) => std::ptr::from_ref(d).cast(),
+            Self::UnionTypeNode(d) => std::ptr::from_ref(d).cast(),
+            Self::VariableDeclaration(d) => std::ptr::from_ref(d).cast(),
+            Self::VariableDeclarationList(d) => std::ptr::from_ref(d).cast(),
+            Self::VariableStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::VoidExpression(d) => std::ptr::from_ref(d).cast(),
+            Self::WhileStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::WithStatement(d) => std::ptr::from_ref(d).cast(),
+            Self::YieldExpression(d) => std::ptr::from_ref(d).cast(),
+        }
+    }
+
+    /// Whether `self` and `other` view the same data: same tag and address.
+    #[must_use]
+    pub fn same(self, other: Self) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&other)
+            && std::ptr::eq(self.addr(), other.addr())
+    }
+}
+
+/// One node data struct: its view and its box.
+pub trait AstData: Sized + 'static {
+    /// The view of this data.
+    fn view(&self) -> NodeData<'_>;
+    /// This data in a new box.
+    fn into_boxed(self) -> BoxedData;
+}
+
+macro_rules! ast_data {
+    ($($v:ident($t:ident)),+ $(,)?) => {$(
+        impl AstData for $t {
+            #[inline]
+            fn view(&self) -> NodeData<'_> {
+                NodeData::$v(self)
+            }
+
+            #[inline]
+            fn into_boxed(self) -> BoxedData {
+                BoxedData::$v(Box::new(self))
+            }
+        }
+    )+};
+}
+
+ast_data! {
+    ArrayLiteralExpression(ArrayLiteralExpressionData),
+    ArrayTypeNode(ArrayTypeNodeData),
+    ArrowFunction(ArrowFunctionData),
+    AsExpression(AsExpressionData),
+    AwaitExpression(AwaitExpressionData),
+    BigIntLiteral(BigIntLiteralData),
+    BinaryExpression(BinaryExpressionData),
+    BindingElement(BindingElementData),
+    BindingPattern(BindingPatternData),
+    Block(BlockData),
+    BreakStatement(BreakStatementData),
+    CallExpression(CallExpressionData),
+    CallSignatureDeclaration(CallSignatureDeclarationData),
+    CaseBlock(CaseBlockData),
+    CaseOrDefaultClause(CaseOrDefaultClauseData),
+    CatchClause(CatchClauseData),
+    ClassDeclaration(ClassDeclarationData),
+    ClassExpression(ClassExpressionData),
+    ClassStaticBlockDeclaration(ClassStaticBlockDeclarationData),
+    ComputedPropertyName(ComputedPropertyNameData),
+    ConditionalExpression(ConditionalExpressionData),
+    ConditionalTypeNode(ConditionalTypeNodeData),
+    ConstructSignatureDeclaration(ConstructSignatureDeclarationData),
+    ConstructorDeclaration(ConstructorDeclarationData),
+    ConstructorTypeNode(ConstructorTypeNodeData),
+    ContinueStatement(ContinueStatementData),
+    DebuggerStatement(DebuggerStatementData),
+    Decorator(DecoratorData),
+    DeleteExpression(DeleteExpressionData),
+    DoStatement(DoStatementData),
+    ElementAccessExpression(ElementAccessExpressionData),
+    EmptyStatement(EmptyStatementData),
+    EnumDeclaration(EnumDeclarationData),
+    EnumMember(EnumMemberData),
+    ExportAssignment(ExportAssignmentData),
+    ExportDeclaration(ExportDeclarationData),
+    ExportSpecifier(ExportSpecifierData),
+    ExpressionStatement(ExpressionStatementData),
+    ExpressionWithTypeArguments(ExpressionWithTypeArgumentsData),
+    ExternalModuleReference(ExternalModuleReferenceData),
+    ForInOrOfStatement(ForInOrOfStatementData),
+    ForStatement(ForStatementData),
+    FunctionDeclaration(FunctionDeclarationData),
+    FunctionExpression(FunctionExpressionData),
+    FunctionTypeNode(FunctionTypeNodeData),
+    GetAccessorDeclaration(GetAccessorDeclarationData),
+    HeritageClause(HeritageClauseData),
+    Identifier(IdentifierData),
+    IfStatement(IfStatementData),
+    ImportAttribute(ImportAttributeData),
+    ImportAttributes(ImportAttributesData),
+    ImportClause(ImportClauseData),
+    ImportDeclaration(ImportDeclarationData),
+    ImportEqualsDeclaration(ImportEqualsDeclarationData),
+    ImportSpecifier(ImportSpecifierData),
+    ImportTypeNode(ImportTypeNodeData),
+    IndexSignatureDeclaration(IndexSignatureDeclarationData),
+    IndexedAccessTypeNode(IndexedAccessTypeNodeData),
+    InferTypeNode(InferTypeNodeData),
+    InterfaceDeclaration(InterfaceDeclarationData),
+    IntersectionTypeNode(IntersectionTypeNodeData),
+    JsDoc(JsDocData),
+    JsDocAllType(JsDocAllTypeData),
+    JsDocAugmentsTag(JsDocAugmentsTagData),
+    JsDocCallbackTag(JsDocCallbackTagData),
+    JsDocDeprecatedTag(JsDocDeprecatedTagData),
+    JsDocImplementsTag(JsDocImplementsTagData),
+    JsDocImportTag(JsDocImportTagData),
+    JsDocLink(JsDocLinkData),
+    JsDocLinkCode(JsDocLinkCodeData),
+    JsDocLinkPlain(JsDocLinkPlainData),
+    JsDocNameReference(JsDocNameReferenceData),
+    JsDocNonNullableType(JsDocNonNullableTypeData),
+    JsDocNullableType(JsDocNullableTypeData),
+    JsDocOptionalType(JsDocOptionalTypeData),
+    JsDocOverloadTag(JsDocOverloadTagData),
+    JsDocOverrideTag(JsDocOverrideTagData),
+    JsDocParameterOrPropertyTag(JsDocParameterOrPropertyTagData),
+    JsDocPrivateTag(JsDocPrivateTagData),
+    JsDocProtectedTag(JsDocProtectedTagData),
+    JsDocPublicTag(JsDocPublicTagData),
+    JsDocReadonlyTag(JsDocReadonlyTagData),
+    JsDocReturnTag(JsDocReturnTagData),
+    JsDocSatisfiesTag(JsDocSatisfiesTagData),
+    JsDocSeeTag(JsDocSeeTagData),
+    JsDocSignature(JsDocSignatureData),
+    JsDocTemplateTag(JsDocTemplateTagData),
+    JsDocText(JsDocTextData),
+    JsDocThisTag(JsDocThisTagData),
+    JsDocThrowsTag(JsDocThrowsTagData),
+    JsDocTypeExpression(JsDocTypeExpressionData),
+    JsDocTypeLiteral(JsDocTypeLiteralData),
+    JsDocTypeTag(JsDocTypeTagData),
+    JsDocTypedefTag(JsDocTypedefTagData),
+    JsDocUnknownTag(JsDocUnknownTagData),
+    JsDocVariadicType(JsDocVariadicTypeData),
+    JsxAttribute(JsxAttributeData),
+    JsxAttributes(JsxAttributesData),
+    JsxClosingElement(JsxClosingElementData),
+    JsxClosingFragment(JsxClosingFragmentData),
+    JsxElement(JsxElementData),
+    JsxExpression(JsxExpressionData),
+    JsxFragment(JsxFragmentData),
+    JsxNamespacedName(JsxNamespacedNameData),
+    JsxOpeningElement(JsxOpeningElementData),
+    JsxOpeningFragment(JsxOpeningFragmentData),
+    JsxSelfClosingElement(JsxSelfClosingElementData),
+    JsxSpreadAttribute(JsxSpreadAttributeData),
+    JsxText(JsxTextData),
+    KeywordExpression(KeywordExpressionData),
+    KeywordTypeNode(KeywordTypeNodeData),
+    LabeledStatement(LabeledStatementData),
+    LiteralTypeNode(LiteralTypeNodeData),
+    MappedTypeNode(MappedTypeNodeData),
+    MetaProperty(MetaPropertyData),
+    MethodDeclaration(MethodDeclarationData),
+    MethodSignatureDeclaration(MethodSignatureDeclarationData),
+    MissingDeclaration(MissingDeclarationData),
+    ModuleBlock(ModuleBlockData),
+    ModuleDeclaration(ModuleDeclarationData),
+    NamedExports(NamedExportsData),
+    NamedImports(NamedImportsData),
+    NamedTupleMember(NamedTupleMemberData),
+    NamespaceExport(NamespaceExportData),
+    NamespaceExportDeclaration(NamespaceExportDeclarationData),
+    NamespaceImport(NamespaceImportData),
+    NewExpression(NewExpressionData),
+    NoSubstitutionTemplateLiteral(NoSubstitutionTemplateLiteralData),
+    NonNullExpression(NonNullExpressionData),
+    NotEmittedStatement(NotEmittedStatementData),
+    NotEmittedTypeElement(NotEmittedTypeElementData),
+    NumericLiteral(NumericLiteralData),
+    ObjectLiteralExpression(ObjectLiteralExpressionData),
+    OmittedExpression(OmittedExpressionData),
+    OptionalTypeNode(OptionalTypeNodeData),
+    ParameterDeclaration(ParameterDeclarationData),
+    ParenthesizedExpression(ParenthesizedExpressionData),
+    ParenthesizedTypeNode(ParenthesizedTypeNodeData),
+    PartiallyEmittedExpression(PartiallyEmittedExpressionData),
+    PostfixUnaryExpression(PostfixUnaryExpressionData),
+    PrefixUnaryExpression(PrefixUnaryExpressionData),
+    PrivateIdentifier(PrivateIdentifierData),
+    PropertyAccessExpression(PropertyAccessExpressionData),
+    PropertyAssignment(PropertyAssignmentData),
+    PropertyDeclaration(PropertyDeclarationData),
+    PropertySignatureDeclaration(PropertySignatureDeclarationData),
+    QualifiedName(QualifiedNameData),
+    RegularExpressionLiteral(RegularExpressionLiteralData),
+    RestTypeNode(RestTypeNodeData),
+    ReturnStatement(ReturnStatementData),
+    SatisfiesExpression(SatisfiesExpressionData),
+    SemicolonClassElement(SemicolonClassElementData),
+    SetAccessorDeclaration(SetAccessorDeclarationData),
+    ShorthandPropertyAssignment(ShorthandPropertyAssignmentData),
+    SourceFile(SourceFileData),
+    SpreadAssignment(SpreadAssignmentData),
+    SpreadElement(SpreadElementData),
+    StringLiteral(StringLiteralData),
+    SwitchStatement(SwitchStatementData),
+    SyntaxList(SyntaxListData),
+    SyntheticExpression(SyntheticExpressionData),
+    SyntheticReferenceExpression(SyntheticReferenceExpressionData),
+    TaggedTemplateExpression(TaggedTemplateExpressionData),
+    TemplateExpression(TemplateExpressionData),
+    TemplateHead(TemplateHeadData),
+    TemplateLiteralTypeNode(TemplateLiteralTypeNodeData),
+    TemplateLiteralTypeSpan(TemplateLiteralTypeSpanData),
+    TemplateMiddle(TemplateMiddleData),
+    TemplateSpan(TemplateSpanData),
+    TemplateTail(TemplateTailData),
+    ThisTypeNode(ThisTypeNodeData),
+    ThrowStatement(ThrowStatementData),
+    Token(TokenData),
+    TryStatement(TryStatementData),
+    TupleTypeNode(TupleTypeNodeData),
+    TypeAliasDeclaration(TypeAliasDeclarationData),
+    TypeAssertion(TypeAssertionData),
+    TypeLiteralNode(TypeLiteralNodeData),
+    TypeOfExpression(TypeOfExpressionData),
+    TypeOperatorNode(TypeOperatorNodeData),
+    TypeParameterDeclaration(TypeParameterDeclarationData),
+    TypePredicateNode(TypePredicateNodeData),
+    TypeQueryNode(TypeQueryNodeData),
+    TypeReferenceNode(TypeReferenceNodeData),
+    UnionTypeNode(UnionTypeNodeData),
+    VariableDeclaration(VariableDeclarationData),
+    VariableDeclarationList(VariableDeclarationListData),
+    VariableStatement(VariableStatementData),
+    VoidExpression(VoidExpressionData),
+    WhileStatement(WhileStatementData),
+    WithStatement(WithStatementData),
+    YieldExpression(YieldExpressionData),
 }
 
 fn visit_optional_child<B, F>(visitor: &mut F, child: Option<NodeId>) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match child {
-        Some(child) => visitor(child),
+        Some(child) => visitor(Child::Node(child)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
 fn visit_children<B, F>(visitor: &mut F, children: &[NodeId]) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     for &child in children {
-        visitor(child)?;
+        visitor(Child::Node(child))?;
     }
     std::ops::ControlFlow::Continue(())
 }
@@ -2875,7 +3925,7 @@ fn visit_optional_children<B, F>(
     children: Option<&[NodeId]>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match children {
         Some(children) => visit_children(visitor, children),
@@ -2883,50 +3933,36 @@ where
     }
 }
 
-fn visit_node_list<B, F>(visitor: &mut F, list: &NodeList) -> std::ops::ControlFlow<B>
-where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
-{
-    visit_children(visitor, &list.nodes)
-}
-
 fn visit_optional_node_list<B, F>(
     visitor: &mut F,
-    list: Option<&NodeList>,
+    list: Option<NodeList>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match list {
-        Some(list) => visit_node_list(visitor, list),
+        Some(list) => visitor(Child::List(list)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
-fn visit_modifier_list<B, F>(visitor: &mut F, list: &ModifierList) -> std::ops::ControlFlow<B>
-where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
-{
-    visit_node_list(visitor, &list.list)
-}
-
 fn visit_optional_modifier_list<B, F>(
     visitor: &mut F,
-    list: Option<&ModifierList>,
+    list: Option<ModifierList>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match list {
-        Some(list) => visit_modifier_list(visitor, list),
+        Some(list) => visitor(Child::List(list.list)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
 impl Node {
     /// Visits every direct AST child in TypeScript-Go `ForEachChild` order.
-    pub fn for_each_child(&self, mut visitor: impl FnMut(NodeId)) {
-        let _ = self.data.try_for_each_child(&mut |child| {
+    pub fn for_each_child(&self, mut visitor: impl FnMut(Child)) {
+        let _ = self.data.view().try_for_each_child(&mut |child| {
             visitor(child);
             std::ops::ControlFlow::<()>::Continue(())
         });
@@ -2937,9 +3973,9 @@ impl Node {
     /// Returning [`std::ops::ControlFlow::Break`] stops traversal immediately.
     pub fn try_for_each_child<B>(
         &self,
-        mut visitor: impl FnMut(NodeId) -> std::ops::ControlFlow<B>,
+        mut visitor: impl FnMut(Child) -> std::ops::ControlFlow<B>,
     ) -> std::ops::ControlFlow<B> {
-        self.data.try_for_each_child(&mut visitor)
+        self.data.view().try_for_each_child(&mut visitor)
     }
 }
 

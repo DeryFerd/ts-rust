@@ -29,14 +29,14 @@ fn run_any_unknown_in_error_context(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagno
     let mut matches: Vec<MatchEntry> = Vec::new();
 
     // Stack-based traversal
-    let mut node_to_visit: Vec<Node> = Vec::new();
-    ctx.source_file.for_each_child(|child| {
-        node_to_visit.push(child);
-        false
-    });
+    // PERF: Go walks the tree with a stack of nodes; this stack holds node
+    // order indexes and pushes and pops at the same points (effperf4).
+    let order = ctx.tp.node_order(ctx.source_file);
+    let mut node_to_visit: Vec<u32> = order.children(0).collect();
 
-    while let Some(node) = node_to_visit.pop() {
-        // Pop from the end (stack)
+    // Pop from the end (stack)
+    while let Some(i) = node_to_visit.pop() {
+        let node = order.node(i);
 
         // Skip type nodes
         if is_type_node(node) {
@@ -79,10 +79,7 @@ fn run_any_unknown_in_error_context(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagno
         }
 
         // Enqueue children for visiting
-        node.for_each_child(|child| {
-            node_to_visit.push(child);
-            false
-        });
+        node_to_visit.extend(order.children(i));
 
         // Get the type at this location
         let mut t = ctx.tp.get_type_at_location(node);

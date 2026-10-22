@@ -9,46 +9,254 @@ use smallvec::SmallVec;
 // nested inference takes another state from the pool, never this one.
 
 // Go: checker/inference.go:11 InferenceKey
+// ts#64553 (Go N' inference.go:11): the key also holds the priority and the
+// variance of the inference state, so a cached inference from type arguments
+// is reused only in the same state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InferenceKey {
-    pub s: TypeId,
-    pub t: TypeId,
+    pub source: TypeId,
+    pub target: TypeId,
+    pub priority: InferencePriority,
+    pub contravariant: bool,
+    pub bivariant: bool,
 }
 
-// PORT: both ids are hashed as one word. No code iterates maps with these
-// keys.
-impl std::hash::Hash for InferenceKey {
+impl InferenceKey {
+    /// PORT: perf. The two ids as one word.
     #[inline]
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_u64(((self.s.0 as u64) << 32) | self.t.0 as u64);
+    fn ids_word(&self) -> u64 {
+        ((self.source.0 as u64) << 32) | self.target.0 as u64
+    }
+
+    /// PORT: perf. The priority bits and the two variance flags as one word.
+    #[inline]
+    fn state_word(&self) -> u64 {
+        ((self.priority.bits() as u32 as u64) << 2)
+            | ((self.contravariant as u64) << 1)
+            | self.bivariant as u64
     }
 }
 
-// PORT: perf. The same word through an Fx mix, which is the hash that
+// PORT: the ids are hashed as one word and the state as a second word. No
+// code iterates maps with these keys.
+impl std::hash::Hash for InferenceKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.ids_word());
+        state.write_u64(self.state_word());
+    }
+}
+
+// PORT: perf. The same words through an Fx mix, which is the hash that
 // `FxHashMap` computes for this key.
 impl FlatKey for InferenceKey {
     #[inline]
     fn flat_hash(&self) -> u64 {
         use std::hash::Hasher;
         let mut h = rustc_hash::FxHasher::default();
-        h.write_u64(((self.s.0 as u64) << 32) | self.t.0 as u64);
+        h.write_u64(self.ids_word());
+        h.write_u64(self.state_word());
         h.finish()
     }
 }
 
-/// The map type of `InferenceState::visited`. For an A/B run against
-/// hashbrown, change it to `FxHashMap<InferenceKey, InferencePriority>`.
-pub type InferenceVisitedMap = FlatMap<InferenceKey, InferencePriority>;
+/// PORT: perf. Not in Go. `InferenceState::definitely_unrelated`: a
+/// direct-mapped cache of `types_definitely_unrelated` for the source and
+/// target pairs of `infer_from_object_types` in one inference. A slot holds
+/// the pair as one word and `(generation << 1) | answer`; a slot of an
+/// earlier inference on this pooled state has another generation, so
+/// nothing is cleared between inferences.
+pub struct DefinitelyUnrelatedCache {
+    slots: Box<[(u64, u64); Self::SLOTS]>,
+}
 
-/// PORT: perf. Not in Go. `stack_recursion_id` as one word, so the inference
+impl DefinitelyUnrelatedCache {
+    const SLOTS: usize = 1024;
+
+    #[inline]
+    fn slot(pair: u64) -> usize {
+        // The murmur3 finalizer, as for `RecursionKey`.
+        let mut x = pair;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        (x ^ (x >> 33)) as usize & (Self::SLOTS - 1)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn get(&self, pair: u64, generation: u64) -> Option<bool> {
+        let (p, g) = self.slots[Self::slot(pair)];
+        (p == pair && g >> 1 == generation).then_some(g & 1 != 0)
+    }
+
+    #[inline]
+    pub fn put(&mut self, pair: u64, generation: u64, unrelated: bool) {
+        self.slots[Self::slot(pair)] = (pair, (generation << 1) | u64::from(unrelated));
+    }
+}
+
+impl Default for DefinitelyUnrelatedCache {
+    fn default() -> Self {
+        Self {
+            slots: Box::new([(0, 0); Self::SLOTS]),
+        }
+    }
+}
+
+/// PORT: perf. Not in Go. `InferenceState::visited`, Go
+/// `map[InferenceKey]InferencePriority`. Open addressing with linear probing
+/// like `FlatMap`, but each slot keeps the generation that wrote it, and a
+/// slot of another generation is empty. So `clear` (Go `clear(n.visited)`,
+/// once per inference) starts a new generation and writes no slot. The
+/// pooled maps keep the slots of their largest inference: on T3 server a
+/// `FlatMap::clear` wrote 454 slots per inference for 5 keys on average.
+/// The map is never iterated, so its layout cannot change any output.
+pub struct InferenceVisitedMap {
+    /// Empty until the first insert; else a power of two.
+    slots: Box<[VisitedSlot]>,
+    /// Keys of the current generation.
+    used: usize,
+    /// Never 0: new slots have generation 0, so they are empty.
+    generation: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct VisitedSlot {
+    key: InferenceKey,
+    value: InferencePriority,
+    generation: u32,
+}
+
+impl Default for InferenceVisitedMap {
+    fn default() -> Self {
+        Self {
+            slots: Box::default(),
+            used: 0,
+            generation: 1,
+        }
+    }
+}
+
+impl InferenceVisitedMap {
+    /// Slot count of the first allocation.
+    const MIN_SLOTS: usize = 8;
+
+    #[inline]
+    #[must_use]
+    pub fn get(&self, key: &InferenceKey) -> Option<InferencePriority> {
+        if self.used == 0 {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut i = (key.flat_hash() as usize) & mask;
+        loop {
+            let slot = &self.slots[i];
+            if slot.generation != self.generation {
+                return None;
+            }
+            if slot.key == *key {
+                return Some(slot.value);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Inserts or overwrites. The table grows before it is half full.
+    #[inline]
+    pub fn insert(&mut self, key: InferenceKey, value: InferencePriority) {
+        let generation = self.generation;
+        if !self.slots.is_empty() {
+            let max_used = self.slots.len() / 2;
+            let mask = self.slots.len() - 1;
+            let mut i = (key.flat_hash() as usize) & mask;
+            loop {
+                let slot = &mut self.slots[i];
+                if slot.generation != generation {
+                    if self.used < max_used {
+                        *slot = VisitedSlot {
+                            key,
+                            value,
+                            generation,
+                        };
+                        self.used += 1;
+                        return;
+                    }
+                    break;
+                }
+                if slot.key == key {
+                    slot.value = value;
+                    return;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+        // The key is absent and the table is empty or full to its load.
+        self.grow();
+        self.insert_absent(VisitedSlot {
+            key,
+            value,
+            generation,
+        });
+        self.used += 1;
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.used
+    }
+
+    /// Removes all keys: the slots of the old generation become empty.
+    #[inline]
+    pub fn clear(&mut self) {
+        if self.used == 0 {
+            return;
+        }
+        self.used = 0;
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            // After 2^32 - 1 clears, old slots would match a generation again.
+            self.slots.fill(VisitedSlot::default());
+            self.generation = 1;
+        }
+    }
+
+    /// Doubles the slot count and puts back the keys of this generation.
+    #[cold]
+    fn grow(&mut self) {
+        let len = (self.slots.len() * 2).max(Self::MIN_SLOTS);
+        let old = std::mem::replace(
+            &mut self.slots,
+            vec![VisitedSlot::default(); len].into_boxed_slice(),
+        );
+        for &slot in &*old {
+            if slot.generation == self.generation {
+                self.insert_absent(slot);
+            }
+        }
+    }
+
+    /// Writes a slot whose key is absent into the first empty slot of its
+    /// probe run. The caller keeps `used` and makes sure an empty slot exists.
+    #[inline]
+    fn insert_absent(&mut self, slot: VisitedSlot) {
+        let mask = self.slots.len() - 1;
+        let mut i = (slot.key.flat_hash() as usize) & mask;
+        while self.slots[i].generation == self.generation {
+            i = (i + 1) & mask;
+        }
+        self.slots[i] = slot;
+    }
+}
+
+/// PORT: perf. Not in Go. A `RecursionId` as one word, so the inference
 /// stacks store and compare ids with plain 8-byte moves. 0 is `None`. A node
 /// handle has nonzero low 32 bits, so it is its own key. A symbol or type
 /// id goes in the high 32 bits with zero low bits: a symbol as its id, a
 /// type as its id with bit 31 set. An id that does not fit (a node with
-/// zero low bits, a nil symbol, or a symbol or type id of 2^31 or more) is
-/// stored as `None`. Such an entry is not a mapped type, an indexed access
-/// or an intersection, so `has_matching_recursion_identity` on it only
-/// compares `get_recursion_identity_from_target` and gives the same answer.
+/// zero low bits, a nil symbol, or a symbol or type id of 2^31 or more) has
+/// no key, and the entry is stored as an entry with unknown ids
+/// (`inference_stack_ids`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecursionKey(u64);
 
@@ -104,10 +312,28 @@ impl FlatKey for RecursionKey {
 /// `StackEntry::prev` of an entry with no earlier same-id entry.
 const NO_PREV: u32 = u32::MAX;
 
-/// PORT: perf. Not in Go. Per entry of an `InferenceStack`: `id` is
-/// `RecursionKey::new(stack_recursion_id(t))`, `prev` is the index of the
-/// next lower entry with the same id (or `NO_PREV`), and `steps` counts the
-/// same-id entry pairs up to this entry whose type id does not go down.
+/// `StackEntry::steps` of an entry whose ids are unknown.
+const UNKNOWN_IDS: u32 = u32::MAX;
+
+/// PORT: perf. Not in Go. The recursion identities of an inference stack
+/// entry (`inference_stack_ids`).
+pub enum StackIds {
+    /// One id: the entry's Go `getRecursionIdentity`.
+    One(RecursionKey),
+    /// Several ids, pushed on the output list: an entry whose Go
+    /// `getRecursionIdentityTarget` is an intersection.
+    Many,
+    /// Not known without the Go code (see `inference_stack_ids`).
+    Unknown,
+}
+
+/// PORT: perf. Not in Go. Per entry of an `InferenceStack`. An entry with
+/// one id: `id` is it, `prev` is the index of the next lower entry with the
+/// same id (or `NO_PREV`), and `steps` counts the same-id entry pairs up to
+/// this entry whose type id does not go down. Any other entry: `id` is
+/// `RecursionKey::NONE`, and `prev` and `steps` are the start and the length
+/// of its ids in `InferenceStack::set_ids`, or `NO_PREV` and `UNKNOWN_IDS`
+/// when its ids are unknown.
 // PERF: the three fields share one 16-byte element, so a push reads the id
 // and the steps of `prev` from one cache line.
 #[derive(Clone, Copy, Debug)]
@@ -117,17 +343,10 @@ struct StackEntry {
     steps: u32,
 }
 
-/// The id list that `is_deeply_nested_type_with_ids` reads.
-impl From<StackEntry> for Option<RecursionId> {
-    #[inline]
-    fn from(entry: StackEntry) -> Self {
-        entry.id.into()
-    }
-}
-
 /// PORT: perf. Not in Go. Go `sourceStack` or `targetStack` of
-/// `InferenceState`, with the recursion id of each entry and the data that
-/// gives `is_deeply_nested_type` for the top entry in O(1).
+/// `InferenceState`, with the recursion ids of each entry and the data that
+/// gives `is_deeply_nested_type` for the top entry in O(1) when every entry
+/// has one id.
 ///
 /// The Go scan counts the first entry with the probe's id, then each later
 /// entry with that id whose type id is not lower than the one before it.
@@ -143,13 +362,39 @@ pub struct InferenceStack {
     pub types: Vec<TypeId>,
     entries: Vec<StackEntry>,
     top: FlatMap<RecursionKey, u32>,
-    /// Entries whose id is `RecursionKey::NONE`.
+    /// Entries whose id is `RecursionKey::NONE` (several or unknown ids).
     none: u32,
+    /// The ids of the entries with several ids, in entry order.
+    pub set_ids: Vec<RecursionKey>,
 }
 
+// PERF: `inline(always)` on push and pop, because `#[inline]` left them out
+// of line.
 impl InferenceStack {
-    // PERF: `inline(always)`, because `#[inline]` left push and pop out of
-    // line.
+    /// Pushes `t` with the ids that `inference_stack_ids` gave for it.
+    /// `first` is the length of `set_ids` before that call.
+    #[inline(always)]
+    pub fn push_ids(&mut self, t: TypeId, ids: StackIds, first: usize) {
+        match ids {
+            StackIds::One(id) => self.push(t, id),
+            StackIds::Many => {
+                self.none += 1;
+                self.types.push(t);
+                self.entries.push(StackEntry {
+                    id: RecursionKey::NONE,
+                    prev: first as u32,
+                    steps: (self.set_ids.len() - first) as u32,
+                });
+            }
+            StackIds::Unknown => {
+                self.set_ids.truncate(first);
+                self.push(t, RecursionKey::NONE);
+            }
+        }
+    }
+
+    /// Pushes `t` with one id, or with unknown ids when `id` is
+    /// `RecursionKey::NONE`.
     #[inline(always)]
     pub fn push(&mut self, t: TypeId, id: RecursionKey) {
         let idx = self.types.len() as u32;
@@ -160,6 +405,7 @@ impl InferenceStack {
         };
         if id == RecursionKey::NONE {
             self.none += 1;
+            entry.steps = UNKNOWN_IDS;
         } else if let Some(prev) = self.top.insert(id, idx)
             && prev < idx
         {
@@ -179,13 +425,32 @@ impl InferenceStack {
         let entry = self.entries.pop().unwrap();
         if entry.id == RecursionKey::NONE {
             self.none -= 1;
+            if entry.steps != UNKNOWN_IDS {
+                self.set_ids.truncate(entry.prev as usize);
+            }
         } else if entry.prev != NO_PREV {
             self.top.insert(entry.id, entry.prev);
         }
     }
 
+    /// Whether the entry at `i` matches the Go `identity` (as `key`, which is
+    /// `NONE` when the identity has no key), when that needs no Go code:
+    /// `None` for an entry with unknown ids.
+    #[inline]
+    fn entry_matches(&self, i: usize, key: RecursionKey) -> Option<bool> {
+        let entry = self.entries[i];
+        if entry.id != RecursionKey::NONE {
+            return Some(entry.id == key);
+        }
+        if entry.steps == UNKNOWN_IDS {
+            return None;
+        }
+        let ids = &self.set_ids[entry.prev as usize..(entry.prev + entry.steps) as usize];
+        Some(key != RecursionKey::NONE && ids.contains(&key))
+    }
+
     /// The Go deeply nested answer for the top entry as the probe, when it
-    /// needs no scan: the top has an id and no entry lacks one.
+    /// needs no scan: every entry has one id.
     #[inline]
     #[must_use]
     pub fn top_deeply_nested(&self, max_depth: i32) -> Option<bool> {
@@ -204,6 +469,7 @@ impl InferenceStack {
     pub fn clear(&mut self) {
         self.types.clear();
         self.entries.clear();
+        self.set_ids.clear();
         self.none = 0;
         if self.top.len() > 1024 {
             self.top = FlatMap::default();
@@ -215,7 +481,8 @@ impl InferenceStack {
 // PORT: Go `inferences []*InferenceInfo` is the inference list of an inference
 // context, so it is the `InferenceContextId` that owns the list (nil when the
 // state is in the free pool). Callers that pass a fresh list in Go push a
-// scratch context first. Go nil `visited` map is `None`.
+// scratch context first. Go nil `visited` map is an empty map: a lookup
+// misses in both.
 #[derive(Default)]
 pub struct InferenceState {
     pub inferences: InferenceContextId,
@@ -227,14 +494,17 @@ pub struct InferenceState {
     pub bivariant: bool,
     pub expanding_flags: ExpandingFlags,
     pub propagation_type: TypeId,
-    pub visited: Option<InferenceVisitedMap>,
-    // PORT: perf. Not in Go. The largest `visited` length that a root
-    // inference on this pooled state reached (see `invoke_once`).
-    pub max_visited_len: usize,
+    pub visited: InferenceVisitedMap,
     // PORT: perf. Go `sourceStack` and `targetStack` with the recursion id
     // of each entry (see `InferenceStack`).
     pub source_stack: InferenceStack,
     pub target_stack: InferenceStack,
+    // PORT: perf. Not in Go. `types_definitely_unrelated` of the source and
+    // target pairs of `infer_from_object_types` in this inference (see
+    // there), made at the first use. `generation` counts the inferences on
+    // this pooled state. An empty slot holds pair 0, which no real pair is.
+    pub definitely_unrelated: Option<DefinitelyUnrelatedCache>,
+    pub generation: u64,
     pub next: Option<Rc<RefCell<InferenceState>>>,
 }
 
@@ -269,24 +539,19 @@ impl Checker {
                 expanding_flags,
                 propagation_type,
                 visited,
-                max_visited_len,
                 source_stack,
                 target_stack,
+                definitely_unrelated: _,
+                generation,
                 next,
             } = &mut *guard;
-            *max_visited_len =
-                (*max_visited_len).max(visited.as_ref().map_or(0, InferenceVisitedMap::len));
-            if let Some(v) = visited.as_mut() {
-                // PORT: Go `clear(n.visited)`. Clearing costs time in the map
-                // capacity, so a mostly empty large map is dropped instead.
-                if v.capacity() > 256 && v.len() < v.capacity() / 8 {
-                    *v = InferenceVisitedMap::default();
-                } else {
-                    v.clear();
-                }
-            }
+            // Go `clear(n.visited)`. It writes no slot (see
+            // `InferenceVisitedMap`).
+            visited.clear();
             source_stack.clear();
             target_stack.clear();
+            // The cache slots of this inference are stale from here on.
+            *generation += 1;
             // PORT: Go `inferences: n.inferences[:0]` keeps only the slice
             // capacity; the context id has none, so it becomes nil.
             *inferences = InferenceContextId::NIL;
@@ -351,47 +616,23 @@ impl Checker {
             (Some(sa), Some(ta)) if sa.symbol == ta.symbol
         );
         if same_alias {
-            let sa = self.ty(source).alias.clone().unwrap();
-            let ta = self.ty(target).alias.clone().unwrap();
-            if !sa.type_arguments.is_empty() || !ta.type_arguments.is_empty() {
-                // Source and target are types originating in the same generic type alias declaration.
-                // Simply infer from source type arguments to target type arguments, with defaults applied.
-                let params_len = self.type_alias_links.get(sa.symbol).type_parameters.len();
-                let node_is_in_js_file = is_in_js_file(self.sym(sa.symbol).value_declaration);
-                // PERF: when no argument is missing and the alias is not in a
-                // JS file, Go fillMissingTypeArguments returns its input and
-                // getMinTypeArgumentCount only reads declarations, so the
-                // argument lists are read in place, without the copies.
-                if params_len != 0
-                    && !node_is_in_js_file
-                    && sa.type_arguments.len() >= params_len
-                    && ta.type_arguments.len() >= params_len
-                {
-                    let variances = self.get_alias_variances(sa.symbol);
-                    self.infer_from_type_arguments(
-                        n,
-                        &sa.type_arguments,
-                        &ta.type_arguments,
-                        &variances,
-                    );
-                    return;
-                }
-                let params = self.type_alias_links.get(sa.symbol).type_parameters.clone();
-                let min_params = self.get_min_type_argument_count(&params);
-                let source_types = self.fill_missing_type_arguments(
-                    &sa.type_arguments,
-                    &params,
-                    min_params,
-                    node_is_in_js_file,
-                );
-                let target_types = self.fill_missing_type_arguments(
-                    &ta.type_arguments,
-                    &params,
-                    min_params,
-                    node_is_in_js_file,
-                );
-                let variances = self.get_alias_variances(sa.symbol);
-                self.infer_from_type_arguments(n, &source_types, &target_types, &variances);
+            let (sa_empty, ta_empty) = (
+                self.ty(source)
+                    .alias
+                    .as_ref()
+                    .unwrap()
+                    .type_arguments
+                    .is_empty(),
+                self.ty(target)
+                    .alias
+                    .as_ref()
+                    .unwrap()
+                    .type_arguments
+                    .is_empty(),
+            );
+            if !sa_empty || !ta_empty {
+                // ts#64553 (Go N' inference.go:84)
+                self.invoke_once(n, source, target, Checker::infer_from_alias_type_arguments);
             }
             // And if there weren't any type arguments, there's no reason to run inference as the types must be the same.
             return;
@@ -549,7 +790,7 @@ impl Checker {
                     {
                         let info = &mut self.inference_context_mut(ctx).inferences[inference];
                         if priority < info.priority {
-                            info.candidate_lists = None;
+                            info.clear_candidates();
                             info.top_level = true;
                             info.priority = priority;
                         }
@@ -563,9 +804,7 @@ impl Checker {
                                 .contains(&candidate)
                             {
                                 self.inference_context_mut(ctx).inferences[inference]
-                                    .candidate_lists_mut()
-                                    .contra_candidates
-                                    .push(candidate);
+                                    .push_candidate(candidate, true /*contra*/);
                                 self.clear_cached_inferences(ctx);
                             }
                         } else if !self.inference_context(ctx).inferences[inference]
@@ -573,9 +812,7 @@ impl Checker {
                             .contains(&candidate)
                         {
                             self.inference_context_mut(ctx).inferences[inference]
-                                .candidate_lists_mut()
-                                .candidates
-                                .push(candidate);
+                                .push_candidate(candidate, false /*contra*/);
                             self.clear_cached_inferences(ctx);
                         }
                     }
@@ -642,15 +879,12 @@ impl Checker {
                 && self.ty(target).as_type_reference().node.is_some())
         {
             // If source and target are references to the same generic type, infer from type arguments
-            let source_type_arguments = self.get_type_arguments(source);
-            let target_type_arguments = self.get_type_arguments(target);
-            let source_target = self.ty(source).as_type_reference().object.target;
-            let variances = self.get_variances(source_target);
-            self.infer_from_type_arguments(
+            // ts#64553 (Go N' inference.go:230)
+            self.invoke_once(
                 n,
-                &source_type_arguments,
-                &target_type_arguments,
-                &variances,
+                source,
+                target,
+                Checker::infer_from_reference_type_arguments,
             );
         } else if source_flags.intersects(TypeFlags::INDEX)
             && target_flags.intersects(TypeFlags::INDEX)
@@ -750,6 +984,69 @@ impl Checker {
                 self.invoke_once(n, source, target, Checker::infer_from_object_types);
             }
         }
+    }
+
+    // Go: checker/inference.go:280 inferFromAliasTypeArguments (Go N', ts#64553)
+    pub fn infer_from_alias_type_arguments(
+        &mut self,
+        n: &mut InferenceState,
+        source: TypeId,
+        target: TypeId,
+    ) {
+        let sa = self.ty(source).alias.clone().unwrap();
+        let ta = self.ty(target).alias.clone().unwrap();
+        // Source and target are types originating in the same generic type alias declaration.
+        // Simply infer from source type arguments to target type arguments, with defaults applied.
+        let params_len = self.type_alias_links.get(sa.symbol).type_parameters.len();
+        let node_is_in_js_file = is_in_js_file(self.sym(sa.symbol).value_declaration);
+        // PERF: when no argument is missing and the alias is not in a
+        // JS file, Go fillMissingTypeArguments returns its input and
+        // getMinTypeArgumentCount only reads declarations, so the
+        // argument lists are read in place, without the copies.
+        if params_len != 0
+            && !node_is_in_js_file
+            && sa.type_arguments.len() >= params_len
+            && ta.type_arguments.len() >= params_len
+        {
+            let variances = self.get_alias_variances(sa.symbol);
+            self.infer_from_type_arguments(n, &sa.type_arguments, &ta.type_arguments, &variances);
+            return;
+        }
+        let params = self.type_alias_links.get(sa.symbol).type_parameters.clone();
+        let min_params = self.get_min_type_argument_count(&params);
+        let source_types = self.fill_missing_type_arguments(
+            &sa.type_arguments,
+            &params,
+            min_params,
+            node_is_in_js_file,
+        );
+        let target_types = self.fill_missing_type_arguments(
+            &ta.type_arguments,
+            &params,
+            min_params,
+            node_is_in_js_file,
+        );
+        let variances = self.get_alias_variances(sa.symbol);
+        self.infer_from_type_arguments(n, &source_types, &target_types, &variances);
+    }
+
+    // Go: checker/inference.go:291 inferFromReferenceTypeArguments (Go N', ts#64553)
+    pub fn infer_from_reference_type_arguments(
+        &mut self,
+        n: &mut InferenceState,
+        source: TypeId,
+        target: TypeId,
+    ) {
+        let source_type_arguments = self.get_type_arguments(source);
+        let target_type_arguments = self.get_type_arguments(target);
+        let source_target = self.ty(source).as_type_reference().object.target;
+        let variances = self.get_variances(source_target);
+        self.infer_from_type_arguments(
+            n,
+            &source_type_arguments,
+            &target_type_arguments,
+            &variances,
+        );
     }
 
     // Go: checker/inference.go:284 inferFromTypeArguments
@@ -855,37 +1152,23 @@ impl Checker {
     ) {
         // PORT: a type handle equals its Go `id`, so the key needs no type read.
         let key = InferenceKey {
-            s: source,
-            t: target,
+            source,
+            target,
+            priority: n.priority,
+            contravariant: n.contravariant,
+            bivariant: n.bivariant,
         };
-        // PORT: perf. The map is made first; a lookup on Go's nil map misses,
-        // and the miss path makes the map anyway, so the map contents are the
-        // same. The insert after a miss finds the probed slots in cache.
+        // PORT: the insert after a miss finds the probed slots in cache.
         {
             let s = &mut *n;
-            let visited = s.visited.get_or_insert_with(InferenceVisitedMap::default);
-            if let Some(&p) = visited.get(&key) {
+            if let Some(p) = s.visited.get(&key) {
                 s.inference_priority = std::cmp::min(s.inference_priority, p);
                 return;
             }
-            // PORT: perf. Not in Go. `put_inference_state` drops a mostly
-            // empty large map, so a later large inference would grow it again
-            // by doubling. Once this inference reaches a quarter of the
-            // largest length seen, the map grows in one step to that length.
-            // A map sized so is not dropped at that fill, and smaller
-            // inferences never make it. The map is never iterated.
-            if visited.len() == s.max_visited_len / 4 {
-                visited.reserve(s.max_visited_len - visited.len());
-            }
-            visited.insert(key, InferencePriority::CIRCULARITY);
+            s.visited.insert(key, InferencePriority::CIRCULARITY);
         }
         let save_inference_priority;
         let save_expanding_flags;
-        // PORT: perf. Each stack entry keeps its recursion id, so the deeply
-        // nested checks below compare ids instead of reading every entry's
-        // type again (see `is_deeply_nested_type_with_ids`).
-        let source_id = RecursionKey::new(self.stack_recursion_id(source));
-        let target_id = RecursionKey::new(self.stack_recursion_id(target));
         {
             let s = &mut *n;
             save_inference_priority = s.inference_priority;
@@ -893,8 +1176,15 @@ impl Checker {
             // We stop inferring and report a circularity if we encounter duplicate recursion identities on both
             // the source side and the target side.
             save_expanding_flags = s.expanding_flags;
-            s.source_stack.push(source, source_id);
-            s.target_stack.push(target, target_id);
+            // PORT: perf. Each stack entry keeps its recursion ids, so the
+            // deeply nested checks below compare ids instead of reading
+            // every entry's type again (see `inference_stack_ids`).
+            let first = s.source_stack.set_ids.len();
+            let ids = self.inference_stack_ids(source, &mut s.source_stack.set_ids);
+            s.source_stack.push_ids(source, ids, first);
+            let first = s.target_stack.set_ids.len();
+            let ids = self.inference_stack_ids(target, &mut s.target_stack.set_ids);
+            s.target_stack.push_ids(target, ids, first);
         }
         // PORT: the stacks are read in place through `n`, instead of cloned.
         let source_nested = {
@@ -924,20 +1214,19 @@ impl Checker {
             s.expanding_flags = save_expanding_flags;
             let inference_priority = s.inference_priority;
             // PORT: the key was inserted above, so this overwrites it in
-            // place (one probe).
-            s.visited
-                .get_or_insert_with(InferenceVisitedMap::default)
-                .insert(key, inference_priority);
+            // place.
+            s.visited.insert(key, inference_priority);
             s.inference_priority = std::cmp::min(s.inference_priority, save_inference_priority);
         }
     }
 
     // PORT: perf. Go `isDeeplyNestedType(t, stack, maxDepth)` where `t` is
-    // the entry just pushed on `stack`. When the top entry has an id and no
-    // entry lacks one, the Go scan only compares ids, so the answer comes
-    // from `InferenceStack` with no scan (debug builds also scan and
-    // compare). Else the scan runs as in Go, with
-    // `has_matching_recursion_identity` for the same types in the same order.
+    // the entry just pushed on `stack`. When every entry has one id, the Go
+    // scan only compares ids, so the answer comes from `InferenceStack`
+    // with no scan (debug builds also scan and compare). Else the scan
+    // compares the known ids and runs the Go code for the probe and the
+    // entries with unknown ids, so `get_recursion_identity_target` runs for
+    // the same types in Go order.
     // Go: checker/relater.go:766 isDeeplyNestedType
     #[inline]
     fn is_deeply_nested_inference_top(&mut self, stack: &InferenceStack, max_depth: i32) -> bool {
@@ -947,17 +1236,177 @@ impl Checker {
         {
             return nested;
         }
-        let t = *stack.types.last().unwrap();
-        let probe_id: Option<RecursionId> = (*stack.entries.last().unwrap()).into();
-        let nested = self.is_deeply_nested_type_with_ids(
-            t,
-            probe_id,
-            &stack.types,
-            &stack.entries,
-            max_depth,
-        );
+        let nested = if (stack.types.len() as i32) < max_depth {
+            false
+        } else {
+            let top = *stack.entries.last().unwrap();
+            if top.id != RecursionKey::NONE {
+                self.inference_stack_scan(stack, top.id, max_depth)
+            } else if top.steps != UNKNOWN_IDS {
+                // Go `isDeeplyNestedType` on each intersection member in
+                // turn, here on their ids.
+                (top.prev..top.prev + top.steps)
+                    .any(|i| self.inference_stack_scan(stack, stack.set_ids[i as usize], max_depth))
+            } else {
+                self.is_deeply_nested_inference_type(*stack.types.last().unwrap(), stack, max_depth)
+            }
+        };
         debug_assert!(fast.is_none_or(|fast| fast == nested));
         nested
+    }
+
+    // PORT: perf. Go `isDeeplyNestedType(t, stack, maxDepth)` on an
+    // inference stack of at least `max_depth` entries, for a probe whose ids
+    // are unknown: the Go code.
+    // Go: checker/relater.go:766 isDeeplyNestedType
+    fn is_deeply_nested_inference_type(
+        &mut self,
+        t: TypeId,
+        stack: &InferenceStack,
+        max_depth: i32,
+    ) -> bool {
+        let target = self.get_recursion_identity_target(t);
+        if self.ty(target).flags.intersects(TypeFlags::INTERSECTION) {
+            for i in 0..self.ty(target).types().len() {
+                let t = self.type_at(target, i);
+                if self.is_deeply_nested_inference_type(t, stack, max_depth) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        let identity = self.get_recursion_identity_from_target(target);
+        let key = RecursionKey::new(Some(identity));
+        self.inference_stack_scan_id(stack, identity, key, max_depth)
+    }
+
+    // PORT: perf. The scan of Go `isDeeplyNestedType` for an identity that
+    // has a key.
+    fn inference_stack_scan(
+        &mut self,
+        stack: &InferenceStack,
+        key: RecursionKey,
+        max_depth: i32,
+    ) -> bool {
+        let identity = Option::<RecursionId>::from(key).unwrap();
+        self.inference_stack_scan_id(stack, identity, key, max_depth)
+    }
+
+    // PORT: perf. The scan of Go `isDeeplyNestedType` for `identity` (as
+    // `key`, `NONE` when it has none): known ids are compared, and an entry
+    // with unknown ids runs Go `hasMatchingRecursionIdentity`.
+    // Go: checker/relater.go:776 isDeeplyNestedType
+    fn inference_stack_scan_id(
+        &mut self,
+        stack: &InferenceStack,
+        identity: RecursionId,
+        key: RecursionKey,
+        max_depth: i32,
+    ) -> bool {
+        let mut count: i32 = 0;
+        let mut last_type_id = TypeId(0);
+        for (i, &t) in stack.types.iter().enumerate() {
+            let matching = match stack.entry_matches(i, key) {
+                Some(matching) => matching,
+                None => self.has_matching_recursion_identity(t, identity),
+            };
+            if matching {
+                // We only count occurrences with a higher type id than the previous occurrence, since higher
+                // type ids are an indicator of newer instantiations caused by recursion.
+                if t >= last_type_id {
+                    count += 1;
+                    if count >= max_depth {
+                        return true;
+                    }
+                }
+                last_type_id = t;
+            }
+        }
+        false
+    }
+
+    // PORT: perf. Not in Go. The recursion ids of an inference stack entry
+    // `t`, for the deeply nested checks of `invoke_once`. Go reads them with
+    // `getRecursionIdentityTarget` and `getRecursionIdentityFromTarget` (in
+    // `hasMatchingRecursionIdentity`, and in `isDeeplyNestedType` when `t`
+    // is the probe), and the ids here are the same when those calls only
+    // read: each instantiated mapped type on the way has its modifiers type
+    // already, so the Go call makes no type. `One` is the id of a target
+    // that is not an intersection. `Many` pushes on `out`, in Go order, the
+    // ids of the members of a target that is an intersection (the Go code
+    // matches an identity against any of them). `Unknown` (`out` as it was
+    // or longer; `push_ids` cuts it) when a mapped type on the way has no
+    // modifiers type yet or an id has no `RecursionKey`: the scan then runs
+    // the Go code for the entry, so the modifiers type is made at the same
+    // point as in Go. Type data does not change after the type is made, and
+    // a modifiers type does not change once it is set, so the ids stay
+    // valid while the entry is on the stack.
+    #[inline]
+    pub fn inference_stack_ids(&self, t: TypeId, out: &mut Vec<RecursionKey>) -> StackIds {
+        let ty = self.ty(t);
+        if !ty.object_flags.contains(ObjectFlags::INSTANTIATED_MAPPED)
+            && !ty
+                .flags
+                .intersects(TypeFlags::INTERSECTION | TypeFlags::INDEXED_ACCESS)
+        {
+            // `t` is its own recursion identity target.
+            let key = RecursionKey::new(Some(self.get_recursion_identity_from_target(t)));
+            return if key == RecursionKey::NONE {
+                StackIds::Unknown
+            } else {
+                StackIds::One(key)
+            };
+        }
+        let first = out.len();
+        if !self.push_recursion_identities(t, out) {
+            return StackIds::Unknown;
+        }
+        if out.len() == first + 1 {
+            return StackIds::One(out.pop().unwrap());
+        }
+        StackIds::Many
+    }
+
+    // PORT: perf. Not in Go. `inference_stack_ids` for any type: pushes the
+    // ids that Go `hasMatchingRecursionIdentity(t, identity)` compares
+    // `identity` with, in Go order. False when they are unknown.
+    // Go: checker/relater.go:797 hasMatchingRecursionIdentity
+    // Go: checker/relater.go:820 getRecursionIdentityTarget
+    fn push_recursion_identities(&self, t: TypeId, out: &mut Vec<RecursionKey>) -> bool {
+        let mut target = t;
+        loop {
+            let ty = self.ty(target);
+            if ty.flags.intersects(TypeFlags::INDEXED_ACCESS) {
+                target = ty.as_indexed_access_type().object_type;
+                continue;
+            }
+            if ty.object_flags.contains(ObjectFlags::INSTANTIATED_MAPPED) {
+                let modifiers = ty.as_mapped_type().modifiers_type;
+                if modifiers.is_nil() {
+                    return false;
+                }
+                let m = self.ty(modifiers);
+                if m.symbol.is_some()
+                    || m.flags.intersects(TypeFlags::INTERSECTION)
+                        && m.types().iter().any(|&t| self.ty(t).symbol.is_some())
+                {
+                    target = modifiers;
+                    continue;
+                }
+            } else if ty.flags.intersects(TypeFlags::INTERSECTION) {
+                return ty
+                    .types()
+                    .iter()
+                    .all(|&t| self.push_recursion_identities(t, out));
+            }
+            break;
+        }
+        let key = RecursionKey::new(Some(self.get_recursion_identity_from_target(target)));
+        if key == RecursionKey::NONE {
+            return false;
+        }
+        out.push(key);
+        true
     }
 
     // Go: checker/inference.go:370 inferFromMatchingTypes
@@ -1504,16 +1953,8 @@ impl Checker {
                 || self.is_array_type(source) && self.is_array_type(target))
         {
             // If source and target are references to the same generic type, infer from type arguments
-            let source_type_arguments = self.get_type_arguments(source);
-            let target_type_arguments = self.get_type_arguments(target);
-            let source_target = self.ty(source).target();
-            let variances = self.get_variances(source_target);
-            self.infer_from_type_arguments(
-                n,
-                &source_type_arguments,
-                &target_type_arguments,
-                &variances,
-            );
+            // ts#64553 (Go N' inference.go:713)
+            self.infer_from_reference_type_arguments(n, source, target);
             return;
         }
         if self.is_generic_mapped_type(source) && self.is_generic_mapped_type(target) {
@@ -1523,7 +1964,7 @@ impl Checker {
             && self
                 .ty(target)
                 .as_mapped_type()
-                .declaration
+                .declaration()
                 .name_type()
                 .is_nil()
         {
@@ -1533,7 +1974,31 @@ impl Checker {
             }
         }
         // Infer from the members of source and target only if the two types are possibly related
-        if self.types_definitely_unrelated(source, target) {
+        // PORT: perf. Go N' (ts#64553) keys `invokeOnce` by the priority and
+        // the variance too, so one inference can run this action again for a
+        // pair it has seen. The first `types_definitely_unrelated` of a pair
+        // runs here as in Go; a later one in the same inference can take the
+        // kept answer. Go's later call gives the same answer and makes
+        // nothing: the properties, the property types and the union and
+        // intersection properties that it reads were made and cached by the
+        // first call, and the type resolutions under way are the same at
+        // every call of one inference (a nested inference has its own
+        // state).
+        let pair = (u64::from(source.0) << 32) | u64::from(target.0);
+        let generation = n.generation;
+        let cache = n.definitely_unrelated.get_or_insert_with(Default::default);
+        let unrelated = match cache.get(pair, generation) {
+            Some(unrelated) => unrelated,
+            None => {
+                let unrelated = self.types_definitely_unrelated(source, target);
+                n.definitely_unrelated
+                    .as_mut()
+                    .unwrap()
+                    .put(pair, generation, unrelated);
+                unrelated
+            }
+        };
+        if unrelated {
             return;
         }
         if self.is_array_or_tuple_type(source) {
@@ -2131,6 +2596,110 @@ impl Checker {
 mod tests {
     use super::*;
 
+    /// The candidate lists of an `InferenceInfo` against two plain lists:
+    /// the inline first candidate keeps the order of both lists. The clear
+    /// comes before any candidate, after the inline one only, after the
+    /// box is made, or not at all.
+    #[test]
+    fn inference_info_candidates_match_lists() {
+        for (pattern, clear_at) in (0u32..64).flat_map(|p| [0, 1, 2, 4, 6].map(|c| (p, c))) {
+            let mut info = InferenceInfo::default();
+            let (mut co, mut contra) = (Vec::new(), Vec::new());
+            for i in 0..6u32 {
+                if i == clear_at {
+                    info.clear_candidates();
+                    co.clear();
+                    contra.clear();
+                }
+                let t = TypeId(100 + i);
+                if pattern >> i & 1 != 0 {
+                    info.push_candidate(t, true);
+                    contra.push(t);
+                } else {
+                    info.push_candidate(t, false);
+                    co.push(t);
+                }
+                assert_eq!(info.candidates(), &co[..]);
+                assert_eq!(info.contra_candidates(), &contra[..]);
+                let copy = clone_inference_info(&info);
+                assert_eq!(copy.candidates(), &co[..]);
+                assert_eq!(copy.contra_candidates(), &contra[..]);
+            }
+        }
+    }
+
+    /// The visited map against a `HashMap` over many clears, with growth and a
+    /// generation wrap: a clear must hide every key of the earlier inference.
+    #[test]
+    fn inference_visited_map_matches_hash_map() {
+        let key = |n: u32| InferenceKey {
+            source: TypeId(n % 37),
+            target: TypeId(n % 11),
+            priority: InferencePriority((n % 3) as i32),
+            contravariant: n % 2 == 0,
+            bivariant: n % 5 == 0,
+        };
+        let mut map = InferenceVisitedMap::default();
+        let mut std_map = std::collections::HashMap::new();
+        let mut rng: u32 = 0x9e37_79b9;
+        for round in 0..300u32 {
+            if round == 200 {
+                map.generation = u32::MAX;
+            }
+            for _ in 0..(round % 50) {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                let k = key(rng % 4000);
+                let v = InferencePriority((rng >> 20) as i32);
+                assert_eq!(map.get(&k), std_map.get(&k).copied());
+                map.insert(k, v);
+                std_map.insert(k, v);
+                assert_eq!(map.len(), std_map.len());
+            }
+            for n in 0..4000 {
+                assert_eq!(map.get(&key(n)), std_map.get(&key(n)).copied());
+            }
+            map.clear();
+            std_map.clear();
+            assert_eq!(map.len(), 0);
+            assert_ne!(map.generation, 0);
+        }
+    }
+
+    /// The clear that wraps the generation to 0 must empty the old slots:
+    /// a slot of generation 1 would read as a key of the new generation 1.
+    /// The insert at the last generation can take the slot of one of the
+    /// three old keys, not of all of them.
+    #[test]
+    fn inference_visited_map_wrap_empties_old_slots() {
+        let key = |n: u32| InferenceKey {
+            source: TypeId(n),
+            target: TypeId(n),
+            priority: InferencePriority(0),
+            contravariant: false,
+            bivariant: false,
+        };
+        let mut map = InferenceVisitedMap::default();
+        for n in 1..=3 {
+            map.insert(key(n), InferencePriority(1));
+        }
+        map.clear();
+        map.generation = u32::MAX;
+        map.insert(key(4), InferencePriority(2));
+        map.clear();
+        assert_eq!(map.generation, 1);
+        for n in 1..=4 {
+            assert_eq!(map.get(&key(n)), None, "{n}");
+        }
+        map.insert(key(5), InferencePriority(3));
+        assert_eq!(map.len(), 1);
+        for n in 1..=4 {
+            assert_eq!(map.get(&key(n)), None, "{n}");
+        }
+        assert_eq!(map.get(&key(5)), Some(InferencePriority(3)));
+    }
+
     #[test]
     fn recursion_key_round_trip() {
         let ids = [
@@ -2228,5 +2797,47 @@ mod tests {
             }
         }
         assert!(fast_answers > 1000);
+    }
+
+    #[test]
+    fn definitely_unrelated_cache_keeps_answers_of_one_generation() {
+        let mut cache = DefinitelyUnrelatedCache::default();
+        assert_eq!(cache.get(0, 0), Some(false));
+        let pair = (5 << 32) | 7;
+        assert_eq!(cache.get(pair, 3), None);
+        cache.put(pair, 3, true);
+        assert_eq!(cache.get(pair, 3), Some(true));
+        assert_eq!(cache.get(pair, 4), None);
+        assert_eq!(cache.get((7 << 32) | 5, 3), None);
+        cache.put(pair, 4, false);
+        assert_eq!(cache.get(pair, 4), Some(false));
+        assert_eq!(cache.get(pair, 3), None);
+    }
+
+    #[test]
+    fn stack_entries_with_several_or_unknown_ids() {
+        let a = RecursionKey::new(Some(RecursionId::Symbol(SymbolId(1))));
+        let b = RecursionKey::new(Some(RecursionId::Symbol(SymbolId(2))));
+        let c = RecursionKey::new(Some(RecursionId::Type(TypeId(3))));
+        let mut stack = InferenceStack::default();
+        stack.push_ids(TypeId(1), StackIds::One(a), 0);
+        stack.set_ids.extend([a, b]);
+        stack.push_ids(TypeId(2), StackIds::Many, 0);
+        // An unknown entry drops the ids that its walk pushed.
+        stack.set_ids.push(c);
+        stack.push_ids(TypeId(3), StackIds::Unknown, 2);
+        assert_eq!(stack.set_ids, [a, b]);
+        assert_eq!(stack.top_deeply_nested(1), None);
+        assert_eq!(stack.entry_matches(0, a), Some(true));
+        assert_eq!(stack.entry_matches(0, b), Some(false));
+        assert_eq!(stack.entry_matches(1, b), Some(true));
+        assert_eq!(stack.entry_matches(1, c), Some(false));
+        assert_eq!(stack.entry_matches(1, RecursionKey::NONE), Some(false));
+        assert_eq!(stack.entry_matches(2, a), None);
+        stack.pop();
+        stack.pop();
+        assert!(stack.set_ids.is_empty());
+        stack.push_ids(TypeId(4), StackIds::One(a), 0);
+        assert_eq!(stack.top_deeply_nested(2), Some(true));
     }
 }

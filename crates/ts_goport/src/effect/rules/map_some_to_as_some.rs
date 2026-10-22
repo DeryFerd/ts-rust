@@ -54,7 +54,7 @@ pub fn analyze_map_some_to_as_some(tp: &mut TypeParser<'_>, sf: Node) -> Vec<Map
         for transformation in &flow.transformations {
             if transformation.args.len() != 1
                 || transformation.callee.is_nil()
-                || !tp.is_node_reference_to_effect_module_api(transformation.callee, "map")
+                || !tp.is_node_reference_to_effect_module_api(transformation.callee, member!("map"))
             {
                 continue;
             }
@@ -95,5 +95,5 @@ fn is_option_some_mapper(tp: &mut TypeParser<'_>, node: Node) -> bool {
             return false;
         }
     }
-    tp.is_node_reference_to_effect_option_module_api(mapper, "some")
+    tp.is_node_reference_to_effect_option_module_api(mapper, member!("some"))
 }

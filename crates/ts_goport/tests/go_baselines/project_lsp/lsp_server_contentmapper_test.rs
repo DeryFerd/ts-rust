@@ -382,7 +382,7 @@ child_test! {
         assert!(rename.is_some() && rename_msg.error.is_none());
         assert!(rename.is_some_and(|rename| rename.workspace_edit.is_none()));
         unregistered_rx
-            .recv_timeout(Duration::from_secs(120))
+            .recv_timeout(Duration::from_mins(2))
             .unwrap_or_else(|err| panic!("expected an unregistration: {err}"));
         let unregistered = unregistrations
             .lock()

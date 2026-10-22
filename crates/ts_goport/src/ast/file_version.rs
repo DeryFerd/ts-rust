@@ -127,7 +127,7 @@ impl FileVersion {
     /// The owner of file version `file`, registered in the registry. The
     /// language server parse cache and `program::mark_freeable_parses`
     /// make it (`freeable_path`).
-    pub(crate) fn new(file: usize) -> Arc<Self> {
+    pub fn new(file: usize) -> Arc<Self> {
         let version = Arc::new(FileVersion {
             file,
             published: OnceLock::new(),
@@ -306,7 +306,7 @@ thread_local! {
 
 /// Records that a publish on this thread published a file at `path`. Does
 /// nothing while `free_file_versions` is off.
-pub(crate) fn note_published_path(path: &str) {
+pub fn note_published_path(path: &str) {
     if !free_file_versions() {
         return;
     }
@@ -331,7 +331,7 @@ pub fn published_paths() -> Arc<FxHashSet<String>> {
 /// The freeable rule: true when a new parse of `path` gets a
 /// `FileVersion`, because `free_file_versions` is on and a publish on this
 /// thread published `path` before.
-pub(crate) fn freeable_path(path: &str) -> bool {
+pub fn freeable_path(path: &str) -> bool {
     free_file_versions() && PUBLISHED_PATHS.with(|paths| paths.borrow().contains(path))
 }
 
@@ -669,6 +669,9 @@ pub fn release_file_version_pins() {
 /// The pins of this thread, taken out as `release_file_version_pins` drops
 /// them.
 fn take_file_version_pins() -> Vec<(usize, VersionPin)> {
+    // A test waits while another test reads the pin epoch.
+    #[cfg(test)]
+    let _turn = crate::test_lock::pin_release();
     PIN_EPOCH.fetch_add(1, Ordering::AcqRel);
     drop_hot();
     PINS.try_with(|pins| {
@@ -1226,8 +1229,11 @@ mod tests {
     /// Publishes on this thread a freeable version of a file of one
     /// identifier per name and pins it. Gives the version (its other
     /// holder) and a weak handle to its text, which goes with its data (its
-    /// store).
+    /// store). The thread holds the store build lock to its end
+    /// (`crate::test_lock::hold`): the tests read the pin epoch and the free
+    /// thread, which other tests also use.
     fn publish_pinned(name: &'static str, names: &[&str]) -> (Arc<FileVersion>, Weak<str>) {
+        crate::test_lock::hold();
         let text = FileText::Shared(Arc::from(names.join(";")));
         let weak = text.weak().expect("a shared text");
         let file = super::super::store::new_file_store(name, text);
@@ -1249,9 +1255,8 @@ mod tests {
     // and a read of it panics. The data of a version of `min_nodes` or more
     // nodes goes to the free thread, which frees it after the values queued
     // before it. The data of a smaller version is freed in the release. A
-    // version with another holder lives until that holder lets go. It
-    // publishes, so no other test may build or publish stores while it runs
-    // (the runner uses one thread).
+    // version with another holder lives until that holder lets go. Its
+    // thread holds the store build lock (`publish_pinned`).
     #[test]
     fn background_pin_release_frees_on_the_free_thread() {
         // Its own thread, so the background mode stays there.
@@ -1300,7 +1305,7 @@ mod tests {
                 "the data of a big version waits for the free thread"
             );
             go.send(()).expect("the free thread waits");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
             while big_text.upgrade().is_some() {
                 assert!(
                     std::time::Instant::now() < deadline,
@@ -1316,14 +1321,18 @@ mod tests {
     // followups30 item 3 (b): a `PinRelease` that waits in the garbage of
     // `gostd::local` when its thread ends drops its pins there, so the
     // thread's end frees the data and does not send it to the free thread
-    // (a thread-local destructor must not start that thread). It publishes,
-    // so no other test may build or publish stores while it runs (the
-    // runner uses one thread).
+    // (a thread-local destructor must not start that thread). Its inner
+    // thread holds the store build lock (`crate::test_lock::hold`) and
+    // blocks the free thread. The test thread does not block it: it would
+    // then wait for the inner thread, which waits for the lock, while a test
+    // that holds the lock waits for the free thread.
     #[test]
     fn a_pin_release_at_the_thread_end_frees_in_place() {
-        // First, so the free thread exists and the end does not start it.
-        let go = block_free_thread();
-        let (probe, text) = std::thread::spawn(|| {
+        let (probe, text, go) = std::thread::spawn(|| {
+            // First, so its thread-local drops last, after the version dies.
+            crate::test_lock::hold();
+            // Then the free thread, so it exists and the end does not start it.
+            let go = block_free_thread();
             // `PINS` before `LOCAL` (`keep_garbage`): the thread-local
             // destructors run in the reverse order of the first uses, so
             // `LOCAL` drops the release while the pins are still there.
@@ -1341,7 +1350,7 @@ mod tests {
             );
             let probe = file_version_probe(node(file)).expect("the pin holds the version");
             // The thread ends with no `drop_garbage`.
-            (probe, text)
+            (probe, text, go)
         })
         .join()
         .expect("the test thread ends");
@@ -1356,9 +1365,8 @@ mod tests {
     // followups32 (followups30 item 3 (a)): a version that dies in a pin
     // release on a thread that frees in the background leaves the registry
     // in the release (`FileVersion::drop`), before its data goes to the free
-    // thread, so a busy free thread leaves no entry of a dead version. It
-    // publishes, so no other test may build or publish stores while it runs
-    // (the runner uses one thread).
+    // thread, so a busy free thread leaves no entry of a dead version. Its
+    // thread holds the store build lock (`publish_pinned`).
     #[test]
     fn a_pin_release_takes_a_dying_version_out_of_the_registry() {
         std::thread::spawn(|| {
@@ -1388,9 +1396,8 @@ mod tests {
     // this thread shares does not unwrap in a pin release (`Rc::try_unwrap`
     // fails): the pin drops there, and the guard keeps the version, which
     // stays live and in the registry. When the guard drops, the version
-    // dies there, and its data is freed with it, not on the free thread. It
-    // publishes, so no other test may build or publish stores while it runs
-    // (the runner uses one thread).
+    // dies there, and its data is freed with it, not on the free thread. Its
+    // thread holds the store build lock (`publish_pinned`).
     #[test]
     fn a_pin_release_keeps_a_version_that_a_guard_shares() {
         std::thread::spawn(|| {
@@ -1405,7 +1412,11 @@ mod tests {
             release_file_version_pins_later();
             assert!(!probe.is_freed(), "the guard keeps the version");
             assert!(lock(&VERSIONS).contains_key(&file), "a live version");
-            assert!(dead_files_since(dead).0.is_empty(), "no version died");
+            // Versions of other tests can die meanwhile.
+            assert!(
+                !dead_files_since(dead).0.contains(&file),
+                "the version did not die"
+            );
             assert_eq!(guard.file(), file);
             drop(guard);
             assert!(probe.is_freed(), "the version dies with the guard");
@@ -1429,7 +1440,7 @@ mod tests {
 
     /// Waits up to 60 s for a free thread to free the data of `text`.
     fn wait_for_free(text: &Weak<str>) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
         while text.upgrade().is_some() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1446,8 +1457,8 @@ mod tests {
     // to the build's free thread, so its id is dead, it is not in the
     // registry and a read of it panics while the free thread is busy. The
     // free thread frees its data later. A version with another holder lives
-    // until that holder lets go. It publishes, so no other test may build or
-    // publish stores while it runs (the runner uses one thread).
+    // until that holder lets go. Its thread holds the store build lock
+    // (`publish_pinned`).
     #[test]
     fn a_dropped_kept_parse_dies_before_its_data_goes_to_the_free_thread() {
         std::thread::spawn(|| {
@@ -1468,7 +1479,12 @@ mod tests {
                 !lock(&VERSIONS).contains_key(&file),
                 "the registry has no entry of the dead version"
             );
-            assert_eq!(dead_files_since(dead).0, [file]);
+            // Versions of other tests can die meanwhile.
+            let (died, _) = dead_files_since(dead);
+            assert!(
+                died.contains(&file) && !died.contains(&shared.file()),
+                "{died:?}"
+            );
             let read = std::panic::catch_unwind(|| pinned_file_version(file).is_some());
             let message = read.expect_err("a read of a dead version panics");
             assert_eq!(

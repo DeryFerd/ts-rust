@@ -2,7 +2,7 @@
 //! (bigsort1, `Checker::sort_large_union_types` in checker/utilities_p1.rs).
 //!
 //! Go sorts the members of each union with `slices.SortStableFunc(types,
-//! CompareTypes)` (checker/checker.go:26275 addTypesToUnion,
+//! CompareTypes)` (checker/checker.go:26344 addTypesToUnion,
 //! checker/utilities.go:414 CompareTypes). The port sorts a list over
 //! `KEYED_SORT_MAX` (4,096) types with a table of keys, which must give
 //! Go's order. Here a tuple of 5,729 members in a shuffled order (string

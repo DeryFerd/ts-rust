@@ -1,0 +1,1959 @@
+{
+ "schemaVersion": 1,
+ "runUrl": "https://github.com/pingdotgg/ts-rust/actions/runs/38461793814",
+ "workflowOutcome": "success (all jobs)",
+ "method": "Blacksmith blacksmith-16vcpu-ubuntu-2404, one runner per case, all five tools on that runner; hyperfine median of 5 runs after 1 warmup. Apps: --noEmit --incremental false. T3 Code: --noEmit --incremental false --composite false. tsc-rs is a PGO build of the v0.6.0 source (a8c5b7063), static musl, no BOLT; tsc-rs-fast is the same binary with --fast.",
+ "verification": {
+  "tscRsVsTsc7": "scripts/bench-apps/verify.py MATCH on all 16 cases (full diagnostic chains; Effect cases: Effect diagnostics only, against @effect/tsgo)",
+  "fastVsDefault": "identical full diagnostic chains on all 16 cases",
+  "effectDiagnostics": {
+   "total": 4823,
+   "unstableApiWarnings": 4602,
+   "ts2790FromNativeEffectCompilers": 26,
+   "tsc6PluginTotal": 305
+  }
+ },
+ "metadata": {
+  "date": "2026-10-13T20:37:44.411546+00:00",
+  "source": "e7e40fca06bf32406d66a9436d344c2c33830c84",
+  "compilerTree": "899597885e363fb99677631fe9fe7a482a5629eb",
+  "run": "https://github.com/pingdotgg/ts-rust/actions/runs/38461793814",
+  "build": "release PGO, static musl, no BOLT",
+  "host": "Linux-6.6.141-x86_64-with-glibc2.39",
+  "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nBogoMIPS:                                8583.84\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d\nVirtualization:                          AMD-V\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+  "memory": "MemTotal:       65017440 kB\nMemFree:        61687072 kB\nMemAvailable:   63871080 kB\nBuffers:          116180 kB\nCached:          2601104 kB\nSwapCached:            0 kB\nActive:           629900 kB\nInactive:        2337276 kB\nActive(anon):       6608 kB\nInactive(anon):   291468 kB\nActive(file):     623292 kB\nInactive(file):  2045808 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:      11534332 kB\nSwapFree:       11534332 kB\nDirty:                52 kB\nWriteback:             0 kB\nAnonPages:        249952 kB\nMapped:           253404 kB\nShmem:             48184 kB\nKReclaimable:     205324 kB\nSlab:             276944 kB\nSReclaimable:     205324 kB\nSUnreclaim:        71620 kB\nKernelStack:        7440 kB\nPageTables:         7136 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    44043052 kB\nCommitted_AS:    2744164 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       16396 kB\nVmallocChunk:          0 kB\nPercpu:             7936 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       17408 kB\nDirectMap2M:     2289664 kB\nDirectMap1G:    65011712 kB\n",
+  "node": "v24.19.0",
+  "pnpm": "unavailable (failed to launch)",
+  "hyperfine": "hyperfine 1.18.0",
+  "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+  "rounds": 5,
+  "warmups": 1,
+  "tools": {
+   "tsc-rs": "0.6.0",
+   "tsc-rs-fast": {
+    "version": "Version 7.1.0-dev",
+    "sha256": "04b85831a758a25deb14772075bac49eb4fee2ad09147d3c1fb7445effe6331c"
+   },
+   "tsc7": {
+    "version": "Version 7.1.0-dev.20261008.1",
+    "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+   },
+   "bun": {
+    "version": "1.4.4-canary.1+c69a636b9",
+    "sha256": "f8ee0cc4412d1c622a345db6e5b81fd36f3754ef9d555d1d7c71fd659f32accc"
+   },
+   "excalidraw": {
+    "commit": "53973c3a423fbd75a4ce68107786b4fcb90e4968",
+    "locks": {
+     "yarn.lock": "2fceed8bdb8180b2d14ab0db6010f48b05da0f3a772e218a7024e88ca7a7c76e"
+    }
+   },
+   "typescript": "7.1.0-dev.20261008.1",
+   "typescript (ts6)": "6.0.3",
+   "playwright": {
+    "commit": "d469960fdfc461e2d5795a3fa48a58a52a91ecaf",
+    "locks": {
+     "package-lock.json": "6410299696067481cdb6ae4cfb642e1801aec705c6480602a6d790b0f7e236e1"
+    }
+   },
+   "sentry": {
+    "commit": "8294650589dbd26f230c73f4ab26b62a68aede8f",
+    "locks": {
+     "pnpm-lock.yaml": "df802a4652763891903c2d6f2debddeac85d1266755d83c26a636f4c171bb600"
+    }
+   },
+   "t3code": {
+    "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+    "locks": {
+     "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+    }
+   },
+   "@effect/tsgo": "0.51.1",
+   "@effect/language-service": "0.87.4",
+   "trpc": {
+    "commit": "d756e591a5e37ef20b8d75ecd4d736c195497289",
+    "locks": {
+     "pnpm-lock.yaml": "d6c2f4b63bd8554e6dd3f1498044adc93f74fdfb8007749c8f1399b3bf23385a"
+    }
+   },
+   "typeorm": {
+    "commit": "c64a1f052fc39f6688b6b73b83d065d7147ba8bb",
+    "locks": {
+     "pnpm-lock.yaml": "1c64af7e28cabeb5e063851bf7710d7e4b0b1083714ab704ce2b5a0e3683d22a"
+    }
+   },
+   "vscode": {
+    "commit": "3f07e1aba32acacb8b08ae91bfdc954b580ad1fd",
+    "locks": {
+     "package-lock.json": "47a3f2ead62041844f7151cfcae23c9fb45f2a6dcfa032fbdc97481d6690489c"
+    }
+   }
+  },
+  "inputs": {
+   "tsc-rs": "0.6.0",
+   "tsc-rs-fast": {
+    "version": "Version 7.1.0-dev",
+    "sha256": "04b85831a758a25deb14772075bac49eb4fee2ad09147d3c1fb7445effe6331c"
+   },
+   "tsc7": {
+    "version": "Version 7.1.0-dev.20261008.1",
+    "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+   },
+   "bun": {
+    "version": "1.4.4-canary.1+c69a636b9",
+    "sha256": "f8ee0cc4412d1c622a345db6e5b81fd36f3754ef9d555d1d7c71fd659f32accc"
+   },
+   "excalidraw": {
+    "commit": "53973c3a423fbd75a4ce68107786b4fcb90e4968",
+    "locks": {
+     "yarn.lock": "2fceed8bdb8180b2d14ab0db6010f48b05da0f3a772e218a7024e88ca7a7c76e"
+    }
+   },
+   "typescript": "7.1.0-dev.20261008.1",
+   "typescript (ts6)": "6.0.3",
+   "playwright": {
+    "commit": "d469960fdfc461e2d5795a3fa48a58a52a91ecaf",
+    "locks": {
+     "package-lock.json": "6410299696067481cdb6ae4cfb642e1801aec705c6480602a6d790b0f7e236e1"
+    }
+   },
+   "sentry": {
+    "commit": "8294650589dbd26f230c73f4ab26b62a68aede8f",
+    "locks": {
+     "pnpm-lock.yaml": "df802a4652763891903c2d6f2debddeac85d1266755d83c26a636f4c171bb600"
+    }
+   },
+   "t3code": {
+    "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+    "locks": {
+     "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+    }
+   },
+   "@effect/tsgo": "0.51.1",
+   "@effect/language-service": "0.87.4",
+   "trpc": {
+    "commit": "d756e591a5e37ef20b8d75ecd4d736c195497289",
+    "locks": {
+     "pnpm-lock.yaml": "d6c2f4b63bd8554e6dd3f1498044adc93f74fdfb8007749c8f1399b3bf23385a"
+    }
+   },
+   "typeorm": {
+    "commit": "c64a1f052fc39f6688b6b73b83d065d7147ba8bb",
+    "locks": {
+     "pnpm-lock.yaml": "1c64af7e28cabeb5e063851bf7710d7e4b0b1083714ab704ce2b5a0e3683d22a"
+    }
+   },
+   "vscode": {
+    "commit": "3f07e1aba32acacb8b08ae91bfdc954b580ad1fd",
+    "locks": {
+     "package-lock.json": "47a3f2ead62041844f7151cfcae23c9fb45f2a6dcfa032fbdc97481d6690489c"
+    }
+   }
+  },
+  "packages": {
+   "tsc-rs": "0.6.0",
+   "tsc-rs-fast": {
+    "version": "Version 7.1.0-dev",
+    "sha256": "04b85831a758a25deb14772075bac49eb4fee2ad09147d3c1fb7445effe6331c"
+   },
+   "tsc7": {
+    "version": "Version 7.1.0-dev.20261008.1",
+    "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+   },
+   "bun": {
+    "version": "1.4.4-canary.1+c69a636b9",
+    "sha256": "f8ee0cc4412d1c622a345db6e5b81fd36f3754ef9d555d1d7c71fd659f32accc"
+   },
+   "excalidraw": {
+    "commit": "53973c3a423fbd75a4ce68107786b4fcb90e4968",
+    "locks": {
+     "yarn.lock": "2fceed8bdb8180b2d14ab0db6010f48b05da0f3a772e218a7024e88ca7a7c76e"
+    }
+   },
+   "typescript": "7.1.0-dev.20261008.1",
+   "typescript (ts6)": "6.0.3",
+   "playwright": {
+    "commit": "d469960fdfc461e2d5795a3fa48a58a52a91ecaf",
+    "locks": {
+     "package-lock.json": "6410299696067481cdb6ae4cfb642e1801aec705c6480602a6d790b0f7e236e1"
+    }
+   },
+   "sentry": {
+    "commit": "8294650589dbd26f230c73f4ab26b62a68aede8f",
+    "locks": {
+     "pnpm-lock.yaml": "df802a4652763891903c2d6f2debddeac85d1266755d83c26a636f4c171bb600"
+    }
+   },
+   "t3code": {
+    "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+    "locks": {
+     "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+    }
+   },
+   "@effect/tsgo": "0.51.1",
+   "@effect/language-service": "0.87.4",
+   "trpc": {
+    "commit": "d756e591a5e37ef20b8d75ecd4d736c195497289",
+    "locks": {
+     "pnpm-lock.yaml": "d6c2f4b63bd8554e6dd3f1498044adc93f74fdfb8007749c8f1399b3bf23385a"
+    }
+   },
+   "typeorm": {
+    "commit": "c64a1f052fc39f6688b6b73b83d065d7147ba8bb",
+    "locks": {
+     "pnpm-lock.yaml": "1c64af7e28cabeb5e063851bf7710d7e4b0b1083714ab704ce2b5a0e3683d22a"
+    }
+   },
+   "vscode": {
+    "commit": "3f07e1aba32acacb8b08ae91bfdc954b580ad1fd",
+    "locks": {
+     "package-lock.json": "47a3f2ead62041844f7151cfcae23c9fb45f2a6dcfa032fbdc97481d6690489c"
+    }
+   }
+  },
+  "package-lock.json": "65a05950965774239c7f33fc181d3c638b486dd85fbf41e9b6c7e16471158b25",
+  "effectgo/package-lock.json": null,
+  "ts6effect/package-lock.json": null,
+  "compilerBuild": {
+   "cacheKey": "bench-compiler-v1-linux-x64-rust1.95.0-9c60aaea3401ba7c4a3c62179a8314ff2865a50046a4a6914659fb93f9a4675c",
+   "source": "e7e40fca06bf32406d66a9436d344c2c33830c84",
+   "compilerTree": "899597885e363fb99677631fe9fe7a482a5629eb",
+   "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+   "build": "release PGO, static musl, no BOLT"
+  }
+ },
+ "totals": {
+  "noeffect": {
+   "tsc6": 87.872571563,
+   "tsc7": 19.454239298,
+   "tsc-rs": 7.954912608,
+   "tsc-rs-fast": 6.910929267,
+   "bun": 6.237343437
+  },
+  "effect": {
+   "tsc6": 190.995493052,
+   "tsc7": 42.552522156,
+   "tsc-rs": 14.300894923,
+   "tsc-rs-fast": 9.773939245,
+   "bun": 59.244009681
+  }
+ },
+ "results": {
+  "apps": {
+   "vscode": {
+    "tsc6": {
+     "median": 91.751032359,
+     "mean": 88.8800943864,
+     "stddev": 7.064862810845975,
+     "times": [
+      94.280421795,
+      76.570993011,
+      89.763827651,
+      92.034197116,
+      91.751032359
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 9,
+     "diagnosticsSha256": "f98fbb0f93a55e6a956c68a6e4cd522fda6d561b31d19efaf06224c42286e278"
+    },
+    "tsc7": {
+     "median": 9.568545889,
+     "mean": 9.646534683,
+     "stddev": 0.4329594447743883,
+     "times": [
+      10.034019191,
+      9.166273505,
+      10.149264876,
+      9.568545889,
+      9.314569954
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 10,
+     "diagnosticsSha256": "a4983725d2931d5312e92e4e54b647b006db1a3d9be66277aa4bc04c528fb789"
+    },
+    "tsc-rs": {
+     "median": 4.811026459,
+     "mean": 4.9380109376,
+     "stddev": 0.30128692015308595,
+     "times": [
+      4.982060709,
+      4.811026459,
+      4.688307664,
+      4.767169688,
+      5.441490168
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 10,
+     "diagnosticsSha256": "a4983725d2931d5312e92e4e54b647b006db1a3d9be66277aa4bc04c528fb789"
+    },
+    "tsc-rs-fast": {
+     "median": 2.642984339,
+     "mean": 2.7038873242,
+     "stddev": 0.3867472316574565,
+     "times": [
+      2.289823029,
+      2.382627065,
+      2.642984339,
+      3.140328428,
+      3.06367376
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 10,
+     "diagnosticsSha256": "a4983725d2931d5312e92e4e54b647b006db1a3d9be66277aa4bc04c528fb789"
+    },
+    "bun": {
+     "median": 2.321843693,
+     "mean": 2.5255829656,
+     "stddev": 0.3385693803423498,
+     "times": [
+      2.922940554,
+      2.304756518,
+      2.321843693,
+      2.215165662,
+      2.863208401
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   },
+   "sentry": {
+    "tsc6": {
+     "median": 80.265856982,
+     "mean": 80.9518266646,
+     "stddev": 9.223076774603289,
+     "times": [
+      83.921221979,
+      70.740331141,
+      75.034795603,
+      80.265856982,
+      94.796927618
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc7": {
+     "median": 13.489574975,
+     "mean": 12.686324378600002,
+     "stddev": 1.5381682513325055,
+     "times": [
+      10.560180587,
+      13.489574975,
+      13.874212974,
+      13.95340054,
+      11.554252817
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 2,
+     "diagnosticsSha256": "ff16b654987c631912e4983684d0eb90115b08d98660d5390d2042112a3e81c0"
+    },
+    "tsc-rs": {
+     "median": 5.30418677,
+     "mean": 5.214743265,
+     "stddev": 0.2669168985851375,
+     "times": [
+      5.496563706,
+      5.40876,
+      5.30418677,
+      4.923676661,
+      4.940529188
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 2,
+     "diagnosticsSha256": "ff16b654987c631912e4983684d0eb90115b08d98660d5390d2042112a3e81c0"
+    },
+    "tsc-rs-fast": {
+     "median": 2.9656170470000003,
+     "mean": 2.95397948,
+     "stddev": 0.17248300455318555,
+     "times": [
+      2.842767436,
+      2.9656170470000003,
+      3.147066762,
+      3.087282755,
+      2.7271634000000002
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 2,
+     "diagnosticsSha256": "ff16b654987c631912e4983684d0eb90115b08d98660d5390d2042112a3e81c0"
+    },
+    "bun": {
+     "median": 6.9337346790000005,
+     "mean": 6.737579404,
+     "stddev": 0.5531531386735918,
+     "times": [
+      6.160714771,
+      6.16189215,
+      6.9337346790000005,
+      7.037030922,
+      7.394524498
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   },
+   "playwright": {
+    "tsc6": {
+     "median": 6.33327062,
+     "mean": 6.3733054548000005,
+     "stddev": 0.1301338060952436,
+     "times": [
+      6.502795318,
+      6.260294925,
+      6.519842262,
+      6.33327062,
+      6.250324149
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc7": {
+     "median": 0.818880724,
+     "mean": 0.8123185886,
+     "stddev": 0.027309542437737592,
+     "times": [
+      0.818880724,
+      0.8450644380000001,
+      0.784293317,
+      0.784107047,
+      0.829247417
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs": {
+     "median": 0.405366155,
+     "mean": 0.40412948379999997,
+     "stddev": 0.022252694151701342,
+     "times": [
+      0.383040031,
+      0.38016673700000003,
+      0.42643831800000004,
+      0.42563617800000003,
+      0.405366155
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs-fast": {
+     "median": 0.333681465,
+     "mean": 0.3303715756,
+     "stddev": 0.024335988330937856,
+     "times": [
+      0.32228929,
+      0.29451451900000003,
+      0.333681465,
+      0.341157979,
+      0.360214625
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bun": {
+     "median": 0.26756766800000004,
+     "mean": 0.26941044000000003,
+     "stddev": 0.021911881878139198,
+     "times": [
+      0.30232251000000004,
+      0.276285493,
+      0.26756766800000004,
+      0.25621619100000004,
+      0.244660338
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   },
+   "typeorm": {
+    "tsc6": {
+     "median": 5.600009961,
+     "mean": 5.79678704,
+     "stddev": 0.5848592447904419,
+     "times": [
+      5.600009961,
+      6.580300152,
+      6.212673188,
+      5.153983154,
+      5.436968745
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc7": {
+     "median": 0.6996980060000001,
+     "mean": 0.7512411414000001,
+     "stddev": 0.10054504938575377,
+     "times": [
+      0.6996980060000001,
+      0.9063773230000001,
+      0.677668127,
+      0.7988797830000001,
+      0.673582468
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs": {
+     "median": 0.38821238700000005,
+     "mean": 0.39273433120000006,
+     "stddev": 0.0166686440768069,
+     "times": [
+      0.37713951300000004,
+      0.37867204400000004,
+      0.404084657,
+      0.38821238700000005,
+      0.415563055
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs-fast": {
+     "median": 0.27296494400000004,
+     "mean": 0.268316256,
+     "stddev": 0.010601405173425418,
+     "times": [
+      0.275415157,
+      0.261737689,
+      0.27296494400000004,
+      0.253064513,
+      0.278398977
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bun": {
+     "median": 0.14714385000000002,
+     "mean": 0.1457412642,
+     "stddev": 0.003258211144686183,
+     "times": [
+      0.14714385000000002,
+      0.14322819,
+      0.149437587,
+      0.141517912,
+      0.147378782
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   },
+   "excalidraw": {
+    "tsc6": {
+     "median": 6.851743249,
+     "mean": 6.8984655548000005,
+     "stddev": 0.21590717817039212,
+     "times": [
+      7.206485252,
+      6.851743249,
+      6.749745628,
+      6.667605818,
+      7.016747827
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc7": {
+     "median": 1.420233627,
+     "mean": 1.4058577358000002,
+     "stddev": 0.04158087386628961,
+     "times": [
+      1.444109379,
+      1.33525432,
+      1.407788292,
+      1.421903061,
+      1.420233627
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs": {
+     "median": 0.6241484180000001,
+     "mean": 0.6247402584000001,
+     "stddev": 0.012726925055605095,
+     "times": [
+      0.6241484180000001,
+      0.6168142360000001,
+      0.645039177,
+      0.6116635060000001,
+      0.6260359550000001
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs-fast": {
+     "median": 0.48358842,
+     "mean": 0.48447761600000006,
+     "stddev": 0.018601717700425492,
+     "times": [
+      0.509520802,
+      0.47571122600000004,
+      0.460037099,
+      0.49353053300000005,
+      0.48358842
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bun": {
+     "median": 0.23670982000000002,
+     "mean": 0.24263101540000004,
+     "stddev": 0.012914001799610181,
+     "times": [
+      0.264548927,
+      0.24382705500000001,
+      0.235131093,
+      0.23293818200000002,
+      0.23670982000000002
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   },
+   "trpc-server": {
+    "tsc6": {
+     "median": 1.547495508,
+     "mean": 1.5873947071999999,
+     "stddev": 0.10302234937082418,
+     "times": [
+      1.76523676,
+      1.538308964,
+      1.580896831,
+      1.505035473,
+      1.547495508
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc7": {
+     "median": 0.17399767900000002,
+     "mean": 0.1733855006,
+     "stddev": 0.004987015179806081,
+     "times": [
+      0.167751786,
+      0.17470947,
+      0.17399767900000002,
+      0.169813081,
+      0.180655487
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs": {
+     "median": 0.08545570100000001,
+     "mean": 0.08486273920000001,
+     "stddev": 0.0024399951737341017,
+     "times": [
+      0.082212378,
+      0.086006619,
+      0.08803174600000001,
+      0.08545570100000001,
+      0.082607252
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs-fast": {
+     "median": 0.088135051,
+     "mean": 0.08778964160000001,
+     "stddev": 0.0043875207223879635,
+     "times": [
+      0.08233261500000001,
+      0.09090456000000001,
+      0.088135051,
+      0.084580451,
+      0.092995531
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bun": {
+     "median": 0.09559819600000001,
+     "mean": 0.09540486220000001,
+     "stddev": 0.0021585144833695686,
+     "times": [
+      0.09511546700000001,
+      0.09222429800000001,
+      0.09827433000000001,
+      0.09559819600000001,
+      0.09581202000000001
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   }
+  },
+  "t3": {
+   "t3-apps-server-noeffect": {
+    "tsc6": {
+     "median": 39.827038846,
+     "mean": 40.8331865124,
+     "stddev": 4.015294280551055,
+     "times": [
+      39.827038846,
+      38.048447822,
+      37.127126841,
+      41.946676436,
+      47.216642617
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 1,
+     "diagnosticsSha256": "4cd2f82479a67685db7e38ba3302928d36ed54d502dabbddd06ba79e01f48bb6"
+    },
+    "tsc7": {
+     "median": 10.249706882,
+     "mean": 10.4339106138,
+     "stddev": 0.4633609043888655,
+     "times": [
+      11.076218262,
+      10.739161332,
+      10.170110417,
+      10.249706882,
+      9.934356176
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 1,
+     "diagnosticsSha256": "b122089a902d7e2e75cdda6ee1d846ecf5938453e3df6cd19c6a611fced95285"
+    },
+    "tsc-rs": {
+     "median": 3.598515588,
+     "mean": 3.7558472554000004,
+     "stddev": 0.3746036731871642,
+     "times": [
+      4.415511165,
+      3.6948813510000003,
+      3.523269611,
+      3.598515588,
+      3.547058562
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 1,
+     "diagnosticsSha256": "b122089a902d7e2e75cdda6ee1d846ecf5938453e3df6cd19c6a611fced95285"
+    },
+    "tsc-rs-fast": {
+     "median": 2.7794427930000003,
+     "mean": 2.850630933,
+     "stddev": 0.2904656813918784,
+     "times": [
+      2.725326553,
+      2.535538644,
+      2.898373283,
+      3.314473392,
+      2.7794427930000003
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 1,
+     "diagnosticsSha256": "b122089a902d7e2e75cdda6ee1d846ecf5938453e3df6cd19c6a611fced95285"
+    },
+    "bun": {
+     "median": 2.68302162,
+     "mean": 2.5430731518,
+     "stddev": 0.36779415400995713,
+     "times": [
+      2.872653296,
+      2.86107593,
+      2.68302162,
+      2.120559403,
+      2.17805551
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   },
+   "t3-apps-server-effect": {
+    "tsc6": {
+     "median": 87.788682891,
+     "mean": 102.0042046414,
+     "stddev": 28.9811769503873,
+     "times": [
+      99.007153411,
+      85.413288521,
+      84.979745016,
+      87.788682891,
+      152.832153368
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 297,
+     "diagnosticsSha256": "abc1ecc12b4005e91916e966dd6be978a76a4d0329a98852808b069b4741f34a"
+    },
+    "tsc7": {
+     "median": 25.229197317,
+     "mean": 26.603635219600005,
+     "stddev": 4.043926235611677,
+     "times": [
+      21.504802847,
+      25.229197317,
+      29.58361821,
+      24.992872137,
+      31.707685587
+     ],
+     "exit_codes": [
+      1,
+      1,
+      1,
+      1,
+      1
+     ],
+     "diagnosticCount": 3200,
+     "diagnosticsSha256": "7f034c918b79c65399aa60b9cf06dcda1897239d3a96730249c1413bc630e033"
+    },
+    "tsc-rs": {
+     "median": 8.203314049,
+     "mean": 8.4471231136,
+     "stddev": 0.8071239207240845,
+     "times": [
+      7.946251432,
+      7.840249952,
+      8.203314049,
+      9.834882081,
+      8.410918054
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 3201,
+     "diagnosticsSha256": "00fe49d31bc7c14752b94f531630f1baa693be72c86371b83352c7b2a6e66e11"
+    },
+    "tsc-rs-fast": {
+     "median": 4.663164493,
+     "mean": 4.8123153826000005,
+     "stddev": 1.175664570629758,
+     "times": [
+      4.663164493,
+      6.599718113,
+      5.083384044,
+      3.401879083,
+      4.31343118
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 3201,
+     "diagnosticsSha256": "00fe49d31bc7c14752b94f531630f1baa693be72c86371b83352c7b2a6e66e11"
+    },
+    "bun": {
+     "median": 29.956833992,
+     "mean": 30.5617011612,
+     "stddev": 2.48844235312441,
+     "times": [
+      34.27447496,
+      27.854851504,
+      31.62832882,
+      29.956833992,
+      29.09401653
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 3177,
+     "diagnosticsSha256": "e6ce24dffb122a9c43e8e112cb6568bfa23e2d40b7252967a45980f311302631"
+    }
+   },
+   "t3-apps-web-noeffect": {
+    "tsc6": {
+     "median": 25.19881624,
+     "mean": 26.230410514000006,
+     "stddev": 2.2857747436545703,
+     "times": [
+      25.19881624,
+      29.900411943,
+      24.203782808,
+      24.906775592,
+      26.942265987
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc7": {
+     "median": 4.415345006,
+     "mean": 4.385849845,
+     "stddev": 0.21837407628921773,
+     "times": [
+      4.079473212,
+      4.415345006,
+      4.63246863,
+      4.532764349,
+      4.269198028
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs": {
+     "median": 1.997269627,
+     "mean": 1.993360487,
+     "stddev": 0.0742520006399278,
+     "times": [
+      2.017629679,
+      1.88552199,
+      1.997269627,
+      2.090841029,
+      1.97554011
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs-fast": {
+     "median": 1.707158436,
+     "mean": 1.712658615,
+     "stddev": 0.056350739611416484,
+     "times": [
+      1.785690227,
+      1.707158436,
+      1.6499787490000002,
+      1.6690186310000001,
+      1.7514470320000002
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bun": {
+     "median": 1.287929321,
+     "mean": 1.2962901488,
+     "stddev": 0.03390258088920086,
+     "times": [
+      1.328601326,
+      1.332650065,
+      1.253040804,
+      1.287929321,
+      1.279229228
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   },
+   "t3-apps-web-effect": {
+    "tsc6": {
+     "median": 58.084551304,
+     "mean": 61.921352485,
+     "stddev": 6.82785045229169,
+     "times": [
+      58.084551304,
+      72.973014695,
+      57.320667006,
+      57.07628347,
+      64.15224595
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc7": {
+     "median": 9.554947559,
+     "mean": 8.9440847112,
+     "stddev": 1.6301010621195935,
+     "times": [
+      7.018743398,
+      7.453690738,
+      9.554947559,
+      9.902732464,
+      10.790309397
+     ],
+     "exit_codes": [
+      1,
+      1,
+      1,
+      1,
+      1
+     ],
+     "diagnosticCount": 650,
+     "diagnosticsSha256": "504744e7820bf3b645848f9f50b9808f166f8c7021cc8ef46686abcf0067a759"
+    },
+    "tsc-rs": {
+     "median": 3.302242691,
+     "mean": 3.3112612165999997,
+     "stddev": 0.17417210613132048,
+     "times": [
+      3.302242691,
+      3.286530952,
+      3.483060655,
+      3.040237461,
+      3.444234324
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 650,
+     "diagnosticsSha256": "504744e7820bf3b645848f9f50b9808f166f8c7021cc8ef46686abcf0067a759"
+    },
+    "tsc-rs-fast": {
+     "median": 2.456406652,
+     "mean": 2.4289255190000003,
+     "stddev": 0.1301897106372777,
+     "times": [
+      2.475347869,
+      2.55963139,
+      2.44253175,
+      2.210709934,
+      2.456406652
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 650,
+     "diagnosticsSha256": "504744e7820bf3b645848f9f50b9808f166f8c7021cc8ef46686abcf0067a759"
+    },
+    "bun": {
+     "median": 17.983876935,
+     "mean": 19.1958590342,
+     "stddev": 2.214120026800466,
+     "times": [
+      22.527696424,
+      17.983876935,
+      17.772311912,
+      17.303302148,
+      20.392107752
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 647,
+     "diagnosticsSha256": "aee93f3f0f9594a252fa5962c0664b82175fc3d05249cba59aea77c29e751a59"
+    }
+   },
+   "t3-apps-mobile-noeffect": {
+    "tsc6": {
+     "median": 11.772079627,
+     "mean": 11.8493662132,
+     "stddev": 0.2707937827767808,
+     "times": [
+      12.28376366,
+      11.69086135,
+      11.586055943,
+      11.772079627,
+      11.914070486
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc7": {
+     "median": 2.219301691,
+     "mean": 2.2204720112,
+     "stddev": 0.02403634859038478,
+     "times": [
+      2.212938217,
+      2.219301691,
+      2.256857669,
+      2.223151023,
+      2.190111456
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs": {
+     "median": 0.993401112,
+     "mean": 1.0130646159999999,
+     "stddev": 0.07035669492181117,
+     "times": [
+      0.962131853,
+      1.114922438,
+      1.052003977,
+      0.9428637000000001,
+      0.993401112
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs-fast": {
+     "median": 1.11681265,
+     "mean": 1.1127946428000002,
+     "stddev": 0.1282200939193646,
+     "times": [
+      1.01423092,
+      0.963253134,
+      1.11681265,
+      1.190800381,
+      1.278876129
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bun": {
+     "median": 0.789513376,
+     "mean": 0.7969827704,
+     "stddev": 0.0366644232759379,
+     "times": [
+      0.848811995,
+      0.815790824,
+      0.789513376,
+      0.777361807,
+      0.75343585
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   },
+   "t3-apps-mobile-effect": {
+    "tsc6": {
+     "median": 16.352832856,
+     "mean": 15.7515514748,
+     "stddev": 1.7108577659527955,
+     "times": [
+      16.48405278,
+      16.352832856,
+      17.645111756,
+      15.142020884,
+      13.133739098
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc7": {
+     "median": 2.827739964,
+     "mean": 2.9073686018,
+     "stddev": 0.2420887225352641,
+     "times": [
+      2.827739964,
+      2.758930231,
+      2.679678161,
+      2.976576653,
+      3.293918
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs": {
+     "median": 1.083230871,
+     "mean": 1.0666277806000002,
+     "stddev": 0.05101615000075807,
+     "times": [
+      1.113799207,
+      1.083230871,
+      1.103541176,
+      0.9890978210000001,
+      1.043469828
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs-fast": {
+     "median": 1.150808458,
+     "mean": 1.1347609760000001,
+     "stddev": 0.03576844449335696,
+     "times": [
+      1.150808458,
+      1.165070966,
+      1.078041348,
+      1.121632139,
+      1.158251969
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bun": {
+     "median": 1.3572015,
+     "mean": 1.3800805944,
+     "stddev": 0.07659059898050694,
+     "times": [
+      1.317907854,
+      1.3572015,
+      1.306120519,
+      1.437642413,
+      1.4815306860000002
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   },
+   "t3-packages-client-runtime-noeffect": {
+    "tsc6": {
+     "median": 6.548749064,
+     "mean": 6.862568877799999,
+     "stddev": 0.7417195907288519,
+     "times": [
+      6.203573744,
+      6.417301379,
+      6.548749064,
+      7.089898421,
+      8.053321781
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc7": {
+     "median": 1.706391502,
+     "mean": 1.8150100129999998,
+     "stddev": 0.2523149065160715,
+     "times": [
+      1.6777410000000001,
+      1.612996822,
+      1.706391502,
+      1.835375461,
+      2.24254528
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs": {
+     "median": 1.048028054,
+     "mean": 1.0421073464,
+     "stddev": 0.08223476778668322,
+     "times": [
+      1.048028054,
+      0.9732476480000001,
+      1.106017269,
+      0.9462579310000001,
+      1.13698583
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs-fast": {
+     "median": 1.003400137,
+     "mean": 1.036381207,
+     "stddev": 0.10460693699488581,
+     "times": [
+      0.939396187,
+      1.183467243,
+      1.103635981,
+      1.003400137,
+      0.952006487
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bun": {
+     "median": 1.264275531,
+     "mean": 1.2595204632,
+     "stddev": 0.04507744630790984,
+     "times": [
+      1.308617822,
+      1.261907707,
+      1.264275531,
+      1.276719466,
+      1.18608179
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   },
+   "t3-packages-client-runtime-effect": {
+    "tsc6": {
+     "median": 19.959203421,
+     "mean": 19.8540639142,
+     "stddev": 2.8974807670195517,
+     "times": [
+      15.271182506,
+      22.398112215,
+      19.367302164,
+      19.959203421,
+      22.274519265
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 5,
+     "diagnosticsSha256": "766da005d56de3ae13c016312113246709a5fc16bde61653f8fb11e885071584"
+    },
+    "tsc7": {
+     "median": 3.674381742,
+     "mean": 3.585364179,
+     "stddev": 0.3083324777190049,
+     "times": [
+      3.804038843,
+      3.674381742,
+      3.906130456,
+      3.381048261,
+      3.161221593
+     ],
+     "exit_codes": [
+      1,
+      1,
+      1,
+      1,
+      1
+     ],
+     "diagnosticCount": 933,
+     "diagnosticsSha256": "278cb6f113287e1781f3493ed6a379e8375dd615dcb2ff6884a1469c60a26a82"
+    },
+    "tsc-rs": {
+     "median": 1.126695437,
+     "mean": 1.1194970094,
+     "stddev": 0.10639740330254689,
+     "times": [
+      1.126695437,
+      1.166261806,
+      1.020288026,
+      1.015279725,
+      1.268960053
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 933,
+     "diagnosticsSha256": "278cb6f113287e1781f3493ed6a379e8375dd615dcb2ff6884a1469c60a26a82"
+    },
+    "tsc-rs-fast": {
+     "median": 1.069178094,
+     "mean": 1.0790896394,
+     "stddev": 0.056630200681781546,
+     "times": [
+      1.003269022,
+      1.053264464,
+      1.069178094,
+      1.141630491,
+      1.128106126
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 933,
+     "diagnosticsSha256": "278cb6f113287e1781f3493ed6a379e8375dd615dcb2ff6884a1469c60a26a82"
+    },
+    "bun": {
+     "median": 8.030385299,
+     "mean": 7.883508035,
+     "stddev": 0.47348733292240425,
+     "times": [
+      8.032169999,
+      8.030385299,
+      8.505598184,
+      7.274577196,
+      7.574809497
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 933,
+     "diagnosticsSha256": "5515492b7bf26d3552141eb7651eec401e32902056b81d82d732bff295ebfe75"
+    }
+   },
+   "t3-packages-shared-noeffect": {
+    "tsc6": {
+     "median": 4.525887786,
+     "mean": 4.5110229424,
+     "stddev": 0.2916147837208808,
+     "times": [
+      4.865927926,
+      4.364034137,
+      4.525887786,
+      4.689077432,
+      4.110187431
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc7": {
+     "median": 0.8634942170000001,
+     "mean": 0.8571101518,
+     "stddev": 0.0622005870592089,
+     "times": [
+      0.7577379710000001,
+      0.846085202,
+      0.9052984970000001,
+      0.8634942170000001,
+      0.912934872
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs": {
+     "median": 0.317698227,
+     "mean": 0.3238406186000001,
+     "stddev": 0.0240347174952919,
+     "times": [
+      0.36482722700000003,
+      0.323049366,
+      0.317698227,
+      0.30430303400000003,
+      0.30932523900000003
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tsc-rs-fast": {
+     "median": 0.30411525100000003,
+     "mean": 0.30032373040000004,
+     "stddev": 0.008450676215234328,
+     "times": [
+      0.30826413,
+      0.28778127200000003,
+      0.30411525100000003,
+      0.305758333,
+      0.295699666
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "bun": {
+     "median": 0.212603589,
+     "mean": 0.21522563640000003,
+     "stddev": 0.006530513150470395,
+     "times": [
+      0.226082688,
+      0.212603589,
+      0.21063336500000002,
+      0.210394619,
+      0.216413921
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 0,
+     "diagnosticsSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+   },
+   "t3-packages-shared-effect": {
+    "tsc6": {
+     "median": 8.81022258,
+     "mean": 9.132442340599999,
+     "stddev": 0.8243465176874895,
+     "times": [
+      9.813959662,
+      8.81022258,
+      10.180304827,
+      8.604691498,
+      8.253033135999999
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 3,
+     "diagnosticsSha256": "a2493f156fd17ce298a533e5205e00e077a465b069a3b4452ecb4dfcdeced924"
+    },
+    "tsc7": {
+     "median": 1.266255574,
+     "mean": 1.3214804644,
+     "stddev": 0.11068196700033715,
+     "times": [
+      1.266255574,
+      1.332954521,
+      1.262554365,
+      1.236662794,
+      1.508975068
+     ],
+     "exit_codes": [
+      1,
+      1,
+      1,
+      1,
+      1
+     ],
+     "diagnosticCount": 66,
+     "diagnosticsSha256": "ec1b80fb40501022f57ded80bf48d9db2608accd9295c878b2f5bbeff03df351"
+    },
+    "tsc-rs": {
+     "median": 0.585411875,
+     "mean": 0.5711414751999999,
+     "stddev": 0.0604778750900498,
+     "times": [
+      0.631327859,
+      0.49922370800000004,
+      0.516820766,
+      0.622923168,
+      0.585411875
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 66,
+     "diagnosticsSha256": "ec1b80fb40501022f57ded80bf48d9db2608accd9295c878b2f5bbeff03df351"
+    },
+    "tsc-rs-fast": {
+     "median": 0.434381548,
+     "mean": 0.442887553,
+     "stddev": 0.02460972613725811,
+     "times": [
+      0.451004145,
+      0.43309301400000005,
+      0.48066388200000004,
+      0.434381548,
+      0.41529517600000004
+     ],
+     "exit_codes": [
+      2,
+      2,
+      2,
+      2,
+      2
+     ],
+     "diagnosticCount": 66,
+     "diagnosticsSha256": "ec1b80fb40501022f57ded80bf48d9db2608accd9295c878b2f5bbeff03df351"
+    },
+    "bun": {
+     "median": 1.915711955,
+     "mean": 1.9935928597999997,
+     "stddev": 0.18538236750830253,
+     "times": [
+      1.816195498,
+      2.290210756,
+      1.915711955,
+      2.047403145,
+      1.8984429450000002
+     ],
+     "exit_codes": [
+      0,
+      0,
+      0,
+      0,
+      0
+     ],
+     "diagnosticCount": 66,
+     "diagnosticsSha256": "70a2dbf87cf452c2f68cd0645626817f7d64bd1e0bc9bb32abe7d7da613b30ae"
+    }
+   }
+  }
+ }
+}

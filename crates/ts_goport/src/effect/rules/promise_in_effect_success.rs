@@ -18,19 +18,25 @@ pub static PROMISE_IN_EFFECT_SUCCESS: Rule = Rule {
 
 fn run_promise_in_effect_success(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
+    // PERF: the node is a node order index (effperf4).
     struct StackEntry {
-        node: Node,
+        index: u32,
         visited: bool,
     }
 
+    // PERF: Go walks the tree with a stack of nodes; this stack holds node
+    // order indexes and pushes and pops at the same points (effperf4).
+    let order = ctx.tp.node_order(ctx.source_file);
     let mut stack = vec![StackEntry {
-        node: ctx.source_file,
+        index: 0,
         visited: false,
     }];
     let mut matched: FxHashMap<Node, bool> = FxHashMap::default();
 
     while let Some(entry) = stack.pop() {
-        let node = entry.node;
+        let node = order.node(entry.index);
+        // Go: promise_in_effect_success.go:39. The node order holds no nil
+        // node, so this never skips; it keeps Go's shape.
         if node.is_nil() {
             continue;
         }
@@ -40,16 +46,13 @@ fn run_promise_in_effect_success(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnosti
                 continue;
             }
             stack.push(StackEntry {
-                node,
+                index: entry.index,
                 visited: true,
             });
-            node.for_each_child(|child| {
-                stack.push(StackEntry {
-                    node: child,
-                    visited: false,
-                });
-                false
-            });
+            stack.extend(order.children(entry.index).map(|child| StackEntry {
+                index: child,
+                visited: false,
+            }));
             continue;
         }
 
@@ -208,7 +211,12 @@ fn type_contains_promise(tp: &mut TypeParser<'_>, t: TypeId) -> bool {
 
 /// explicitPromiseSuccessApis lists the Effect APIs whose explicit type
 /// arguments annotate the success channel directly.
-static EXPLICIT_PROMISE_SUCCESS_APIS: &[&str] = &["succeed", "as", "map", "zipWith"];
+static EXPLICIT_PROMISE_SUCCESS_APIS: [ExportMember; 4] = [
+    ExportMember::new("succeed"),
+    ExportMember::new("as"),
+    ExportMember::new("map"),
+    ExportMember::new("zipWith"),
+];
 
 /// hasExplicitPromiseSuccessTypeArguments reports whether the promise in the
 /// success channel was written explicitly through type arguments on the node
@@ -266,7 +274,7 @@ fn is_explicit_promise_success_transformation(
 
 // Go: rules/promise_in_effect_success.go isExplicitPromiseSuccessApi
 fn is_explicit_promise_success_api(tp: &mut TypeParser<'_>, node: Node) -> bool {
-    for name in EXPLICIT_PROMISE_SUCCESS_APIS {
+    for name in &EXPLICIT_PROMISE_SUCCESS_APIS {
         if tp.is_node_reference_to_effect_module_api(node, name) {
             return true;
         }
@@ -279,5 +287,5 @@ fn is_effect_sync_call(tp: &mut TypeParser<'_>, node: Node) -> bool {
     if node.is_nil() || node.kind() != SyntaxKind::CallExpression {
         return false;
     }
-    tp.is_node_reference_to_effect_module_api(node.expression(), "sync")
+    tp.is_node_reference_to_effect_module_api(node.expression(), member!("sync"))
 }

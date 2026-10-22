@@ -19,6 +19,7 @@ use crate::frontend::tspath::{
     normalize_path, normalize_slashes,
 };
 use crate::printer::EmitResolver;
+use crate::printer::emit_context::ParseEmitNodes;
 use crate::sourcemap::generator::{Generator, new_generator};
 use crate::transformers::reference_resolver::new_binder_reference_resolver;
 use crate::transformers::transformer::{
@@ -119,7 +120,7 @@ impl JsPrint {
     }
 }
 
-// Go: compiler/emitter.go:55 declarationTransformer (#4712)
+// Go: compiler/emitter.go:57 declarationTransformer (#4712)
 // PORT: renamed, because `DeclarationTransformer` is the declarations
 // transformer struct.
 trait DeclarationTransformerLike {
@@ -169,8 +170,21 @@ impl Emitter {
         let source_map_file_path = self.paths.source_map_file_path().to_string();
         let declaration_file_path = self.paths.declaration_file_path().to_string();
         let declaration_map_path = self.paths.declaration_map_path().to_string();
-        self.emit_js_file(self.source_file, &js_file_path, &source_map_file_path);
+        // ts#64649 (emitter.go:50-53): one emit context and one emit resolver
+        // for both outputs, so the d.ts part sees what the JS transforms
+        // wrote in the context. Where the port runs the two parts in two
+        // emitters (`program_emit`: the emit pool and the d.ts twins), the
+        // d.ts part gets that data in `transform_declaration_part`.
+        let emit_context = new_emit_context();
+        let emit_resolver = self.host.new_emit_resolver(emit_context);
+        self.emit_js_file(
+            emit_resolver.clone(),
+            self.source_file,
+            &js_file_path,
+            &source_map_file_path,
+        );
         self.emit_declaration_file(
+            emit_resolver,
             self.source_file,
             &declaration_file_path,
             &declaration_map_path,
@@ -178,12 +192,13 @@ impl Emitter {
         self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
     }
 
-    // Go: compiler/emitter.go:60 emitter.getDeclarationTransformers
+    // Go: compiler/emitter.go:62 emitter.getDeclarationTransformers
     // #4712: takes the source file, and adds the supplemental references
     // transformer.
+    // ts#64649: takes the emit resolver of this emit.
     fn get_declaration_transformers(
         &self,
-        emit_context: &Rc<EmitContext>,
+        emit_resolver: Rc<dyn EmitResolver>,
         source_file: Node,
         declaration_file_path: &str,
         declaration_map_path: &str,
@@ -193,7 +208,7 @@ impl Emitter {
         let mut transformers: Vec<Box<dyn DeclarationTransformerLike>> = Vec::with_capacity(2);
         transformers.push(Box::new(crate::declarations::new_declaration_transformer(
             self.host.clone(),
-            Some(emit_context.clone()),
+            emit_resolver,
             options(),
             declaration_file_path,
             declaration_map_path,
@@ -209,10 +224,11 @@ impl Emitter {
         transformers
     }
 
-    // Go: compiler/emitter.go:68 emitter.runScriptTransformers
+    // Go: compiler/emitter.go:70 emitter.runScriptTransformers
+    // ts#64649: takes the emit resolver of this emit.
     fn run_script_transformers(
         &self,
-        emit_context: &Rc<EmitContext>,
+        emit_resolver: Rc<dyn EmitResolver>,
         mut source_file: Node,
     ) -> Node {
         let _trace = crate::tracing::get().map(|tr| {
@@ -223,16 +239,17 @@ impl Emitter {
                 false,
             )
         });
-        for mut transformer in get_script_transformers(emit_context, &self.host, source_file) {
+        for mut transformer in get_script_transformers(emit_resolver, source_file) {
             source_file = transformer.transform_source_file(source_file);
         }
         source_file
     }
 
-    // Go: compiler/emitter.go:78 emitter.runDeclarationTransformers
+    // Go: compiler/emitter.go:80 emitter.runDeclarationTransformers
+    // ts#64649: takes the emit resolver of this emit.
     fn run_declaration_transformers(
         &self,
-        emit_context: &Rc<EmitContext>,
+        emit_resolver: Rc<dyn EmitResolver>,
         mut source_file: Node,
         declaration_file_path: &str,
         declaration_map_path: &str,
@@ -247,7 +264,7 @@ impl Emitter {
         });
         let mut diags = Vec::new();
         for mut transformer in self.get_declaration_transformers(
-            emit_context,
+            emit_resolver,
             source_file,
             declaration_file_path,
             declaration_map_path,
@@ -259,22 +276,32 @@ impl Emitter {
         (source_file, diags)
     }
 
-    // Go: compiler/emitter.go:181 emitter.emitJSFile
-    fn emit_js_file(&mut self, source_file: Node, js_file_path: &str, source_map_file_path: &str) {
-        if let Some(print) = self.transform_js_file(source_file, js_file_path) {
+    // Go: compiler/emitter.go:185 emitter.emitJSFile
+    fn emit_js_file(
+        &mut self,
+        emit_resolver: Rc<dyn EmitResolver>,
+        source_file: Node,
+        js_file_path: &str,
+        source_map_file_path: &str,
+    ) {
+        if let Some(print) = self.transform_js_file(emit_resolver, source_file, js_file_path) {
             self.print_js_file(print, js_file_path, source_map_file_path);
         }
     }
 
     /// PORT: not in Go. The JS part of a file (`emit_only` is `Js`) up to
-    /// its print: the script transforms, which may call the emit resolver,
-    /// so they run on the file's checker thread. It returns the print, or
-    /// `None` when the part has nothing to print (skipped or blocked).
-    /// `finish_js_part` runs the rest.
+    /// its print: the script transforms. It returns the print, or `None`
+    /// when the part has nothing to print (skipped or blocked).
+    /// `finish_js_part` runs the rest. The part has its own emit context
+    /// and resolver, as `emit` makes them (emitter.go:50-51). When the
+    /// file's d.ts part runs in another emitter, it gets the parse-tree
+    /// entries of this context (`EmitContext::export_parse_emit_nodes` of
+    /// `JsPrint::emit_context`) for `transform_declaration_part`.
     pub fn transform_js_part(&mut self) -> Option<JsPrint> {
         debug_assert!(self.emit_only == EmitOnly::Js, "not a JS part");
         let js_file_path = self.paths.js_file_path().to_string();
-        let print = self.transform_js_file(self.source_file, &js_file_path);
+        let emit_resolver = self.host.new_emit_resolver(new_emit_context());
+        let print = self.transform_js_file(emit_resolver, self.source_file, &js_file_path);
         if print.is_none() {
             self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
         }
@@ -293,7 +320,14 @@ impl Emitter {
 
     /// The part of Go `emitJSFile` up to its printer: the script
     /// transforms. None when it returns before the print.
-    fn transform_js_file(&mut self, source_file: Node, js_file_path: &str) -> Option<JsPrint> {
+    fn transform_js_file(
+        &mut self,
+        emit_resolver: Rc<dyn EmitResolver>,
+        source_file: Node,
+        js_file_path: &str,
+    ) -> Option<JsPrint> {
+        // Go: compiler/emitter.go:186 (ts#64649)
+        let emit_context = emit_resolver.emit_context().clone();
         let options = options();
 
         if source_file.is_nil()
@@ -320,10 +354,7 @@ impl Emitter {
             )
         });
 
-        // Go `putEmitContext()` is the `reset` at the end of `print_js_file`.
-        let (emit_context, _) = get_emit_context();
-
-        let source_file = self.run_script_transformers(&emit_context, source_file);
+        let source_file = self.run_script_transformers(emit_resolver, source_file);
         Some(JsPrint {
             source_file,
             emit_context,
@@ -360,7 +391,7 @@ impl Emitter {
                 // !!!
                 ..PrintHandlers::default()
             },
-            Some(emit_context.clone()),
+            Some(emit_context),
         );
 
         // PORT: not in Go. Size the output buffer once. JS output is close to
@@ -379,8 +410,6 @@ impl Emitter {
             options,
             should_emit_source_maps,
         );
-        // Go `putEmitContext()`.
-        emit_context.reset();
     }
 
     /// PORT: not in Go. The d.ts part of a split file (`emit_only` is
@@ -388,11 +417,30 @@ impl Emitter {
     /// emit resolver, so they run on the file's checker thread. It returns
     /// the print, or `None` when the part has nothing to print (skipped or
     /// blocked). `finish_declaration_part` runs the rest.
-    pub fn transform_declaration_part(&mut self) -> Option<DeclarationPrint> {
+    ///
+    /// `js_emit_nodes` holds what the file's JS transforms wrote on
+    /// parse-tree nodes, when another emitter ran them for this emit (the
+    /// emit pool or the checker before its twin). Go runs both parts in one
+    /// context (emitter.go:50-53), so the part's new context gets them
+    /// before the declaration transforms. It is None when no JS transforms
+    /// ran for this emit (no JS part, skipped, blocked), as Go's d.ts part
+    /// then sees no JS data. One difference to Go: the JS print can write
+    /// too (Go printer.go:1601, `EFNoSourceMap` on a function body), after
+    /// the export. A d.ts print never prints a function body.
+    pub fn transform_declaration_part(
+        &mut self,
+        js_emit_nodes: Option<ParseEmitNodes>,
+    ) -> Option<DeclarationPrint> {
         debug_assert!(self.emit_only == EmitOnly::Dts, "not a d.ts part");
         let declaration_file_path = self.paths.declaration_file_path().to_string();
         let declaration_map_path = self.paths.declaration_map_path().to_string();
+        let emit_context = new_emit_context();
+        if let Some(js_emit_nodes) = js_emit_nodes {
+            emit_context.import_parse_emit_nodes(js_emit_nodes);
+        }
+        let emit_resolver = self.host.new_emit_resolver(emit_context);
         let print = self.transform_declaration_file(
+            emit_resolver,
             self.source_file,
             &declaration_file_path,
             &declaration_map_path,
@@ -412,14 +460,16 @@ impl Emitter {
         self.emit_result.diagnostics = self.emitter_diagnostics.get_diagnostics();
     }
 
-    // Go: compiler/emitter.go:221 emitter.emitDeclarationFile
+    // Go: compiler/emitter.go:223 emitter.emitDeclarationFile
     fn emit_declaration_file(
         &mut self,
+        emit_resolver: Rc<dyn EmitResolver>,
         source_file: Node,
         declaration_file_path: &str,
         declaration_map_path: &str,
     ) {
         if let Some(print) = self.transform_declaration_file(
+            emit_resolver,
             source_file,
             declaration_file_path,
             declaration_map_path,
@@ -432,10 +482,13 @@ impl Emitter {
     /// declaration transforms. None when it returns before the print.
     fn transform_declaration_file(
         &mut self,
+        emit_resolver: Rc<dyn EmitResolver>,
         source_file: Node,
         declaration_file_path: &str,
         declaration_map_path: &str,
     ) -> Option<DeclarationPrint> {
+        // Go: compiler/emitter.go:224 (ts#64649)
+        let emit_context = emit_resolver.emit_context().clone();
         let options = options();
 
         if source_file.is_nil()
@@ -460,9 +513,8 @@ impl Emitter {
             )
         });
 
-        let (emit_context, put_emit_context) = get_emit_context();
         let (source_file, diags) = self.run_declaration_transformers(
-            &emit_context,
+            emit_resolver,
             source_file,
             declaration_file_path,
             declaration_map_path,
@@ -482,7 +534,6 @@ impl Emitter {
                 ))
         {
             self.emit_result.emit_skipped = true;
-            put_emit_context();
             return None;
         }
 
@@ -490,7 +541,6 @@ impl Emitter {
             !diags.is_empty() && !self.force_emit && self.emit_only != EmitOnly::BuilderSignature;
         if decl_blocked {
             self.emit_result.emit_skipped = true;
-            put_emit_context();
             return None;
         }
 
@@ -562,7 +612,7 @@ impl Emitter {
                 Some((Some(original_source.clone()), mapped))
             }));
         }
-        let mut printer = new_printer(printer_options, print_handlers, Some(emit_context.clone()));
+        let mut printer = new_printer(printer_options, print_handlers, Some(emit_context));
 
         let declaration_map_options = CompilerOptions {
             source_map: if emit_declaration_map {
@@ -591,11 +641,9 @@ impl Emitter {
             &declaration_map_options,
             should_emit_source_maps,
         );
-        // Go `putEmitContext()`.
-        emit_context.reset();
     }
 
-    // Go: compiler/emitter.go:314 emitter.printSourceFile
+    // Go: compiler/emitter.go:315 emitter.printSourceFile
     fn print_source_file(
         &mut self,
         js_file_path: &str,
@@ -627,6 +675,13 @@ impl Emitter {
             writer,
             source_map_generator.clone(),
         );
+        // PORT: Go N' (ts#64649) calls `emitContext.Factory.ReleaseArenas()`
+        // here (emitter.go:329), after each file, on the file's own emit
+        // context. It only lets the GC take nodes that nothing reaches. Here
+        // the transform and declaration emit nodes stay with their thread or
+        // program version (`ast::synthetic` owners); only the checker's
+        // to-string builder frees its nodes per call (`PrintScope` in
+        // checker/printer_impl.rs).
         // PORT: not in Go. See `js_part`.
         self.wait_for_js_part();
 
@@ -758,7 +813,7 @@ impl Emitter {
         diagnostics.get_diagnostics()
     }
 
-    // Go: compiler/emitter.go:395 emitter.writeText
+    // Go: compiler/emitter.go:394 emitter.writeText
     fn write_text(
         &self,
         file_name: &str,
@@ -771,7 +826,7 @@ impl Emitter {
         crate::printer::EmitHost::write_file(self.host.as_ref(), file_name, text)
     }
 
-    // Go: compiler/emitter.go:417 emitter.getSourceMapDirectory
+    // Go: compiler/emitter.go:432 emitter.getSourceMapDirectory
     fn get_source_map_directory(
         &self,
         map_options: &CompilerOptions,
@@ -803,7 +858,7 @@ impl Emitter {
         get_directory_path(&normalize_path(file_path))
     }
 
-    // Go: compiler/emitter.go:443 emitter.getSourceMappingURL
+    // Go: compiler/emitter.go:442 emitter.getSourceMappingURL
     fn get_source_mapping_url(
         &self,
         map_options: &CompilerOptions,
@@ -851,14 +906,14 @@ impl Emitter {
     }
 }
 
-// Go: compiler/emitter.go:295 declarationMapSource
+// Go: compiler/emitter.go:296 declarationMapSource
 struct DeclarationMapSource {
     file_name: &'static str,
     text: FileText,
     line_map: Vec<i32>,
 }
 
-// Go: compiler/emitter.go:301 newDeclarationMapSource
+// Go: compiler/emitter.go:302 newDeclarationMapSource
 fn new_declaration_map_source(source_file: Node) -> DeclarationMapSource {
     let text = source_file_original_text(source_file);
     DeclarationMapSource {
@@ -868,7 +923,7 @@ fn new_declaration_map_source(source_file: Node) -> DeclarationMapSource {
     }
 }
 
-// Go: compiler/emitter.go:310 declarationMapSource.FileName, Text, ECMALineMap
+// Go: compiler/emitter.go:311 declarationMapSource.FileName, Text, ECMALineMap
 impl crate::sourcemap::source::Source for DeclarationMapSource {
     fn text(&self) -> &str {
         &self.text
@@ -883,7 +938,7 @@ impl crate::sourcemap::source::Source for DeclarationMapSource {
     }
 }
 
-// Go: compiler/emitter.go:90 getModuleTransformer
+// Go: compiler/emitter.go:92 getModuleTransformer
 fn get_module_transformer(opts: &TransformOptions) -> Option<TransformerBox> {
     use crate::transformers::moduletransforms;
     match opts.compiler_options.get_emit_module_kind() {
@@ -942,7 +997,7 @@ struct ScriptTransformChoice {
     emit_resolver_references: bool,
 }
 
-// Go: compiler/emitter.go:112 getScriptTransformers (its first lines)
+// Go: compiler/emitter.go:114 getScriptTransformers (its first lines)
 fn script_transform_choice(options: &CompilerOptions, source_file: Node) -> ScriptTransformChoice {
     // JS files don't use reference calculations as they don't do import elision, no need to calculate it
     let import_elision_enabled =
@@ -1006,13 +1061,16 @@ fn may_have_enum_declaration(source_file: Node) -> bool {
             .any(|extra| is_enum(extra.local_symbol))
 }
 
-// Go: compiler/emitter.go:112 getScriptTransformers
+// Go: compiler/emitter.go:114 getScriptTransformers
+// ts#64649: takes the emit resolver, and reads the emit context from it. Go
+// panics when the resolver or its context is nil; neither is nil here.
 pub fn get_script_transformers(
-    emit_context: &Rc<EmitContext>,
-    host: &Rc<crate::program::EmitHost>,
+    emit_resolver: Rc<dyn EmitResolver>,
     source_file: Node,
 ) -> Vec<TransformerBox> {
     use crate::transformers::{estransforms, inliners, jsxtransforms, tstransforms};
+
+    let emit_context = emit_resolver.emit_context().clone();
 
     let mut tx: Vec<TransformerBox> = Vec::new();
     let options = options();
@@ -1023,8 +1081,6 @@ pub fn get_script_transformers(
         emit_resolver_references,
     } = script_transform_choice(options, source_file);
 
-    let emit_resolver: Rc<dyn EmitResolver> = host.emit_resolver();
-
     let reference_resolver: Rc<dyn TransformReferenceResolver> = if emit_resolver_references {
         Rc::new(EmitResolverReferenceResolver(emit_resolver.clone()))
     } else {
@@ -1032,7 +1088,7 @@ pub fn get_script_transformers(
     };
 
     let opts = TransformOptions {
-        context: emit_context.clone(),
+        context: emit_context,
         compiler_options: options,
         resolver: reference_resolver,
         emit_resolver,
@@ -1118,13 +1174,13 @@ pub fn parsed_source_file(file: Node) -> Node {
     file
 }
 
-// Go: compiler/emitter.go:402 shouldEmitSourceMaps
+// Go: compiler/emitter.go:401 shouldEmitSourceMaps
 fn should_emit_source_maps(map_options: &CompilerOptions, source_file: Node) -> bool {
     (map_options.source_map.is_true() || map_options.inline_source_map.is_true())
         && !file_extension_is(source_file_file_name(source_file), ".json")
 }
 
-// Go: compiler/emitter.go:407 getSourceRoot
+// Go: compiler/emitter.go:406 getSourceRoot
 fn get_source_root(map_options: &CompilerOptions) -> String {
     // Normalize source root and make sure it has trailing "/" so that it can be used to combine paths with the
     // relative paths of the sources list in the sourcemap

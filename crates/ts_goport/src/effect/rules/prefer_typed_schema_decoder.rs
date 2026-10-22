@@ -10,13 +10,13 @@ use crate::prelude::*;
 // A callee references at most one of these exports, and the match returns
 // on the first hit, so the order does not change the output.
 // Go: rules/prefer_typed_schema_decoder.go typedSchemaDecoders
-static TYPED_SCHEMA_DECODERS: &[(&str, &str)] = &[
-    ("decodeUnknownEffect", "decodeEffect"),
-    ("decodeUnknownSync", "decodeSync"),
-    ("decodeUnknownExit", "decodeExit"),
-    ("decodeUnknownOption", "decodeOption"),
-    ("decodeUnknownResult", "decodeResult"),
-    ("decodeUnknownPromise", "decodePromise"),
+static TYPED_SCHEMA_DECODERS: [(ExportMember, &str); 6] = [
+    (ExportMember::new("decodeUnknownEffect"), "decodeEffect"),
+    (ExportMember::new("decodeUnknownSync"), "decodeSync"),
+    (ExportMember::new("decodeUnknownExit"), "decodeExit"),
+    (ExportMember::new("decodeUnknownOption"), "decodeOption"),
+    (ExportMember::new("decodeUnknownResult"), "decodeResult"),
+    (ExportMember::new("decodeUnknownPromise"), "decodePromise"),
 ];
 
 /// PreferTypedSchemaDecoder suggests typed Schema decoders when the input is
@@ -90,16 +90,13 @@ pub fn analyze_prefer_typed_schema_decoder(
         }
     }
 
-    fn walk(
+    fn visit(
         tp: &mut TypeParser<'_>,
         sf: Node,
         matches: &mut Vec<PreferTypedSchemaDecoderMatch>,
         handled_decoder_names: &mut FxHashSet<Node>,
         node: Node,
-    ) -> bool {
-        if node.is_nil() {
-            return false;
-        }
+    ) {
         if node.kind() == SyntaxKind::CallExpression {
             let call = node;
             if call.argument_list().is_some()
@@ -125,10 +122,12 @@ pub fn analyze_prefer_typed_schema_decoder(
                 }
             }
         }
-        node.for_each_child(|child| walk(tp, sf, matches, handled_decoder_names, child));
-        false
     }
-    walk(tp, sf, &mut matches, &mut handled_decoder_names, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, &mut handled_decoder_names, n);
+    }
     // PORT: Go `sort.Slice` is not stable; the port sorts stably. Matches
     // with the same start come from one decoder name node.
     matches.sort_by(|a, b| a.location.pos().cmp(&b.location.pos()));
@@ -263,11 +262,11 @@ fn contains_unresolved_type_variable(
 
 // Go: rules/prefer_typed_schema_decoder.go matchUnknownSchemaDecoder
 fn match_unknown_schema_decoder(tp: &mut TypeParser<'_>, callee: Node) -> (String, String) {
-    for &(unknown_name, typed_name) in TYPED_SCHEMA_DECODERS {
+    for (unknown_name, typed_name) in &TYPED_SCHEMA_DECODERS {
         if tp.is_node_reference_to_effect_schema_module_api(callee, unknown_name)
             || tp.is_node_reference_to_effect_schema_parser_module_api(callee, unknown_name)
         {
-            return (unknown_name.to_string(), typed_name.to_string());
+            return (unknown_name.name.to_string(), typed_name.to_string());
         }
     }
     (String::new(), String::new())

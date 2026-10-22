@@ -26,9 +26,36 @@ impl Checker {
     pub fn has_matching_argument(&mut self, expression: Node, reference: Node) -> bool {
         // PERF: the argument list is program data (`NodeSlice` is `Copy`), so
         // the loop reads it in place with no copy.
+        // PERF: portonly1 item 5. Go `isOrContainsMatchingReference(reference,
+        // argument)` (flow.go:1898) walks the access chain of `reference`
+        // again for each argument (`containsMatchingReference`, flow.go:1841;
+        // `optionalChainContainsReference`, flow.go:1851).
+        // Go reads `Kind` and `Expression()` as fields; here each is a store
+        // read, so the chain is read once, before the loop. The calls of
+        // `is_matching_reference` are the same and in the same order.
+        let mut reference_chain: smallvec::SmallVec<[Node; 4]> = smallvec::SmallVec::new();
+        let mut source = reference;
+        while is_access_expression(source) {
+            source = source.expression();
+            reference_chain.push(source);
+        }
         for argument in expression.arguments() {
-            if self.is_or_contains_matching_reference(reference, argument)
-                || self.optional_chain_contains_reference(argument, reference)
+            // Go `isOrContainsMatchingReference(reference, argument)`.
+            let argument_kind = argument.kind();
+            if self.is_matching_reference_kind(reference, argument, argument_kind)
+                || reference_chain.iter().any(|&source| {
+                    self.is_matching_reference_kind(source, argument, argument_kind)
+                })
+                // `optionalChainContainsReference` is false at once unless the
+                // argument is an optional chain (`is_optional_chain` tests
+                // these kinds first).
+                || matches!(
+                    argument_kind,
+                    SyntaxKind::PropertyAccessExpression
+                        | SyntaxKind::ElementAccessExpression
+                        | SyntaxKind::CallExpression
+                        | SyntaxKind::NonNullExpression
+                ) && self.optional_chain_contains_reference(argument, reference)
             {
                 return true;
             }
@@ -416,7 +443,9 @@ impl Checker {
                                 prop = self.get_property_of_type(t, &prop_name);
                             }
                         } else {
-                            prop = self.get_property_of_type(t, name.text());
+                            // PERF: namekeys1. By the name's id, as
+                            // `check_property_access_expression`.
+                            prop = self.get_property_of_type(t, &name.text_name());
                         }
                         if prop.is_some() {
                             return self.get_explicit_type_of_symbol(prop, diagnostic);
@@ -1005,9 +1034,11 @@ impl Checker {
     pub fn is_reachable_flow_node(&mut self, flow: FlowNodeId) -> bool {
         // flowskip1 verify: an effect site (flow_skip.rs).
         self.flow_skip.effects += 1;
-        let f = self.get_flow_state();
-        let result = self.is_reachable_flow_node_worker(&f, flow, false /*noCacheCheck*/);
-        self.put_flow_state(f);
+        let result = self.is_reachable_flow_node_worker(
+            &mut FlowState::default(),
+            flow,
+            false, /*noCacheCheck*/
+        );
         self.last_flow_node = flow;
         self.last_flow_node_reachable = result;
         result
@@ -1016,7 +1047,7 @@ impl Checker {
     // Go: checker/flow.go:2522 isReachableFlowNodeWorker
     pub fn is_reachable_flow_node_worker(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         flow: FlowNodeId,
         no_cache_check: bool,
     ) -> bool {
@@ -1027,11 +1058,12 @@ impl Checker {
                 return self.last_flow_node_reachable;
             }
             // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            // flowcost1: the walk's cached flow nodes (`FlowState::flow_data`).
             let mut flow_data_guard = None;
-            let flow_data = flow.get_flow_in(&mut flow_data_guard);
+            let flow_data = f.flow_data(flow, &mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
-                if !no_cache_check && f.borrow().reduce_labels.is_empty() {
+                if !no_cache_check && f.reduce_labels.is_empty() {
                     if let Some(&reachable) = self.flow_node_reachable.get(&flow) {
                         return reachable;
                     }
@@ -1071,8 +1103,7 @@ impl Checker {
                 flow = flow_data.antecedent;
             } else if flags.intersects(FlowFlags::BRANCH_LABEL) {
                 // A branching point is reachable if any branch is reachable.
-                let antecedents =
-                    get_branch_label_antecedents(flow, flow_data, &f.borrow().reduce_labels);
+                let antecedents = get_branch_label_antecedents(flow, flow_data, &f.reduce_labels);
                 for &antecedent in antecedents.iter() {
                     if self
                         .is_reachable_flow_node_worker(f, antecedent, false /*noCacheCheck*/)
@@ -1100,15 +1131,13 @@ impl Checker {
             } else if flags.intersects(FlowFlags::REDUCE_LABEL) {
                 // Cache is unreliable once we start adjusting labels
                 self.last_flow_node = FlowNodeId::NIL;
-                f.borrow_mut()
-                    .reduce_labels
-                    .push(ReduceLabel::of(flow_data));
+                f.reduce_labels.push(ReduceLabel::of(flow_data));
                 let result = self.is_reachable_flow_node_worker(
                     f,
                     flow_data.antecedent,
                     false, /*noCacheCheck*/
                 );
-                f.borrow_mut().reduce_labels.pop();
+                f.reduce_labels.pop();
                 return result;
             } else {
                 return !flags.intersects(FlowFlags::UNREACHABLE);
@@ -1138,16 +1167,13 @@ impl Checker {
     // leading to the node.
     // Go: checker/flow.go:2604 isPostSuperFlowNode
     pub fn is_post_super_flow_node(&mut self, flow: FlowNodeId, no_cache_check: bool) -> bool {
-        let f = self.get_flow_state();
-        let result = self.is_post_super_flow_node_worker(&f, flow, no_cache_check);
-        self.put_flow_state(f);
-        result
+        self.is_post_super_flow_node_worker(&mut FlowState::default(), flow, no_cache_check)
     }
 
     // Go: checker/flow.go:2611 isPostSuperFlowNodeWorker
     pub fn is_post_super_flow_node_worker(
         &mut self,
-        f: &Rc<RefCell<FlowState>>,
+        f: &mut FlowState,
         flow: FlowNodeId,
         no_cache_check: bool,
     ) -> bool {
@@ -1155,8 +1181,9 @@ impl Checker {
         let mut no_cache_check = no_cache_check;
         loop {
             // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
+            // flowcost1: the walk's cached flow nodes (`FlowState::flow_data`).
             let mut flow_data_guard = None;
-            let flow_data = flow.get_flow_in(&mut flow_data_guard);
+            let flow_data = f.flow_data(flow, &mut flow_data_guard);
             let flags = flow_data.flags;
             if flags.intersects(FlowFlags::SHARED) {
                 if !no_cache_check {
@@ -1184,8 +1211,7 @@ impl Checker {
                 }
                 flow = flow_data.antecedent;
             } else if flags.intersects(FlowFlags::BRANCH_LABEL) {
-                let antecedents =
-                    get_branch_label_antecedents(flow, flow_data, &f.borrow().reduce_labels);
+                let antecedents = get_branch_label_antecedents(flow, flow_data, &f.reduce_labels);
                 for &antecedent in antecedents.iter() {
                     if !self
                         .is_post_super_flow_node_worker(f, antecedent, false /*noCacheCheck*/)
@@ -1198,15 +1224,13 @@ impl Checker {
                 // A loop is post-super if the control flow path that leads to the top is post-super.
                 flow = flow_data.antecedents[0];
             } else if flags.intersects(FlowFlags::REDUCE_LABEL) {
-                f.borrow_mut()
-                    .reduce_labels
-                    .push(ReduceLabel::of(flow_data));
+                f.reduce_labels.push(ReduceLabel::of(flow_data));
                 let result = self.is_post_super_flow_node_worker(
                     f,
                     flow_data.antecedent,
                     false, /*noCacheCheck*/
                 );
-                f.borrow_mut().reduce_labels.pop();
+                f.reduce_labels.pop();
                 return result;
             } else {
                 // Unreachable nodes are considered post-super to silence errors

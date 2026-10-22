@@ -40,7 +40,7 @@ use ts_goport::prelude::*;
 const BUILD_END: &str = "Watching for file changes";
 
 /// How long one build may take.
-const BUILD_TIMEOUT: Duration = Duration::from_secs(300);
+const BUILD_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// The wait between the end of a build and the next edit.
 const EDIT_DELAY: Duration = Duration::from_millis(300);

@@ -13,13 +13,16 @@
 //! PORT: Go `p.nodeSliceArena` only saves allocations. Here each call uses a
 //! new `Vec`.
 
-use crate::astdata::NodeData as D;
+use crate::astdata::BoxedData as D;
 use crate::frontend::prelude::*;
 
 /// Go `node.AsX().Field = v`: clones the data of `n`, lets `f` change it and
-/// stores it back.
+/// stores it back. The ids and lists that `f` stores come from the `node_*`
+/// value helpers of `ast::synthetic` for `n` (`node_child_id`,
+/// `node_list_value`, ...), not from the parser's factory: they must be in
+/// the space and owner of `n`, as its new data is (astshrink2).
 fn mutate(n: Node, f: impl FnOnce(&mut D)) {
-    let mut data = with_ast_data(n, Clone::clone);
+    let mut data = with_ast_data(n, |d| d.to_boxed());
     f(&mut data);
     replace_node_data(n, data);
 }
@@ -45,15 +48,18 @@ macro_rules! with_function_like_data {
             D::MethodSignatureDeclaration($d) => $body,
             D::SetAccessorDeclaration($d) => $body,
             D::IndexSignatureDeclaration($i) => $index_body,
-            other => panic!("node data is not function-like: {}", other.schema_name()),
+            other => panic!(
+                "node data is not function-like: {}",
+                other.view().schema_name()
+            ),
         }
     };
 }
 
 // Go: ast/ast.go:677 (m *MutableNode) SetType
 // PORT: only the kinds that the reparser writes. Go panics on other kinds.
-fn set_type(f: &NodeFactory, n: Node, t: Node) {
-    let id = f.oid(t);
+fn set_type(n: Node, t: Node) {
+    let id = node_opt_child_id(n, t);
     mutate(n, |data| match data {
         D::VariableDeclaration(d) => d.type_ = id,
         D::ParameterDeclaration(d) => d.type_ = id,
@@ -65,30 +71,30 @@ fn set_type(f: &NodeFactory, n: Node, t: Node) {
         D::GetAccessorDeclaration(d) => d.type_ = id,
         other => panic!(
             "Unhandled case in mutableNode.SetType: {}",
-            other.schema_name()
+            other.view().schema_name()
         ),
     });
 }
 
 // Go: ast/ast.go:387 (m *MutableNode) SetExpression
 // PORT: only the kinds that the reparser writes.
-fn set_expression(f: &NodeFactory, n: Node, expr: Node) {
-    let id = f.id(expr);
+fn set_expression(n: Node, expr: Node) {
+    let id = node_child_id(n, expr);
     mutate(n, |data| match data {
         D::ReturnStatement(d) => d.expression = Some(id),
         D::ParenthesizedExpression(d) => d.expression = id,
         D::ExportAssignment(d) => d.expression = id,
         other => panic!(
             "Unhandled case in mutableNode.SetExpression: {}",
-            other.schema_name()
+            other.view().schema_name()
         ),
     });
 }
 
 // Go: ast/ast.go:765 (m *MutableNode) SetInitializer
 // PORT: only the kinds that the reparser writes.
-fn set_initializer(f: &NodeFactory, n: Node, initializer: Node) {
-    let id = f.id(initializer);
+fn set_initializer(n: Node, initializer: Node) {
+    let id = node_child_id(n, initializer);
     mutate(n, |data| match data {
         D::VariableDeclaration(d) => d.initializer = Some(id),
         D::PropertyDeclaration(d) => d.initializer = Some(id),
@@ -99,8 +105,8 @@ fn set_initializer(f: &NodeFactory, n: Node, initializer: Node) {
 
 // Go: ast/ast.go:227 (m *MutableNode) SetModifiers
 // PORT: only the kinds that the reparser writes.
-fn set_modifiers(f: &NodeFactory, n: Node, modifiers: ModifierList) {
-    let mods = f.mods(modifiers);
+fn set_modifiers(n: Node, modifiers: ModifierList) {
+    let mods = node_modifiers_value(n, modifiers);
     mutate(n, |data| match data {
         D::PropertyDeclaration(d) => d.modifiers = mods,
         D::MethodDeclaration(d) => d.modifiers = mods,
@@ -108,13 +114,16 @@ fn set_modifiers(f: &NodeFactory, n: Node, modifiers: ModifierList) {
         D::GetAccessorDeclaration(d) => d.modifiers = mods,
         D::SetAccessorDeclaration(d) => d.modifiers = mods,
         D::BinaryExpression(d) => d.modifiers = mods,
-        other => panic!("Unhandled case in setModifiers: {}", other.schema_name()),
+        other => panic!(
+            "Unhandled case in setModifiers: {}",
+            other.view().schema_name()
+        ),
     });
 }
 
 /// Go `fun.FunctionLikeData().TypeParameters = list`.
-fn set_function_type_parameters(f: &NodeFactory, fun: Node, list: NodeList) {
-    let v = f.opt_list(list);
+fn set_function_type_parameters(fun: Node, list: NodeList) {
+    let v = node_list_value(fun, list);
     mutate(
         fun,
         |data| with_function_like_data!(data, d => d.type_parameters = v, index d => d.type_parameters = v),
@@ -122,8 +131,8 @@ fn set_function_type_parameters(f: &NodeFactory, fun: Node, list: NodeList) {
 }
 
 /// Go `fun.FunctionLikeData().Parameters = list`.
-fn set_function_parameters(f: &NodeFactory, fun: Node, list: NodeList) {
-    let v = f.req_list(list);
+fn set_function_parameters(fun: Node, list: NodeList) {
+    let v = node_req_list_value(fun, list);
     mutate(
         fun,
         |data| with_function_like_data!(data, d => d.parameters = v, index d => d.parameters = v),
@@ -131,9 +140,9 @@ fn set_function_parameters(f: &NodeFactory, fun: Node, list: NodeList) {
 }
 
 /// Go `fun.FunctionLikeData().Type = t`.
-fn set_function_type(f: &NodeFactory, fun: Node, t: Node) {
-    let v = f.oid(t);
-    let required = f.id(t);
+fn set_function_type(fun: Node, t: Node) {
+    let v = node_opt_child_id(fun, t);
+    let required = node_child_id(fun, t);
     mutate(
         fun,
         |data| with_function_like_data!(data, d => d.type_ = v, index d => d.type_ = required),
@@ -141,8 +150,8 @@ fn set_function_type(f: &NodeFactory, fun: Node, t: Node) {
 }
 
 /// Go `fun.FunctionLikeData().FullSignature = t`.
-fn set_function_full_signature(f: &NodeFactory, fun: Node, t: Node) {
-    let v = f.oid(t);
+fn set_function_full_signature(fun: Node, t: Node) {
+    let v = node_opt_child_id(fun, t);
     mutate(
         fun,
         |data| with_function_like_data!(data, d => d.full_signature = v, index d => d.full_signature = v),
@@ -252,7 +261,7 @@ impl<'a> Parser<'a> {
                 );
                 let type_parameters =
                     self.gather_type_parameters(js_doc, true /*typedefOrCallback*/);
-                let tp = self.factory.opt_list(type_parameters);
+                let tp = node_list_value(type_alias, type_parameters);
                 mutate(type_alias, |data| {
                     if let D::TypeAliasDeclaration(d) = data {
                         d.type_parameters = tp;
@@ -269,7 +278,7 @@ impl<'a> Parser<'a> {
                         "typedef tag type expression should be a name reference or a type expression{kind:?}"
                     ),
                 };
-                let t = self.factory.id(t);
+                let t = node_child_id(type_alias, t);
                 mutate(type_alias, |data| {
                     if let D::TypeAliasDeclaration(d) = data {
                         d.type_ = t;
@@ -314,7 +323,7 @@ impl<'a> Parser<'a> {
                 );
                 let type_parameters =
                     self.gather_type_parameters(js_doc, true /*typedefOrCallback*/);
-                let tp = self.factory.opt_list(type_parameters);
+                let tp = node_list_value(type_alias, type_parameters);
                 mutate(type_alias, |data| {
                     if let D::TypeAliasDeclaration(d) = data {
                         d.type_parameters = tp;
@@ -433,7 +442,7 @@ impl<'a> Parser<'a> {
         if tag.kind() != SyntaxKind::JsDocCallbackTag {
             let type_parameters =
                 self.gather_type_parameters(js_doc, false /*typedefOrCallback*/);
-            set_function_type_parameters(&self.factory, signature, type_parameters);
+            set_function_type_parameters(signature, type_parameters);
         }
         let mut parameters: Vec<Node> = Vec::new();
         for (pi, param) in js_signature.parameters().iter().enumerate() {
@@ -452,7 +461,7 @@ impl<'a> Parser<'a> {
                 );
                 if param.type_expression().is_some() {
                     let t = self.add_deep_clone_reparse(param.type_expression().type_());
-                    set_type(&self.factory, parameter, t);
+                    set_type(parameter, t);
                 }
             } else if param.kind() == SyntaxKind::JsDocParameterTag
                 || param.kind() == SyntaxKind::JsDocPropertyTag
@@ -520,11 +529,11 @@ impl<'a> Parser<'a> {
             self.reparse_js_doc_comment(parameter, param);
         }
         let parameter_list = self.new_node_list(js_signature.parameter_list().loc(), &parameters);
-        set_function_parameters(&self.factory, signature, parameter_list);
+        set_function_parameters(signature, parameter_list);
 
         if js_signature.type_().is_some() && js_signature.type_().type_expression().is_some() {
             let t = self.add_deep_clone_reparse(js_signature.type_().type_expression().type_());
-            set_function_type(&self.factory, signature, t);
+            set_function_type(signature, t);
         }
         let loc = if tag.kind() == SyntaxKind::JsDocOverloadTag {
             tag.tag_name()
@@ -573,7 +582,7 @@ impl<'a> Parser<'a> {
                 if prop.type_expression().is_some() {
                     let property_type =
                         self.reparse_js_doc_type_literal(prop.type_expression().type_());
-                    let id = self.factory.id(property_type);
+                    let id = node_child_id(property, property_type);
                     mutate(property, |data| {
                         if let D::PropertySignatureDeclaration(d) = data {
                             d.type_ = id;
@@ -683,7 +692,7 @@ impl<'a> Parser<'a> {
                                 if declaration.type_().is_nil() && tag.type_expression().is_some() {
                                     let t =
                                         self.add_deep_clone_reparse(tag.type_expression().type_());
-                                    set_type(&self.factory, declaration, t);
+                                    set_type(declaration, t);
                                     self.finish_mutated_node(declaration);
                                     return;
                                 }
@@ -698,7 +707,7 @@ impl<'a> Parser<'a> {
                     | SyntaxKind::GetAccessor => {
                         if parent.type_().is_nil() && tag.type_expression().is_some() {
                             let t = self.add_deep_clone_reparse(tag.type_expression().type_());
-                            set_type(&self.factory, parent, t);
+                            set_type(parent, t);
                             self.finish_mutated_node(parent);
                             return;
                         }
@@ -706,7 +715,7 @@ impl<'a> Parser<'a> {
                     SyntaxKind::Parameter => {
                         if parent.type_().is_nil() && tag.type_expression().is_some() {
                             let t = self.reparse_js_doc_type_literal(tag.type_expression().type_());
-                            set_type(&self.factory, parent, t);
+                            set_type(parent, t);
                             self.finish_mutated_node(parent);
                             return;
                         }
@@ -717,7 +726,7 @@ impl<'a> Parser<'a> {
                             let kind = get_assignment_declaration_kind(bin);
                             if kind != JSDeclarationKind::NONE && tag.type_expression().is_some() {
                                 let t = self.add_deep_clone_reparse(tag.type_expression().type_());
-                                set_type(&self.factory, bin, t);
+                                set_type(bin, t);
                                 self.finish_mutated_node(bin);
                                 return;
                             }
@@ -731,7 +740,7 @@ impl<'a> Parser<'a> {
                                 parent.expression(),
                                 true, /*isAssertion*/
                             );
-                            set_expression(&self.factory, parent, cast);
+                            set_expression(parent, cast);
                             self.finish_mutated_node(parent);
                             return;
                         }
@@ -748,7 +757,7 @@ impl<'a> Parser<'a> {
                         && tag.type_expression().is_some()
                     {
                         let t = self.add_deep_clone_reparse(tag.type_expression().type_());
-                        set_function_full_signature(&self.factory, fun, t);
+                        set_function_full_signature(fun, t);
                         self.finish_mutated_node(fun);
                     }
                 }
@@ -766,7 +775,7 @@ impl<'a> Parser<'a> {
                                     declaration.initializer(),
                                     false, /*isAssertion*/
                                 );
-                                set_initializer(&self.factory, declaration, cast);
+                                set_initializer(declaration, cast);
                                 self.finish_mutated_node(declaration);
                                 break;
                             }
@@ -780,7 +789,7 @@ impl<'a> Parser<'a> {
                         let t = self.add_deep_clone_reparse(tag.type_expression().type_());
                         let cast =
                             self.make_new_cast(t, parent.initializer(), false /*isAssertion*/);
-                        set_initializer(&self.factory, parent, cast);
+                        set_initializer(parent, cast);
                         self.finish_mutated_node(parent);
                     }
                 }
@@ -789,7 +798,7 @@ impl<'a> Parser<'a> {
                     if initializer.is_some() && tag.type_expression().is_some() {
                         let t = self.add_deep_clone_reparse(tag.type_expression().type_());
                         let cast = self.make_new_cast(t, initializer, false /*isAssertion*/);
-                        let id = self.factory.oid(cast);
+                        let id = node_opt_child_id(parent, cast);
                         mutate(parent, |data| {
                             if let D::ShorthandPropertyAssignment(d) = data {
                                 d.object_assignment_initializer = id;
@@ -805,7 +814,7 @@ impl<'a> Parser<'a> {
                         let t = self.add_deep_clone_reparse(tag.type_expression().type_());
                         let cast =
                             self.make_new_cast(t, parent.expression(), false /*isAssertion*/);
-                        set_expression(&self.factory, parent, cast);
+                        set_expression(parent, cast);
                         self.finish_mutated_node(parent);
                     }
                 }
@@ -817,7 +826,7 @@ impl<'a> Parser<'a> {
                             let t = self.add_deep_clone_reparse(tag.type_expression().type_());
                             let cast =
                                 self.make_new_cast(t, bin.right(), false /*isAssertion*/);
-                            let id = self.factory.id(cast);
+                            let id = node_child_id(bin, cast);
                             mutate(bin, |data| {
                                 if let D::BinaryExpression(d) = data {
                                     d.right = id;
@@ -835,7 +844,7 @@ impl<'a> Parser<'a> {
                     if fun.type_parameter_list().is_nil() && fun.full_signature().is_nil() {
                         let type_parameters =
                             self.gather_type_parameters(js_doc, false /*typedefOrCallback*/);
-                        set_function_type_parameters(&self.factory, fun, type_parameters);
+                        set_function_type_parameters(fun, type_parameters);
                         self.finish_mutated_node(fun);
                     }
                 } else if parent.kind() == SyntaxKind::ClassDeclaration
@@ -845,7 +854,7 @@ impl<'a> Parser<'a> {
                     if parent.type_parameter_list().is_nil() {
                         let type_parameters =
                             self.gather_type_parameters(js_doc, false /*typedefOrCallback*/);
-                        let v = self.factory.opt_list(type_parameters);
+                        let v = node_list_value(parent, type_parameters);
                         mutate(parent, |data| match data {
                             D::ClassDeclaration(d) => d.type_parameters = v,
                             D::ClassExpression(d) => d.type_parameters = v,
@@ -866,13 +875,13 @@ impl<'a> Parser<'a> {
                             let t = self.reparse_js_doc_type_literal(
                                 parameter_tag.type_expression().type_(),
                             );
-                            new_type = Some(self.factory.oid(t));
+                            new_type = Some(node_opt_child_id(param, t));
                         }
                         let mut new_question = None;
                         if param.question_token().is_nil() {
                             let question = self.make_question_if_optional(parameter_tag);
                             if question.is_some() {
-                                new_question = Some(self.factory.oid(question));
+                                new_question = Some(node_opt_child_id(param, question));
                             }
                         }
                         mutate(param, |data| {
@@ -908,7 +917,7 @@ impl<'a> Parser<'a> {
                         );
                         if tag.type_expression().is_some() {
                             let t = self.add_deep_clone_reparse(tag.type_expression().type_());
-                            set_type(&self.factory, this_param, t);
+                            set_type(this_param, t);
                         }
                         self.finish_reparsed_node(this_param, tag.tag_name());
 
@@ -917,7 +926,7 @@ impl<'a> Parser<'a> {
                         new_params.extend(params.iter());
 
                         let list = self.new_node_list(fun.parameter_list().loc(), &new_params);
-                        set_function_parameters(&self.factory, fun, list);
+                        set_function_parameters(fun, list);
                         self.finish_mutated_node(fun);
                     }
                 }
@@ -930,7 +939,7 @@ impl<'a> Parser<'a> {
                     && tag.type_expression().is_some()
                 {
                     let t = self.add_deep_clone_reparse(tag.type_expression().type_());
-                    set_function_type(&self.factory, fun, t);
+                    set_function_type(fun, t);
                     self.finish_mutated_node(fun);
                 }
             }
@@ -985,7 +994,7 @@ impl<'a> Parser<'a> {
                             loc = parent.modifiers().loc();
                         }
                         let list = self.new_modifier_list(loc, &nodes);
-                        set_modifiers(&self.factory, parent, list);
+                        set_modifiers(parent, list);
                         self.finish_mutated_node(parent);
                     }
                     _ => {}
@@ -1009,7 +1018,7 @@ impl<'a> Parser<'a> {
                             let mut types = old_types.nodes().to_vec();
                             types.push(self.add_deep_clone_reparse(class_name));
                             let list = self.factory.new_node_list_with_loc(&types, old_types.loc());
-                            let v = self.factory.req_list(list);
+                            let v = node_req_list_value(implements_clause, list);
                             mutate(implements_clause, |data| {
                                 if let D::HeritageClause(d) = data {
                                     d.types = v;
@@ -1036,7 +1045,7 @@ impl<'a> Parser<'a> {
                         self.factory
                             .new_node_list_with_loc(&clauses, heritage_clauses.loc())
                     };
-                    let v = self.factory.opt_list(new_heritage_clauses);
+                    let v = node_list_value(class, new_heritage_clauses);
                     mutate(class, |data| match data {
                         D::ClassDeclaration(d) => d.heritage_clauses = v,
                         D::ClassExpression(d) => d.heritage_clauses = v,
@@ -1068,7 +1077,7 @@ impl<'a> Parser<'a> {
                                 new_arguments.push(self.add_deep_clone_reparse(arg));
                             }
                             let list = self.new_node_list(source_arguments.loc(), &new_arguments);
-                            let v = self.factory.opt_list(list);
+                            let v = node_list_value(target, list);
                             mutate(target, |data| {
                                 if let D::ExpressionWithTypeArguments(d) = data {
                                     d.type_arguments = v;
@@ -1246,5 +1255,58 @@ fn get_class_like_data(parent: Node) -> Node {
     match parent.kind() {
         SyntaxKind::ClassDeclaration | SyntaxKind::ClassExpression => parent,
         _ => Node::NIL,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::synthetic::{free_synthetic_nodes, free_synthetic_owner, open_synthetic_owner};
+    use crate::core::{GoProgram, enter_program, next_program_id};
+
+    // A data write (`mutate`) on a synthetic node puts the lists of its new
+    // values in the owner of the node, with its new data, not in the current
+    // owner: a base node changed while a program version is current keeps
+    // them after that version is freed. It is the astshrink2 shape of
+    // `set_node_modifiers`; the reparser writes store nodes today, so no run
+    // reaches it.
+    #[test]
+    fn data_writes_put_their_lists_in_the_node_owner() {
+        std::thread::spawn(|| {
+            let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
+                id: next_program_id(),
+                options: Box::leak(Box::default()),
+                state: std::sync::OnceLock::new(),
+            }));
+            let f = NodeFactory::new();
+            let a = f.new_identifier("a");
+            let export = f.new_modifier(SyntaxKind::ExportKeyword);
+            let fun = f.new_function_type_node(NodeList::NIL, f.new_node_list(&[]), Node::NIL);
+            let bin = f.new_binary_expression(
+                ModifierList::NIL,
+                f.new_identifier("x"),
+                Node::NIL,
+                f.new_token(SyntaxKind::EqualsToken),
+                f.new_identifier("y"),
+            );
+            let (parameters, type_parameters) = (f.new_node_list(&[a]), f.new_node_list(&[a]));
+            let modifiers = f.new_modifier_list(&[export]);
+
+            open_synthetic_owner(program.id);
+            {
+                let _program = enter_program(Some(program));
+                set_function_parameters(fun, parameters);
+                set_function_type_parameters(fun, type_parameters);
+                set_modifiers(bin, modifiers);
+            }
+            free_synthetic_owner(program.id);
+
+            assert_eq!(fun.parameter_list().nodes().to_vec(), vec![a]);
+            assert_eq!(fun.type_parameter_list().nodes().to_vec(), vec![a]);
+            assert_eq!(bin.modifiers().nodes().to_vec(), vec![export]);
+            free_synthetic_nodes();
+        })
+        .join()
+        .expect("test thread panicked");
     }
 }

@@ -48,21 +48,22 @@ fn run_global_date(ctx: &mut RuleContext<'_, '_>, check_in_effect: bool) -> Vec<
 
     let mut diags = Vec::new();
     let source_file = ctx.source_file;
-    walk(ctx, check_in_effect, date_symbol, &mut diags, source_file);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in ctx.tp.node_order(source_file).nodes() {
+        visit(ctx, check_in_effect, date_symbol, &mut diags, n);
+    }
 
     diags
 }
 
-fn walk(
+fn visit(
     ctx: &mut RuleContext<'_, '_>,
     check_in_effect: bool,
     date_symbol: SymbolId,
     diags: &mut Vec<Diagnostic>,
     node: Node,
-) -> bool {
-    if node.is_nil() {
-        return false;
-    }
+) {
     let in_effect = ctx
         .tp
         .get_effect_context_flags(node)
@@ -103,7 +104,4 @@ fn walk(
             ));
         }
     }
-
-    node.for_each_child(|n| walk(ctx, check_in_effect, date_symbol, diags, n));
-    false
 }

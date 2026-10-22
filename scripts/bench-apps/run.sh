@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Times a full type check of each app with tsc 6, tsc 7, tsc-rs and bun check (hyperfine, 1 warmup,
+# Times a full type check of each app with tsc 6, tsc 7, tsc-rs, tsc-rs --fast and bun check (hyperfine, 1 warmup,
 # RUNS runs, default 5). Before the timing, one run per tool writes its exit code and errors.
 # usage: scripts/bench-apps/run.sh <work-dir> [app...]   (after setup.sh; default: every app)
 # Output: <work-dir>/results/<app>.json (hyperfine), <app>.errors and <app>.<tool>.diag.
@@ -7,7 +7,7 @@
 # files then get the tools in their name (<app>.tsc-rs.json), and summary.py puts them over the
 # full run's times.
 # Time on a quiet machine: the numbers are noise while something else uses the CPU.
-set -uo pipefail
+set -euo pipefail
 [[ $# -ge 1 ]] || { sed -n '4p' "$0" >&2; exit 2; }
 work=$(cd "$1" && pwd); shift
 # app, repo dir, tsconfig
@@ -20,11 +20,11 @@ trpc-server trpc packages/server/tsconfig.json'
 
 # Native binaries, without the npm launchers. tsc 6 runs out of memory on VS Code and Sentry with
 # Node's default heap.
-RS=$work/node_modules/@tsc-rs/darwin-arm64/lib/tsc
-GO=$work/node_modules/@typescript/typescript-darwin-arm64/lib/tsc
+# shellcheck source=scripts/bench-apps/common.sh
+source "$(cd -- "$(dirname -- "$0")" && pwd)/common.sh"
+bench_tools "$work"
 TS6="node --max-old-space-size=16384 $work/node_modules/ts6/lib/tsc.js"
-BUN=$work/bun-darwin-aarch64/bun
-names=(tsc6 tsc7 tsc-rs bun)
+names=(tsc6 tsc7 tsc-rs tsc-rs-fast bun)
 sel=()
 for i in "${!names[@]}"; do [[ " ${TOOLS:-${names[*]}} " == *" ${names[$i]} "* ]] && sel+=("$i"); done
 tag=${TOOLS:+.${TOOLS// /+}}
@@ -34,16 +34,7 @@ while read -r app dir cfg; do
   [[ $# == 0 || " $* " == *" $app "* ]] || continue
   flags="-p $cfg --noEmit --incremental false"
   cmds=("$TS6 $flags --pretty false" "$GO $flags --pretty false" "$RS $flags --pretty false"
-        "$BUN check $flags --no-pretty --all")
+        "$RS $flags --fast --pretty false" "$BUN check $flags --no-pretty --all")
   cd "$work/repos/$dir"
-  : >"$work/results/$app$tag.errors"
-  for i in "${sel[@]}"; do
-    out=$(${cmds[$i]} 2>&1); rc=$?
-    grep 'error TS' <<<"$out" | sort >"$work/results/$app.${names[$i]}.diag"
-    echo "${names[$i]} rc=$rc errors=$(wc -l <"$work/results/$app.${names[$i]}.diag" | tr -d ' ')" >>"$work/results/$app$tag.errors"
-  done
-  echo "== $app: $(tr '\n' ' ' <"$work/results/$app$tag.errors")"
-  args=()
-  for i in "${sel[@]}"; do args+=(-n "${names[$i]}" "${cmds[$i]}"); done
-  hyperfine -N -i --warmup 1 --runs "${RUNS:-5}" --export-json "$work/results/$app$tag.json" "${args[@]}"
+  bench_measure "$work/results/$app$tag" "${cmds[@]}"
 done <<<"$APPS"

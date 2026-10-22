@@ -1,14 +1,16 @@
 //! Port of typescript-go `internal/binder/binder.go` lines 1-910.
 //!
 //! PORT: Go stores binder output on AST nodes and on `ast.SourceFile`. Here
-//! the AST is immutable, so the binder keeps that output in `Binder`
-//! (`node_bind`, `file_bind`, `flow_nodes`) while it runs, and
-//! `bind_source_file` moves it into the node records (`ast/store.rs`) and
-//! the `GoFile` `OnceCell`s at the end (`BoundFile::install`).
+//! the binder writes the symbol, the added flags and the flow node of a
+//! node into its node record (`ast/store.rs`) while it runs, as Go writes
+//! the node, and keeps the other node fields, `file_bind` and `flow_nodes`
+//! in `Binder` (`NodeBindRecords`). `BoundFile::install` moves those into
+//! the `GoFile` `OnceCell`s at the end.
 //! Binder code must read and write node binder data through the `Binder`
 //! helpers below (`node_symbol`, `set_node_symbol`, `node_flags`,
 //! `get_locals`, `flow`, `flow_mut`, ...), not through `Node::symbol()` and
-//! friends, which only see the data after binding finishes.
+//! friends: before the install a record can hold the ids of the file's own
+//! arena, and the other fields are not in the `GoFile` yet.
 
 use crate::astdata::NodeData;
 use crate::prelude::*;
@@ -65,12 +67,11 @@ pub struct Binder {
 
     /// Rust-only: `Node::file_index` of `file`.
     pub file_index: usize,
-    /// Rust-only: parser flags of `file` (`GoFile::parser_flags`), indexed
-    /// by `NodeId::index()`. Cached so `node_flags` skips the program lookup.
-    /// The guard pins a freeable file version while the binder runs.
-    pub parser_flags: FileRef<[NodeFlags]>,
-    /// Rust-only: binder data per node of `file`, indexed by `NodeId::index()`.
-    pub node_bind: NodeBindBuilder,
+    /// Rust-only: the binder data of the nodes of `file`, in their node
+    /// records (Go writes it into the nodes), indexed by `NodeId::index()`.
+    /// It holds the parser flags of `file`, whose guard pins a freeable
+    /// file version while the binder runs.
+    pub node_bind: NodeBindRecords,
     /// Rust-only: binder fields of `ast.SourceFile` (`BindDiagnostics`,
     /// `EndFlowNode`, `PatternAmbientModules`, `GlobalExports`, ...).
     pub file_bind: FileBindData,
@@ -142,10 +143,11 @@ impl FlowNode {
 //
 // PORT: `getBinder`/`putBinder` (a sync.Pool) are not needed. `symbols` is
 // the program-wide arena; it is moved into the binder and moved back when
-// binding ends. The binder output is stored in the file's `GoFile`
-// `OnceCell`s (Go `file.BindOnce`). A file that is already bound is skipped.
-// The caller publishes what the file added to `symbols` for the checkers'
-// copies (`Lineage::add_file`).
+// binding ends. The binder writes the node records while it binds
+// (`NodeBindRecords`), and the install stores the rest of its output in the
+// file's `GoFile` `OnceCell`s (Go `file.BindOnce`). A file that is already
+// bound is skipped. The caller publishes what the file added to `symbols`
+// for the checkers' copies (`Lineage::add_file`).
 pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
     if crate::ast::go_file(file.file_index())
         .file_bind
@@ -157,135 +159,221 @@ pub fn bind_source_file(file: Node, symbols: &mut SymbolArena) {
     bind_source_file_detached(file, symbols).install();
 }
 
-/// Binder data per node of the file being bound. Most nodes get no data, so
-/// a node keeps a 4-byte slot into `entries`, and `entries[0]` is the empty
-/// data, which is never written. The flow node of a node is kept in `flows`,
-/// not in `entries`. The install writes both into the node records
-/// (`nodes`, `ast::bind_store_records`); `compact` merges them into the
-/// compact form of the lib bind snapshot.
-// PERF: bind C. The binder gives a flow node to every identifier (Go
-// binder.go `bind`), so a flow node in `entries` made a 40-byte entry for
-// each of them. Now it is one 4-byte write.
-#[derive(Default)]
-pub struct NodeBindBuilder {
-    /// Per node, by `NodeId::index()`: index into `entries`, 0 for none.
-    slots: Vec<u32>,
-    entries: Vec<NodeBindData>,
-    /// Per node, by `NodeId::index()`: the low half of its flow node id
-    /// (index + 1), 0 for nil.
-    flows: Vec<u32>,
-    /// The high half of every flow node id of the file: its file index
-    /// (`FlowNodeId::new`).
-    flow_file: u64,
-    /// Nodes that got a flow node, counted when a flow goes from nil to
-    /// set. With `entries` it bounds the nodes that have data.
-    flow_count: usize,
+/// The binder output of the nodes of the file being bound, written while it
+/// binds, as Go writes it into the nodes (binder.go). The symbol, the added
+/// flags and the flow node of a node go into its node record (`records`,
+/// `ast::BindRecords`). The other fields of a node (local symbol, locals,
+/// next container, end and return flow node) go into an extras entry, made
+/// on the first write of one of them; the `bind` word of its record then
+/// holds the index + 1 of the entry with `ast::BIND_EXTRA`, and the entry
+/// holds its flow node (the layout of `ast::bind_store_records`). The
+/// binder reads them back from there, as Go reads the node.
+///
+/// A bind into a new arena (`bind_source_file_detached` from a parallel or
+/// `--singleThreaded` bind) writes the ids of that arena. `symbol_slots`
+/// lists the slots whose record got a symbol, so `BoundFile::remap` moves
+/// only those.
+///
+/// Until the install, a drop resets the records of the file
+/// (`BindRecords::reset`): a panic in the bind, or a bind that
+/// `program::bind_files_parallel` drops (it made thread-local state, or a
+/// file before it failed). A later bind of the file then finds the records
+/// as the parse left them.
+// PERF: bindonce2. R214 kept this data in two zeroed u32 per node and a
+// 48-byte entry per node with data (`NodeBindBuilder`), and the install
+// walked every slot to write the records: 7.1% of VS Code st bind cycles
+// (perfscan5).
+pub struct NodeBindRecords {
+    file: usize,
+    records: crate::ast::BindRecords,
+    /// The parser flags of the file (`GoFile::parser_flags`), which
+    /// `remove_node_flags` and the reset keep. The guard pins a freeable
+    /// file version until the install or the reset.
+    parser_flags: FileRef<[NodeFlags]>,
+    extras: Vec<NodeBindExtra>,
+    symbol_slots: Vec<u32>,
+    /// True from the start of the bind to the install.
+    pending: bool,
 }
 
-impl NodeBindBuilder {
-    /// A builder for the `node_count` nodes of file `file_index`, with room
-    /// for `entries` entries before the first copy.
-    #[must_use]
-    pub fn new(file_index: usize, node_count: usize, entries: usize) -> Self {
-        let mut data = Vec::with_capacity(entries.max(1));
-        data.push(NodeBindData::default());
-        // PERF: `zeroed_vec`, as `get_mut` and `set_flow_node` read a slot
-        // before they write it.
-        NodeBindBuilder {
-            slots: zeroed_vec(node_count),
-            entries: data,
-            flows: zeroed_vec(node_count),
-            flow_file: (file_index as u64) << 32,
-            flow_count: 0,
+impl Default for NodeBindRecords {
+    fn default() -> Self {
+        NodeBindRecords {
+            file: 0,
+            records: crate::ast::BindRecords::default(),
+            parser_flags: FileRef::Static(&[]),
+            extras: Vec::new(),
+            symbol_slots: Vec::new(),
+            pending: false,
+        }
+    }
+}
+
+impl Drop for NodeBindRecords {
+    fn drop(&mut self) {
+        if self.pending {
+            self.records.reset(&self.parser_flags);
+        }
+    }
+}
+
+impl NodeBindRecords {
+    /// The records of published file `file`, whose parser flags are
+    /// `parser_flags`, for a bind. Panics when the file has binder output:
+    /// the bind would write over it.
+    fn start(file: usize, parser_flags: FileRef<[NodeFlags]>) -> Self {
+        assert!(
+            crate::ast::go_file(file).node_bind.get().is_none(),
+            "file already bound"
+        );
+        let records = crate::ast::bind_records(file);
+        debug_assert_eq!(records.len(), parser_flags.len());
+        let slots = records.len();
+        NodeBindRecords {
+            file,
+            records,
+            parser_flags,
+            // About one node in 16 has extras (locals containers, exported
+            // declarations, function-like nodes) and one in 8 a symbol, so
+            // the lists do not grow by doubling. Capacity only.
+            extras: Vec::with_capacity(slots / 16 + 1),
+            symbol_slots: Vec::with_capacity(slots / 8 + 1),
+            pending: true,
         }
     }
 
-    /// The data of node `index` (`NodeId::index()`), without its flow node.
-    /// Binder code never reads a flow node back from a node.
+    /// Go `node.Symbol()` of node `index` (`NodeId::index()`).
     #[inline]
-    #[must_use]
-    pub fn get(&self, index: usize) -> &NodeBindData {
-        &self.entries[self.slots[index] as usize]
+    fn symbol(&self, index: usize) -> SymbolId {
+        self.records.symbol(index)
     }
 
-    /// The data of node `index`, made on first write. Set the flow node
-    /// with `set_flow_node`, not through this reference.
+    /// Go `node.DeclarationData().Symbol = symbol`.
     #[inline]
-    pub fn get_mut(&mut self, index: usize) -> &mut NodeBindData {
-        let mut slot = self.slots[index];
-        if slot == 0 {
-            slot = u32::try_from(self.entries.len()).expect("node bind overflow");
-            self.entries.push(NodeBindData::default());
-            self.slots[index] = slot;
+    fn set_symbol(&mut self, index: usize, symbol: SymbolId) {
+        // A slot that went from a symbol back to nil and on to a new one
+        // would be listed twice and move twice. The binder never writes nil.
+        assert!(symbol.is_some(), "binder wrote a nil symbol");
+        if self.records.set_symbol(index, symbol) {
+            self.symbol_slots
+                .push(u32::try_from(index).expect("slot index"));
         }
-        &mut self.entries[slot as usize]
+    }
+
+    /// The extras entry of node `index`, or `None` for a node with none.
+    #[inline]
+    fn extra(&self, index: usize) -> Option<&NodeBindExtra> {
+        let word = self.records.bind_word(index);
+        (word & crate::ast::BIND_EXTRA != 0)
+            .then(|| &self.extras[(word & !crate::ast::BIND_EXTRA) as usize - 1])
+    }
+
+    /// Runs `write` on the extras entry of node `index`, made with the
+    /// flow node of its record on first use. A nil value (`nil`) makes no
+    /// entry: R214 made one only for a node with a field that is not nil.
+    fn write_extra(&mut self, index: usize, nil: bool, write: impl FnOnce(&mut NodeBindExtra)) {
+        let word = self.records.bind_word(index);
+        let entry = if word & crate::ast::BIND_EXTRA != 0 {
+            (word & !crate::ast::BIND_EXTRA) as usize - 1
+        } else if nil {
+            return;
+        } else {
+            let flow_node = if word == 0 {
+                FlowNodeId::NIL
+            } else {
+                FlowNodeId(((self.file as u64) << 32) | u64::from(word))
+            };
+            self.extras.push(NodeBindExtra {
+                flow_node,
+                ..NodeBindExtra::NONE
+            });
+            let extra = u32::try_from(self.extras.len()).expect("binder extras");
+            assert_eq!(extra & crate::ast::BIND_EXTRA, 0, "binder extras");
+            self.records
+                .set_bind_word(index, crate::ast::BIND_EXTRA | extra);
+            self.extras.len() - 1
+        };
+        write(&mut self.extras[entry]);
     }
 
     /// Go `node.FlowNodeData().FlowNode = flow` for node `index`.
     #[inline]
     pub fn set_flow_node(&mut self, index: usize, flow: FlowNodeId) {
         debug_assert!(
-            flow.is_nil() || (flow.0 & !0xffff_ffff) == self.flow_file,
+            flow.is_nil() || flow.file_index() == self.file,
             "flow node from another file"
         );
-        let low = flow.0 as u32;
-        let old = std::mem::replace(&mut self.flows[index], low);
-        self.flow_count += usize::from(old == 0 && low != 0);
+        let word = self.records.bind_word(index);
+        if word & crate::ast::BIND_EXTRA != 0 {
+            self.extras[(word & !crate::ast::BIND_EXTRA) as usize - 1].flow_node = flow;
+        } else {
+            // `bind_source_file_live` checks the flow node count.
+            debug_assert_eq!(flow.0 as u32 & crate::ast::BIND_EXTRA, 0);
+            self.records.set_bind_word(index, flow.0 as u32);
+        }
     }
 
-    /// Each node that has data or a flow node, in node order: its
-    /// `NodeId::index()`, the index of its entry in `entries`, the data
-    /// (`None` for a node with only a flow node) and the flow node.
-    fn nodes(&self) -> impl Iterator<Item = (usize, usize, Option<&NodeBindData>, FlowNodeId)> {
-        let flow_file = self.flow_file;
-        self.slots
-            .iter()
-            .zip(&self.flows)
-            .enumerate()
-            .filter(|&(_, (&slot, &flow))| slot | flow != 0)
-            .map(move |(index, (&slot, &flow))| {
-                let flow = if flow == 0 {
-                    FlowNodeId::NIL
-                } else {
-                    FlowNodeId(flow_file | u64::from(flow))
-                };
-                let data = (slot != 0).then(|| &self.entries[slot as usize]);
-                (index, slot as usize, data, flow)
-            })
+    /// Moves the ids of a bind into a new arena to their place in the
+    /// program arena (`BoundFile::remap`): the symbols of the records that
+    /// got one, and the ids in the extras.
+    fn remap(&mut self, offsets: ArenaOffsets) {
+        self.records
+            .map_symbols(&self.symbol_slots, |symbol| offsets.symbol(symbol));
+        for extra in &mut self.extras {
+            extra.local_symbol = offsets.symbol(extra.local_symbol);
+            extra.locals = offsets.table(extra.locals);
+        }
     }
 
-    /// The compact form of the data, in node order.
+    /// Ends the bind for the install: the records stay, and the extras go to
+    /// the file's `FileNodeBind`.
+    fn finish(mut self) -> Vec<NodeBindExtra> {
+        self.pending = false;
+        std::mem::take(&mut self.extras)
+    }
+
+    /// The compact form of the data, as the lib bind snapshot keeps it: the
+    /// data of each node read back from its record and extras entry. The
+    /// added flags are the record flags that are not parser flags.
     fn compact(&self) -> NodeBindParts {
-        debug_assert!(
-            self.entries.iter().all(|data| data.flow_node.is_nil()),
-            "flow node written outside set_flow_node"
-        );
-        let entries = &self.entries;
-        let flow_file = self.flow_file;
-        let nodes = self.slots.iter().zip(&self.flows).map(|(&slot, &flow)| {
-            if slot == 0 && flow == 0 {
-                return None;
-            }
-            let mut data = entries[slot as usize];
-            if flow != 0 {
-                data.flow_node = FlowNodeId(flow_file | u64::from(flow));
-            }
-            Some(data)
+        let flow_file = (self.file as u64) << 32;
+        let nodes = (0..self.records.len()).map(|index| {
+            let (symbol, flags, word) = self.records.node_fields(index)?;
+            let added_flags = flags.without(self.parser_flags[index]);
+            let data = match self.extra(index) {
+                Some(extra) => NodeBindData {
+                    symbol,
+                    local_symbol: extra.local_symbol,
+                    locals: extra.locals,
+                    next_container: extra.next_container,
+                    flow_node: extra.flow_node,
+                    end_flow_node: extra.end_flow_node,
+                    return_flow_node: extra.return_flow_node,
+                    added_flags,
+                },
+                None => NodeBindData {
+                    symbol,
+                    flow_node: if word == 0 {
+                        FlowNodeId::NIL
+                    } else {
+                        FlowNodeId(flow_file | u64::from(word))
+                    },
+                    added_flags,
+                    ..NodeBindData::default()
+                },
+            };
+            (data != NodeBindData::default()).then_some(data)
         });
-        NodeBindParts::new(nodes, entries.len() - 1 + self.flow_count)
+        NodeBindParts::new(nodes, self.records.len())
     }
 }
 
 /// The binder data of the nodes of one file as the bind hands it over
-/// (`BoundFile`): the builder of a live bind, or the compact form that the
-/// lib bind snapshot keeps. The install writes either into the node records
-/// (`ast::bind_store_records`).
-// PERF: AST node records, step 2. A live bind hands over its builder: a
-// compact form made on the bind thread would be read again by the install,
-// and the compaction (`NodeBindParts::new`) was about 0.35% of the
-// instructions of `goport -p` on effect.
+/// (`BoundFile`): the records that a live bind wrote, or the compact form
+/// that the lib bind snapshot keeps, which the install writes into the
+/// node records (`ast::bind_store_records`).
 pub enum BoundNodes {
-    Built(NodeBindBuilder),
+    Written(NodeBindRecords),
     Parts(NodeBindParts),
 }
 
@@ -294,30 +382,8 @@ impl BoundNodes {
     #[must_use]
     pub fn compact(&self) -> std::borrow::Cow<'_, NodeBindParts> {
         match self {
-            BoundNodes::Built(builder) => std::borrow::Cow::Owned(builder.compact()),
+            BoundNodes::Written(nodes) => std::borrow::Cow::Owned(nodes.compact()),
             BoundNodes::Parts(parts) => std::borrow::Cow::Borrowed(parts),
-        }
-    }
-
-    /// The data entries, for remapping ids in place (`BoundFile::remap`).
-    fn entries_mut(&mut self) -> &mut [NodeBindData] {
-        match self {
-            BoundNodes::Built(builder) => &mut builder.entries,
-            BoundNodes::Parts(parts) => parts.entries_mut(),
-        }
-    }
-
-    /// Writes the data into the node records of published file `file` and
-    /// gives the extras (`ast::bind_store_records`).
-    fn write_records(&self, file: usize) -> Vec<NodeBindExtra> {
-        match self {
-            BoundNodes::Built(builder) => crate::ast::bind_store_records(file, builder.nodes()),
-            BoundNodes::Parts(parts) => crate::ast::bind_store_records(
-                file,
-                parts
-                    .nodes()
-                    .map(|(index, entry, data)| (index, entry, Some(data), data.flow_node)),
-            ),
         }
     }
 }
@@ -352,17 +418,14 @@ pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile
         crate::ast::file_version::go_file_ref!(file_index, 0, |g, _key| g.parser_flags[..]);
     let node_count = parser_flags.len();
     // PERF: U1 (e). A store file has counts from its slot kinds, made when
-    // it was frozen, so the flow nodes grow with no copy. Its entry count
-    // also counts one entry per identifier flow node, which bind C keeps in
-    // `NodeBindBuilder::flows`, so the entries are sized from the node
-    // count. Capacity only: the output does not change.
+    // it was frozen, so the flow nodes grow with no copy. Capacity only:
+    // the output does not change.
     let flow_nodes = match frozen_store_bind_estimate(file_index) {
-        Some((_, flow_nodes)) => Vec::with_capacity(flow_nodes),
+        Some(flow_nodes) => Vec::with_capacity(flow_nodes),
         None => Vec::new(),
     };
-    // About one node in four gets data other than a flow node (a
-    // declaration, a container or a flagged node).
-    let node_bind = NodeBindBuilder::new(file_index, node_count, node_count / 4 + 1);
+    // From here a panic resets the records of the file (`NodeBindRecords`).
+    let node_bind = NodeBindRecords::start(file_index, parser_flags);
     // PERF: bind D. About one symbol per 8 nodes and one table per 16 (lib
     // files have more), so the first arena chunk does not grow by doubling.
     // Capacity only.
@@ -370,7 +433,6 @@ pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile
     let mut b = Binder {
         file,
         file_index,
-        parser_flags,
         symbols: std::mem::take(symbols),
         node_bind,
         flow_nodes,
@@ -390,13 +452,15 @@ pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile
         flow_nodes,
         ..
     } = b;
-    debug_assert!(
-        node_bind.entries.iter().all(|data| data.flow_node.is_nil()),
-        "flow node written outside set_flow_node"
+    // A record's `bind` word holds the low half of a flow node id, without
+    // `BIND_EXTRA` (R214 checked each record at the install).
+    assert!(
+        flow_nodes.len() < crate::ast::BIND_EXTRA as usize,
+        "too many flow nodes in file {file_index}"
     );
     BoundFile {
         file,
-        node_bind: BoundNodes::Built(node_bind),
+        node_bind: BoundNodes::Written(node_bind),
         flow_nodes,
         file_bind,
     }
@@ -404,10 +468,11 @@ pub fn bind_source_file_live(file: Node, symbols: &mut SymbolArena) -> BoundFile
 
 impl BoundFile {
     /// Stores the output in the file's `GoFile` `OnceLock`s (Go
-    /// `file.BindOnce`). AST node records, step 2: first writes the symbol,
-    /// the flow node and the added flags of each node into its record
-    /// (`ast::bind_store_records`); the other fields go into the
-    /// `FileNodeBind` of the file. The ids must be program ids already
+    /// `file.BindOnce`). A live bind wrote the node records already
+    /// (`NodeBindRecords`), so this moves its extras into the
+    /// `FileNodeBind` of the file. A lib snapshot load writes the symbol,
+    /// the flow node and the added flags of each node into its record here
+    /// (`ast::bind_store_records`). The ids must be program ids already
     /// (`remap`). A parallel bind installs each file on its bind thread, as
     /// Go's `BindSourceFile` stores the output in the file on the goroutine
     /// that binds it (`program::bind_files_parallel`).
@@ -415,7 +480,15 @@ impl BoundFile {
         let file = self.file.file_index();
         let go_file = crate::ast::go_file(file);
         assert!(go_file.node_bind.get().is_none(), "file already bound");
-        let extras = self.node_bind.write_records(file);
+        let extras = match self.node_bind {
+            BoundNodes::Written(nodes) => nodes.finish(),
+            BoundNodes::Parts(parts) => crate::ast::bind_store_records(
+                file,
+                parts
+                    .nodes()
+                    .map(|(index, entry, data)| (index, entry, Some(data), data.flow_node)),
+            ),
+        };
         assert!(
             go_file.node_bind.set(FileNodeBind::new(extras)).is_ok(),
             "file already bound"
@@ -434,11 +507,15 @@ impl BoundFile {
     /// arena to their place in the program arena (see
     /// `SymbolArena::append_file_arena`).
     pub fn remap(&mut self, offsets: ArenaOffsets) {
-        // A live bind remaps its entry 0 (the empty data) too: nil stays nil.
-        for data in self.node_bind.entries_mut() {
-            data.symbol = offsets.symbol(data.symbol);
-            data.local_symbol = offsets.symbol(data.local_symbol);
-            data.locals = offsets.table(data.locals);
+        match &mut self.node_bind {
+            BoundNodes::Written(nodes) => nodes.remap(offsets),
+            BoundNodes::Parts(parts) => {
+                for data in parts.entries_mut() {
+                    data.symbol = offsets.symbol(data.symbol);
+                    data.local_symbol = offsets.symbol(data.local_symbol);
+                    data.locals = offsets.table(data.locals);
+                }
+            }
         }
         let file_bind = &mut self.file_bind;
         file_bind.global_exports = offsets.table(file_bind.global_exports);
@@ -461,69 +538,92 @@ impl Binder {
         self.symbols.sym_mut(symbol)
     }
 
-    /// Binder data of a node in the file being bound.
-    pub fn node_data(&self, node: Node) -> &NodeBindData {
+    /// `NodeId::index()` of `node`, a node of the file being bound.
+    #[inline]
+    fn bind_index(&self, node: Node) -> usize {
         debug_assert!(node.is_some(), "nil node dereference");
         debug_assert_eq!(node.file_index(), self.file_index, "node from another file");
-        self.node_bind.get(node.node_id().index())
-    }
-
-    /// Mutable binder data of a node in the file being bound.
-    pub fn node_data_mut(&mut self, node: Node) -> &mut NodeBindData {
-        debug_assert!(node.is_some(), "nil node dereference");
-        debug_assert_eq!(node.file_index(), self.file_index, "node from another file");
-        self.node_bind.get_mut(node.node_id().index())
+        node.node_id().index()
     }
 
     /// Go `node.Symbol()` while binding.
+    #[inline]
     pub fn node_symbol(&self, node: Node) -> SymbolId {
-        self.node_data(node).symbol
+        self.node_bind.symbol(self.bind_index(node))
     }
 
     /// Go `node.DeclarationData().Symbol = symbol`.
+    #[inline]
     pub fn set_node_symbol(&mut self, node: Node, symbol: SymbolId) {
-        self.node_data_mut(node).symbol = symbol;
+        let index = self.bind_index(node);
+        self.node_bind.set_symbol(index, symbol);
     }
 
     /// Go `node.LocalSymbol()` while binding.
     pub fn node_local_symbol(&self, node: Node) -> SymbolId {
-        self.node_data(node).local_symbol
+        let index = self.bind_index(node);
+        self.node_bind
+            .extra(index)
+            .map_or(SymbolId::NIL, |extra| extra.local_symbol)
     }
 
     /// Go `node.ExportableData().LocalSymbol = symbol`.
     pub fn set_node_local_symbol(&mut self, node: Node, symbol: SymbolId) {
-        self.node_data_mut(node).local_symbol = symbol;
+        let index = self.bind_index(node);
+        self.node_bind
+            .write_extra(index, symbol.is_nil(), |extra| extra.local_symbol = symbol);
     }
 
     /// Go `node.Locals()` while binding (nil when not created).
     pub fn node_locals(&self, node: Node) -> SymbolTable {
-        self.node_data(node).locals
+        let index = self.bind_index(node);
+        self.node_bind
+            .extra(index)
+            .map_or(SymbolTable::NIL, |extra| extra.locals)
     }
 
     /// Go `node.LocalsContainerData().Locals = locals`.
     pub fn set_node_locals(&mut self, node: Node, locals: SymbolTable) {
         // U1 (d): `Node::locals` reads nil for other kinds.
         debug_assert!(is_locals_container(node), "locals on a {:?}", node.kind());
-        self.node_data_mut(node).locals = locals;
+        let index = self.bind_index(node);
+        self.node_bind
+            .write_extra(index, locals.is_nil(), |extra| extra.locals = locals);
     }
 
     /// Go `ast.GetLocals(container)`: creates the locals table on first use.
     pub fn get_locals(&mut self, container: Node) -> SymbolTable {
-        let locals = self.node_data(container).locals;
+        let locals = self.node_locals(container);
         if locals.is_some() {
             return locals;
         }
         let locals = self
             .symbols
             .new_table_with_capacity(locals_size_hint(container));
-        // U1 (d): `Node::locals` reads nil for other kinds.
-        debug_assert!(
-            is_locals_container(container),
-            "locals on a {:?}",
-            container.kind()
-        );
-        self.node_data_mut(container).locals = locals;
+        self.set_node_locals(container, locals);
         locals
+    }
+
+    /// Go `LocalsContainerData().NextContainer = next`.
+    pub fn set_next_container(&mut self, container: Node, next: Node) {
+        let index = self.bind_index(container);
+        self.node_bind
+            .write_extra(index, next.is_nil(), |extra| extra.next_container = next);
+    }
+
+    /// Go `bodyData.EndFlowNode = flow` of a function-like or module node.
+    pub fn set_end_flow_node(&mut self, node: Node, flow: FlowNodeId) {
+        let index = self.bind_index(node);
+        self.node_bind
+            .write_extra(index, flow.is_nil(), |extra| extra.end_flow_node = flow);
+    }
+
+    /// Go `ReturnFlowNode = flow` of a constructor, function or class
+    /// static block (`set_return_flow_node` checks the kind).
+    pub fn set_node_return_flow_node(&mut self, node: Node, flow: FlowNodeId) {
+        let index = self.bind_index(node);
+        self.node_bind
+            .write_extra(index, flow.is_nil(), |extra| extra.return_flow_node = flow);
     }
 
     /// Go `ast.GetMembers(symbol)` where `symbol` is the symbol of
@@ -562,12 +662,12 @@ impl Binder {
         self.file_bind.global_exports
     }
 
-    /// Go `node.Flags` while binding: parser flags plus binder-added flags.
+    /// Go `node.Flags` while binding: parser flags plus the flags that the
+    /// binder added so far, from the node record (`NodeBindRecords`).
     #[inline]
     pub fn node_flags(&self, node: Node) -> NodeFlags {
         debug_assert_eq!(node.file_index(), self.file_index, "node from another file");
-        let index = node.node_id().index();
-        self.parser_flags[index] | self.node_bind.get(index).added_flags
+        self.node_bind.records.flags(node.node_id().index())
     }
 
     /// Go `node.AsBinaryExpression()` of BinaryExpression `node` of `file`,
@@ -582,19 +682,22 @@ impl Binder {
         BinaryView::with_ids(node, self.frozen_ids)
     }
 
-    /// Go `node.Flags |= flags`.
+    /// Go `node.Flags |= flags`. `flags` must be in `BINDER_ADDED_FLAGS`.
+    #[inline]
     pub fn add_node_flags(&mut self, node: Node, flags: NodeFlags) {
-        let data = self.node_data_mut(node);
-        data.added_flags = data.added_flags | flags;
+        let index = self.bind_index(node);
+        self.node_bind.records.add_flags(index, flags);
     }
 
     /// Go `node.Flags &^= flags`.
     ///
-    /// PORT: only binder-added bits can be cleared. The binder only clears
-    /// flags it sets itself (`ExportContext`, ...), so this matches Go.
+    /// PORT: only binder-added bits can be cleared: a parser flag stays.
+    /// The binder only clears flags it sets itself (`ExportContext`, ...),
+    /// so this matches Go.
     pub fn remove_node_flags(&mut self, node: Node, flags: NodeFlags) {
-        let data = self.node_data_mut(node);
-        data.added_flags = data.added_flags.without(flags);
+        let index = self.bind_index(node);
+        let clear = flags.without(self.node_bind.parser_flags[index]);
+        self.node_bind.records.clear_flags(index, clear);
     }
 
     /// Go `*ast.FlowNode` field reads.
@@ -682,15 +785,21 @@ impl Binder {
         // order are the same as Go's.
         let data = parsed_node_data(node);
         debug_assert!(is_computed_name || !has_dynamic_name_in(node, data));
+        // PERF: parsefast1 item 2. The kind is read once (Go reads `Kind`).
+        let kind = node.kind();
+        // Go `ast.IsExportSpecifier(node)` (binder.go:153), inline. Its kind
+        // at pin fed0bf24149f:
+        // Go: ast/ast_generated.go:2954 IsExportSpecifier
         let is_default_export = has_syntactic_modifier_in(node, data, ModifierFlags::DEFAULT)
-            || is_export_specifier(node) && module_export_name_is_default(node.name_in(data));
+            || kind == SyntaxKind::ExportSpecifier
+                && module_export_name_is_default(node.name_in(data));
         // The exported symbol for an export default function/class node is always named "default"
         let name: Name = if is_computed_name {
             Name::from(INTERNAL_SYMBOL_NAME_COMPUTED)
         } else if is_default_export && parent.is_some() {
             Name::from(INTERNAL_SYMBOL_NAME_DEFAULT)
         } else {
-            self.get_declaration_name_in(node, data)
+            self.get_declaration_name_of_kind(node, kind, data)
         };
         let mut symbol: SymbolId;
         if name == INTERNAL_SYMBOL_NAME_MISSING {
@@ -725,11 +834,17 @@ impl Binder {
             let (found, slot) = self.symbols.get_slot(symbol_table, &name);
             symbol = found;
             if symbol.is_nil() {
-                symbol = self.new_symbol(SymbolFlags::NONE, name);
+                // Go `newSymbol(SymbolFlagsNone, name)`, the table write, the
+                // `SymbolFlagsReplaceableByMethod` flag, `addDeclarationToSymbol`
+                // and the parent write below, in one symbol write.
+                let flags = if is_replaceable_by_method {
+                    SymbolFlags::REPLACEABLE_BY_METHOD
+                } else {
+                    SymbolFlags::NONE
+                };
+                symbol = self.new_declared_symbol(name, flags, node, includes, parent);
                 self.symbols.set_slot(slot, symbol);
-                if is_replaceable_by_method {
-                    self.sym_mut(symbol).flags |= SymbolFlags::REPLACEABLE_BY_METHOD;
-                }
+                return symbol;
             } else if is_replaceable_by_method
                 && !self
                     .sym(symbol)
@@ -892,7 +1007,21 @@ impl Binder {
     /// `get_declaration_name` on `d`, the data of `node` that the caller
     /// already loaded with `parsed_node_data` (query Q7-3). It holds the body.
     pub fn get_declaration_name_in(&mut self, node: Node, d: LoadedData) -> Name {
-        if is_export_assignment(node) {
+        self.get_declaration_name_of_kind(node, node.kind(), d)
+    }
+
+    /// `get_declaration_name_in` for a caller that already read `node.kind()`
+    /// (`kind`).
+    // PERF: parsefast1 item 2. The node kind and the name kind are each read
+    // once, as Go reads its `Kind` fields (a port kind read goes through
+    // the node store).
+    pub fn get_declaration_name_of_kind(
+        &mut self,
+        node: Node,
+        kind: SyntaxKind,
+        d: LoadedData,
+    ) -> Name {
+        if kind == SyntaxKind::ExportAssignment {
             return if node.is_export_equals() {
                 Name::from(INTERNAL_SYMBOL_NAME_EXPORT_EQUALS)
             } else {
@@ -901,7 +1030,14 @@ impl Binder {
         }
         let name = get_name_of_declaration_in(node, d);
         if name.is_some() {
-            if is_ambient_module(node) {
+            let name_kind = name.kind();
+            // Go `ast.IsAmbientModule(node)` (binder.go:306), inline: the
+            // name of a module declaration is `name`. Its kinds at pin
+            // fed0bf24149f:
+            // Go: ast/utilities.go:1658 IsAmbientModule
+            if kind == SyntaxKind::ModuleDeclaration
+                && (name_kind == SyntaxKind::StringLiteral || is_global_scope_augmentation(node))
+            {
                 let module_name = name.text();
                 if is_global_scope_augmentation(node) {
                     return Name::from(INTERNAL_SYMBOL_NAME_GLOBAL);
@@ -918,7 +1054,7 @@ impl Binder {
                 }
                 return Name::from(format!("\"{module_name}\""));
             }
-            if is_private_identifier(name) {
+            if name_kind == SyntaxKind::PrivateIdentifier {
                 // containingClass exists because private names only allowed inside classes
                 let containing_class = get_containing_class(node);
                 if containing_class.is_nil() {
@@ -926,22 +1062,32 @@ impl Binder {
                     return Name::from(INTERNAL_SYMBOL_NAME_MISSING);
                 }
                 let private_name = Name::from(get_symbol_name_for_private_identifier(
-                    &self.symbols,
-                    self.node_symbol(containing_class),
+                    containing_class,
                     name.text(),
                 ));
                 self.symbols.note_private_name(&private_name);
                 return private_name;
             }
-            if is_property_name_literal(name) || is_jsx_namespaced_name(name) {
+            // Go `ast.IsPropertyNameLiteral(name) || ast.IsJsxNamespacedName(name)`
+            // (binder.go:327), inline. Their kinds at pin fed0bf24149f:
+            // Go: ast/utilities.go:260 IsPropertyNameLiteral
+            // Go: ast/ast_generated.go:6468 IsJsxNamespacedName
+            if matches!(
+                name_kind,
+                SyntaxKind::Identifier
+                    | SyntaxKind::StringLiteral
+                    | SyntaxKind::NoSubstitutionTemplateLiteral
+                    | SyntaxKind::NumericLiteral
+                    | SyntaxKind::JsxNamespacedName
+            ) {
                 // PERF: U1 (a). An identifier name reads the name interned at
                 // parse (`Node::text_name`), with no text load and no intern.
-                if is_identifier(name) {
+                if name_kind == SyntaxKind::Identifier {
                     return name.text_name();
                 }
                 return Name::from(name.text());
             }
-            if is_computed_property_name(name) {
+            if name_kind == SyntaxKind::ComputedPropertyName {
                 let name_expression = name.expression();
                 // treat computed property names where expression is string/numeric literal as just string/numeric literal
                 if is_string_or_numeric_literal_like(name_expression) {
@@ -958,7 +1104,7 @@ impl Binder {
             }
             return Name::from(INTERNAL_SYMBOL_NAME_MISSING);
         }
-        match node.kind() {
+        match kind {
             SyntaxKind::Constructor => return Name::from(INTERNAL_SYMBOL_NAME_CONSTRUCTOR),
             SyntaxKind::FunctionType | SyntaxKind::CallSignature => {
                 return Name::from(INTERNAL_SYMBOL_NAME_CALL);
@@ -992,33 +1138,87 @@ impl Binder {
 
 // Go: binder/binder.go:374 GetSymbolNameForPrivateIdentifier
 //
-// PORT: Go `ast.GetSymbolId` hands out lazy global ids. Here the arena index
-// is the symbol id. It is stable because every checker arena starts as a
-// clone of the binder arena, and it is unique, which is all the name needs
-// inside the process. Go binds files in parallel, and each file into its own
-// arena here, so a bind cannot give the Go id. Where Go shows `symbol.Name`
-// outside the process (the API), `go_symbol_name` puts the id back.
-pub fn get_symbol_name_for_private_identifier(
+// PORT: Go puts `ast.GetSymbolId(containingClassSymbol)`, a lazy global id,
+// in the name. Here the number is the key of the class node
+// (`private_name_key`), so the binder and the checker give the class the
+// same names, and `go_symbol_name` puts the Go id back where Go shows
+// `symbol.Name` outside the process (the API). The binder passes the
+// containing class node; the checker passes the class symbol
+// (`get_symbol_name_for_private_identifier_of_symbol`).
+// PORT: edleak1. The number was the arena index of the class symbol, so
+// each bind of an edited file (a new class symbol) interned new names, and
+// the process-wide interner never frees them (query-core: about 4 KiB per
+// edit, from 24 private members). Go frees them with the file.
+#[must_use]
+pub fn get_symbol_name_for_private_identifier(containing_class: Node, description: &str) -> String {
+    format!(
+        "{}#{}@{}",
+        INTERNAL_SYMBOL_NAME_PREFIX,
+        private_name_key(containing_class),
+        description
+    )
+}
+
+/// Rust-only (edleak1): the number in the private names of class-like node
+/// `class` (`get_symbol_name_for_private_identifier`). It is unique among
+/// the classes of a program: the hash of the file name in the high bits,
+/// and the store handle of the class name (of the class node when it has
+/// none) in the low 32 bits. The next version of an edited file gives the
+/// same class the same key when the edit adds or removes no node before its
+/// name (a node gets its handle when the parser makes it, and a class node
+/// after its members), so its names are interned again only then. The key
+/// is at least 2^32, above every symbol id
+/// (`get_symbol_name_for_private_identifier_of_symbol`).
+// PORT: a hash of the file name, not an id, so the key needs no shared
+// table: two file names with one 64-bit hash and one handle would share
+// names.
+#[must_use]
+pub fn private_name_key(class: Node) -> u128 {
+    let name = class.name();
+    let identity = if name.is_some() { name } else { class };
+    let file = source_file_file_name(get_source_file_of_node(class));
+    let file_hash = xxhash_rust::xxh3::xxh3_64(file.as_bytes());
+    ((u128::from(file_hash) + 1) << 32) | u128::from(identity.0 as u32)
+}
+
+/// Go `GetSymbolNameForPrivateIdentifier(containingClassSymbol, description)`
+/// for the checker, which has the symbol. A symbol that a class-like node
+/// declares (`node.symbol()`, the binder symbol) gets the names that the
+/// binder gave its members. Any other symbol (an interface, a merged copy
+/// of a class) gets its id as the number: Go's id of such a symbol differs
+/// from the class's too, so no member of the class matches, and an id is
+/// below 2^32, so it matches no class key.
+#[must_use]
+pub fn get_symbol_name_for_private_identifier_of_symbol(
     symbols: &SymbolArena,
     containing_class_symbol: SymbolId,
     description: &str,
 ) -> String {
-    let _ = symbols;
-    format!(
-        "{}#{}@{}",
-        INTERNAL_SYMBOL_NAME_PREFIX, containing_class_symbol.0, description
-    )
+    let class = symbols
+        .sym(containing_class_symbol)
+        .declarations
+        .iter()
+        .copied()
+        .find(|&declaration| {
+            is_class_like(declaration) && declaration.symbol() == containing_class_symbol
+        });
+    match class {
+        Some(class) => get_symbol_name_for_private_identifier(class, description),
+        None => format!(
+            "{}#{}@{}",
+            INTERNAL_SYMBOL_NAME_PREFIX, containing_class_symbol.0, description
+        ),
+    }
 }
 
 /// Rust-only: the text of Go `symbol.Name` for `symbol`, as the API returns
 /// it (Go api/session.go:75 `newSymbolResponse`). A private identifier name
-/// holds the arena index of its class
-/// (`get_symbol_name_for_private_identifier`). Go holds `ast.GetSymbolId` of
-/// the class there, which is also the API handle of the class (Go
-/// api/proto.go:40 `SymbolHandle`). This returns the name with that id
-/// (`get_symbol_id`). Other names come back as they are. Only a symbol that
-/// a private identifier declares has such a name, as in
-/// `SymbolArena::prepare_file_arena`; a name that source text spells stays.
+/// holds the key of its class (`get_symbol_name_for_private_identifier`).
+/// Go holds `ast.GetSymbolId` of the class there, which is also the API
+/// handle of the class (Go api/proto.go:40 `SymbolHandle`). This returns the
+/// name with that id (`get_symbol_id`). Other names come back as they are.
+/// Only a symbol that a private identifier declares, in a class whose key
+/// the name holds, has such a name; a name that source text spells stays.
 #[must_use]
 pub fn go_symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
     let s = symbols.sym(symbol);
@@ -1035,22 +1235,24 @@ pub fn go_symbol_name(symbols: &SymbolArena, symbol: SymbolId) -> String {
     let Some(at) = rest.find('@') else {
         return name.to_string();
     };
-    let Ok(class) = rest[..at].parse::<u32>() else {
+    let Ok(key) = rest[..at].parse::<u128>() else {
         return name.to_string();
     };
-    if class == 0
-        || class as usize >= symbols.symbol_count()
-        || !s
-            .declarations
-            .iter()
-            .any(|&declaration| is_private_identifier(get_name_of_declaration(declaration)))
-    {
+    // The binder names a private identifier declaration after its
+    // containing class (`get_declaration_name_of_kind`).
+    let class = s
+        .declarations
+        .iter()
+        .filter(|&&declaration| is_private_identifier(get_name_of_declaration(declaration)))
+        .map(|&declaration| get_containing_class(declaration))
+        .find(|&class| class.is_some() && private_name_key(class) == key);
+    let Some(class) = class else {
         return name.to_string();
-    }
+    };
     format!(
         "{}#{}{}",
         INTERNAL_SYMBOL_NAME_PREFIX,
-        get_symbol_id(symbols, SymbolId(class)),
+        get_symbol_id(symbols, class.symbol()),
         &rest[at..]
     )
 }
@@ -1443,9 +1645,7 @@ impl Binder {
     // PORT: returns `Declarations`, which holds one node inline, so no list
     // is allocated.
     pub fn new_single_declaration(&mut self, declaration: Node) -> Declarations {
-        let mut declarations = Declarations::default();
-        declarations.push(declaration);
-        declarations
+        Declarations::one(declaration)
     }
 
     // Go: binder/binder.go:538 setFlowNodeReferenced
@@ -2215,4 +2415,84 @@ fn remove_file_extension(path: &str) -> &str {
         }
     }
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The binder fields in the records of each slot of `file`.
+    fn record_fields(file: usize) -> Vec<Option<(SymbolId, NodeFlags, u32)>> {
+        let records = crate::ast::bind_records(file);
+        (0..records.len())
+            .map(|index| records.node_fields(index))
+            .collect()
+    }
+
+    /// bindonce2: the binder writes the node records while it binds. A bind
+    /// that is not installed (a parallel bind that is dropped, or a panic)
+    /// sets them back as the parse left them, so the serial bind after it
+    /// gives the output of a first bind.
+    #[test]
+    fn a_bind_that_is_not_installed_resets_the_node_records() {
+        let dir = std::env::temp_dir().join(format!("ts_goport_bindonce2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.ts"),
+            "export class C { x = 1; m() { return this.x; } }\n\
+             export function f(a: number) { if (a) { return a; } }\n\
+             namespace N { export const v = 1; }\n\
+             outer: for (const i of [1]) { break outer; }\n\
+             let y = f(1) ?? N.v;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "noLib": true, "types": [] }, "files": ["a.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = crate::program::try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _scope = crate::core::enter_program(Some(program));
+        let file = program
+            .source_files()
+            .find(|file| file.info.file_name.ends_with("/a.ts"))
+            .expect("a.ts is in the program")
+            .root;
+        let parsed = record_fields(file.file_index());
+        let bind = || bind_source_file_live(file, &mut SymbolArena::new_file());
+
+        let first = bind();
+        assert_ne!(
+            record_fields(file.file_index()),
+            parsed,
+            "the bind wrote no record"
+        );
+        let parts = first.node_bind.compact().into_owned();
+        drop(first);
+        assert_eq!(
+            record_fields(file.file_index()),
+            parsed,
+            "a dropped bind left its writes"
+        );
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _bound = bind();
+            panic!("test: a bind thread panics after the bind");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            record_fields(file.file_index()),
+            parsed,
+            "a panicked bind left its writes"
+        );
+
+        let again = bind();
+        assert!(
+            again.node_bind.compact().parts() == parts.parts(),
+            "a bind after the reset gives other data"
+        );
+    }
 }

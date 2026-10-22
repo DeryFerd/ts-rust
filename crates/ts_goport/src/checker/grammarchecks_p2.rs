@@ -1,9 +1,51 @@
 //! Port of typescript-go `internal/checker/grammarchecks.go` lines 952-1857.
 
 use crate::prelude::*;
-use std::borrow::Cow;
+use smallvec::SmallVec;
 
 use crate::diagnostics::Message;
+
+/// Go's `seen := make(map[string]DeclarationMeaning)` of
+/// `checkGrammarObjectLiteralExpression`, keyed by the interned name
+/// (`get_effective_property_name_key`). The first 8 names stay inline and
+/// are found by id, as Go's small map holds up to 8 keys without a table.
+/// The ninth name moves them all to the hash map.
+// PERF: parentname1. The map had `Cow<str>` keys, hashed byte by byte, and
+// a new table that grew from empty for each object literal (checkline1).
+#[derive(Default)]
+struct SeenPropertyNames {
+    small: SmallVec<[(Name, DeclarationMeaning); 8]>,
+    /// Empty until the ninth name; then it holds every name.
+    map: FxHashMap<Name, DeclarationMeaning>,
+}
+
+impl SeenPropertyNames {
+    /// Go `seen[name]`: the empty meaning for a name not seen.
+    fn get(&self, name: &Name) -> DeclarationMeaning {
+        if self.map.is_empty() {
+            self.small
+                .iter()
+                .find(|(n, _)| n == name)
+                .map_or_else(DeclarationMeaning::default, |&(_, m)| m)
+        } else {
+            self.map.get(name).copied().unwrap_or_default()
+        }
+    }
+
+    /// Go `seen[name] = meaning`.
+    fn set(&mut self, name: Name, meaning: DeclarationMeaning) {
+        if !self.map.is_empty() {
+            self.map.insert(name, meaning);
+        } else if let Some(slot) = self.small.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = meaning;
+        } else if self.small.len() < self.small.inline_size() {
+            self.small.push((name, meaning));
+        } else {
+            self.map.extend(self.small.drain(..));
+            self.map.insert(name, meaning);
+        }
+    }
+}
 
 impl Checker {
     // Go: checker/grammarchecks.go:935 checkGrammarInterfaceDeclaration
@@ -134,13 +176,16 @@ impl Checker {
         node: Node,
         in_destructuring: bool,
     ) -> bool {
-        let mut seen: FxHashMap<Cow<'static, str>, DeclarationMeaning> = FxHashMap::default();
+        let mut seen = SeenPropertyNames::default();
 
         // PORT: Go reads `node.Properties.Nodes` with a nil check; `properties()`
         // is empty for a nil list.
         let properties = node.properties();
         for prop in properties {
-            if prop.kind() == SyntaxKind::SpreadAssignment {
+            // PERF: deferbody1. Go reads `prop.Kind` as a field in each test;
+            // here it is read once.
+            let prop_kind = prop.kind();
+            if prop_kind == SyntaxKind::SpreadAssignment {
                 let spread_expression = prop.expression();
                 if in_destructuring {
                     // a rest property cannot be destructured any further
@@ -163,7 +208,7 @@ impl Checker {
                 self.check_grammar_computed_property_name(name);
             }
 
-            if prop.kind() == SyntaxKind::ShorthandPropertyAssignment && !in_destructuring {
+            if prop_kind == SyntaxKind::ShorthandPropertyAssignment && !in_destructuring {
                 let object_assignment_initializer = prop.object_assignment_initializer();
                 if object_assignment_initializer.is_some() {
                     // having objectAssignmentInitializer is only valid in an ObjectAssignmentPattern.
@@ -197,13 +242,25 @@ impl Checker {
             }
 
             // Modifiers are never allowed on properties except for 'async' on a method declaration
-            let modifiers = prop.modifier_nodes();
+            // PERF: deferbody1. A published store node with no modifier bits
+            // has no modifier list, so its node data is not read for the
+            // list. `check_grammar_modifiers` (grammarchecks_p1.rs) gives the
+            // reason: each of Go's parser sites makes a list with one or more
+            // nodes, and each modifier and decorator kind has a flag. The
+            // fast path relies on that in every build; the debug_assert only
+            // checks it in debug builds (as there).
+            let modifiers = if frozen_store_modifier_flags(prop) == Some(ModifierFlags::NONE) {
+                debug_assert!(prop.modifiers().is_nil(), "modifier bits without a list");
+                NodeSlice::default()
+            } else {
+                prop.modifier_nodes()
+            };
             if modifiers.len() != 0 {
                 if can_have_modifiers(prop) {
                     for m in modifiers.iter() {
                         if is_modifier(m)
                             && (m.kind() != SyntaxKind::AsyncKeyword
-                                || prop.kind() != SyntaxKind::MethodDeclaration)
+                                || prop_kind != SyntaxKind::MethodDeclaration)
                         {
                             self.grammar_error_on_node(
                                 m,
@@ -234,7 +291,7 @@ impl Checker {
             //    d.IsAccessorDescriptor(previous) is true and IsAccessorDescriptor(propId.descriptor) is true
             // and either both previous and propId.descriptor have[[Get]] fields or both previous and propId.descriptor have[[Set]] fields
             let current_kind: DeclarationMeaning;
-            match prop.kind() {
+            match prop_kind {
                 SyntaxKind::ShorthandPropertyAssignment | SyntaxKind::PropertyAssignment => {
                     // PORT: Go reads `NamedMemberBase.PostfixToken` from the concrete
                     // node; `postfix_token()` (Go `Node.PostfixToken()`) reads the same
@@ -282,15 +339,13 @@ impl Checker {
             }
 
             if !in_destructuring {
-                let (effective_name, ok) =
-                    self.get_effective_property_name_for_property_name_node(name);
-                if !ok {
+                let Some(effective_name) = self.get_effective_property_name_key(name) else {
                     continue;
-                }
+                };
 
-                let existing_kind = seen.get(&effective_name).copied().unwrap_or_default();
+                let existing_kind = seen.get(&effective_name);
                 if existing_kind.is_empty() {
-                    seen.insert(effective_name, current_kind);
+                    seen.set(effective_name, current_kind);
                 } else if current_kind.intersects(DeclarationMeaning::METHOD)
                     && existing_kind.intersects(DeclarationMeaning::METHOD)
                 {
@@ -313,7 +368,7 @@ impl Checker {
                     if existing_kind != DeclarationMeaning::GET_OR_SET_ACCESSOR
                         && current_kind != existing_kind
                     {
-                        seen.insert(effective_name, current_kind | existing_kind);
+                        seen.set(effective_name, current_kind | existing_kind);
                     } else {
                         return self.grammar_error_on_node(
                             name,
@@ -1442,7 +1497,8 @@ impl Checker {
                 if name_text != "meta" {
                     let is_callee =
                         is_call_expression(node.parent()) && node.parent().expression() == node;
-                    if name_text == "defer" {
+                    // ts#63915, Go N' grammarchecks.go:1825: `defer` and `source`
+                    if is_import_phase_meta_property(node) {
                         if !is_callee {
                             return self.grammar_error_at_pos(
                                 node,
@@ -1456,7 +1512,7 @@ impl Checker {
                         if is_callee {
                             return self.grammar_error_on_node(
                                 node_name,
-                                diag::X_0_is_not_a_valid_meta_property_for_keyword_import_Did_you_mean_meta_or_defer,
+                                diag::X_0_is_not_a_valid_meta_property_for_keyword_import_Did_you_mean_meta_defer_or_source,
                                 args![name_text],
                             );
                         }

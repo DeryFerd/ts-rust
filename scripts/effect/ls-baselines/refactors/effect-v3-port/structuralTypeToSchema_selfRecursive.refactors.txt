@@ -1,0 +1,156 @@
+=== Refactor Inventory ===
+
+[R1] selection: "5:18-5:22"
+  Refactor 0: "Wrap with pipe" (refactor.rewrite.effect.wrapWithPipe)
+  Refactor 1: "Generate Effect.Schema from type" (refactor.rewrite.effect.typeToEffectSchema)
+  Refactor 2: "Generate Schema.Class from type" (refactor.rewrite.effect.typeToEffectSchemaClass)
+  Refactor 3: "Refactor to Schema (Recursive Structural)" (refactor.rewrite.effect.structuralTypeToSchema)
+
+[R2] selection: "10:13-10:17"
+  Refactor 0: "Wrap with pipe" (refactor.rewrite.effect.wrapWithPipe)
+  Refactor 1: "Generate Effect.Schema from type" (refactor.rewrite.effect.typeToEffectSchema)
+  Refactor 2: "Generate Schema.Class from type" (refactor.rewrite.effect.typeToEffectSchemaClass)
+  Refactor 3: "Refactor to Schema (Recursive Structural)" (refactor.rewrite.effect.structuralTypeToSchema)
+
+[R3] selection: "empty (0:0-0:0)"
+  (no refactors)
+
+=== Refactor Application Results ===
+
+=== [R1] Refactor 0: "Wrap with pipe" ===
+
+--- file:///.src/structuralTypeToSchema_selfRecursive.ts ---
+// refactor: 5:18-5:22, 10:13-10:17
+// @effect-v3
+import * as Schema from "effect/Schema"
+
+export interface pipe(Tree) {
+  value: number
+  children: Array<Tree>
+}
+
+export type Json = string | number | boolean | null | ReadonlyArray<Json> | { readonly [key: string]: Json }
+
+
+=== [R1] Refactor 1: "Generate Effect.Schema from type" ===
+
+--- file:///.src/structuralTypeToSchema_selfRecursive.ts ---
+// refactor: 5:18-5:22, 10:13-10:17
+// @effect-v3
+import * as Schema from "effect/Schema"
+
+export const Tree = Schema.Struct({
+    value: Schema.Number,
+    children: Schema.Array(Tree)
+});
+
+export interface Tree {
+  value: number
+  children: Array<Tree>
+}
+
+export type Json = string | number | boolean | null | ReadonlyArray<Json> | { readonly [key: string]: Json }
+
+
+=== [R1] Refactor 2: "Generate Schema.Class from type" ===
+
+--- file:///.src/structuralTypeToSchema_selfRecursive.ts ---
+// refactor: 5:18-5:22, 10:13-10:17
+// @effect-v3
+import * as Schema from "effect/Schema"
+
+export class Tree extends Schema.Class<Tree>("Tree")({
+    value: Schema.Number,
+    children: Schema.Array(Tree)
+}) {}
+
+export interface Tree {
+  value: number
+  children: Array<Tree>
+}
+
+export type Json = string | number | boolean | null | ReadonlyArray<Json> | { readonly [key: string]: Json }
+
+
+=== [R1] Refactor 3: "Refactor to Schema (Recursive Structural)" ===
+
+--- file:///.src/structuralTypeToSchema_selfRecursive.ts ---
+// refactor: 5:18-5:22, 10:13-10:17
+// @effect-v3
+import * as Schema from "effect/Schema"
+
+export const Tree = undefined /* maximum depth exceeded */;
+
+export interface Tree {
+  value: number
+  children: Array<Tree>
+}
+
+export type Json = string | number | boolean | null | ReadonlyArray<Json> | { readonly [key: string]: Json }
+
+
+=== [R2] Refactor 0: "Wrap with pipe" ===
+
+--- file:///.src/structuralTypeToSchema_selfRecursive.ts ---
+// refactor: 5:18-5:22, 10:13-10:17
+// @effect-v3
+import * as Schema from "effect/Schema"
+
+export interface Tree {
+  value: number
+  children: Array<Tree>
+}
+
+export type pipe(Json) = string | number | boolean | null | ReadonlyArray<Json> | { readonly [key: string]: Json }
+
+
+=== [R2] Refactor 1: "Generate Effect.Schema from type" ===
+
+--- file:///.src/structuralTypeToSchema_selfRecursive.ts ---
+// refactor: 5:18-5:22, 10:13-10:17
+// @effect-v3
+import * as Schema from "effect/Schema"
+
+export interface Tree {
+  value: number
+  children: Array<Tree>
+}
+
+export const Json = Schema.Union(Schema.String, Schema.Number, Schema.Boolean, Schema.Null, Schema.Array(Json), Schema.Struct({}, { key: Schema.String, value: Json }));
+
+export type Json = string | number | boolean | null | ReadonlyArray<Json> | { readonly [key: string]: Json }
+
+
+=== [R2] Refactor 2: "Generate Schema.Class from type" ===
+
+--- file:///.src/structuralTypeToSchema_selfRecursive.ts ---
+// refactor: 5:18-5:22, 10:13-10:17
+// @effect-v3
+import * as Schema from "effect/Schema"
+
+export interface Tree {
+  value: number
+  children: Array<Tree>
+}
+
+export const Json = Schema.Union(Schema.String, Schema.Number, Schema.Boolean, Schema.Null, Schema.Array(Json), Schema.Struct({}, { key: Schema.String, value: Json }));
+
+export type Json = string | number | boolean | null | ReadonlyArray<Json> | { readonly [key: string]: Json }
+
+
+=== [R2] Refactor 3: "Refactor to Schema (Recursive Structural)" ===
+
+--- file:///.src/structuralTypeToSchema_selfRecursive.ts ---
+// refactor: 5:18-5:22, 10:13-10:17
+// @effect-v3
+import * as Schema from "effect/Schema"
+
+export interface Tree {
+  value: number
+  children: Array<Tree>
+}
+
+export const Json = undefined /* maximum depth exceeded */;
+
+export type Json = string | number | boolean | null | ReadonlyArray<Json> | { readonly [key: string]: Json }
+

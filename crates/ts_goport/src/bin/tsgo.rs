@@ -118,6 +118,13 @@ fn main() -> MainResult {
     set_malloc_tunables(&budget);
     budget.install();
     // After the exec in `set_malloc_tunables` and before the work thread.
+    // Also before `go_runtime_start`: keep this order. jemalloc gives a new
+    // thread the arena with the fewest threads, and the holder thread of
+    // the layout moves to arena 3 only when it first runs. The time of
+    // `go_runtime_start` lets it move before the work thread starts. Else
+    // the work thread can take arena 3 too, and two checkers then share an
+    // arena: about 40,000 more pages per multi-threaded zod run (int59 r4;
+    // jemarena1: 27 of 30 zod runs with the other order, 1 of 30 with this).
     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
     ts_goport::jemalloc_layout::jemalloc_layout();
     // After the exec in `set_malloc_tunables`: an exec resets the handlers,
@@ -950,7 +957,7 @@ fn send_code(worker: Worker, code: i32) {
 // `scanner_util::GO_STRING_MARKER`). The system writer writes the Go bytes
 // of the output (`GoOutput`).
 fn run_main(start: Instant) -> i32 {
-    let args: Vec<String> = ts_goport::frontend::osutil::args()[1..].to_vec();
+    let mut args: Vec<String> = ts_goport::frontend::osutil::args()[1..].to_vec();
 
     if let Some(first) = args.first() {
         match first.as_str() {
@@ -959,6 +966,11 @@ fn run_main(start: Instant) -> i32 {
             _ => {}
         }
     }
+
+    // PORT: not in Go (fastmode1). Go has no `--fast`: where Go's parser
+    // reads it as an option name, it becomes an empty argument, which Go's
+    // option parsing skips (`take_flag`).
+    ts_goport::fast_mode::take_flag(&mut args);
 
     // Go: ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
     let (ctx, stop) = notify_context(&context::background());
@@ -1034,7 +1046,7 @@ fn install_panic_hook() {
         }
         let location = info
             .location()
-            .map(|l| format!(" at {}:{}", l.file(), l.line()))
+            .map(|l| format!(" at {}:{}", go_site_file(l.file()), l.line()))
             .unwrap_or_default();
         // The output so far comes first, also in one file with stderr.
         ts_goport::execute::tsc::stdio::flush_cli_stdout_at_exit();

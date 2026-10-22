@@ -1,6 +1,6 @@
 //! Port-only test of the memo of spelling suggestions from the globals table
 //! (`Checker::get_suggestion_for_symbol_name_lookup`, Go
-//! `checker/checker.go:1816 getSuggestionForSymbolNameLookup`).
+//! `checker/checker.go:1819 getSuggestionForSymbolNameLookup`).
 //!
 //! PORT: no Go counterpart. Each unresolved name below is looked up twice or
 //! more with the same meaning, so the second lookup reads the memo: a

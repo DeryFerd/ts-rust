@@ -31,7 +31,7 @@
 //! after each merge round, before the lib bind generator):
 //!
 //! ```text
-//! cargo test -p ts_goport --lib frontend::parser::lib_parse_snapshot::tests::generate_lib_parse_snapshot -- --ignored --exact
+//! cargo test -p goport_core --lib frontend::parser::lib_parse_snapshot::tests::generate_lib_parse_snapshot -- --ignored --exact
 //! ```
 //!
 //! `snapshot_matches_live_parse` fails while the blob is stale.
@@ -56,7 +56,7 @@
 //! - the `ParsedSourceFile` fields in declaration order, with node handles
 //!   as slot indexes (0 is nil), and the import specifiers.
 
-use crate::ast::store::{LibParseSlot, load_lib_parse_slots, reset_file_store};
+use crate::ast::store::{LibListTable, LibParseSlot, load_lib_parse_slots, reset_file_store};
 #[cfg(test)]
 use crate::ast::store::{lib_parse_slot_views, lib_parse_store_dump};
 use crate::astdata::NodeData;
@@ -351,6 +351,7 @@ fn decode(
         total: 1,
         index: 0,
         pos: 0,
+        ids: Vec::new(),
     };
     let count = d.count()?;
     d.total = u32::try_from(count).ok()?.checked_add(1)?;
@@ -374,7 +375,7 @@ fn decode(
         let text_is_keyword = get_identifier_token(name.as_str()) != SyntaxKind::Identifier;
         names.push((name, text_is_keyword));
     }
-    if !load_lib_parse_slots(store, count, || d.slot(&palette, &names)) {
+    if !load_lib_parse_slots(store, count, |lists| d.slot(&palette, &names, lists)) {
         return None;
     }
     let file = d.parsed_file(opts, text)?;
@@ -421,6 +422,59 @@ struct Decoder<'a> {
     /// `loc.pos()` of the slot being read (of the one before, until its
     /// position is read); list ranges are relative to it.
     pos: i64,
+    /// The ids of the list being read (`list_parts`), kept between lists.
+    ids: Vec<crate::astdata::NodeId>,
+}
+
+/// The `Decoder` of one node data, with the list table of the store, which
+/// the list readers add to (astshrink1). The other field readers are the
+/// `Decoder` methods (`Deref`).
+struct PayloadDecoder<'d, 'a, 't, 'l> {
+    dec: &'d mut Decoder<'a>,
+    lists: &'t mut LibListTable<'l>,
+}
+
+impl<'a> std::ops::Deref for PayloadDecoder<'_, 'a, '_, '_> {
+    type Target = Decoder<'a>;
+
+    fn deref(&self) -> &Decoder<'a> {
+        self.dec
+    }
+}
+
+impl std::ops::DerefMut for PayloadDecoder<'_, '_, '_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.dec
+    }
+}
+
+impl PayloadDecoder<'_, '_, '_, '_> {
+    fn list(&mut self) -> Option<crate::astdata::NodeList> {
+        let (range, comma) = self.dec.list_parts()?;
+        Some(
+            self.lists
+                .push(range, &self.dec.ids, comma, Default::default()),
+        )
+    }
+
+    fn olist(&mut self) -> Option<Option<crate::astdata::NodeList>> {
+        Some(if self.flag()? {
+            Some(self.list()?)
+        } else {
+            None
+        })
+    }
+
+    fn mods(&mut self) -> Option<Option<crate::astdata::ModifierList>> {
+        if !self.flag()? {
+            return Some(None);
+        }
+        let (range, comma) = self.dec.list_parts()?;
+        let flags = crate::astdata::ModifierFlags(self.num()?);
+        Some(Some(crate::astdata::ModifierList {
+            list: self.lists.push(range, &self.dec.ids, comma, flags),
+        }))
+    }
 }
 
 impl<'a> Decoder<'a> {
@@ -488,6 +542,7 @@ impl<'a> Decoder<'a> {
         &mut self,
         palette: &[(SyntaxKind, NodeFlags)],
         names: &[(Name, bool)],
+        lists: &mut LibListTable<'_>,
     ) -> Option<LibParseSlot> {
         self.index += 1;
         let (kind, flags) = *palette.get(usize::try_from(self.var()?).ok()?)?;
@@ -512,7 +567,7 @@ impl<'a> Decoder<'a> {
             }
             None
         } else {
-            let data = decode_payload(self, variant)?;
+            let data = decode_payload(&mut PayloadDecoder { dec: self, lists }, variant)?;
             if !data.matches_syntax_kind(kind) {
                 return None;
             }
@@ -548,7 +603,8 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    fn list(&mut self) -> Option<crate::astdata::NodeList> {
+    /// The range and the missing-list bit of a list; its ids go to `ids`.
+    fn list_parts(&mut self) -> Option<(crate::astdata::text::TextRange, bool)> {
         let start_delta = self.zz()?;
         let start = u32::try_from(self.pos + start_delta).ok()?;
         let end = u32::try_from(i64::from(start) + self.zz()?).ok()?;
@@ -557,59 +613,18 @@ impl<'a> Decoder<'a> {
         if len > self.r.remaining() {
             return None;
         }
-        let mut nodes = Vec::with_capacity(len);
+        self.ids.clear();
         for _ in 0..len {
-            nodes.push(self.id()?);
+            let id = self.id()?;
+            self.ids.push(id);
         }
-        Some(crate::astdata::NodeList {
-            range: crate::astdata::text::TextRange::new(
+        Some((
+            crate::astdata::text::TextRange::new(
                 crate::astdata::text::TextPos::new(start),
                 crate::astdata::text::TextPos::new(end),
             ),
-            nodes,
-            has_trailing_comma: head & 1 != 0,
-        })
-    }
-
-    fn olist(&mut self) -> Option<Option<crate::astdata::NodeList>> {
-        Some(if self.flag()? {
-            Some(self.list()?)
-        } else {
-            None
-        })
-    }
-
-    fn mods(&mut self) -> Option<Option<crate::astdata::ModifierList>> {
-        if !self.flag()? {
-            return Some(None);
-        }
-        let list = self.list()?;
-        Some(Some(crate::astdata::ModifierList {
-            list,
-            flags: crate::astdata::ModifierFlags(self.num()?),
-        }))
-    }
-
-    fn osym(&mut self) -> Option<Option<crate::astdata::SymbolId>> {
-        match self.var()? {
-            0 => Some(None),
-            value => Some(Some(crate::astdata::SymbolId(
-                u32::try_from(value - 1).ok()?,
-            ))),
-        }
-    }
-
-    fn oflow(&mut self) -> Option<Option<crate::astdata::FlowNodeId>> {
-        match self.var()? {
-            0 => Some(None),
-            value => Some(Some(crate::astdata::FlowNodeId(
-                u32::try_from(value - 1).ok()?,
-            ))),
-        }
-    }
-
-    fn table(&mut self) -> Option<crate::astdata::SymbolTable> {
-        Some(crate::astdata::SymbolTable)
+            head & 1 != 0,
+        ))
     }
 
     fn opaque(&mut self) -> Option<crate::astdata::OpaqueValue> {
@@ -900,10 +915,11 @@ macro_rules! payload_codec {
     ($($variant_tag:literal $variant:ident($data:ident) {
         $($field:ident: $codec:ident),* $(,)?
     })*) => {
-        /// The node data with variant tag `variant_tag`, from `dec`.
-        fn decode_payload(dec: &mut Decoder<'_>, variant_tag: u8) -> Option<NodeData> {
+        /// The node data with variant tag `variant_tag`, from `dec`, in the
+        /// AST arena of this thread (astchunks2: no box per node).
+        fn decode_payload(dec: &mut PayloadDecoder<'_, '_, '_, '_>, variant_tag: u8) -> Option<NodeData<'static>> {
             Some(match variant_tag {
-                $($variant_tag => NodeData::$variant(Box::new(crate::astdata::$data {
+                $($variant_tag => NodeData::$variant(crate::ast::leak_in_ast_arena(crate::astdata::$data {
                     $($field: dec.$codec()?,)*
                 })),)*
                 _ => return None,
@@ -912,10 +928,10 @@ macro_rules! payload_codec {
 
         /// Writes the variant tag and the fields of `payload`.
         #[cfg(test)]
-        fn encode_payload(enc: &mut Encoder, payload: &NodeData) -> Result<(), String> {
+        fn encode_payload(enc: &mut Encoder, payload: NodeData<'_>) -> Result<(), String> {
             match payload {
                 $(NodeData::$variant(payload) => {
-                    let crate::astdata::$data { $($field),* } = &**payload;
+                    let crate::astdata::$data { $($field),* } = payload;
                     enc.u8($variant_tag);
                     $(enc.$codec($field)?;)*
                 })*
@@ -929,182 +945,127 @@ macro_rules! payload_codec {
 // `NodeData` variant, in enum order; the codec of each field follows from
 // its type). The tags stay below `SHARED_NAME`.
 payload_codec! {
-    0 ArrayLiteralExpression(ArrayLiteralExpressionData) {
-        elements: list, multi_line: flag, facts: num,
-    }
+    0 ArrayLiteralExpression(ArrayLiteralExpressionData) { elements: list, multi_line: flag }
     1 ArrayTypeNode(ArrayTypeNodeData) { element_type: id }
     2 ArrowFunction(ArrowFunctionData) {
-        asterisk_token: oid, body: id, end_flow_node: oflow, equals_greater_than_token: id,
-        flow_node: oflow, full_signature: oid, locals: table, next_container: oid, parameters: list,
-        symbol: osym, type_: oid, type_parameters: olist, facts: num, modifiers: mods,
+        asterisk_token: oid, body: id, equals_greater_than_token: id, full_signature: oid,
+        parameters: list, type_: oid, type_parameters: olist, modifiers: mods,
     }
     3 AsExpression(AsExpressionData) { expression: id, type_: id }
     4 AwaitExpression(AwaitExpressionData) { expression: id }
     5 BigIntLiteral(BigIntLiteralData) { text: string, token_flags: tflags }
     6 BinaryExpression(BinaryExpressionData) {
-        left: id, operator_token: id, right: id, symbol: osym, type_: oid, facts: num,
-        modifiers: mods,
+        left: id, operator_token: id, right: id, type_: oid, modifiers: mods,
     }
     7 BindingElement(BindingElementData) {
-        dot_dot_dot_token: oid, flow_node: oflow, initializer: oid, local_symbol: osym,
-        property_name: oid, symbol: osym, facts: num, name: oid,
+        dot_dot_dot_token: oid, initializer: oid, property_name: oid, name: oid,
     }
-    8 BindingPattern(BindingPatternData) { elements: list, facts: num }
-    9 Block(BlockData) {
-        flow_node: oflow, locals: table, multi_line: flag, next_container: oid, statements: list,
-        facts: num,
-    }
-    10 BreakStatement(BreakStatementData) { flow_node: oflow, label: oid }
+    8 BindingPattern(BindingPatternData) { elements: list }
+    9 Block(BlockData) { multi_line: flag, statements: list }
+    10 BreakStatement(BreakStatementData) { label: oid }
     11 CallExpression(CallExpressionData) {
-        arguments: list, expression: id, question_dot_token: oid, symbol: osym,
-        type_arguments: olist, facts: num,
+        arguments: list, expression: id, question_dot_token: oid, type_arguments: olist,
     }
     12 CallSignatureDeclaration(CallSignatureDeclarationData) {
-        full_signature: oid, locals: table, next_container: oid, parameters: list, symbol: osym,
-        type_: oid, type_parameters: olist,
+        full_signature: oid, parameters: list, type_: oid, type_parameters: olist,
     }
-    13 CaseBlock(CaseBlockData) { clauses: list, locals: table, next_container: oid, facts: num }
-    14 CaseOrDefaultClause(CaseOrDefaultClauseData) {
-        expression: id, fallthrough_flow_node: oflow, statements: list, facts: num,
-    }
-    15 CatchClause(CatchClauseData) {
-        block: id, locals: table, next_container: oid, variable_declaration: oid, facts: num,
-    }
+    13 CaseBlock(CaseBlockData) { clauses: list }
+    14 CaseOrDefaultClause(CaseOrDefaultClauseData) { expression: id, statements: list }
+    15 CatchClause(CatchClauseData) { block: id, variable_declaration: oid }
     16 ClassDeclaration(ClassDeclarationData) {
-        flow_node: oflow, heritage_clauses: olist, local_symbol: osym, locals: table, members: list,
-        next_container: oid, symbol: osym, type_parameters: olist, facts: num, modifiers: mods,
-        name: oid,
+        heritage_clauses: olist, members: list, type_parameters: olist, modifiers: mods, name: oid,
     }
     17 ClassExpression(ClassExpressionData) {
-        heritage_clauses: olist, local_symbol: osym, locals: table, members: list,
-        next_container: oid, symbol: osym, type_parameters: olist, facts: num, modifiers: mods,
-        name: oid,
+        heritage_clauses: olist, members: list, type_parameters: olist, modifiers: mods, name: oid,
     }
-    18 ClassStaticBlockDeclaration(ClassStaticBlockDeclarationData) {
-        body: id, locals: table, next_container: oid, return_flow_node: oflow, symbol: osym,
-        facts: num, modifiers: mods,
-    }
-    19 ComputedPropertyName(ComputedPropertyNameData) { expression: id, facts: num }
+    18 ClassStaticBlockDeclaration(ClassStaticBlockDeclarationData) { body: id, modifiers: mods }
+    19 ComputedPropertyName(ComputedPropertyNameData) { expression: id }
     20 ConditionalExpression(ConditionalExpressionData) {
         colon_token: id, condition: id, question_token: id, when_false: id, when_true: id,
-        facts: num,
     }
     21 ConditionalTypeNode(ConditionalTypeNodeData) {
-        check_type: id, extends_type: id, false_type: id, locals: table, next_container: oid,
-        true_type: id,
+        check_type: id, extends_type: id, false_type: id, true_type: id,
     }
     22 ConstructSignatureDeclaration(ConstructSignatureDeclarationData) {
-        full_signature: oid, locals: table, next_container: oid, parameters: list, symbol: osym,
-        type_: oid, type_parameters: olist,
+        full_signature: oid, parameters: list, type_: oid, type_parameters: olist,
     }
     23 ConstructorDeclaration(ConstructorDeclarationData) {
-        asterisk_token: oid, body: oid, end_flow_node: oflow, full_signature: oid, locals: table,
-        next_container: oid, parameters: list, return_flow_node: oflow, symbol: osym, type_: oid,
-        type_parameters: olist, facts: num, modifiers: mods,
+        asterisk_token: oid, body: oid, full_signature: oid, parameters: list, type_: oid,
+        type_parameters: olist, modifiers: mods,
     }
     24 ConstructorTypeNode(ConstructorTypeNodeData) {
-        full_signature: oid, locals: table, next_container: oid, parameters: list, symbol: osym,
-        type_: oid, type_parameters: olist, modifiers: mods,
+        full_signature: oid, parameters: list, type_: oid, type_parameters: olist, modifiers: mods,
     }
-    25 ContinueStatement(ContinueStatementData) { flow_node: oflow, label: oid }
-    26 DebuggerStatement(DebuggerStatementData) { flow_node: oflow }
-    27 Decorator(DecoratorData) { expression: id, facts: num }
+    25 ContinueStatement(ContinueStatementData) { label: oid }
+    26 DebuggerStatement(DebuggerStatementData) {}
+    27 Decorator(DecoratorData) { expression: id }
     28 DeleteExpression(DeleteExpressionData) { expression: id }
-    29 DoStatement(DoStatementData) { expression: id, flow_node: oflow, statement: id, facts: num }
+    29 DoStatement(DoStatementData) { expression: id, statement: id }
     30 ElementAccessExpression(ElementAccessExpressionData) {
-        argument_expression: id, expression: id, flow_node: oflow, question_dot_token: oid,
-        facts: num,
+        argument_expression: id, expression: id, question_dot_token: oid,
     }
-    31 EmptyStatement(EmptyStatementData) { flow_node: oflow }
-    32 EnumDeclaration(EnumDeclarationData) {
-        flow_node: oflow, local_symbol: osym, members: list, symbol: osym, facts: num,
-        modifiers: mods, name: id,
-    }
+    31 EmptyStatement(EmptyStatementData) {}
+    32 EnumDeclaration(EnumDeclarationData) { members: list, modifiers: mods, name: id }
     33 EnumMember(EnumMemberData) {
-        initializer: oid, postfix_token: oid, symbol: osym, facts: num, modifiers: mods, name: id,
+        initializer: oid, postfix_token: oid, modifiers: mods, name: id,
     }
     34 ExportAssignment(ExportAssignmentData) {
-        expression: id, flow_node: oflow, is_export_equals: flag, symbol: osym, type_: oid,
-        facts: num, modifiers: mods,
+        expression: id, is_export_equals: flag, type_: oid, modifiers: mods,
     }
     35 ExportDeclaration(ExportDeclarationData) {
-        attributes: oid, export_clause: oid, flow_node: oflow, is_type_only: flag,
-        module_specifier: oid, symbol: osym, facts: num, modifiers: mods,
+        attributes: oid, export_clause: oid, is_type_only: flag, module_specifier: oid,
+        modifiers: mods,
     }
-    36 ExportSpecifier(ExportSpecifierData) {
-        is_type_only: flag, local_symbol: osym, property_name: oid, symbol: osym, facts: num,
-        name: id,
-    }
-    37 ExpressionStatement(ExpressionStatementData) { expression: id, flow_node: oflow }
+    36 ExportSpecifier(ExportSpecifierData) { is_type_only: flag, property_name: oid, name: id }
+    37 ExpressionStatement(ExpressionStatementData) { expression: id }
     38 ExpressionWithTypeArguments(ExpressionWithTypeArgumentsData) {
-        expression: id, type_arguments: olist, facts: num,
+        expression: id, type_arguments: olist,
     }
     39 ExternalModuleReference(ExternalModuleReferenceData) { expression: id }
     40 ForInOrOfStatement(ForInOrOfStatementData) {
-        await_modifier: oid, expression: id, flow_node: oflow, initializer: id, locals: table,
-        next_container: oid, statement: id, facts: num,
+        await_modifier: oid, expression: id, initializer: id, statement: id,
     }
     41 ForStatement(ForStatementData) {
-        condition: oid, flow_node: oflow, incrementor: oid, initializer: oid, locals: table,
-        next_container: oid, statement: id, facts: num,
+        condition: oid, incrementor: oid, initializer: oid, statement: id,
     }
     42 FunctionDeclaration(FunctionDeclarationData) {
-        asterisk_token: oid, body: oid, end_flow_node: oflow, flow_node: oflow, full_signature: oid,
-        local_symbol: osym, locals: table, next_container: oid, parameters: list,
-        return_flow_node: oflow, symbol: osym, type_: oid, type_parameters: olist, facts: num,
-        modifiers: mods, name: oid,
+        asterisk_token: oid, body: oid, full_signature: oid, parameters: list, type_: oid,
+        type_parameters: olist, modifiers: mods, name: oid,
     }
     43 FunctionExpression(FunctionExpressionData) {
-        asterisk_token: oid, body: id, end_flow_node: oflow, flow_node: oflow, full_signature: oid,
-        locals: table, next_container: oid, parameters: list, return_flow_node: oflow, symbol: osym,
-        type_: oid, type_parameters: olist, facts: num, modifiers: mods, name: oid,
+        asterisk_token: oid, body: id, full_signature: oid, parameters: list, type_: oid,
+        type_parameters: olist, modifiers: mods, name: oid,
     }
     44 FunctionTypeNode(FunctionTypeNodeData) {
-        full_signature: oid, locals: table, next_container: oid, parameters: list, symbol: osym,
-        type_: oid, type_parameters: olist, modifiers: mods,
+        full_signature: oid, parameters: list, type_: oid, type_parameters: olist, modifiers: mods,
     }
     45 GetAccessorDeclaration(GetAccessorDeclarationData) {
-        asterisk_token: oid, body: oid, end_flow_node: oflow, flow_node: oflow, full_signature: oid,
-        locals: table, next_container: oid, parameters: list, postfix_token: oid, symbol: osym,
-        type_: oid, type_parameters: olist, facts: num, modifiers: mods, name: id,
+        asterisk_token: oid, body: oid, full_signature: oid, parameters: list, postfix_token: oid,
+        type_: oid, type_parameters: olist, modifiers: mods, name: id,
     }
-    46 HeritageClause(HeritageClauseData) { token: kind, types: list, facts: num }
-    47 Identifier(IdentifierData) { flow_node: oflow, text: string }
-    48 IfStatement(IfStatementData) {
-        else_statement: oid, expression: id, flow_node: oflow, then_statement: id, facts: num,
-    }
-    49 ImportAttribute(ImportAttributeData) { value: id, facts: num, name: id }
-    50 ImportAttributes(ImportAttributesData) {
-        attributes: list, multi_line: flag, token: kind, facts: num,
-    }
-    51 ImportClause(ImportClauseData) {
-        local_symbol: osym, named_bindings: oid, phase_modifier: okind, symbol: osym, facts: num,
-        name: oid,
-    }
+    46 HeritageClause(HeritageClauseData) { token: kind, types: list }
+    47 Identifier(IdentifierData) { text: string }
+    48 IfStatement(IfStatementData) { else_statement: oid, expression: id, then_statement: id }
+    49 ImportAttribute(ImportAttributeData) { value: id, name: id }
+    50 ImportAttributes(ImportAttributesData) { attributes: list, multi_line: flag, token: kind }
+    51 ImportClause(ImportClauseData) { named_bindings: oid, phase_modifier: okind, name: oid }
     52 ImportDeclaration(ImportDeclarationData) {
-        attributes: oid, flow_node: oflow, import_clause: oid, module_specifier: id, symbol: osym,
-        facts: num, modifiers: mods,
+        attributes: oid, import_clause: oid, module_specifier: id, modifiers: mods,
     }
     53 ImportEqualsDeclaration(ImportEqualsDeclarationData) {
-        flow_node: oflow, is_type_only: flag, local_symbol: osym, module_reference: id,
-        symbol: osym, facts: num, modifiers: mods, name: id,
+        is_type_only: flag, module_reference: id, modifiers: mods, name: id,
     }
-    54 ImportSpecifier(ImportSpecifierData) {
-        is_type_only: flag, local_symbol: osym, property_name: oid, symbol: osym, facts: num,
-        name: id,
-    }
+    54 ImportSpecifier(ImportSpecifierData) { is_type_only: flag, property_name: oid, name: id }
     55 ImportTypeNode(ImportTypeNodeData) {
         argument: id, attributes: oid, is_type_of: flag, qualifier: oid, type_arguments: olist,
     }
     56 IndexSignatureDeclaration(IndexSignatureDeclarationData) {
-        full_signature: oid, locals: table, next_container: oid, parameters: list, symbol: osym,
-        type_: id, type_parameters: olist, modifiers: mods,
+        full_signature: oid, parameters: list, type_: id, type_parameters: olist, modifiers: mods,
     }
     57 IndexedAccessTypeNode(IndexedAccessTypeNodeData) { index_type: id, object_type: id }
     58 InferTypeNode(InferTypeNodeData) { type_parameter: id }
     59 InterfaceDeclaration(InterfaceDeclarationData) {
-        flow_node: oflow, heritage_clauses: olist, local_symbol: osym, members: list, symbol: osym,
-        type_parameters: olist, modifiers: mods, name: id,
+        heritage_clauses: olist, members: list, type_parameters: olist, modifiers: mods, name: id,
     }
     60 IntersectionTypeNode(IntersectionTypeNodeData) { types: list }
     61 JsDoc(JsDocData) { comment: list, tags: olist }
@@ -1141,8 +1102,7 @@ payload_codec! {
     }
     84 JsDocSeeTag(JsDocSeeTagData) { comment: olist, name_expression: id, tag_name: id }
     85 JsDocSignature(JsDocSignatureData) {
-        full_signature: oid, locals: table, next_container: oid, parameters: list, symbol: osym,
-        type_: oid, type_parameters: olist,
+        full_signature: oid, parameters: list, type_: oid, type_parameters: olist,
     }
     86 JsDocTemplateTag(JsDocTemplateTagData) {
         comment: olist, constraint: id, tag_name: id, type_parameters: list,
@@ -1151,96 +1111,76 @@ payload_codec! {
     88 JsDocThisTag(JsDocThisTagData) { comment: olist, tag_name: id, type_expression: id }
     89 JsDocThrowsTag(JsDocThrowsTagData) { comment: olist, tag_name: id, type_expression: oid }
     90 JsDocTypeExpression(JsDocTypeExpressionData) { type_: id }
-    91 JsDocTypeLiteral(JsDocTypeLiteralData) {
-        is_array_type: flag, js_doc_property_tags: oids, symbol: osym,
-    }
+    91 JsDocTypeLiteral(JsDocTypeLiteralData) { is_array_type: flag, js_doc_property_tags: oids }
     92 JsDocTypeTag(JsDocTypeTagData) { comment: olist, tag_name: id, type_expression: id }
     93 JsDocTypedefTag(JsDocTypedefTagData) {
         comment: olist, tag_name: id, type_expression: oid, name: oid,
     }
     94 JsDocUnknownTag(JsDocUnknownTagData) { comment: olist, tag_name: id }
     95 JsDocVariadicType(JsDocVariadicTypeData) { type_: id }
-    96 JsxAttribute(JsxAttributeData) { initializer: oid, symbol: osym, facts: num, name: id }
-    97 JsxAttributes(JsxAttributesData) { properties: list, symbol: osym, facts: num }
+    96 JsxAttribute(JsxAttributeData) { initializer: oid, name: id }
+    97 JsxAttributes(JsxAttributesData) { properties: list }
     98 JsxClosingElement(JsxClosingElementData) { tag_name: id }
     99 JsxClosingFragment(JsxClosingFragmentData) {}
-    100 JsxElement(JsxElementData) {
-        children: list, closing_element: id, opening_element: id, facts: num,
-    }
+    100 JsxElement(JsxElementData) { children: list, closing_element: id, opening_element: id }
     101 JsxExpression(JsxExpressionData) { dot_dot_dot_token: oid, expression: oid }
-    102 JsxFragment(JsxFragmentData) {
-        children: list, closing_fragment: id, opening_fragment: id, facts: num,
-    }
-    103 JsxNamespacedName(JsxNamespacedNameData) { namespace: id, facts: num, name: id }
+    102 JsxFragment(JsxFragmentData) { children: list, closing_fragment: id, opening_fragment: id }
+    103 JsxNamespacedName(JsxNamespacedNameData) { namespace: id, name: id }
     104 JsxOpeningElement(JsxOpeningElementData) {
-        attributes: id, tag_name: id, type_arguments: olist, facts: num,
+        attributes: id, tag_name: id, type_arguments: olist,
     }
     105 JsxOpeningFragment(JsxOpeningFragmentData) {}
     106 JsxSelfClosingElement(JsxSelfClosingElementData) {
-        attributes: id, tag_name: id, type_arguments: olist, facts: num,
+        attributes: id, tag_name: id, type_arguments: olist,
     }
     107 JsxSpreadAttribute(JsxSpreadAttributeData) { expression: id }
     108 JsxText(JsxTextData) {
         contains_only_trivia_white_spaces: flag, text: string, token_flags: tflags,
     }
-    109 KeywordExpression(KeywordExpressionData) { flow_node: oflow }
+    109 KeywordExpression(KeywordExpressionData) {}
     110 KeywordTypeNode(KeywordTypeNodeData) {}
-    111 LabeledStatement(LabeledStatementData) { flow_node: oflow, label: id, statement: id }
+    111 LabeledStatement(LabeledStatementData) { label: id, statement: id }
     112 LiteralTypeNode(LiteralTypeNodeData) { literal: id }
     113 MappedTypeNode(MappedTypeNodeData) {
-        locals: table, members: olist, name_type: oid, next_container: oid, question_token: oid,
-        readonly_token: oid, symbol: osym, type_: oid, type_parameter: id,
+        members: olist, name_type: oid, question_token: oid, readonly_token: oid, type_: oid,
+        type_parameter: id,
     }
-    114 MetaProperty(MetaPropertyData) {
-        flow_node: oflow, keyword_token: kind, facts: num, name: id,
-    }
+    114 MetaProperty(MetaPropertyData) { keyword_token: kind, name: id }
     115 MethodDeclaration(MethodDeclarationData) {
-        asterisk_token: oid, body: oid, end_flow_node: oflow, flow_node: oflow, full_signature: oid,
-        locals: table, next_container: oid, parameters: list, postfix_token: oid, symbol: osym,
-        type_: oid, type_parameters: olist, facts: num, modifiers: mods, name: id,
+        asterisk_token: oid, body: oid, full_signature: oid, parameters: list, postfix_token: oid,
+        type_: oid, type_parameters: olist, modifiers: mods, name: id,
     }
     116 MethodSignatureDeclaration(MethodSignatureDeclarationData) {
-        full_signature: oid, locals: table, next_container: oid, parameters: list,
-        postfix_token: oid, symbol: osym, type_: oid, type_parameters: olist, modifiers: mods,
-        name: id,
+        full_signature: oid, parameters: list, postfix_token: oid, type_: oid,
+        type_parameters: olist, modifiers: mods, name: id,
     }
-    117 MissingDeclaration(MissingDeclarationData) {
-        flow_node: oflow, symbol: osym, modifiers: mods,
-    }
-    118 ModuleBlock(ModuleBlockData) { flow_node: oflow, statements: list, facts: num }
+    117 MissingDeclaration(MissingDeclarationData) { modifiers: mods }
+    118 ModuleBlock(ModuleBlockData) { statements: list }
     119 ModuleDeclaration(ModuleDeclarationData) {
-        asterisk_token: oid, attributes: oid, body: oid, end_flow_node: oflow, flow_node: oflow,
-        keyword: kind, local_symbol: osym, locals: table, next_container: oid, symbol: osym,
-        facts: num, modifiers: mods, name: id,
+        asterisk_token: oid, attributes: oid, body: oid, keyword: kind, modifiers: mods, name: id,
     }
-    120 NamedExports(NamedExportsData) { elements: list, facts: num }
-    121 NamedImports(NamedImportsData) { elements: list, facts: num }
+    120 NamedExports(NamedExportsData) { elements: list }
+    121 NamedImports(NamedImportsData) { elements: list }
     122 NamedTupleMember(NamedTupleMemberData) {
-        dot_dot_dot_token: oid, question_token: oid, symbol: osym, type_: id, name: id,
+        dot_dot_dot_token: oid, question_token: oid, type_: id, name: id,
     }
-    123 NamespaceExport(NamespaceExportData) { symbol: osym, name: id }
-    124 NamespaceExportDeclaration(NamespaceExportDeclarationData) {
-        flow_node: oflow, symbol: osym, modifiers: mods, name: id,
-    }
-    125 NamespaceImport(NamespaceImportData) { local_symbol: osym, symbol: osym, name: id }
-    126 NewExpression(NewExpressionData) {
-        arguments: olist, expression: id, type_arguments: olist, facts: num,
-    }
+    123 NamespaceExport(NamespaceExportData) { name: id }
+    124 NamespaceExportDeclaration(NamespaceExportDeclarationData) { modifiers: mods, name: id }
+    125 NamespaceImport(NamespaceImportData) { name: id }
+    126 NewExpression(NewExpressionData) { arguments: olist, expression: id, type_arguments: olist }
     127 NoSubstitutionTemplateLiteral(NoSubstitutionTemplateLiteralData) {
-        raw_text: string, symbol: osym, template_flags: tflags, text: string, token_flags: tflags,
+        raw_text: string, template_flags: tflags, text: string, token_flags: tflags,
     }
     128 NonNullExpression(NonNullExpressionData) { expression: id }
-    129 NotEmittedStatement(NotEmittedStatementData) { flow_node: oflow }
+    129 NotEmittedStatement(NotEmittedStatementData) {}
     130 NotEmittedTypeElement(NotEmittedTypeElementData) {}
     131 NumericLiteral(NumericLiteralData) { text: string, token_flags: tflags }
-    132 ObjectLiteralExpression(ObjectLiteralExpressionData) {
-        multi_line: flag, properties: list, symbol: osym, facts: num,
-    }
+    132 ObjectLiteralExpression(ObjectLiteralExpressionData) { multi_line: flag, properties: list }
     133 OmittedExpression(OmittedExpressionData) {}
     134 OptionalTypeNode(OptionalTypeNodeData) { type_: id }
     135 ParameterDeclaration(ParameterDeclarationData) {
-        dot_dot_dot_token: oid, initializer: oid, question_token: oid, symbol: osym, type_: oid,
-        facts: num, modifiers: mods, name: id,
+        dot_dot_dot_token: oid, initializer: oid, question_token: oid, type_: oid, modifiers: mods,
+        name: id,
     }
     136 ParenthesizedExpression(ParenthesizedExpressionData) { expression: id }
     137 ParenthesizedTypeNode(ParenthesizedTypeNodeData) { type_: id }
@@ -1249,44 +1189,36 @@ payload_codec! {
     140 PrefixUnaryExpression(PrefixUnaryExpressionData) { operand: id, operator: kind }
     141 PrivateIdentifier(PrivateIdentifierData) { text: string }
     142 PropertyAccessExpression(PropertyAccessExpressionData) {
-        expression: id, flow_node: oflow, question_dot_token: oid, facts: num, name: id,
+        expression: id, question_dot_token: oid, name: id,
     }
     143 PropertyAssignment(PropertyAssignmentData) {
-        initializer: id, postfix_token: oid, symbol: osym, type_: oid, facts: num, modifiers: mods,
-        name: id,
+        initializer: id, postfix_token: oid, type_: oid, modifiers: mods, name: id,
     }
     144 PropertyDeclaration(PropertyDeclarationData) {
-        initializer: oid, postfix_token: oid, symbol: osym, type_: oid, facts: num, modifiers: mods,
-        name: id,
+        initializer: oid, postfix_token: oid, type_: oid, modifiers: mods, name: id,
     }
     145 PropertySignatureDeclaration(PropertySignatureDeclarationData) {
-        initializer: id, postfix_token: oid, symbol: osym, type_: id, modifiers: mods, name: id,
+        initializer: id, postfix_token: oid, type_: id, modifiers: mods, name: id,
     }
-    146 QualifiedName(QualifiedNameData) { flow_node: oflow, left: id, right: id, facts: num }
+    146 QualifiedName(QualifiedNameData) { left: id, right: id }
     147 RegularExpressionLiteral(RegularExpressionLiteralData) { text: string, token_flags: tflags }
     148 RestTypeNode(RestTypeNodeData) { type_: id }
-    149 ReturnStatement(ReturnStatementData) { expression: oid, flow_node: oflow, facts: num }
+    149 ReturnStatement(ReturnStatementData) { expression: oid }
     150 SatisfiesExpression(SatisfiesExpressionData) { expression: id, type_: id }
-    151 SemicolonClassElement(SemicolonClassElementData) { symbol: osym }
+    151 SemicolonClassElement(SemicolonClassElementData) {}
     152 SetAccessorDeclaration(SetAccessorDeclarationData) {
-        asterisk_token: oid, body: oid, end_flow_node: oflow, flow_node: oflow, full_signature: oid,
-        locals: table, next_container: oid, parameters: list, postfix_token: oid, symbol: osym,
-        type_: oid, type_parameters: olist, facts: num, modifiers: mods, name: id,
+        asterisk_token: oid, body: oid, full_signature: oid, parameters: list, postfix_token: oid,
+        type_: oid, type_parameters: olist, modifiers: mods, name: id,
     }
     153 ShorthandPropertyAssignment(ShorthandPropertyAssignmentData) {
-        equals_token: oid, object_assignment_initializer: oid, postfix_token: oid, symbol: osym,
-        type_: oid, facts: num, modifiers: mods, name: id,
+        equals_token: oid, object_assignment_initializer: oid, postfix_token: oid, type_: oid,
+        modifiers: mods, name: id,
     }
-    154 SourceFile(SourceFileData) {
-        end_of_file_token: id, locals: table, next_container: oid, statements: list, symbol: osym,
-        facts: num,
-    }
-    155 SpreadAssignment(SpreadAssignmentData) { expression: id, symbol: osym }
+    154 SourceFile(SourceFileData) { end_of_file_token: id, statements: list }
+    155 SpreadAssignment(SpreadAssignmentData) { expression: id }
     156 SpreadElement(SpreadElementData) { expression: id }
     157 StringLiteral(StringLiteralData) { text: string, token_flags: tflags }
-    158 SwitchStatement(SwitchStatementData) {
-        case_block: id, expression: id, flow_node: oflow, facts: num,
-    }
+    158 SwitchStatement(SwitchStatementData) { case_block: id, expression: id }
     159 SyntaxList(SyntaxListData) { children: ids }
     160 SyntheticExpression(SyntheticExpressionData) {
         is_spread: flag, tuple_name_source: oid, type_: opaque,
@@ -1295,9 +1227,9 @@ payload_codec! {
         expression: id, this_arg: id,
     }
     162 TaggedTemplateExpression(TaggedTemplateExpressionData) {
-        question_dot_token: oid, tag: id, template: id, type_arguments: olist, facts: num,
+        question_dot_token: oid, tag: id, template: id, type_arguments: olist,
     }
-    163 TemplateExpression(TemplateExpressionData) { head: id, template_spans: list, facts: num }
+    163 TemplateExpression(TemplateExpressionData) { head: id, template_spans: list }
     164 TemplateHead(TemplateHeadData) {
         raw_text: string, template_flags: tflags, text: string, token_flags: tflags,
     }
@@ -1311,23 +1243,19 @@ payload_codec! {
         raw_text: string, template_flags: tflags, text: string, token_flags: tflags,
     }
     170 ThisTypeNode(ThisTypeNodeData) {}
-    171 ThrowStatement(ThrowStatementData) { expression: id, flow_node: oflow, facts: num }
+    171 ThrowStatement(ThrowStatementData) { expression: id }
     172 Token(TokenData) {}
-    173 TryStatement(TryStatementData) {
-        catch_clause: oid, finally_block: oid, flow_node: oflow, try_block: id, facts: num,
-    }
+    173 TryStatement(TryStatementData) { catch_clause: oid, finally_block: oid, try_block: id }
     174 TupleTypeNode(TupleTypeNodeData) { elements: list }
     175 TypeAliasDeclaration(TypeAliasDeclarationData) {
-        flow_node: oflow, local_symbol: osym, locals: table, next_container: oid, symbol: osym,
         type_: id, type_parameters: olist, modifiers: mods, name: id,
     }
     176 TypeAssertion(TypeAssertionData) { expression: id, type_: id }
-    177 TypeLiteralNode(TypeLiteralNodeData) { members: list, symbol: osym }
+    177 TypeLiteralNode(TypeLiteralNodeData) { members: list }
     178 TypeOfExpression(TypeOfExpressionData) { expression: id }
     179 TypeOperatorNode(TypeOperatorNodeData) { operator: kind, type_: id }
     180 TypeParameterDeclaration(TypeParameterDeclarationData) {
-        constraint: oid, default_type: oid, expression: oid, symbol: osym, modifiers: mods,
-        name: id,
+        constraint: oid, default_type: oid, expression: oid, modifiers: mods, name: id,
     }
     181 TypePredicateNode(TypePredicateNodeData) {
         asserts_modifier: oid, parameter_name: id, type_: oid,
@@ -1336,20 +1264,13 @@ payload_codec! {
     183 TypeReferenceNode(TypeReferenceNodeData) { type_arguments: olist, type_name: id }
     184 UnionTypeNode(UnionTypeNodeData) { types: list }
     185 VariableDeclaration(VariableDeclarationData) {
-        exclamation_token: oid, initializer: oid, local_symbol: osym, symbol: osym, type_: oid,
-        facts: num, name: id,
+        exclamation_token: oid, initializer: oid, type_: oid, name: id,
     }
-    186 VariableDeclarationList(VariableDeclarationListData) { declarations: list, facts: num }
-    187 VariableStatement(VariableStatementData) {
-        declaration_list: id, flow_node: oflow, facts: num, modifiers: mods,
-    }
+    186 VariableDeclarationList(VariableDeclarationListData) { declarations: list }
+    187 VariableStatement(VariableStatementData) { declaration_list: id, modifiers: mods }
     188 VoidExpression(VoidExpressionData) { expression: id }
-    189 WhileStatement(WhileStatementData) {
-        expression: id, flow_node: oflow, statement: id, facts: num,
-    }
-    190 WithStatement(WithStatementData) {
-        expression: id, flow_node: oflow, statement: id, facts: num,
-    }
+    189 WhileStatement(WhileStatementData) { expression: id, statement: id }
+    190 WithStatement(WithStatementData) { expression: id, statement: id }
     191 YieldExpression(YieldExpressionData) { asterisk_token: oid, expression: oid }
 }
 
@@ -1367,6 +1288,9 @@ struct Encoder {
     index: u32,
     /// See `Decoder::pos`.
     pos: i64,
+    /// The list table of the store (astshrink1), which the list fields
+    /// of its node data name.
+    lists: Vec<&'static crate::ast::store::StaticList>,
 }
 
 #[cfg(test)]
@@ -1432,12 +1356,13 @@ impl Encoder {
     }
 
     fn list(&mut self, l: &crate::astdata::NodeList) -> Result<(), String> {
+        let l = self.lists[l.index()];
         let start = i64::from(l.range.start.get());
         let end = i64::from(l.range.end.get());
         self.zz(start - self.pos);
         self.zz(end - start);
-        self.var(((l.nodes.len() as u64) << 1) | u64::from(l.has_trailing_comma));
-        for id in &l.nodes {
+        self.var(((l.nodes.len() as u64) << 1) | u64::from(l.has_trailing_comma()));
+        for id in l.nodes {
             self.id(id)?;
         }
         Ok(())
@@ -1460,23 +1385,10 @@ impl Encoder {
             Some(m) => {
                 self.u8(1);
                 self.list(&m.list)?;
-                self.var(u64::from(m.flags.0));
+                let flags = self.lists[m.list.index()].modifier_flags();
+                self.var(u64::from(flags.0));
             }
         }
-        Ok(())
-    }
-
-    fn osym(&mut self, symbol: &Option<crate::astdata::SymbolId>) -> Result<(), String> {
-        self.var(symbol.map_or(0, |symbol| u64::from(symbol.0) + 1));
-        Ok(())
-    }
-
-    fn oflow(&mut self, flow: &Option<crate::astdata::FlowNodeId>) -> Result<(), String> {
-        self.var(flow.map_or(0, |flow| u64::from(flow.0) + 1));
-        Ok(())
-    }
-
-    fn table(&mut self, _: &crate::astdata::SymbolTable) -> Result<(), String> {
         Ok(())
     }
 
@@ -1734,6 +1646,7 @@ fn encode_section(
         store: file.store,
         index: 0,
         pos: 0,
+        lists: crate::ast::store::lib_parse_list_table(file.store),
     };
     let mut palette: Vec<(SyntaxKind, NodeFlags)> = Vec::new();
     let mut palette_index: FxHashMap<(SyntaxKind, NodeFlags), u64> = FxHashMap::default();
@@ -1786,6 +1699,7 @@ fn encode_section(
         store: file.store,
         index: 0,
         pos: 0,
+        lists: Vec::new(),
     };
     e.count(views.len());
     e.count(palette.len());
@@ -1826,7 +1740,7 @@ mod tests {
     };
 
     /// How to write the blob again.
-    const REGENERATE: &str = "run `cargo test -p ts_goport --lib \
+    const REGENERATE: &str = "run `cargo test -p goport_core --lib \
         frontend::parser::lib_parse_snapshot::tests::generate_lib_parse_snapshot -- --ignored --exact` \
         (through scripts/run-cargo-capped.sh)";
 
@@ -1984,7 +1898,7 @@ mod tests {
         let blob = write_blob(MAGIC, &sections);
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/frontend/parser/lib_parse.bin"
+            "/../../src/frontend/parser/lib_parse.bin"
         );
         std::fs::write(path, &blob).unwrap_or_else(|e| panic!("cannot write {path}: {e}"));
         eprintln!("wrote {path}: {} bytes", blob.len());

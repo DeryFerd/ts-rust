@@ -7,8 +7,15 @@
 //!
 //! PORT: Go reuses slices across calls (`nodeSliceArena`, `stringSliceArena`,
 //! `jsdocCommentsSpace`, `jsdocCommentRangesSpace`, `jsdocTagCommentsSpace`,
-//! `jsdocTagCommentsPartsSpace`). They only save allocations. Here each call
-//! uses a new `Vec`, and the parser fields are not used.
+//! `jsdocTagCommentsPartsSpace`). They only save allocations. Here the
+//! comment text parsers reuse `jsdoc_comments_space`,
+//! `jsdoc_tag_comments_space` and `jsdoc_tag_comments_parts_space` as Go
+//! does, and the other calls use a new `Vec`.
+//!
+//! PERF: the comment text parts are slices of the scanner text, as Go's
+//! substrings, not a `String` per token (jsdocstr1; astchunks0 section 7).
+
+use std::borrow::Cow;
 
 use crate::frontend::prelude::*;
 
@@ -74,11 +81,35 @@ pub const PROPERTY_LIKE_PARSE_CALLBACK_PARAMETER: PropertyLikeParse = 1 << 2;
 // PORT: Go strings are bytes, so `s[i:]` can split a UTF-8 sequence. Rust
 // `&str` slicing panics there. `s` is whitespace, which has no port form unit
 // (see `scanner_util::GO_STRING_MARKER`), so the split bytes become invalid
-// byte units, the Go bytes.
-fn byte_suffix(s: &str, i: usize) -> String {
+// byte units, the Go bytes: a new text. Otherwise it is a slice of `s`.
+fn byte_suffix(s: &str, i: usize) -> Cow<'_, str> {
     match s.get(i..) {
-        Some(t) => t.to_string(),
-        None => crate::scanner_util::go_string_from_bytes(s.as_bytes()[i..].to_vec()),
+        Some(t) => Cow::Borrowed(t),
+        None => Cow::Owned(crate::scanner_util::go_string_from_bytes(
+            s.as_bytes()[i..].to_vec(),
+        )),
+    }
+}
+
+/// The text of a JSDocText or JSDocLink node made of its parts.
+// PORT: Go keeps the parts (substrings of the comment) and joins them in
+// `Text()` (`ast.go:300`). The port node data owns `Vec<String>`, and every
+// reader joins it (`Node::text`), so the parser joins the parts once here
+// and the node keeps one part, as the API decoder makes it.
+fn joined_parts<S: std::borrow::Borrow<str>>(parts: &[S]) -> Vec<String> {
+    if parts.is_empty() {
+        Vec::new()
+    } else {
+        vec![parts.concat()]
+    }
+}
+
+/// Go `strings.TrimRightFunc(part, f)`: a shorter slice, or a shorter owned
+/// text.
+fn trim_part_end(part: &mut Cow<'_, str>, f: fn(char) -> bool) {
+    match part {
+        Cow::Borrowed(s) => *s = (*s).trim_end_matches(f),
+        Cow::Owned(s) => s.truncate(s.trim_end_matches(f).len()),
     }
 }
 
@@ -266,6 +297,15 @@ impl<'a> Parser<'a> {
         let save_context_flags = self.context_flags;
         let save_parsing_contexts = self.parsing_contexts;
         let save_scanner_state = self.scanner.mark();
+        // Not in Go (parsefast2): `set_text` clears it.
+        let save_text_has_no_go_string_marker = self.scanner.text_has_no_go_string_marker;
+        // Go: jsdoc.go:153 Mark saves the `commentDirectives` slice header,
+        // SetText (jsdoc.go:164, scanner.go:400) starts a nil slice, so the
+        // JSDoc scan appends to a new array, and Rewind (jsdoc.go:181) gives
+        // back the outer slice unchanged. A directive inside the JSDoc is
+        // dropped. PORT: the scanner state keeps only a length into the
+        // scanner's one `Vec`, so the save also takes that `Vec` (issue #49).
+        let save_comment_directives = std::mem::take(&mut self.scanner.comment_directives);
         let save_diagnostics_length = self.diagnostics.borrow().diagnostics.len();
         let save_has_parse_error = self.has_parse_error();
         let save_has_await_identifier = self.statement_has_await_identifier;
@@ -284,6 +324,7 @@ impl<'a> Parser<'a> {
         // parse. The positions after the split char differ from Go's, so
         // the nodes, lists and diagnostics map them (`jsdoc_tail_pos`).
         let (cut, kept) = jsdoc_text_cut(save_source_text, end as usize);
+        let cut_has_no_tail = kept.is_empty();
         self.source_text = if kept.is_empty() {
             &save_source_text[..cut]
         } else {
@@ -302,6 +343,10 @@ impl<'a> Parser<'a> {
             }
         };
         self.scanner.set_text(self.source_text);
+        // A cut of the text with no kept tail is a prefix of the text; a
+        // tail holds invalid byte units, which are markers.
+        self.scanner
+            .set_text_has_no_go_string_marker(cut_has_no_tail && save_text_has_no_go_string_marker);
         // +3 for leading `/**`
         self.scanner.reset_pos(start + 3);
         self.set_context_flags(NodeFlags::JS_DOC, true);
@@ -327,8 +372,11 @@ impl<'a> Parser<'a> {
 
         self.source_text = save_source_text;
         self.scanner.set_text(self.source_text);
+        self.scanner
+            .set_text_has_no_go_string_marker(save_text_has_no_go_string_marker);
         self.parsing_contexts = save_parsing_contexts;
         self.context_flags = save_context_flags;
+        self.scanner.comment_directives = save_comment_directives;
         self.scanner.rewind(save_scanner_state);
         self.token = save_token;
         self.set_has_parse_error(save_has_parse_error);
@@ -356,7 +404,8 @@ impl<'a> Parser<'a> {
         let mut backtick_count = 0;
         let mut in_fenced_code_block = false;
         let mut comment_parts: Vec<Node> = Vec::new();
-        let mut comments: Vec<String> = Vec::new();
+        // Go: `comments := p.jsdocCommentsSpace`. Taken while in use.
+        let mut comments = std::mem::take(&mut self.jsdoc_comments_space);
         let mut comments_pos = -1;
         let mut link_end = start;
         let mut margin = -1;
@@ -364,12 +413,12 @@ impl<'a> Parser<'a> {
         // would hold them borrowed for the whole loop, so it is a macro.
         macro_rules! push_comment {
             ($text:expr) => {{
-                let text: String = ($text).to_string();
+                let text: &'a str = $text;
                 if margin == -1 {
                     margin = indent;
                 }
                 indent += text.len() as i32;
-                comments.push(text);
+                comments.push(Cow::Borrowed(text));
             }};
         }
 
@@ -416,12 +465,12 @@ impl<'a> Parser<'a> {
                     }
                 }
                 SyntaxKind::NewLineTrivia => {
-                    comments.push(self.scanner.token_text().to_string());
+                    comments.push(Cow::Borrowed(self.scanner.token_text()));
                     state = JsdocState::BeginningOfLine;
                     indent = 0;
                 }
                 SyntaxKind::AsteriskToken => {
-                    let asterisk: String = self.scanner.token_text().to_string();
+                    let asterisk = self.scanner.token_text();
                     if state == JsdocState::SawAsterisk {
                         // If we've already seen an asterisk, then we can no longer parse a tag on this line
                         state = JsdocState::SavingComments;
@@ -442,7 +491,7 @@ impl<'a> Parser<'a> {
                         "whitespace shouldn't come from the scanner while saving top-level comment text"
                     );
                     // only collect whitespace if we're already saving comments or have just crossed the comment indent margin
-                    let whitespace: String = self.scanner.token_text().to_string();
+                    let whitespace = self.scanner.token_text();
                     let len = whitespace.len() as i32;
                     if margin > -1 && indent + len > margin {
                         let mut existing_indent = margin - indent;
@@ -452,7 +501,7 @@ impl<'a> Parser<'a> {
                         if existing_indent < 0 {
                             existing_indent = 0;
                         }
-                        comments.push(byte_suffix(&whitespace, existing_indent as usize));
+                        comments.push(byte_suffix(whitespace, existing_indent as usize));
                     }
                     indent += len;
                 }
@@ -494,10 +543,8 @@ impl<'a> Parser<'a> {
                                 if link_end == start {
                                     remove_leading_newlines(&mut comments);
                                 }
-                                // PERF: `take` moves the strings out and leaves
-                                // `comments` empty, as Go's `comments = comments[:0]`.
-                                let text =
-                                    self.factory.new_js_doc_text(std::mem::take(&mut comments));
+                                let text = self.factory.new_js_doc_text(joined_parts(&comments));
+                                comments.clear();
                                 let jsdoc_text =
                                     self.finish_node_with_end(text, link_end, comment_end);
                                 comment_parts.push(jsdoc_text);
@@ -534,12 +581,14 @@ impl<'a> Parser<'a> {
         }
 
         if let Some(last) = comments.last_mut() {
-            *last = last.trim_end_matches(char::is_whitespace).to_string();
-            // PERF: `comments` is not read after this, so move it.
-            let text = self.factory.new_js_doc_text(std::mem::take(&mut comments));
+            trim_part_end(last, char::is_whitespace);
+            let text = self.factory.new_js_doc_text(joined_parts(&comments));
             let jsdoc_text = self.finish_node_with_end(text, link_end, comments_pos);
             comment_parts.push(jsdoc_text);
         }
+        // Go: `p.jsdocCommentsSpace = comments[:0]`.
+        comments.clear();
+        self.jsdoc_comments_space = comments;
 
         assert!(
             !(!comment_parts.is_empty() && !tags.is_empty() && comments_pos == -1),
@@ -593,35 +642,40 @@ impl<'a> Parser<'a> {
     }
 
     // Go: jsdoc.go:431 skipWhitespaceOrAsterisk
-    pub(crate) fn skip_whitespace_or_asterisk(&mut self) -> String {
+    // PERF: Go joins the texts of the tokens after the last newline. The
+    // JSDoc tokens after it are contiguous (`scan_js_doc_token` starts each
+    // one at the end of the one before), so the join is the slice of the
+    // scanner text from the end of that newline to the full start of the
+    // current token: no allocation.
+    pub(crate) fn skip_whitespace_or_asterisk(&mut self) -> &'a str {
         if (self.token == SyntaxKind::WhitespaceTrivia || self.token == SyntaxKind::NewLineTrivia)
             && self.look_ahead(Self::is_next_nonwhitespace_token_end_of_file)
         {
             // Don't skip whitespace prior to EoF (or end of comment) - that shouldn't be included in any node's range
-            return String::new();
+            return "";
         }
 
         let mut preceding_line_break = self.scanner.has_preceding_line_break();
-        let mut seen_line_break = false;
-        let mut indents: Vec<String> = Vec::with_capacity(4);
+        // The end of the last newline token (Go: `seenLineBreak` and the
+        // start of `indents`).
+        let mut indents_start: Option<i32> = None;
         while (preceding_line_break && self.token == SyntaxKind::AsteriskToken)
             || self.token == SyntaxKind::WhitespaceTrivia
             || self.token == SyntaxKind::NewLineTrivia
         {
-            indents.push(self.scanner.token_text().to_string());
             if self.token == SyntaxKind::NewLineTrivia {
                 preceding_line_break = true;
-                seen_line_break = true;
-                indents.clear();
+                indents_start = Some(self.scanner.token_end());
             } else if self.token == SyntaxKind::AsteriskToken {
                 preceding_line_break = false;
             }
             self.next_token_js_doc();
         }
-        if seen_line_break {
-            indents.concat()
-        } else {
-            String::new()
+        match indents_start {
+            Some(start) => {
+                &self.scanner.text[start as usize..self.scanner.token_full_start() as usize]
+            }
+            None => "",
         }
     }
 
@@ -638,44 +692,42 @@ impl<'a> Parser<'a> {
         let indent_text = self.skip_whitespace_or_asterisk();
 
         let tag = match tag_name.text() {
-            "implements" => self.parse_implements_tag(start, tag_name, margin, &indent_text),
-            "augments" | "extends" => {
-                self.parse_augments_tag(start, tag_name, margin, &indent_text)
-            }
+            "implements" => self.parse_implements_tag(start, tag_name, margin, indent_text),
+            "augments" | "extends" => self.parse_augments_tag(start, tag_name, margin, indent_text),
             "public" => self.parse_simple_tag(
                 start,
                 NodeFactory::new_js_doc_public_tag,
                 tag_name,
                 margin,
-                &indent_text,
+                indent_text,
             ),
             "private" => self.parse_simple_tag(
                 start,
                 NodeFactory::new_js_doc_private_tag,
                 tag_name,
                 margin,
-                &indent_text,
+                indent_text,
             ),
             "protected" => self.parse_simple_tag(
                 start,
                 NodeFactory::new_js_doc_protected_tag,
                 tag_name,
                 margin,
-                &indent_text,
+                indent_text,
             ),
             "readonly" => self.parse_simple_tag(
                 start,
                 NodeFactory::new_js_doc_readonly_tag,
                 tag_name,
                 margin,
-                &indent_text,
+                indent_text,
             ),
             "override" => self.parse_simple_tag(
                 start,
                 NodeFactory::new_js_doc_override_tag,
                 tag_name,
                 margin,
-                &indent_text,
+                indent_text,
             ),
             "deprecated" => {
                 self.has_deprecated_tag = true;
@@ -684,10 +736,10 @@ impl<'a> Parser<'a> {
                     NodeFactory::new_js_doc_deprecated_tag,
                     tag_name,
                     margin,
-                    &indent_text,
+                    indent_text,
                 )
             }
-            "this" => self.parse_this_tag(start, tag_name, margin, &indent_text),
+            "this" => self.parse_this_tag(start, tag_name, margin, indent_text),
             "arg" | "argument" | "param" => self.parse_parameter_or_property_tag(
                 start,
                 tag_name,
@@ -695,18 +747,18 @@ impl<'a> Parser<'a> {
                 margin,
             ),
             "return" | "returns" => {
-                self.parse_return_tag(tags, start, tag_name, margin, &indent_text)
+                self.parse_return_tag(tags, start, tag_name, margin, indent_text)
             }
-            "template" => self.parse_template_tag(start, tag_name, margin, &indent_text),
-            "type" => self.parse_type_tag(tags, start, tag_name, margin, &indent_text),
-            "typedef" => self.parse_typedef_tag(start, tag_name, margin, &indent_text),
-            "callback" => self.parse_callback_tag(start, tag_name, margin, &indent_text),
-            "overload" => self.parse_overload_tag(start, tag_name, margin, &indent_text),
-            "satisfies" => self.parse_satisfies_tag(start, tag_name, margin, &indent_text),
-            "see" => self.parse_see_tag(start, tag_name, margin, &indent_text),
-            "exception" | "throws" => self.parse_throws_tag(start, tag_name, margin, &indent_text),
-            "import" => self.parse_import_tag(start, tag_name, margin, &indent_text),
-            _ => self.parse_unknown_tag(start, tag_name, margin, &indent_text),
+            "template" => self.parse_template_tag(start, tag_name, margin, indent_text),
+            "type" => self.parse_type_tag(tags, start, tag_name, margin, indent_text),
+            "typedef" => self.parse_typedef_tag(start, tag_name, margin, indent_text),
+            "callback" => self.parse_callback_tag(start, tag_name, margin, indent_text),
+            "overload" => self.parse_overload_tag(start, tag_name, margin, indent_text),
+            "satisfies" => self.parse_satisfies_tag(start, tag_name, margin, indent_text),
+            "see" => self.parse_see_tag(start, tag_name, margin, indent_text),
+            "exception" | "throws" => self.parse_throws_tag(start, tag_name, margin, indent_text),
+            "import" => self.parse_import_tag(start, tag_name, margin, indent_text),
+            _ => self.parse_unknown_tag(start, tag_name, margin, indent_text),
         };
         assert!(!tag.is_nil(), "tag should not be nil");
         tag
@@ -718,7 +770,7 @@ impl<'a> Parser<'a> {
         pos: i32,
         end: i32,
         mut margin: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> NodeList {
         // some tags, like typedef and callback, have already parsed their comments earlier
         if indent_text.is_empty() {
@@ -727,16 +779,22 @@ impl<'a> Parser<'a> {
         let initial_margin = if (margin as usize) < indent_text.len() {
             byte_suffix(indent_text, margin as usize)
         } else {
-            String::new()
+            Cow::Borrowed("")
         };
-        self.parse_tag_comments(margin, Some(&initial_margin))
+        self.parse_tag_comments(margin, Some(initial_margin))
     }
 
     // Go: jsdoc.go:546 parseTagComments
-    fn parse_tag_comments(&mut self, mut indent: i32, initial_margin: Option<&str>) -> NodeList {
+    fn parse_tag_comments(
+        &mut self,
+        mut indent: i32,
+        initial_margin: Option<Cow<'a, str>>,
+    ) -> NodeList {
         let comments_pos = self.node_pos();
-        let mut comments: Vec<String> = Vec::new();
-        let mut parts: Vec<Node> = Vec::new();
+        // Go: `comments := p.jsdocTagCommentsSpace` and `parts :=
+        // p.jsdocTagCommentsPartsSpace`, set to nil while in use.
+        let mut comments = std::mem::take(&mut self.jsdoc_tag_comments_space);
+        let mut parts = std::mem::take(&mut self.jsdoc_tag_comments_parts_space);
         let mut link_end = -1;
         let mut state = JsdocState::BeginningOfLine;
         let mut backtick_count = 0;
@@ -746,7 +804,7 @@ impl<'a> Parser<'a> {
         // PORT: Go `pushComment` closure, as a macro (see parseJSDocCommentWorker).
         macro_rules! push_comment {
             ($text:expr) => {{
-                let text: String = ($text).to_string();
+                let text: Cow<'a, str> = ($text).into();
                 if margin == -1 {
                     margin = indent;
                 }
@@ -776,7 +834,7 @@ impl<'a> Parser<'a> {
                 SyntaxKind::NewLineTrivia => {
                     state = JsdocState::BeginningOfLine;
                     // don't use pushComment here because we want to keep the margin unchanged
-                    comments.push(self.scanner.token_text().to_string());
+                    comments.push(Cow::Borrowed(self.scanner.token_text()));
                     indent = 0;
                 }
                 SyntaxKind::AtToken => {
@@ -801,11 +859,11 @@ impl<'a> Parser<'a> {
                         state != JsdocState::SavingComments && state != JsdocState::SavingBackticks,
                         "whitespace shouldn't come from the scanner while saving comment text"
                     );
-                    let whitespace: String = self.scanner.token_text().to_string();
+                    let whitespace = self.scanner.token_text();
                     let len = whitespace.len() as i32;
                     // if the whitespace crosses the margin, take only the whitespace that passes the margin
                     if margin > -1 && indent + len > margin {
-                        comments.push(byte_suffix(&whitespace, (margin - indent).max(0) as usize));
+                        comments.push(byte_suffix(whitespace, (margin - indent).max(0) as usize));
                         state = if in_fenced_code_block {
                             JsdocState::SavingBackticks
                         } else {
@@ -829,9 +887,8 @@ impl<'a> Parser<'a> {
                             } else {
                                 comments_pos
                             };
-                            // PERF: `take` moves the strings out and leaves
-                            // `comments` empty, as Go's `comments = comments[:0]`.
-                            let t = self.factory.new_js_doc_text(std::mem::take(&mut comments));
+                            let t = self.factory.new_js_doc_text(joined_parts(&comments));
+                            comments.clear();
                             let text = self.finish_node_with_end(t, comment_start, comment_end);
                             parts.push(text);
                             parts.push(link);
@@ -895,17 +952,24 @@ impl<'a> Parser<'a> {
             } else {
                 comments_pos
             };
-            // PERF: `comments` is not read after this, so move it.
-            let t = self.factory.new_js_doc_text(std::mem::take(&mut comments));
+            let t = self.factory.new_js_doc_text(joined_parts(&comments));
             let text = self.finish_node(t, comment_start);
             parts.push(text);
         }
+        // Go: `p.jsdocTagCommentsSpace = comments[:0]`.
+        comments.clear();
+        self.jsdoc_tag_comments_space = comments;
 
-        if !parts.is_empty() {
+        let list = if !parts.is_empty() {
             let end = self.scanner.token_end();
-            return self.new_node_list(TextRange::new(comments_pos, end), &parts);
-        }
-        NodeList::NIL
+            self.new_node_list(TextRange::new(comments_pos, end), &parts)
+        } else {
+            NodeList::NIL
+        };
+        // Go: `p.jsdocTagCommentsPartsSpace = parts[:0]`.
+        parts.clear();
+        self.jsdoc_tag_comments_parts_space = parts;
+        list
     }
 
     // Go: jsdoc.go:714 parseJSDocLink
@@ -919,18 +983,30 @@ impl<'a> Parser<'a> {
         // start at token after link, then skip any whitespace
         self.skip_whitespace();
         let name = self.parse_js_doc_link_name();
-        let mut text: Vec<String> = Vec::new();
+        // PERF: Go appends each token text. The tokens after the first are
+        // JSDoc tokens, which start at the end of the one before, so the
+        // parts are the slice of the text from the start of the first token
+        // to the end of the last one.
+        let text_start = self.scanner.token_start();
+        let mut text_end = text_start;
         while self.token != SyntaxKind::CloseBraceToken
             && self.token != SyntaxKind::NewLineTrivia
             && self.token != SyntaxKind::EndOfFile
         {
-            text.push(self.scanner.token_text().to_string());
+            text_end = self.scanner.token_end();
             self.next_token_js_doc(); // Couldn't this be nextTokenCommentJSDoc?
         }
-        let create = match link_type.as_str() {
-            "link" => self.factory.new_js_doc_link(name, text.clone()),
-            "linkcode" => self.factory.new_js_doc_link_code(name, text.clone()),
-            _ => self.factory.new_js_doc_link_plain(name, text.clone()),
+        // The one-part node text (see `joined_parts`), or no part when the
+        // loop took no token.
+        let text = if text_end > text_start {
+            vec![self.scanner.text[text_start as usize..text_end as usize].to_string()]
+        } else {
+            Vec::new()
+        };
+        let create = match link_type {
+            "link" => self.factory.new_js_doc_link(name, text),
+            "linkcode" => self.factory.new_js_doc_link_code(name, text),
+            _ => self.factory.new_js_doc_link_plain(name, text),
         };
         let end = self.scanner.token_end();
         self.finish_node_with_end(create, start, end)
@@ -964,14 +1040,14 @@ impl<'a> Parser<'a> {
 
     // Go: jsdoc.go:765 parseJSDocLinkPrefix
     // PORT: Go returns `(string, bool)`; `false` (with the kind "NONE") is `None`.
-    fn parse_js_doc_link_prefix(&mut self) -> Option<String> {
+    fn parse_js_doc_link_prefix(&mut self) -> Option<&'a str> {
         self.skip_whitespace_or_asterisk();
         if self.token == SyntaxKind::OpenBraceToken
             && self.next_token_js_doc() == SyntaxKind::AtToken
             && token_is_identifier_or_keyword(self.next_token_js_doc())
         {
-            let kind: String = self.scanner.token_value().to_string();
-            if is_js_doc_link_tag(&kind) {
+            let kind = self.scanner.token_value();
+            if is_js_doc_link_tag(kind) {
                 return Some(kind);
             }
         }
@@ -984,7 +1060,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         indent: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         let pos = self.node_pos();
         let comment = self.parse_trailing_tag_comments(start, pos, indent, indent_text);
@@ -1058,7 +1134,7 @@ impl<'a> Parser<'a> {
         }
 
         let pos = self.node_pos();
-        let comment = self.parse_trailing_tag_comments(start, pos, indent, &indent_text);
+        let comment = self.parse_trailing_tag_comments(start, pos, indent, indent_text);
 
         let nested_type_literal =
             self.parse_nested_type_literal(type_expression, name, target, indent);
@@ -1138,7 +1214,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         indent: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         if previous_tags.iter().any(|&t| is_js_doc_return_tag(t)) {
             let end = self.scanner.token_start();
@@ -1168,7 +1244,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         indent: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         if previous_tags.iter().any(|&t| is_js_doc_type_tag(t)) {
             let end = self.scanner.token_start();
@@ -1198,7 +1274,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         indent: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         let has_name_reference = (self.is_identifier()
             && !self.source_text[self.scanner.token_end() as usize..].starts_with("://"))
@@ -1222,7 +1298,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         margin: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         let class_name = self.parse_expression_with_type_arguments_for_augments();
         let pos = self.node_pos();
@@ -1239,7 +1315,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         margin: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         let class_name = self.parse_expression_with_type_arguments_for_augments();
         let pos = self.node_pos();
@@ -1256,7 +1332,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         margin: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         let type_expression = self.parse_js_doc_type_expression(false);
         let pos = self.node_pos();
@@ -1273,7 +1349,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         margin: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         let type_expression = self.try_parse_type_expression();
         let pos = self.node_pos();
@@ -1290,7 +1366,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         margin: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         let after_import_tag_pos = self.scanner.token_full_start();
 
@@ -1362,7 +1438,7 @@ impl<'a> Parser<'a> {
         create_tag: fn(&NodeFactory, Node, NodeList) -> Node,
         tag_name: Node,
         margin: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         let pos = self.node_pos();
         let comment = self.parse_trailing_tag_comments(start, pos, margin, indent_text);
@@ -1376,7 +1452,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         margin: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         let type_expression = self.parse_js_doc_type_expression(true);
         self.skip_whitespace();
@@ -1427,7 +1503,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         indent: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         let mut type_expression = self.try_parse_type_expression();
         self.skip_whitespace_or_asterisk();
@@ -1601,7 +1677,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         indent: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         let mut full_name = self.parse_js_doc_type_name_with_namespace(false /*nested*/);
         if full_name.is_nil() {
@@ -1632,7 +1708,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         indent: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         self.skip_whitespace();
         let mut comment = self.parse_tag_comments(indent, None);
@@ -1729,8 +1805,8 @@ impl<'a> Parser<'a> {
             "arg" | "argument" | "param" => {
                 t = PROPERTY_LIKE_PARSE_PARAMETER | PROPERTY_LIKE_PARSE_CALLBACK_PARAMETER
             }
-            "template" => return self.parse_template_tag(start, tag_name, indent, &indent_text),
-            "this" => return self.parse_this_tag(start, tag_name, indent, &indent_text),
+            "template" => return self.parse_template_tag(start, tag_name, indent, indent_text),
+            "this" => return self.parse_this_tag(start, tag_name, indent, indent_text),
             _ => return Node::NIL,
         }
         if (target & t) == 0 {
@@ -1802,7 +1878,7 @@ impl<'a> Parser<'a> {
         start: i32,
         tag_name: Node,
         indent: i32,
-        indent_text: &str,
+        indent_text: &'a str,
     ) -> Node {
         // The template tag looks like one of the following:
         //   @template T,U,V
@@ -1888,7 +1964,7 @@ impl<'a> Parser<'a> {
 
 // Go: jsdoc.go:380 removeLeadingNewlines
 // PORT: Go returns the subslice `comments[i:]`; this drops the prefix in place.
-fn remove_leading_newlines(comments: &mut Vec<String>) {
+fn remove_leading_newlines(comments: &mut Vec<Cow<'_, str>>) {
     let mut i = 0;
     while i < comments.len() && comments[i].trim_start_matches(['\r', '\n']).is_empty() {
         i += 1;
@@ -1896,21 +1972,17 @@ fn remove_leading_newlines(comments: &mut Vec<String>) {
     comments.drain(..i);
 }
 
-// Go: jsdoc.go:388 trimEnd
-fn trim_end(s: &str) -> &str {
-    s.trim_end_matches(is_white_space_like)
-}
-
 // Go: jsdoc.go:392 removeTrailingWhitespace
 // PORT: Go returns the subslice `comments[:end]`; this truncates in place.
-fn remove_trailing_whitespace(comments: &mut Vec<String>) {
+// A part that trims to empty is dropped, so trimming it first is the same.
+// Go `trimEnd` (jsdoc.go:388) is `trim_part_end` with `is_white_space_like`.
+fn remove_trailing_whitespace(comments: &mut Vec<Cow<'_, str>>) {
     let mut end = comments.len();
     for i in (0..comments.len()).rev() {
-        let trimmed = trim_end(&comments[i]);
-        if trimmed.is_empty() {
+        trim_part_end(&mut comments[i], is_white_space_like);
+        if comments[i].is_empty() {
             end = i;
         } else {
-            comments[i] = trimmed.to_string();
             break;
         }
     }

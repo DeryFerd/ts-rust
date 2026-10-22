@@ -308,7 +308,14 @@ impl<'a> AstGenerator<'a> {
             }
         }
         fields.remove("Flags");
-        Ok(fields.into_values().filter(|field| !field.no_go).collect())
+        // astshrink1: the `goOnly` fields are the binder fields (`Symbol`,
+        // `LocalSymbol`, `Locals`, `NextContainer`, the flow nodes and
+        // `facts`). The port keeps that data in the store records, the bind
+        // extras and `subtree_facts`, so the node data has no room for it.
+        Ok(fields
+            .into_values()
+            .filter(|field| !field.no_go && !field.go_only)
+            .collect())
     }
 
     fn apply_inherited_member(
@@ -345,7 +352,7 @@ impl<'a> AstGenerator<'a> {
                 continue;
             }
             let Some(field) = fields.iter().find(|field| field.schema_name == member.name) else {
-                if member.no_go {
+                if member.no_go || member.go_only {
                     continue;
                 }
                 return Err(format!(
@@ -474,13 +481,13 @@ impl<'a> AstGenerator<'a> {
         )
         .unwrap();
         writeln!(output, "    pub fn try_for_each_child<B, F>(").unwrap();
-        writeln!(output, "        &self,").unwrap();
+        writeln!(output, "        self,").unwrap();
         writeln!(output, "        visitor: &mut F,").unwrap();
         writeln!(output, "    ) -> std::ops::ControlFlow<B>").unwrap();
         writeln!(output, "    where").unwrap();
         writeln!(
             output,
-            "        F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,"
+            "        F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,"
         )
         .unwrap();
         writeln!(output, "    {{").unwrap();
@@ -526,6 +533,202 @@ impl<'a> AstGenerator<'a> {
         Ok(())
     }
 
+    /// `NodeData::for_each_list`: every list field of the data, also the
+    /// ones that `try_for_each_child` does not visit. A print pack copies
+    /// them all (astshrink1).
+    fn generate_list_walk(&self, output: &mut String) -> Result<(), String> {
+        output.push_str(
+            "
+    /// Visits every list field of the data, also the ones that
+    /// `try_for_each_child` skips, as Go `ForEachChild` does.
+    #[allow(clippy::too_many_lines)]
+    pub fn for_each_list(self, mut visitor: impl FnMut(NodeList)) {
+        let mut visit = |list: Option<NodeList>| {
+            if let Some(list) = list {
+                visitor(list);
+            }
+        };
+        match self {
+",
+        );
+        for (name, node) in &self.schema.nodes.definitions {
+            let mut visits = Vec::new();
+            for field in self.node_fields(name, node)? {
+                let f = rust_field_name(&field.schema_name);
+                let ty = self.rust_type(&field.ty, field.list, field.optional)?;
+                visits.push(match ty.as_str() {
+                    "NodeList" => format!("visit(Some(node.{f}))"),
+                    "Option<NodeList>" => format!("visit(node.{f})"),
+                    "ModifierList" => format!("visit(Some(node.{f}.list))"),
+                    "Option<ModifierList>" => format!("visit(node.{f}.map(|m| m.list))"),
+                    _ => continue,
+                });
+            }
+            let rust_name = rust_type_name(name);
+            match visits.as_slice() {
+                [] => {}
+                [visit] => {
+                    writeln!(output, "            Self::{rust_name}(node) => {visit},").unwrap();
+                }
+                _ => {
+                    let visits = visits.join("; ");
+                    writeln!(
+                        output,
+                        "            Self::{rust_name}(node) => {{ {visits}; }}"
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        output.push_str("            _ => {}\n        }\n    }\n");
+        Ok(())
+    }
+
+    /// `BoxedData`, the owning data (a box per payload), and `NodeData<'a>`,
+    /// the borrowed view that readers match (Go's `nodeData` interface word:
+    /// a tag and a pointer, 16 B). Both are `#[repr(u8)]` with one variant
+    /// order, so `BoxedData::view` is a copy (astchunks2 probe).
+    fn generate_data_enums(&self, output: &mut String) {
+        output.push_str(
+            "/// The owning node data: one box per payload. Owned file versions (LSP)
+/// and synthetic nodes keep their data in it. Readers match its `view`.
+#[derive(Clone, Debug)]
+#[repr(u8)]
+pub enum BoxedData {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(output, "    {rust_name}(Box<{rust_name}Data>),").unwrap();
+        }
+        output.push_str(
+            "}
+
+/// The node data that readers match: a tag and a reference (16 B), as Go's
+/// `nodeData` interface word. Same tags and order as `BoxedData`.
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum NodeData<'a> {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(output, "    {rust_name}(&'a {rust_name}Data),").unwrap();
+        }
+        output.push_str(
+            "}
+
+impl BoxedData {
+    /// The view of the data. A 16 B copy: the two enums have one layout.
+    #[inline]
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn view(&self) -> NodeData<'_> {
+        match self {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(
+                output,
+                "            Self::{rust_name}(d) => NodeData::{rust_name}(d),"
+            )
+            .unwrap();
+        }
+        output.push_str("        }\n    }\n}\n\n");
+    }
+
+    /// `NodeData::to_boxed`, `NodeData::addr` and `NodeData::same`.
+    fn generate_view_methods(&self, output: &mut String) {
+        output.push_str(
+            "
+    /// An owning copy of the data in a new box.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn to_boxed(self) -> BoxedData {
+        match self {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(
+                output,
+                "            Self::{rust_name}(d) => BoxedData::{rust_name}(Box::new(d.clone())),"
+            )
+            .unwrap();
+        }
+        output.push_str(
+            "        }
+    }
+
+    /// The address of the data. Data of a zero-size type can share an
+    /// address with other data: `same` also compares the tag.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn addr(self) -> *const () {
+        match self {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(
+                output,
+                "            Self::{rust_name}(d) => std::ptr::from_ref(d).cast(),"
+            )
+            .unwrap();
+        }
+        output.push_str(
+            "        }
+    }
+
+    /// Whether `self` and `other` view the same data: same tag and address.
+    #[must_use]
+    pub fn same(self, other: Self) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&other)
+            && std::ptr::eq(self.addr(), other.addr())
+    }
+",
+        );
+    }
+
+    /// `AstData`: the view and the box of one data struct (the factory's
+    /// `new_node<T: AstData>`).
+    fn generate_ast_data_impls(&self, output: &mut String) {
+        output.push_str(
+            "/// One node data struct: its view and its box.
+pub trait AstData: Sized + 'static {
+    /// The view of this data.
+    fn view(&self) -> NodeData<'_>;
+    /// This data in a new box.
+    fn into_boxed(self) -> BoxedData;
+}
+
+macro_rules! ast_data {
+    ($($v:ident($t:ident)),+ $(,)?) => {$(
+        impl AstData for $t {
+            #[inline]
+            fn view(&self) -> NodeData<'_> {
+                NodeData::$v(self)
+            }
+
+            #[inline]
+            fn into_boxed(self) -> BoxedData {
+                BoxedData::$v(Box::new(self))
+            }
+        }
+    )+};
+}
+
+ast_data! {
+",
+        );
+        for name in self.schema.nodes.definitions.keys() {
+            let rust_name = rust_type_name(name);
+            writeln!(output, "    {rust_name}({rust_name}Data),").unwrap();
+        }
+        output.push_str("}\n\n");
+    }
+
     fn generate_hand_written_child_arm(
         output: &mut String,
         schema_name: &str,
@@ -535,9 +738,17 @@ impl<'a> AstGenerator<'a> {
             return Err(format!("unsupported handwritten visitor for {schema_name}"));
         }
         writeln!(output, "            Self::{rust_name}(node) => {{").unwrap();
-        writeln!(output, "                visitor(node.tag_name)?;").unwrap();
+        writeln!(
+            output,
+            "                visitor(Child::Node(node.tag_name))?;"
+        )
+        .unwrap();
         writeln!(output, "                if node.is_name_first {{").unwrap();
-        writeln!(output, "                    visitor(node.name)?;").unwrap();
+        writeln!(
+            output,
+            "                    visitor(Child::Node(node.name))?;"
+        )
+        .unwrap();
         writeln!(
             output,
             "                    visit_optional_child(visitor, node.type_expression)?;"
@@ -549,11 +760,15 @@ impl<'a> AstGenerator<'a> {
             "                    visit_optional_child(visitor, node.type_expression)?;"
         )
         .unwrap();
-        writeln!(output, "                    visitor(node.name)?;").unwrap();
+        writeln!(
+            output,
+            "                    visitor(Child::Node(node.name))?;"
+        )
+        .unwrap();
         writeln!(output, "                }}").unwrap();
         writeln!(
             output,
-            "                visit_optional_node_list(visitor, node.comment.as_ref())"
+            "                visit_optional_node_list(visitor, node.comment)"
         )
         .unwrap();
         writeln!(output, "            }}").unwrap();
@@ -566,19 +781,19 @@ impl<'a> AstGenerator<'a> {
             .child_storage(field)?
             .ok_or_else(|| format!("{} is not an AST child", field.schema_name))?
         {
-            ChildStorage::Node => format!("visitor(node.{field_name})"),
+            ChildStorage::Node => format!("visitor(Child::Node(node.{field_name}))"),
             ChildStorage::OptionalNode => {
                 format!("visit_optional_child(visitor, node.{field_name})")
             }
-            ChildStorage::NodeList => format!("visit_node_list(visitor, &node.{field_name})"),
+            ChildStorage::NodeList => format!("visitor(Child::List(node.{field_name}))"),
             ChildStorage::OptionalNodeList => {
-                format!("visit_optional_node_list(visitor, node.{field_name}.as_ref())")
+                format!("visit_optional_node_list(visitor, node.{field_name})")
             }
             ChildStorage::ModifierList => {
-                format!("visit_modifier_list(visitor, &node.{field_name})")
+                format!("visitor(Child::List(node.{field_name}.list))")
             }
             ChildStorage::OptionalModifierList => {
-                format!("visit_optional_modifier_list(visitor, node.{field_name}.as_ref())")
+                format!("visit_optional_modifier_list(visitor, node.{field_name})")
             }
             ChildStorage::RawNodes => format!("visit_children(visitor, &node.{field_name})"),
             ChildStorage::OptionalRawNodes => {
@@ -624,15 +839,8 @@ impl<'a> AstGenerator<'a> {
             writeln!(output).unwrap();
         }
 
-        writeln!(output, "#[derive(Clone, Debug)]").unwrap();
-        writeln!(output, "pub enum NodeData {{").unwrap();
-        for name in self.schema.nodes.definitions.keys() {
-            let rust_name = rust_type_name(name);
-            writeln!(output, "    {rust_name}(Box<{rust_name}Data>),").unwrap();
-        }
-        writeln!(output, "}}").unwrap();
-        writeln!(output).unwrap();
-        writeln!(output, "impl NodeData {{").unwrap();
+        self.generate_data_enums(&mut output);
+        writeln!(output, "impl<'a> NodeData<'a> {{").unwrap();
         writeln!(
             output,
             "    pub const SCHEMA_NODE_COUNT: usize = {};",
@@ -662,7 +870,7 @@ impl<'a> AstGenerator<'a> {
         writeln!(output, "    #[allow(clippy::too_many_lines)]").unwrap();
         writeln!(
             output,
-            "    pub const fn schema_name(&self) -> &'static str {{"
+            "    pub const fn schema_name(self) -> &'static str {{"
         )
         .unwrap();
         writeln!(output, "        match self {{").unwrap();
@@ -673,7 +881,11 @@ impl<'a> AstGenerator<'a> {
         writeln!(output, "        }}").unwrap();
         writeln!(output, "    }}").unwrap();
         self.generate_child_traversal(&mut output)?;
+        self.generate_list_walk(&mut output)?;
+        self.generate_view_methods(&mut output);
         writeln!(output, "}}").unwrap();
+        writeln!(output).unwrap();
+        self.generate_ast_data_impls(&mut output);
         writeln!(output).unwrap();
         write_child_traversal_helpers(&mut output);
 
@@ -715,20 +927,20 @@ fn write_child_traversal_helpers(output: &mut String) {
     child: Option<NodeId>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match child {
-        Some(child) => visitor(child),
+        Some(child) => visitor(Child::Node(child)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
 fn visit_children<B, F>(visitor: &mut F, children: &[NodeId]) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     for &child in children {
-        visitor(child)?;
+        visitor(Child::Node(child))?;
     }
     std::ops::ControlFlow::Continue(())
 }
@@ -738,7 +950,7 @@ fn visit_optional_children<B, F>(
     children: Option<&[NodeId]>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match children {
         Some(children) => visit_children(visitor, children),
@@ -746,50 +958,36 @@ where
     }
 }
 
-fn visit_node_list<B, F>(visitor: &mut F, list: &NodeList) -> std::ops::ControlFlow<B>
-where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
-{
-    visit_children(visitor, &list.nodes)
-}
-
 fn visit_optional_node_list<B, F>(
     visitor: &mut F,
-    list: Option<&NodeList>,
+    list: Option<NodeList>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match list {
-        Some(list) => visit_node_list(visitor, list),
+        Some(list) => visitor(Child::List(list)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
-fn visit_modifier_list<B, F>(visitor: &mut F, list: &ModifierList) -> std::ops::ControlFlow<B>
-where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
-{
-    visit_node_list(visitor, &list.list)
-}
-
 fn visit_optional_modifier_list<B, F>(
     visitor: &mut F,
-    list: Option<&ModifierList>,
+    list: Option<ModifierList>,
 ) -> std::ops::ControlFlow<B>
 where
-    F: FnMut(NodeId) -> std::ops::ControlFlow<B> + ?Sized,
+    F: FnMut(Child) -> std::ops::ControlFlow<B> + ?Sized,
 {
     match list {
-        Some(list) => visit_modifier_list(visitor, list),
+        Some(list) => visitor(Child::List(list.list)),
         None => std::ops::ControlFlow::Continue(()),
     }
 }
 
 impl Node {
     /// Visits every direct AST child in TypeScript-Go `ForEachChild` order.
-    pub fn for_each_child(&self, mut visitor: impl FnMut(NodeId)) {
-        let _ = self.data.try_for_each_child(&mut |child| {
+    pub fn for_each_child(&self, mut visitor: impl FnMut(Child)) {
+        let _ = self.data.view().try_for_each_child(&mut |child| {
             visitor(child);
             std::ops::ControlFlow::<()>::Continue(())
         });
@@ -800,9 +998,9 @@ impl Node {
     /// Returning [`std::ops::ControlFlow::Break`] stops traversal immediately.
     pub fn try_for_each_child<B>(
         &self,
-        mut visitor: impl FnMut(NodeId) -> std::ops::ControlFlow<B>,
+        mut visitor: impl FnMut(Child) -> std::ops::ControlFlow<B>,
     ) -> std::ops::ControlFlow<B> {
-        self.data.try_for_each_child(&mut visitor)
+        self.data.view().try_for_each_child(&mut visitor)
     }
 }
 
@@ -987,17 +1185,43 @@ pub struct SymbolTable;
 #[derive(Clone, Debug, Default)]
 pub struct OpaqueValue;
 
-#[derive(Clone, Debug, Default)]
-pub struct NodeList {
-    pub range: TextRange,
-    pub nodes: Vec<NodeId>,
-    pub has_trailing_comma: bool,
+/// A list field of node data: entry `index()` of the list table of the owner
+/// of the data (a file store, or the synthetic arena of a thread). The entry
+/// holds the Go `Loc`, the node ids, the missing-list bit and, for a modifier
+/// list, Go `ModifiersToFlags`. Go stores a `*NodeList`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NodeList(std::num::NonZeroU32);
+
+impl NodeList {
+    /// The list field of table entry `index`.
+    #[must_use]
+    pub const fn new(index: u32) -> Self {
+        match std::num::NonZeroU32::new(index.wrapping_add(1)) {
+            Some(n) => Self(n),
+            None => panic!("list table index out of range"),
+        }
+    }
+
+    /// The table entry.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        (self.0.get() - 1) as usize
+    }
 }
 
-#[derive(Clone, Debug, Default)]
+/// A modifier list field: the list of its table entry (Go `ModifierList`
+/// embeds its `NodeList`).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ModifierList {
     pub list: NodeList,
-    pub flags: ModifierFlags,
+}
+
+/// A direct child that `NodeData::try_for_each_child` visits: a child node
+/// id, or a list field (whose ids are in the list table of the data's owner).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Child {
+    Node(NodeId),
+    List(NodeList),
 }
 
 #[derive(Clone, Debug)]
@@ -1006,7 +1230,7 @@ pub struct Node {
     pub flags: NodeFlags,
     pub range: TextRange,
     pub parent: Option<NodeId>,
-    pub data: NodeData,
+    pub data: BoxedData,
 }
 
 #[derive(Debug)]
@@ -1166,6 +1390,12 @@ mod tests {
         assert!(output.contains("pub const SCHEMA_NODE_ALIAS_COUNT: usize = 72;"));
         assert!(output.contains("pub const SCHEMA_LIST_ALIAS_COUNT: usize = 23;"));
         assert_eq!(output.matches("(Box<").count(), 192);
+        assert!(output.contains("#[repr(u8)]\npub enum BoxedData {"));
+        assert!(output.contains("#[repr(u8)]\npub enum NodeData<'a> {"));
+        assert_eq!(output.matches("(&'a ").count(), 192);
+        assert!(output.contains("pub fn view(&self) -> NodeData<'_>"));
+        assert!(output.contains("pub fn to_boxed(self) -> BoxedData"));
+        assert!(output.contains("pub trait AstData: Sized"));
         assert!(output.contains("pub struct SourceFileData"));
         assert!(output.contains("pub struct JsDocParameterOrPropertyTagData"));
     }
@@ -1184,7 +1414,7 @@ mod tests {
         assert!(output.contains("pub else_statement: Option<NodeId>"));
         assert!(output.contains("pub statements: NodeList"));
         assert!(output.contains("pub modifiers: Option<ModifierList>"));
-        assert!(output.contains("pub flow_node: Option<FlowNodeId>"));
+        assert!(!output.contains("pub flow_node:"));
         let export_assignment = output
             .split("pub struct ExportAssignmentData")
             .nth(1)
@@ -1227,22 +1457,22 @@ mod tests {
         let output = generate_ast(UPSTREAM_AST).unwrap();
 
         assert!(output.contains(
-            "Self::DoStatement(node) => {\n                visitor(node.statement)?;\n                visitor(node.expression)"
+            "Self::DoStatement(node) => {\n                visitor(Child::Node(node.statement))?;\n                visitor(Child::Node(node.expression))"
         ));
         assert!(output.contains(
-            "Self::FunctionDeclaration(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;\n                visit_optional_child(visitor, node.asterisk_token)?;\n                visit_optional_child(visitor, node.name)?;\n                visit_optional_node_list(visitor, node.type_parameters.as_ref())?;\n                visit_node_list(visitor, &node.parameters)?;\n                visit_optional_child(visitor, node.type_)?;\n                visit_optional_child(visitor, node.full_signature)?;\n                visit_optional_child(visitor, node.body)"
+            "Self::FunctionDeclaration(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers)?;\n                visit_optional_child(visitor, node.asterisk_token)?;\n                visit_optional_child(visitor, node.name)?;\n                visit_optional_node_list(visitor, node.type_parameters)?;\n                visitor(Child::List(node.parameters))?;\n                visit_optional_child(visitor, node.type_)?;\n                visit_optional_child(visitor, node.full_signature)?;\n                visit_optional_child(visitor, node.body)"
         ));
         assert!(output.contains(
-            "Self::ImportDeclaration(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;\n                visit_optional_child(visitor, node.import_clause)?;\n                visitor(node.module_specifier)?;\n                visit_optional_child(visitor, node.attributes)"
+            "Self::ImportDeclaration(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers)?;\n                visit_optional_child(visitor, node.import_clause)?;\n                visitor(Child::Node(node.module_specifier))?;\n                visit_optional_child(visitor, node.attributes)"
         ));
         assert!(output.contains(
-            "Self::ExportAssignment(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers.as_ref())?;\n                visit_optional_child(visitor, node.type_)?;\n                visitor(node.expression)"
+            "Self::ExportAssignment(node) => {\n                visit_optional_modifier_list(visitor, node.modifiers)?;\n                visit_optional_child(visitor, node.type_)?;\n                visitor(Child::Node(node.expression))"
         ));
         assert!(output.contains(
-            "Self::SourceFile(node) => {\n                visit_node_list(visitor, &node.statements)?;\n                visitor(node.end_of_file_token)"
+            "Self::SourceFile(node) => {\n                visitor(Child::List(node.statements))?;\n                visitor(Child::Node(node.end_of_file_token))"
         ));
         assert!(output.contains(
-            "Self::JsDocParameterOrPropertyTag(node) => {\n                visitor(node.tag_name)?;\n                if node.is_name_first"
+            "Self::JsDocParameterOrPropertyTag(node) => {\n                visitor(Child::Node(node.tag_name))?;\n                if node.is_name_first"
         ));
     }
 }

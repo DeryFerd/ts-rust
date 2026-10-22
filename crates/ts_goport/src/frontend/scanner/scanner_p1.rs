@@ -42,9 +42,9 @@ pub type ErrorCallback =
 // ---------------------------------------------------------------------------
 
 /// Go `utf8.RuneError`.
-pub(crate) const RUNE_ERROR: i32 = 0xFFFD;
+pub const RUNE_ERROR: i32 = 0xFFFD;
 /// Go `utf8.RuneSelf`.
-pub(crate) const RUNE_SELF: i32 = 0x80;
+pub const RUNE_SELF: i32 = 0x80;
 
 /// Go `utf8.DecodeRuneInString(text[pos:])`. Returns `(RuneError, 0)` at the
 /// end and `(RuneError, 1)` for an invalid sequence (for example `pos` inside
@@ -54,7 +54,7 @@ pub(crate) const RUNE_SELF: i32 = 0x80;
 // size in `text`: a real U+FDD0 as `(0xFDD0, 6)`, an invalid byte as
 // `(RuneError, 7)` where Go gives `(RuneError, 1)`, and a lone surrogate
 // (only in values, never in source text) as `(RuneError, 7)`.
-pub(crate) fn utf8_decode_rune_in_string(text: &str, pos: usize) -> (i32, i32) {
+pub fn utf8_decode_rune_in_string(text: &str, pos: usize) -> (i32, i32) {
     let bytes = text.as_bytes();
     if pos >= bytes.len() {
         return (RUNE_ERROR, 0);
@@ -71,7 +71,7 @@ pub(crate) fn utf8_decode_rune_in_string(text: &str, pos: usize) -> (i32, i32) {
 
 /// Go `utf8.DecodeLastRuneInString(text[:end])`.
 // PORT: a unit of the port form decodes as in `utf8_decode_rune_in_string`.
-pub(crate) fn utf8_decode_last_rune_in_string(text: &str, end: usize) -> (i32, i32) {
+pub fn utf8_decode_last_rune_in_string(text: &str, end: usize) -> (i32, i32) {
     let bytes = text.as_bytes();
     if end == 0 {
         return (RUNE_ERROR, 0);
@@ -151,7 +151,7 @@ pub(crate) fn utf8_decode_last_rune(s: &str) -> (i32, i32) {
 /// Maps a Go rune to a `char` for the `stringutil` predicates.
 // PORT: Go passes the rune through. A value that is not a Unicode scalar
 // (-1, a surrogate) becomes U+FFFD, which no predicate accepts, as Go.
-pub(crate) fn rune_to_char(r: i32) -> char {
+pub fn rune_to_char(r: i32) -> char {
     u32::try_from(r)
         .ok()
         .and_then(char::from_u32)
@@ -255,6 +255,7 @@ pub(crate) static TEXT_TO_KEYWORD: &[(&str, SyntaxKind)] = &[
     ("return", SyntaxKind::ReturnKeyword),
     ("satisfies", SyntaxKind::SatisfiesKeyword),
     ("set", SyntaxKind::SetKeyword),
+    ("source", SyntaxKind::SourceKeyword),
     ("static", SyntaxKind::StaticKeyword),
     ("string", SyntaxKind::StringKeyword),
     ("super", SyntaxKind::SuperKeyword),
@@ -424,6 +425,7 @@ pub(crate) fn text_to_keyword(text: &str) -> SyntaxKind {
             b"object" => K::ObjectKeyword,
             b"public" => K::PublicKeyword,
             b"return" => K::ReturnKeyword,
+            b"source" => K::SourceKeyword,
             b"static" => K::StaticKeyword,
             b"string" => K::StringKeyword,
             b"switch" => K::SwitchKeyword,
@@ -501,7 +503,10 @@ pub(crate) fn text_to_token(text: &str) -> Option<SyntaxKind> {
 // PORT: `commentDirectives` is a Go slice header. Go `Rewind` restores its
 // length, and later appends overwrite the shared backing array after that
 // length. Here the backing array is `Scanner.comment_directives` and the
-// state keeps only the length (`comment_directives_len`). `tokenValue` is a
+// state keeps only the length (`comment_directives_len`). Go `SetText` starts
+// a nil slice, which shares no array with a state saved before it; `set_text`
+// keeps the `Vec`, so a caller that rewinds to such a state saves the `Vec`
+// too (`parse_js_doc_comment`, issue #49). `tokenValue` is a
 // slice of the scanned text or an interned `&'static str` (see
 // `intern_token_value`), so the state is `Copy`.
 #[derive(Clone, Copy, Debug)]
@@ -562,6 +567,12 @@ pub struct Scanner<'a> {
     pub(crate) hex_digit_cache: FxHashMap<Box<str>, &'static str>,
 
     pub(crate) comment_directives: Vec<CommentDirective>,
+
+    /// True when the caller of `set_text` found no `GO_STRING_MARKER` in
+    /// the text (`set_text_has_no_go_string_marker`). Every slice of such a
+    /// text is its own value form, so a string token value needs no
+    /// `go_value` scan. `set_text` makes it false.
+    pub(crate) text_has_no_go_string_marker: bool,
 }
 
 // Go: scanner/scanner.go:225 defaultScanner
@@ -581,6 +592,7 @@ pub(crate) fn default_scanner<'a>() -> Scanner<'a> {
         hex_number_cache: FxHashMap::default(),
         hex_digit_cache: FxHashMap::default(),
         comment_directives: Vec::new(),
+        text_has_no_go_string_marker: false,
     }
 }
 
@@ -640,7 +652,9 @@ impl<'a> Scanner<'a> {
     }
 
     // Go: scanner/scanner.go:276 TokenText
-    pub fn token_text(&self) -> &str {
+    // PORT: a slice of the text (`'a`), like the Go substring, so a caller
+    // can keep it after the next scan.
+    pub fn token_text(&self) -> &'a str {
         &self.text[self.scanner_state.token_start as usize..self.scanner_state.pos as usize]
     }
 
@@ -824,6 +838,17 @@ impl<'a> Scanner<'a> {
         self.text = text;
         self.end = self.text.len() as i32;
         self.scanner_state = ScannerState::default();
+        self.text_has_no_go_string_marker = false;
+    }
+
+    /// Tells the scanner that the text of the last `set_text` holds no
+    /// `GO_STRING_MARKER` (`contains_go_string_marker`), so its string
+    /// token values are slices of the text with no `go_value` scan.
+    // PERF: parsefast2. Go uses the slice as is. The parser checks its
+    // whole text once; other scanners keep the scan of each value.
+    pub fn set_text_has_no_go_string_marker(&mut self, value: bool) {
+        debug_assert!(!value || !crate::scanner_util::contains_go_string_marker(self.text));
+        self.text_has_no_go_string_marker = value;
     }
 
     // Go: scanner/scanner.go:402 SetOnError

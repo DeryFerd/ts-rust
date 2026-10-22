@@ -71,6 +71,9 @@ pub(super) struct GoSharedState {
     /// Shared with the version this one was updated from when the frontend
     /// shares the cache (Go `tryReuse`).
     known_symlinks: OnceLock<Arc<crate::modulespecifiers::symlinks::KnownSymlinks>>,
+    /// The loading thread's part of `known_symlinks`, when another thread
+    /// can finish it (`SymlinkSeed`, `build_lazy_shared_state`).
+    symlink_seed: SymlinkSeedSlot,
     /// Go `processedFiles.sourceFilesFoundSearchingNodeModules`, by path.
     /// Shared like `resolved_modules`.
     source_files_found_searching_node_modules: Arc<FxHashSet<String>>,
@@ -243,7 +246,7 @@ pub(super) fn update_program_version(
     // PORT: Go watch gives `UpdateProgram` a host whose cache no longer has
     // the changed file. A new cached host over the OS file system reads it
     // again.
-    let host_cwd = old_np.get_current_directory();
+    let host_cwd = old_np.host().get_current_directory();
     // #4712: no content mapper project (see `load_config`).
     let host = new_cached_fs_compiler_host(
         &host_cwd,
@@ -286,20 +289,23 @@ pub(super) fn mark_freeable_parses(np: &NewProgram) {
     }
 }
 
-// Go: compiler/program.go:2300 GetSymlinkCache (`get_go_symlink_cache`)
+// Go: compiler/program.go:2330 GetSymlinkCache (`get_go_symlink_cache`)
 // PORT: Go builds the cache on first use, on any goroutine. The port
 // builds it from the frontend program, which only the loading thread has,
 // and keeps a thread-safe copy in the program's shared state. The loading
-// thread builds it on first use, or when it seeds a thread
-// (`build_lazy_shared_state`), so a seeded thread finds it built.
+// thread builds it on first use. A thread seeded from it finishes the
+// seed that the loading thread made when it seeded the thread
+// (`build_lazy_shared_state`), or finds the cache built.
 pub(super) fn known_symlinks() -> Arc<crate::modulespecifiers::symlinks::KnownSymlinks> {
     if let Some(built) = with_go(GoSharedState::built_known_symlinks) {
         return built;
     }
     let id = prog().id;
-    let frontend = FRONTENDS
-        .with(|frontends| frontends.borrow().get(&id).cloned())
-        .expect("the symlink cache is built on the loading thread (`build_lazy_shared_state`)");
+    let Some(frontend) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned()) else {
+        // A seeded thread: the first one finishes the seed, and a thread
+        // that asks meanwhile waits for it (`OnceLock::get_or_init`).
+        return with_go(|go| finish_symlink_seed(go, SymlinkSeed::finish));
+    };
     // PORT: the parallel bind seeds threads while the project host still
     // tracks its file system calls, before Go makes any use of the cache. A
     // Go first use after the host is frozen (project/compilerhost.go:57)
@@ -319,18 +325,311 @@ pub(super) fn known_symlinks() -> Arc<crate::modulespecifiers::symlinks::KnownSy
             Arc::new(built.expect("without_fs_tracking runs its callback"))
         }
     };
-    with_go(|go| Arc::clone(go.known_symlinks.get_or_init(|| copy)))
+    with_go(|go| {
+        let built = Arc::clone(go.known_symlinks.get_or_init(|| copy));
+        // No thread finishes the seed now: free it and the load's lookups
+        // that it keeps.
+        go.symlink_seed.discard();
+        built
+    })
 }
 
-/// Builds the shared state values that the current program makes on first
-/// use (`known_symlinks`), when this thread loaded it: a thread seeded from
-/// this one (`WorkerSeed`) cannot build them. Does nothing on another
-/// thread, which was seeded after they were built, or for an alias
-/// resolver program.
+/// `known_symlinks` on a seeded thread: the cache, which the first caller
+/// makes with `finish` from the loading thread's seed. A caller that comes
+/// meanwhile waits for it (`OnceLock::get_or_init`).
+fn finish_symlink_seed(
+    go: &GoSharedState,
+    finish: impl FnOnce(SymlinkSeed) -> crate::modulespecifiers::symlinks::KnownSymlinks,
+) -> Arc<crate::modulespecifiers::symlinks::KnownSymlinks> {
+    Arc::clone(
+        go.known_symlinks
+            .get_or_init(|| Arc::new(go.symlink_seed.finish(finish))),
+    )
+}
+
+/// Makes the shared state values that the current program makes on first
+/// use (`known_symlinks`) ready for a thread seeded from this one
+/// (`WorkerSeed`), when this thread loaded the program: a seeded thread
+/// cannot read the frontend program. For the symlink cache, that is its
+/// seed (`SymlinkSeed`), which makes no file system call, so a program that
+/// never uses the cache makes none of its `realpath` calls, as in Go. Where
+/// a seed cannot be finished on another thread (`SymlinkSeed::of`), the
+/// cache itself. Does nothing on another thread, which was seeded after
+/// this, or for an alias resolver program.
+// PERF (syscut1): the cache took 62 `realpath` calls (open, readlink,
+// close) in a VS Code `--noEmit` check, where Go makes none.
 pub(super) fn build_lazy_shared_state() {
     let id = prog().id;
-    if FRONTENDS.with(|frontends| frontends.borrow().contains_key(&id)) {
-        let _ = known_symlinks();
+    let Some(frontend) = FRONTENDS.with(|frontends| frontends.borrow().get(&id).cloned()) else {
+        return;
+    };
+    let ready = with_go(|go| go.known_symlinks.get().is_some() || go.symlink_seed.is_set());
+    if ready {
+        return;
+    }
+    match SymlinkSeed::of(&frontend) {
+        Some(seed) => with_go(|go| go.symlink_seed.set(seed)),
+        None => {
+            let _ = known_symlinks();
+        }
+    }
+}
+
+/// The symlink cache seed of a program (`SymlinkSeed`), until the first
+/// thread that uses the cache takes it to finish it (`finish`). A seed that
+/// no thread finishes (the loading thread built the cache itself, or no
+/// thread used it) frees with the load's lookups that it keeps on the free
+/// thread (`SymlinkSeed::free`): when the cache is built (`discard`), or
+/// when the program's shared state drops.
+// PORT: not in Go (see `SymlinkSeed`).
+#[derive(Default)]
+pub(super) struct SymlinkSeedSlot(std::sync::Mutex<SeedState>);
+
+#[derive(Default)]
+enum SeedState {
+    /// The loading thread made no seed yet, or the seed is gone: a thread
+    /// finished it, or the loading thread built the cache.
+    #[default]
+    Empty,
+    Ready(SymlinkSeed),
+    /// The finish of the seed panicked, and this is a copy of its payload.
+    /// The seed is gone, so each later user of the cache raises it again.
+    Panicked(FinishPanic),
+}
+
+impl SymlinkSeedSlot {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SeedState> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// True when the loading thread made the seed: it is here, or its
+    /// finish panicked.
+    fn is_set(&self) -> bool {
+        !matches!(*self.lock(), SeedState::Empty)
+    }
+
+    fn set(&self, seed: SymlinkSeed) {
+        *self.lock() = SeedState::Ready(seed);
+    }
+
+    /// The symlink cache: the seed finished with `finish`, for the first
+    /// thread that uses the cache. When `finish` panics, its panic goes on,
+    /// and each later caller raises a copy of it: the seed is gone, and the
+    /// first panic is the cause.
+    fn finish(
+        &self,
+        finish: impl FnOnce(SymlinkSeed) -> crate::modulespecifiers::symlinks::KnownSymlinks,
+    ) -> crate::modulespecifiers::symlinks::KnownSymlinks {
+        let seed = {
+            let mut state = self.lock();
+            match std::mem::take(&mut *state) {
+                SeedState::Ready(seed) => seed,
+                SeedState::Panicked(panic) => {
+                    let again = panic.copy();
+                    *state = SeedState::Panicked(panic);
+                    drop(state);
+                    again.raise()
+                }
+                SeedState::Empty => {
+                    drop(state);
+                    panic!(
+                        "the loading thread made the symlink cache seed (`build_lazy_shared_state`)"
+                    )
+                }
+            }
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| finish(seed))) {
+            Ok(symlinks) => symlinks,
+            Err(payload) => {
+                *self.lock() = SeedState::Panicked(FinishPanic::of(&*payload));
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    /// Lets go of the seed (`SymlinkSeed::free`): the cache is built.
+    fn discard(&self) {
+        let state = std::mem::take(&mut *self.lock());
+        if let SeedState::Ready(seed) = state {
+            seed.free();
+        }
+    }
+}
+
+impl Drop for SymlinkSeedSlot {
+    fn drop(&mut self) {
+        self.discard();
+    }
+}
+
+/// A copy of the payload of a panic in `SymlinkSeed::finish`
+/// (`SymlinkSeedSlot::finish`): a Go panic (`GoPanic`), so that the run
+/// ends as Go ends it whichever thread reports it, or the text of any
+/// other panic.
+enum FinishPanic {
+    Go(crate::core::GoPanic),
+    Text(String),
+}
+
+impl FinishPanic {
+    fn of(payload: &(dyn std::any::Any + Send)) -> Self {
+        if let Some(panic) = payload.downcast_ref::<crate::core::GoPanic>() {
+            return FinishPanic::Go(crate::core::GoPanic {
+                message: panic.message.clone(),
+                go_type: panic.go_type,
+                repanicked: panic.repanicked,
+                recovered_before: panic.recovered_before.clone(),
+                fault_address: panic.fault_address,
+                location: panic.location,
+            });
+        }
+        let text = payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            // The text that Rust prints for any other payload.
+            .unwrap_or_else(|| "Box<dyn Any>".to_string());
+        FinishPanic::Text(text)
+    }
+
+    fn copy(&self) -> Self {
+        match self {
+            FinishPanic::Go(panic) => FinishPanic::of(panic),
+            FinishPanic::Text(text) => FinishPanic::Text(text.clone()),
+        }
+    }
+
+    fn raise(self) -> ! {
+        match self {
+            FinishPanic::Go(panic) => std::panic::panic_any(panic),
+            FinishPanic::Text(text) => std::panic::panic_any(text),
+        }
+    }
+}
+
+/// The loading thread's part of the symlink cache
+/// (`NewProgram::symlink_cache_seed`), and what a resolver of the program
+/// needs, so that the thread that first uses the cache finishes it with its
+/// own resolver (`finish`).
+// PORT: not in Go, where any goroutine reads the program (see
+// `known_symlinks`).
+pub(super) struct SymlinkSeed {
+    seed: crate::frontend::compiler::SymlinkCacheSeed,
+    options: crate::options::CompilerOptions,
+    typings_location: String,
+    project_name: String,
+    current_directory: String,
+    /// The lookups of the program's host (Go `p.Host().FS()`, a
+    /// `cachedvfs`) that another thread can read. `None` when it has none
+    /// (see `of`).
+    stats: Option<crate::frontend::compiler::HostStatCache>,
+}
+
+impl SymlinkSeed {
+    /// The seed of `frontend`. `None` where the loading thread builds the
+    /// cache itself: a host that does not show the plain OS file system (a
+    /// new resolver of another thread would not see its files), project
+    /// references and content mappers (the program resolver's host maps
+    /// files that the OS file system does not show), and a program that
+    /// emits declarations, which uses the cache.
+    ///
+    /// A load with no parse workers (as with `--singleThreaded`, whose one
+    /// checker has a thread of its own) leaves its lookups only in the
+    /// host's `CachedFs`, which only the loading thread reads. Its seed has
+    /// none, so the finish makes the lookups that it needs
+    /// (`HostStatCache::empty`): Go builds the cache on first use in every
+    /// mode (program.go:2330 `GetSymlinkCache`).
+    // PERF (followups66): the eager build of a `--singleThreaded` VS Code
+    // `--noEmit` check made 61 more readlink calls than the default mode.
+    fn of(frontend: &NewProgram) -> Option<Self> {
+        use crate::frontend::compiler::HostStatCache;
+        let stats = frontend
+            .host()
+            .stat_cache()
+            .map(HostStatCache::Build)
+            .or_else(|| frontend.load_stats.take());
+        let options = frontend.options();
+        if !frontend.host().is_plain_os_fs()
+            || !frontend.get_resolved_project_references().is_empty()
+            || !frontend.content_mapper_extensions().is_empty()
+            || (options.get_emit_declarations() && !options.no_emit.is_true())
+        {
+            if let Some(stats) = stats {
+                stats.free();
+            }
+            return None;
+        }
+        Some(SymlinkSeed {
+            seed: frontend.symlink_cache_seed(),
+            options: options.clone(),
+            typings_location: frontend.get_global_typings_cache_location(),
+            project_name: frontend.opts.project_name.clone(),
+            current_directory: frontend.host().get_current_directory(),
+            stats,
+        })
+    }
+
+    /// Lets go of a seed that no thread finishes. A seed with the host's
+    /// lookups goes to the free thread (`drop_in_background`, which the
+    /// load started), as `HostStatCache::free` does; one without them is
+    /// small and drops here, so a `--singleThreaded` run starts no thread
+    /// for it.
+    fn free(self) {
+        if self.stats.is_some() {
+            crate::execute::build::build_task::drop_in_background(self);
+        }
+    }
+
+    /// The symlink cache: the seed finished with a new resolver of the
+    /// program on the OS file system of this thread, with the lookups of
+    /// the host (Go `newResolver`, program.go:191, on the host's
+    /// `cachedvfs`).
+    fn finish(self) -> crate::modulespecifiers::symlinks::KnownSymlinks {
+        use crate::frontend::module::{ResolutionHost, ResolverOptions, new_resolver};
+        struct OsHost {
+            fs: Rc<dyn Fs>,
+            current_directory: String,
+        }
+        impl ResolutionHost for OsHost {
+            fn fs(&self) -> &dyn Fs {
+                &*self.fs
+            }
+            fn get_current_directory(&self) -> &str {
+                &self.current_directory
+            }
+        }
+        // The finish's own lookups, when the host has none that this thread
+        // can read, are few: they drop here with the resolver.
+        let stats = self.stats.clone();
+        let resolver = new_resolver(ResolverOptions {
+            host: Some(Rc::new(OsHost {
+                fs: Rc::new(crate::frontend::compiler::HostStatFs::new(
+                    self.stats
+                        .unwrap_or_else(crate::frontend::compiler::HostStatCache::empty),
+                )),
+                current_directory: self.current_directory,
+            })),
+            compiler_options: Some(Rc::new(self.options)),
+            typings_location: self.typings_location,
+            project_name: self.project_name,
+            extra_extensions: Vec::new(),
+            package_json_cache: None,
+        });
+        let symlinks = self.seed.finish(|dep, package_json_name| {
+            resolver.resolve_package_directory(
+                dep,
+                package_json_name,
+                crate::options::RESOLUTION_MODE_COMMON_JS,
+                None,
+            )
+        });
+        drop(resolver);
+        if let Some(stats) = stats {
+            stats.free();
+        }
+        symlinks
     }
 }
 
@@ -343,7 +642,14 @@ pub(super) fn new_program_version(
     // first load. `build_program` makes the new version current for its
     // state.
     let _scope = crate::core::enter_program(None);
-    build_program(np, Entry::Version, np.get_current_directory(), previous)
+    // The path keys of the frontend program are made against the host's
+    // current directory, as the loader made them (`NewProgram::to_path`).
+    build_program(
+        np,
+        Entry::Version,
+        np.host().get_current_directory(),
+        previous,
+    )
 }
 
 thread_local! {
@@ -393,7 +699,7 @@ pub(super) fn publish_parsed_files(cwd: &str) {
     publish_file_stores(files);
 }
 
-// Go: ast/ast.go:2745 (*SourceFile).resolveJSDoc (slow path; the caller
+// Go: ast/ast.go:2747 (*SourceFile).resolveJSDoc (slow path; the caller
 // has checked the parser cache) and parser/jsdoc.go:19 parseJSDocForNode
 /// The lazy JSDoc of `node` in published file `file`, whose info is
 /// `info`. The result is cached in `LAZY_JSDOC`.
@@ -441,7 +747,7 @@ pub(crate) fn cached_lazy_js_doc(node: Node) -> Option<&'static [Node]> {
     LAZY_JSDOC.with(|cache| cache.borrow().get(&node).copied())
 }
 
-// Go: compiler/program.go:129 FileExists (the Go frontend program)
+// Go: compiler/program.go:145 FileExists (the Go frontend program)
 // PORT: the loading thread asks the program host (with its cache). Another
 // thread (a checker worker) cannot read that cache. It asks the program's
 // thread-safe cache (Go `cachedvfs.FS`, compiler/host.go:52), which asks
@@ -582,13 +888,14 @@ fn load_config(
         return Err(messages.join("\n"));
     }
     let config = config.ok_or_else(|| format!("cannot parse {config_abs}"))?;
-    // PERF: the default lib parses start now, before the host and the
-    // loader exist (`start_default_lib_prefetch`).
+    // PERF: the default lib and root file parses start now, before the
+    // host and the loader exist (`start_default_lib_prefetch`).
     start_default_lib_prefetch(
         &config,
         &cwd,
         fs.use_case_sensitive_file_names(),
         &bundled::lib_path(),
+        true,
     );
 
     // Go: tsc.go:302 NewCachedFSCompilerHost, tsc.go:310 NewProgram.
@@ -682,6 +989,11 @@ fn build_program(
             .map(|file| (file.store, file))
             .collect()
     }
+    // PERF (serialgap1): the checker split of a one-program process runs
+    // beside the build and the bind (`start_checker_associations`).
+    if matches!(entry, Entry::Only) {
+        super::ls_program::start_checker_associations(np);
+    }
     let parsed = match &replaced {
         Some(replaced) => new_files(replaced.iter().map(|r| r.file)),
         None => new_files(files.iter()),
@@ -693,33 +1005,43 @@ fn build_program(
             "a program file that no publish has seen was not replaced"
         );
     }
-    let go_files = go_files_of_unpublished_stores(&parsed, &cwd, use_case_sensitive_file_names);
-
     let id = next_program_id();
-    FRONTENDS.with(|frontends| {
-        assert!(
-            frontends.borrow_mut().insert(id, Rc::clone(np)).is_none(),
-            "program {id} already loaded"
-        );
-    });
-    // The stores become read-only here, before the program is installed.
-    publish_file_stores(go_files);
-    // A program file must be published as a source file. A parse that an
-    // earlier publish did not know (see `note_parsed_source_file`) became a
-    // store with no root there, and its bind would fail far from the cause.
-    // The build of the old version checked the files that a new version
-    // shares with it.
-    let assert_published = |file: &Rc<ParsedSourceFile>| {
-        assert!(
-            crate::ast::go_file(file.store).root.is_some(),
-            "program file {} was published as a store that is not a source file",
-            file.file_name()
-        );
+    let publish = || {
+        let go_files = go_files_of_unpublished_stores(&parsed, &cwd, use_case_sensitive_file_names);
+        FRONTENDS.with(|frontends| {
+            assert!(
+                frontends.borrow_mut().insert(id, Rc::clone(np)).is_none(),
+                "program {id} already loaded"
+            );
+        });
+        // The stores become read-only here, before the program is installed.
+        publish_file_stores(go_files);
+        // A program file must be published as a source file. A parse that an
+        // earlier publish did not know (see `note_parsed_source_file`) became a
+        // store with no root there, and its bind would fail far from the cause.
+        // The build of the old version checked the files that a new version
+        // shares with it.
+        let assert_published = |file: &Rc<ParsedSourceFile>| {
+            assert!(
+                crate::ast::go_file(file.store).root.is_some(),
+                "program file {} was published as a store that is not a source file",
+                file.file_name()
+            );
+        };
+        match &replaced {
+            Some(replaced) if !check => replaced.iter().for_each(|r| assert_published(r.file)),
+            _ => files.iter().for_each(assert_published),
+        }
     };
-    match &replaced {
-        Some(replaced) if !check => replaced.iter().for_each(|r| assert_published(r.file)),
-        _ => files.iter().for_each(assert_published),
-    }
+    // PERF (serialgap1): a program that needs its full tables builds their
+    // per-file part on two threads while this thread makes and publishes
+    // the Go files (`TableParts::build`). Port only: Go has no tables.
+    let parts = if replaced.is_none() {
+        Some(TableParts::build(np, publish))
+    } else {
+        publish();
+        None
+    };
     let program: &'static GoProgram = Box::leak(Box::new(GoProgram {
         id,
         options,
@@ -759,12 +1081,13 @@ fn build_program(
             (tables, common_source_directory)
         }
         _ => {
-            let tables = full_tables(np, previous_shared);
+            let parts = parts.unwrap_or_else(|| TableParts::build(np, || ()));
+            let tables = full_tables_of(np, previous_shared, parts);
             let common_source_directory = intern_program_str(&common_source_directory_of(np));
             (tables, common_source_directory)
         }
     };
-    // Go: compiler/program.go:408 ReuseProgram keeps `processedFiles`, so
+    // Go: compiler/program.go:359 ReuseProgram keeps `processedFiles`, so
     // the new program keeps the resolver and the package.json lookups of
     // module specifier generation in its cache (program.go:147-169).
     if let Some(old) = &previous
@@ -879,7 +1202,7 @@ fn replaced_files<'a>(
         // The `redirect_files_by_path` half (Go :371) cannot hold here, and
         // stays as in Go. A redirect path is the path of a package copy that
         // the loader leaves out of the program files (Go
-        // filesparser.go:467-477, the `continue`), and `old_file` is a
+        // filesparser.go:455-484, the `continue`), and `old_file` is a
         // program file. A changed copy at a redirect path takes the full
         // build in `reuse_program` (frontend/compiler/program_new.rs, Go
         // program.go:371), so no reused version gets here with it. Test:
@@ -908,36 +1231,26 @@ fn replaced_files<'a>(
 /// frontend program and shared state of the version that `np` was updated
 /// from (`GoSharedState::new`).
 fn full_tables(np: &NewProgram, previous: Option<(&NewProgram, &GoSharedState)>) -> VersionTables {
-    let files = np.source_files();
-    let source_file_order: Vec<usize> = files.iter().map(|file| file.store).collect();
-    let mut slots = SlotsBuilder::new(&source_file_order);
-    // Every program file path is in `files_by_path` too.
-    let mut file_by_path = FxHashMap::with_capacity_and_hasher(
-        np.files_by_path().len().max(files.len()),
-        Default::default(),
-    );
-    for (slot, file) in files.iter().enumerate() {
-        file_by_path.insert(file.path().0.clone(), slot);
-    }
-    // Go: filesparser.go:425 `filesByPath[task.path] = packageIdFile`. A
-    // package dedup redirect path maps to the first file with the same
-    // package id, so `GetSourceFileByPath` finds that file.
-    // PERF: copies the path only when it adds an entry (`entry` needs an
-    // owned key even when the path is already there).
-    for (path, file) in np.files_by_path() {
-        if !file_by_path.contains_key(&path.0) {
-            file_by_path.insert(path.0.clone(), slots.slot_of(file.store));
-        }
-    }
-    let other_files = slots.other_files;
-    let file_meta = files
-        .iter()
-        .map(|file| file_program_meta(np, file))
-        .collect();
+    full_tables_of(np, previous, TableParts::build(np, || ()))
+}
+
+/// `full_tables` of `np` with its per-file part `parts`.
+fn full_tables_of(
+    np: &NewProgram,
+    previous: Option<(&NewProgram, &GoSharedState)>,
+    parts: TableParts,
+) -> VersionTables {
+    let TableParts {
+        source_file_order,
+        other_files,
+        file_by_path,
+        file_meta,
+    } = parts;
     let go = GoSharedState::new(np, previous, None, &file_by_path);
     VersionTables {
         go: Some(go),
-        file_versions: files
+        file_versions: np
+            .source_files()
             .iter()
             .filter_map(|file| file.version.get().cloned())
             .collect(),
@@ -947,6 +1260,117 @@ fn full_tables(np: &NewProgram, previous: Option<(&NewProgram, &GoSharedState)>)
             Arc::new(file_by_path),
             Arc::new(file_meta),
         )
+    }
+}
+
+/// The per-file part of `full_tables`: the file ids in slot order, the
+/// files that are not program files, the slot of each path and the program
+/// fields of each file.
+struct TableParts {
+    source_file_order: Vec<usize>,
+    other_files: Vec<usize>,
+    file_by_path: FxHashMap<String, usize>,
+    file_meta: Vec<FileProgramMeta>,
+}
+
+impl TableParts {
+    /// The table parts of `np`, while this thread runs `beside`. Unless the
+    /// program is single-threaded, the slots of the paths and the program
+    /// fields are built on two threads of their own, from borrowed paths and
+    /// maps that the threads can read (a part whose thread cannot start is
+    /// built on this thread); `beside` must not change the program.
+    // PERF (serialgap1): in build_program `beside` makes and publishes the
+    // Go files (VS Code: the two parts took 6.9 ms of the 16 ms build).
+    fn build(np: &NewProgram, beside: impl FnOnce()) -> TableParts {
+        let files = np.source_files();
+        let source_file_order: Vec<usize> = files.iter().map(|file| file.store).collect();
+        let paths: Vec<&GoPath> = files.iter().map(|file| file.path()).collect();
+        let by_path_len = np.files_by_path().len();
+        // Go: filesparser.go:480 `filesByPath[task.path] = packageIdFile`. A
+        // package dedup redirect path maps to the first file with the same
+        // package id, so `GetSourceFileByPath` finds that file. Every
+        // program file path is in `files_by_path` too (`collect_files`
+        // adds each file at its path), so the map has other paths only when
+        // it has more entries than the program has files.
+        let redirects: Vec<(&str, usize)> = if by_path_len > files.len() {
+            np.files_by_path()
+                .iter()
+                .map(|(path, file)| (path.as_str(), file.store))
+                .collect()
+        } else {
+            if check_version_tables() {
+                assert!(
+                    paths
+                        .iter()
+                        .all(|path| np.files_by_path().contains_key(*path)),
+                    "a program file path is not in files_by_path"
+                );
+            }
+            Vec::new()
+        };
+        let metas: &FxHashMap<GoPath, SourceFileMetaData> =
+            &np.processed_files.source_file_meta_datas;
+        let libs: FxHashSet<&str> = np
+            .processed_files
+            .lib_files
+            .keys()
+            .map(|path| path.as_str())
+            .collect();
+        let slots = || {
+            let mut slots = SlotsBuilder::new(&source_file_order);
+            let mut file_by_path = FxHashMap::with_capacity_and_hasher(
+                by_path_len.max(paths.len()),
+                Default::default(),
+            );
+            for (slot, path) in paths.iter().enumerate() {
+                file_by_path.insert(path.0.clone(), slot);
+            }
+            // PERF: copies the path only when it adds an entry (`entry`
+            // needs an owned key even when the path is already there).
+            for &(path, store) in &redirects {
+                if !file_by_path.contains_key(path) {
+                    file_by_path.insert(path.to_string(), slots.slot_of(store));
+                }
+            }
+            (file_by_path, slots.other_files)
+        };
+        // Go `SourceFile.Metadata` and `IsDefaultLibrary` of each file
+        // (`file_program_meta`).
+        let meta = || -> Vec<FileProgramMeta> {
+            paths
+                .iter()
+                .map(|path| FileProgramMeta {
+                    meta_data: metas.get(*path).cloned().unwrap_or_default(),
+                    is_default_library: libs.contains(path.as_str()),
+                })
+                .collect()
+        };
+        let ((file_by_path, other_files), file_meta) =
+            if np.single_threaded() || cfg!(target_family = "wasm") {
+                beside();
+                (slots(), meta())
+            } else {
+                std::thread::scope(|scope| {
+                    // `slots` and `meta` borrow only, so they are `Copy`: a
+                    // part whose thread cannot start is made here.
+                    let slots_thread = crate::program::helper_thread(scope, "goport-tables", slots);
+                    let meta_thread = crate::program::helper_thread(scope, "goport-tables", meta);
+                    beside();
+                    fn join<T>(result: std::thread::Result<T>) -> T {
+                        result.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    }
+                    (
+                        slots_thread.map_or_else(slots, |thread| join(thread.join())),
+                        meta_thread.map_or_else(meta, |thread| join(thread.join())),
+                    )
+                })
+            };
+        TableParts {
+            source_file_order,
+            other_files,
+            file_by_path,
+            file_meta,
+        }
     }
 }
 
@@ -1071,10 +1495,10 @@ fn common_source_directory_of(p: &NewProgram) -> String {
     )
 }
 
-// Go: compiler/program.go:828 collectContentMapperOptionDiagnostics (#4712)
+// Go: compiler/program.go:852 collectContentMapperOptionDiagnostics (#4712)
 // PORT: returns the list; Go sets `p.contentMapperOptionDiagnostics`.
 fn collect_content_mapper_option_diagnostics(p: &NewProgram) -> Vec<Diagnostic> {
-    // Go: compiler/program.go:138 ContentMapperProject
+    // Go: compiler/program.go:158 ContentMapperProject
     let Some(project) = p.host().content_mapper_project() else {
         return Vec::new();
     };
@@ -1360,9 +1784,10 @@ impl GoSharedState {
         };
         let source_to_project_reference = copy_map(&mapper.source_to_project_reference);
         let output_dts_to_project_reference = copy_map(&mapper.output_dts_to_project_reference);
-        // The load released the mapper's loader (Go fileloader.go:223), so
-        // no entry is added after it (`getSourceToDtsIfSymlink`, :163), and
-        // an entry with no source finds nothing.
+        // The load released the mapper's loader, so no entry is added after
+        // it (Go ts#64519: only the load's builder adds entries,
+        // projectreferencefilemapper.go:197 resolveSymlink), and an entry
+        // with no source finds nothing.
         let realpath_dts_to_source: FxHashMap<_, _> = mapper
             .realpath_dts_to_source
             .borrow()
@@ -1371,7 +1796,7 @@ impl GoSharedState {
                 Some((path.0.clone(), project_references.entry(entry.as_ref()?)))
             })
             .collect();
-        let can_use_project_reference_source = mapper.opts.can_use_project_reference_source();
+        let can_use_project_reference_source = mapper.use_source_of_project_reference;
         drop(mapper);
         // Go asks for the redirect of checker files only, which are program
         // files. A redirect comes from the path and the project references,
@@ -1449,7 +1874,8 @@ impl GoSharedState {
             .collect();
         Self {
             has_emit_blocking_diagnostics,
-            current_directory: p.get_current_directory(),
+            // The directory of the program's path keys (`NewProgram::to_path`).
+            current_directory: p.host().get_current_directory(),
             use_case_sensitive_file_names: p.use_case_sensitive_file_names(),
             // #4712
             content_mapper_extensions: p.command_line().content_mapper_extensions(),
@@ -1469,12 +1895,13 @@ impl GoSharedState {
             redirects_for_resolution,
             resolved_project_references,
             known_symlinks,
+            symlink_seed: SymlinkSeedSlot::default(),
             source_files_found_searching_node_modules,
             from_old_tables: reused.is_some(),
         }
     }
 
-    // Go: compiler/program.go:528 ContentMapperExtensions (#4712)
+    // Go: compiler/program.go:549 ContentMapperExtensions (#4712)
     pub(super) fn content_mapper_extensions(&self) -> &[String] {
         &self.content_mapper_extensions
     }
@@ -1484,7 +1911,7 @@ impl GoSharedState {
         &self.content_mapper_option_diagnostics
     }
 
-    // Go: compiler/program.go:181 GetSourceOfProjectReferenceIfOutputIncluded
+    // Go: compiler/program.go:206 GetSourceOfProjectReferenceIfOutputIncluded
     // (the map lookup; the caller falls back to the file name)
     pub(super) fn get_source_of_project_reference_if_output_included(
         &self,
@@ -1495,7 +1922,7 @@ impl GoSharedState {
             .map(String::as_str)
     }
 
-    // Go: compiler/projectreferencefilemapper.go:68 getProjectReferenceFromSource
+    // Go: compiler/projectreferencefilemapper.go:78 getProjectReferenceFromSource
     pub(super) fn get_project_reference_from_source(
         &self,
         path: &str,
@@ -1503,7 +1930,7 @@ impl GoSharedState {
         self.source_to_project_reference.get(path).cloned()
     }
 
-    // Go: compiler/projectreferencefilemapper.go:72 getProjectReferenceFromOutputDts
+    // Go: compiler/projectreferencefilemapper.go:82 getProjectReferenceFromOutputDts
     pub(super) fn get_project_reference_from_output_dts(
         &self,
         path: &str,
@@ -1511,12 +1938,12 @@ impl GoSharedState {
         self.output_dts_to_project_reference.get(path).cloned()
     }
 
-    // Go: compiler/projectreferencefilemapper.go:76 isSourceFromProjectReference
+    // Go: compiler/projectreferencefilemapper.go:86 isSourceFromProjectReference
     pub(super) fn is_source_from_project_reference(&self, path: &str) -> bool {
         self.can_use_project_reference_source && self.source_to_project_reference.contains_key(path)
     }
 
-    // Go: compiler/program.go:206 GetRedirectForResolution (for program files)
+    // Go: compiler/program.go:231 GetRedirectForResolution (for program files)
     pub(super) fn get_redirect_for_resolution(
         &self,
         file: Node,
@@ -1524,7 +1951,7 @@ impl GoSharedState {
         self.redirects_for_resolution.get(&file.file_index())
     }
 
-    // Go: compiler/program.go:215 GetResolvedProjectReferences
+    // Go: compiler/program.go:245 GetResolvedProjectReferences
     pub(super) fn get_resolved_project_references(
         &self,
     ) -> Vec<Option<Arc<ResolvedProjectReference>>> {
@@ -1539,8 +1966,8 @@ impl GoSharedState {
         self.known_symlinks.get().cloned()
     }
 
-    // Go: compiler/program.go:211 GetParseFileRedirect
-    // Go: compiler/projectreferencefilemapper.go:35 getParseFileRedirect
+    // Go: compiler/program.go:236 GetParseFileRedirect
+    // Go: compiler/projectreferencefilemapper.go:45 getParseFileRedirect
     // PORT: after the load, so `getSourceToDtsIfSymlink` only reads
     // `realpathDtsToSource`. None is the Go "".
     // PERF: with no project reference entries there is no redirect, and
@@ -1579,12 +2006,12 @@ impl GoSharedState {
         (!redirect.is_empty()).then_some(redirect)
     }
 
-    // Go: compiler/program.go:173 GetRedirectTargets
+    // Go: compiler/program.go:198 GetRedirectTargets
     pub(super) fn get_redirect_targets(&self, path: &str) -> Vec<String> {
         self.redirect_targets.get(path).cloned().unwrap_or_default()
     }
 
-    // Go: compiler/program.go:242 GetSourceFileFromReference (for the
+    // Go: compiler/program.go:275 GetSourceFileFromReference (for the
     // preserved references of a program file)
     pub(super) fn get_source_file_from_reference(&self, origin: Node, r: &FileReference) -> Node {
         self.references
@@ -1593,7 +2020,7 @@ impl GoSharedState {
             .expect("not a preserved reference of a program file")
     }
 
-    // Go: compiler/program.go:623 GetResolvedModule
+    // Go: compiler/program.go:644 GetResolvedModule
     // PERF: returns a borrow, and looks the name up as `&str`. A name has at
     // most one entry per mode, so the mode scan finds the Go map entry.
     pub(super) fn get_resolved_module(
@@ -1609,7 +2036,7 @@ impl GoSharedState {
             .get(&(module_reference, mode) as &dyn crate::frontend::module::ModeAwareKey)
     }
 
-    // Go: compiler/program.go:640 GetResolvedModules (ranged over: every
+    // Go: compiler/program.go:664 GetResolvedModules (ranged over: every
     // resolution of every file)
     // PERF: borrows the version's own map, as Go returns `p.resolvedModules`
     // with no copy. The order is the map order; Go ranges over maps in a
@@ -1621,7 +2048,7 @@ impl GoSharedState {
             .map(|resolved| &**resolved)
     }
 
-    // Go: compiler/program.go:2199 GetJSXRuntimeImportSpecifier
+    // Go: compiler/program.go:2228 GetJSXRuntimeImportSpecifier
     pub(super) fn get_jsx_runtime_import_specifier(&self, path: &str) -> (String, Node) {
         self.jsx_runtime_import_specifiers
             .get(path)
@@ -1629,7 +2056,7 @@ impl GoSharedState {
             .unwrap_or((String::new(), Node::NIL))
     }
 
-    // Go: compiler/program.go:1390 IsEmitBlocked
+    // Go: compiler/program.go:1414 IsEmitBlocked
     pub(super) fn is_emit_blocked(&self, emit_file_name: &str) -> bool {
         let path = crate::frontend::tspath::to_path(
             emit_file_name,
@@ -1639,13 +2066,13 @@ impl GoSharedState {
         self.has_emit_blocking_diagnostics.contains(&path.0)
     }
 
-    // Go: compiler/program.go:2195 IsSourceFileFromExternalLibrary
+    // Go: compiler/program.go:2224 IsSourceFileFromExternalLibrary
     pub(super) fn is_source_file_from_external_library(&self, path: &str) -> bool {
         self.source_files_found_searching_node_modules
             .contains(path)
     }
 
-    // Go: compiler/program.go:2206 GetImportHelpersImportSpecifier
+    // Go: compiler/program.go:2235 GetImportHelpersImportSpecifier
     pub(super) fn get_import_helpers_import_specifier(&self, path: &str) -> Node {
         self.import_helpers_import_specifiers
             .get(path)
@@ -1653,7 +2080,7 @@ impl GoSharedState {
             .unwrap_or(Node::NIL)
     }
 
-    // Go: compiler/program.go:840 GetIncludeProcessorDiagnostics (the
+    // Go: compiler/program.go:864 GetIncludeProcessorDiagnostics (the
     // include processor part)
     pub(super) fn get_include_processor_diagnostics(&self, file: Node) -> Vec<Diagnostic> {
         // Go builds the collection here (`includeProcessor.getDiagnostics`).
@@ -1749,7 +2176,7 @@ fn assert_same_include_diagnostics(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     /// A copy of `np` with the file at `slot` parsed again, as Go
@@ -1769,7 +2196,8 @@ mod tests {
             .insert(file.path().clone(), file);
         NewProgram {
             opts: np.opts.clone(),
-            compare_paths_options: np.compare_paths_options.clone(),
+            hosts: np.hosts.clone(),
+            module_resolution_error: np.module_resolution_error.clone(),
             processed_files,
             uses_uri_style_node_core_modules: np.uses_uri_style_node_core_modules,
             common_source_directory: std::cell::OnceCell::new(),
@@ -1786,8 +2214,9 @@ mod tests {
     /// A program whose `index.ts` imports two packages, each with its own
     /// copy of pkg@1.0.0: a package redirect group. The second copy's path
     /// is a redirect path, and the first copy is its target. `name` names
-    /// the fixture dir. The caller enters the program scope.
-    fn redirect_group_program(name: &str) -> NewProgram {
+    /// the fixture dir. The caller enters the program scope. The split
+    /// tests (`ls_program`) use it too.
+    pub(in crate::program) fn redirect_group_program(name: &str) -> NewProgram {
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let pkg = r#"{"name":"pkg","version":"1.0.0","types":"index.d.ts"}"#;
@@ -1834,6 +2263,30 @@ mod tests {
         let np = new_program(opts);
         let _ = std::fs::remove_dir_all(&dir);
         np
+    }
+
+    // followups58 (R208 reviewer): a table thread that cannot start leaves
+    // its part to the calling thread, and the parts are the same. The program
+    // has a package dedup redirect path (`redirects`).
+    #[test]
+    fn table_parts_without_their_threads_are_the_same() {
+        let _scope = crate::core::enter_program(None);
+        let np = redirect_group_program("goport-table-parts");
+        assert!(np.files_by_path().len() > np.source_files().len());
+        let parts = || {
+            let mut beside = false;
+            let parts = TableParts::build(&np, || beside = true);
+            assert!(beside);
+            (
+                parts.source_file_order,
+                parts.other_files,
+                parts.file_by_path,
+                parts.file_meta,
+            )
+        };
+        let threaded = parts();
+        let fallback = crate::program::refuse_helper_threads(parts);
+        assert_eq!(fallback, threaded);
     }
 
     // followups4 (R153 reviewer): editfast1 gives a full build when a
@@ -1923,9 +2376,10 @@ mod tests {
     }
 
     // progtables1: Go builds the symlink cache on first use
-    // (program.go:2300 GetSymlinkCache, a `lazyValue`). A load does not
-    // build it. A seeded thread cannot build it, so the loading thread
-    // builds it when it seeds one, and both read the same copy.
+    // (program.go:2330 GetSymlinkCache, a `lazyValue`). A load does not
+    // build it. A seeded thread cannot read the frontend program, so the
+    // loading thread makes the cache's seed when it seeds one, and both
+    // read the same copy.
     #[cfg(unix)]
     #[test]
     fn symlink_cache_is_built_on_first_use() {
@@ -1962,6 +2416,167 @@ mod tests {
             "node_modules/pkg is not a known symlink"
         );
         drop(frontend);
+        crate::program::release_program(program);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // syscut1: seeding a thread does not build the symlink cache, so a
+    // program that never uses it makes none of its `realpath` calls, as in
+    // Go. The seeded thread that first uses it finishes the loading
+    // thread's seed (`SymlinkSeed`) and finds the symlink of a runtime
+    // dependency that nothing imports (`dep`, found only by
+    // `ResolvePackageDirectory`, program.go:2367) as the frontend does.
+    #[cfg(unix)]
+    #[test]
+    fn seeded_thread_finishes_the_symlink_cache() {
+        assert_seeded_thread_finishes_the_symlink_cache("goport-seed-symlinks", false);
+    }
+
+    // followups66: a `--singleThreaded` load has no parse workers, so no
+    // other thread can read its lookups. Its one checker runs on a seeded
+    // thread, which finishes the seed with lookups of its own: the load
+    // does not build the cache, as in Go (`GetSymlinkCache` is a
+    // `lazyValue` in every mode).
+    #[cfg(unix)]
+    #[test]
+    fn single_threaded_seeded_thread_finishes_the_symlink_cache() {
+        assert_seeded_thread_finishes_the_symlink_cache("goport-seed-symlinks-st", true);
+    }
+
+    /// The body of `seeded_thread_finishes_the_symlink_cache`, for a
+    /// project dir named `name`, `--singleThreaded` when `single_threaded`.
+    #[cfg(unix)]
+    fn assert_seeded_thread_finishes_the_symlink_cache(name: &str, single_threaded: bool) {
+        let dir = symlinked_package_project(name);
+        if single_threaded {
+            std::fs::write(
+                format!("{dir}/tsconfig.json"),
+                r#"{"compilerOptions":{"types":[],"singleThreaded":true},"files":["index.ts"]}"#,
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            format!("{dir}/package.json"),
+            r#"{"name":"app","dependencies":{"pkg":"1.0.0","dep":"1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(format!("{dir}/real/dep")).unwrap();
+        std::fs::write(
+            format!("{dir}/real/dep/package.json"),
+            r#"{"name":"dep","types":"index.d.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            format!("{dir}/real/dep/index.d.ts"),
+            "export declare const d: number;\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../real/dep", format!("{dir}/node_modules/dep")).unwrap();
+        let program = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        let frontend = frontend_of(program);
+        let seeded = {
+            let _scope = crate::core::enter_program(Some(program));
+            assert_eq!(crate::program::single_threaded(), single_threaded);
+            crate::program::spawn_seeded_thread(|| ())
+                .join()
+                .expect("the seeded thread ends");
+            assert!(
+                with_go(|go| go.known_symlinks.get().is_none()),
+                "seeding a thread built the symlink cache"
+            );
+            crate::program::spawn_seeded_thread(|| {
+                crate::program::get_go_symlink_cache().expect("a Go frontend program")
+            })
+            .join()
+            .expect("the seeded thread reads the cache")
+        };
+        let directories = |symlinks: &crate::modulespecifiers::symlinks::KnownSymlinks| {
+            symlinks.directories().keys().cloned().collect::<Vec<_>>()
+        };
+        assert_eq!(
+            directories(&seeded),
+            directories(&frontend.build_symlink_cache())
+        );
+        for name in ["pkg", "dep"] {
+            assert!(
+                directories(&seeded)
+                    .iter()
+                    .any(|path| path.0.ends_with(&format!("/node_modules/{name}/"))),
+                "node_modules/{name} is not a known symlink"
+            );
+        }
+        drop(frontend);
+        crate::program::release_program(program);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // followups66: when the loading thread builds the symlink cache itself
+    // (here after it seeded a thread that did not use it), no thread
+    // finishes the seed, so the seed and the load's lookups that it keeps
+    // go at once (`SymlinkSeedSlot::discard`), not when the program drops.
+    #[cfg(unix)]
+    #[test]
+    fn loading_thread_build_frees_the_symlink_seed() {
+        let dir = symlinked_package_project("goport-seed-discard");
+        let program = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        {
+            let _scope = crate::core::enter_program(Some(program));
+            crate::program::spawn_seeded_thread(|| ())
+                .join()
+                .expect("the seeded thread ends");
+            assert!(
+                with_go(|go| go.symlink_seed.is_set()),
+                "seeding a thread made no symlink cache seed"
+            );
+            let _ = crate::program::get_go_symlink_cache().expect("a Go frontend program");
+            assert!(
+                !with_go(|go| go.symlink_seed.is_set()),
+                "the symlink cache seed outlived the cache"
+            );
+        }
+        crate::program::release_program(program);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // followups66: a panic in the finish of the symlink cache seed takes
+    // the seed with it. The next thread that uses the cache raises the same
+    // panic again (here a Go panic, so the run still ends as Go ends it),
+    // not a panic about a missing seed.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_seed_finish_panic_is_raised_again() {
+        let dir = symlinked_package_project("goport-seed-panic");
+        let program = crate::program::try_load_version(&format!("{dir}/tsconfig.json"), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {dir}: {e}"));
+        let go_panic_message = |result: std::thread::Result<()>| {
+            let payload = result.expect_err("the cache use panics");
+            payload
+                .downcast_ref::<crate::core::GoPanic>()
+                .map(|panic| panic.message.clone())
+                .unwrap_or_else(|| panic!("not a Go panic"))
+        };
+        let (first, again) = {
+            let _scope = crate::core::enter_program(Some(program));
+            type Finish = fn(SymlinkSeed) -> crate::modulespecifiers::symlinks::KnownSymlinks;
+            let use_cache = |finish: Option<Finish>| {
+                crate::program::spawn_seeded_thread(move || {
+                    std::panic::catch_unwind(|| match finish {
+                        Some(finish) => drop(with_go(|go| finish_symlink_seed(go, finish))),
+                        None => drop(crate::program::get_go_symlink_cache()),
+                    })
+                })
+                .join()
+                .expect("the seeded thread ends")
+            };
+            let first = use_cache(Some(|_| {
+                crate::core::go_panic("the first cause".to_string())
+            }));
+            (go_panic_message(first), go_panic_message(use_cache(None)))
+        };
+        assert_eq!(first, "the first cause");
+        assert_eq!(again, "the first cause");
         crate::program::release_program(program);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -13,99 +13,12 @@ pub use flow::*;
 pub use js_string::{append_js_string, decode_js_string, encode_js_string, normalize_js_string};
 pub use syntax_kind::SyntaxKind;
 
-/// Recognizes dynamic import calls without treating ordinary property calls as imports.
-#[must_use]
-pub fn is_import_call(arena: &NodeArena, node: &Node) -> bool {
-    let NodeData::CallExpression(call) = &node.data else {
-        return false;
-    };
-    if node.kind != SyntaxKind::CallExpression {
-        return false;
-    }
-    let Some(callee) = arena.get(call.expression) else {
-        return false;
-    };
-    match (&callee.data, callee.kind) {
-        (NodeData::KeywordExpression(_) | NodeData::Token(_), SyntaxKind::ImportKeyword) => true,
-        (NodeData::MetaProperty(meta), SyntaxKind::MetaProperty)
-            if meta.keyword_token == SyntaxKind::ImportKeyword =>
-        {
-            matches!(arena.get(meta.name), Some(Node { kind: SyntaxKind::Identifier, data: NodeData::Identifier(name), .. }) if name.text == "defer")
-        }
-        _ => false,
-    }
-}
-
-/// Finds real `import.meta` syntax in a source tree, excluding `JSDoc` annotations.
-#[must_use]
-pub fn source_file_contains_import_meta(arena: &NodeArena, source_file: NodeId) -> bool {
-    if !matches!(
-        arena.get(source_file),
-        Some(Node {
-            kind: SyntaxKind::SourceFile,
-            data: NodeData::SourceFile(_),
-            ..
-        })
-    ) {
-        return false;
-    }
-    let mut pending = vec![source_file];
-    while let Some(id) = pending.pop() {
-        let Some(node) = arena.get(id) else {
-            continue;
-        };
-        if matches!(
-            node.kind,
-            SyntaxKind::JsTypeAliasDeclaration | SyntaxKind::JsImportDeclaration
-        ) || matches!(node.data, NodeData::JsDoc(_))
-        {
-            continue;
-        }
-        if matches!(
-            &node.data,
-            NodeData::MetaProperty(meta)
-                if node.kind == SyntaxKind::MetaProperty
-                    && meta.keyword_token == SyntaxKind::ImportKeyword
-                    && matches!(
-                        arena.get(meta.name),
-                        Some(Node { kind: SyntaxKind::Identifier, data: NodeData::Identifier(name), .. })
-                            if name.text == "meta"
-                    )
-        ) {
-            return true;
-        }
-        node.for_each_child(|child| {
-            let reparsed = arena
-                .get(child)
-                .is_some_and(|node| node.flags.0 & NodeFlags::REPARSED.0 != 0);
-            // Only these type edges contain attached JSDoc reparses. Other
-            // reparsed nodes and real TypeScript type expressions still count.
-            let jsdoc_annotation = reparsed
-                && match &node.data {
-                    NodeData::ArrowFunction(function) => {
-                        function.type_ == Some(child)
-                            || function
-                                .type_parameters
-                                .as_ref()
-                                .is_some_and(|parameters| parameters.nodes.contains(&child))
-                    }
-                    NodeData::ParameterDeclaration(parameter) => parameter.type_ == Some(child),
-                    _ => false,
-                };
-            if !jsdoc_annotation {
-                pending.push(child);
-            }
-        });
-    }
-    false
-}
-
-impl NodeData {
+impl NodeData<'_> {
     /// Whether this generated node payload is structurally compatible with a
     /// syntax kind. Most schema names match directly; shared payloads and the
     /// handful of public kind aliases are listed explicitly.
     #[must_use]
-    pub fn matches_syntax_kind(&self, kind: SyntaxKind) -> bool {
+    pub fn matches_syntax_kind(self, kind: SyntaxKind) -> bool {
         match self {
             Self::Token(_) => kind.is_token(),
             Self::KeywordExpression(_) => kind.is_keyword_expression(),
@@ -251,28 +164,41 @@ mod tests {
     use crate::astdata::text::TextRange;
 
     use super::{
-        ConditionalExpressionData, DoStatementData, FileId, ImportDeclarationData,
-        JsDocParameterOrPropertyTagData, ModifierFlags, ModifierList, Node, NodeArena, NodeData,
-        NodeFlags, NodeId, NodeList, NodeRef, SourceFileData, SymbolTable, SyntaxKind,
+        BoxedData, Child, ConditionalExpressionData, DoStatementData, FileId,
+        ImportDeclarationData, JsDocParameterOrPropertyTagData, ModifierFlags, ModifierList, Node,
+        NodeArena, NodeData, NodeFlags, NodeId, NodeList, NodeRef, SourceFileData, SyntaxKind,
         SyntaxListData, TokenData,
     };
 
+    thread_local! {
+        /// The list table of these tests: node data names a list by its
+        /// index in the table of its owner.
+        static LISTS: std::cell::RefCell<Vec<Vec<NodeId>>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
     fn node_list(nodes: &[u32]) -> NodeList {
-        NodeList {
-            range: TextRange::default(),
-            nodes: nodes.iter().copied().map(NodeId::new).collect(),
-            has_trailing_comma: false,
-        }
+        LISTS.with_borrow_mut(|lists| {
+            lists.push(nodes.iter().copied().map(NodeId::new).collect());
+            NodeList::new((lists.len() - 1) as u32)
+        })
     }
 
     fn modifier_list(nodes: &[u32]) -> ModifierList {
         ModifierList {
             list: node_list(nodes),
-            flags: ModifierFlags::default(),
         }
     }
 
-    fn direct_children(data: NodeData) -> Vec<NodeId> {
+    /// The node ids that `child` stands for: the node, or the nodes of the
+    /// list.
+    fn child_ids(child: Child) -> Vec<NodeId> {
+        match child {
+            Child::Node(id) => vec![id],
+            Child::List(l) => LISTS.with_borrow(|lists| lists[l.index()].clone()),
+        }
+    }
+
+    fn direct_children(data: BoxedData) -> Vec<NodeId> {
         let node = Node {
             kind: SyntaxKind::Unknown,
             flags: NodeFlags::default(),
@@ -281,7 +207,7 @@ mod tests {
             data,
         };
         let mut children = Vec::new();
-        node.for_each_child(|child| children.push(child));
+        node.for_each_child(|child| children.extend(child_ids(child)));
         children
     }
 
@@ -295,7 +221,7 @@ mod tests {
             flags: NodeFlags::default(),
             range: TextRange::default(),
             parent: None,
-            data: NodeData::Token(Box::new(TokenData)),
+            data: BoxedData::Token(Box::new(TokenData)),
         }
     }
 
@@ -313,14 +239,14 @@ mod tests {
             flags: NodeFlags::default(),
             range: TextRange::default(),
             parent: None,
-            data: NodeData::Token(Box::new(TokenData)),
+            data: BoxedData::Token(Box::new(TokenData)),
         });
         let second = arena.alloc(Node {
             kind: SyntaxKind::EndOfFile,
             flags: NodeFlags::default(),
             range: TextRange::default(),
             parent: None,
-            data: NodeData::Token(Box::new(TokenData)),
+            data: BoxedData::Token(Box::new(TokenData)),
         });
 
         assert_eq!(first.index(), 0);
@@ -461,54 +387,44 @@ mod tests {
         let cases = vec![
             (
                 "do statement visits its body before its condition",
-                NodeData::DoStatement(Box::new(DoStatementData {
+                BoxedData::DoStatement(Box::new(DoStatementData {
                     expression: NodeId::new(2),
-                    flow_node: None,
                     statement: NodeId::new(1),
-                    facts: 0,
                 })),
                 node_ids(&[1, 2]),
             ),
             (
                 "conditional expression includes punctuation tokens",
-                NodeData::ConditionalExpression(Box::new(ConditionalExpressionData {
+                BoxedData::ConditionalExpression(Box::new(ConditionalExpressionData {
                     colon_token: NodeId::new(4),
                     condition: NodeId::new(1),
                     question_token: NodeId::new(2),
                     when_false: NodeId::new(5),
                     when_true: NodeId::new(3),
-                    facts: 0,
                 })),
                 node_ids(&[1, 2, 3, 4, 5]),
             ),
             (
                 "modifier and node lists flatten in place",
-                NodeData::ImportDeclaration(Box::new(ImportDeclarationData {
+                BoxedData::ImportDeclaration(Box::new(ImportDeclarationData {
                     attributes: Some(NodeId::new(6)),
-                    flow_node: None,
                     import_clause: Some(NodeId::new(3)),
                     module_specifier: NodeId::new(5),
-                    symbol: None,
-                    facts: 0,
                     modifiers: Some(modifier_list(&[1, 2])),
                 })),
                 node_ids(&[1, 2, 3, 5, 6]),
             ),
             (
                 "source-file statements precede end-of-file",
-                NodeData::SourceFile(Box::new(SourceFileData {
+                BoxedData::SourceFile(Box::new(SourceFileData {
                     end_of_file_token: NodeId::new(4),
-                    locals: SymbolTable,
-                    next_container: None,
                     statements: node_list(&[1, 2, 3]),
-                    symbol: None,
-                    facts: 0,
                 })),
                 node_ids(&[1, 2, 3, 4]),
             ),
             (
                 "raw syntax-list children retain their order",
-                NodeData::SyntaxList(Box::new(SyntaxListData {
+                BoxedData::SyntaxList(Box::new(SyntaxListData {
                     children: node_ids(&[3, 1, 2]),
                 })),
                 node_ids(&[3, 1, 2]),
@@ -527,7 +443,7 @@ mod tests {
             (false, node_ids(&[1, 3, 2, 4, 5])),
         ] {
             let data =
-                NodeData::JsDocParameterOrPropertyTag(Box::new(JsDocParameterOrPropertyTagData {
+                BoxedData::JsDocParameterOrPropertyTag(Box::new(JsDocParameterOrPropertyTagData {
                     comment: Some(node_list(&[4, 5])),
                     is_bracketed: false,
                     is_name_first,
@@ -546,23 +462,20 @@ mod tests {
             flags: NodeFlags::default(),
             range: TextRange::default(),
             parent: None,
-            data: NodeData::SourceFile(Box::new(SourceFileData {
+            data: BoxedData::SourceFile(Box::new(SourceFileData {
                 end_of_file_token: NodeId::new(4),
-                locals: SymbolTable,
-                next_container: None,
                 statements: node_list(&[1, 2, 3]),
-                symbol: None,
-                facts: 0,
             })),
         };
         let mut visited = Vec::new();
         let result = node.try_for_each_child(|child| {
-            visited.push(child);
-            if child == NodeId::new(2) {
-                ControlFlow::Break(child)
-            } else {
-                ControlFlow::Continue(())
+            for child in child_ids(child) {
+                visited.push(child);
+                if child == NodeId::new(2) {
+                    return ControlFlow::Break(child);
+                }
             }
+            ControlFlow::Continue(())
         });
 
         assert_eq!(result, ControlFlow::Break(NodeId::new(2)));

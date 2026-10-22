@@ -27,10 +27,14 @@
 //! as for PGO training):
 //!
 //! ```text
-//! cargo test -p ts_goport --lib binder::lib_snapshot::tests::generate_lib_bind_snapshot -- --ignored --exact
+//! cargo test -p goport_core --lib binder::lib_snapshot::tests::generate_lib_bind_snapshot -- --ignored --exact
 //! ```
 //!
 //! `snapshot_matches_live_bind` fails while the blob is stale.
+//!
+//! A snapshot lib must have no private class member: a private name holds
+//! a hash of the lib's file name (`private_name_key`), and the key does not
+//! hold the file name. `generate_lib_bind_snapshot` fails on one.
 //! `GOPORT_LIB_SNAPSHOT=0` turns the snapshot off (for A/B timing), and
 //! `GOPORT_LIB_SNAPSHOT=trace` writes one line per lib file to stderr.
 //!
@@ -1173,7 +1177,7 @@ mod tests {
     use super::*;
 
     /// How to write the blob again.
-    const REGENERATE: &str = "run `cargo test -p ts_goport --lib \
+    const REGENERATE: &str = "run `cargo test -p goport_core --lib \
         binder::lib_snapshot::tests::generate_lib_bind_snapshot -- --ignored --exact` \
         (through scripts/run-cargo-capped.sh)";
 
@@ -1251,6 +1255,15 @@ mod tests {
                 unported,
                 "{lib}: the live bind hit unported code, which a load would skip"
             );
+            let private: Vec<Name> = live.1.private_names().collect();
+            assert!(
+                private.is_empty(),
+                "{lib}: the lib has private class members ({private:?}). A private name holds a \
+                 hash of the lib's file name (`private_name_key`), and the snapshot key does not \
+                 hold the file name, so a load at another lib path (a noembed build, another lib \
+                 dir) would give the old path's names. Put the file name in the key first, or \
+                 key private names by something that does not depend on the path"
+            );
             let key = SnapshotKey::of(file).unwrap_or_else(|| panic!("{lib}: no key"));
             let section =
                 encode(file, &key, &live.0, &live.1).unwrap_or_else(|e| panic!("{lib}: {e}"));
@@ -1268,7 +1281,7 @@ mod tests {
             sections.push((lib, section));
         });
         let blob = write_blob(MAGIC, &sections);
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/binder/lib_bind.bin");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/binder/lib_bind.bin");
         std::fs::write(path, &blob).unwrap_or_else(|e| panic!("cannot write {path}: {e}"));
         eprintln!("wrote {path}: {} bytes", blob.len());
     }

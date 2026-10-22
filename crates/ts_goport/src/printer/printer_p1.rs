@@ -637,6 +637,10 @@ fn get_literal_text_of_node_worker(
 // Go: printer/printer.go:230 getTextOfNode
 // PORT: free function form of the Printer method. See
 // `get_literal_text_of_node_worker`.
+// `Printer::write_factory_name_text` takes the `node.Text()` return of the
+// Identifier arm for a factory name. It uses the same two tests
+// (`has_auto_generate_info` and `can_use_source_file`). A change to this
+// function must change it too.
 fn get_text_of_node_worker(
     generator: &mut NameGenerator,
     state: NodeTextState<'_>,
@@ -644,18 +648,17 @@ fn get_text_of_node_worker(
     include_trivia: bool,
 ) -> Cow<'static, str> {
     let emit_context = state.emit_context;
-    if is_member_name(node) {
-        // PERF: no hash lookup while the map is empty.
-        let auto_generated = {
-            let auto_generate = emit_context.auto_generate.borrow();
-            !auto_generate.is_empty() && auto_generate.contains_key(&node)
-        };
-        if auto_generated {
-            return Cow::Owned(generator.generate_name(node));
-        }
+    // PERF: printfast1. Go reads `node.Kind` for `IsMemberName`,
+    // `IsStringLiteral` and the switch. A factory node reads its kind in
+    // the thread's arena, so the port reads it once.
+    let kind = node.kind();
+    if matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier)
+        && emit_context.has_auto_generate_info(node)
+    {
+        return Cow::Owned(generator.generate_name(node));
     }
 
-    if is_string_literal(node) {
+    if kind == SyntaxKind::StringLiteral {
         let text_source_node = text_source_of(emit_context, node);
         if text_source_node.is_some() {
             return get_text_of_node_worker(generator, state, text_source_node, include_trivia);
@@ -663,12 +666,12 @@ fn get_text_of_node_worker(
     }
 
     let current_source_file = state.current_source_file;
-    let can_use_source_file =
-        current_source_file.is_some() && node.parent().is_some() && !node_is_synthesized(node);
 
-    match node.kind() {
+    match kind {
         SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::JsxNamespacedName => {
-            if !can_use_source_file || get_source_file_of_node(node) != state.current_original {
+            if !can_use_source_file(current_source_file, node)
+                || get_source_file_of_node(node) != state.current_original
+            {
                 return Cow::Borrowed(node.text());
             }
         }
@@ -695,6 +698,13 @@ fn get_text_of_node_worker(
         include_trivia,
         state.skip_trivia_memo,
     )
+}
+
+/// Go `canUseSourceFile` of `getTextOfNode` (printer.go:241): the text of
+/// `node` can come from `current_source_file`. `get_text_of_node_worker`
+/// and `Printer::write_factory_name_text` both use it.
+fn can_use_source_file(current_source_file: Node, node: Node) -> bool {
+    current_source_file.is_some() && node.parent().is_some() && !node_is_synthesized(node)
 }
 
 /// Go `scanner.GetSourceTextOfNodeFromSourceFile` that borrows the source
@@ -1736,7 +1746,11 @@ impl Printer {
         }
 
         let state = self.enter_token_node(node, flags);
-        self.write_token_text(node.kind(), WriteKind::KEYWORD, node.pos());
+        // PERF: printfast1. Go `writeTokenText(node.Kind, WriteKindKeyword,
+        // node.Pos())` and drops the result, the only use of the position.
+        // A factory node reads its position in the thread's arena, so the
+        // port writes the token text with no position read.
+        self.write_as(token_to_string(node.kind()), WriteKind::KEYWORD);
         self.exit_token_node(node, state);
     }
 
@@ -1917,12 +1931,18 @@ impl Printer {
 
     // Go: printer/printer.go:1118 emitIdentifierText
     pub(crate) fn emit_identifier_text(&mut self, node: Node) {
-        let f = get_source_file_of_node(node);
-        debug_assert!(
+        // PERF: printfast1. Go evaluates `GetSourceFileOfNode` for its
+        // `debug.Assert` in every build. It only reads, so a release build
+        // skips the parent walk.
+        debug_assert!({
+            let f = get_source_file_of_node(node);
             f.is_nil()
                 || self.current_source_file.is_nil()
                 || source_file_file_name(f) == source_file_file_name(self.current_source_file)
-        );
+        });
+        if is_synthetic_node(node) && self.write_factory_name_text(node) {
+            return;
+        }
         let text = self.get_text_of_node_cow(node, false /*includeTrivia*/);
 
         let symbol = self
@@ -1934,6 +1954,47 @@ impl Printer {
             return;
         }
         self.write(&text);
+    }
+
+    /// `emitIdentifierText` of factory name `node` when Go `getTextOfNode`
+    /// (printer.go:230) gives `node.Text()`: the name has no auto-generate
+    /// record and Go `canUseSourceFile` is false. Writes the text of its
+    /// node data. False, with nothing written, in any other case.
+    // PERF: printfast1. `Node::text` of a factory name interns the text of
+    // its node data at each read (`scoped_node_text`). Go reads a field.
+    // Type text (`typeToString`) prints its names here.
+    // PORT: the tests are the ones of the Identifier arm of
+    // `get_text_of_node_worker` (`has_auto_generate_info`,
+    // `can_use_source_file`), so the two cannot differ.
+    fn write_factory_name_text(&mut self, node: Node) -> bool {
+        if !matches!(
+            node.kind(),
+            SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier
+        ) || self.emit_context.has_auto_generate_info(node)
+            || can_use_source_file(self.current_source_file, node)
+        {
+            return false;
+        }
+        let symbol = self
+            .id_to_symbol
+            .as_ref()
+            .and_then(|id_to_symbol| id_to_symbol.get(&node).copied());
+        with_ast_data(node, |data| {
+            let text = match data {
+                crate::astdata::NodeData::Identifier(d) => d.text.as_str(),
+                crate::astdata::NodeData::PrivateIdentifier(d) => d.text.as_str(),
+                _ => return false,
+            };
+            // `Node::text` of an empty data text reads the store name.
+            if text.is_empty() {
+                return false;
+            }
+            match symbol {
+                Some(symbol) => self.write_symbol(text, symbol),
+                None => self.write(text),
+            }
+            true
+        })
     }
 
     // Go: printer/printer.go:1132 emitIdentifierName

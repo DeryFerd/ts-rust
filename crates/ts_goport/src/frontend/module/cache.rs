@@ -4,10 +4,10 @@ use crate::frontend::prelude::*;
 use std::cell::Cell;
 use std::sync::Arc;
 
-// Go: module/cache.go:9 ModeAwareCache
+// Go: module/cache.go:10 ModeAwareCache
 pub type ModeAwareCache<T> = FxHashMap<ModeAwareCacheKey, T>;
 
-// Go: module/cache.go:11 moduleResolutionCacheKey
+// Go: module/cache.go:12 moduleResolutionCacheKey
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModuleResolutionCacheKey {
     pub containing_directory: String,
@@ -87,7 +87,7 @@ impl ModuleResolutionCacheKey {
     }
 }
 
-// Go: module/cache.go:18 moduleResolutionCache
+// Go: module/cache.go:19 moduleResolutionCache
 // PORT: Go `collections.SyncMap` is a plain map behind a `RefCell`, so the
 // `DefaultResolver` methods can take `&self`. Cached Go pointers are `Arc`: parse
 // workers share them (`SharedResolutionCache`), and checker threads read
@@ -98,20 +98,20 @@ pub struct ModuleResolutionCache {
 }
 
 impl ModuleResolutionCache {
-    // Go: module/cache.go:22 moduleResolutionCache.Get
+    // Go: module/cache.go:23 moduleResolutionCache.Get
     #[must_use]
     pub fn get(&self, key: &dyn ModuleKey) -> Option<Arc<ResolvedModule>> {
         self.cache.borrow().get(key).cloned()
     }
 
-    // Go: module/cache.go:26 moduleResolutionCache.Set
+    // Go: module/cache.go:27 moduleResolutionCache.Set
     // PORT: Go `LoadOrStore`: the first stored value wins.
     pub fn set(&self, key: ModuleResolutionCacheKey, value: Arc<ResolvedModule>) {
         self.cache.borrow_mut().entry(key).or_insert(value);
     }
 }
 
-// Go: module/cache.go:30 typeRefDirectiveResolutionCacheKey
+// Go: module/cache.go:31 typeRefDirectiveResolutionCacheKey
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TypeRefDirectiveResolutionCacheKey {
     pub containing_directory: String,
@@ -121,7 +121,7 @@ pub struct TypeRefDirectiveResolutionCacheKey {
     pub from_inferred_types_containing_file: bool,
 }
 
-// Go: module/cache.go:38 typeRefDirectiveResolutionCache
+// Go: module/cache.go:39 typeRefDirectiveResolutionCache
 // PORT: see `ModuleResolutionCache`.
 #[derive(Default)]
 pub struct TypeRefDirectiveResolutionCache {
@@ -130,7 +130,7 @@ pub struct TypeRefDirectiveResolutionCache {
 }
 
 impl TypeRefDirectiveResolutionCache {
-    // Go: module/cache.go:42 typeRefDirectiveResolutionCache.Get
+    // Go: module/cache.go:43 typeRefDirectiveResolutionCache.Get
     #[must_use]
     pub fn get(
         &self,
@@ -139,7 +139,7 @@ impl TypeRefDirectiveResolutionCache {
         self.cache.borrow().get(key).cloned()
     }
 
-    // Go: module/cache.go:46 typeRefDirectiveResolutionCache.Set
+    // Go: module/cache.go:47 typeRefDirectiveResolutionCache.Set
     // PORT: Go `Store`: the last stored value wins.
     pub fn set(
         &self,
@@ -150,18 +150,18 @@ impl TypeRefDirectiveResolutionCache {
     }
 }
 
-// Go: module/cache.go:50 parsedPatternsCache
+// Go: module/cache.go:51 parsedPatternsCache
 // PORT: Go keys the `SyncMap` by the `*OrderedMap` of `paths`, and the key
 // keeps that map alive. The Rust `paths` map is a field of the
 // `CompilerOptions`, so the key is the address of that field (0 for a nil
 // map), and the entry holds the options `Rc` that owns it.
 #[derive(Default)]
 pub struct ParsedPatternsCache {
-    cache: RefCell<FxHashMap<usize, (Rc<CompilerOptions>, Rc<ParsedPatterns>)>>,
+    pub cache: RefCell<FxHashMap<usize, (Rc<CompilerOptions>, Rc<ParsedPatterns>)>>,
 }
 
 impl ParsedPatternsCache {
-    // Go: module/cache.go:54 parsedPatternsCache.Get
+    // Go: module/cache.go:55 parsedPatternsCache.Get
     // PORT: Go takes `compilerOptions.Paths`; this takes the options that
     // own it (see the type).
     pub fn get(&self, compiler_options: &Rc<CompilerOptions>) -> Rc<ParsedPatterns> {
@@ -189,13 +189,92 @@ impl ParsedPatternsCache {
     }
 }
 
-// Go: module/cache.go:62 caches
+// Go: module/cache.go:63 ResolutionData (ts#64519)
+/// The part of a resolver that a program keeps and that later resolvers
+/// share (`new_resolver`): the options and the package.json cache. It holds
+/// no host and no resolution caches.
 // PORT: Go `*packagejson.InfoCache` is shared between resolvers
 // (`ResolverOptions.PackageJsonCache`), so it is `Rc<InfoCache>`. `InfoCache`
-// has interior mutability, like the Go `SyncMap`.
-pub struct Caches {
-    pub package_json_info_cache: Rc<InfoCache>,
+// has interior mutability, like the Go `SyncMap`. Go shares the
+// `*ResolutionData`; here it is `Rc<ResolutionData>`.
+pub struct ResolutionData {
+    pub compiler_options: Rc<CompilerOptions>,
+    pub typings_location: String,
+    pub project_name: String,
+    // tsgo#4712: the content mapper extensions.
+    pub extra_extensions: Vec<String>,
 
+    pub package_json_info_cache: Rc<InfoCache>,
+}
+
+// Go: module/cache.go:72 newResolutionData (ts#64519)
+// PORT: Go keeps a nil `CompilerOptions` and panics at its first use; this
+// panics now (as `new_resolver` did).
+pub(crate) fn new_resolution_data(opts: &ResolverOptions) -> ResolutionData {
+    let host = opts.host.as_ref().expect("module.NewResolver: nil Host");
+    ResolutionData {
+        compiler_options: opts
+            .compiler_options
+            .clone()
+            .expect("module.NewResolver: nil CompilerOptions"),
+        typings_location: opts.typings_location.clone(),
+        project_name: opts.project_name.clone(),
+        extra_extensions: opts.extra_extensions.clone(),
+        package_json_info_cache: opts.package_json_cache.clone().unwrap_or_else(|| {
+            Rc::new(new_info_cache(
+                host.get_current_directory(),
+                host.fs().use_case_sensitive_file_names(),
+            ))
+        }),
+    }
+}
+
+// Go: module/cache.go:86 (*ResolutionData).Clone (ts#64519)
+/// The same data with a copy of the package.json cache table
+/// (`InfoCache::clone`).
+impl Clone for ResolutionData {
+    fn clone(&self) -> Self {
+        ResolutionData {
+            compiler_options: self.compiler_options.clone(),
+            typings_location: self.typings_location.clone(),
+            project_name: self.project_name.clone(),
+            extra_extensions: self.extra_extensions.clone(),
+            package_json_info_cache: Rc::new(self.package_json_info_cache.as_ref().clone()),
+        }
+    }
+}
+
+impl ResolutionData {
+    // Go: module/cache.go:97 (*ResolutionData).PackageJsonCacheEntries (ts#64519)
+    // PORT: the loader's resolver also lists the package.json lookups of the
+    // parse worker answers that it took
+    // (`DefaultResolver::package_json_cache_entries`). They are in its
+    // `Caches`, not here.
+    pub fn package_json_cache_entries(
+        &self,
+        mut f: impl FnMut(&Path, PackageJsonCacheEntry<'_>) -> bool,
+    ) {
+        self.package_json_info_cache.range(|key, entry| {
+            f(
+                key,
+                PackageJsonCacheEntry {
+                    package_directory: &entry.package_directory,
+                    directory_exists: entry.directory_exists,
+                    exists: entry.exists(),
+                },
+            )
+        });
+    }
+}
+
+// Go: module/resolver.go:335 DefaultResolver (the caches; ts#64519 moves
+// them there from module/cache.go:62 caches at 673a5f17d713)
+// PORT: the Go fields `moduleResolutionCache`, `typeRefDirectiveResolutionCache`
+// and `parsedPatternsForPaths` of `DefaultResolver`, with the Rust-only
+// caches of the parallel load. Each resolver has its own; a resolver that
+// `ResolutionData::new_resolver` makes starts empty.
+#[derive(Default)]
+pub struct Caches {
     pub module_resolution_cache: ModuleResolutionCache,
     pub type_ref_directive_resolution_cache: TypeRefDirectiveResolutionCache,
 
@@ -575,28 +654,8 @@ pub struct AheadStats {
 }
 
 impl Caches {
-    // PORT: Go zero `caches` with only `packageJsonInfoCache` set
-    // (`NewResolver` with a shared `PackageJsonCache`).
-    #[must_use]
-    pub fn with_package_json_info_cache(package_json_info_cache: Rc<InfoCache>) -> Caches {
-        Caches {
-            package_json_info_cache,
-            module_resolution_cache: ModuleResolutionCache::default(),
-            type_ref_directive_resolution_cache: TypeRefDirectiveResolutionCache::default(),
-            parsed_patterns_for_paths: ParsedPatternsCache::default(),
-            shared: None,
-            package_json_log: RefCell::new(Vec::new()),
-            worker_package_jsons: RefCell::new(Vec::new()),
-            worker_package_json_reads: None,
-            worker_lookups: RefCell::new(Vec::new()),
-            ahead: RefCell::new(None),
-        }
-    }
-
-    /// Drops the cached resolutions and package.json entries when no
-    /// program uses this resolver any more
-    /// (`NewProgram::release_resolver_caches`). A package.json cache that
-    /// another resolver shares stays.
+    /// Drops the cached resolutions when no program uses this resolver any
+    /// more (`DefaultResolver::release_caches`).
     // PORT: not in Go. Go's GC frees the resolver with its last program.
     pub fn release(&self) {
         let modules = std::mem::take(&mut *self.module_resolution_cache.cache.borrow_mut());
@@ -613,13 +672,10 @@ impl Caches {
             worker_package_jsons,
             worker_lookups,
         )));
-        if Rc::strong_count(&self.package_json_info_cache) == 1 {
-            self.package_json_info_cache.clear();
-        }
     }
 }
 
-// Go: module/cache.go:18 moduleResolutionCache and :40
+// Go: module/cache.go:19 moduleResolutionCache and :40
 // typeRefDirectiveResolutionCache, the `SyncMap`s themselves.
 // PORT: Go shares one resolver, and so these maps, between all parse tasks
 // of a program. The Rust loader resolves on one thread with `Rc` values
@@ -637,22 +693,83 @@ impl Caches {
 // adds them to its own package.json cache.
 #[derive(Default)]
 pub struct SharedResolutionCache {
-    modules: std::sync::Mutex<
-        FxHashMap<ModuleResolutionCacheKey, SharedResolution<Arc<ResolvedModule>>>,
-    >,
-    type_ref_directives: std::sync::Mutex<
-        FxHashMap<
-            TypeRefDirectiveResolutionCacheKey,
-            SharedResolution<Arc<ResolvedTypeReferenceDirective>>,
-        >,
+    modules: SharedMap<ModuleResolutionCacheKey, SharedResolution<Arc<ResolvedModule>>>,
+    type_ref_directives: SharedMap<
+        TypeRefDirectiveResolutionCacheKey,
+        SharedResolution<Arc<ResolvedTypeReferenceDirective>>,
     >,
     /// The package scopes that resolve-ahead workers found, by directory
     /// (`DefaultResolver::publish_package_scope`), or that parse workers
     /// found for the metadata of the files they parse (`store_scope`).
-    scopes: std::sync::Mutex<FxHashMap<String, SharedResolution<Option<PackageScope>>>>,
+    scopes: SharedMap<String, SharedResolution<Option<PackageScope>>>,
     /// The first read of each package.json that a parse worker made in this
     /// load, by file name (`store_package_json_read`).
-    package_json_reads: std::sync::Mutex<FxHashMap<String, Arc<WorkerPackageJsonRead>>>,
+    package_json_reads: SharedMap<String, Arc<WorkerPackageJsonRead>>,
+}
+
+/// The shards of a `SharedMap`.
+const SHARED_MAP_SHARDS: usize = 64;
+
+/// One map of a `SharedResolutionCache`: Go `collections.SyncMap`, in
+/// shards by the key hash (`shard`).
+// PORT: a Go `SyncMap` reads a key with no lock, so the parse goroutines
+// that look up and store answers at once do not wait for each other. One
+// lock over the whole module map made the parse workers wait for it about
+// 17,000 times in a VS Code load (syscut1, testbox: 45% of the futex calls
+// of the load).
+struct SharedMap<K, V> {
+    shards: Box<[std::sync::Mutex<FxHashMap<K, V>>]>,
+}
+
+impl<K, V> Default for SharedMap<K, V> {
+    fn default() -> Self {
+        SharedMap {
+            shards: (0..SHARED_MAP_SHARDS)
+                .map(|_| std::sync::Mutex::default())
+                .collect(),
+        }
+    }
+}
+
+impl<K, V> SharedMap<K, V> {
+    /// The locked shard of the key whose hash is `hash` (`key_hash`).
+    fn shard(&self, hash: u64) -> std::sync::MutexGuard<'_, FxHashMap<K, V>> {
+        lock_shared(&self.shards[shard_index(hash)])
+    }
+
+    /// Calls `f` with each value, one shard at a time.
+    fn for_each_value(&self, mut f: impl FnMut(&V)) {
+        for shard in &self.shards {
+            lock_shared(shard).values().for_each(&mut f);
+        }
+    }
+
+    /// Takes every value out of the map.
+    fn take_values(&self) -> Vec<V> {
+        self.shards
+            .iter()
+            .flat_map(|shard| std::mem::take(&mut *lock_shared(shard)).into_values())
+            .collect()
+    }
+}
+
+/// The hash that picks the shard of `key` in a `SharedMap`. A borrowed
+/// key must give the hash of its owned key (`Borrow`).
+fn key_hash<Q: std::hash::Hash + ?Sized>(key: &Q) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one(key)
+}
+
+/// The shard of a key whose Fx hash is `hash`, in a map of 64 shards:
+/// bits 51 to 56. The map in the shard hashes the key with Fx too, and
+/// hashbrown takes its 7-bit tag from the top bits (57 to 63) and its
+/// bucket from the low bits. Shards by the top bits gave each shard's keys
+/// nearly one tag, so a lookup compared many keys: 5 times slower than
+/// one map (syscut1 round 2 bench, 50k module keys, one thread). Shared by
+/// `StatMap::shard` (compiler/files_parser.rs).
+pub(crate) fn shard_index(hash: u64) -> usize {
+    const _: () = assert!(SHARED_MAP_SHARDS == 64);
+    ((hash >> 51) & 63) as usize
 }
 
 /// A parse worker's answer in the `SharedResolutionCache`.
@@ -1165,7 +1282,7 @@ impl SharedResolutionCache {
         if ANSWER_WAIT.with(Cell::get) {
             return self.wait_for_module(key);
         }
-        lock_shared(&self.modules).get(key).cloned()
+        self.modules.shard(key_hash(&key.parts())).get(key).cloned()
     }
 
     /// `get_module` on a thread that waits for the answers of the parse
@@ -1176,9 +1293,9 @@ impl SharedResolutionCache {
         &self,
         key: &dyn ModuleKey,
     ) -> Option<SharedResolution<Arc<ResolvedModule>>> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
         loop {
-            let found = lock_shared(&self.modules).get(key).cloned();
+            let found = self.modules.shard(key_hash(&key.parts())).get(key).cloned();
             if found.is_some() || std::time::Instant::now() > deadline {
                 return found;
             }
@@ -1190,25 +1307,29 @@ impl SharedResolutionCache {
     /// package scope (`SharedResolution::ahead`).
     // PORT: not in Go (resolve ahead, compiler/resolve_ahead.rs).
     pub fn for_each_ahead_calls(&self, mut f: impl FnMut(&[AheadCall])) {
-        for value in lock_shared(&self.modules).values() {
-            f(value.ahead.as_deref().unwrap_or_default());
-        }
-        for value in lock_shared(&self.scopes).values() {
-            f(value.ahead.as_deref().unwrap_or_default());
-        }
+        self.modules
+            .for_each_value(|value| f(value.ahead.as_deref().unwrap_or_default()));
+        self.scopes
+            .for_each_value(|value| f(value.ahead.as_deref().unwrap_or_default()));
     }
 
     /// The package scope of `directory` that a worker found.
     // PORT: not in Go (resolve ahead).
     #[must_use]
     pub fn get_scope(&self, directory: &str) -> Option<SharedResolution<Option<PackageScope>>> {
-        lock_shared(&self.scopes).get(directory).cloned()
+        self.scopes
+            .shard(key_hash(directory))
+            .get(directory)
+            .cloned()
     }
 
     /// Publishes the package scope of `directory` (the first value wins).
     // PORT: not in Go (resolve ahead).
     pub fn set_scope(&self, directory: String, value: SharedResolution<Option<PackageScope>>) {
-        lock_shared(&self.scopes).entry(directory).or_insert(value);
+        self.scopes
+            .shard(key_hash(directory.as_str()))
+            .entry(directory)
+            .or_insert(value);
     }
 
     /// Stores `read()`, a parse worker's read of the package.json
@@ -1220,7 +1341,8 @@ impl SharedResolutionCache {
         file_name: &str,
         read: impl FnOnce() -> WorkerPackageJsonRead,
     ) -> Arc<WorkerPackageJsonRead> {
-        lock_shared(&self.package_json_reads)
+        self.package_json_reads
+            .shard(key_hash(file_name))
             .entry(file_name.to_string())
             .or_insert_with(|| Arc::new(read()))
             .clone()
@@ -1231,7 +1353,8 @@ impl SharedResolutionCache {
     // PORT: not in Go (see `WorkerPackageJsonRead`).
     #[must_use]
     pub fn package_json_read(&self, file_name: &str) -> Option<Arc<WorkerPackageJsonRead>> {
-        lock_shared(&self.package_json_reads)
+        self.package_json_reads
+            .shard(key_hash(file_name))
             .get(file_name)
             .cloned()
     }
@@ -1241,7 +1364,9 @@ impl SharedResolutionCache {
     // PORT: not in Go (see `WorkerPackageJsonRead`).
     #[must_use]
     pub fn has_package_json_read(&self, file_name: &str) -> bool {
-        lock_shared(&self.package_json_reads).contains_key(file_name)
+        self.package_json_reads
+            .shard(key_hash(file_name))
+            .contains_key(file_name)
     }
 
     /// Gives the package.json reads of the load that the loader did not
@@ -1253,8 +1378,7 @@ impl SharedResolutionCache {
     /// for it (`InfoCache::get`).
     // PORT: not in Go (see `WorkerPackageJsonRead`).
     pub fn end_package_json_reads(&self, cache: &InfoCache) {
-        let reads = std::mem::take(&mut *lock_shared(&self.package_json_reads));
-        for read in reads.values() {
+        for read in self.package_json_reads.take_values() {
             read.adopt(cache);
         }
     }
@@ -1270,7 +1394,8 @@ impl SharedResolutionCache {
         directory: &str,
         value: SharedResolution<Option<PackageScope>>,
     ) -> SharedResolution<Option<PackageScope>> {
-        lock_shared(&self.scopes)
+        self.scopes
+            .shard(key_hash(directory))
             .entry(directory.to_string())
             .or_insert(value)
             .clone()
@@ -1282,7 +1407,10 @@ impl SharedResolutionCache {
         key: ModuleResolutionCacheKey,
         value: SharedResolution<Arc<ResolvedModule>>,
     ) {
-        lock_shared(&self.modules).entry(key).or_insert(value);
+        self.modules
+            .shard(key_hash(&key.parts()))
+            .entry(key)
+            .or_insert(value);
     }
 
     /// Go `typeRefDirectiveResolutionCache.Get`.
@@ -1291,7 +1419,10 @@ impl SharedResolutionCache {
         &self,
         key: &TypeRefDirectiveResolutionCacheKey,
     ) -> Option<SharedResolution<Arc<ResolvedTypeReferenceDirective>>> {
-        lock_shared(&self.type_ref_directives).get(key).cloned()
+        self.type_ref_directives
+            .shard(key_hash(key))
+            .get(key)
+            .cloned()
     }
 
     /// Go `typeRefDirectiveResolutionCache.Set` (`Store`: the last value
@@ -1301,7 +1432,9 @@ impl SharedResolutionCache {
         key: TypeRefDirectiveResolutionCacheKey,
         value: SharedResolution<Arc<ResolvedTypeReferenceDirective>>,
     ) {
-        lock_shared(&self.type_ref_directives).insert(key, value);
+        self.type_ref_directives
+            .shard(key_hash(&key))
+            .insert(key, value);
     }
 }
 
@@ -1604,13 +1737,25 @@ impl Caches {
         }
     }
 
+    /// Keeps the file system lookups of a worker answer that the loader's
+    /// resolver took (`worker_lookups`).
+    pub fn note_worker_lookups(&self, lookups: &Option<Arc<[StatLookup]>>) {
+        if let Some(lookups) = lookups.as_ref().filter(|lookups| !lookups.is_empty()) {
+            self.worker_lookups.borrow_mut().push(lookups.clone());
+        }
+    }
+}
+
+// PORT: the loader's resolver; the package.json cache is in its
+// `ResolutionData` (ts#64519).
+impl DefaultResolver {
     /// The loader's resolver: keeps the read of each lookup of
     /// `package_jsons` that has one, the lookups of the package scope walk
     /// of a file's metadata that a parse worker made, in its package.json
     /// cache, as the first read of the load made it
     /// (`PackageJsonLookup::read`), unless the cache has the entry: Go
     /// `InfoCache.Set` keeps the first. In Go the loader finds the metadata
-    /// (fileloader.go:391 `loadSourceFileMetaData`) with the program's
+    /// (fileloader.go:389 `loadSourceFileMetaData`) with the program's
     /// resolver, so a later lookup on the loading thread (the loader's own
     /// resolutions, Go `Program.GetPackageJsonInfo`) finds what the load
     /// read and does not read the file again. The cache parses a text only
@@ -1628,30 +1773,12 @@ impl Caches {
             read.adopt(&self.package_json_info_cache);
         }
     }
-
-    /// Keeps the file system lookups of a worker answer that the loader's
-    /// resolver took (`worker_lookups`).
-    pub fn note_worker_lookups(&self, lookups: &Option<Arc<[StatLookup]>>) {
-        if let Some(lookups) = lookups.as_ref().filter(|lookups| !lookups.is_empty()) {
-            self.worker_lookups.borrow_mut().push(lookups.clone());
-        }
-    }
 }
 
-// Go: module/cache.go:74 newCaches
-#[must_use]
-pub fn new_caches(
-    current_directory: &str,
-    use_case_sensitive_file_names: bool,
-    _options: &CompilerOptions,
-) -> Caches {
-    Caches::with_package_json_info_cache(Rc::new(new_info_cache(
-        current_directory,
-        use_case_sensitive_file_names,
-    )))
-}
+// Go: module/cache.go:74 newCaches (at 673a5f17d713; removed by ts#64519,
+// which makes it newResolutionData, module/cache.go:72 `new_resolution_data`)
 
-// Go: module/cache.go:84 getRedirectConfigName
+// Go: module/cache.go:101 getRedirectConfigName
 #[must_use]
 pub fn get_redirect_config_name(redirect: Option<&dyn ModuleResolvedProjectReference>) -> String {
     match redirect {
@@ -1814,7 +1941,7 @@ mod tests {
         resolve(&loader, &dir, NAMES);
         // Every answer came from a worker, so the loader made no lookup.
         let mut own = 0;
-        loader.caches.package_json_info_cache.range(|_, _| {
+        loader.package_json_info_cache.range(|_, _| {
             own += 1;
             true
         });
@@ -1872,7 +1999,7 @@ mod tests {
         // The loader's own read of b comes before the adoption.
         assert_eq!(name("b").as_deref(), Some("b-loader"));
         std::fs::remove_dir_all(&root).unwrap();
-        loader.caches.adopt_worker_package_jsons(&[
+        loader.adopt_worker_package_jsons(&[
             lookup(first),
             lookup(second),
             lookup(Arc::new(read("b", "b-worker"))),
@@ -1924,7 +2051,7 @@ mod tests {
         let worker = {
             let queue = queue.clone();
             std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
                 let mut marked = true;
                 while queue.waiting.load(std::sync::atomic::Ordering::SeqCst) != 2 {
                     if std::time::Instant::now() > deadline {

@@ -14,7 +14,7 @@ use crate::diagnostics::Message;
 use crate::prelude::*;
 
 impl Checker {
-    // Go: checker/checker.go:14240 errorSkippedOnNoEmit
+    // Go: checker/checker.go:14277 errorSkippedOnNoEmit
     // PORT: Go sets the flag on the diagnostic that `c.error` returns: the stored
     // one (#4825: it can be an equal one added before). `c.error` is inlined so
     // the flag goes on the stored diagnostic. The result is a clone of it.
@@ -34,7 +34,7 @@ impl Checker {
         diagnostic
     }
 
-    // Go: checker/checker.go:14246 errorOrSuggestion
+    // Go: checker/checker.go:14283 errorOrSuggestion
     pub fn error_or_suggestion(
         &mut self,
         is_error: bool,
@@ -45,7 +45,7 @@ impl Checker {
         self.add_error_or_suggestion(is_error, new_diagnostic_for_node(location, message, args));
     }
 
-    // Go: checker/checker.go:14250 errorAndMaybeSuggestAwait
+    // Go: checker/checker.go:14287 errorAndMaybeSuggestAwait
     // PORT: Go adds the related info to the diagnostic that `c.error` returns:
     // the stored one (#4825: it can be an equal one added before). `c.error` is
     // inlined so the related info goes on the stored diagnostic. The result is a
@@ -70,7 +70,7 @@ impl Checker {
         diagnostic
     }
 
-    // Go: checker/checker.go:14258 addErrorOrSuggestion
+    // Go: checker/checker.go:14295 addErrorOrSuggestion
     pub fn add_error_or_suggestion(&mut self, is_error: bool, diagnostic: Diagnostic) {
         if is_error {
             self.add_diagnostic(diagnostic);
@@ -81,7 +81,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:14268 IsDeprecatedDeclaration
+    // Go: checker/checker.go:14305 IsDeprecatedDeclaration
     // PERF: U4 (CH7). A node of a store without the flag is not deprecated
     // (`frozen_store_lacks_deprecated_tag`), so the cached combined flags
     // are not read. That cache is a one-entry memo of a pure function, so
@@ -98,7 +98,7 @@ impl Checker {
         is_deprecated_declaration_with_cached_flags(declaration, flags)
     }
 
-    // Go: checker/checker.go:14272 addDeprecatedSuggestion
+    // Go: checker/checker.go:14309 addDeprecatedSuggestion
     pub fn add_deprecated_suggestion(
         &mut self,
         location: Node,
@@ -110,7 +110,7 @@ impl Checker {
         self.add_deprecated_suggestion_worker(declarations, diagnostic)
     }
 
-    // Go: checker/checker.go:14277 addDeprecatedSuggestionWorker
+    // Go: checker/checker.go:14314 addDeprecatedSuggestionWorker
     // PORT: takes the diagnostic by value. Go (#4825) returns
     // `c.addSuggestionDiagnostic(diagnostic)`, the stored diagnostic or the
     // discarded one. Here the result is a clone of it.
@@ -137,7 +137,7 @@ impl Checker {
         diagnostic
     }
 
-    // Go: checker/checker.go:14288 isDeprecatedSymbol
+    // Go: checker/checker.go:14325 isDeprecatedSymbol
     pub fn is_deprecated_symbol(&mut self, symbol: SymbolId) -> bool {
         let parent_symbol = self.get_parent_of_symbol(symbol);
         let declarations = self.sym(symbol).declarations.clone();
@@ -177,19 +177,19 @@ impl Checker {
         true
     }
 
-    // Go: checker/checker.go:14300 hasParseDiagnostics
+    // Go: checker/checker.go:14337 hasParseDiagnostics
     pub fn has_parse_diagnostics(&self, source_file: Node) -> bool {
         !source_file_info(source_file).diagnostics.is_empty()
     }
 
-    // Go: checker/checker.go:14304 newSymbol
+    // Go: checker/checker.go:14341 newSymbol
     pub fn new_symbol(&mut self, flags: SymbolFlags, name: impl Into<Name>) -> SymbolId {
         self.symbol_count += 1;
         self.symbols
             .new_symbol(flags | SymbolFlags::TRANSIENT, name)
     }
 
-    // Go: checker/checker.go:14312 newSymbolEx
+    // Go: checker/checker.go:14349 newSymbolEx
     pub fn new_symbol_ex(
         &mut self,
         flags: SymbolFlags,
@@ -201,7 +201,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:14318 newParameter
+    // Go: checker/checker.go:14355 newParameter
     pub fn new_parameter(&mut self, name: &str, t: TypeId) -> SymbolId {
         let symbol = self.new_symbol(SymbolFlags::FUNCTION_SCOPED_VARIABLE, name);
         self.value_symbol_links
@@ -210,7 +210,7 @@ impl Checker {
         symbol
     }
 
-    // Go: checker/checker.go:14324 newProperty
+    // Go: checker/checker.go:14361 newProperty
     pub fn new_property(&mut self, name: &str, t: TypeId) -> SymbolId {
         let symbol = self.new_symbol(SymbolFlags::PROPERTY, name);
         self.value_symbol_links
@@ -219,7 +219,7 @@ impl Checker {
         symbol
     }
 
-    // Go: checker/checker.go:14330 combineSymbolTables
+    // Go: checker/checker.go:14367 combineSymbolTables
     pub fn combine_symbol_tables(
         &mut self,
         first: SymbolTable,
@@ -237,7 +237,7 @@ impl Checker {
         combined
     }
 
-    // Go: checker/checker.go:14343 mergeSymbolTable
+    // Go: checker/checker.go:14380 mergeSymbolTable
     // PORT: Go ranges over the map in random order; this iterates a snapshot
     // of `source` in insertion order.
     pub fn merge_symbol_table(
@@ -279,7 +279,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:14380 mergeSymbol
+    // Go: checker/checker.go:14417 mergeSymbol
     /**
      * Note: if target is transient, then it is mutable, and mergeSymbol with both mutate and return it.
      * If target is not transient, mergeSymbol will produce a transient clone, mutate that and return it.
@@ -381,7 +381,7 @@ impl Checker {
         target
     }
 
-    // Go: checker/checker.go:14435 reportMergeSymbolError
+    // Go: checker/checker.go:14472 reportMergeSymbolError
     pub fn report_merge_symbol_error(&mut self, target: SymbolId, source: SymbolId) {
         let target_flags = self.sym(target).flags;
         let source_flags = self.sym(source).flags;
@@ -432,7 +432,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:14460 addDuplicateDeclarationErrorsForSymbols
+    // Go: checker/checker.go:14497 addDuplicateDeclarationErrorsForSymbols
     pub fn add_duplicate_declaration_errors_for_symbols(
         &mut self,
         target: SymbolId,
@@ -447,7 +447,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:14466 addDuplicateDeclarationError
+    // Go: checker/checker.go:14503 addDuplicateDeclarationError
     // PORT: Go changes the diagnostic that `lookupOrIssueError` returns. Since
     // #4825 that is the stored one: an equal diagnostic added before, or the new
     // one. Here the call is inlined so the loop changes the stored entry in
@@ -508,7 +508,7 @@ fn add_duplicate_declaration_related_info(
     }
 }
 
-// Go: checker/checker.go:14492 createDiagnosticForNode
+// Go: checker/checker.go:14529 createDiagnosticForNode
 pub fn create_diagnostic_for_node(
     node: Node,
     message: &'static Message,
@@ -517,7 +517,7 @@ pub fn create_diagnostic_for_node(
     new_diagnostic_for_node(node, message, args)
 }
 
-// Go: checker/checker.go:14496 getAdjustedNodeForError
+// Go: checker/checker.go:14533 getAdjustedNodeForError
 pub fn get_adjusted_node_for_error(node: Node) -> Node {
     let name = get_name_of_declaration(node);
     if name.is_some() {
@@ -527,7 +527,7 @@ pub fn get_adjusted_node_for_error(node: Node) -> Node {
 }
 
 impl Checker {
-    // Go: checker/checker.go:14504 lookupOrIssueError
+    // Go: checker/checker.go:14541 lookupOrIssueError
     // PORT: Go (#4825) returns `c.addDiagnostic(NewDiagnosticForNode(...))`:
     // `Add` finds an equal stored diagnostic, so there is no `Lookup`. That is
     // the body of `error`, which returns a clone of the stored diagnostic. A
@@ -542,7 +542,7 @@ impl Checker {
         self.error(location, message, args)
     }
 
-    // Go: checker/checker.go:14508 getFirstDeclaration
+    // Go: checker/checker.go:14545 getFirstDeclaration
     // PORT: package-level Go function that reads symbol data, so a method.
     pub fn get_first_declaration(&self, symbol: SymbolId) -> Node {
         let declarations = &self.sym(symbol).declarations;
@@ -553,7 +553,7 @@ impl Checker {
     }
 }
 
-// Go: checker/checker.go:14515 getExcludedSymbolFlags
+// Go: checker/checker.go:14552 getExcludedSymbolFlags
 pub fn get_excluded_symbol_flags(flags: SymbolFlags) -> SymbolFlags {
     let mut result = SymbolFlags::NONE;
     if flags.intersects(SymbolFlags::BLOCK_SCOPED_VARIABLE) {
@@ -617,7 +617,7 @@ fn maps_clone_symbol_table(symbols: &mut SymbolArena, table: SymbolTable) -> Sym
 }
 
 impl Checker {
-    // Go: checker/checker.go:14571 cloneSymbol
+    // Go: checker/checker.go:14608 cloneSymbol
     pub fn clone_symbol(&mut self, symbol: SymbolId) -> SymbolId {
         let flags = self.sym(symbol).flags;
         let name = self.sym(symbol).name.clone();
@@ -641,7 +641,7 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:14583 getMergedSymbol
+    // Go: checker/checker.go:14620 getMergedSymbol
     pub fn get_merged_symbol(&self, symbol: SymbolId) -> SymbolId {
         if symbol.is_some() {
             if let Some(&merged) = self.merged_symbols.get(&symbol) {
@@ -653,7 +653,7 @@ impl Checker {
         symbol
     }
 
-    // Go: checker/checker.go:14593 getParentOfSymbol
+    // Go: checker/checker.go:14630 getParentOfSymbol
     pub fn get_parent_of_symbol(&mut self, symbol: SymbolId) -> SymbolId {
         let parent = self.sym(symbol).parent;
         if parent.is_some() {
@@ -663,27 +663,29 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:14600 recordMergedSymbol
+    // Go: checker/checker.go:14637 recordMergedSymbol
     pub fn record_merged_symbol(&mut self, target: SymbolId, source: SymbolId) {
         self.merge_version += 1;
         self.merged_symbols.insert(source, target);
     }
 
-    // Go: checker/checker.go:14604 getSymbolIfSameReference
+    // Go: checker/checker.go:14641 getResolvedTarget (ts#64469)
+    pub fn get_resolved_target(&mut self, symbol: SymbolId) -> SymbolId {
+        let merged = self.get_merged_symbol(symbol);
+        let resolved = self.resolve_symbol(merged);
+        self.get_merged_symbol(resolved)
+    }
+
+    // Go: checker/checker.go:14645 getSymbolIfSameReference
     pub fn get_symbol_if_same_reference(&mut self, s1: SymbolId, s2: SymbolId) -> SymbolId {
-        let m1 = self.get_merged_symbol(s1);
-        let r1 = self.resolve_symbol(m1);
-        let left = self.get_merged_symbol(r1);
-        let m2 = self.get_merged_symbol(s2);
-        let r2 = self.resolve_symbol(m2);
-        let right = self.get_merged_symbol(r2);
-        if left == right {
+        // ts#64469, Go N' checker.go:14646
+        if self.get_resolved_target(s1) == self.get_resolved_target(s2) {
             return s1;
         }
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:14611 getExportSymbolOfValueSymbolIfExported
+    // Go: checker/checker.go:14652 getExportSymbolOfValueSymbolIfExported
     pub fn get_export_symbol_of_value_symbol_if_exported(&self, mut symbol: SymbolId) -> SymbolId {
         if symbol.is_some()
             && self.sym(symbol).flags.intersects(SymbolFlags::EXPORT_VALUE)
@@ -694,7 +696,7 @@ impl Checker {
         self.get_merged_symbol(symbol)
     }
 
-    // Go: checker/checker.go:14618 getSymbolOfDeclaration
+    // Go: checker/checker.go:14659 getSymbolOfDeclaration
     pub fn get_symbol_of_declaration(&mut self, node: Node) -> SymbolId {
         let symbol = node.symbol();
         if symbol.is_some() {
@@ -704,7 +706,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:14628 getSymbolOfNode
+    // Go: checker/checker.go:14669 getSymbolOfNode
     // Get the merged symbol for a node. If you know the node is a `Declaration`, it is more type safe to
     // use use `getSymbolOfDeclaration` instead.
     // PORT: Go reads `node.DeclarationData().Symbol`; `node.symbol()` is the
@@ -719,7 +721,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:14636 getLateBoundSymbol
+    // Go: checker/checker.go:14677 getLateBoundSymbol
     // PERF: chkport1 item 7. Most calls take the early exit. It reads the
     // symbol once and compares the name by id (`COMPUTED_NAME`), and it is
     // inlined: the rest is out of line (`get_late_bound_symbol_slow`), so
@@ -763,12 +765,12 @@ impl Checker {
         links.late_symbol
     }
 
-    // Go: checker/checker.go:14656 resolveSymbol
+    // Go: checker/checker.go:14697 resolveSymbol
     pub fn resolve_symbol(&mut self, symbol: SymbolId) -> SymbolId {
         self.resolve_symbol_ex(symbol, false /*dontResolveAlias*/)
     }
 
-    // Go: checker/checker.go:14660 resolveSymbolEx
+    // Go: checker/checker.go:14701 resolveSymbolEx
     pub fn resolve_symbol_ex(&mut self, symbol: SymbolId, dont_resolve_alias: bool) -> SymbolId {
         if !dont_resolve_alias
             && is_non_local_alias(
@@ -782,7 +784,7 @@ impl Checker {
         symbol
     }
 
-    // Go: checker/checker.go:14667 getTargetOfImportEqualsDeclaration
+    // Go: checker/checker.go:14708 getTargetOfImportEqualsDeclaration
     pub fn get_target_of_import_equals_declaration(&mut self, node: Node) -> SymbolId {
         // Node is ImportEqualsDeclaration | VariableDeclaration
         if is_variable_declaration(node)
@@ -823,7 +825,7 @@ impl Checker {
         resolved
     }
 
-    // Go: checker/checker.go:14690 resolveExternalModuleTypeByLiteral
+    // Go: checker/checker.go:14731 resolveExternalModuleTypeByLiteral
     pub fn resolve_external_module_type_by_literal(&mut self, name: Node) -> TypeId {
         let module_sym = self.resolve_external_module_name(
             name,
@@ -841,7 +843,7 @@ impl Checker {
         self.any_type
     }
 
-    // Go: checker/checker.go:14702 getSymbolOfPartOfRightHandSideOfImportEquals
+    // Go: checker/checker.go:14743 getSymbolOfPartOfRightHandSideOfImportEquals
     // This function is only for imports with entity names
     pub fn get_symbol_of_part_of_right_hand_side_of_import_equals(
         &mut self,
@@ -882,7 +884,7 @@ impl Checker {
         )
     }
 
-    // Go: checker/checker.go:14722 checkAndReportErrorForResolvingImportAliasToTypeOnlySymbol
+    // Go: checker/checker.go:14763 checkAndReportErrorForResolvingImportAliasToTypeOnlySymbol
     pub fn check_and_report_error_for_resolving_import_alias_to_type_only_symbol(
         &mut self,
         node: Node,
@@ -930,7 +932,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:14749 getTypeOnlyDeclarationOfEntityName
+    // Go: checker/checker.go:14790 getTypeOnlyDeclarationOfEntityName
     pub fn get_type_only_declaration_of_entity_name(&mut self, name: Node) -> Node {
         let symbol = self.resolve_entity_name(
             name,
@@ -945,8 +947,28 @@ impl Checker {
         Node::NIL
     }
 
-    // Go: checker/checker.go:14756 getTargetOfImportClause
+    // Go: checker/checker.go:14797 getTargetOfImportClause
     pub fn get_target_of_import_clause(&mut self, node: Node) -> SymbolId {
+        // ts#63915, Go N' checker.go:14798: `import source x from "m"` binds
+        // x to a variable of type AbstractModuleSource.
+        if node.phase_modifier() == SyntaxKind::SourceKeyword {
+            let alias = self.get_symbol_of_declaration(node);
+            let immediate_target = self.alias_symbol_links.get(alias).immediate_target;
+            if immediate_target.is_nil() {
+                let symbol =
+                    self.new_symbol(SymbolFlags::FUNCTION_SCOPED_VARIABLE, node.name().text());
+                let declarations = self.sym(alias).declarations.clone();
+                self.sym_mut(symbol).declarations = declarations;
+                // Go reads the links (and gives the id) before the right side.
+                self.value_symbol_links.get_by_id(&self.symbols, symbol);
+                let resolved_type = self.get_global_abstract_module_source_type();
+                self.value_symbol_links
+                    .get_by_id(&self.symbols, symbol)
+                    .resolved_type = resolved_type;
+                self.alias_symbol_links.get(alias).immediate_target = symbol;
+            }
+            return self.alias_symbol_links.get(alias).immediate_target;
+        }
         let module_specifier = get_module_specifier_from_node(node.parent());
         let import_attributes_type =
             self.get_type_from_import_attributes(get_import_attributes(node.parent()));
@@ -966,7 +988,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:14764 getTargetOfModuleDefault
+    // Go: checker/checker.go:14816 getTargetOfModuleDefault
     pub fn get_target_of_module_default(
         &mut self,
         module_symbol: SymbolId,
@@ -1059,7 +1081,7 @@ impl Checker {
         export_default_symbol
     }
 
-    // Go: checker/checker.go:14828 reportNonDefaultExport
+    // Go: checker/checker.go:14880 reportNonDefaultExport
     pub fn report_non_default_export(&mut self, module_symbol: SymbolId, node: Node) {
         let exports = self.sym(module_symbol).exports;
         let node_symbol = node.symbol();
@@ -1126,7 +1148,7 @@ impl Checker {
         }
     }
 
-    // Go: checker/checker.go:14852 resolveExportByName
+    // Go: checker/checker.go:14904 resolveExportByName
     pub fn resolve_export_by_name(
         &mut self,
         module_symbol: SymbolId,
@@ -1135,9 +1157,7 @@ impl Checker {
         dont_resolve_alias: bool,
     ) -> SymbolId {
         let exports = self.sym(module_symbol).exports;
-        let export_value = self
-            .symbols
-            .get(exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS);
+        let export_value = self.symbols.get(exports, &*EXPORT_EQUALS_NAME);
         let export_symbol = if export_value.is_some() {
             let t = self.get_type_of_symbol(export_value);
             self.get_property_of_type_ex(
@@ -1152,7 +1172,7 @@ impl Checker {
         resolved
     }
 
-    // Go: checker/checker.go:14865 getTargetOfNamespaceImport
+    // Go: checker/checker.go:14917 getTargetOfNamespaceImport
     pub fn get_target_of_namespace_import(&mut self, node: Node) -> SymbolId {
         let module_specifier = self.get_module_specifier_for_import_or_export(node);
         let import_attributes_type =
@@ -1168,7 +1188,7 @@ impl Checker {
         resolved
     }
 
-    // Go: checker/checker.go:14873 getTargetOfNamespaceExport
+    // Go: checker/checker.go:14925 getTargetOfNamespaceExport
     pub fn get_target_of_namespace_export(&mut self, node: Node) -> SymbolId {
         let module_specifier = self.get_module_specifier_for_import_or_export(node);
         if module_specifier.is_some() {
@@ -1187,7 +1207,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:14884 getTargetOfImportSpecifier
+    // Go: checker/checker.go:14936 getTargetOfImportSpecifier
     pub fn get_target_of_import_specifier(&mut self, node: Node) -> SymbolId {
         let name = node.property_name_or_name();
         if is_import_specifier(node) && module_export_name_is_default(name) {
@@ -1220,7 +1240,7 @@ impl Checker {
         resolved
     }
 
-    // Go: checker/checker.go:14904 getExternalModuleMember
+    // Go: checker/checker.go:14956 getExternalModuleMember
     pub fn get_external_module_member(
         &mut self,
         node: Node,
@@ -1253,6 +1273,9 @@ impl Checker {
             return SymbolId::NIL;
         }
         let name_text = name.text();
+        // PERF (jsxname1): the export lookups below take the name's `Name`
+        // (`text_name`), so they compare name ids.
+        let name_key = name.text_name();
         let target_symbol =
             self.resolve_es_module_symbol(module_symbol, specifier, module_specifier);
         if target_symbol.is_some() {
@@ -1269,20 +1292,18 @@ impl Checker {
                 // is guarded by `moduleSymbol != nil`.
                 let has_export_equals = module_symbol.is_some() && {
                     let exports = self.sym(module_symbol).exports;
-                    self.symbols
-                        .get(exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS)
-                        .is_some()
+                    self.symbols.get(exports, &*EXPORT_EQUALS_NAME).is_some()
                 };
                 let mut symbol_from_variable;
                 // First check if module was specified with "export=". If so, get the member from the resolved type
                 if has_export_equals {
                     let t = self.get_type_of_symbol(target_symbol);
                     symbol_from_variable = self.get_property_of_type_ex(
-                        t, name_text, true,  /*skipObjectFunctionPropertyAugment*/
+                        t, &name_key, true,  /*skipObjectFunctionPropertyAugment*/
                         false, /*includeTypeOnlyMembers*/
                     );
                 } else {
-                    symbol_from_variable = self.get_property_of_variable(target_symbol, name_text);
+                    symbol_from_variable = self.get_property_of_variable(target_symbol, &name_key);
                 }
                 // if symbolFromVariable is export - get its final target
                 symbol_from_variable =
@@ -1290,9 +1311,7 @@ impl Checker {
                 let mut export_container = target_symbol;
                 let has_export_equals = module_symbol.is_some() && {
                     let exports = self.sym(module_symbol).exports;
-                    self.symbols
-                        .get(exports, INTERNAL_SYMBOL_NAME_EXPORT_EQUALS)
-                        .is_some()
+                    self.symbols.get(exports, &*EXPORT_EQUALS_NAME).is_some()
                 };
                 if has_export_equals {
                     // For `export =` modules, supplemental type/namespace exports live on the original module symbol.
@@ -1300,7 +1319,7 @@ impl Checker {
                 }
                 let mut symbol_from_module = self.get_export_of_module(
                     export_container,
-                    name_text,
+                    &name_key,
                     specifier,
                     dont_resolve_alias,
                 );
@@ -1363,8 +1382,13 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:14980 getPropertyOfVariable
-    pub fn get_property_of_variable(&mut self, symbol: SymbolId, name: &str) -> SymbolId {
+    // Go: checker/checker.go:15032 getPropertyOfVariable
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`).
+    pub fn get_property_of_variable<'a>(
+        &mut self,
+        symbol: SymbolId,
+        name: impl Into<TableKey<'a>>,
+    ) -> SymbolId {
         if self.sym(symbol).flags.intersects(SymbolFlags::VARIABLE) {
             let type_annotation = self.sym(symbol).value_declaration.type_();
             if type_annotation.is_some() {
@@ -1376,7 +1400,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:15008 combineValueAndTypeSymbols
+    // Go: checker/checker.go:15060 combineValueAndTypeSymbols
     // This function creates a synthetic symbol that combines the value side of one symbol with the
     // type/namespace side of another symbol. Consider this example:
     //
@@ -1441,17 +1465,21 @@ impl Checker {
         result
     }
 
-    // Go: checker/checker.go:15031 getExportOfModule
-    pub fn get_export_of_module(
+    // Go: checker/checker.go:15083 getExportOfModule
+    // PORT: `name` is a `&str` or a `&Name` (`TableKey`). With a `Name`,
+    // the exports lookup compares name ids.
+    pub fn get_export_of_module<'a>(
         &mut self,
         symbol: SymbolId,
-        name_text: &str,
+        name: impl Into<TableKey<'a>>,
         specifier: Node,
         dont_resolve_alias: bool,
     ) -> SymbolId {
         if self.sym(symbol).flags.intersects(SymbolFlags::MODULE) {
+            let name: TableKey<'a> = name.into();
+            let name_text = name.text();
             let exports = self.get_exports_of_symbol(symbol);
-            let export_symbol = self.symbols.get(exports, name_text);
+            let export_symbol = self.symbols.get(exports, name);
             let resolved = self.resolve_symbol_ex(export_symbol, dont_resolve_alias);
             let export_star_declaration = self
                 .module_symbol_links
@@ -1466,7 +1494,7 @@ impl Checker {
         SymbolId::NIL
     }
 
-    // Go: checker/checker.go:15042 isOnlyImportableAsDefault
+    // Go: checker/checker.go:15094 isOnlyImportableAsDefault
     pub fn is_only_importable_as_default(
         &mut self,
         usage: Node,
@@ -1499,7 +1527,7 @@ impl Checker {
         false
     }
 
-    // Go: checker/checker.go:15060 canHaveSyntheticDefault
+    // Go: checker/checker.go:15112 canHaveSyntheticDefault
     pub fn can_have_synthetic_default(
         &mut self,
         file: Node,
@@ -1610,7 +1638,7 @@ impl Checker {
                 .is_nil()
     }
 
-    // Go: checker/checker.go:15119 getEmitSyntaxForModuleSpecifierExpression
+    // Go: checker/checker.go:15171 getEmitSyntaxForModuleSpecifierExpression
     pub fn get_emit_syntax_for_module_specifier_expression(
         &mut self,
         usage: Node,
@@ -1621,7 +1649,7 @@ impl Checker {
         ModuleKind::NONE
     }
 
-    // Go: checker/checker.go:15126 errorNoModuleMemberSymbol
+    // Go: checker/checker.go:15178 errorNoModuleMemberSymbol
     pub fn error_no_module_member_symbol(
         &mut self,
         module_symbol: SymbolId,
@@ -1684,20 +1712,28 @@ impl Checker {
 // ported as a shared module (options.rs keeps a private copy), so this file
 // keeps its own private copy with the same logic.
 // Go: tspath/extension.go:121 GetDeclarationFileExtension
-fn tspath_get_declaration_file_extension(file_name: &str) -> String {
+// PERF: namekeys1. Returns a slice of `file_name` or a constant, as Go does,
+// not a `String`. The ".d." search finds each '.' with `memchr`: `str::find`
+// built a `StrSearcher` on every call (about 70 M cycles of VS Code check,
+// one call per ES import through `is_only_importable_as_default`).
+fn tspath_get_declaration_file_extension(file_name: &str) -> &str {
     let base = tspath_get_base_file_name(file_name);
     // Go: tspath.SupportedDeclarationExtensions
     for ext in [".d.ts", ".d.cts", ".d.mts"] {
         if base.ends_with(ext) {
-            return ext.to_string();
+            return ext;
         }
     }
     if base.ends_with(".ts") {
-        if let Some(index) = base.find(".d.") {
-            return base[index..].to_string();
+        let bytes = base.as_bytes();
+        // Go: strings.Index(base, ".d.")
+        if let Some(index) =
+            memchr::memchr_iter(b'.', bytes).find(|&i| bytes[i + 1..].starts_with(b"d."))
+        {
+            return &base[index..];
         }
     }
-    String::new()
+    ""
 }
 
 // PORT: Go `tspath.GetBaseFileName` for the absolute, normalized file names

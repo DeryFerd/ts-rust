@@ -969,7 +969,7 @@ mod tests {
         // The orchestrator parses a config that no thread has started, so
         // the take waits until a thread has started it.
         let slot = lock(&pool.shared.slots).get(&path).cloned().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
         while matches!(*lock(&slot.state), SlotState::Queued) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -998,7 +998,7 @@ mod tests {
                     .unwrap_or_default()
             }));
         });
-        let taken = receiver.recv_timeout(std::time::Duration::from_secs(60));
+        let taken = receiver.recv_timeout(std::time::Duration::from_mins(1));
         lock(&PANIC_AFTER_PARSE).retain(|name| *name != config);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(

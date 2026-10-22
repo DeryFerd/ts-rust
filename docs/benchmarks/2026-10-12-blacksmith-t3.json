@@ -1,0 +1,1936 @@
+{
+  "schemaVersion": 1,
+  "runUrl": "https://github.com/pingdotgg/ts-rust/actions/runs/38185127561",
+  "workflowOutcome": "success",
+  "method": "Five timed runs after one warmup; sum of project medians. One Blacksmith 16-vCPU runner per project/mode, all five tools on that runner.",
+  "effectReference": {
+    "package": "@effect/tsgo",
+    "version": "0.51.1",
+    "typescript": "7.0.2"
+  },
+  "verification": "All no-Effect current Rust diagnostics match TypeScript 7.1.0-dev.20261008.1. All 4823 TS377xxx diagnostics match the native Effect 0.51.1 compiler. Rust and 0.3.0 report the same error codes; server TS2322 message truncation differs.",
+  "totals": {
+    "noeffect": {
+      "tsc6": 79.571561066,
+      "tsc7": 16.073706886,
+      "tsc-rs-0.3.0": 6.867801598000001,
+      "tsc-rs": 6.407872511000001,
+      "bun": 4.573195041
+    },
+    "effect": {
+      "tsc6": 167.16093411999998,
+      "tsc7": 26.196860511,
+      "tsc-rs-0.3.0": 10.713096884999999,
+      "tsc-rs": 8.549555202,
+      "bun": 45.444983128
+    }
+  },
+  "results": {
+    "t3-apps-server-noeffect": {
+      "runner": {
+        "date": "2026-10-12T00:03:40.040556+00:00",
+        "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+        "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+        "run": "https://github.com/pingdotgg/ts-rust/actions/runs/38185127561",
+        "build": "release PGO, static musl, no BOLT",
+        "host": "Linux-6.6.141-x86_64-with-glibc2.39",
+        "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nBogoMIPS:                                8583.80\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d\nVirtualization:                          AMD-V\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+        "memory": "MemTotal:       65017440 kB\nMemFree:        57905080 kB\nMemAvailable:   63795524 kB\nBuffers:          258076 kB\nCached:          5789976 kB\nSwapCached:            0 kB\nActive:           904644 kB\nInactive:        5388320 kB\nActive(anon):       7096 kB\nInactive(anon):   287780 kB\nActive(file):     897548 kB\nInactive(file):  5100540 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:      11534332 kB\nSwapFree:       11534332 kB\nDirty:                 4 kB\nWriteback:             0 kB\nAnonPages:        244944 kB\nMapped:           251220 kB\nShmem:             49964 kB\nKReclaimable:     612824 kB\nSlab:             717368 kB\nSReclaimable:     612824 kB\nSUnreclaim:       104544 kB\nKernelStack:        7104 kB\nPageTables:         6716 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    44043052 kB\nCommitted_AS:    2625184 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       16108 kB\nVmallocChunk:          0 kB\nPercpu:             7936 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       17408 kB\nDirectMap2M:     2289664 kB\nDirectMap1G:    65011712 kB\n",
+        "node": "v24.19.0",
+        "pnpm": "unavailable (failed to launch)",
+        "hyperfine": "hyperfine 1.18.0",
+        "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+        "rounds": 5,
+        "warmups": 1,
+        "tools": {
+          "tsc-rs": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "1d03a3f7085afa28a89ef4a97b854fc72245903e6ab36aa13395611179238b3a"
+          },
+          "tsc-rs-0.3.0": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "59eb23905da5aaf440e86e2cd0181de5b9030e55fc15178a8311622d833abeb9"
+          },
+          "tsc7": {
+            "version": "Version 7.1.0-dev.20261008.1",
+            "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+          },
+          "bun": {
+            "version": "1.4.4-canary.1+7c96a1212",
+            "sha256": "73721bfa7afb06daee334bdb0c612ab975993b1f4cb1dfc6a7dc7c905c1a6da8"
+          }
+        },
+        "inputs": {
+          "t3code": {
+            "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+            "locks": {
+              "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+            }
+          }
+        },
+        "packages": {
+          "typescript": "7.1.0-dev.20261008.1",
+          "typescript (ts6)": "6.0.3",
+          "tsc-rs": "0.3.0",
+          "@effect/tsgo": "0.51.1",
+          "@effect/language-service": "0.87.4"
+        },
+        "package-lock.json": "b21b73bd71e3453201dff5f0ec2e7e5a10d395e02ef861f3851a30ac60702444",
+        "effectgo/package-lock.json": "4637aece6901b2a665918cd28488838d2068babe683c0107f3c24233f485c07d",
+        "ts6effect/package-lock.json": "d638fb5ce9b9ca65df0c8674831443295669de3f6199debdb949b5a54cc9d9e4",
+        "compilerBuild": {
+          "cacheKey": "bench-compiler-v1-linux-x64-rust1.95.0-837e349b4da7f41205694387cc0d2070b4c9300e91d9e238f8002c46bcddef4a",
+          "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+          "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+          "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+          "build": "release PGO, static musl, no BOLT"
+        }
+      },
+      "tools": {
+        "tsc6": {
+          "median": 35.006189326,
+          "mean": 35.168314648999996,
+          "stddev": 0.6049938737154906,
+          "times": [
+            34.817390485,
+            34.618640501,
+            36.172860114,
+            35.226492819,
+            35.006189326
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 1,
+          "diagnosticCodes": {
+            "TS2322": 1
+          },
+          "diagnosticsSha256": "06922bb4987cb774c05e45b2ad7f2a8ca054e4435368d1e85069dabb44028008"
+        },
+        "tsc7": {
+          "median": 8.536915138,
+          "mean": 8.6704347222,
+          "stddev": 0.327071284353962,
+          "times": [
+            8.536915138,
+            8.525745797,
+            8.548812719,
+            9.254026929,
+            8.486673028
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 1,
+          "diagnosticCodes": {
+            "TS2322": 1
+          },
+          "diagnosticsSha256": "5946b38464dc3278154eae21a1009e85e41cff439e761aacd83b7a701609e0e1"
+        },
+        "tsc-rs-0.3.0": {
+          "median": 3.236519769,
+          "mean": 3.2598708656,
+          "stddev": 0.04654878043967467,
+          "times": [
+            3.280301931,
+            3.332275926,
+            3.236519769,
+            3.230021013,
+            3.220235689
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 1,
+          "diagnosticCodes": {
+            "TS2322": 1
+          },
+          "diagnosticsSha256": "09469675f5ed66b21033193cebd8e53cf91cb6c786d70a98d9a47f4653c3538e"
+        },
+        "tsc-rs": {
+          "median": 2.876605929,
+          "mean": 2.8930383940000004,
+          "stddev": 0.06816722739795669,
+          "times": [
+            2.876605929,
+            2.8226746780000003,
+            2.841679662,
+            2.986456103,
+            2.937775598
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 1,
+          "diagnosticCodes": {
+            "TS2322": 1
+          },
+          "diagnosticsSha256": "5946b38464dc3278154eae21a1009e85e41cff439e761aacd83b7a701609e0e1"
+        },
+        "bun": {
+          "median": 2.001360213,
+          "mean": 2.0100011542000003,
+          "stddev": 0.05980465306976128,
+          "times": [
+            2.107467931,
+            1.952524286,
+            2.001360213,
+            2.015971282,
+            1.972682059
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      }
+    },
+    "t3-apps-server-effect": {
+      "runner": {
+        "date": "2026-10-12T00:13:25.193037+00:00",
+        "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+        "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+        "run": "https://github.com/pingdotgg/ts-rust/actions/runs/38185127561",
+        "build": "release PGO, static musl, no BOLT",
+        "host": "Linux-6.6.141-x86_64-with-glibc2.39",
+        "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nBogoMIPS:                                8583.84\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d\nVirtualization:                          AMD-V\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+        "memory": "MemTotal:       65017440 kB\nMemFree:        57883176 kB\nMemAvailable:   63779084 kB\nBuffers:          258748 kB\nCached:          5796384 kB\nSwapCached:            0 kB\nActive:          1006660 kB\nInactive:        5297376 kB\nActive(anon):       8364 kB\nInactive(anon):   292524 kB\nActive(file):     998296 kB\nInactive(file):  5004852 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:      11534332 kB\nSwapFree:       11534332 kB\nDirty:                 8 kB\nWriteback:             0 kB\nAnonPages:        248684 kB\nMapped:           251812 kB\nShmem:             51984 kB\nKReclaimable:     613228 kB\nSlab:             718168 kB\nSReclaimable:     613228 kB\nSUnreclaim:       104940 kB\nKernelStack:        7200 kB\nPageTables:         6784 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    44043052 kB\nCommitted_AS:    2661948 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       16204 kB\nVmallocChunk:          0 kB\nPercpu:             8128 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       17408 kB\nDirectMap2M:     2289664 kB\nDirectMap1G:    65011712 kB\n",
+        "node": "v24.19.0",
+        "pnpm": "unavailable (failed to launch)",
+        "hyperfine": "hyperfine 1.18.0",
+        "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+        "rounds": 5,
+        "warmups": 1,
+        "tools": {
+          "tsc-rs": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "1d03a3f7085afa28a89ef4a97b854fc72245903e6ab36aa13395611179238b3a"
+          },
+          "tsc-rs-0.3.0": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "59eb23905da5aaf440e86e2cd0181de5b9030e55fc15178a8311622d833abeb9"
+          },
+          "tsc7": {
+            "version": "Version 7.1.0-dev.20261008.1",
+            "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+          },
+          "bun": {
+            "version": "1.4.4-canary.1+7c96a1212",
+            "sha256": "73721bfa7afb06daee334bdb0c612ab975993b1f4cb1dfc6a7dc7c905c1a6da8"
+          }
+        },
+        "inputs": {
+          "t3code": {
+            "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+            "locks": {
+              "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+            }
+          }
+        },
+        "packages": {
+          "typescript": "7.1.0-dev.20261008.1",
+          "typescript (ts6)": "6.0.3",
+          "tsc-rs": "0.3.0",
+          "@effect/tsgo": "0.51.1",
+          "@effect/language-service": "0.87.4"
+        },
+        "package-lock.json": "b21b73bd71e3453201dff5f0ec2e7e5a10d395e02ef861f3851a30ac60702444",
+        "effectgo/package-lock.json": "4637aece6901b2a665918cd28488838d2068babe683c0107f3c24233f485c07d",
+        "ts6effect/package-lock.json": "d638fb5ce9b9ca65df0c8674831443295669de3f6199debdb949b5a54cc9d9e4",
+        "compilerBuild": {
+          "cacheKey": "bench-compiler-v1-linux-x64-rust1.95.0-837e349b4da7f41205694387cc0d2070b4c9300e91d9e238f8002c46bcddef4a",
+          "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+          "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+          "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+          "build": "release PGO, static musl, no BOLT"
+        }
+      },
+      "tools": {
+        "tsc6": {
+          "median": 86.505169161,
+          "mean": 86.1787311096,
+          "stddev": 1.5595801295434222,
+          "times": [
+            87.336526911,
+            86.505169161,
+            83.898034116,
+            87.752409884,
+            85.401515476
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 297,
+          "diagnosticCodes": {
+            "TS70": 12,
+            "TS16": 4,
+            "TS2322": 1,
+            "TS-1": 10,
+            "TS44": 206,
+            "TS41": 4,
+            "TS15": 11,
+            "TS47": 14,
+            "TS5": 5,
+            "TS29": 7,
+            "TS32": 18,
+            "TS11": 4,
+            "TS2": 1
+          },
+          "diagnosticsSha256": "14bf7bd1e463c72cc3a6bea09a0e168ea290f30632a43d3df34dcef807c68101"
+        },
+        "tsc7": {
+          "median": 14.412538312,
+          "mean": 14.2950700544,
+          "stddev": 0.6311799361504181,
+          "times": [
+            14.959390651,
+            14.813289645,
+            14.412538312,
+            13.756576545,
+            13.533555119
+          ],
+          "exit_codes": [
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "diagnosticCount": 3200,
+          "diagnosticCodes": {
+            "TS377136": 3000,
+            "TS377015": 4,
+            "TS377112": 5,
+            "TS377047": 4,
+            "TS377012": 11,
+            "TS377099": 4,
+            "TS377016": 14,
+            "TS377132": 3,
+            "TS377017": 5,
+            "TS377114": 9,
+            "TS377117": 46,
+            "TS377111": 8,
+            "TS377095": 3,
+            "TS377120": 8,
+            "TS377019": 7,
+            "TS377116": 16,
+            "TS2790": 23,
+            "TS377074": 18,
+            "TS377014": 4,
+            "TS377113": 3,
+            "TS377118": 3,
+            "TS377009": 1,
+            "TS377124": 1
+          },
+          "diagnosticsSha256": "6e6cad9b0ea57eba8ef9fd83563f7b027c3e6b4d9f392cd300d73ff9a68f5bef"
+        },
+        "tsc-rs-0.3.0": {
+          "median": 5.547303415,
+          "mean": 5.582794294600001,
+          "stddev": 0.08098896323462489,
+          "times": [
+            5.600613284,
+            5.547303415,
+            5.510151053,
+            5.540475356,
+            5.715428365
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 3201,
+          "diagnosticCodes": {
+            "TS377136": 3000,
+            "TS377015": 4,
+            "TS377112": 5,
+            "TS2322": 1,
+            "TS377047": 4,
+            "TS377012": 11,
+            "TS377099": 4,
+            "TS377016": 14,
+            "TS377132": 3,
+            "TS377017": 5,
+            "TS377114": 9,
+            "TS377117": 46,
+            "TS377111": 8,
+            "TS377095": 3,
+            "TS377120": 8,
+            "TS377019": 7,
+            "TS377116": 16,
+            "TS2790": 23,
+            "TS377074": 18,
+            "TS377014": 4,
+            "TS377113": 3,
+            "TS377118": 3,
+            "TS377009": 1,
+            "TS377124": 1
+          },
+          "diagnosticsSha256": "17fab2551de160cc158728164b0810fedf1f4e686b7835d485c40ff63a320b40"
+        },
+        "tsc-rs": {
+          "median": 4.201303087,
+          "mean": 4.2111675972,
+          "stddev": 0.12632843964135143,
+          "times": [
+            4.150750454,
+            4.201303087,
+            4.410131407,
+            4.068654233,
+            4.224998805
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 3201,
+          "diagnosticCodes": {
+            "TS377136": 3000,
+            "TS377015": 4,
+            "TS377112": 5,
+            "TS2322": 1,
+            "TS377047": 4,
+            "TS377012": 11,
+            "TS377099": 4,
+            "TS377016": 14,
+            "TS377132": 3,
+            "TS377017": 5,
+            "TS377114": 9,
+            "TS377117": 46,
+            "TS377111": 8,
+            "TS377095": 3,
+            "TS377120": 8,
+            "TS377019": 7,
+            "TS377116": 16,
+            "TS2790": 23,
+            "TS377074": 18,
+            "TS377014": 4,
+            "TS377113": 3,
+            "TS377118": 3,
+            "TS377009": 1,
+            "TS377124": 1
+          },
+          "diagnosticsSha256": "110d6b4f6756eb82f56d606f56c96fa61c3d6ae2717c2c42e6cc8e76cb4be604"
+        },
+        "bun": {
+          "median": 24.63665417,
+          "mean": 24.718204727799996,
+          "stddev": 0.24299227084633432,
+          "times": [
+            24.52419002,
+            24.63665417,
+            24.679560564,
+            24.609761311,
+            25.140857574
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 3177,
+          "diagnosticCodes": {
+            "effect(unstableApiUsage)": 3000,
+            "effect(unnecessaryPipeChain)": 4,
+            "effect(preferTypedSchemaDecoder)": 5,
+            "effect(effectFnOpportunity)": 4,
+            "effect(tryCatchInEffectGen)": 11,
+            "effect(catchToIgnore)": 4,
+            "effect(effectSucceedWithVoid)": 14,
+            "effect(flatMapIgnoredParamToAndThen)": 3,
+            "effect(unnecessaryEffectGen)": 5,
+            "effect(mapSomeToAsSome)": 9,
+            "effect(preferSucceedSomeOrNone)": 46,
+            "effect(abortControllerInEffect)": 8,
+            "effect(catchToOrElseSucceed)": 3,
+            "effect(flatMapConditionalToFilterOrFail)": 8,
+            "effect(unnecessaryFailYieldableError)": 7,
+            "effect(catchConditionalRefailToCatchIf)": 16,
+            "effect(runEffectInsideEffect)": 18,
+            "effect(returnEffectInGen)": 4,
+            "effect(allOfMapToForEach)": 3,
+            "effect(optionMatchToFromOption)": 3,
+            "effect(catchUnfailableEffect)": 1,
+            "effect(provideLayerSucceedToProvideService)": 1
+          },
+          "diagnosticsSha256": "a1b50839583d538fcfdec4988d64c7b9a5c657fd8428878fe0b90abc02904b9e"
+        }
+      }
+    },
+    "t3-apps-web-noeffect": {
+      "runner": {
+        "date": "2026-10-12T00:01:12.380906+00:00",
+        "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+        "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+        "run": "https://github.com/pingdotgg/ts-rust/actions/runs/38185127561",
+        "build": "release PGO, static musl, no BOLT",
+        "host": "Linux-6.6.141-x86_64-with-glibc2.39",
+        "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nBogoMIPS:                                8583.77\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d\nVirtualization:                          AMD-V\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+        "memory": "MemTotal:       65017440 kB\nMemFree:        57889216 kB\nMemAvailable:   63785664 kB\nBuffers:          258632 kB\nCached:          5792964 kB\nSwapCached:            0 kB\nActive:           914504 kB\nInactive:        5382600 kB\nActive(anon):       6816 kB\nInactive(anon):   287532 kB\nActive(file):     907688 kB\nInactive(file):  5095068 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:      11534332 kB\nSwapFree:       11534332 kB\nDirty:                16 kB\nWriteback:             0 kB\nAnonPages:        244828 kB\nMapped:           254084 kB\nShmem:             48832 kB\nKReclaimable:     614160 kB\nSlab:             718992 kB\nSReclaimable:     614160 kB\nSUnreclaim:       104832 kB\nKernelStack:        7376 kB\nPageTables:         6832 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    44043052 kB\nCommitted_AS:    2680064 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       16428 kB\nVmallocChunk:          0 kB\nPercpu:             7936 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       17408 kB\nDirectMap2M:     2289664 kB\nDirectMap1G:    65011712 kB\n",
+        "node": "v24.19.0",
+        "pnpm": "unavailable (failed to launch)",
+        "hyperfine": "hyperfine 1.18.0",
+        "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+        "rounds": 5,
+        "warmups": 1,
+        "tools": {
+          "tsc-rs": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "1d03a3f7085afa28a89ef4a97b854fc72245903e6ab36aa13395611179238b3a"
+          },
+          "tsc-rs-0.3.0": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "59eb23905da5aaf440e86e2cd0181de5b9030e55fc15178a8311622d833abeb9"
+          },
+          "tsc7": {
+            "version": "Version 7.1.0-dev.20261008.1",
+            "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+          },
+          "bun": {
+            "version": "1.4.4-canary.1+7c96a1212",
+            "sha256": "73721bfa7afb06daee334bdb0c612ab975993b1f4cb1dfc6a7dc7c905c1a6da8"
+          }
+        },
+        "inputs": {
+          "t3code": {
+            "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+            "locks": {
+              "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+            }
+          }
+        },
+        "packages": {
+          "typescript": "7.1.0-dev.20261008.1",
+          "typescript (ts6)": "6.0.3",
+          "tsc-rs": "0.3.0",
+          "@effect/tsgo": "0.51.1",
+          "@effect/language-service": "0.87.4"
+        },
+        "package-lock.json": "b21b73bd71e3453201dff5f0ec2e7e5a10d395e02ef861f3851a30ac60702444",
+        "effectgo/package-lock.json": "4637aece6901b2a665918cd28488838d2068babe683c0107f3c24233f485c07d",
+        "ts6effect/package-lock.json": "d638fb5ce9b9ca65df0c8674831443295669de3f6199debdb949b5a54cc9d9e4",
+        "compilerBuild": {
+          "cacheKey": "bench-compiler-v1-linux-x64-rust1.95.0-837e349b4da7f41205694387cc0d2070b4c9300e91d9e238f8002c46bcddef4a",
+          "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+          "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+          "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+          "build": "release PGO, static musl, no BOLT"
+        }
+      },
+      "tools": {
+        "tsc6": {
+          "median": 24.028206509,
+          "mean": 24.1807490396,
+          "stddev": 0.4569419342132462,
+          "times": [
+            24.773518414,
+            23.798423556,
+            24.028206509,
+            24.547203159,
+            23.75639356
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc7": {
+          "median": 3.305221505,
+          "mean": 3.3142499414,
+          "stddev": 0.04908141958630582,
+          "times": [
+            3.2834273449999998,
+            3.305221505,
+            3.325302974,
+            3.2651368720000002,
+            3.392161011
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc-rs-0.3.0": {
+          "median": 1.6655935350000002,
+          "mean": 1.674128121,
+          "stddev": 0.034384490440565955,
+          "times": [
+            1.651192702,
+            1.7160063760000002,
+            1.6655935350000002,
+            1.702999985,
+            1.634848007
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc-rs": {
+          "median": 1.628930462,
+          "mean": 1.6403634408000003,
+          "stddev": 0.05369347752311532,
+          "times": [
+            1.6969908930000002,
+            1.628930462,
+            1.563730735,
+            1.686313534,
+            1.62585158
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "bun": {
+          "median": 1.032890687,
+          "mean": 1.0435734777999999,
+          "stddev": 0.019293267198788797,
+          "times": [
+            1.076009696,
+            1.032890687,
+            1.031564856,
+            1.046794367,
+            1.030607783
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      }
+    },
+    "t3-apps-web-effect": {
+      "runner": {
+        "date": "2026-10-12T00:06:25.472567+00:00",
+        "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+        "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+        "run": "https://github.com/pingdotgg/ts-rust/actions/runs/38185127561",
+        "build": "release PGO, static musl, no BOLT",
+        "host": "Linux-6.6.141-x86_64-with-glibc2.39",
+        "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nBogoMIPS:                                8583.82\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d\nVirtualization:                          AMD-V\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+        "memory": "MemTotal:       65017440 kB\nMemFree:        57917752 kB\nMemAvailable:   63812064 kB\nBuffers:          258720 kB\nCached:          5790544 kB\nSwapCached:            0 kB\nActive:          1005752 kB\nInactive:        5282628 kB\nActive(anon):       7152 kB\nInactive(anon):   281376 kB\nActive(file):     998600 kB\nInactive(file):  5001252 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:      11534332 kB\nSwapFree:       11534332 kB\nDirty:                56 kB\nWriteback:             0 kB\nAnonPages:        238800 kB\nMapped:           250284 kB\nShmem:             49412 kB\nKReclaimable:     614928 kB\nSlab:             719040 kB\nSReclaimable:     614928 kB\nSUnreclaim:       104112 kB\nKernelStack:        6960 kB\nPageTables:         6624 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    44043052 kB\nCommitted_AS:    2626340 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       16060 kB\nVmallocChunk:          0 kB\nPercpu:             7936 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       17408 kB\nDirectMap2M:     2289664 kB\nDirectMap1G:    65011712 kB\n",
+        "node": "v24.19.0",
+        "pnpm": "unavailable (failed to launch)",
+        "hyperfine": "hyperfine 1.18.0",
+        "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+        "rounds": 5,
+        "warmups": 1,
+        "tools": {
+          "tsc-rs": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "1d03a3f7085afa28a89ef4a97b854fc72245903e6ab36aa13395611179238b3a"
+          },
+          "tsc-rs-0.3.0": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "59eb23905da5aaf440e86e2cd0181de5b9030e55fc15178a8311622d833abeb9"
+          },
+          "tsc7": {
+            "version": "Version 7.1.0-dev.20261008.1",
+            "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+          },
+          "bun": {
+            "version": "1.4.4-canary.1+7c96a1212",
+            "sha256": "73721bfa7afb06daee334bdb0c612ab975993b1f4cb1dfc6a7dc7c905c1a6da8"
+          }
+        },
+        "inputs": {
+          "t3code": {
+            "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+            "locks": {
+              "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+            }
+          }
+        },
+        "packages": {
+          "typescript": "7.1.0-dev.20261008.1",
+          "typescript (ts6)": "6.0.3",
+          "tsc-rs": "0.3.0",
+          "@effect/tsgo": "0.51.1",
+          "@effect/language-service": "0.87.4"
+        },
+        "package-lock.json": "b21b73bd71e3453201dff5f0ec2e7e5a10d395e02ef861f3851a30ac60702444",
+        "effectgo/package-lock.json": "4637aece6901b2a665918cd28488838d2068babe683c0107f3c24233f485c07d",
+        "ts6effect/package-lock.json": "d638fb5ce9b9ca65df0c8674831443295669de3f6199debdb949b5a54cc9d9e4",
+        "compilerBuild": {
+          "cacheKey": "bench-compiler-v1-linux-x64-rust1.95.0-837e349b4da7f41205694387cc0d2070b4c9300e91d9e238f8002c46bcddef4a",
+          "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+          "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+          "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+          "build": "release PGO, static musl, no BOLT"
+        }
+      },
+      "tools": {
+        "tsc6": {
+          "median": 50.922453555,
+          "mean": 51.103551643399996,
+          "stddev": 0.8830865853565207,
+          "times": [
+            50.693019146,
+            49.934577611,
+            52.012747037,
+            51.954960868,
+            50.922453555
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc7": {
+          "median": 6.280544176,
+          "mean": 6.2473151052,
+          "stddev": 0.06476212387535325,
+          "times": [
+            6.296221428,
+            6.145993589,
+            6.219288837,
+            6.280544176,
+            6.294527496
+          ],
+          "exit_codes": [
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "diagnosticCount": 650,
+          "diagnosticCodes": {
+            "TS377136": 647,
+            "TS2790": 3
+          },
+          "diagnosticsSha256": "540cc0b1f0e55b16fe81df95918503d0f9a606381a73aee367b67bca1759038a"
+        },
+        "tsc-rs-0.3.0": {
+          "median": 2.757297927,
+          "mean": 2.779917565,
+          "stddev": 0.03711180934885028,
+          "times": [
+            2.757297927,
+            2.82663145,
+            2.813631753,
+            2.752982668,
+            2.749044027
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 650,
+          "diagnosticCodes": {
+            "TS377136": 647,
+            "TS2790": 3
+          },
+          "diagnosticsSha256": "540cc0b1f0e55b16fe81df95918503d0f9a606381a73aee367b67bca1759038a"
+        },
+        "tsc-rs": {
+          "median": 2.23775056,
+          "mean": 2.2187092406,
+          "stddev": 0.049016006812469384,
+          "times": [
+            2.157500389,
+            2.242077921,
+            2.23775056,
+            2.179229291,
+            2.276988042
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 650,
+          "diagnosticCodes": {
+            "TS377136": 647,
+            "TS2790": 3
+          },
+          "diagnosticsSha256": "540cc0b1f0e55b16fe81df95918503d0f9a606381a73aee367b67bca1759038a"
+        },
+        "bun": {
+          "median": 13.999998776,
+          "mean": 14.006644642800001,
+          "stddev": 0.13449948464877579,
+          "times": [
+            13.82731592,
+            14.205252514,
+            13.982543167,
+            13.999998776,
+            14.018112837
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 647,
+          "diagnosticCodes": {
+            "effect(unstableApiUsage)": 647
+          },
+          "diagnosticsSha256": "221ab6de82c489447169f8a35ccb24fc1300365f137b7740533c7a79228d3e98"
+        }
+      }
+    },
+    "t3-apps-mobile-noeffect": {
+      "runner": {
+        "date": "2026-10-11T23:59:18.565700+00:00",
+        "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+        "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+        "run": "https://github.com/pingdotgg/ts-rust/actions/runs/38185127561",
+        "build": "release PGO, static musl, no BOLT",
+        "host": "Linux-6.6.141-x86_64-with-glibc2.39",
+        "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nBogoMIPS:                                8583.78\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d\nVirtualization:                          AMD-V\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+        "memory": "MemTotal:       65017440 kB\nMemFree:        57874116 kB\nMemAvailable:   63769372 kB\nBuffers:          258260 kB\nCached:          5790732 kB\nSwapCached:            0 kB\nActive:           890688 kB\nInactive:        5411260 kB\nActive(anon):       6540 kB\nInactive(anon):   294452 kB\nActive(file):     884148 kB\nInactive(file):  5116808 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:      11534332 kB\nSwapFree:       11534332 kB\nDirty:                12 kB\nWriteback:            16 kB\nAnonPages:        252604 kB\nMapped:           253576 kB\nShmem:             48036 kB\nKReclaimable:     614768 kB\nSlab:             719244 kB\nSReclaimable:     614768 kB\nSUnreclaim:       104476 kB\nKernelStack:        7328 kB\nPageTables:         6740 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    44043052 kB\nCommitted_AS:    2666500 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       16364 kB\nVmallocChunk:          0 kB\nPercpu:             7936 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       17408 kB\nDirectMap2M:     2289664 kB\nDirectMap1G:    65011712 kB\n",
+        "node": "v24.19.0",
+        "pnpm": "unavailable (failed to launch)",
+        "hyperfine": "hyperfine 1.18.0",
+        "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+        "rounds": 5,
+        "warmups": 1,
+        "tools": {
+          "tsc-rs": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "1d03a3f7085afa28a89ef4a97b854fc72245903e6ab36aa13395611179238b3a"
+          },
+          "tsc-rs-0.3.0": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "59eb23905da5aaf440e86e2cd0181de5b9030e55fc15178a8311622d833abeb9"
+          },
+          "tsc7": {
+            "version": "Version 7.1.0-dev.20261008.1",
+            "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+          },
+          "bun": {
+            "version": "1.4.4-canary.1+7c96a1212",
+            "sha256": "73721bfa7afb06daee334bdb0c612ab975993b1f4cb1dfc6a7dc7c905c1a6da8"
+          }
+        },
+        "inputs": {
+          "t3code": {
+            "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+            "locks": {
+              "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+            }
+          }
+        },
+        "packages": {
+          "typescript": "7.1.0-dev.20261008.1",
+          "typescript (ts6)": "6.0.3",
+          "tsc-rs": "0.3.0",
+          "@effect/tsgo": "0.51.1",
+          "@effect/language-service": "0.87.4"
+        },
+        "package-lock.json": "b21b73bd71e3453201dff5f0ec2e7e5a10d395e02ef861f3851a30ac60702444",
+        "effectgo/package-lock.json": "4637aece6901b2a665918cd28488838d2068babe683c0107f3c24233f485c07d",
+        "ts6effect/package-lock.json": "d638fb5ce9b9ca65df0c8674831443295669de3f6199debdb949b5a54cc9d9e4",
+        "compilerBuild": {
+          "cacheKey": "bench-compiler-v1-linux-x64-rust1.95.0-837e349b4da7f41205694387cc0d2070b4c9300e91d9e238f8002c46bcddef4a",
+          "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+          "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+          "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+          "build": "release PGO, static musl, no BOLT"
+        }
+      },
+      "tools": {
+        "tsc6": {
+          "median": 10.845120913,
+          "mean": 10.76400108,
+          "stddev": 0.19051434342151366,
+          "times": [
+            10.938470507,
+            10.542906223,
+            10.845120913,
+            10.918050382,
+            10.575457375
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc7": {
+          "median": 2.069133206,
+          "mean": 2.071453094,
+          "stddev": 0.025516221277228766,
+          "times": [
+            2.07046277,
+            2.059604466,
+            2.11325723,
+            2.069133206,
+            2.044807798
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc-rs-0.3.0": {
+          "median": 1.028036339,
+          "mean": 1.0268231624,
+          "stddev": 0.007185631840468933,
+          "times": [
+            1.035522754,
+            1.015763912,
+            1.028036339,
+            1.025605552,
+            1.029187255
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc-rs": {
+          "median": 1.012572343,
+          "mean": 1.0401176282,
+          "stddev": 0.06194770848717703,
+          "times": [
+            0.97221871,
+            1.080891019,
+            1.012572343,
+            1.125866005,
+            1.009040064
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "bun": {
+          "median": 0.730577125,
+          "mean": 0.7286877638,
+          "stddev": 0.007817642270510685,
+          "times": [
+            0.7153889800000001,
+            0.731565345,
+            0.729842563,
+            0.736064806,
+            0.730577125
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      }
+    },
+    "t3-apps-mobile-effect": {
+      "runner": {
+        "date": "2026-10-11T23:59:24.524365+00:00",
+        "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+        "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+        "run": "https://github.com/pingdotgg/ts-rust/actions/runs/38185127561",
+        "build": "release PGO, static musl, no BOLT",
+        "host": "Linux-6.6.141-x86_64-with-glibc2.39",
+        "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nBogoMIPS:                                8583.87\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d\nVirtualization:                          AMD-V\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+        "memory": "MemTotal:       65017440 kB\nMemFree:        57899444 kB\nMemAvailable:   63792692 kB\nBuffers:          259092 kB\nCached:          5788212 kB\nSwapCached:            0 kB\nActive:           983772 kB\nInactive:        5312152 kB\nActive(anon):       6700 kB\nInactive(anon):   290564 kB\nActive(file):     977072 kB\nInactive(file):  5021588 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:      11534332 kB\nSwapFree:       11534332 kB\nDirty:                44 kB\nWriteback:             0 kB\nAnonPages:        248644 kB\nMapped:           253336 kB\nShmem:             48644 kB\nKReclaimable:     615056 kB\nSlab:             719044 kB\nSReclaimable:     615056 kB\nSUnreclaim:       103988 kB\nKernelStack:        7280 kB\nPageTables:         6856 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    44043052 kB\nCommitted_AS:    2671348 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       16380 kB\nVmallocChunk:          0 kB\nPercpu:             7936 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       17408 kB\nDirectMap2M:     2289664 kB\nDirectMap1G:    65011712 kB\n",
+        "node": "v24.19.0",
+        "pnpm": "unavailable (failed to launch)",
+        "hyperfine": "hyperfine 1.18.0",
+        "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+        "rounds": 5,
+        "warmups": 1,
+        "tools": {
+          "tsc-rs": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "1d03a3f7085afa28a89ef4a97b854fc72245903e6ab36aa13395611179238b3a"
+          },
+          "tsc-rs-0.3.0": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "59eb23905da5aaf440e86e2cd0181de5b9030e55fc15178a8311622d833abeb9"
+          },
+          "tsc7": {
+            "version": "Version 7.1.0-dev.20261008.1",
+            "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+          },
+          "bun": {
+            "version": "1.4.4-canary.1+7c96a1212",
+            "sha256": "73721bfa7afb06daee334bdb0c612ab975993b1f4cb1dfc6a7dc7c905c1a6da8"
+          }
+        },
+        "inputs": {
+          "t3code": {
+            "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+            "locks": {
+              "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+            }
+          }
+        },
+        "packages": {
+          "typescript": "7.1.0-dev.20261008.1",
+          "typescript (ts6)": "6.0.3",
+          "tsc-rs": "0.3.0",
+          "@effect/tsgo": "0.51.1",
+          "@effect/language-service": "0.87.4"
+        },
+        "package-lock.json": "b21b73bd71e3453201dff5f0ec2e7e5a10d395e02ef861f3851a30ac60702444",
+        "effectgo/package-lock.json": "4637aece6901b2a665918cd28488838d2068babe683c0107f3c24233f485c07d",
+        "ts6effect/package-lock.json": "d638fb5ce9b9ca65df0c8674831443295669de3f6199debdb949b5a54cc9d9e4",
+        "compilerBuild": {
+          "cacheKey": "bench-compiler-v1-linux-x64-rust1.95.0-837e349b4da7f41205694387cc0d2070b4c9300e91d9e238f8002c46bcddef4a",
+          "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+          "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+          "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+          "build": "release PGO, static musl, no BOLT"
+        }
+      },
+      "tools": {
+        "tsc6": {
+          "median": 10.7127861,
+          "mean": 10.7519468888,
+          "stddev": 0.12005235496204836,
+          "times": [
+            10.865732133,
+            10.892309287,
+            10.657839016,
+            10.631067908,
+            10.7127861
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc7": {
+          "median": 2.432542151,
+          "mean": 2.4313355184,
+          "stddev": 0.02474938937886612,
+          "times": [
+            2.3948943590000003,
+            2.439433697,
+            2.432542151,
+            2.426370697,
+            2.463436688
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc-rs-0.3.0": {
+          "median": 1.038379712,
+          "mean": 1.0346812378,
+          "stddev": 0.024925600184999064,
+          "times": [
+            1.071771815,
+            1.038438032,
+            1.019096845,
+            1.038379712,
+            1.005719785
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc-rs": {
+          "median": 1.019937893,
+          "mean": 1.0319240724,
+          "stddev": 0.059617041344927804,
+          "times": [
+            1.055236711,
+            0.9840615930000001,
+            0.9774893950000001,
+            1.12289477,
+            1.019937893
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "bun": {
+          "median": 1.155944241,
+          "mean": 1.1571589564,
+          "stddev": 0.010145370129159321,
+          "times": [
+            1.160114922,
+            1.154794583,
+            1.1715367269999999,
+            1.1434043090000001,
+            1.155944241
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      }
+    },
+    "t3-packages-client-runtime-noeffect": {
+      "runner": {
+        "date": "2026-10-11T23:58:38.836468+00:00",
+        "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+        "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+        "run": "https://github.com/pingdotgg/ts-rust/actions/runs/38185127561",
+        "build": "release PGO, static musl, no BOLT",
+        "host": "Linux-6.6.141-x86_64-with-glibc2.39",
+        "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nBogoMIPS:                                8583.83\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d\nVirtualization:                          AMD-V\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+        "memory": "MemTotal:       65017440 kB\nMemFree:        57904000 kB\nMemAvailable:   63793048 kB\nBuffers:          257676 kB\nCached:          5786548 kB\nSwapCached:            0 kB\nActive:           869040 kB\nInactive:        5422344 kB\nActive(anon):       6496 kB\nInactive(anon):   288372 kB\nActive(file):     862544 kB\nInactive(file):  5133972 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:      11534332 kB\nSwapFree:       11534332 kB\nDirty:                 4 kB\nWriteback:             0 kB\nAnonPages:        246932 kB\nMapped:           252820 kB\nShmem:             47708 kB\nKReclaimable:     613000 kB\nSlab:             717024 kB\nSReclaimable:     613000 kB\nSUnreclaim:       104024 kB\nKernelStack:        7488 kB\nPageTables:         7096 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    44043052 kB\nCommitted_AS:    2733064 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       16556 kB\nVmallocChunk:          0 kB\nPercpu:             7936 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       17408 kB\nDirectMap2M:     2289664 kB\nDirectMap1G:    65011712 kB\n",
+        "node": "v24.19.0",
+        "pnpm": "unavailable (failed to launch)",
+        "hyperfine": "hyperfine 1.18.0",
+        "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+        "rounds": 5,
+        "warmups": 1,
+        "tools": {
+          "tsc-rs": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "1d03a3f7085afa28a89ef4a97b854fc72245903e6ab36aa13395611179238b3a"
+          },
+          "tsc-rs-0.3.0": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "59eb23905da5aaf440e86e2cd0181de5b9030e55fc15178a8311622d833abeb9"
+          },
+          "tsc7": {
+            "version": "Version 7.1.0-dev.20261008.1",
+            "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+          },
+          "bun": {
+            "version": "1.4.4-canary.1+7c96a1212",
+            "sha256": "73721bfa7afb06daee334bdb0c612ab975993b1f4cb1dfc6a7dc7c905c1a6da8"
+          }
+        },
+        "inputs": {
+          "t3code": {
+            "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+            "locks": {
+              "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+            }
+          }
+        },
+        "packages": {
+          "typescript": "7.1.0-dev.20261008.1",
+          "typescript (ts6)": "6.0.3",
+          "tsc-rs": "0.3.0",
+          "@effect/tsgo": "0.51.1",
+          "@effect/language-service": "0.87.4"
+        },
+        "package-lock.json": "b21b73bd71e3453201dff5f0ec2e7e5a10d395e02ef861f3851a30ac60702444",
+        "effectgo/package-lock.json": "4637aece6901b2a665918cd28488838d2068babe683c0107f3c24233f485c07d",
+        "ts6effect/package-lock.json": "d638fb5ce9b9ca65df0c8674831443295669de3f6199debdb949b5a54cc9d9e4",
+        "compilerBuild": {
+          "cacheKey": "bench-compiler-v1-linux-x64-rust1.95.0-837e349b4da7f41205694387cc0d2070b4c9300e91d9e238f8002c46bcddef4a",
+          "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+          "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+          "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+          "build": "release PGO, static musl, no BOLT"
+        }
+      },
+      "tools": {
+        "tsc6": {
+          "median": 5.994702959,
+          "mean": 6.436893095399999,
+          "stddev": 0.9234029675311484,
+          "times": [
+            8.085515188,
+            6.124342067,
+            5.988288458,
+            5.991616805,
+            5.994702959
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc7": {
+          "median": 1.513424566,
+          "mean": 1.5524236500000002,
+          "stddev": 0.21028189852641263,
+          "times": [
+            1.513424566,
+            1.357480517,
+            1.908085334,
+            1.450048221,
+            1.5330796119999999
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc-rs-0.3.0": {
+          "median": 0.659405675,
+          "mean": 0.6693456192000001,
+          "stddev": 0.03861888178550721,
+          "times": [
+            0.6591101890000001,
+            0.632054278,
+            0.6611991060000001,
+            0.659405675,
+            0.734958848
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc-rs": {
+          "median": 0.6010845800000001,
+          "mean": 0.6073604472,
+          "stddev": 0.02801036782790845,
+          "times": [
+            0.5796099370000001,
+            0.6010845800000001,
+            0.6544793560000001,
+            0.597426945,
+            0.604201418
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "bun": {
+          "median": 0.6276487970000001,
+          "mean": 0.6241357524000001,
+          "stddev": 0.012762514972738262,
+          "times": [
+            0.6276487970000001,
+            0.640481637,
+            0.6180468,
+            0.6282078680000001,
+            0.6062936600000001
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      }
+    },
+    "t3-packages-client-runtime-effect": {
+      "runner": {
+        "date": "2026-10-11T23:59:58.976161+00:00",
+        "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+        "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+        "run": "https://github.com/pingdotgg/ts-rust/actions/runs/38185127561",
+        "build": "release PGO, static musl, no BOLT",
+        "host": "Linux-6.6.141-x86_64-with-glibc2.39",
+        "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nBogoMIPS:                                8583.83\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d\nVirtualization:                          AMD-V\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+        "memory": "MemTotal:       65017440 kB\nMemFree:        57897776 kB\nMemAvailable:   63788808 kB\nBuffers:          257988 kB\nCached:          5788172 kB\nSwapCached:            0 kB\nActive:           966888 kB\nInactive:        5325704 kB\nActive(anon):       6536 kB\nInactive(anon):   287932 kB\nActive(file):     960352 kB\nInactive(file):  5037772 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:      11534332 kB\nSwapFree:       11534332 kB\nDirty:                28 kB\nWriteback:             0 kB\nAnonPages:        246724 kB\nMapped:           253188 kB\nShmem:             48036 kB\nKReclaimable:     613376 kB\nSlab:             717364 kB\nSReclaimable:     613376 kB\nSUnreclaim:       103988 kB\nKernelStack:        7328 kB\nPageTables:         7248 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    44043052 kB\nCommitted_AS:    2710300 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       16412 kB\nVmallocChunk:          0 kB\nPercpu:             7744 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       17408 kB\nDirectMap2M:     2289664 kB\nDirectMap1G:    65011712 kB\n",
+        "node": "v24.19.0",
+        "pnpm": "unavailable (failed to launch)",
+        "hyperfine": "hyperfine 1.18.0",
+        "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+        "rounds": 5,
+        "warmups": 1,
+        "tools": {
+          "tsc-rs": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "1d03a3f7085afa28a89ef4a97b854fc72245903e6ab36aa13395611179238b3a"
+          },
+          "tsc-rs-0.3.0": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "59eb23905da5aaf440e86e2cd0181de5b9030e55fc15178a8311622d833abeb9"
+          },
+          "tsc7": {
+            "version": "Version 7.1.0-dev.20261008.1",
+            "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+          },
+          "bun": {
+            "version": "1.4.4-canary.1+7c96a1212",
+            "sha256": "73721bfa7afb06daee334bdb0c612ab975993b1f4cb1dfc6a7dc7c905c1a6da8"
+          }
+        },
+        "inputs": {
+          "t3code": {
+            "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+            "locks": {
+              "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+            }
+          }
+        },
+        "packages": {
+          "typescript": "7.1.0-dev.20261008.1",
+          "typescript (ts6)": "6.0.3",
+          "tsc-rs": "0.3.0",
+          "@effect/tsgo": "0.51.1",
+          "@effect/language-service": "0.87.4"
+        },
+        "package-lock.json": "b21b73bd71e3453201dff5f0ec2e7e5a10d395e02ef861f3851a30ac60702444",
+        "effectgo/package-lock.json": "4637aece6901b2a665918cd28488838d2068babe683c0107f3c24233f485c07d",
+        "ts6effect/package-lock.json": "d638fb5ce9b9ca65df0c8674831443295669de3f6199debdb949b5a54cc9d9e4",
+        "compilerBuild": {
+          "cacheKey": "bench-compiler-v1-linux-x64-rust1.95.0-837e349b4da7f41205694387cc0d2070b4c9300e91d9e238f8002c46bcddef4a",
+          "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+          "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+          "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+          "build": "release PGO, static musl, no BOLT"
+        }
+      },
+      "tools": {
+        "tsc6": {
+          "median": 12.834075021,
+          "mean": 12.916481047400001,
+          "stddev": 0.21812797681057228,
+          "times": [
+            13.280508967,
+            12.944843441,
+            12.794372207,
+            12.728605601,
+            12.834075021
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 5,
+          "diagnosticCodes": {
+            "TS47": 3,
+            "TS29": 1,
+            "TS44": 1
+          },
+          "diagnosticsSha256": "72aec53444d9fe943c00ee35622eb3e49247ee27bac3e98b332b98f73d98780c"
+        },
+        "tsc7": {
+          "median": 2.11282343,
+          "mean": 2.1075246408000003,
+          "stddev": 0.01700519758658864,
+          "times": [
+            2.128757317,
+            2.115808092,
+            2.11282343,
+            2.088862491,
+            2.091371874
+          ],
+          "exit_codes": [
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "diagnosticCount": 933,
+          "diagnosticCodes": {
+            "TS377136": 890,
+            "TS377016": 3,
+            "TS377114": 1,
+            "TS377095": 1,
+            "TS377019": 1,
+            "TS377117": 37
+          },
+          "diagnosticsSha256": "be0ef1e60544cc0495e4490422789aa18d0d27a989801ab46f6c198f651a0bc3"
+        },
+        "tsc-rs-0.3.0": {
+          "median": 0.9931666950000001,
+          "mean": 1.0072140096,
+          "stddev": 0.052147083057431605,
+          "times": [
+            0.935974501,
+            1.046716679,
+            0.991399994,
+            0.9931666950000001,
+            1.068812179
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 933,
+          "diagnosticCodes": {
+            "TS377136": 890,
+            "TS377016": 3,
+            "TS377114": 1,
+            "TS377095": 1,
+            "TS377019": 1,
+            "TS377117": 37
+          },
+          "diagnosticsSha256": "be0ef1e60544cc0495e4490422789aa18d0d27a989801ab46f6c198f651a0bc3"
+        },
+        "tsc-rs": {
+          "median": 0.760077644,
+          "mean": 0.7617712658,
+          "stddev": 0.015731953755954715,
+          "times": [
+            0.739590972,
+            0.7774459610000001,
+            0.760077644,
+            0.755482565,
+            0.7762591870000001
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 933,
+          "diagnosticCodes": {
+            "TS377136": 890,
+            "TS377016": 3,
+            "TS377114": 1,
+            "TS377095": 1,
+            "TS377019": 1,
+            "TS377117": 37
+          },
+          "diagnosticsSha256": "be0ef1e60544cc0495e4490422789aa18d0d27a989801ab46f6c198f651a0bc3"
+        },
+        "bun": {
+          "median": 4.231781335,
+          "mean": 4.2337480396,
+          "stddev": 0.02507037504784778,
+          "times": [
+            4.221878846,
+            4.207829623,
+            4.232325173,
+            4.274925221,
+            4.231781335
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 933,
+          "diagnosticCodes": {
+            "effect(unstableApiUsage)": 890,
+            "effect(effectSucceedWithVoid)": 3,
+            "effect(mapSomeToAsSome)": 1,
+            "effect(catchToOrElseSucceed)": 1,
+            "effect(unnecessaryFailYieldableError)": 1,
+            "effect(preferSucceedSomeOrNone)": 37
+          },
+          "diagnosticsSha256": "08fddf0d59fdc57da23874f1237331fbf6d6b6007e9c8583fbf94094e6d05bdd"
+        }
+      }
+    },
+    "t3-packages-shared-noeffect": {
+      "runner": {
+        "date": "2026-10-11T23:58:06.793097+00:00",
+        "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+        "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+        "run": "https://github.com/pingdotgg/ts-rust/actions/runs/38185127561",
+        "build": "release PGO, static musl, no BOLT",
+        "host": "Linux-6.6.141-x86_64-with-glibc2.39",
+        "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nBogoMIPS:                                8583.84\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d\nVirtualization:                          AMD-V\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+        "memory": "MemTotal:       65017440 kB\nMemFree:        57892432 kB\nMemAvailable:   63783068 kB\nBuffers:          258536 kB\nCached:          5785292 kB\nSwapCached:            0 kB\nActive:           864808 kB\nInactive:        5430952 kB\nActive(anon):       6292 kB\nInactive(anon):   292740 kB\nActive(file):     858516 kB\nInactive(file):  5138212 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:      11534332 kB\nSwapFree:       11534332 kB\nDirty:              2928 kB\nWriteback:             0 kB\nAnonPages:        251384 kB\nMapped:           251700 kB\nShmem:             47100 kB\nKReclaimable:     614376 kB\nSlab:             717920 kB\nSReclaimable:     614376 kB\nSUnreclaim:       103544 kB\nKernelStack:        7280 kB\nPageTables:         7012 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    44043052 kB\nCommitted_AS:    2677012 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       16348 kB\nVmallocChunk:          0 kB\nPercpu:             7936 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       17408 kB\nDirectMap2M:     2289664 kB\nDirectMap1G:    65011712 kB\n",
+        "node": "v24.19.0",
+        "pnpm": "unavailable (failed to launch)",
+        "hyperfine": "hyperfine 1.18.0",
+        "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+        "rounds": 5,
+        "warmups": 1,
+        "tools": {
+          "tsc-rs": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "1d03a3f7085afa28a89ef4a97b854fc72245903e6ab36aa13395611179238b3a"
+          },
+          "tsc-rs-0.3.0": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "59eb23905da5aaf440e86e2cd0181de5b9030e55fc15178a8311622d833abeb9"
+          },
+          "tsc7": {
+            "version": "Version 7.1.0-dev.20261008.1",
+            "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+          },
+          "bun": {
+            "version": "1.4.4-canary.1+7c96a1212",
+            "sha256": "73721bfa7afb06daee334bdb0c612ab975993b1f4cb1dfc6a7dc7c905c1a6da8"
+          }
+        },
+        "inputs": {
+          "t3code": {
+            "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+            "locks": {
+              "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+            }
+          }
+        },
+        "packages": {
+          "typescript": "7.1.0-dev.20261008.1",
+          "typescript (ts6)": "6.0.3",
+          "tsc-rs": "0.3.0",
+          "@effect/tsgo": "0.51.1",
+          "@effect/language-service": "0.87.4"
+        },
+        "package-lock.json": "b21b73bd71e3453201dff5f0ec2e7e5a10d395e02ef861f3851a30ac60702444",
+        "effectgo/package-lock.json": "4637aece6901b2a665918cd28488838d2068babe683c0107f3c24233f485c07d",
+        "ts6effect/package-lock.json": "d638fb5ce9b9ca65df0c8674831443295669de3f6199debdb949b5a54cc9d9e4",
+        "compilerBuild": {
+          "cacheKey": "bench-compiler-v1-linux-x64-rust1.95.0-837e349b4da7f41205694387cc0d2070b4c9300e91d9e238f8002c46bcddef4a",
+          "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+          "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+          "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+          "build": "release PGO, static musl, no BOLT"
+        }
+      },
+      "tools": {
+        "tsc6": {
+          "median": 3.697341359,
+          "mean": 3.7294946756000003,
+          "stddev": 0.08426656026289553,
+          "times": [
+            3.843340952,
+            3.784807541,
+            3.692326976,
+            3.697341359,
+            3.62965655
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc7": {
+          "median": 0.649012471,
+          "mean": 0.658713243,
+          "stddev": 0.02541968907570851,
+          "times": [
+            0.648874721,
+            0.651463627,
+            0.7035907180000001,
+            0.649012471,
+            0.640624678
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc-rs-0.3.0": {
+          "median": 0.27824628,
+          "mean": 0.28998399080000004,
+          "stddev": 0.02849463013476351,
+          "times": [
+            0.280685985,
+            0.340782754,
+            0.27534247300000003,
+            0.27486246200000003,
+            0.27824628
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "tsc-rs": {
+          "median": 0.288679197,
+          "mean": 0.29194003860000006,
+          "stddev": 0.01717216589785506,
+          "times": [
+            0.281285712,
+            0.31997936800000004,
+            0.275673736,
+            0.29408218,
+            0.288679197
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "bun": {
+          "median": 0.180718219,
+          "mean": 0.18104386040000003,
+          "stddev": 0.0033055584039116347,
+          "times": [
+            0.18648535700000002,
+            0.177677053,
+            0.180919657,
+            0.180718219,
+            0.17941901600000001
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 0,
+          "diagnosticCodes": {},
+          "diagnosticsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      }
+    },
+    "t3-packages-shared-effect": {
+      "runner": {
+        "date": "2026-10-11T23:58:35.981892+00:00",
+        "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+        "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+        "run": "https://github.com/pingdotgg/ts-rust/actions/runs/38185127561",
+        "build": "release PGO, static musl, no BOLT",
+        "host": "Linux-6.6.141-x86_64-with-glibc2.39",
+        "cpu": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD EPYC\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      1\nCore(s) per socket:                      16\nSocket(s):                               1\nStepping:                                0\nBogoMIPS:                                8583.87\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand hypervisor lahf_lm cmp_legacy svm cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw topoext perfctr_core ssbd perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves avx_vnni avx512_bf16 clzero xsaveerptr wbnoinvd arat npt lbrv nrip_save tsc_scale vmcb_clean flushbyasid pausefilter pfthreshold v_vmsave_vmload vgif vnmi avx512vbmi umip pku avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid movdiri movdir64b fsrm avx512_vp2intersect flush_l1d\nVirtualization:                          AMD-V\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               768 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Vulnerable\nVulnerability Spectre v1:                Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers\nVulnerability Spectre v2:                Vulnerable; IBPB: disabled; STIBP: disabled; PBRSB-eIBRS: Not affected; BHI: Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Not affected",
+        "memory": "MemTotal:       65017440 kB\nMemFree:        57893336 kB\nMemAvailable:   63788588 kB\nBuffers:          258292 kB\nCached:          5792668 kB\nSwapCached:            0 kB\nActive:           964140 kB\nInactive:        5331424 kB\nActive(anon):       6660 kB\nInactive(anon):   286468 kB\nActive(file):     957480 kB\nInactive(file):  5044956 kB\nUnevictable:           0 kB\nMlocked:               0 kB\nSwapTotal:      11534332 kB\nSwapFree:       11534332 kB\nDirty:                28 kB\nWriteback:             0 kB\nAnonPages:        244644 kB\nMapped:           253900 kB\nShmem:             48524 kB\nKReclaimable:     613284 kB\nSlab:             716412 kB\nSReclaimable:     613284 kB\nSUnreclaim:       103128 kB\nKernelStack:        7520 kB\nPageTables:         6960 kB\nSecPageTables:         0 kB\nNFS_Unstable:          0 kB\nBounce:                0 kB\nWritebackTmp:          0 kB\nCommitLimit:    44043052 kB\nCommitted_AS:    2722080 kB\nVmallocTotal:   34359738367 kB\nVmallocUsed:       16476 kB\nVmallocChunk:          0 kB\nPercpu:             7936 kB\nAnonHugePages:         0 kB\nShmemHugePages:        0 kB\nShmemPmdMapped:        0 kB\nFileHugePages:         0 kB\nFilePmdMapped:         0 kB\nHugePages_Total:       0\nHugePages_Free:        0\nHugePages_Rsvd:        0\nHugePages_Surp:        0\nHugepagesize:       2048 kB\nHugetlb:               0 kB\nDirectMap4k:       17408 kB\nDirectMap2M:     2289664 kB\nDirectMap1G:    65011712 kB\n",
+        "node": "v24.19.0",
+        "pnpm": "unavailable (failed to launch)",
+        "hyperfine": "hyperfine 1.18.0",
+        "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2",
+        "rounds": 5,
+        "warmups": 1,
+        "tools": {
+          "tsc-rs": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "1d03a3f7085afa28a89ef4a97b854fc72245903e6ab36aa13395611179238b3a"
+          },
+          "tsc-rs-0.3.0": {
+            "version": "Version 7.1.0-dev",
+            "sha256": "59eb23905da5aaf440e86e2cd0181de5b9030e55fc15178a8311622d833abeb9"
+          },
+          "tsc7": {
+            "version": "Version 7.1.0-dev.20261008.1",
+            "sha256": "d4dc929ad3f61cf685a85929a286c619887248845323978473db7eecc0f2d623"
+          },
+          "bun": {
+            "version": "1.4.4-canary.1+7c96a1212",
+            "sha256": "73721bfa7afb06daee334bdb0c612ab975993b1f4cb1dfc6a7dc7c905c1a6da8"
+          }
+        },
+        "inputs": {
+          "t3code": {
+            "commit": "cd41c4ada0c70cc2eec95ecd7266f3dab010c58c",
+            "locks": {
+              "pnpm-lock.yaml": "d0cde9630dba654c077f362e95d8342f89be84245f7ab5b41681074159d5e246"
+            }
+          }
+        },
+        "packages": {
+          "typescript": "7.1.0-dev.20261008.1",
+          "typescript (ts6)": "6.0.3",
+          "tsc-rs": "0.3.0",
+          "@effect/tsgo": "0.51.1",
+          "@effect/language-service": "0.87.4"
+        },
+        "package-lock.json": "b21b73bd71e3453201dff5f0ec2e7e5a10d395e02ef861f3851a30ac60702444",
+        "effectgo/package-lock.json": "4637aece6901b2a665918cd28488838d2068babe683c0107f3c24233f485c07d",
+        "ts6effect/package-lock.json": "d638fb5ce9b9ca65df0c8674831443295669de3f6199debdb949b5a54cc9d9e4",
+        "compilerBuild": {
+          "cacheKey": "bench-compiler-v1-linux-x64-rust1.95.0-837e349b4da7f41205694387cc0d2070b4c9300e91d9e238f8002c46bcddef4a",
+          "source": "6c4d9ae3386e8e031ff1bff5eb8733c14018c300",
+          "compilerTree": "2ba4a7a89d90492a3ff83f544406196d0d0cf64a",
+          "rust": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+          "build": "release PGO, static musl, no BOLT"
+        }
+      },
+      "tools": {
+        "tsc6": {
+          "median": 6.186450283,
+          "mean": 6.180897890599999,
+          "stddev": 0.021073494069657323,
+          "times": [
+            6.154161609,
+            6.164917354,
+            6.186450283,
+            6.205989173,
+            6.192971034
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 3,
+          "diagnosticCodes": {
+            "TS-1": 3
+          },
+          "diagnosticsSha256": "48200e90fc122ac15293174cb830cba3aa5f7d1fabc67e59edaabdc72b999b2f"
+        },
+        "tsc7": {
+          "median": 0.9584124420000001,
+          "mean": 0.9573803114,
+          "stddev": 0.04318987755144587,
+          "times": [
+            0.9072494560000001,
+            1.008203363,
+            0.922146467,
+            0.9908898290000001,
+            0.9584124420000001
+          ],
+          "exit_codes": [
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "diagnosticCount": 66,
+          "diagnosticCodes": {
+            "TS377136": 65,
+            "TS377114": 1
+          },
+          "diagnosticsSha256": "86b3a1c031fd56c41b52cac7137cd62ba57da7b35892e5593b4e5c5f417ea5af"
+        },
+        "tsc-rs-0.3.0": {
+          "median": 0.376949136,
+          "mean": 0.37432466140000004,
+          "stddev": 0.005426183397628842,
+          "times": [
+            0.37797747200000004,
+            0.378876184,
+            0.37192647,
+            0.376949136,
+            0.365894045
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 66,
+          "diagnosticCodes": {
+            "TS377136": 65,
+            "TS377114": 1
+          },
+          "diagnosticsSha256": "86b3a1c031fd56c41b52cac7137cd62ba57da7b35892e5593b4e5c5f417ea5af"
+        },
+        "tsc-rs": {
+          "median": 0.33048601800000005,
+          "mean": 0.3298695158,
+          "stddev": 0.011214540862514522,
+          "times": [
+            0.323572631,
+            0.33048601800000005,
+            0.34641555700000004,
+            0.332506077,
+            0.316367296
+          ],
+          "exit_codes": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "diagnosticCount": 66,
+          "diagnosticCodes": {
+            "TS377136": 65,
+            "TS377114": 1
+          },
+          "diagnosticsSha256": "86b3a1c031fd56c41b52cac7137cd62ba57da7b35892e5593b4e5c5f417ea5af"
+        },
+        "bun": {
+          "median": 1.420604606,
+          "mean": 1.4290402912000002,
+          "stddev": 0.039068349090886495,
+          "times": [
+            1.404694236,
+            1.444544553,
+            1.420604606,
+            1.4879374360000002,
+            1.387420625
+          ],
+          "exit_codes": [
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "diagnosticCount": 66,
+          "diagnosticCodes": {
+            "effect(unstableApiUsage)": 65,
+            "effect(mapSomeToAsSome)": 1
+          },
+          "diagnosticsSha256": "858a1165c53166f7dfb4dcae5a5de8fd1c385b0ff5de1c5d5df3106bd93fcd1f"
+        }
+      }
+    }
+  }
+}

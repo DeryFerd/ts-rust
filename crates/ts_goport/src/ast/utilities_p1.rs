@@ -552,11 +552,15 @@ pub fn get_locals(
 
 // Determines if a node is missing (either `nil` or empty)
 // Go: ast/utilities.go:66 NodeIsMissing
+// PERF: noderef1 G1. The loc and the kind are read through one view
+// (`NodeRef`).
 pub fn node_is_missing(node: Node) -> bool {
-    node.is_nil()
-        || node.loc().pos() == node.loc().end()
-            && node.loc().pos() >= 0
-            && node.kind() != SyntaxKind::EndOfFile
+    if node.is_nil() {
+        return true;
+    }
+    let node = NodeRef::new(node);
+    let loc = node.loc();
+    loc.pos() == loc.end() && loc.pos() >= 0 && node.kind() != SyntaxKind::EndOfFile
 }
 
 // Determines if a node is present
@@ -756,9 +760,13 @@ pub fn is_array_binding_or_assignment_element(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:166 IsBindingPattern
+// PERF: noderef1 G3. One kind read, inline.
+#[inline]
 pub fn is_binding_pattern(node: Node) -> bool {
-    node.kind() == SyntaxKind::ObjectBindingPattern
-        || node.kind() == SyntaxKind::ArrayBindingPattern
+    matches!(
+        node.kind(),
+        SyntaxKind::ObjectBindingPattern | SyntaxKind::ArrayBindingPattern
+    )
 }
 
 // Go: ast/utilities.go:170 IsForInOrOfStatement
@@ -781,16 +789,56 @@ pub fn is_assignment_target(node: Node) -> bool {
 // Go: ast/utilities.go:184 GetAssignmentTarget
 // PERF: U4 (CH7). A step inside a published store reads the parent and its
 // kind with one store lookup (`frozen_store_parent_kind`).
+// PERF: deferbody1. Most calls end at the first step, at a parent kind that
+// the walk does not handle (a call, a property access, a statement). That
+// step is inline at the caller; the walk is out of line.
+#[inline(always)]
 pub fn get_assignment_target(node: Node) -> Node {
+    let (parent, parent_kind) = assignment_target_parent(node);
+    match parent_kind {
+        SyntaxKind::BinaryExpression
+        | SyntaxKind::PrefixUnaryExpression
+        | SyntaxKind::PostfixUnaryExpression
+        | SyntaxKind::ForInStatement
+        | SyntaxKind::ForOfStatement
+        | SyntaxKind::ParenthesizedExpression
+        | SyntaxKind::ArrayLiteralExpression
+        | SyntaxKind::SpreadElement
+        | SyntaxKind::NonNullExpression
+        | SyntaxKind::SpreadAssignment
+        | SyntaxKind::ShorthandPropertyAssignment
+        | SyntaxKind::PropertyAssignment => get_assignment_target_from(node, parent, parent_kind),
+        _ => Node::NIL,
+    }
+}
+
+/// Go `node.Parent` and `node.Parent.Kind`: one store lookup for a parent in
+/// the same published store (`frozen_store_parent_kind`).
+#[inline(always)]
+fn assignment_target_parent(node: Node) -> (Node, SyntaxKind) {
+    match frozen_store_parent_kind(node) {
+        Some(parent_and_kind) => parent_and_kind,
+        None => node_parent_and_kind_slow(node),
+    }
+}
+
+/// `node.Parent` and its kind, read one by one: a parent in another store,
+/// a nil parent (its kind read panics, as Go does) or a node that is not in
+/// a published store.
+#[cold]
+#[inline(never)]
+fn node_parent_and_kind_slow(node: Node) -> (Node, SyntaxKind) {
+    let parent = node.parent();
+    (parent, parent.kind())
+}
+
+/// The walk of `get_assignment_target` from `node`, whose parent `parent`
+/// of kind `parent_kind` the caller has read.
+#[inline(never)]
+fn get_assignment_target_from(node: Node, parent: Node, parent_kind: SyntaxKind) -> Node {
     let mut node = node;
+    let (mut parent, mut parent_kind) = (parent, parent_kind);
     loop {
-        let (parent, parent_kind) = match frozen_store_parent_kind(node) {
-            Some(parent_and_kind) => parent_and_kind,
-            None => {
-                let parent = node.parent();
-                (parent, parent.kind())
-            }
-        };
         match parent_kind {
             SyntaxKind::BinaryExpression => {
                 if is_assignment_operator(parent.operator_token().kind()) && parent.left() == node {
@@ -843,6 +891,7 @@ pub fn get_assignment_target(node: Node) -> Node {
             }
             _ => return Node::NIL,
         }
+        (parent, parent_kind) = assignment_target_parent(node);
     }
 }
 
@@ -906,8 +955,13 @@ pub fn is_member_name(node: Node) -> bool {
 }
 
 // Go: ast/utilities.go:275 IsEntityName
+// PERF: noderef1 G3. One kind read, inline.
+#[inline]
 pub fn is_entity_name(node: Node) -> bool {
-    node.kind() == SyntaxKind::Identifier || node.kind() == SyntaxKind::QualifiedName
+    matches!(
+        node.kind(),
+        SyntaxKind::Identifier | SyntaxKind::QualifiedName
+    )
 }
 
 // Go: ast/utilities.go:279 IsPropertyName
@@ -999,7 +1053,9 @@ pub fn is_signed_numeric_literal(node: Node) -> bool {
 // result is the same) and `OPTIONAL_CHAIN` is a parser bit
 // (`Node::parser_flags`), so most nodes load neither their flags nor their
 // binder data.
+// PERF: noderef1 G2. The kind and the flags through one view (`NodeRef`).
 pub fn is_optional_chain(node: Node) -> bool {
+    let node = NodeRef::new(node);
     matches!(
         node.kind(),
         SyntaxKind::PropertyAccessExpression
@@ -1253,7 +1309,7 @@ static FUNCTION_LIKE_KINDS: KindSet = KindSet::of(&[
 
 // Go: ast/utilities.go:483 isFunctionLikeDeclarationKind
 #[inline]
-fn is_function_like_declaration_kind(kind: SyntaxKind) -> bool {
+pub fn is_function_like_declaration_kind(kind: SyntaxKind) -> bool {
     FUNCTION_LIKE_DECLARATION_KINDS.contains(kind)
 }
 
@@ -1501,34 +1557,53 @@ pub fn is_statement_but_not_declaration(node: Node) -> bool {
 // Go: ast/utilities.go:695 IsStatement
 #[inline]
 pub fn is_statement(node: Node) -> bool {
-    // PERF: one lookup for `isStatementKindButNotDeclarationKind(kind) ||
-    // isDeclarationStatementKind(kind)`. Neither list holds `Block`.
-    STATEMENT_KINDS.contains(node.kind()) || is_block_statement(node)
+    is_statement_ref(NodeRef::new(node))
+}
+
+/// `is_statement` on the view of the node.
+// PERF: one lookup for `isStatementKindButNotDeclarationKind(kind) ||
+// isDeclarationStatementKind(kind)`. Neither list holds `Block`. noderef1
+// G2: the Block test reads the parent through the view (`NodeRef`).
+#[inline]
+pub fn is_statement_ref(node: NodeRef) -> bool {
+    let kind = node.kind();
+    STATEMENT_KINDS.contains(kind) || kind == SyntaxKind::Block && is_block_statement_ref(node)
 }
 
 // Determines whether a node is a BlockStatement. If parents are available, this ensures the Block is
 // not part of a `try` statement, `catch` clause, or the Block-like body of a function
 // Go: ast/utilities.go:702 isBlockStatement
-fn is_block_statement(node: Node) -> bool {
+// PERF: noderef1 G2. The node and its parent are read through one view
+// (`NodeRef`): one registry lookup, where the Go reads made eight.
+fn is_block_statement_ref(node: NodeRef) -> bool {
     if node.kind() != SyntaxKind::Block {
         return false;
     }
-    if node.parent().is_some()
-        && (node.parent().kind() == SyntaxKind::TryStatement
-            || node.parent().kind() == SyntaxKind::CatchClause)
+    let parent = node.parent();
+    if parent.is_some()
+        && matches!(
+            parent.kind(),
+            SyntaxKind::TryStatement | SyntaxKind::CatchClause
+        )
     {
         return false;
     }
-    !is_function_block(node)
+    // `!is_function_block(node)`: `node` is a Block.
+    !(parent.is_some() && is_function_like_kind(parent.kind()))
 }
 
 // Determines whether a node is the Block-like body of a function by walking the parent of the node
 // Go: ast/utilities.go:713 IsFunctionBlock
+// PERF: noderef1 G2. One view (`NodeRef`) for the node and its parent.
 pub fn is_function_block(node: Node) -> bool {
-    node.is_some()
-        && node.kind() == SyntaxKind::Block
-        && node.parent().is_some()
-        && is_function_like(node.parent())
+    if node.is_nil() {
+        return false;
+    }
+    let node = NodeRef::new(node);
+    node.kind() == SyntaxKind::Block && {
+        let parent = node.parent();
+        parent.is_some() && is_function_like_kind(parent.kind())
+    }
 }
 
 // Go: ast/utilities.go:717 IsBlockOrCatchScoped
@@ -1740,11 +1815,13 @@ pub fn get_source_file_of_node(node: Node) -> Node {
 }
 
 /// The Go `GetSourceFileOfNode` parent walk.
+// PERF: noderef1 G2. Through views (`NodeRef`): no registry lookup for a
+// parent in the same store.
 fn walk_to_source_file(node: Node) -> Node {
-    let mut node = node;
+    let mut node = NodeRef::new(node);
     while node.is_some() {
         if node.kind() == SyntaxKind::SourceFile {
-            return node;
+            return node.node();
         }
         node = node.parent();
     }
@@ -1915,9 +1992,8 @@ mod binary_view_tests {
     /// binderview1: a `BinaryView` holds what the field accessors read:
     /// before the publish (the accessor path), after it in an alias-free
     /// store (`FrozenIds::Direct`) and in a store with an alias slot (a
-    /// synthetic right operand, `FrozenIds::Records`), and with no ids. It
-    /// publishes, so no other test may build or publish stores while it runs
-    /// (the runner uses one thread).
+    /// synthetic right operand, `FrozenIds::Records`), and with no ids. Its
+    /// build takes the store build lock (`crate::test_lock`).
     #[test]
     fn binary_view_reads_what_the_accessors_read() {
         let plain = new_file_store("/binaryview/a.ts", "x = y;");

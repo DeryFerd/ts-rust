@@ -1,11 +1,12 @@
 //! Go: compiler/filesparser.go (parse tasks, the files parser and
 //! `getProcessedFiles`).
 
-use super::file_loader::SyntheticImports;
+use super::file_loader::{ImportNames, SyntheticImports};
 use crate::frontend::prelude::*;
 use crate::gostd::slices::stable_sort_by;
 use crate::program::ThreadBudget;
 use std::cell::Cell;
+use std::rc::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
@@ -47,6 +48,12 @@ pub struct ParseTask {
 
     pub loaded_task: Option<ParseTaskRef>,
     pub all_include_reasons: Vec<Rc<FileIncludeReason>>,
+    /// The task data of the task's path (`task_data_by_path`), set when
+    /// `FilesParser::start` queues the task.
+    // PERF (parload1 step 4): Go looks the data up by path at each visit of
+    // `collectFiles`; the link saves the string hash per visit. A `Weak`
+    // link makes no `Rc` cycle (task, data, task).
+    pub data: Weak<RefCell<ParseTaskData>>,
 }
 
 /// Go `*parseTask`.
@@ -58,7 +65,7 @@ impl ParseTask {
         self.normalized_file_path.clone()
     }
 
-    // Go: filesparser.go:55 (*parseTask).Path
+    // Go: filesparser.go:55 (*parseTask).Path (at 673a5f17d713; ts#64159 renames it PathKey, compiler/filesparser.go:55)
     pub fn path(&self) -> Path {
         self.path.clone()
     }
@@ -98,7 +105,7 @@ impl ParseTask {
             if !allow_non_ts_extensions {
                 let canonical_file_name = get_canonical_file_name(
                     &self.normalized_file_path,
-                    loader.opts.host.fs().use_case_sensitive_file_names(),
+                    loader.host.fs().use_case_sensitive_file_names(),
                 );
                 if !loader.is_supported_extension(&canonical_file_name) {
                     if has_js_file_extension(&canonical_file_name) {
@@ -202,6 +209,7 @@ impl ParseTask {
                     self.add_sub_task(
                         ResolvedRef {
                             file_name: lib_file.path.clone(),
+                            path: lib_file.path_key.clone(),
                             include_reason: Some(include_reason),
                             ..Default::default()
                         },
@@ -219,6 +227,8 @@ impl ParseTask {
         for supplemental in file.supplemental_source_files() {
             self.sub_tasks.push(Rc::new(RefCell::new(ParseTask {
                 normalized_file_path: supplemental.file_name().to_string(),
+                // ts#64159 (filesparser.go:176)
+                path: loader.to_path(supplemental.file_name()),
                 file: Some(supplemental.clone()),
                 is_content_mapper_supplemental: true,
                 include_reason: Some(new_file_include_reason(
@@ -230,7 +240,7 @@ impl ParseTask {
         }
     }
 
-    // Go: filesparser.go:185 (*parseTask).redirect
+    // Go: filesparser.go:187 (*parseTask).redirect
     pub fn redirect(&mut self, _loader: &FileLoader, file_name: &str) {
         let redirected = Rc::new(RefCell::new(ParseTask {
             normalized_file_path: normalize_path(file_name),
@@ -243,7 +253,7 @@ impl ParseTask {
         self.sub_tasks = vec![redirected];
     }
 
-    // Go: filesparser.go:195 (*parseTask).loadAutomaticTypeDirectives
+    // Go: filesparser.go:198 (*parseTask).loadAutomaticTypeDirectives
     pub fn load_automatic_type_directives(&mut self, loader: &FileLoader) {
         let _trace = crate::tracing::get().map(|tr| {
             tr.push(
@@ -263,7 +273,7 @@ impl ParseTask {
         }
     }
 
-    // Go: filesparser.go:216 (*parseTask).addSubTask
+    // Go: filesparser.go:220 (*parseTask).addSubTask
     pub fn add_sub_task(&mut self, ref_: ResolvedRef, lib_file: Option<Rc<LibFile>>) {
         // PERF: a resolved name is normal already (Go normalizes it again);
         // then the name moves, with no copy.
@@ -274,6 +284,7 @@ impl ParseTask {
         };
         let sub_task = Rc::new(RefCell::new(ParseTask {
             normalized_file_path,
+            path: ref_.path,
             lib_file,
             increase_depth: ref_.increase_depth,
             elide_on_depth: ref_.elide_on_depth,
@@ -285,14 +296,44 @@ impl ParseTask {
     }
 }
 
-// Go: filesparser.go:208 resolvedRef
+// Go: filesparser.go:211 resolvedRef
 #[derive(Clone, Default)]
 pub struct ResolvedRef {
     pub file_name: String,
+    /// ts#64159 (Go N' `resolvedRef.path`): the path of `file_name`, from
+    /// the resolution. Empty: `FilesParser::start` makes it.
+    pub path: Path,
     pub increase_depth: bool,
     pub elide_on_depth: bool,
     pub include_reason: Option<Rc<FileIncludeReason>>,
     pub package_id: PackageId,
+}
+
+/// Sets the path of a task that `FilesParser::start` queues: the one it
+/// came with (Go `task.path`, ts#64159), else the loader's `to_path` of its
+/// file name.
+fn set_task_path(loader: &FileLoader, task: &mut ParseTask) {
+    if task.path.is_empty() {
+        // PERF: Go `loader.toPath` asks the host for its current directory
+        // and case sensitivity each time; the loader keeps the same values
+        // (`compare_paths_options`), so no copy of the directory is made.
+        task.path = to_path(
+            &task.normalized_file_path,
+            &loader.compare_paths_options.current_directory,
+            loader.compare_paths_options.use_case_sensitive_file_names,
+        );
+    } else {
+        debug_assert_eq!(
+            task.path,
+            to_path(
+                &task.normalized_file_path,
+                &loader.compare_paths_options.current_directory,
+                loader.compare_paths_options.use_case_sensitive_file_names,
+            ),
+            "path of task {}",
+            task.normalized_file_path
+        );
+    }
 }
 
 /// One queued run of the closure that Go `filesParser.start` passes to
@@ -304,7 +345,7 @@ pub(crate) struct QueuedParseTask {
     depth: i32,
 }
 
-// Go: filesparser.go:229 filesParser
+// Go: filesparser.go:233 filesParser
 // PORT: Go `core.WorkGroup` is single threaded here (contract 10). Go
 // `singleThreadedWorkGroup` keeps queued functions in a slice and
 // `RunAndWait` pops the last one first, so `queue` is a stack with the same
@@ -321,6 +362,10 @@ pub struct FilesParser {
     pub max_depth: i32,
     /// Go `singleThreaded`: no parse workers.
     pub single_threaded: bool,
+    /// The lookups that the loader and the parse workers of `parse` shared
+    /// (`HostStatCache::Load`), until `get_processed_files` moves them to
+    /// the program.
+    pub(crate) load_stats: Cell<Option<HostStatCache>>,
 }
 
 // PORT: Go's garbage collector frees the parse tasks with the loader. Here
@@ -358,7 +403,7 @@ impl Drop for ParseTaskLinks {
     }
 }
 
-// Go: filesparser.go:243 getParseTaskData
+// Go: filesparser.go:247 getParseTaskData
 // PORT: Go takes the value from `parseTaskDataPool`; `putParseTaskData`
 // (filesparser.go:226) returns an unused one. No pool is needed here.
 fn get_parse_task_data(task: &ParseTaskRef) -> Rc<RefCell<ParseTaskData>> {
@@ -373,7 +418,7 @@ fn get_parse_task_data(task: &ParseTaskRef) -> Rc<RefCell<ParseTaskData>> {
     }))
 }
 
-// Go: filesparser.go:255 parseTaskData
+// Go: filesparser.go:259 parseTaskData
 // PORT: Go iterates `tasks` (a Go map) in random order. `IndexMap` keeps
 // insertion order. The map holds more than one task only when one path is
 // reached through file names that differ in casing.
@@ -416,7 +461,7 @@ fn all_roots_cached(
 }
 
 impl FilesParser {
-    // Go: filesparser.go:264 (*filesParser).parse
+    // Go: filesparser.go:268 (*filesParser).parse
     pub fn parse(&mut self, loader: &FileLoader, tasks: &[ParseTaskRef]) {
         if PREFETCH.with(|p| p.borrow().is_some()) {
             self.run(loader, tasks);
@@ -429,7 +474,7 @@ impl FilesParser {
         // The worker parses of these paths are freeable file versions
         // (`PrefetchQueue::freeable`). An early pool queued its jobs before
         // this set existed, so its parses would be static: it goes.
-        let freeable = if loader.opts.host.freeable_worker_parses() {
+        let freeable = if loader.host.freeable_worker_parses() {
             crate::ast::published_paths()
         } else {
             Arc::default()
@@ -442,7 +487,7 @@ impl FilesParser {
         // A host with its own file cache (`CompilerHost::prefetch_parses`)
         // gets no workers. This does not set `single_threaded`, so the
         // queue order stays that of a parallel load.
-        let mut workers = if self.single_threaded || !loader.opts.host.prefetch_parses() {
+        let mut workers = if self.single_threaded || !loader.host.prefetch_parses() {
             0
         } else {
             prefetch_worker_count()
@@ -457,7 +502,7 @@ impl FilesParser {
         let cached = if workers == 0 {
             FxHashMap::default()
         } else {
-            loader.opts.host.cached_source_file_refs()
+            loader.host.cached_source_file_refs()
         };
         // When the host gives every root file from its cache, no worker
         // parse can be used, so no worker starts. The loader parses the
@@ -475,8 +520,31 @@ impl FilesParser {
         }
         POOL_LOADS.fetch_add(1, AtomicOrdering::Relaxed);
         let config = PrefetchConfig::of_loader(loader);
+        // The workers use the cache of the loader's file system
+        // (`SharedStatCache`). Only on the plain OS file system: another
+        // file system caches other files than the workers read. It is set
+        // before the resolve config, so a worker's resolver sees it
+        // (`WorkerResolver::new`).
+        let build_host_cache = loader
+            .host
+            .stat_cache()
+            .filter(|_| loader.host.is_plain_os_fs());
+        let resolve = WorkerResolveConfig::of_loader(loader);
+        // An early pool whose workers resolve already (its root jobs) fits
+        // only with the same config, and with no host cache, which they
+        // did not see.
+        let fits = |pool: &PrefetchPool| {
+            pool.shared.config == config
+                && pool.shared.resolve.get().is_none_or(|early| {
+                    build_host_cache.is_none()
+                        && match (early, &resolve) {
+                            (Some(early), Some(resolve)) => early.same(resolve),
+                            (early, resolve) => early.is_none() && resolve.is_none(),
+                        }
+                })
+        };
         let mut pool = match early {
-            Some(pool) if pool.shared.config == config => pool,
+            Some(pool) if fits(&pool) => pool,
             other => {
                 if let Some(other) = other {
                     other.discard();
@@ -484,24 +552,14 @@ impl FilesParser {
                 PrefetchPool::start(config, workers)
             }
         };
-        // The workers use the cache of the loader's file system
-        // (`SharedStatCache`). Only on the plain OS file system: another
-        // file system caches other files than the workers read. It is set
-        // before the resolve config, so a worker's resolver sees it
-        // (`WorkerResolver::new`).
-        let build_host_cache = loader
-            .opts
-            .host
-            .stat_cache()
-            .filter(|_| loader.opts.host.is_plain_os_fs());
+        pool.shared
+            .count(|c| c.loader_started = Some(std::time::Instant::now()));
         if let Some(cache) = build_host_cache {
             cache.start_load();
             let _ = pool.shared.stats.host.set(cache);
         }
-        let _ = pool
-            .shared
-            .resolve
-            .set(WorkerResolveConfig::of_loader(loader));
+        // An early pool with root jobs has this config already.
+        let _ = pool.shared.resolve.set(resolve);
         {
             let mut queue = lock(&pool.shared.queue);
             queue.cached = cached;
@@ -533,7 +591,22 @@ impl FilesParser {
         self.run_queue(loader, Some(&mut pool));
         // Closes the queue, then waits for the workers.
         drop(prefetch);
+        let shared = Arc::clone(&pool.shared);
         drop(pool);
+        // The program keeps the lookups of the plain OS host's load for the
+        // thread that finishes its symlink cache (`HostStatCache`). A `tsc
+        // -b` host keeps its own (`CompilerHost::stat_cache`).
+        if loader.host.is_plain_os_fs() && shared.stats.host.get().is_none() {
+            self.load_stats
+                .set(Some(HostStatCache::Load(Arc::clone(&shared.stats))));
+        }
+        // PERF: the workers' state (the resolution cache, the jobs) is freed
+        // beside the rest of the load, as Go's GC frees it; this thread has
+        // the last reference now. Not in Go. The free thread is one per
+        // process (`goport-free`): the first load with workers starts it,
+        // also in the LSP and API servers, and it then waits on its queue
+        // for the frees of later loads and builds.
+        crate::execute::build::build_task::drop_in_background(shared);
     }
 
     /// Go `parse` without the workers: queue the root tasks and run the
@@ -591,22 +664,18 @@ impl FilesParser {
         }
     }
 
-    // Go: filesparser.go:269 (*filesParser).start
+    // Go: filesparser.go:273 (*filesParser).start
     pub fn start(&mut self, loader: &FileLoader, tasks: &[ParseTaskRef], depth: i32) {
         let prefetch = PREFETCH.with(|p| p.borrow().clone());
         let mut requests = Vec::new();
         for task in tasks {
-            // PERF: Go `loader.toPath` asks the host for its current
-            // directory and case sensitivity each time; the loader keeps
-            // the same values (`compare_paths_options`), so no copy of the
-            // directory is made per task.
-            let path = to_path(
-                &task.borrow().normalized_file_path,
-                &loader.compare_paths_options.current_directory,
-                loader.compare_paths_options.use_case_sensitive_file_names,
-            );
-            task.borrow_mut().path = path.clone();
-            let (data, loaded) = match self.task_data_by_path.get(&path) {
+            // ts#64159 (filesparser.go:275): Go panics on a task without a
+            // path. PORT: the tasks that Go gives a path when it makes them
+            // and the port does not (root, lib, automatic type directive
+            // and redirect tasks) get it here.
+            set_task_path(loader, &mut task.borrow_mut());
+            let existing = self.task_data_by_path.get(&task.borrow().path).cloned();
+            let (data, loaded) = match existing {
                 Some(data) => {
                     // No queued task of this path ran yet, so the loader
                     // loads the file later (a job to move up).
@@ -617,6 +686,7 @@ impl FilesParser {
                 }
                 None => {
                     let candidate = get_parse_task_data(task);
+                    let path = task.borrow().path.clone();
                     self.task_data_by_path
                         .insert(path.clone(), candidate.clone());
                     if prefetch.is_some() {
@@ -630,6 +700,7 @@ impl FilesParser {
                     (candidate, false)
                 }
             };
+            task.borrow_mut().data = Rc::downgrade(&data);
 
             self.queue.push(QueuedParseTask {
                 task: task.clone(),
@@ -745,7 +816,7 @@ impl FilesParser {
     }
 
     /// The body of the closure that Go `start` queues.
-    // Go: filesparser.go:269 (*filesParser).start (queued func)
+    // Go: filesparser.go:273 (*filesParser).start (queued func)
     fn run_queued(&mut self, loader: &FileLoader, queued: QueuedParseTask) {
         let QueuedParseTask {
             task,
@@ -756,8 +827,11 @@ impl FilesParser {
 
         let mut start_subtasks = false;
         if loaded {
-            let name = task.borrow().normalized_file_path.clone();
-            let existing_task = data.borrow().tasks.get(&name).cloned();
+            let existing_task = data
+                .borrow()
+                .tasks
+                .get(&task.borrow().normalized_file_path)
+                .cloned();
             if let Some(existing_task) = existing_task {
                 // Go: tasks[i].loadedTask = existingTask (tasks[i] is task)
                 // PORT: a restart of started subtasks (see below) queues the
@@ -768,6 +842,7 @@ impl FilesParser {
                     task.borrow_mut().loaded_task = Some(existing_task);
                 }
             } else {
+                let name = task.borrow().normalized_file_path.clone();
                 let mut d = data.borrow_mut();
                 d.tasks.insert(name, task.clone());
                 // This is new task for file name - so load subtasks if there was loading for any other casing
@@ -789,11 +864,11 @@ impl FilesParser {
         } else {
             depth
         };
-        let mut relower = false;
+        let lowered;
         {
             let mut d = data.borrow_mut();
-            if current_depth < d.lowest_depth {
-                relower = d.lowest_depth != i32::MAX;
+            lowered = current_depth < d.lowest_depth;
+            if lowered {
                 // If we're seeing this task at a lower depth than before,
                 // reprocess its subtasks to ensure they are loaded.
                 d.lowest_depth = current_depth;
@@ -806,10 +881,11 @@ impl FilesParser {
             return;
         }
 
-        // PORT: Go does not change `data.tasks` in this loop, so a copy of the
-        // values iterates the same tasks.
-        let tasks_by_file_name: Vec<ParseTaskRef> = data.borrow().tasks.values().cloned().collect();
-        for task_by_file_name in tasks_by_file_name {
+        // PORT: Go does not change `data.tasks` in this loop, so an index
+        // walks the same tasks. PERF (parload1 step 4): no copy of the list.
+        let count = data.borrow().tasks.len();
+        for index in 0..count {
+            let task_by_file_name = data.borrow().tasks[index].clone();
             let mut load_sub_tasks = start_subtasks;
             if !task_by_file_name.borrow().loaded {
                 task_by_file_name.borrow_mut().load(loader);
@@ -819,34 +895,21 @@ impl FilesParser {
                     data.borrow_mut().started_sub_tasks = true;
                 }
             }
-            if !task_by_file_name.borrow().started_sub_tasks && load_sub_tasks {
+            // ts#64632: a later arrival that lowers the depth starts the
+            // subtasks again at the new depth, so each file ends at its
+            // lowest depth over all paths, in every run order.
+            if load_sub_tasks && (lowered || !task_by_file_name.borrow().started_sub_tasks) {
                 task_by_file_name.borrow_mut().started_sub_tasks = true;
-                let sub_tasks = task_by_file_name.borrow().sub_tasks.clone();
                 let lowest_depth = data.borrow().lowest_depth;
-                self.start(loader, &sub_tasks, lowest_depth);
-            } else if relower
-                && !self.single_threaded
-                && task_by_file_name.borrow().started_sub_tasks
-            {
-                // PORT: parallel tsgo runs each queued task in its own
-                // goroutine, so the shallowest path to a file usually arrives
-                // first and its subtasks start at that depth. This queue pops
-                // LIFO (Go singleThreadedWorkGroup order) and can reach a file
-                // first through a deeper path. Go then lowers `lowestDepth`
-                // but does not restart subtasks that already started, so the
-                // children keep a depth > 0 (node_modules files: no TS6059, no
-                // emit). Start them again at the new depth to give the result
-                // of parallel tsgo. This is also the Strada rule. Tested in
-                // pinned Go: all project configs match parallel tsgo.
-                // `--singleThreaded` keeps the exact Go order.
-                let sub_tasks = task_by_file_name.borrow().sub_tasks.clone();
-                let lowest_depth = data.borrow().lowest_depth;
-                self.start(loader, &sub_tasks, lowest_depth);
+                // PERF (parload1 step 4): no copy of the list. `start`
+                // borrows only the subtasks, which are tasks of their own.
+                let parent = task_by_file_name.borrow();
+                self.start(loader, &parent.sub_tasks, lowest_depth);
             }
         }
     }
 
-    // Go: filesparser.go:330 (*filesParser).getProcessedFiles
+    // Go: filesparser.go:337 (*filesParser).getProcessedFiles
     pub fn get_processed_files(&self, loader: &FileLoader) -> ProcessedFiles {
         let total_file_count = loader.total_file_count.get() as usize;
         let lib_file_count = loader.lib_file_count.get() as usize;
@@ -883,18 +946,14 @@ impl FilesParser {
             } else {
                 None
             };
-        let mut resolved_modules: FxHashMap<Path, ModeAwareCache<Arc<ResolvedModule>>> =
-            FxHashMap::default();
         let mut type_resolutions_in_file: FxHashMap<
             Path,
             ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>,
         > = FxHashMap::default();
-        let mut source_file_meta_datas: FxHashMap<Path, SourceFileMetaData> = FxHashMap::default();
         let mut jsx_runtime_import_specifiers: Option<
             FxHashMap<Path, Rc<JsxRuntimeImportSpecifier>>,
         > = None;
         let mut import_helpers_import_specifiers: Option<FxHashMap<Path, Node>> = None;
-        let mut source_files_found_searching_node_modules: FxHashSet<Path> = FxHashSet::default();
         let mut lib_files_map: FxHashMap<Path, Rc<LibFile>> =
             FxHashMap::with_capacity_and_hasher(lib_file_count, Default::default());
 
@@ -932,14 +991,12 @@ impl FilesParser {
             tasks_seen_by_name_ignore_case: &'a mut Option<FxHashMap<String, ParseTaskRef>>,
             include_processor: &'a mut IncludeProcessor,
             output_file_to_project_reference_source: &'a mut Option<FxHashMap<Path, String>>,
-            resolved_modules: &'a mut FxHashMap<Path, ModeAwareCache<Arc<ResolvedModule>>>,
+            file_maps: &'a mut FileMapSink,
             type_resolutions_in_file:
                 &'a mut FxHashMap<Path, ModeAwareCache<Rc<ResolvedTypeReferenceDirective>>>,
-            source_file_meta_datas: &'a mut FxHashMap<Path, SourceFileMetaData>,
             jsx_runtime_import_specifiers:
                 &'a mut Option<FxHashMap<Path, Rc<JsxRuntimeImportSpecifier>>>,
             import_helpers_import_specifiers: &'a mut Option<FxHashMap<Path, Node>>,
-            source_files_found_searching_node_modules: &'a mut FxHashSet<Path>,
             lib_files_map: &'a mut FxHashMap<Path, Rc<LibFile>>,
             redirect_targets_map: &'a mut Option<FxHashMap<Path, Vec<String>>>,
             redirect_files_by_path: &'a mut Option<FxHashMap<Path, RedirectsFile>>,
@@ -959,7 +1016,7 @@ impl FilesParser {
         }
 
         impl Collector<'_> {
-            // Go: filesparser.go:379 collectFiles
+            // Go: filesparser.go:386 collectFiles
             fn collect_files(&mut self, tasks: &[ParseTaskRef]) {
                 let loader = self.loader;
                 for task in tasks {
@@ -986,24 +1043,45 @@ impl FilesParser {
                             include_reason.clone(),
                         );
                     }
-                    let data = self
-                        .parser
-                        .task_data_by_path
-                        .get(&task.borrow().path)
-                        .cloned();
                     if !task.borrow().loaded {
                         continue;
                     }
-                    let data = data.expect("loaded parse task without task data");
+                    // PERF (parload1 step 4): the task's link to its data
+                    // (`ParseTask::data`), else the lookup by path.
+                    let data = {
+                        let t = task.borrow();
+                        let data = t.data.upgrade().unwrap_or_else(|| {
+                            self.parser
+                                .task_data_by_path
+                                .get(&t.path)
+                                .cloned()
+                                .expect("loaded parse task without task data")
+                        });
+                        debug_assert!(
+                            self.parser
+                                .task_data_by_path
+                                .get(&t.path)
+                                .is_some_and(|by_path| Rc::ptr_eq(by_path, &data))
+                        );
+                        data
+                    };
                     let data_key = Rc::as_ptr(&data);
 
-                    let normalized_file_path = task.borrow().normalized_file_path.clone();
-                    let task_path = task.borrow().path.clone();
-
                     // ensure we only walk each task once
-                    if let Some(checked_name) = self.seen.get(&data_key).cloned() {
-                        if let Some(file) = task.borrow().file.clone() {
-                            if checked_name != normalized_file_path
+                    // PERF (parload1 step 4): a visit of a walked task with
+                    // the same name (most visits) copies no name.
+                    if let Some(checked_name) = self.seen.get(&data_key) {
+                        if *checked_name != task.borrow().normalized_file_path {
+                            let checked_name = checked_name.clone();
+                            let (normalized_file_path, task_path, file) = {
+                                let t = task.borrow();
+                                (
+                                    t.normalized_file_path.clone(),
+                                    t.path.clone(),
+                                    t.file.clone(),
+                                )
+                            };
+                            if let Some(file) = file
                                 && self
                                     .recorded_duplicates
                                     .entry(data_key)
@@ -1023,42 +1101,43 @@ impl FilesParser {
                                         .is_content_mapper_failure_stub(),
                                 });
                             }
-                        }
-                        // PORT: equal names give equal absolute paths, so
-                        // the check below only runs for different names.
-                        if checked_name != normalized_file_path
-                            && !loader
+                            // PORT: equal names give equal absolute paths, so
+                            // the check below only runs for different names.
+                            if !loader
                                 .opts
                                 .config
                                 .compiler_options()
                                 .force_consistent_casing_in_file_names
                                 .is_false()
-                        {
-                            // Check if it differs only in drive letters its ok to ignore that error:
-                            let checked_absolute_path = get_normalized_absolute_path_without_root(
-                                &checked_name,
-                                &loader.compare_paths_options.current_directory,
-                            );
-                            let input_absolute_path = get_normalized_absolute_path_without_root(
-                                &normalized_file_path,
-                                &loader.compare_paths_options.current_directory,
-                            );
-                            if checked_absolute_path != input_absolute_path {
-                                self.include_processor
-                                    .add_processing_diagnostics_for_file_casing(
-                                        &task_path,
+                            {
+                                // Check if it differs only in drive letters its ok to ignore that error:
+                                let checked_absolute_path =
+                                    get_normalized_absolute_path_without_root(
                                         &checked_name,
-                                        &normalized_file_path,
-                                        include_reason
-                                            .clone()
-                                            .expect("nil pointer dereference: includeReason"),
+                                        &loader.compare_paths_options.current_directory,
                                     );
+                                let input_absolute_path = get_normalized_absolute_path_without_root(
+                                    &normalized_file_path,
+                                    &loader.compare_paths_options.current_directory,
+                                );
+                                if checked_absolute_path != input_absolute_path {
+                                    self.include_processor
+                                        .add_processing_diagnostics_for_file_casing(
+                                            &task_path,
+                                            &checked_name,
+                                            &normalized_file_path,
+                                            include_reason
+                                                .clone()
+                                                .expect("nil pointer dereference: includeReason"),
+                                        );
+                                }
                             }
                         }
                         continue;
-                    } else {
-                        self.seen.insert(data_key, normalized_file_path.clone());
                     }
+                    let normalized_file_path = task.borrow().normalized_file_path.clone();
+                    let task_path = task.borrow().path.clone();
+                    self.seen.insert(data_key, normalized_file_path.clone());
 
                     if let Some(tasks_seen_by_name_ignore_case) =
                         self.tasks_seen_by_name_ignore_case.as_mut()
@@ -1085,10 +1164,10 @@ impl FilesParser {
                     {
                         let t = task.borrow();
                         for trace in &t.type_resolutions_trace {
-                            loader.opts.host.trace(trace.message, trace.args.clone());
+                            loader.host.trace(trace.message, trace.args.clone());
                         }
                         for trace in &t.resolutions_trace {
-                            loader.opts.host.trace(trace.message, trace.args.clone());
+                            loader.host.trace(trace.message, trace.args.clone());
                         }
                     }
 
@@ -1145,8 +1224,7 @@ impl FilesParser {
                                 self.files_by_path
                                     .insert(task_path.clone(), package_id_file);
                                 if data_lowest_depth > 0 {
-                                    self.source_files_found_searching_node_modules
-                                        .insert(task_path.clone());
+                                    self.file_maps.add(FileMapEntry::Found(task_path.clone()));
                                 }
                                 continue;
                             } else if let Some(file) = &file {
@@ -1218,14 +1296,12 @@ impl FilesParser {
                         self.files.push(file.clone());
                     }
                     self.files_by_path.insert(path.clone(), file);
-                    self.resolved_modules
-                        .insert(path.clone(), std::mem::take(&mut t.resolutions_in_file));
+                    let resolutions = std::mem::take(&mut t.resolutions_in_file);
                     self.type_resolutions_in_file.insert(
                         path.clone(),
                         std::mem::take(&mut t.type_resolutions_in_file),
                     );
-                    self.source_file_meta_datas
-                        .insert(path.clone(), std::mem::take(&mut t.metadata));
+                    let meta = std::mem::take(&mut t.metadata);
 
                     if let Some(jsx_runtime_import_specifier) = &t.jsx_runtime_import_specifier {
                         self.jsx_runtime_import_specifiers
@@ -1237,40 +1313,47 @@ impl FilesParser {
                             .get_or_insert_with(FxHashMap::default)
                             .insert(path.clone(), t.import_helpers_import_specifier);
                     }
-                    if data_lowest_depth > 0 {
-                        self.source_files_found_searching_node_modules.insert(path);
-                    }
+                    self.file_maps.add(FileMapEntry::File {
+                        path,
+                        resolutions,
+                        meta,
+                        found_searching_node_modules: data_lowest_depth > 0,
+                    });
                 }
             }
         }
 
-        let mut collector = Collector {
-            parser: self,
-            loader,
-            seen: &mut seen,
-            missing_files: &mut missing_files,
-            duplicate_source_files: &mut duplicate_source_files,
-            files: &mut files,
-            lib_files: &mut lib_files,
-            files_by_path: &mut files_by_path,
-            tasks_seen_by_name_ignore_case: &mut tasks_seen_by_name_ignore_case,
-            include_processor: &mut include_processor,
-            output_file_to_project_reference_source: &mut output_file_to_project_reference_source,
-            resolved_modules: &mut resolved_modules,
-            type_resolutions_in_file: &mut type_resolutions_in_file,
-            source_file_meta_datas: &mut source_file_meta_datas,
-            jsx_runtime_import_specifiers: &mut jsx_runtime_import_specifiers,
-            import_helpers_import_specifiers: &mut import_helpers_import_specifiers,
-            source_files_found_searching_node_modules:
-                &mut source_files_found_searching_node_modules,
-            lib_files_map: &mut lib_files_map,
-            redirect_targets_map: &mut redirect_targets_map,
-            redirect_files_by_path: &mut redirect_files_by_path,
-            package_id_to_source_file: &mut package_id_to_source_file,
-            recorded_duplicates: FxHashMap::default(),
-            total_file_count,
-        };
-        collector.collect_files(&loader.root_tasks);
+        let FileMaps {
+            mut resolved_modules,
+            source_file_meta_datas,
+            source_files_found_searching_node_modules,
+        } = FileMaps::collect(self.single_threaded, |file_maps| {
+            let mut collector = Collector {
+                parser: self,
+                loader,
+                seen: &mut seen,
+                missing_files: &mut missing_files,
+                duplicate_source_files: &mut duplicate_source_files,
+                files: &mut files,
+                lib_files: &mut lib_files,
+                files_by_path: &mut files_by_path,
+                tasks_seen_by_name_ignore_case: &mut tasks_seen_by_name_ignore_case,
+                include_processor: &mut include_processor,
+                output_file_to_project_reference_source:
+                    &mut output_file_to_project_reference_source,
+                file_maps,
+                type_resolutions_in_file: &mut type_resolutions_in_file,
+                jsx_runtime_import_specifiers: &mut jsx_runtime_import_specifiers,
+                import_helpers_import_specifiers: &mut import_helpers_import_specifiers,
+                lib_files_map: &mut lib_files_map,
+                redirect_targets_map: &mut redirect_targets_map,
+                redirect_files_by_path: &mut redirect_files_by_path,
+                package_id_to_source_file: &mut package_id_to_source_file,
+                recorded_duplicates: FxHashMap::default(),
+                total_file_count,
+            };
+            collector.collect_files(&loader.root_tasks);
+        });
         loader.sort_libs(&mut lib_files);
 
         let lib_files_len = lib_files.len() as i32;
@@ -1307,12 +1390,13 @@ impl FilesParser {
             );
             resolved_modules.insert(key, cache);
             for trace in &value.trace {
-                loader.opts.host.trace(trace.message, trace.args.clone());
+                loader.host.trace(trace.message, trace.args.clone());
             }
         }
 
         ProcessedFiles {
             finished_processing: true,
+            load_stats: LoadStatCache(Cell::new(self.load_stats.take())),
             resolver: loader.resolver.clone(),
             files: all_files,
             duplicate_source_files,
@@ -1335,11 +1419,10 @@ impl FilesParser {
             redirect_files_by_path: redirect_files_by_path.map(Rc::new),
             // tsgo#4712
             content_mapper_diagnostics: loader.content_mapper_diagnostics.borrow().clone(),
-            module_resolution_error: loader.module_resolution_error.borrow().clone(),
         }
     }
 
-    // Go: filesparser.go:589 (*filesParser).addIncludeReason
+    // Go: filesparser.go:594 (*filesParser).addIncludeReason
     // PORT: Go can append a nil reason. Only the automatic type directive
     // root task has no reason, and `collectFiles` never passes it here, so a
     // nil reason is skipped.
@@ -1365,6 +1448,185 @@ impl FilesParser {
                 reasons.insert(t.path.clone(), vec![reason]);
             }
         }
+    }
+}
+
+/// What `collect_files` adds for one file to the maps of `FileMaps`.
+enum FileMapEntry {
+    /// A program file at `path`: its module resolutions and metadata, and
+    /// whether the load found it searching node_modules.
+    File {
+        path: Path,
+        resolutions: ModeAwareCache<Arc<ResolvedModule>>,
+        meta: SourceFileMetaData,
+        found_searching_node_modules: bool,
+    },
+    /// A package dedup redirect path that the load found searching
+    /// node_modules.
+    Found(Path),
+}
+
+/// The maps of `get_processed_files` that `collect_files` only adds to and
+/// that another thread can own: Go `resolvedModules`, `sourceFileMetaDatas`
+/// and `sourceFilesFoundSearchingNodeModules`.
+#[derive(Default)]
+struct FileMaps {
+    resolved_modules: FxHashMap<Path, ModeAwareCache<Arc<ResolvedModule>>>,
+    source_file_meta_datas: FxHashMap<Path, SourceFileMetaData>,
+    source_files_found_searching_node_modules: FxHashSet<Path>,
+}
+
+impl FileMaps {
+    /// Adds `entry` as Go `collectFiles` adds it (filesparser.go:455-548).
+    fn add(&mut self, entry: FileMapEntry) {
+        match entry {
+            FileMapEntry::File {
+                path,
+                resolutions,
+                meta,
+                found_searching_node_modules,
+            } => {
+                self.resolved_modules.insert(path.clone(), resolutions);
+                self.source_file_meta_datas.insert(path.clone(), meta);
+                if found_searching_node_modules {
+                    self.source_files_found_searching_node_modules.insert(path);
+                }
+            }
+            FileMapEntry::Found(path) => {
+                self.source_files_found_searching_node_modules.insert(path);
+            }
+        }
+    }
+
+    /// The maps that `walk` adds to through its sink. Each map gets its
+    /// entries in the order of the walk, so it is the map that the walk
+    /// would make itself. Unless `single_threaded`, another thread adds
+    /// them while the walk goes on; when that thread cannot start, the
+    /// walk's thread adds them.
+    // PERF (serialgap1): Go's walk is serial (filesparser.go:337), and so is
+    // this one; the map work of each file moves off it. VS Code: about 11k
+    // files, two path copies and up to three inserts each.
+    fn collect(single_threaded: bool, walk: impl FnOnce(&mut FileMapSink)) -> FileMaps {
+        let mut sink = FileMapSink {
+            maps: FileMaps::default(),
+            batch: Vec::new(),
+            send: None,
+        };
+        if single_threaded || cfg!(target_family = "wasm") {
+            walk(&mut sink);
+            return sink.maps;
+        }
+        let (send, receive) = std::sync::mpsc::channel::<Vec<FileMapEntry>>();
+        std::thread::scope(|scope| {
+            let Some(maps) = crate::program::helper_thread(scope, "goport-collect", move || {
+                let mut maps = FileMaps::default();
+                for batch in receive {
+                    batch.into_iter().for_each(|entry| maps.add(entry));
+                }
+                maps
+            }) else {
+                walk(&mut sink);
+                return sink.maps;
+            };
+            sink.batch = Vec::with_capacity(FileMapSink::BATCH);
+            sink.send = Some(send);
+            walk(&mut sink);
+            // Sends the last batch. Dropping the sender ends the thread's
+            // loop (also when the walk panics).
+            sink.flush();
+            drop(sink);
+            maps.join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    }
+}
+
+/// Where `collect_files` puts the entries of `FileMaps`: `maps` on this
+/// thread, or batches sent to the thread of `FileMaps::collect`.
+struct FileMapSink {
+    maps: FileMaps,
+    batch: Vec<FileMapEntry>,
+    send: Option<std::sync::mpsc::Sender<Vec<FileMapEntry>>>,
+}
+
+impl FileMapSink {
+    /// Entries per batch: VS Code sends about 40.
+    const BATCH: usize = 256;
+
+    fn add(&mut self, entry: FileMapEntry) {
+        if self.send.is_none() {
+            self.maps.add(entry);
+            return;
+        }
+        self.batch.push(entry);
+        if self.batch.len() == Self::BATCH {
+            self.flush();
+        }
+    }
+
+    /// Sends the entries that are not sent yet.
+    fn flush(&mut self) {
+        if let Some(send) = &self.send
+            && !self.batch.is_empty()
+        {
+            let full = std::mem::replace(&mut self.batch, Vec::with_capacity(Self::BATCH));
+            // The thread receives until the sender drops.
+            let _ = send.send(full);
+        }
+    }
+}
+
+#[cfg(test)]
+mod file_maps_tests {
+    use super::*;
+
+    // followups58 (R208 reviewer): when the collect thread cannot start, the
+    // walk's thread adds the entries itself, and the maps are the ones of a
+    // serial walk. Paths come again with other metadata, so the order of the
+    // inserts shows.
+    #[test]
+    fn collect_without_its_thread_makes_the_same_maps() {
+        let walk = |threaded: bool| {
+            move |sink: &mut FileMapSink| {
+                assert_eq!(sink.send.is_some(), threaded);
+                for i in 0..3 * FileMapSink::BATCH {
+                    let path = Path(format!("/p/f{}.ts", i % 300));
+                    sink.add(if i % 7 == 0 {
+                        FileMapEntry::Found(path)
+                    } else {
+                        FileMapEntry::File {
+                            path,
+                            resolutions: ModeAwareCache::default(),
+                            meta: SourceFileMetaData {
+                                package_json_type: i.to_string(),
+                                ..SourceFileMetaData::default()
+                            },
+                            found_searching_node_modules: i % 3 == 0,
+                        }
+                    });
+                }
+            }
+        };
+        let sorted = |maps: FileMaps| {
+            let mut resolved: Vec<Path> = maps.resolved_modules.into_keys().collect();
+            let mut metas: Vec<(Path, SourceFileMetaData)> =
+                maps.source_file_meta_datas.into_iter().collect();
+            let mut found: Vec<Path> = maps
+                .source_files_found_searching_node_modules
+                .into_iter()
+                .collect();
+            resolved.sort_by(|a, b| a.0.cmp(&b.0));
+            metas.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+            found.sort_by(|a, b| a.0.cmp(&b.0));
+            (resolved, metas, found)
+        };
+        let serial = sorted(FileMaps::collect(true, walk(false)));
+        let threaded = sorted(FileMaps::collect(false, walk(true)));
+        let fallback = sorted(crate::program::refuse_helper_threads(|| {
+            FileMaps::collect(false, walk(false))
+        }));
+        assert_eq!(threaded, serial);
+        assert_eq!(fallback, serial);
     }
 }
 
@@ -1486,6 +1748,11 @@ struct PrefetchJob {
     freeable: bool,
     state: Mutex<PrefetchState>,
     done: Condvar,
+    /// Set with `state` locked when a loader waits on `done`
+    /// (`PrefetchJob::wait_done`), so the worker that leaves the job wakes
+    /// it (`PrefetchJob::settle`). A job that no loader waits for wakes
+    /// none: a wake is a syscall even with no waiter.
+    waited: AtomicBool,
     /// What the worker that parsed the file resolved for the loader after
     /// the parse (`FilePrep`), once it is there.
     prep: Mutex<Option<Box<FilePrep>>>,
@@ -1493,6 +1760,55 @@ struct PrefetchJob {
     /// mapper's virtual text (`prefetch_mapped`).
     // PORT: not in Go, where the parse goroutines transform (tsgo#4712).
     mapped: Option<Arc<ConcurrentTransform>>,
+    /// When the job was queued, for the debug counts of a claim
+    /// (`GOPORT_PREFETCH_STATS`). `None` without them.
+    queued_at: Option<std::time::Instant>,
+    /// True when a loader batch put the job below the others
+    /// (`queue_batch`), for the debug counts.
+    under: AtomicBool,
+    /// Tests: set when the worker that parsed the file has stored its prep
+    /// or made none (`set_prep_wait`).
+    #[cfg(test)]
+    prep_settled: AtomicBool,
+}
+
+impl PrefetchJob {
+    /// Waits on `done` with `state` locked, after it marks that a loader
+    /// waits (`waited`).
+    fn wait_done<'j>(
+        &'j self,
+        state: std::sync::MutexGuard<'j, PrefetchState>,
+    ) -> std::sync::MutexGuard<'j, PrefetchState> {
+        self.waited.store(true, AtomicOrdering::Relaxed);
+        self.done
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Sets the state of a job that its worker leaves, and wakes the
+    /// loaders that wait for it (`wait_done`), if any.
+    fn settle(&self, result: Option<PrefetchResult>) {
+        let mut state = lock(&self.state);
+        *state = PrefetchState::Done(result);
+        // `waited` is set with `state` locked, so it is read here with the
+        // same lock.
+        let waited = self.waited.load(AtomicOrdering::Relaxed);
+        drop(state);
+        if waited {
+            self.done.notify_all();
+        }
+    }
+}
+
+/// Sets `PrefetchJob::prep_settled` when the worker leaves the job.
+#[cfg(test)]
+struct PrepSettled<'j>(&'j PrefetchJob);
+
+#[cfg(test)]
+impl Drop for PrepSettled<'_> {
+    fn drop(&mut self) {
+        self.0.prep_settled.store(true, AtomicOrdering::Release);
+    }
 }
 
 enum PrefetchState {
@@ -1556,13 +1872,18 @@ pub(crate) struct FilePrep {
     synthetic: SyntheticImports,
     /// The number of `file.imports`.
     imports: usize,
-    /// The mode of every answer: Go `getModeForUsageLocation` of a plain
-    /// `import .. from` in the file (`guess_import_mode`). The worker
-    /// cannot read the import nodes (`DetachedParse::import_specifiers`).
-    mode: ResolutionMode,
+    /// The mode of each answer: Go `getModeForUsageLocation` of its name,
+    /// from the usage that the worker read (`names`); without `names`, the
+    /// mode of a plain `import .. from` in the file (`guess_import_mode`).
+    modes: Vec<ResolutionMode>,
     /// The synthetic imports, then the imports, by module name index.
-    /// `None` for an empty name.
+    /// `None` for an empty name or a source phase import.
     answers: Vec<Option<SharedResolution<Arc<ResolvedModule>>>>,
+    /// The names, usages and flags of the file's imports and module
+    /// augmentations, read while the nodes were on the worker thread
+    /// (parload1). The loader reads them in place of the nodes. `None`
+    /// with `GOPORT_LOAD_NAMES=0` (an A/B switch).
+    pub(crate) names: Option<Box<ImportNames>>,
 }
 
 impl FilePrep {
@@ -1592,7 +1913,7 @@ impl FilePrep {
         index: usize,
         mode: ResolutionMode,
     ) -> Option<&SharedResolution<Arc<ResolvedModule>>> {
-        if mode != self.mode {
+        if self.modes.get(index) != Some(&mode) {
             return None;
         }
         self.answers.get(index)?.as_ref()
@@ -1619,6 +1940,17 @@ impl TakenParse {
     /// has stored in the shared cache by then, so it is not later than the
     /// worker.
     pub(crate) fn take_prep(self) -> Option<Box<FilePrep>> {
+        // A test can make the loader wait (up to 60 s) until the worker has
+        // stored the prep or made none (`set_prep_wait`).
+        #[cfg(test)]
+        if PREP_WAIT.with(Cell::get) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
+            while !self.0.prep_settled.load(AtomicOrdering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         let prep = lock(&self.0.prep).take();
         if prep.is_none() {
             count_prep(|c| c.preps_missing += 1);
@@ -1648,20 +1980,14 @@ fn take_prefetched_meta(loader: &FileLoader, file_name: &str) -> Option<SourceFi
         match &*state {
             PrefetchState::Running => {
                 waited.get_or_insert_with(std::time::Instant::now);
-                state = job
-                    .done
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = job.wait_done(state);
             }
             // A test can make the loader wait for a job that no worker has
             // started yet (`set_meta_wait`), so the worker finds the
             // metadata whatever the timing.
             #[cfg(test)]
             PrefetchState::Queued if META_WAIT.with(Cell::get) => {
-                state = job
-                    .done
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = job.wait_done(state);
             }
             PrefetchState::Done(Some(result)) => break result.meta.clone(),
             _ => break None,
@@ -1688,6 +2014,11 @@ thread_local! {
     static LOAD_PREP: Cell<Option<bool>> = const { Cell::new(None) };
     /// The preps that loads on this thread took (`FilePrep`), for tests.
     static PREPS_TAKEN: Cell<usize> = const { Cell::new(0) };
+    /// A test's choice of `load_names_enabled` for its loads on this thread.
+    static LOAD_NAMES: Cell<Option<bool>> = const { Cell::new(None) };
+    /// The names that loads on this thread resolved themselves, for tests.
+    #[cfg(test)]
+    static NAMES_OWN: Cell<usize> = const { Cell::new(0) };
 }
 
 /// True when the parse workers of a load on this thread make preps for
@@ -1697,6 +2028,35 @@ fn load_prep_enabled() -> bool {
     LOAD_PREP
         .with(Cell::get)
         .unwrap_or_else(|| std::env::var_os("GOPORT_LOAD_PREP").is_none_or(|value| value != "0"))
+}
+
+/// True when the parse workers read the import names of their parses for
+/// the loader (`FilePrep::names`): unless `GOPORT_LOAD_NAMES` is `0` (an
+/// A/B switch), or a test chose (`set_load_names`).
+fn load_names_enabled() -> bool {
+    LOAD_NAMES
+        .with(Cell::get)
+        .unwrap_or_else(|| std::env::var_os("GOPORT_LOAD_NAMES").is_none_or(|value| value != "0"))
+}
+
+/// Sets `load_names_enabled` for the loads on this thread (tests).
+#[cfg(test)]
+pub(crate) fn set_load_names(on: Option<bool>) {
+    LOAD_NAMES.with(|names| names.set(on));
+}
+
+/// The module names that loads on this thread resolved themselves so far
+/// (tests): no prep answer had the name's mode, or no prep fit.
+#[cfg(test)]
+pub(crate) fn names_own() -> usize {
+    NAMES_OWN.with(Cell::get)
+}
+
+/// Notes module names that the loader resolved itself.
+pub(crate) fn note_names_own(count: usize) {
+    #[cfg(test)]
+    NAMES_OWN.with(|own| own.set(own.get() + count));
+    let _ = count;
 }
 
 /// Sets `load_prep_enabled` for the loads on this thread (tests).
@@ -1710,6 +2070,18 @@ thread_local! {
     /// A test's choice to make the loads on this thread wait in
     /// `take_prefetched_meta` for a job that is still queued.
     static META_WAIT: Cell<bool> = const { Cell::new(false) };
+    /// A test's choice to make the loads on this thread wait in
+    /// `TakenParse::take_prep` for the worker's prep.
+    static PREP_WAIT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the loads on this thread wait in `TakenParse::take_prep` until the
+/// worker that parsed the file has stored its prep or made none, so the
+/// loader takes each prep whatever the timing (tests). A worker stores the
+/// prep after the parse that the loader waits for.
+#[cfg(test)]
+pub(crate) fn set_prep_wait(on: bool) {
+    PREP_WAIT.with(|wait| wait.set(on));
 }
 
 /// Makes the loads on this thread wait for the parse worker of each file
@@ -1772,8 +2144,10 @@ enum PrefetchRequest {
 struct PrefetchQueue {
     /// Jobs no worker has taken yet. Workers take the newest first, like
     /// the loader's queue, but take `lib.dom.d.ts` before all others. A job
-    /// can be in the list twice (`rank_largest`, `queue_batch`); a worker
-    /// skips a job that is no longer queued.
+    /// that moves up is pushed again, so it can be in the list more than
+    /// once (`rank_largest`, `queue_batch`, and the move-up of a worker's
+    /// `PrefetchShared::queue`); a worker skips a job that is no longer
+    /// queued.
     pending: Vec<Arc<PrefetchJob>>,
     /// The content-mapped jobs no worker has taken yet, newest first too.
     /// The workers of `PrefetchPool::add_mapped_workers` take only these;
@@ -1786,6 +2160,9 @@ struct PrefetchQueue {
     /// The root file jobs for the next free worker to rank by file size,
     /// and how many of the largest to move up (`PrefetchShared::rank_roots`).
     rank: Option<(Vec<Arc<PrefetchJob>>, usize)>,
+    /// The root file names of an early pool for the next free worker to
+    /// queue below the other jobs (`PrefetchShared::queue_roots`).
+    roots: Option<Vec<String>>,
     /// Every job by file name. A file name is queued once.
     by_name: FxHashMap<String, Arc<PrefetchJob>>,
     /// The files that the loader's host gives from its cache, with their
@@ -1806,10 +2183,18 @@ struct PrefetchQueue {
     redirects: FxHashMap<String, (String, Path)>,
     next_job: usize,
     closed: bool,
+    /// The workers that wait on `PrefetchShared::ready` and no wake has
+    /// reached yet (`PrefetchShared::wake`).
+    sleepers: usize,
     /// True once the workers of `PrefetchPool::add_mapped_workers` start.
     /// They wait on `ready` too (`PrefetchShared::wake`).
     // PORT: not in Go (see `PrefetchJob::mapped`).
     mapped_workers: bool,
+    /// True when the debug counts are kept (`GOPORT_PREFETCH_STATS`): jobs
+    /// note when they are queued.
+    timed: bool,
+    /// `move_up_enabled` of the thread that started the pool.
+    move_up: bool,
 }
 
 impl PrefetchQueue {
@@ -1843,8 +2228,13 @@ impl PrefetchQueue {
             freeable,
             state: Mutex::new(PrefetchState::Queued),
             done: Condvar::new(),
+            waited: AtomicBool::new(false),
             prep: Mutex::new(None),
             mapped,
+            queued_at: self.timed.then(std::time::Instant::now),
+            under: AtomicBool::new(false),
+            #[cfg(test)]
+            prep_settled: AtomicBool::new(false),
         });
         self.next_job += 1;
         self.by_name.insert(job.opts.file_name.clone(), job.clone());
@@ -1943,8 +2333,8 @@ impl PrefetchConfig {
             .lib_replacement
             .is_true();
         PrefetchConfig {
-            current_directory: loader.opts.host.get_current_directory(),
-            use_case_sensitive_file_names: loader.opts.host.fs().use_case_sensitive_file_names(),
+            current_directory: loader.host.get_current_directory(),
+            use_case_sensitive_file_names: loader.host.fs().use_case_sensitive_file_names(),
             default_library_path: if lib_replacement {
                 String::new()
             } else {
@@ -1984,17 +2374,30 @@ struct WorkerResolveConfig {
     /// its names for the loader (`FilePrep`): the loader takes worker
     /// answers, and `GOPORT_LOAD_PREP` is not `0`.
     prep: bool,
+    /// True when, with `prep`, the workers read the import names of each
+    /// parse for the loader and resolve each name with its own mode
+    /// (`FilePrep::names`): `GOPORT_LOAD_NAMES` is not `0`.
+    names: bool,
 }
 
 impl WorkerResolveConfig {
     /// The config of `loader`. `None` when workers do not resolve.
     fn of_loader(loader: &FileLoader) -> Option<Self> {
+        Self::of_loader_with(loader, loader.shared_resolution.clone())
+    }
+
+    /// `of_loader` with `shared` as the loader's shared resolution cache,
+    /// before the loader keeps it (`early_shared_resolution`).
+    fn of_loader_with(
+        loader: &FileLoader,
+        shared: Option<Arc<SharedResolutionCache>>,
+    ) -> Option<Self> {
         let options = loader.opts.config.compiler_options();
         // PORT: see `skip_module_resolution` and `create_module_resolver` in
         // `process_all_program_files`.
         if !super::file_loader::workers_resolve_imports(options)
             || loader.opts.skip_module_resolution
-            || loader.opts.create_module_resolver.is_some()
+            || loader.custom_module_resolver
         {
             return None;
         }
@@ -2002,7 +2405,7 @@ impl WorkerResolveConfig {
         // answer of a redirected file is another cache key.
         let mut references = Vec::new();
         let mut redirects = FxHashMap::default();
-        if loader.shared_resolution.is_some() {
+        if shared.is_some() {
             let mapper = loader.project_reference_file_mapper.borrow();
             let mut index_of: FxHashMap<*const ParsedCommandLine, usize> = FxHashMap::default();
             // Go `getRedirectForResolution` tries the sources first, so a
@@ -2028,11 +2431,56 @@ impl WorkerResolveConfig {
             typings_location: loader.opts.typings_location.clone(),
             project_name: loader.opts.project_name.clone(),
             extra_extensions: loader.content_mapper_extensions.clone(),
-            shared: loader.shared_resolution.clone(),
+            prep: shared.is_some() && load_prep_enabled(),
+            shared,
             references,
             redirects,
-            prep: loader.shared_resolution.is_some() && load_prep_enabled(),
+            names: load_names_enabled(),
         })
+    }
+
+    /// The config of the early pool of `config` (`start_default_lib_prefetch`):
+    /// `of_loader` of a tsc loader with no project references, no content
+    /// mappers and a new shared resolution cache. `None` when such a loader
+    /// shares no resolution cache (`process_all_program_files`).
+    fn of_config(config: &ParsedCommandLine) -> Option<Self> {
+        let options = config.compiler_options();
+        if !super::file_loader::workers_resolve_imports(options)
+            || options.trace_resolution == Tristate::True
+            || config.has_project_references()
+            || !config.content_mappers().is_empty()
+        {
+            return None;
+        }
+        Some(WorkerResolveConfig {
+            options: (**options).clone(),
+            typings_location: String::new(),
+            project_name: String::new(),
+            extra_extensions: Vec::new(),
+            shared: Some(Arc::default()),
+            references: Vec::new(),
+            redirects: FxHashMap::default(),
+            prep: load_prep_enabled(),
+            names: load_names_enabled(),
+        })
+    }
+
+    /// True when the workers resolve the same with both configs: equal
+    /// fields and the same shared resolution cache.
+    fn same(&self, other: &Self) -> bool {
+        let shared = match (&self.shared, &other.shared) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        shared
+            && self.options == other.options
+            && self.typings_location == other.typings_location
+            && self.project_name == other.project_name
+            && self.extra_extensions == other.extra_extensions
+            && self.references == other.references
+            && self.redirects == other.redirects
+            && self.prep == other.prep
+            && self.names == other.names
     }
 }
 
@@ -2045,8 +2493,11 @@ struct PrefetchShared {
     config: PrefetchConfig,
     /// The stat cache of the workers' file systems (`WorkerFs`).
     stats: Arc<SharedStatCache>,
-    /// Set when the loader takes the workers (`FilesParser::parse`). Until
-    /// then, and with `None` inside, the workers do not resolve.
+    /// Set when the loader takes the workers (`FilesParser::parse`), or
+    /// before the loader exists by an early pool with root jobs
+    /// (`start_default_lib_prefetch`), which the loader takes only with an
+    /// equal config (`early_shared_resolution`, `FilesParser::parse`).
+    /// Until it is set, and with `None` inside, the workers do not resolve.
     resolve: OnceLock<Option<WorkerResolveConfig>>,
     /// Debug counts of `take_prefetched`, kept when `GOPORT_PREFETCH_STATS`
     /// is set and printed to stderr when the pool stops.
@@ -2076,6 +2527,8 @@ pub(crate) struct PrefetchStats {
     /// Preps that the loader took, and that did not fit (`FilePrep::fits`).
     pub(crate) preps_taken: usize,
     pub(crate) preps_unfit: usize,
+    /// Taken preps with the worker's import names (`FilePrep::names`).
+    pub(crate) preps_named: usize,
     /// Worker parses with no prep when the loader needed it: the worker
     /// still resolved, or it made none.
     preps_missing: usize,
@@ -2083,7 +2536,24 @@ pub(crate) struct PrefetchStats {
     /// (another mode than the worker's).
     pub(crate) names_taken: usize,
     pub(crate) names_own: usize,
+    /// Per claimed job: how long it was queued, the jobs on the worker
+    /// stack then, and whether a loader batch put it below the others.
+    claims: Vec<(std::time::Duration, usize, bool)>,
+    /// When the pool started, the workers, and their time on jobs.
+    started: Option<std::time::Instant>,
+    workers: usize,
+    busy: std::time::Duration,
+    /// parload2: when the loader took the pool (`FilesParser::parse`), the
+    /// root jobs that an early pool queued (`queue_roots`), and the claims
+    /// in the first `EARLY_CLAIMS` of the loader: the time and the file.
+    loader_started: Option<std::time::Instant>,
+    early_roots: usize,
+    early_claims: Vec<(std::time::Duration, String)>,
 }
+
+/// The start of the load whose claims the debug counts list
+/// (`PrefetchStats::early_claims`).
+const EARLY_CLAIMS: std::time::Duration = std::time::Duration::from_millis(50);
 
 impl PrefetchStats {
     /// Prints the counts to stderr. The sizes are read here, so only a
@@ -2124,14 +2594,76 @@ impl PrefetchStats {
                 .join(", "),
         );
         eprintln!(
-            "goport prefetch: took {} worker metadata; preps: took {} ({} names, {} resolved here), unfit {}, missing {}",
+            "goport prefetch: took {} worker metadata; preps: took {} (named {}; {} names, {} resolved here), unfit {}, missing {}",
             self.meta_taken,
             self.preps_taken,
+            self.preps_named,
             self.names_taken,
             self.names_own,
             self.preps_unfit,
             self.preps_missing,
         );
+        // parload1: why jobs were still queued when the loader came.
+        let bucket = |age: std::time::Duration| match age.as_micros() {
+            0..100 => 0,
+            100..1000 => 1,
+            1000..10000 => 2,
+            _ => 3,
+        };
+        let mut ages = [[0usize; 4]; 2];
+        let mut pending = [0usize; 2];
+        for &(age, stack, under) in &self.claims {
+            let side = usize::from(!under);
+            ages[side][bucket(age)] += 1;
+            pending[side] += stack;
+        }
+        for (side, label) in [(0, "under"), (1, "other")] {
+            let count: usize = ages[side].iter().sum();
+            eprintln!(
+                "goport prefetch: claims {label} {count}: age <0.1ms {} <1ms {} <10ms {} >=10ms {}; worker stack mean {:.0}",
+                ages[side][0],
+                ages[side][1],
+                ages[side][2],
+                ages[side][3],
+                pending[side] as f64 / count.max(1) as f64,
+            );
+        }
+        if let (Some(started), Some(loader)) = (self.started, self.loader_started) {
+            let mut early: Vec<(u64, std::time::Duration, &String)> = self
+                .early_claims
+                .iter()
+                .map(|(at, name)| (size(name), *at, name))
+                .collect();
+            stable_sort_by(&mut early, |a, b| b.0.cmp(&a.0));
+            eprintln!(
+                "goport prefetch: pool started {:.1} ms before the loader with {} root jobs; {} claims in the first {} ms ({} KB): {}",
+                loader.duration_since(started).as_secs_f64() * 1e3,
+                self.early_roots,
+                early.len(),
+                EARLY_CLAIMS.as_millis(),
+                early.iter().map(|(size, ..)| size).sum::<u64>() / 1024,
+                early
+                    .iter()
+                    .take(5)
+                    .map(|(size, at, name)| format!(
+                        "{name} {} KB at {:.1} ms",
+                        size / 1024,
+                        at.as_secs_f64() * 1e3
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        if let Some(started) = self.started {
+            let wall = started.elapsed();
+            eprintln!(
+                "goport prefetch: {} workers busy {:.1} ms of {:.1} ms ({:.0}%)",
+                self.workers,
+                self.busy.as_secs_f64() * 1e3,
+                wall.as_secs_f64() * 1e3,
+                100.0 * self.busy.as_secs_f64() / (wall.as_secs_f64() * self.workers.max(1) as f64),
+            );
+        }
     }
 }
 
@@ -2186,6 +2718,10 @@ thread_local! {
     /// them.
     static EARLY_POOL: RefCell<Option<PrefetchPool>> = const { RefCell::new(None) };
 
+    /// The `LoaderStatFs` made on this thread so far: the next one gets this
+    /// number (`PrefetchPool::host`).
+    static LOADER_HOSTS: Cell<u64> = const { Cell::new(0) };
+
     /// The job of the worker parse that `take_prefetched` gave last, and
     /// the root node of the adopted parse (`TakenParse::of`).
     static TAKEN: RefCell<Option<(Arc<PrefetchJob>, Node)>> = const { RefCell::new(None) };
@@ -2194,20 +2730,30 @@ thread_local! {
 impl PrefetchShared {
     fn new(config: PrefetchConfig) -> Self {
         Self {
-            queue: Mutex::new(PrefetchQueue::default()),
+            queue: Mutex::new(PrefetchQueue {
+                timed: std::env::var_os("GOPORT_PREFETCH_STATS").is_some(),
+                move_up: move_up_enabled(),
+                ..PrefetchQueue::default()
+            }),
             ready: Condvar::new(),
             closed: AtomicBool::new(false),
             config,
             stats: Arc::new(SharedStatCache::default()),
             resolve: OnceLock::new(),
-            counts: std::env::var_os("GOPORT_PREFETCH_STATS")
-                .map(|_| Mutex::new(PrefetchStats::default())),
+            counts: std::env::var_os("GOPORT_PREFETCH_STATS").map(|_| {
+                Mutex::new(PrefetchStats {
+                    started: Some(std::time::Instant::now()),
+                    ..PrefetchStats::default()
+                })
+            }),
         }
     }
 
     /// Closes the queue: the workers stop after their current job.
     fn close(&self) {
-        lock(&self.queue).closed = true;
+        let mut queue = lock(&self.queue);
+        queue.closed = true;
+        queue.sleepers = 0;
         self.closed.store(true, AtomicOrdering::Relaxed);
         self.ready.notify_all();
     }
@@ -2263,7 +2809,7 @@ impl PrefetchShared {
             return;
         }
         queue.rank = Some((jobs, count));
-        self.wake(&queue, 1);
+        self.wake(&mut queue, 1);
     }
 
     /// Pushes the `count` largest of `jobs` that are still queued on top of
@@ -2274,34 +2820,65 @@ impl PrefetchShared {
         let mut sized: Vec<(i64, Arc<PrefetchJob>)> = jobs
             .into_iter()
             .filter(|job| queued(job))
-            .filter_map(|job| fs.stat(&job.opts.file_name).map(|info| (info.size(), job)))
+            .filter_map(|job| {
+                let (_, size) = self.stats.node(fs, &job.opts.file_name)?;
+                Some((size, job))
+            })
             .collect();
         // Stable: files of one size keep the root order.
         sized.sort_by_key(|(size, _)| *size);
         let largest = sized.split_off(sized.len().saturating_sub(count));
         let mut queue = lock(&self.queue);
+        let mut pushed = 0;
         for (_, job) in largest {
             if queued(&job) {
                 queue.push_pending(job);
+                pushed += 1;
             }
         }
-        drop(queue);
-        self.ready.notify_all();
+        self.wake(&mut queue, pushed);
     }
 
-    /// Queues a parse of `opts.file_name`, unless one is queued already.
+    /// `queue_locked` with its own lock of the queue, and the wake of a
+    /// worker for a new job.
+    #[cfg(test)]
     fn queue(&self, opts: SourceFileParseOptions, script_kind: ScriptKind) {
         let mut queue = lock(&self.queue);
-        if queue.by_name.contains_key(&opts.file_name) {
-            return;
+        let new = Self::queue_locked(&mut queue, opts, script_kind);
+        self.wake(&mut queue, usize::from(new));
+    }
+
+    /// Queues a parse of `opts.file_name`, unless one is queued already,
+    /// with the queue lock held. A job that no worker has taken moves up.
+    /// True when it made a new job: the caller wakes a worker for it.
+    // PERF (parload2): a worker queues the files that a parse references.
+    // The loader loads them right after that file (depth first), so a job
+    // that a root file or an earlier parse queued, deep in the list, moves
+    // up, as the loader's own batches move up the jobs it reaches
+    // (`queue_batch`). Else the loader reaches it first and parses it
+    // itself. `GOPORT_PREFETCH_MOVE_UP=0` turns it off.
+    fn queue_locked(
+        queue: &mut PrefetchQueue,
+        opts: SourceFileParseOptions,
+        script_kind: ScriptKind,
+    ) -> bool {
+        if let Some(job) = queue.by_name.get(&opts.file_name) {
+            if queue.move_up
+                && !queue.is_first(job)
+                && matches!(*lock(&job.state), PrefetchState::Queued)
+            {
+                let job = job.clone();
+                queue.push_pending(job);
+            }
+            return false;
         }
         let Some(job) = queue.add(opts, script_kind, None) else {
-            return;
+            return false;
         };
         if !queue.is_first(&job) {
             queue.pending.push(job);
         }
-        self.wake(&queue, 1);
+        true
     }
 
     /// Queues the parses of one `FilesParser::start` batch: new jobs, and
@@ -2342,38 +2919,80 @@ impl PrefetchShared {
         }
         if let Some(newest) = jobs.pop() {
             woken += jobs.len();
+            if queue.timed {
+                newest.under.store(true, AtomicOrdering::Relaxed);
+            }
             queue.push_pending(newest);
             for job in jobs {
                 queue.push_pending(job);
             }
         }
-        self.wake(&queue, woken);
+        self.wake(&mut queue, woken);
     }
 
-    /// Wakes the workers for `jobs` new jobs, with the queue lock held. Go
-    /// runs each queued task on a goroutine of its own
-    /// (core/workgroup.go:34 parallelWorkGroup.Queue), so a job wakes one
-    /// worker. Once the workers of content-mapped jobs started, they wait on
-    /// `ready` too, and one wake could reach a worker that cannot take the
-    /// job, so all wake. The lock keeps such a worker from starting to wait
-    /// between the check and the wake.
+    /// Wakes the workers for `jobs` new jobs, with the queue lock held: a
+    /// job wakes one sleeping worker, and no wake is made when no worker
+    /// sleeps (`PrefetchQueue::sleepers`), as a wake is a syscall even with
+    /// no waiter. Go runs each queued task on a goroutine of its own
+    /// (core/workgroup.go:34 parallelWorkGroup.Queue), and its scheduler
+    /// wakes an idle thread for a new goroutine only when a thread is idle
+    /// (runtime/proc.go `wakep`). Once the workers of content-mapped jobs
+    /// started, they wait on `ready` too, and one wake could reach a worker
+    /// that cannot take the job, so all wake. The lock keeps a worker from
+    /// starting to wait between the check and the wake.
     // PORT: not in Go (see `PrefetchJob::mapped`).
-    fn wake(&self, queue: &std::sync::MutexGuard<'_, PrefetchQueue>, jobs: usize) {
+    // PERF (syscut1): a VS Code load made about 10,000 wakes with no
+    // worker asleep, most of them the loader's (`queue_batch`).
+    fn wake(&self, queue: &mut PrefetchQueue, jobs: usize) {
+        let woken = jobs.min(queue.sleepers);
+        if woken == 0 {
+            return;
+        }
         if queue.mapped_workers {
-            if jobs > 0 {
-                self.ready.notify_all();
-            }
+            queue.sleepers = 0;
+            self.ready.notify_all();
         } else {
-            for _ in 0..jobs {
+            queue.sleepers -= woken;
+            for _ in 0..woken {
                 self.ready.notify_one();
             }
         }
     }
 
-    /// Queues a parse of each file in `names` that the parser can take (a
-    /// normalized absolute name with a known extension).
+    /// Queues a parse of each file in `names` that the parser can take
+    /// (`parse_request`), with one lock of the queue.
+    // PERF (syscut1): with a lock per name, the queue lock took 15,000 to
+    // 24,000 futex calls in a VS Code load (testbox, 4 runs), and 7,000 to
+    // 12,000 with one lock per call.
     fn queue_names(&self, names: Vec<String>) {
+        let requests: Vec<_> = names
+            .into_iter()
+            .filter_map(|file_name| self.parse_request(file_name))
+            .collect();
+        if requests.is_empty() {
+            return;
+        }
+        let mut queue = lock(&self.queue);
+        let mut new = 0;
+        for (opts, script_kind) in requests {
+            new += usize::from(Self::queue_locked(&mut queue, opts, script_kind));
+        }
+        self.wake(&mut queue, new);
+    }
+
+    /// The parse options and script kind of a job for `file_name`, when
+    /// the parser can take it: a normalized absolute name with a known
+    /// extension.
+    fn parse_request(&self, file_name: String) -> Option<(SourceFileParseOptions, ScriptKind)> {
         let config = &self.config;
+        let script_kind = get_script_kind_from_file_name(&file_name);
+        if script_kind == ScriptKind::UNKNOWN
+            || !has_extension(&file_name)
+            || get_encoded_root_length(&file_name) == 0
+            || file_name != normalize_path(&file_name)
+        {
+            return None;
+        }
         // PERF (perffu1): with the program options the guess is the one of
         // `FilesParser::prefetch_request`. With the default options, a
         // file with no import or export that the loader parses with other
@@ -2384,38 +3003,61 @@ impl PrefetchShared {
             Some(Some(resolve)) => Some(&resolve.options),
             _ => None,
         };
-        for file_name in names {
-            let script_kind = get_script_kind_from_file_name(&file_name);
-            if script_kind == ScriptKind::UNKNOWN
-                || !has_extension(&file_name)
-                || get_encoded_root_length(&file_name) == 0
-                || file_name != normalize_path(&file_name)
-            {
+        let path = to_path(
+            &file_name,
+            &config.current_directory,
+            config.use_case_sensitive_file_names,
+        );
+        // PORT: the options are a guess (see `FilesParser::prefetch_request`).
+        let external_module_indicator_options = options.map_or_else(Default::default, |options| {
+            get_external_module_indicator_options(
+                &file_name,
+                options,
+                &SourceFileMetaData::default(),
+            )
+        });
+        Some((
+            SourceFileParseOptions {
+                file_name,
+                path,
+                external_module_indicator_options,
+            },
+            script_kind,
+        ))
+    }
+
+    /// Queues the root files of an early pool (`start_default_lib_prefetch`)
+    /// below the other jobs, the first root lowest. The loader runs its root
+    /// tasks newest first, after the lib tasks, so the workers take the
+    /// jobs in the order in which the loader needs them. A worker runs it,
+    /// so the loading thread does not make the jobs.
+    // PERF (parload2): the loader of a large program reached root files
+    // such as VS Code's `vscode.d.ts` (724 KB) before any worker had
+    // started them, and parsed them itself.
+    fn queue_roots(&self, names: Vec<String>) {
+        let requests: Vec<_> = names
+            .into_iter()
+            .filter_map(|name| self.parse_request(name))
+            .collect();
+        let mut queue = lock(&self.queue);
+        let mut jobs = Vec::with_capacity(requests.len());
+        for (opts, script_kind) in requests {
+            // A loader that came first queued the job already.
+            if queue.by_name.contains_key(&opts.file_name) {
                 continue;
             }
-            let path = to_path(
-                &file_name,
-                &config.current_directory,
-                config.use_case_sensitive_file_names,
-            );
-            // PORT: the options are a guess (see `FilesParser::prefetch_request`).
-            let external_module_indicator_options =
-                options.map_or_else(Default::default, |options| {
-                    get_external_module_indicator_options(
-                        &file_name,
-                        options,
-                        &SourceFileMetaData::default(),
-                    )
-                });
-            self.queue(
-                SourceFileParseOptions {
-                    file_name,
-                    path,
-                    external_module_indicator_options,
-                },
-                script_kind,
-            );
+            let Some(job) = queue.add(opts, script_kind, None) else {
+                break;
+            };
+            if !queue.is_first(&job) {
+                jobs.push(job);
+            }
         }
+        let count = jobs.len();
+        queue.pending.splice(0..0, jobs);
+        self.wake(&mut queue, count);
+        drop(queue);
+        self.count(|c| c.early_roots = count);
     }
 
     /// Queues the files that a parsed file references, so their parses do
@@ -2436,15 +3078,12 @@ impl PrefetchShared {
         let config = &self.config;
         let mut names = Vec::new();
         for reference in &refs.referenced_files {
-            let name = if is_rooted_disk_path(&reference.file_name) {
-                reference.file_name.clone()
-            } else {
-                combine_paths(
-                    &get_directory_path(&refs.file_name),
-                    &[&reference.file_name],
-                )
-            };
-            names.push(normalize_path(&name));
+            // The name that `resolve_tripleslash_path_reference` reads first
+            // (ts#64159: no trailing separator).
+            names.push(resolve_path_without_trailing_directory_separator(
+                &get_directory_path(&refs.file_name),
+                &[&reference.file_name],
+            ));
         }
         if !config.default_library_path.is_empty() {
             for lib in &refs.lib_reference_directives {
@@ -2489,6 +3128,14 @@ struct PrefetchPool {
     /// True once the workers of content-mapped jobs started
     /// (`FilesParser::queue_mapped_prefetch`).
     mapped_workers: bool,
+    /// True when a loader took the shared resolution cache of this early
+    /// pool (`early_shared_resolution`). Its workers write that cache, so
+    /// `discard` waits for them.
+    handed: bool,
+    /// The number of the next `LoaderStatFs` on this thread when the pool
+    /// started (`LOADER_HOSTS`). An early pool goes to that host
+    /// (`worker_stats`).
+    host: u64,
 }
 
 impl PrefetchPool {
@@ -2497,6 +3144,8 @@ impl PrefetchPool {
             shared: Arc::new(PrefetchShared::new(config)),
             threads: Vec::new(),
             mapped_workers: false,
+            handed: false,
+            host: LOADER_HOSTS.with(Cell::get),
         };
         pool.add_workers(workers);
         pool
@@ -2534,10 +3183,18 @@ impl PrefetchPool {
         }
     }
 
-    /// Stops an unused pool without waiting: each worker ends after its
-    /// current job.
+    /// Stops an unused pool: each worker ends after its current job. It
+    /// waits for the workers only when a loader reads their resolution
+    /// cache (`handed`), so that no worker writes that cache after the
+    /// load, as Go waits for every parse task of a load (filesparser.go:270
+    /// `w.wg.RunAndWait()`).
     fn discard(mut self) {
         self.shared.close();
+        if self.handed {
+            for thread in self.threads.drain(..) {
+                let _ = thread.join();
+            }
+        }
         // Dropping a join handle detaches its thread.
         self.threads.clear();
     }
@@ -2548,6 +3205,7 @@ impl Drop for PrefetchPool {
         self.shared.close();
         // A discarded pool has no threads here and prints no counts.
         let used = !self.threads.is_empty();
+        let workers = self.threads.len();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -2560,6 +3218,7 @@ impl Drop for PrefetchPool {
         self.shared.count(|c| {
             c.untaken = untaken;
             c.untaken_bytes = untaken_bytes;
+            c.workers = workers;
             c.print();
         });
     }
@@ -2572,14 +3231,23 @@ impl Drop for PrefetchPool {
 /// after the config parse, on the thread that loads the program. The loader
 /// takes the workers when its config matches (`FilesParser::parse`) and
 /// checks each parse, as for every worker parse; else they stop unused.
+///
+/// With `roots`, for a tsc program whose loader shares a resolution cache
+/// with its workers (`WorkerResolveConfig::of_config`), the workers also
+/// parse the root files and resolve their imports with that cache, which
+/// the loader takes (`early_shared_resolution`). Pass it only for a host
+/// with no stat cache of its own (not `tsc -b`). `GOPORT_EARLY_ROOTS=0`
+/// turns it off.
 // PORT: not in Go. Go starts the lib parses when `NewProgram` queues its
 // root tasks; here the lib.dom parse is the longest path of small
-// programs, so it starts earlier.
+// programs, so it starts earlier. PERF (parload2): the root parses start
+// before the loader setup too.
 pub fn start_default_lib_prefetch(
     config: &ParsedCommandLine,
     current_directory: &str,
     use_case_sensitive_file_names: bool,
     default_library_path: &str,
+    roots: bool,
 ) {
     let options = config.compiler_options();
     // Go `processAllProgramFiles` loads lib files only for a program with
@@ -2628,6 +3296,17 @@ pub fn start_default_lib_prefetch(
         },
         prefetch_worker_count(),
     );
+    // Set before the root jobs, so the workers resolve and parse them with
+    // the program options.
+    if roots
+        && early_roots_enabled()
+        && let Some(resolve) = WorkerResolveConfig::of_config(config)
+    {
+        let _ = pool.shared.resolve.set(Some(resolve));
+        let mut queue = lock(&pool.shared.queue);
+        queue.roots = Some(config.file_names().to_vec());
+        pool.shared.wake(&mut queue, 1);
+    }
     pool.shared.queue_names(
         names
             .iter()
@@ -2638,6 +3317,89 @@ pub fn start_default_lib_prefetch(
     if let Some(old) = EARLY_POOL.with(|early| early.borrow_mut().replace(pool)) {
         old.discard();
     }
+}
+
+/// False when `GOPORT_EARLY_ROOTS=0`: an early pool parses no root files
+/// (`start_default_lib_prefetch`). An A/B switch.
+fn early_roots_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GOPORT_EARLY_ROOTS").is_none_or(|value| value != "0"))
+}
+
+/// False when `GOPORT_PREFETCH_MOVE_UP=0`: a worker does not move up the
+/// queued jobs of the files that a parse references (`PrefetchShared::queue`).
+/// An A/B switch, read once, or a test's choice for the pools that start on
+/// its thread (`set_move_up`).
+fn move_up_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(on) = MOVE_UP.with(Cell::get) {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GOPORT_PREFETCH_MOVE_UP").is_none_or(|value| value != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice of `move_up_enabled` for the pools of this thread.
+    static MOVE_UP: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Sets `move_up_enabled` for the pools that start on this thread (tests).
+#[cfg(test)]
+pub(crate) fn set_move_up(on: Option<bool>) {
+    MOVE_UP.with(|move_up| move_up.set(on));
+}
+
+/// The shared resolution cache of the early pool of this thread, for the
+/// loader that makes its shared cache now (`process_all_program_files`),
+/// when the early workers run with this loader's config: the same
+/// `PrefetchConfig` and `WorkerResolveConfig::same`, as
+/// `FilesParser::parse` checks before it takes the pool. Else the early
+/// pool stops, so that no worker answers with another config, and the
+/// loader makes a new cache. When `parse` stops a pool that gave its cache
+/// here, it waits for the workers (`PrefetchPool::discard`).
+// PORT: not in Go (see `start_default_lib_prefetch`).
+pub(crate) fn early_shared_resolution(loader: &FileLoader) -> Option<Arc<SharedResolutionCache>> {
+    EARLY_POOL.with(|early| {
+        let mut early = early.borrow_mut();
+        let pool = early.as_ref()?;
+        let fits = match pool.shared.resolve.get() {
+            Some(Some(config)) => config.shared.clone().filter(|shared| {
+                loader.host.stat_cache().is_none()
+                    && pool.shared.config == PrefetchConfig::of_loader(loader)
+                    && WorkerResolveConfig::of_loader_with(loader, Some(shared.clone()))
+                        .is_some_and(|loader_config| loader_config.same(config))
+            }),
+            // An early pool with no root jobs: the loader sets its config.
+            _ => return None,
+        };
+        if fits.is_none() {
+            if let Some(pool) = early.take() {
+                pool.discard();
+            }
+        } else if let Some(pool) = early.as_mut() {
+            pool.handed = true;
+        }
+        #[cfg(test)]
+        if fits.is_some() {
+            EARLY_POOLS_TAKEN.with(|taken| taken.set(taken.get() + 1));
+        }
+        fits
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The early shared caches that loads on this thread took, for tests.
+    static EARLY_POOLS_TAKEN: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The early shared caches that loads on this thread took
+/// (`early_shared_resolution`), for tests.
+#[cfg(test)]
+pub(crate) fn early_pools_taken() -> usize {
+    EARLY_POOLS_TAKEN.with(Cell::get)
 }
 
 /// The `/// <reference lib="..." />` names at the top of a bundled lib
@@ -2774,15 +3536,13 @@ impl RunningJob<'_> {
     fn finish(self, result: Option<PrefetchResult>) {
         let job = self.0;
         std::mem::forget(self);
-        *lock(&job.state) = PrefetchState::Done(result);
-        job.done.notify_all();
+        job.settle(result);
     }
 }
 
 impl Drop for RunningJob<'_> {
     fn drop(&mut self) {
-        *lock(&self.0.state) = PrefetchState::Done(None);
-        self.0.done.notify_all();
+        self.0.settle(None);
     }
 }
 
@@ -2820,6 +3580,7 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
     });
     let mut resolver: Option<WorkerResolver> = None;
     let mut resolver_failed = false;
+    let timed = shared.counts.is_some();
     loop {
         let job = {
             let mut queue = lock(&shared.queue);
@@ -2830,6 +3591,12 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
                 if !mapped_only {
                     if let Some(job) = queue.first.take() {
                         break job;
+                    }
+                    if let Some(names) = queue.roots.take() {
+                        drop(queue);
+                        shared.queue_roots(names);
+                        queue = lock(&shared.queue);
+                        continue;
                     }
                     if let Some((jobs, count)) = queue.rank.take() {
                         drop(queue);
@@ -2844,6 +3611,8 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
                 if let Some(job) = queue.mapped.pop() {
                     break job;
                 }
+                // A wake takes this worker off the count (`wake`).
+                queue.sleepers += 1;
                 queue = shared
                     .ready
                     .wait(queue)
@@ -2857,6 +3626,7 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
             }
             *state = PrefetchState::Running;
         }
+        let started = timed.then(std::time::Instant::now);
         let running = RunningJob(&job);
         #[cfg(test)]
         if lock(&PANIC_IN_JOB).as_deref() == Some(job.opts.file_name.as_str()) {
@@ -2931,7 +3701,16 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
                                 ),
                             ..job.opts.clone()
                         });
-                let mut result = prefetch_parse(&*fs, &job, opts.as_ref().unwrap_or(&job.opts));
+                let read_names = prep_config.is_some_and(|config| config.names) && meta.is_some();
+                let (mut result, names) = match prefetch_parse(
+                    &*fs,
+                    &job,
+                    opts.as_ref().unwrap_or(&job.opts),
+                    read_names,
+                ) {
+                    Some((result, names)) => (Some(result), names),
+                    None => (None, None),
+                };
                 if let Some(result) = &mut result {
                     WORKER_READS.fetch_add(1, AtomicOrdering::Relaxed);
                     result.meta = meta.clone();
@@ -2948,7 +3727,10 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
                                 resolver.synthetic_imports(config, &job.opts.path, &parse.file)
                             },
                         );
-                        (Some(Arc::new(FileRefs::take_from(parse))), synthetic)
+                        (
+                            Some(Arc::new(FileRefs::take_from(parse))),
+                            synthetic.map(|synthetic| (synthetic, names)),
+                        )
                     }
                     None => (None, None),
                 };
@@ -2956,26 +3738,34 @@ fn run_prefetch_worker(shared: &PrefetchShared, mapped_only: bool) {
             }
         };
         running.finish(result);
-        let Some(refs) = refs else {
-            continue;
-        };
-        let prep = meta.zip(synthetic).map(|(meta, synthetic)| {
-            (
-                PrepInput {
-                    meta: meta.meta,
-                    synthetic,
-                },
-                &*job,
-            )
-        });
-        // A resolution that panics (a Go panic) panics on the loader too
-        // when it resolves the same import. The worker only stops resolving.
-        let queued = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            shared.queue_references(&*fs, &refs, resolver.as_ref(), prep);
-        }));
-        if queued.is_err() {
-            resolver = None;
-            resolver_failed = true;
+        #[cfg(test)]
+        let _settled = PrepSettled(&job);
+        if let Some(refs) = refs {
+            let prep = meta.zip(synthetic).map(|(meta, (synthetic, names))| {
+                (
+                    PrepInput {
+                        meta: meta.meta,
+                        synthetic,
+                        names,
+                    },
+                    &*job,
+                )
+            });
+            // A resolution that panics (a Go panic) panics on the loader
+            // too when it resolves the same import. The worker only stops
+            // resolving.
+            let queued = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                shared.queue_references(&*fs, &refs, resolver.as_ref(), prep);
+            }));
+            if queued.is_err() {
+                resolver = None;
+                resolver_failed = true;
+            }
+        }
+        // A job with no references (an unread file) is busy time too.
+        if let Some(started) = started {
+            let busy = started.elapsed();
+            shared.count(|c| c.busy += busy);
         }
     }
 }
@@ -3168,7 +3958,9 @@ impl WorkerResolver {
     ///
     /// With `prep` (the file's metadata and synthetic imports), the
     /// synthetic imports resolve too, and the answers go to the loader
-    /// (`FilePrep`). The module names have no import nodes here, so each
+    /// (`FilePrep`). Each import resolves with the mode of the usage that
+    /// the worker read with the parse (`PrepInput::names`, parload1). A
+    /// synthetic import, or an import whose usage the worker did not read,
     /// resolves with the mode of a plain import (`guess_import_mode`).
     fn resolve(
         &self,
@@ -3208,19 +4000,35 @@ impl WorkerResolver {
         let redirect = redirect
             .as_ref()
             .map(|(_, redirect)| &**redirect as &dyn ModuleResolvedProjectReference);
-        let (meta, synthetic) = match prep {
-            Some(PrepInput { meta, synthetic }) => (meta, Some(synthetic)),
+        let (meta, synthetic, import_names) = match prep {
+            Some(PrepInput {
+                meta,
+                synthetic,
+                names,
+            }) => (meta, Some(synthetic), names),
             // Go `loadSourceFileMetaData` reads the program's options.
             None => (
                 super::file_loader::source_file_meta_data(&self.resolver, &self.options, file_name),
                 None,
+                None,
             ),
         };
+        // parload1: with the import names, each import resolves with the
+        // mode of its usage, as on the loader; the names must be those of
+        // `refs` (the same parse).
+        let import_names = import_names.filter(|names| {
+            names.len() >= refs.import_specifiers.len()
+                && refs
+                    .import_specifiers
+                    .iter()
+                    .enumerate()
+                    .all(|(index, specifier)| names.get(index).0 == specifier)
+        });
         for reference in &refs.type_reference_directives {
             if shared.is_closed() {
                 return None;
             }
-            // Go: fileloader.go:1033 getModeForTypeReferenceDirectiveInFile
+            // Go: fileloader.go:1021 getModeForTypeReferenceDirectiveInFile
             let mode = if reference.resolution_mode != RESOLUTION_MODE_NONE {
                 reference.resolution_mode
             } else {
@@ -3236,7 +4044,7 @@ impl WorkerResolver {
                 names.push(normalize_path(&resolved.resolved_file_name));
             }
         }
-        let mode = super::file_loader::guess_import_mode(file_name, &meta, &options);
+        let guessed_mode = super::file_loader::guess_import_mode(file_name, &meta, &options);
         // The shared cache keeps the first answer of each key with its
         // lookup logs: the prep takes that entry.
         let answers_from = synthetic
@@ -3253,21 +4061,48 @@ impl WorkerResolver {
             .as_ref()
             .map_or(0, |synthetic| synthetic.names().count());
         let mut answers = Vec::with_capacity(synthetic_names + refs.import_specifiers.len());
+        let mut modes = Vec::with_capacity(synthetic_names + refs.import_specifiers.len());
+        let mut file_emit_mode = None;
         let specifiers = synthetic
             .iter()
             .flat_map(SyntheticImports::names)
             .chain(refs.import_specifiers.iter().map(String::as_str));
-        for specifier in specifiers {
+        for (index, specifier) in specifiers.enumerate() {
             if shared.is_closed() {
                 return None;
             }
-            if specifier.is_empty() {
+            // A synthetic import is a plain `import .. from` (its usage is
+            // `ImportUsage::Other`), so the guessed mode is its mode.
+            let usage = index
+                .checked_sub(synthetic_names)
+                .zip(import_names.as_ref())
+                .map(|(import, names)| names.get(import));
+            let mode = match usage {
+                Some((_, usage, _, _)) => super::file_loader::mode_for_import_usage(
+                    usage,
+                    file_name,
+                    &meta,
+                    Some(&options),
+                    &mut file_emit_mode,
+                ),
+                None => guessed_mode,
+            };
+            modes.push(mode);
+            // ts#63915: the loader does not resolve a source phase import.
+            if specifier.is_empty()
+                || usage.is_some_and(|(_, _, _, source_phase)| source_phase == Some(true))
+            {
                 answers.push(None);
                 continue;
             }
-            let (resolved, _, _) =
+            // The worker's resolver is the default resolver, which never
+            // fails (Go resolver.go:469 gives a nil error). So no answer
+            // has an error for the loader to note (Go
+            // `moduleResolutionError`, fileloader.go:884).
+            let (resolved, _, err) =
                 self.resolver
                     .resolve_module_name(specifier, containing_file, mode, redirect);
+            debug_assert!(err.is_none(), "the default resolver failed on {specifier}");
             if let Some((cache, directory, redirect_name)) = &answers_from {
                 answers.push(cache.get_module(&(
                     directory.as_str(),
@@ -3296,8 +4131,9 @@ impl WorkerResolver {
             containing_file: containing_file.to_string(),
             synthetic: synthetic?,
             imports: refs.import_specifiers.len(),
-            mode,
+            modes,
             answers,
+            names: import_names,
         })
     }
 }
@@ -3307,6 +4143,9 @@ impl WorkerResolver {
 struct PrepInput {
     meta: SourceFileMetaData,
     synthetic: SyntheticImports,
+    /// The import names of the parse (`FilePrep::names`), when the worker
+    /// read them.
+    names: Option<Box<ImportNames>>,
 }
 
 /// The lookups that Go `cachedvfs` caches (all but `Stat`), in maps that
@@ -3315,66 +4154,168 @@ struct PrepInput {
 /// cache in them too (`BuildStatCache`).
 #[derive(Default)]
 pub struct StatCache {
-    file_exists: Mutex<FxHashMap<String, bool>>,
-    directory_exists: Mutex<FxHashMap<String, bool>>,
-    realpath: Mutex<FxHashMap<String, String>>,
-    entries: Mutex<FxHashMap<String, Entries>>,
+    file_exists: StatMap<bool>,
+    directory_exists: StatMap<bool>,
+    realpath: StatMap<String>,
+    entries: StatMap<Entries>,
 }
 
-/// The cached value of `path`, or `load()` stored as it. The lock is not
-/// held while `load` runs.
-fn cached_stat<V: Clone>(
-    cache: &Mutex<FxHashMap<String, V>>,
-    path: &str,
-    load: impl FnOnce() -> V,
-) -> V {
-    if let Some(value) = lock(cache).get(path) {
-        return value.clone();
+/// The shards of a `StatMap`.
+const STAT_MAP_SHARDS: usize = 64;
+
+/// How long a lookup waits for the thread that loads the same path
+/// (`StatMap::get_or_load`) before it loads the path itself.
+const STAT_MAP_WAIT: std::time::Duration = std::time::Duration::from_micros(20);
+
+/// Go `collections.SyncMap` of one `cachedvfs` lookup, for threads: one map
+/// per shard of the path hash. The parse workers of a directory ask for
+/// the same package.json scope and `node_modules` lookups together, so a
+/// miss marks its path as loading (`StatSlot::Loading`): a thread that asks
+/// for that path meanwhile waits for the answer (`STAT_MAP_WAIT`, spinning:
+/// a lock wait costs more than the call) and makes no call of its own.
+// PORT: Go `cachedvfs` loads outside the map (cachedvfs.go:56, in
+// `DirectoryExists` at :49), so two goroutines can both call the file
+// system for one path. The answer is the same.
+struct StatMap<V> {
+    shards: Box<[Mutex<FxHashMap<String, StatSlot<V>>>]>,
+}
+
+enum StatSlot<V> {
+    Ready(V),
+    /// A thread loads the value now. It sets the cell, then makes the slot
+    /// `Ready`.
+    Loading(Arc<OnceLock<V>>),
+}
+
+impl<V: Clone> StatSlot<V> {
+    fn value(&self) -> Option<V> {
+        match self {
+            StatSlot::Ready(value) => Some(value.clone()),
+            StatSlot::Loading(cell) => cell.get().cloned(),
+        }
     }
-    let value = load();
-    lock(cache).entry(path.to_string()).or_insert(value).clone()
+}
+
+impl<V> Default for StatMap<V> {
+    fn default() -> Self {
+        StatMap {
+            shards: (0..STAT_MAP_SHARDS).map(|_| Mutex::default()).collect(),
+        }
+    }
+}
+
+impl<V: Clone> StatMap<V> {
+    fn shard(&self, path: &str) -> &Mutex<FxHashMap<String, StatSlot<V>>> {
+        use std::hash::BuildHasher;
+        const _: () = assert!(STAT_MAP_SHARDS == 64);
+        let hash = rustc_hash::FxBuildHasher.hash_one(path);
+        &self.shards[crate::frontend::module::shard_index(hash)]
+    }
+
+    /// The cached value of `path`.
+    fn get(&self, path: &str) -> Option<V> {
+        lock(self.shard(path)).get(path).and_then(StatSlot::value)
+    }
+
+    /// The cached value of `path`, or `load()` stored as it.
+    fn get_or_load(&self, path: &str, load: impl FnOnce() -> V) -> V {
+        let loading = {
+            let mut shard = lock(self.shard(path));
+            match shard.get(path) {
+                Some(StatSlot::Ready(value)) => return value.clone(),
+                Some(StatSlot::Loading(cell)) => Some(cell.clone()),
+                None => {
+                    shard.insert(path.to_string(), StatSlot::Loading(Arc::default()));
+                    None
+                }
+            }
+        };
+        if let Some(cell) = loading {
+            let start = std::time::Instant::now();
+            loop {
+                if let Some(value) = cell.get() {
+                    return value.clone();
+                }
+                for _ in 0..32 {
+                    std::hint::spin_loop();
+                }
+                if start.elapsed() > STAT_MAP_WAIT {
+                    // The loading thread is slow (or descheduled): the
+                    // answer is the same.
+                    return load();
+                }
+            }
+        }
+        let value = load();
+        self.insert_if_absent(path, value)
+    }
+
+    /// Stores `value` as the value of `path` when there is none (or only
+    /// a load of it). Returns the value that the map has.
+    fn insert_if_absent(&self, path: &str, value: V) -> V {
+        let mut shard = lock(self.shard(path));
+        match shard.get_mut(path) {
+            Some(StatSlot::Ready(old)) => old.clone(),
+            Some(slot) => {
+                if let StatSlot::Loading(cell) = slot {
+                    let _ = cell.set(value.clone());
+                }
+                *slot = StatSlot::Ready(value.clone());
+                value
+            }
+            None => {
+                shard.insert(path.to_string(), StatSlot::Ready(value.clone()));
+                value
+            }
+        }
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            lock(shard).clear();
+        }
+    }
 }
 
 /// Stores the value of `path` in `from` in `to`, when `to` has none.
-fn copy_stat<V: Clone>(
-    from: &Mutex<FxHashMap<String, V>>,
-    to: &Mutex<FxHashMap<String, V>>,
-    path: &str,
-) {
-    let Some(value) = lock(from).get(path).cloned() else {
-        return;
-    };
-    lock(to).entry(path.to_string()).or_insert(value);
+fn copy_stat<V: Clone>(from: &StatMap<V>, to: &StatMap<V>, path: &str) {
+    if let Some(value) = from.get(path) {
+        to.insert_if_absent(path, value);
+    }
 }
 
 /// Stores each value of `from` in `to`, when `to` has none for its path.
-fn merge_stats<V>(from: &Mutex<FxHashMap<String, V>>, to: &Mutex<FxHashMap<String, V>>) {
-    let from = std::mem::take(&mut *lock(from));
-    let mut to = lock(to);
-    for (path, value) in from {
-        to.entry(path).or_insert(value);
+/// `from` is empty after.
+fn merge_stats<V: Clone>(from: &StatMap<V>, to: &StatMap<V>) {
+    for shard in &from.shards {
+        let slots = std::mem::take(&mut *lock(shard));
+        for (path, slot) in slots {
+            if let Some(value) = slot.value() {
+                to.insert_if_absent(&path, value);
+            }
+        }
     }
 }
 
 impl StatCache {
     /// The cached `FileExists(path)`, or `load()` stored as it.
     pub fn file_exists(&self, path: &str, load: impl FnOnce() -> bool) -> bool {
-        cached_stat(&self.file_exists, path, load)
+        self.file_exists.get_or_load(path, load)
     }
 
     /// The cached `DirectoryExists(path)`, or `load()` stored as it.
     pub fn directory_exists(&self, path: &str, load: impl FnOnce() -> bool) -> bool {
-        cached_stat(&self.directory_exists, path, load)
+        self.directory_exists.get_or_load(path, load)
     }
 
     /// The cached `Realpath(path)`, or `load()` stored as it.
     pub fn realpath(&self, path: &str, load: impl FnOnce() -> String) -> String {
-        cached_stat(&self.realpath, path, load)
+        self.realpath.get_or_load(path, load)
     }
 
     /// The cached `GetAccessibleEntries(path)`, or `load()` stored as it.
     pub fn entries(&self, path: &str, load: impl FnOnce() -> Entries) -> Entries {
-        cached_stat(&self.entries, path, load)
+        self.entries.get_or_load(path, load)
     }
 
     /// Stores the value of `lookup` in `from` here, when this cache has
@@ -3393,10 +4334,10 @@ impl StatCache {
 
     /// Go `cachedvfs.FS.ClearCache` for these lookups.
     pub fn clear(&self) {
-        lock(&self.file_exists).clear();
-        lock(&self.directory_exists).clear();
-        lock(&self.realpath).clear();
-        lock(&self.entries).clear();
+        self.file_exists.clear();
+        self.directory_exists.clear();
+        self.realpath.clear();
+        self.entries.clear();
     }
 }
 
@@ -3405,7 +4346,7 @@ impl StatCache {
 /// program loads.
 ///
 /// PORT: Go parse tasks share the host's cachedvfs, which lasts for the
-/// whole build, and a write does not update it (cachedvfs.go:144). So each
+/// whole build, and a write does not update it (cachedvfs.go:145). So each
 /// lookup that a program makes before the build writes that path stays
 /// for the later programs. The parse workers here also resolve guesses:
 /// imports with a guessed resolution mode, files that the loader may not
@@ -3435,20 +4376,16 @@ impl BuildStatCache {
     /// `cached`, as Go `cachedvfs` stores each lookup.
     fn host_lookup<V: Clone>(
         &self,
-        map: impl Fn(&StatCache) -> &Mutex<FxHashMap<String, V>>,
+        map: impl Fn(&StatCache) -> &StatMap<V>,
         path: &str,
         load: impl FnOnce() -> V,
     ) -> V {
         let cached = map(&self.cached);
-        if let Some(value) = lock(cached).get(path) {
-            return value.clone();
+        if let Some(value) = cached.get(path) {
+            return value;
         }
-        let found = lock(map(&self.load)).get(path).cloned();
-        let value = found.unwrap_or_else(load);
-        lock(cached)
-            .entry(path.to_string())
-            .or_insert(value)
-            .clone()
+        let value = map(&self.load).get(path).unwrap_or_else(load);
+        cached.insert_if_absent(path, value)
     }
 
     /// A parse worker's lookup: the value in `cached`, else in `load`, else
@@ -3456,16 +4393,16 @@ impl BuildStatCache {
     /// into the log of the resolution that runs (`note_worker_lookup`).
     fn worker_lookup<V: Clone>(
         &self,
-        map: impl Fn(&StatCache) -> &Mutex<FxHashMap<String, V>>,
+        map: impl Fn(&StatCache) -> &StatMap<V>,
         kind: StatKind,
         path: &str,
         load: impl FnOnce() -> V,
     ) -> V {
-        if let Some(value) = lock(map(&self.cached)).get(path) {
-            return value.clone();
+        if let Some(value) = map(&self.cached).get(path) {
+            return value;
         }
         note_worker_lookup(kind, path);
-        cached_stat(map(&self.load), path, load)
+        map(&self.load).get_or_load(path, load)
     }
 
     /// The host's `FileExists(path)` (see `host_lookup`).
@@ -3532,9 +4469,30 @@ impl BuildStatCache {
 /// they read what the build has cached, and the host's file system reads
 /// what they found.
 #[derive(Default)]
-struct SharedStatCache {
+pub(crate) struct SharedStatCache {
     own: StatCache,
     host: OnceLock<Arc<BuildStatCache>>,
+    /// The package.json texts that the workers' resolvers read
+    /// (`WorkerFs::read_file`), so that each is read once in the load. Go
+    /// reads each once into the resolver's package.json cache, which all
+    /// parse tasks share; each worker resolver here has its own cache.
+    package_jsons: StatMap<(Arc<str>, bool)>,
+    /// The OS stat of each path that a `FileExists`, `DirectoryExists` or
+    /// root file size (`PrefetchShared::rank_largest`) asked for in the load,
+    /// as (is a directory, size), when there is no host cache. Go
+    /// `vfs.Common` answers each of the two lookups with a stat
+    /// (internal.go:59, :64), so here one stat answers all three. Not for
+    /// the lookups of a bundled path (`exists`).
+    // PORT: Go `cachedvfs` caches `DirectoryExists` and `FileExists` in two
+    // maps (cachedvfs.go:49, :65), so Go makes one stat per lookup kind: 2
+    // stats for a path that it asks both of. Here the first lookup of a
+    // path fixes both answers for the load, and for the program's symlink
+    // cache, which reads them after the load (`HostStatCache::Load`,
+    // `HostStatFs`). So the port makes fewer stats than Go. The answers
+    // are Go's unless the file system changes between Go's two stats of
+    // one path. The load writes no file, so the output of the load is the
+    // same.
+    nodes: StatMap<Option<(bool, i64)>>,
 }
 
 impl SharedStatCache {
@@ -3543,15 +4501,48 @@ impl SharedStatCache {
     /// or `load()` stored there.
     fn lookup<V: Clone>(
         &self,
-        map: impl Fn(&StatCache) -> &Mutex<FxHashMap<String, V>>,
+        map: impl Fn(&StatCache) -> &StatMap<V>,
         kind: StatKind,
         path: &str,
         load: impl FnOnce() -> V,
     ) -> V {
         match self.host.get() {
             Some(host) => host.worker_lookup(map, kind, path, load),
-            None => cached_stat(map(&self.own), path, load),
+            None => map(&self.own).get_or_load(path, load),
         }
+    }
+
+    /// The OS stat of `path` on `fs` (see `nodes`).
+    fn node(&self, fs: &dyn Fs, path: &str) -> Option<(bool, i64)> {
+        self.nodes.get_or_load(path, || {
+            fs.stat(path).map(|info| (info.is_dir(), info.size()))
+        })
+    }
+
+    /// `FileExists` (or with `directory`, `DirectoryExists`) of `path` on
+    /// `fs`, the bundled wrapper of the OS file system. For an OS path it is
+    /// Go `vfs.Common.FileExists` or `DirectoryExists`, each a stat, so one
+    /// stat in `nodes` answers both (see the PORT note there). A bundled
+    /// path is answered by `fs` itself (no syscall): there the stat and the
+    /// lookups differ (Go embed.go:66 and :85: `Stat("bundled:///")` is a
+    /// directory, but `DirectoryExists("bundled:///")` is false). `None`
+    /// with a host cache: its lookups of each kind stay for later programs,
+    /// so they must not answer each other (`BuildStatCache`).
+    fn exists(&self, fs: &dyn Fs, path: &str, directory: bool) -> Option<bool> {
+        if self.host.get().is_some() {
+            return None;
+        }
+        if crate::frontend::bundled::is_bundled(path) {
+            return Some(if directory {
+                fs.directory_exists(path)
+            } else {
+                fs.file_exists(path)
+            });
+        }
+        Some(
+            self.node(fs, path)
+                .is_some_and(|(is_dir, _)| is_dir == directory),
+        )
     }
 }
 
@@ -3572,6 +4563,9 @@ impl Fs for WorkerFs {
     }
 
     fn file_exists(&self, path: &str) -> bool {
+        if let Some(exists) = self.stats.exists(&*self.fs, path, false) {
+            return exists;
+        }
         self.stats.lookup(
             |c| &c.file_exists,
             StatKind::FileExists,
@@ -3581,9 +4575,15 @@ impl Fs for WorkerFs {
     }
 
     fn read_file(&self, path: &str) -> (String, bool) {
-        let read = self.fs.read_file(path);
+        if !path.ends_with("/package.json") {
+            return self.fs.read_file(path);
+        }
+        let (text, ok) = self.stats.package_jsons.get_or_load(path, || {
+            let (text, ok) = self.fs.read_file(path);
+            (Arc::from(text), ok)
+        });
+        let read = (text.to_string(), ok);
         if let Some(shared) = &self.keep_package_jsons
-            && path.ends_with("/package.json")
             && !shared.has_package_json_read(path)
         {
             note_worker_package_json_read(path, &read.0);
@@ -3613,6 +4613,9 @@ impl Fs for WorkerFs {
     }
 
     fn directory_exists(&self, path: &str) -> bool {
+        if let Some(exists) = self.stats.exists(&*self.fs, path, true) {
+            return exists;
+        }
         self.stats.lookup(
             |c| &c.directory_exists,
             StatKind::DirectoryExists,
@@ -3641,6 +4644,340 @@ impl Fs for WorkerFs {
             path,
             || self.fs.realpath(path),
         )
+    }
+}
+
+/// The base file system of a compiler host on the plain OS file system
+/// (`new_cached_fs_compiler_host`, under its `cachedvfs`): its
+/// `FileExists`, `DirectoryExists`, `Realpath` and `GetAccessibleEntries`
+/// calls on this thread go through the stat cache of the parse workers of
+/// this thread's load or of its own load's early pool (`worker_stats`,
+/// `SharedStatCache::own`), as Go parse tasks and the loader share the
+/// host's cachedvfs. The loader then makes no call that a worker made
+/// already, and a worker makes none that the loader made (for example the
+/// root file checks of `addRootFileTask`, which the workers' import
+/// lookups ask for again). Every other call goes to `fs`.
+// PORT: not in Go (see `SharedStatCache`). The workers read the same OS
+// file system (`CompilerHost::is_plain_os_fs`), so a worker's answer is
+// the answer of `fs`.
+pub(crate) struct LoaderStatFs {
+    fs: Rc<dyn Fs>,
+    /// The number of this host on its thread (`LOADER_HOSTS`).
+    host: u64,
+}
+
+impl LoaderStatFs {
+    pub(crate) fn new(fs: Rc<dyn Fs>) -> Self {
+        let host = LOADER_HOSTS.with(|hosts| {
+            let host = hosts.get();
+            hosts.set(host + 1);
+            host
+        });
+        LoaderStatFs { fs, host }
+    }
+
+    /// `load()`, or the value of `path` in the workers' cache of this
+    /// thread's load (else of its early pool), where `load()` is stored
+    /// when the cache has none. Only a cache of the workers' own (no
+    /// `tsc -b` host cache).
+    fn shared<V: Clone>(
+        &self,
+        map: impl Fn(&StatCache) -> &StatMap<V>,
+        path: &str,
+        load: impl FnOnce() -> V,
+    ) -> V {
+        match worker_stats(self.host) {
+            Some(stats) => map(&stats.own).get_or_load(path, load),
+            None => load(),
+        }
+    }
+
+    /// `FileExists` (or with `directory`, `DirectoryExists`) of `path`
+    /// (see `SharedStatCache::exists`), else the call on `fs`.
+    fn exists(&self, path: &str, directory: bool) -> bool {
+        if let Some(exists) =
+            worker_stats(self.host).and_then(|stats| stats.exists(&*self.fs, path, directory))
+        {
+            return exists;
+        }
+        if directory {
+            self.fs.directory_exists(path)
+        } else {
+            self.fs.file_exists(path)
+        }
+    }
+}
+
+/// The stat cache of the parse workers of this thread's load, else of the
+/// early pool of `host`'s load (`host` is a `LoaderStatFs` number), when
+/// the cache is their own (no `tsc -b` host cache).
+///
+/// An early pool's cache keeps the OS answers from when its workers ran.
+/// Each flow that starts an early pool makes its host next and loads with
+/// that host, and the load takes the pool (`FilesParser::parse`), except
+/// `tsc -b`: it starts an early pool but makes no `LoaderStatFs` (its host
+/// is `new_compiler_host_over`), and its load gives the pool the build
+/// host's stat cache, which this does not give. So the pool's answers are
+/// those of the host's own load. An early pool goes
+/// only to the first host made after it (`PrefetchPool::host`): a later
+/// host does not read the pool of a host that never loaded. A flow that
+/// makes no host after it starts a pool leaves the pool to the next host
+/// on the thread, until a load takes the pool or a new pool replaces it.
+fn worker_stats(host: u64) -> Option<Arc<SharedStatCache>> {
+    let shared = PREFETCH.with(|p| p.borrow().clone()).or_else(|| {
+        EARLY_POOL.with(|early| {
+            early
+                .borrow()
+                .as_ref()
+                .filter(|pool| pool.host == host)
+                .map(|pool| pool.shared.clone())
+        })
+    })?;
+    shared
+        .stats
+        .host
+        .get()
+        .is_none()
+        .then(|| shared.stats.clone())
+}
+
+impl Fs for LoaderStatFs {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.fs.use_case_sensitive_file_names()
+    }
+
+    fn file_exists(&self, path: &str) -> bool {
+        self.exists(path, false)
+    }
+
+    fn read_file(&self, path: &str) -> (String, bool) {
+        self.fs.read_file(path)
+    }
+
+    fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.write_file(path, data)
+    }
+
+    fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.append_file(path, data)
+    }
+
+    fn remove(&self, path: &str) -> Result<(), FsError> {
+        self.fs.remove(path)
+    }
+
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<std::time::SystemTime>,
+        m_time: Option<std::time::SystemTime>,
+    ) -> Result<(), FsError> {
+        self.fs.chtimes(path, a_time, m_time)
+    }
+
+    fn directory_exists(&self, path: &str) -> bool {
+        self.exists(path, true)
+    }
+
+    fn get_accessible_entries(&self, path: &str) -> Entries {
+        self.shared(
+            |c| &c.entries,
+            path,
+            || self.fs.get_accessible_entries(path),
+        )
+    }
+
+    fn stat(&self, path: &str) -> Option<FileInfo> {
+        self.fs.stat(path)
+    }
+
+    fn realpath(&self, path: &str) -> String {
+        self.shared(|c| &c.realpath, path, || self.fs.realpath(path))
+    }
+}
+
+/// The thread-safe lookup cache of a program host's file system, which a
+/// thread other than the loading one can read (`HostStatFs`).
+// PORT: not in Go, where each goroutine reads the host's `cachedvfs`
+// (`p.Host().FS()`). The port's `tsc` host caches in `CachedFs`, which
+// only the loading thread reads. These are the caches that it shares.
+#[derive(Clone)]
+pub(crate) enum HostStatCache {
+    /// The lookups that the loader (`LoaderStatFs`) and the parse workers
+    /// of a load on the plain OS file system made (`SharedStatCache`).
+    /// They answer for the host: every answer is the OS answer, and the
+    /// load writes no file. Empty for a load that made none that another
+    /// thread can read (`empty`).
+    Load(Arc<SharedStatCache>),
+    /// The cache of the `tsc -b` host (`CompilerHost::stat_cache`).
+    Build(Arc<BuildStatCache>),
+}
+
+impl HostStatCache {
+    /// No lookups, for a load on the plain OS file system with no parse
+    /// workers (as with `--singleThreaded`): its lookups are in the host's
+    /// `CachedFs`, which only the loading thread reads. A `HostStatFs` on
+    /// it makes each lookup that it needs, once.
+    pub(crate) fn empty() -> Self {
+        HostStatCache::Load(Arc::default())
+    }
+
+    /// Lets go of these lookups. A load's lookups go to the free thread
+    /// (`drop_in_background`, which the load started), so this thread does
+    /// not free them; the `tsc -b` host keeps its own.
+    pub(crate) fn free(self) {
+        if let HostStatCache::Load(stats) = self {
+            crate::execute::build::build_task::drop_in_background(stats);
+        }
+    }
+}
+
+/// The lookups of a program's load (`HostStatCache::Load`), until the
+/// thread that finishes the program's symlink cache takes them
+/// (program/go_frontend.rs `SymlinkSeed`). A copy of the files (Go
+/// `UpdateProgram`) has none: the file system can change after the load.
+#[derive(Default)]
+pub struct LoadStatCache(Cell<Option<HostStatCache>>);
+
+impl LoadStatCache {
+    pub(crate) fn take(&self) -> Option<HostStatCache> {
+        self.0.take()
+    }
+}
+
+impl Clone for LoadStatCache {
+    fn clone(&self) -> Self {
+        LoadStatCache::default()
+    }
+}
+
+/// The OS file system of this thread with the `FileExists`,
+/// `DirectoryExists`, `Realpath` and `GetAccessibleEntries` lookups of a
+/// program's host (`HostStatCache`): a lookup that the host made is not
+/// made again, and a new one is stored there, as Go `cachedvfs` does for
+/// each goroutine (cachedvfs.go:49, :65). Every other call goes to the OS
+/// file system.
+pub(crate) struct HostStatFs {
+    fs: Rc<dyn Fs>,
+    cache: HostStatCache,
+}
+
+impl HostStatFs {
+    pub(crate) fn new(cache: HostStatCache) -> Self {
+        HostStatFs {
+            fs: crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs()),
+            cache,
+        }
+    }
+
+    /// `FileExists` (or with `directory`, `DirectoryExists`) of `path`.
+    fn exists(&self, path: &str, directory: bool) -> bool {
+        let load = || {
+            if directory {
+                self.fs.directory_exists(path)
+            } else {
+                self.fs.file_exists(path)
+            }
+        };
+        match &self.cache {
+            HostStatCache::Load(stats) => stats
+                .exists(&*self.fs, path, directory)
+                .unwrap_or_else(load),
+            HostStatCache::Build(stats) if directory => stats.directory_exists(path, load),
+            HostStatCache::Build(stats) => stats.file_exists(path, load),
+        }
+    }
+}
+
+impl Fs for HostStatFs {
+    fn use_case_sensitive_file_names(&self) -> bool {
+        self.fs.use_case_sensitive_file_names()
+    }
+
+    fn file_exists(&self, path: &str) -> bool {
+        self.exists(path, false)
+    }
+
+    fn read_file(&self, path: &str) -> (String, bool) {
+        self.fs.read_file(path)
+    }
+
+    fn write_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.write_file(path, data)
+    }
+
+    fn append_file(&self, path: &str, data: &str) -> Result<(), FsError> {
+        self.fs.append_file(path, data)
+    }
+
+    fn remove(&self, path: &str) -> Result<(), FsError> {
+        self.fs.remove(path)
+    }
+
+    fn chtimes(
+        &self,
+        path: &str,
+        a_time: Option<std::time::SystemTime>,
+        m_time: Option<std::time::SystemTime>,
+    ) -> Result<(), FsError> {
+        self.fs.chtimes(path, a_time, m_time)
+    }
+
+    fn directory_exists(&self, path: &str) -> bool {
+        self.exists(path, true)
+    }
+
+    fn get_accessible_entries(&self, path: &str) -> Entries {
+        let load = || self.fs.get_accessible_entries(path);
+        match &self.cache {
+            HostStatCache::Load(stats) => stats.own.entries(path, load),
+            HostStatCache::Build(stats) => stats.entries(path, load),
+        }
+    }
+
+    fn stat(&self, path: &str) -> Option<FileInfo> {
+        self.fs.stat(path)
+    }
+
+    fn realpath(&self, path: &str) -> String {
+        let load = || self.fs.realpath(path);
+        match &self.cache {
+            HostStatCache::Load(stats) => stats.own.realpath(path, load),
+            HostStatCache::Build(stats) => stats.realpath(path, load),
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_stat_fs_tests {
+    use super::*;
+
+    // syscut1 round 2: the symlink cache's resolver on another thread
+    // reads the lookups of the program's load and makes no call that the
+    // load made (Go: the host's `cachedvfs`), and stores its own there.
+    #[test]
+    fn host_stat_fs_answers_from_the_load() {
+        let dir = std::env::temp_dir().join(format!("goport-host-stat-fs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().replace('\\', "/");
+        let gone = format!("{dir}/node_modules/gone");
+        let stats = Arc::new(SharedStatCache::default());
+        // The load found `gone`, which does not exist now: an answer from
+        // the cache shows that no call was made.
+        stats.nodes.insert_if_absent(&gone, Some((true, 0)));
+        stats
+            .own
+            .realpath
+            .insert_if_absent(&gone, format!("{dir}/real/gone"));
+        let fs = HostStatFs::new(HostStatCache::Load(Arc::clone(&stats)));
+        assert!(fs.directory_exists(&gone));
+        assert!(!fs.file_exists(&gone));
+        assert_eq!(fs.realpath(&gone), format!("{dir}/real/gone"));
+        // A new lookup is stored for the next one.
+        let here = format!("{dir}/node_modules");
+        assert!(!fs.directory_exists(&here));
+        assert_eq!(stats.nodes.get(&here), Some(None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -3691,7 +5028,8 @@ fn prefetch_parse(
     fs: &dyn Fs,
     job: &PrefetchJob,
     opts: &SourceFileParseOptions,
-) -> Option<PrefetchResult> {
+    read_names: bool,
+) -> Option<(PrefetchResult, Option<Box<ImportNames>>)> {
     // A bundled lib text is embedded, so it needs no copy. Another text is
     // leaked, as the loader's is, except the text of a freeable file
     // version (`FileText::new`).
@@ -3712,23 +5050,30 @@ fn prefetch_parse(
         // the version frees them, and a parse that the loader does not take
         // is freed with the pool.
         let _owned_nodes = job.freeable.then(crate::ast::enter_freeable_parse);
-        parse_source_file_detached(job.job, opts, text.clone(), job.script_kind)
+        // parload1: the import names are read while the nodes are on this
+        // thread.
+        parse_source_file_detached_reading(job.job, opts, text.clone(), job.script_kind, |file| {
+            read_names.then(|| Box::new(ImportNames::of(file)))
+        })
     }));
-    let parse = match parse {
-        Ok(parse) => (parse.store.is_self_contained()
-            && (synthetic_slot_count(), next_ids()) == before)
-            .then_some(parse),
+    let (parse, names) = match parse {
+        Ok((parse, names)) => {
+            let usable =
+                parse.store.is_self_contained() && (synthetic_slot_count(), next_ids()) == before;
+            (usable.then_some(parse), names.filter(|_| usable))
+        }
         Err(_) => {
             let _ = take_detached_file_store();
-            None
+            (None, None)
         }
     };
-    Some(PrefetchResult {
+    let result = PrefetchResult {
         text,
         parse,
         meta: None,
         mapped: None,
-    })
+    };
+    Some((result, names))
 }
 
 /// A parse worker's transform of a content-mapped file: the transform
@@ -3806,7 +5151,8 @@ pub(crate) fn take_prefetched_mapped(
     let mut state = lock(&job.state);
     #[cfg(test)]
     if lock(&MAPPED_WAIT_FOR_WORKER).contains(&opts.file_name) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        job.waited.store(true, AtomicOrdering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
         while matches!(*state, PrefetchState::Queued) && std::time::Instant::now() < deadline {
             // A worker sets `Running` without a wake, so this polls.
             state = job
@@ -3826,10 +5172,7 @@ pub(crate) fn take_prefetched_mapped(
             PrefetchState::Running => {
                 *state = PrefetchState::Running;
                 waited.get_or_insert_with(std::time::Instant::now);
-                state = job
-                    .done
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = job.wait_done(state);
             }
             PrefetchState::Done(result) => break result,
         }
@@ -3894,25 +5237,41 @@ pub fn take_prefetched(
     let Some(shared) = PREFETCH.with(|p| p.borrow().clone()) else {
         return Prefetched::Nothing;
     };
-    let Some(job) = lock(&shared.queue).by_name.get(&opts.file_name).cloned() else {
-        shared.count(|c| c.not_queued.push(opts.file_name.clone()));
-        return Prefetched::Nothing;
+    let (job, stack) = {
+        let queue = lock(&shared.queue);
+        let Some(job) = queue.by_name.get(&opts.file_name).cloned() else {
+            drop(queue);
+            shared.count(|c| c.not_queued.push(opts.file_name.clone()));
+            return Prefetched::Nothing;
+        };
+        (job, queue.pending.len())
     };
     let mut state = lock(&job.state);
     let mut waited: Option<std::time::Instant> = None;
     let result = loop {
         match std::mem::replace(&mut *state, PrefetchState::Claimed) {
             PrefetchState::Queued | PrefetchState::Claimed => {
-                shared.count(|c| c.claimed.push(opts.file_name.clone()));
+                shared.count(|c| {
+                    c.claimed.push(opts.file_name.clone());
+                    if let Some(at) = c.loader_started.map(|started| started.elapsed())
+                        && at < EARLY_CLAIMS
+                    {
+                        c.early_claims.push((at, opts.file_name.clone()));
+                    }
+                    if let Some(queued_at) = job.queued_at {
+                        c.claims.push((
+                            queued_at.elapsed(),
+                            stack,
+                            job.under.load(AtomicOrdering::Relaxed),
+                        ));
+                    }
+                });
                 return Prefetched::Nothing;
             }
             PrefetchState::Running => {
                 *state = PrefetchState::Running;
                 waited.get_or_insert_with(std::time::Instant::now);
-                state = job
-                    .done
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = job.wait_done(state);
             }
             PrefetchState::Done(result) => break result,
         }
@@ -3956,5 +5315,209 @@ pub fn take_prefetched(
     } else {
         unusable();
         Prefetched::Text(worker_text)
+    }
+}
+
+#[cfg(test)]
+mod move_up_tests {
+    use super::*;
+
+    // `GOPORT_PREFETCH_MOVE_UP` is read once per process, so a test chooses
+    // the switch per pool (`set_move_up`), and both run here. A job that no
+    // worker took moves up when a parse references its file again: it is
+    // pushed again, on top. With the switch off, it stays where it is.
+    #[test]
+    fn a_queued_job_moves_up_only_with_the_switch() {
+        let opts = |name: &str| SourceFileParseOptions {
+            file_name: format!("/p/{name}"),
+            path: Path(format!("/p/{name}")),
+            external_module_indicator_options: ExternalModuleIndicatorOptions::default(),
+        };
+        for (on, pending) in [
+            (false, ["/p/a.ts", "/p/b.ts"].as_slice()),
+            (true, ["/p/a.ts", "/p/b.ts", "/p/a.ts"].as_slice()),
+        ] {
+            set_move_up(Some(on));
+            let shared = PrefetchShared::new(PrefetchConfig {
+                current_directory: "/p".to_string(),
+                use_case_sensitive_file_names: true,
+                default_library_path: String::new(),
+            });
+            set_move_up(None);
+            for name in ["a.ts", "b.ts", "a.ts"] {
+                shared.queue(opts(name), ScriptKind::TS);
+            }
+            let queue = lock(&shared.queue);
+            let names: Vec<&str> = queue
+                .pending
+                .iter()
+                .map(|job| job.opts.file_name.as_str())
+                .collect();
+            assert_eq!(names, pending, "move-up {on}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod stat_cache_tests {
+    use super::*;
+
+    // statcut1 round 2 (skeptic): one stat answers `FileExists` and
+    // `DirectoryExists` only where the file system answers them from that
+    // stat. The bundled wrapper does not for `bundled:///`: its stat is a
+    // directory, but `DirectoryExists` is false (Go embed.go:66, :85). Each
+    // answer of the workers' cache must be the file system's own.
+    #[test]
+    fn one_stat_answers_as_the_file_system() {
+        let fs = crate::frontend::bundled::wrap_fs(crate::frontend::vfs::osvfs_fs());
+        let dir = std::env::temp_dir().join(format!("ts_goport_statcut_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), "").unwrap();
+        let root = normalize_slashes(&dir.to_string_lossy());
+        let lib = format!("{}/lib.es5.d.ts", crate::frontend::bundled::lib_path());
+        let paths = [
+            "bundled:///".to_string(),
+            "bundled:///libs".to_string(),
+            "bundled:///libs/".to_string(),
+            "bundled:///nope".to_string(),
+            lib,
+            root.clone(),
+            format!("{root}/"),
+            format!("{root}/a.ts"),
+            format!("{root}/b.ts"),
+        ];
+        let stats = SharedStatCache::default();
+        for path in &paths {
+            // The stat of a root file size comes first, as in a load
+            // (`PrefetchShared::rank_largest`).
+            let _ = stats.node(&*fs, path);
+            assert_eq!(
+                stats.exists(&*fs, path, false),
+                Some(fs.file_exists(path)),
+                "FileExists({path})"
+            );
+            assert_eq!(
+                stats.exists(&*fs, path, true),
+                Some(fs.directory_exists(path)),
+                "DirectoryExists({path})"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lookup of a path that another thread loads waits at most
+    /// `STAT_MAP_WAIT`, then loads the path itself and stores nothing: the
+    /// value of the path stays the loader's.
+    #[test]
+    fn stat_map_waiter_loads_itself() {
+        use std::sync::mpsc;
+        let map = &StatMap::<u32>::default();
+        std::thread::scope(|scope| {
+            let (started, on_start) = mpsc::channel();
+            let (finish, on_finish) = mpsc::channel::<()>();
+            let loader = scope.spawn(move || {
+                map.get_or_load("p", || {
+                    started.send(()).unwrap();
+                    // Until `finish` is dropped.
+                    let _ = on_finish.recv();
+                    1
+                })
+            });
+            on_start.recv().unwrap();
+            let (waited, on_wait) = mpsc::channel();
+            scope.spawn(move || waited.send(map.get_or_load("p", || 2)));
+            // A waiter that waited for the loader would get 1, after
+            // `finish`.
+            let wait = on_wait.recv_timeout(std::time::Duration::from_secs(10));
+            let stored = map.get("p");
+            drop(finish);
+            assert_eq!(wait, Ok(2));
+            assert_eq!(stored, None);
+            assert_eq!(loader.join().unwrap(), 1);
+        });
+        assert_eq!(map.get("p"), Some(1));
+    }
+
+    /// A load that never finishes (it panics) leaves its slot `Loading`.
+    /// Each lookup of the path then loads it itself, and an insert stores
+    /// its value there.
+    #[test]
+    fn stat_map_load_that_never_finishes() {
+        let map = Arc::new(StatMap::<u32>::default());
+        let load = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            map.get_or_load("p", || panic!("the load fails"))
+        }));
+        assert!(load.is_err());
+        assert_eq!(map.get("p"), None);
+        // On another thread, so that a lookup that waits for the slot
+        // fails the test and does not stop it.
+        let (looked, on_look) = std::sync::mpsc::channel();
+        std::thread::spawn({
+            let map = map.clone();
+            move || looked.send((map.get_or_load("p", || 1), map.get_or_load("p", || 2)))
+        });
+        let looks = on_look.recv_timeout(std::time::Duration::from_secs(10));
+        assert_eq!(looks, Ok((1, 2)));
+        assert_eq!(map.insert_if_absent("p", 3), 3);
+        assert_eq!(map.get_or_load("p", || 4), 3);
+    }
+
+    /// A clear drops the values and the slots of the loads that run, as Go
+    /// `ClearCache`. The value of a load that runs over the clear is then
+    /// stored, as Go's `Store` after `ClearCache`.
+    #[test]
+    fn stat_map_insert_after_clear() {
+        use std::sync::mpsc;
+        let map = &StatMap::<u32>::default();
+        assert_eq!(map.get_or_load("p", || 1), 1);
+        map.clear();
+        assert_eq!(map.get("p"), None);
+        assert_eq!(map.insert_if_absent("p", 2), 2);
+        assert_eq!(map.get_or_load("p", || 3), 2);
+        std::thread::scope(|scope| {
+            let (started, on_start) = mpsc::channel();
+            let (finish, on_finish) = mpsc::channel::<()>();
+            let loader = scope.spawn(move || {
+                map.get_or_load("q", || {
+                    started.send(()).unwrap();
+                    let _ = on_finish.recv();
+                    4
+                })
+            });
+            on_start.recv().unwrap();
+            map.clear();
+            drop(finish);
+            assert_eq!(loader.join().unwrap(), 4);
+        });
+        assert_eq!(map.get("q"), Some(4));
+        assert_eq!(map.get_or_load("q", || 5), 4);
+    }
+
+    /// An early pool's stat cache goes only to the first `LoaderStatFs`
+    /// made on its thread after the pool started (`worker_stats`).
+    #[test]
+    fn early_pool_stats_go_to_the_next_host() {
+        let new_host = || LoaderStatFs::new(crate::frontend::vfs::osvfs_fs()).host;
+        let before = new_host();
+        let pool = PrefetchPool::start(
+            PrefetchConfig {
+                current_directory: "/".to_string(),
+                use_case_sensitive_file_names: true,
+                default_library_path: String::new(),
+            },
+            0,
+        );
+        let stats = pool.shared.stats.clone();
+        if let Some(old) = EARLY_POOL.with(|early| early.borrow_mut().replace(pool)) {
+            old.discard();
+        }
+        let first = new_host();
+        let later = new_host();
+        let reads = |host| worker_stats(host).is_some_and(|got| Arc::ptr_eq(&got, &stats));
+        let read = [reads(before), reads(first), reads(later)];
+        if let Some(pool) = EARLY_POOL.with(|early| early.borrow_mut().take()) {
+            pool.discard();
+        }
+        assert_eq!(read, [false, true, false], "before, first, later");
     }
 }

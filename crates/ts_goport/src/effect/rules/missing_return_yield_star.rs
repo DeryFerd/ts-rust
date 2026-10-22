@@ -57,21 +57,21 @@ pub fn analyze_missing_return_yield_star(
 ) -> Vec<MissingReturnYieldStarMatch> {
     let mut matches = Vec::new();
 
-    walk(tp, sf, &mut matches, sf);
+    // PERF: Go walks the tree; the node order has the same nodes in the same
+    // order (effperf4).
+    for &n in tp.node_order(sf).nodes() {
+        visit(tp, sf, &mut matches, n);
+    }
 
     matches
 }
 
-fn walk(
+fn visit(
     tp: &mut TypeParser<'_>,
     sf: Node,
     matches: &mut Vec<MissingReturnYieldStarMatch>,
     n: Node,
-) -> bool {
-    if n.is_nil() {
-        return false;
-    }
-
+) {
     if n.kind() == SyntaxKind::ExpressionStatement {
         let expr = n.expression();
         let unwrapped = skip_outer_expressions(expr, OuterExpressionKinds::OEK_ALL);
@@ -90,9 +90,6 @@ fn walk(
             }
         }
     }
-
-    n.for_each_child(|child| walk(tp, sf, matches, child));
-    false
 }
 
 // Go: rules.shouldReportMissingReturnYieldStar

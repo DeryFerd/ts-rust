@@ -1,8 +1,8 @@
 # Format, lint, build and test on every pull request and on each push to main that changes code.
 # The full protected set (TestLocal shards, gate, bound runs, LSP and API oracles, np-suite) stays in
 # the revision pipeline (scripts/goport/candidate.sh). This workflow is a fast check that the tree
-# builds and its own tests pass on Linux (x64 and arm64), macOS and Windows (x64, MSVC), and that
-# the tsc compiles for Intel macOS.
+# builds and its own tests pass on Linux (x64 and arm64), macOS and Windows (x64, MSVC), that
+# the tsc compiles for Intel macOS, and that the wasm module (npm/wasm) passes its package tests.
 name: CI
 
 on:
@@ -29,8 +29,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -C debuginfo=0
-  # The toolchain of shipped bins, fmt and clippy (scripts/goport/README.md, "Build toolchain").
-  RUSTUP_TOOLCHAIN: 1.93.0
+  # The toolchain of shipped bins (release.yml), the candidate evidence, fmt and clippy
+  # (scripts/goport/README.md, "Build toolchain").
+  RUSTUP_TOOLCHAIN: 1.95.0
 
 jobs:
   lint:
@@ -51,7 +52,7 @@ jobs:
           cargo run --locked --quiet -p ts_ast_codegen -- check crates/ts_goport/src/astdata/syntax_kind.rs
           cargo run --locked --quiet -p ts_ast_codegen -- check-ast crates/ts_goport/src/astdata/ast_generated.rs
       # The packages of the revision quality step (candidate.sh): 0 warnings.
-      - run: cargo clippy --locked -p ts_goport -p goport_util -p goport_lsproto --all-targets -- -D warnings
+      - run: cargo clippy --locked -p ts_goport -p goport_core -p goport_util -p goport_lsproto --all-targets -- -D warnings
 
   test:
     name: test (${{ matrix.runner }})
@@ -168,3 +169,32 @@ jobs:
         run: |
           rustup target add --toolchain "$RUSTUP_TOOLCHAIN" x86_64-apple-darwin
           cargo check --locked -p ts_goport --bin tsgo --target x86_64-apple-darwin
+
+  # The wasm module of npm/wasm on a fast profile, and the package's tests in Node. The protected set
+  # builds no wasm32 target, so it did not see a checker panic that only the wasm build had (issue
+  # #83). Its repro is a test in npm/wasm/test/tsc.test.mjs.
+  wasm:
+    name: wasm
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal -t wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      # The release profile and no wasm-opt: about 1.5 minutes on 32 vCPU with no cache.
+      - name: Build the module
+        run: scripts/wasm/build.sh
+        env:
+          WASM_PROFILE: release
+          WASM_OPT: none
+      # Not `node --test`: on Node 24 its test process has execArgv flags that a Worker refuses
+      # (ERR_WORKER_INVALID_EXEC_ARGV), and npm/wasm/node.js gives its Worker that execArgv.
+      - name: Package tests
+        run: node npm/wasm/test/tsc.test.mjs

@@ -1,5 +1,5 @@
 //! Port-only tests of the API session of the LSP server
-//! (`custom/initializeAPISession`, Go `server.go:2280
+//! (`custom/initializeAPISession`, Go `server.go:2333
 //! handleInitializeAPISession`).
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -116,7 +116,7 @@ fn init_api_session(client: &LspClient) -> PathBuf {
 }
 
 /// How long a read of the API pipe waits for the server.
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
+const READ_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[cfg(unix)]
 type ApiReader = ApiStream;
@@ -241,7 +241,7 @@ fn shutdown_and_exit(client: &LspClient) {
         .message(),
     );
     assert!(
-        client.wait_server_end(Duration::from_secs(60)),
+        client.wait_server_end(Duration::from_mins(1)),
         "the server did not stop after exit"
     );
 }
@@ -275,11 +275,11 @@ child_test! {
 child_test! {
     // followups2 (apisess1 item 6): while an API request waits for a
     // client callback that never comes, Go serves LSP messages in order on
-    // its dispatch goroutine (server.go:968). The port serves the ones that
+    // its dispatch goroutine (server.go:1004). The port serves the ones that
     // do not need the session (didChange here) in order, keeps the others
     // (hover), and serves shutdown and exit wherever they are in the queue.
     // The server logs each message it handled (`window/logMessage`, Go
-    // server.go:1182 "handled method"), so the log shows that didChange
+    // server.go:1218 "handled method"), so the log shows that didChange
     // was served before shutdown and the hover was not.
     fn api_callback_wait_serves_shutdown_and_exit_behind_other_messages() {
         let handled = Arc::new(Mutex::new(Vec::<String>::new()));

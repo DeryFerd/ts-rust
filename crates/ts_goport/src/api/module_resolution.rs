@@ -38,8 +38,9 @@ pub struct ModuleResolverFactoryImpl {
     registration: Rc<ModuleResolverRegistration>,
     contexts: Rc<ProgramResolutionContexts>,
     conn: Option<Rc<dyn ipc::Conn>>,
-    ctx: Context,
     current_directory: String,
+    /// Go `caseSensitivity` (the session's).
+    use_case_sensitive: bool,
 }
 
 // Go: api/module_resolution.go programResolutionContext
@@ -63,6 +64,7 @@ pub struct CallbackModuleResolver {
     conn: Option<Rc<dyn ipc::Conn>>,
     ctx: Context,
     current_directory: String,
+    use_case_sensitive: bool,
     snapshot: SnapshotID,
     program_resolution_context_id: u64,
     fallback_resolver: Rc<dyn module::Resolver>,
@@ -70,8 +72,11 @@ pub struct CallbackModuleResolver {
 
 // Go: api/module_resolution.go moduleResolverFactory.NewResolver
 impl project::ModuleResolverFactory for ModuleResolverFactoryImpl {
+    // ts#64519: the resolver uses the caller's ctx, not the factory's
+    // (module_resolution.go:46 at fed0bf24149f).
     fn new_resolver(
         &self,
+        ctx: &Context,
         mut options: module::ResolverOptions,
     ) -> (Rc<dyn module::Resolver>, Box<dyn FnOnce()>) {
         options.compiler_options = Some(self.registration.compiler_options.clone());
@@ -90,8 +95,9 @@ impl project::ModuleResolverFactory for ModuleResolverFactoryImpl {
         let mut resolver: Rc<dyn module::Resolver> = Rc::new(CallbackModuleResolver {
             registration: self.registration.clone(),
             conn: self.conn.clone(),
-            ctx: self.ctx.clone(),
+            ctx: ctx.clone(),
             current_directory: self.current_directory.clone(),
+            use_case_sensitive: self.use_case_sensitive,
             snapshot: SnapshotID(0),
             program_resolution_context_id: context_id,
             fallback_resolver: fallback,
@@ -169,7 +175,14 @@ impl module::Resolver for CallbackModuleResolver {
         )
     }
 
+    // Go: api/module_resolution.go:134 callbackModuleResolver.GetResolutionData (ts#64519)
+    fn get_resolution_data(&self) -> Rc<module::ResolutionData> {
+        self.fallback_resolver.get_resolution_data()
+    }
+
     // Go: api/module_resolution.go callbackModuleResolver.GetPackageScopeForPath
+    // (at 673a5f17d713; removed by ts#64519)
+    // PORT: kept with `module::Resolver::get_package_scope_for_path`.
     fn get_package_scope_for_path(
         &self,
         directory: &str,
@@ -284,6 +297,7 @@ impl CallbackModuleResolver {
             static_module_resolution_to_resolved_module(
                 Some(&static_resolution),
                 &self.current_directory,
+                self.use_case_sensitive,
             )
             .map(Arc::new),
             Vec::new(),
@@ -348,8 +362,9 @@ pub fn compile_module_resolution_spec(
             ..Default::default()
         };
         if let Some(containing_directory) = &entry.containing_directory {
-            static_entry.containing_directory = tspath::get_normalized_absolute_path(
-                &containing_directory.to_absolute_file_name(current_directory),
+            // ts#64159 (Go N' module_resolution.go:166): `tspath.ToRootedDirectoryPath`.
+            static_entry.containing_directory = to_rooted_path(
+                &containing_directory.to_file_name(current_directory),
                 current_directory,
             );
         }
@@ -370,9 +385,12 @@ pub fn compile_module_resolution_spec(
             }
             static_entry.resolution_mode = Some(mode);
         }
-        static_entry.result =
-            static_module_resolution_to_resolved_module(Some(result), current_directory)
-                .map(Arc::new);
+        static_entry.result = static_module_resolution_to_resolved_module(
+            Some(result),
+            current_directory,
+            use_case_sensitive,
+        )
+        .map(Arc::new);
         entries.push(static_entry);
     }
 
@@ -394,19 +412,25 @@ pub fn compile_module_resolution_spec(
 pub fn static_module_resolution_to_resolved_module(
     static_resolution: Option<&StaticModuleResolution>,
     current_directory: &str,
+    use_case_sensitive: bool,
 ) -> Option<ResolvedModule> {
     let static_resolution = static_resolution?;
     let resolved_file_name = static_resolution.resolved_file_name.as_ref()?;
+    let resolved_file_name = tspath::get_normalized_absolute_path(
+        &resolved_file_name.to_file_name(current_directory),
+        current_directory,
+    );
     let mut result = ResolvedModule {
-        resolved_file_name: tspath::get_normalized_absolute_path(
-            &resolved_file_name.to_absolute_file_name(current_directory),
-            current_directory,
-        ),
+        // ts#64159 (Go N' module_resolution.go:197)
+        resolved_path: tspath::to_path(&resolved_file_name, current_directory, use_case_sensitive),
+        resolved_file_name,
+        // ts#64638 (Go N' module_resolution.go:192)
+        is_custom_resolution: true,
         ..Default::default()
     };
     if let Some(original_path) = &static_resolution.original_path {
         result.original_path = tspath::get_normalized_absolute_path(
-            &original_path.to_absolute_file_name(current_directory),
+            &original_path.to_file_name(current_directory),
             current_directory,
         );
     }
@@ -440,9 +464,9 @@ pub fn module_resolution_trace_to_strings(trace: &[module::DiagAndArgs]) -> Vec<
 
 impl Session {
     // Go: api/module_resolution.go Session.moduleResolverFactory
+    // ts#64519: no ctx argument (module_resolution.go:221 at fed0bf24149f).
     pub fn module_resolver_factory(
         &self,
-        ctx: &Context,
         options: &CreateProgramOptions,
     ) -> Result<Option<Rc<dyn project::ModuleResolverFactory>>, GoError> {
         if options.module_resolver.0 == 0 {
@@ -473,8 +497,10 @@ impl Session {
             registration: data,
             contexts: self.program_resolution_contexts.clone(),
             conn,
-            ctx: ctx.clone(),
             current_directory: self.get_current_directory(),
+            // Go `f.session.caseSensitivity()` (module_resolution.go:64): the
+            // snapshot host's file system, not the project session's.
+            use_case_sensitive: self.use_case_sensitive_file_names(),
         })))
     }
 }
@@ -568,7 +594,8 @@ impl Session {
         let provider = compile_module_resolution_spec(
             params.module_resolutions.as_ref(),
             &self.get_current_directory(),
-            self.fs().use_case_sensitive_file_names(),
+            // Go `s.caseSensitivity()` (module_resolution.go:291).
+            self.use_case_sensitive_file_names(),
         )?;
         self.next_module_resolver_id
             .set(self.next_module_resolver_id.get() + 1);
@@ -650,10 +677,9 @@ impl Session {
             }
         }
         let cwd = self.get_current_directory();
-        let containing_directory = tspath::get_normalized_absolute_path(
-            &params.containing_directory.to_absolute_file_name(&cwd),
-            &cwd,
-        );
+        // ts#64159 (Go N' module_resolution.go:340): `tspath.ToRootedDirectoryPath`.
+        let containing_directory =
+            to_rooted_path(&params.containing_directory.to_file_name(&cwd), &cwd);
 
         let mut resolver: Rc<dyn module::Resolver>;
         if params.snapshot.0 != 0 && params.in_progress_snapshot != 0 {
@@ -709,6 +735,8 @@ impl Session {
                 conn: self.conn.borrow().clone(),
                 ctx: ctx.clone(),
                 current_directory: cwd,
+                // Go `s.caseSensitivity()` (module_resolution.go:376).
+                use_case_sensitive: self.use_case_sensitive_file_names(),
                 snapshot: params.snapshot,
                 program_resolution_context_id: params.in_progress_snapshot,
                 fallback_resolver: resolver,

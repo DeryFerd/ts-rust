@@ -327,6 +327,26 @@ impl Checker {
         &mut self,
         node: Node, /*Union[HasModifiers, HasDecorators, HasIllegalModifiers, HasIllegalDecorators]*/
     ) -> bool {
+        // PERF: portonly1 item 3. Go tests `node.Modifiers() == nil`
+        // (grammarchecks.go:215). A published store node reads that from its
+        // modifier bits column, without its node data: a parsed modifier list
+        // is never empty, and each modifier and decorator kind has a flag, so
+        // no bits means no list. Go's parser makes a modifier list at 6 sites
+        // (pin fed0bf24149f), all through `newModifierList` (parser.go:5984),
+        // and each list has one or more nodes:
+        // - parser.go:2270 parseModuleOrNamespaceDeclaration: the implicit
+        //   `export` of a nested namespace (1 node);
+        // - parser.go:3876 parseModifiersForConstructorType: `abstract`
+        //   (1 node);
+        // - parser.go:3968 parseModifiersEx: only when `len(list) != 0`;
+        // - parser.go:4518 parseModifiersForArrowFunction: `async` (1 node);
+        // - reparser.go:564 reparseHosted: a JSDoc readonly, access or
+        //   override tag (the old nodes plus 1);
+        // - reparser.go:705 createExportModifier: `export` (1 node).
+        if frozen_store_modifier_flags(node) == Some(ModifierFlags::NONE) {
+            debug_assert!(node.modifiers().is_nil(), "modifier bits without a list");
+            return false;
+        }
         let modifier_list = node.modifiers();
         if modifier_list.is_nil() {
             return false;
@@ -1321,10 +1341,28 @@ impl Checker {
 
         for i in 0..parameter_count {
             let parameter = parameter_nodes.get(i);
-            if parameter.dot_dot_dot_token().is_some() {
+            // PERF: portonly1 item 3. Go reads the fields of
+            // `parameters.Nodes[i].AsParameterDeclaration()` (grammarchecks.go:692)
+            // from one struct; `parameter_parts` reads them with one node data
+            // load. A parameter list holds only ParameterDeclaration nodes.
+            // For another kind, Go panics too: `AsParameterDeclaration`
+            // (ast_generated.go:9158) is the type assertion
+            // `n.data.(*ParameterDeclaration)`. The fallback below keeps the
+            // old reads (3 field accessors at once). Of these, only
+            // `dot_dot_dot_token` panics (`field_panic`), for a kind other
+            // than Parameter, BindingElement, NamedTupleMember and
+            // JsxExpression; `question_token` and `initializer` return NIL.
+            // So the port panics for fewer kinds than Go here, but no such
+            // kind can be in a parameter list.
+            let parts = parameter_parts(parameter).unwrap_or_else(|| ParameterParts {
+                dot_dot_dot_token: parameter.dot_dot_dot_token(),
+                question_token: parameter.question_token(),
+                initializer: parameter.initializer(),
+            });
+            if parts.dot_dot_dot_token.is_some() {
                 if i != parameter_count - 1 {
                     return self.grammar_error_on_node(
-                        parameter.dot_dot_dot_token(),
+                        parts.dot_dot_dot_token,
                         diag::A_rest_parameter_must_be_last_in_a_parameter_list,
                         args![],
                     );
@@ -1336,15 +1374,15 @@ impl Checker {
                     );
                 }
 
-                if parameter.question_token().is_some() {
+                if parts.question_token.is_some() {
                     return self.grammar_error_on_node(
-                        parameter.question_token(),
+                        parts.question_token,
                         diag::A_rest_parameter_cannot_be_optional,
                         args![],
                     );
                 }
 
-                if parameter.initializer().is_some() {
+                if parts.initializer.is_some() {
                     return self.grammar_error_on_node(
                         parameter.name(),
                         diag::A_rest_parameter_cannot_have_an_initializer,
@@ -1354,10 +1392,10 @@ impl Checker {
             } else if is_optional_declaration(parameter) {
                 seen_optional_parameter = true;
                 // A reparsed '?' token indicates a bracketed name in @param tag
-                let question_token = parameter.question_token();
+                let question_token = parts.question_token;
                 if question_token.is_some()
                     && !question_token.flags().intersects(NodeFlags::REPARSED)
-                    && parameter.initializer().is_some()
+                    && parts.initializer.is_some()
                 {
                     return self.grammar_error_on_node(
                         parameter.name(),
@@ -1365,7 +1403,7 @@ impl Checker {
                         args![],
                     );
                 }
-            } else if seen_optional_parameter && parameter.initializer().is_nil() {
+            } else if seen_optional_parameter && parts.initializer.is_nil() {
                 return self.grammar_error_on_node(
                     parameter.name(),
                     diag::A_required_parameter_cannot_follow_an_optional_parameter,
@@ -1383,10 +1421,22 @@ impl Checker {
             let body = node.body();
             let mut use_strict_directive = Node::NIL;
             if body.is_some() && is_block(body) {
-                use_strict_directive = find_use_strict_prologue(
-                    get_source_file_of_node(node),
-                    &body.statements().to_vec(),
-                );
+                // PERF: portonly1 item 3. Go passes `body.Statements()`
+                // (grammarchecks.go:727) with no copy; the port read the
+                // statements into a new Vec for each function. This is Go
+                // binder.go:1360 `FindUseStrictPrologue` on the statements in
+                // place (`find_use_strict_prologue` takes a slice, and
+                // `binder_p2.rs` is a key source of the lib blobs).
+                let source_file = get_source_file_of_node(node);
+                for statement in body.statements() {
+                    if !is_prologue_directive(statement) {
+                        break;
+                    }
+                    if is_use_strict_prologue_directive(source_file, statement) {
+                        use_strict_directive = statement;
+                        break;
+                    }
+                }
             }
             if use_strict_directive.is_some() {
                 let non_simple_parameters: Vec<Node> = node
@@ -1854,7 +1904,9 @@ impl Checker {
             }
 
             let type_node = member.type_();
-            if !is_string_literal_like_type(type_node) {
+            // ts#64243 (Go N' grammarchecks.go:2261): a no-substitution template
+            // literal type is no string literal type here.
+            if !is_literal_type_node(type_node) || !is_string_literal(type_node.literal()) {
                 return self.grammar_error_on_node(
                     type_node,
                     diag::An_import_attributes_property_must_have_a_string_literal_type_annotation,

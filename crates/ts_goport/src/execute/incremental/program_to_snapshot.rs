@@ -33,6 +33,7 @@ pub fn program_to_snapshot(
     snapshot.hash_with_text = hash_with_text;
     snapshot.check_pending = options().no_check.is_true();
     let mut to = ToProgramSnapshot {
+        program,
         old_program,
         snapshot,
         global_file_removed: false,
@@ -50,8 +51,10 @@ pub fn program_to_snapshot(
 }
 
 // Go: incremental/programtosnapshot.go:42 toProgramSnapshot
-// PORT: Go `program` is the current program and is not a field.
+// PORT: Go `program` is the current program. The port reads it through the
+// `program.rs` free functions, except its own flags (`single_threaded`).
 struct ToProgramSnapshot<'a> {
+    program: &'static GoProgram,
     old_program: Option<&'a Program>,
     snapshot: Snapshot,
     global_file_removed: bool,
@@ -134,7 +137,11 @@ impl ToProgramSnapshot<'_> {
         // Here another thread hashes the texts while the files bind and the
         // checkers start (`start_text_hashes`), and the loop takes each hash
         // in file order. The hash values do not depend on the thread.
-        let versions = start_text_hashes(&files, self.snapshot.hash_with_text);
+        let versions = start_text_hashes(
+            &files,
+            self.snapshot.hash_with_text,
+            self.program.single_threaded(),
+        );
         // PORT: perf. Go runs this loop in a WorkGroup. `getReferencedFiles`
         // runs on the file's checker thread (`start_referenced_files_job`),
         // so the jobs of every file are sent first and run in parallel; the
@@ -144,7 +151,8 @@ impl ToProgramSnapshot<'_> {
         bind_all();
         // PORT: perf. Each job gets the file's set of the old snapshot, and
         // returns that set when the new set is the same (see
-        // `ReferencedFileSet::finish`).
+        // `ReferencedFileSet::finish`). It also compares the two sets
+        // (`ReferencedFiles::same_as_old`).
         let mut reference_jobs: std::collections::VecDeque<_> = files
             .iter()
             .map(|&file| {
@@ -163,7 +171,10 @@ impl ToProgramSnapshot<'_> {
             let mut signature = String::new();
             // PORT: Go stores the `newReferences` pointer and still reads it
             // below. `Arc` shares the set in the same way, without a copy.
-            let new_references = reference_jobs
+            let ReferencedFiles {
+                set: new_references,
+                same_as_old,
+            } = reference_jobs
                 .pop_front()
                 .expect("one referenced files job per file")
                 .wait();
@@ -180,10 +191,7 @@ impl ToProgramSnapshot<'_> {
                         || old_file_info.implied_node_format != implied_node_format
                     {
                         self.snapshot.add_file_to_change_set(file_path.clone());
-                    } else if !same_references(
-                        new_references.as_deref(),
-                        old_snapshot.referenced_map.get_references(&file_path),
-                    ) {
+                    } else if !same_as_old {
                         // Referenced files changed
                         self.snapshot.add_file_to_change_set(file_path.clone());
                     } else if let Some(new_references) =
@@ -211,11 +219,13 @@ impl ToProgramSnapshot<'_> {
                             repopulate_diagnostics_of_file(emit_diagnostics, file),
                         );
                     }
+                    // PORT: perf (t3inc2). The flags come first, so the
+                    // default library lookup runs only when it decides.
                     if can_copy_semantic_diagnostics
-                        && (!source_file_info(file).is_declaration_file
-                            || copy_declaration_file_diagnostics)
-                        && (!is_source_file_default_library(&file_path)
-                            || copy_lib_file_diagnostics)
+                        && (copy_declaration_file_diagnostics
+                            || !source_file_info(file).is_declaration_file)
+                        && (copy_lib_file_diagnostics
+                            || !is_source_file_default_library(&file_path))
                     {
                         // Unchanged file copy diagnostics
                         if let Some(diagnostics) =
@@ -419,9 +429,9 @@ impl ToProgramSnapshot<'_> {
 
 /// Go `newReferences.Equals(oldReferences)`: both absent, or the same
 /// paths in any order.
-// PORT: perf. A file whose imports did not change gets the same paths in
-// the same order as in the old snapshot, so an equal order is checked
-// first, without a hash of each path.
+// PORT: perf. A file whose imports did not change gets the old snapshot's
+// set itself (`ReferencedFileSet::finish`), so the pointer is checked
+// first, then an equal order, without a hash of each path.
 fn same_references(a: Option<&FxIndexSet<Path>>, b: Option<&FxIndexSet<Path>>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => {
@@ -433,12 +443,19 @@ fn same_references(a: Option<&FxIndexSet<Path>>, b: Option<&FxIndexSet<Path>>) -
 
 /// Starts the Go `t.snapshot.computeHash(versionText)` of each file in
 /// `files`. The receiver gives the hashes in file order as they are ready.
+/// `single_threaded` is the program's own flag (Go
+/// `core.NewWorkGroup(t.program.SingleThreaded())`,
+/// programtosnapshot.go:91).
 // PORT: perf. The hashes run on one new thread, so that they overlap the
 // bind and the checker start in `compute_program_file_changes` (the texts
 // are `'static`, or owned for a content-mapped file). With `--singleThreaded` they run here, before the bind.
 // One thread is enough: it reads each text once (about 16 MB for Effect),
 // which takes much less time than the bind.
-fn start_text_hashes(files: &[Node], hash_with_text: bool) -> std::sync::mpsc::Receiver<String> {
+fn start_text_hashes(
+    files: &[Node],
+    hash_with_text: bool,
+    single_threaded: bool,
+) -> std::sync::mpsc::Receiver<String> {
     let texts: Vec<std::borrow::Cow<'static, str>> = files
         .iter()
         .map(|&file| {
@@ -472,7 +489,7 @@ fn start_text_hashes(files: &[Node], hash_with_text: bool) -> std::sync::mpsc::R
         }
     };
     // wasm has one thread.
-    if single_threaded() || cfg!(target_family = "wasm") {
+    if single_threaded || cfg!(target_family = "wasm") {
         hash_texts();
     } else {
         crate::core::GoThread::new()
@@ -551,8 +568,7 @@ fn add_referenced_files_from_import_literal(
 // added before, without the path hash (in Hono, about 110 ambient module
 // declarations for each file). The paths are kept as a list of
 // candidates in Go order, so `finish` can give back the old snapshot's set
-// when it is the same, without a copy of each path. The set and its order
-// are the same.
+// when it has the same paths, without a copy of each path.
 #[derive(Default)]
 struct ReferencedFileSet {
     /// What Go adds to the set, in order. A path can repeat.
@@ -583,8 +599,8 @@ impl ReferencedFileSet {
     }
 
     /// The set: None when it is empty (Go stores no set then). `old` is the
-    /// file's set in the old snapshot; when the new set has the same paths
-    /// in the same order, `old` itself is the result.
+    /// file's set in the old snapshot; when the new set is the same
+    /// (`same_as`), `old` itself is the result.
     fn finish(self, old: Option<Arc<FxIndexSet<Path>>>) -> Option<Arc<FxIndexSet<Path>>> {
         if let Some(old) = old
             && self.same_as(&old)
@@ -605,11 +621,54 @@ impl ReferencedFileSet {
         (!paths.is_empty()).then(|| Arc::new(paths))
     }
 
-    /// True when inserting the candidates in order into an empty set gives
-    /// `old`, in the same order: the first time each path comes, it is the
-    /// next path of `old`, a repeat is a path that came before, and every
-    /// path of `old` comes.
+    /// True when the new set can be `old`: inserting the candidates in order
+    /// into an empty set gives `old` in the same order (the first time each
+    /// path comes, it is the next path of `old`, a repeat is a path that
+    /// came before, and every path of `old` comes), or every candidate is a
+    /// program file and the set has the paths of `old` in any order.
+    // PORT: perf (t3inc2). A set read from build info is in file id order
+    // (`snapshotToBuildInfo` sorts it), so up to t3inc1 a file whose
+    // imports did not change got a new set in its import order, and the
+    // loading thread then compared the two sets path by path (T3 Code
+    // apps/web: about 330,000 lookups). Go's `collections.Set` has no
+    // order. Here the order of a stored set counts only where the build
+    // info gives an id to a path that has none yet (`toFileId`, in the
+    // order of the set): every program file has its id before then
+    // (`setFileInfoAndEmitSignatures`). So for a set of program files the
+    // old set, with the same paths, gives the same output as a new one. A
+    // triple slash or type reference path can be a file outside the
+    // program, so a set with one keeps the order rule.
     fn same_as(&self, old: &FxIndexSet<Path>) -> bool {
+        if self
+            .candidates
+            .iter()
+            .any(|candidate| matches!(candidate, ReferencedCandidate::Path(_)))
+        {
+            return self.same_in_order_as(old);
+        }
+        let mut seen = vec![false; old.len()];
+        let mut count = 0;
+        for candidate in &self.candidates {
+            let index = match candidate {
+                ReferencedCandidate::File(file) => {
+                    old.get_index_of(source_file_info(*file).path.as_str())
+                }
+                ReferencedCandidate::Path(path) => old.get_index_of(path.as_str()),
+            };
+            let Some(index) = index else {
+                return false;
+            };
+            if !seen[index] {
+                seen[index] = true;
+                count += 1;
+            }
+        }
+        count == old.len()
+    }
+
+    /// True when inserting the candidates in order into an empty set gives
+    /// `old`, in the same order.
+    fn same_in_order_as(&self, old: &FxIndexSet<Path>) -> bool {
         let mut next = 0;
         for candidate in &self.candidates {
             let index = match candidate {
@@ -632,25 +691,20 @@ impl ReferencedFileSet {
 // Gets the path to reference file from file name, it could be resolvedPath if present otherwise path
 // PORT: the paths are pushed in Go order; the checker job adds them to the
 // set (see `start_referenced_files_job`).
-fn add_referenced_file_from_file_name(
-    file_name: &str,
-    referenced_files: &mut Vec<Path>,
-    source_file_directory: &str,
-) {
+// ts#64544: `file_name` is absolute, so the redirect lookup finds a project
+// reference source or output.
+fn add_referenced_file_from_file_name(file_name: &str, referenced_files: &mut Vec<Path>) {
     let redirect = get_parse_file_redirect(file_name);
-    if !redirect.is_empty() {
-        referenced_files.push(to_path(
-            &redirect,
-            get_current_directory(),
-            use_case_sensitive_file_names(),
-        ));
+    let file_name = if redirect.is_empty() {
+        file_name
     } else {
-        referenced_files.push(to_path(
-            file_name,
-            source_file_directory,
-            use_case_sensitive_file_names(),
-        ));
-    }
+        &redirect
+    };
+    referenced_files.push(to_path(
+        file_name,
+        get_current_directory(),
+        use_case_sensitive_file_names(),
+    ));
 }
 
 // Go: incremental/programtosnapshot.go:291 getReferencedFiles
@@ -659,12 +713,25 @@ fn add_referenced_file_from_file_name(
 pub fn get_referenced_files(file: Node) -> Option<FxIndexSet<Path>> {
     start_referenced_files_job(file, None)
         .wait()
+        .set
         .map(Arc::unwrap_or_clone)
 }
 
 /// The result of `get_referenced_files`, computed on the file's checker
 /// thread.
-pub type ReferencedFilesJob = CheckerJob<Option<Arc<FxIndexSet<Path>>>>;
+pub type ReferencedFilesJob = CheckerJob<ReferencedFiles>;
+
+/// What a `ReferencedFilesJob` gives.
+pub struct ReferencedFiles {
+    /// The set of `get_referenced_files`.
+    pub set: Option<Arc<FxIndexSet<Path>>>,
+    /// Go `newReferences.Equals(oldReferences)` (`same_references`) of
+    /// `set` and the old set that the job got.
+    // PORT: perf (t3inc2). Go compares on the loading goroutine, where the
+    // old set is looked up again. The job has that set, so it compares on
+    // the checker thread.
+    pub same_as_old: bool,
+}
 
 /// Sends `get_referenced_files` for `file` to its checker thread without
 /// waiting (see `compute_program_file_changes`).
@@ -719,7 +786,9 @@ pub fn start_referenced_files_job(
                 referenced_files.add_file(file_of_decl);
             }
         }
-        referenced_files.finish(old)
+        let set = referenced_files.finish(old.clone());
+        let same_as_old = same_references(set.as_deref(), old.as_deref());
+        ReferencedFiles { set, same_as_old }
     })
 }
 
@@ -803,10 +872,10 @@ fn referenced_file_name_paths(file: Node) -> Vec<Path> {
     let source_file_directory = get_directory_path(source_file_file_name(file));
     // Handle triple slash references
     for referenced_file in &source_file_info(file).referenced_files {
+        // ts#64544: the name resolves against the file's directory first.
         add_referenced_file_from_file_name(
-            &referenced_file.file_name,
+            &get_normalized_absolute_path(&referenced_file.file_name, &source_file_directory),
             &mut referenced_files,
-            &source_file_directory,
         );
     }
 
@@ -815,17 +884,13 @@ fn referenced_file_name_paths(file: Node) -> Vec<Path> {
     let path = info.path.as_str();
     for type_ref in get_resolved_type_reference_directives_in_file(path) {
         if !type_ref.resolved_file_name.is_empty() {
-            add_referenced_file_from_file_name(
-                &type_ref.resolved_file_name,
-                &mut referenced_files,
-                &source_file_directory,
-            );
+            add_referenced_file_from_file_name(&type_ref.resolved_file_name, &mut referenced_files);
         }
     }
     referenced_files
 }
 
-// Go: incremental/programtosnapshot.go:337 repopulateDiagnosticsOfFile
+// Go: incremental/programtosnapshot.go:341 repopulateDiagnosticsOfFile
 // repopulateDiagnosticsOfFile repopulates diagnostic chains that depend on program state.
 // When diagnostics are copied from a previous build, their message chains may reference
 // stale program state (e.g., resolved module alternate results, package.json scope).
@@ -851,7 +916,7 @@ pub fn repopulate_diagnostics_of_file(
     diags.clone()
 }
 
-// Go: incremental/programtosnapshot.go:351 repopulateDiagnosticsList
+// Go: incremental/programtosnapshot.go:355 repopulateDiagnosticsList
 // repopulateDiagnosticsList repopulates diagnostic chains in a list of diagnostics.
 // Returns nil if no diagnostics needed repopulation (i.e., no changes were made).
 #[must_use]
@@ -874,7 +939,7 @@ pub fn repopulate_diagnostics_list(diags: &[Diagnostic], file: Node) -> Option<V
     Some(result)
 }
 
-// Go: incremental/programtosnapshot.go:373 repopulateDiagnosticMessageChain
+// Go: incremental/programtosnapshot.go:377 repopulateDiagnosticMessageChain
 // repopulateDiagnosticMessageChain repopulates chains that have repopulate info.
 // Returns nil if no changes were made.
 #[must_use]
@@ -930,7 +995,7 @@ pub fn repopulate_diagnostic_message_chain(
     Some(result)
 }
 
-// Go: incremental/programtosnapshot.go:418 astDiagToBuildInfoDiag
+// Go: incremental/programtosnapshot.go:422 astDiagToBuildInfoDiag
 #[must_use]
 pub fn ast_diag_to_build_info_diag(d: &Diagnostic) -> BuildInfoDiagnosticWithFileName {
     // PORT: Go byte offsets (see `go_text_range`).

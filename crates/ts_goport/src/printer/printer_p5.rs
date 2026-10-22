@@ -148,15 +148,27 @@ impl Printer {
         } else {
             let end = (start + count).min(length);
 
-            let nodes = children.nodes().to_vec();
-            let has_trailing_comma = self.has_trailing_comma(parent_node, children);
+            // PERF: printfast1. Go slices `children.Nodes` and reads
+            // `children.Loc`. A factory list gives its nodes and its range
+            // in one arena read, not one read per node.
+            let (nodes, children_loc) = match children.synthetic_list() {
+                Some(list) => crate::ast::synthetic::synthetic_list_nodes_and_loc(list),
+                None => (children.nodes().to_vec(), children.loc()),
+            };
+            // Go `children.HasTrailingComma()` (ast.go:139) from the nodes
+            // and range read above.
+            let list_has_trailing_comma = nodes
+                .last()
+                .is_some_and(|last| last.end() < children_loc.end());
+            let has_trailing_comma =
+                self.has_trailing_comma(parent_node, children, list_has_trailing_comma);
             self.emit_list_items(
                 emit,
                 parent_node,
                 &nodes[start as usize..end as usize],
                 format,
                 has_trailing_comma,
-                children.loc(),
+                children_loc,
             );
         }
 
@@ -173,11 +185,19 @@ impl Printer {
     }
 
     // Go: printer/printer.go:4801 hasTrailingComma
-    pub(crate) fn has_trailing_comma(&mut self, parent_node: Node, children: NodeList) -> bool {
+    // PERF: printfast1. The caller passes Go `children.HasTrailingComma()`
+    // (`list_has_trailing_comma`): `emit_list_range` has the nodes and range
+    // of the list, so it needs no second read of a factory list.
+    pub(crate) fn has_trailing_comma(
+        &mut self,
+        parent_node: Node,
+        children: NodeList,
+        list_has_trailing_comma: bool,
+    ) -> bool {
         // NodeList.HasTrailingComma() is unreliable on transformed nodes as some nodes may have been removed. In the event
         // we believe we may need to emit a trailing comma, we must first look to the respective node list on the original
         // node first.
-        if !children.has_trailing_comma() {
+        if !list_has_trailing_comma {
             return false;
         }
 
@@ -318,6 +338,11 @@ impl Printer {
 
         // Emit each child.
         let mut previous_sibling = Node::NIL;
+        // PERF: printfast1. `previous_sibling.End()`, read with its `Pos`
+        // before its emit. Go reads its `Loc` again; a factory node reads
+        // it in the thread's arena. The printer moves no list node: a debug
+        // build asserts that the emit kept the end.
+        let mut previous_end = 0;
         let mut should_decrease_indent_after_emit = false;
         for &child in children {
             // Write the delimiter if this is not the first node.
@@ -332,13 +357,11 @@ impl Printer {
                 //          a
                 //          /* End of parameter a */ -> this comment isn't considered to be trailing comment of parameter "a" due to newline
                 //          ,
-                if format.intersects(ListFormat::DELIMITERS_MASK)
-                    && previous_sibling.end() != parent_end
-                {
+                if format.intersects(ListFormat::DELIMITERS_MASK) && previous_end != parent_end {
                     if !self.comments_disabled
                         && self.should_emit_trailing_comments(previous_sibling)
                     {
-                        self.emit_leading_comments(previous_sibling.end(), false /*elided*/);
+                        self.emit_leading_comments(previous_end, false /*elided*/);
                     }
                 }
 
@@ -392,8 +415,14 @@ impl Printer {
                 should_emit_intervening_comments = may_emit_intervening_comments;
             }
 
-            self.next_list_element_pos = child.pos();
+            let child_loc = child.loc();
+            self.next_list_element_pos = child_loc.pos();
             emit(self, child);
+            debug_assert_eq!(
+                child.end(),
+                child_loc.end(),
+                "the emit of a list child moved its end"
+            );
 
             if should_decrease_indent_after_emit {
                 self.decrease_indent();
@@ -401,6 +430,7 @@ impl Printer {
             }
 
             previous_sibling = child;
+            previous_end = child_loc.end();
         }
 
         // Write a trailing comma, if requested.
@@ -413,7 +443,7 @@ impl Printer {
             if previous_sibling.is_some() && !skip_trailing_comments {
                 self.emit_token(
                     SyntaxKind::CommaToken,
-                    previous_sibling.end(),
+                    previous_end,
                     WriteKind::PUNCTUATION,
                     previous_sibling,
                 );
@@ -429,14 +459,14 @@ impl Printer {
         //          /* end of element 2 */
         //       ];
         if previous_sibling.is_some()
-            && parent_end != previous_sibling.end()
+            && parent_end != previous_end
             && format.intersects(ListFormat::DELIMITERS_MASK)
             && !skip_trailing_comments
         {
             let comments_pos = if emit_trailing_comma && children_text_range.end() > 0 {
                 children_text_range.end()
             } else {
-                previous_sibling.end()
+                previous_end
             };
             self.emit_leading_comments(comments_pos, false /*elided*/);
         }
@@ -1764,6 +1794,13 @@ impl Printer {
         if nodes.is_nil() {
             return;
         }
+        // PERF: printfast1. With no auto-generate record, every
+        // `generateName` of this walk only reads the text of a name and
+        // drops it (see `generate_name`), so the walk changes nothing. The
+        // walk adds no record. Type text (`typeToString`) has none.
+        if !self.emit_context.has_any_auto_generate_info() {
+            return;
+        }
         for node in nodes.nodes() {
             self.generate_member_names(node);
         }
@@ -1803,6 +1840,13 @@ impl Printer {
     // Generate the text for a generated identifier or private identifier
     // Go: printer/printer.go:6138 generateName
     pub(crate) fn generate_name(&mut self, name: Node) {
+        // PERF: printfast1. Go drops the result. For a name with no
+        // auto-generate record, Go `GenerateName` (namegenerator.go:114)
+        // only returns `GetTextOfNode(name)`, which changes nothing, so the
+        // port does not build that string.
+        if !self.emit_context.has_auto_generate_info(name) {
+            return;
+        }
         let _ = self.sync_name_generator().generate_name(name);
     }
 

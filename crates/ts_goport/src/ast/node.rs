@@ -61,81 +61,56 @@ fn req(file: usize, id: crate::astdata::NodeId) -> Node {
     Node::new(file, id)
 }
 
-/// A required list.
-fn list(file: usize, l: &'static crate::astdata::NodeList) -> NodeList {
-    NodeList::from_ts(file, Some(l))
-}
-
-/// An optional list. `None` is Go `nil`.
-fn opt_list(file: usize, l: &'static Option<crate::astdata::NodeList>) -> NodeList {
-    NodeList::from_ts(file, l.as_ref())
-}
-
-/// An optional modifier list. `None` is Go `nil`.
-fn mods(file: usize, m: &'static Option<crate::astdata::ModifierList>) -> ModifierList {
-    ModifierList::from_ts(file, m.as_ref())
-}
-
-/// A list read in place from the data of a node of `file`, parsed or
-/// synthetic. `None` is Go `nil`. Code that walks the lists of node data it
-/// reads in a scope (subtree facts, the child walk of a synthetic node)
-/// reads them this way; accessors return `NodeList` handles instead.
+/// A list read from the data of node `n`, parsed or synthetic, as a
+/// `NodeList` handle (`data_list`). Go `nil` when `None`. Code that walks
+/// the lists of node data it reads in a scope (subtree facts, the child walk
+/// of a synthetic node) reads them this way; accessors read them with
+/// `list_of!` instead.
 #[derive(Clone, Copy)]
-struct DataList<'a> {
-    file: usize,
-    list: Option<&'a crate::astdata::NodeList>,
+struct DataList {
+    list: NodeList,
 }
 
-impl<'a> DataList<'a> {
+impl DataList {
     /// A required list.
-    fn req(file: usize, l: &'a crate::astdata::NodeList) -> Self {
+    fn req(n: Node, l: &crate::astdata::NodeList) -> Self {
         Self {
-            file,
-            list: Some(l),
+            list: data_list(n, *l),
         }
     }
 
     /// An optional list.
-    fn opt(file: usize, l: &'a Option<crate::astdata::NodeList>) -> Self {
+    fn opt(n: Node, l: &Option<crate::astdata::NodeList>) -> Self {
         Self {
-            file,
-            list: l.as_ref(),
+            list: l.map_or(NodeList::NIL, |l| data_list(n, l)),
         }
     }
 
     /// The list of an optional modifier list.
-    fn mods(file: usize, m: &'a Option<crate::astdata::ModifierList>) -> Self {
+    fn mods(n: Node, m: &Option<crate::astdata::ModifierList>) -> Self {
         Self {
-            file,
-            list: m.as_ref().map(|m| &m.list),
+            list: m.map_or(NodeList::NIL, |m| data_list(n, m.list)),
         }
     }
 
     /// Go `list != nil` (see `NodeList::is_nil`).
     fn is_some(self) -> bool {
-        self.list.is_some_and(|l| !is_nil_list_marker(l))
+        self.list.is_some()
     }
 
     /// The nodes of the list, in order, as `NodeList::nodes` gives them.
     /// Empty when nil.
-    fn nodes(self) -> impl Iterator<Item = Node> + 'a {
-        let file = self.file;
-        let frozen = frozen_store_ids(file);
-        self.list
-            .map_or(&[][..], |l| &l.nodes[..])
-            .iter()
-            .map(move |&id| match frozen {
-                Some(ids) => ids.node(id),
-                None => Node::new(file, id),
-            })
+    fn nodes(self) -> NodeSliceIter {
+        self.list.nodes().iter()
     }
 }
 
-/// `ModifierList::modifier_flags` of a modifier list read in place from
-/// node data (store or synthetic).
-fn in_place_modifier_flags(m: &Option<crate::astdata::ModifierList>) -> ModifierFlags {
-    m.as_ref()
-        .map_or(ModifierFlags::NONE, |m| ModifierFlags(m.flags.0))
+/// `ModifierList::modifier_flags` of modifier list field `m` of the data of
+/// node `n` (store or synthetic).
+fn in_place_modifier_flags(n: Node, m: &Option<crate::astdata::ModifierList>) -> ModifierFlags {
+    m.map_or(ModifierFlags::NONE, |m| {
+        data_modifiers(n, m).modifier_flags()
+    })
 }
 
 /// True when data variant `$v` fits a node of kind `$k`. This mirrors
@@ -320,6 +295,24 @@ macro_rules! match_data {
     }};
 }
 
+/// True when `$k`, the kind of a published store node, fits none of the
+/// data variants `$v`: `kind_lacks_data!` on a kind that the caller read.
+macro_rules! kind_lacks_variants {
+    ($k:expr, [$($v:ident),+]) => {{
+        let kind: SyntaxKind = $k;
+        kind != SyntaxKind::Unknown $(&& !variant_has_kind!($v, kind))+
+    }};
+}
+
+/// `read_ast_node_miss` with the nil check of `with_data!`: the node data
+/// read of a node that is not a published store node with node data
+/// (`FrozenNode::data`).
+#[inline]
+pub(crate) fn read_data_miss<R>(n: Node, read: impl FnOnce(NodeData<'_>) -> R) -> R {
+    assert!(n.is_some(), "nil node dereference");
+    crate::ast::synthetic::read_ast_node_miss(n, read)
+}
+
 /// Go field read by node data variant. Each arm lists `NodeData` variants,
 /// binds the variant data to `$d` and the node's file to `$file`, and
 /// evaluates `$e`. Other variants give `$def`.
@@ -327,16 +320,67 @@ macro_rules! match_data {
 /// PERF: a published store node whose kind fits no listed variant gives `$def`
 /// from its node record (`kind_lacks_data!`), without the pointer
 /// chase to its astdata node and data.
+// PERF: noderead2. The kind test and the node data read share one registry
+// lookup (`FrozenNode`). They were two (`frozen_store_kind`, then
+// `with_data!`), and the `OnceLock` acquire load of each stops LLVM from
+// merging them. Go reads `n.Kind` and `n.data` from one struct.
 macro_rules! by_data {
     ($n:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$file:ident, $d:ident| $e:expr),+ $(,)?) => {{
         let node: Node = $n;
-        if kind_lacks_data!(node, [$($($v),+),+]) {
-            debug_assert!(!with_data!(node, |d| matches!(d, $($(NodeData::$v(_))|+)|+)));
-            $def
-        } else {
-            with_data!(node, |d| {
-                match_data!(node.file_index(), d, $def, $([$($v),+] => |$file, $d| $e),+)
-            })
+        let frozen = frozen_store_node(node);
+        match frozen {
+            Some(f) if kind_lacks_variants!(f.kind(), [$($($v),+),+]) => {
+                debug_assert!(!with_data!(node, |d| matches!(d, $($(NodeData::$v(_))|+)|+)));
+                $def
+            }
+            _ => match frozen.and_then(FrozenNode::data) {
+                Some(d) => match_data!(node.file_index(), d, $def, $([$($v),+] => |$file, $d| $e),+),
+                None => read_data_miss(node, |d| {
+                    match_data!(node.file_index(), d, $def, $([$($v),+] => |$file, $d| $e),+)
+                }),
+            },
+        }
+    }};
+}
+
+/// `by_data!` for arms that read child nodes: each arm binds `$ids`, the
+/// `ChildIds` of the node, in place of its file. A published store node
+/// gives its kind, node data and child ids from one registry lookup.
+// PERF: noderead2. `by_data!` and then `Node::new` for the child were two
+// registry lookups (three before `by_data!` shared one).
+macro_rules! by_child_ids {
+    ($n:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$ids:ident, $d:ident| $e:expr),+ $(,)?) => {{
+        let node: Node = $n;
+        let frozen = frozen_store_node(node);
+        match frozen {
+            Some(f) if kind_lacks_variants!(f.kind(), [$($($v),+),+]) => {
+                debug_assert!(!with_data!(node, |d| matches!(d, $($(NodeData::$v(_))|+)|+)));
+                $def
+            }
+            _ => match frozen.and_then(|f| Some((f.data()?, f.ids()))) {
+                Some((d, ids)) => {
+                    match_ids!(ChildIds::Frozen(ids), d, $def, $([$($v),+] => |$ids, $d| $e),+)
+                }
+                None => read_data_miss(node, |d| {
+                    let ids = ChildIds::File(node.file_index());
+                    match_ids!(ids, d, $def, $([$($v),+] => |$ids, $d| $e),+)
+                }),
+            },
+        }
+    }};
+}
+
+/// The data match of `by_child_ids!`: `match_data!` with the `ChildIds`
+/// `$ids_in` in place of the file.
+macro_rules! match_ids {
+    ($ids_in:expr, $data:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$ids:ident, $d:ident| $e:expr),+ $(,)?) => {{
+        let ids: ChildIds = $ids_in;
+        match $data {
+            $($(NodeData::$v($d) => {
+                let $ids = ids;
+                $e
+            })+)+
+            _ => $def,
         }
     }};
 }
@@ -345,24 +389,129 @@ macro_rules! by_data {
 /// variants and the field (`req`, `opt` or `mods`, see `sel_field!`).
 /// `$of` is `list_of` or `modifiers_of`. Other variants give `$def`. The
 /// `kind_lacks_data!` shortcut is the same as in `by_data!`.
+// PERF: noderead2. One registry lookup for the kind test, the node data and
+// the list table, as in `by_data!`.
 macro_rules! list_by_data {
     ($n:expr, $of:ident, $def:expr, $([$($v:ident),+ $(,)?] => $how:ident $field:ident),+ $(,)?) => {{
         let node: Node = $n;
-        if kind_lacks_data!(node, [$($($v),+),+]) {
-            $def
-        } else {
-            $of!(node, |d| match d {
+        let frozen = frozen_store_node(node);
+        match frozen {
+            Some(f) if kind_lacks_variants!(f.kind(), [$($($v),+),+]) => $def,
+            _ => frozen_list_of!($of, node, frozen, |d| match d {
                 $($(NodeData::$v(d) => Some(sel_field!($how, d.$field)),)+)+
                 _ => None,
             })
-            .unwrap_or($def)
+            .unwrap_or($def),
         }
     }};
 }
 
+/// `list_of!` (or `modifiers_of!`, `$of`) on node `$n`, whose
+/// `frozen_store_node` the caller already read as `$frozen`: the node data
+/// and the list table of a published store node come from that lookup. Any
+/// other node reads through `$of!`.
+macro_rules! frozen_list_of {
+    (list_of, $n:expr, $frozen:expr, |$d:ident| $body:expr) => {
+        frozen_list_of!(@read list_of, $n, $frozen, |$d| $body, NodeList, nodes)
+    };
+    (modifiers_of, $n:expr, $frozen:expr, |$d:ident| $body:expr) => {
+        frozen_list_of!(@read modifiers_of, $n, $frozen, |$d| $body, ModifierList, modifiers)
+    };
+    (@read $of:ident, $n:expr, $frozen:expr, |$d:ident| $body:expr, $list:ident, $as:ident) => {{
+        let n__: Node = $n;
+        let frozen__: Option<FrozenNode> = $frozen;
+        match frozen__.and_then(|f| Some((f.data()?, f.lists()))) {
+            Some((data__, lists__)) => {
+                let $d: NodeData<'static> = data__;
+                let found: Option<Option<crate::ast::synthetic::AnyList<'static>>> = $body;
+                found.map(|l| {
+                    $list::from_table(
+                        n__.file_index(),
+                        lists__,
+                        l.map(crate::ast::synthetic::AnyList::$as),
+                    )
+                })
+            }
+            None => $of!(n__, |$d| $body),
+        }
+    }};
+}
+
+/// How the child ids in the node data of one node become handles
+/// (`Node::new(file, id)`): from the registry block that the data read
+/// already looked up (`FrozenIds`), or through `Node::new` for a node that
+/// is not a published store node with node data.
+#[derive(Clone, Copy)]
+pub(crate) enum ChildIds {
+    Frozen(FrozenIds),
+    File(usize),
+}
+
+impl ChildIds {
+    /// `Node::new(file, id)`.
+    #[inline(always)]
+    pub(crate) fn node(self, id: crate::astdata::NodeId) -> Node {
+        match self {
+            ChildIds::Frozen(ids) => {
+                let n = ids.node(id);
+                #[cfg(debug_assertions)]
+                {
+                    let (FrozenIds::Direct { base } | FrozenIds::Records { base, .. }) = ids;
+                    debug_assert_eq!(n, Node::new((base >> 32) as usize, id), "ChildIds");
+                }
+                n
+            }
+            ChildIds::File(file) => Node::new(file, id),
+        }
+    }
+
+    /// Go `nil` for an optional child, else `node`.
+    #[inline(always)]
+    pub(crate) fn opt(self, id: Option<crate::astdata::NodeId>) -> Node {
+        match id {
+            Some(id) => self.node(id),
+            None => Node::NIL,
+        }
+    }
+}
+
+/// The node data and the child ids of published store node `n`, from one
+/// registry lookup, or `None` for any other node (read it with the
+/// accessors). For a hot site that reads a few fields of one node.
+#[inline]
+#[must_use]
+pub fn frozen_data_ids(n: Node) -> Option<(NodeData<'static>, FrozenIds)> {
+    let f = frozen_store_node(n)?;
+    Some((f.data()?, f.ids()))
+}
+
+/// `with_data!` that also binds `$ids`, the `ChildIds` of node `$n`: a
+/// published store node gives its node data and child ids from one registry
+/// lookup. The Go field accessors of `fields.rs` read through it.
+// PERF: noderead2. `with_data!` and then `Node::new` for the child were
+// two registry lookups for a Go `n.AsX().Field` read.
+macro_rules! with_child_ids {
+    ($n:expr, |$d:ident, $ids:ident| $body:expr) => {{
+        let n__: $crate::core::Node = $n;
+        match $crate::ast::frozen_store_node(n__).and_then(|f| Some((f.data()?, f.ids()))) {
+            Some((data__, ids__)) => {
+                let $d: $crate::astdata::NodeData<'_> = data__;
+                let $ids = $crate::ast::ChildIds::Frozen(ids__);
+                $body
+            }
+            None => $crate::ast::read_data_miss(n__, |data__| {
+                let $d: $crate::astdata::NodeData<'_> = data__;
+                let $ids = $crate::ast::ChildIds::File(n__.file_index());
+                $body
+            }),
+        }
+    }};
+}
+pub(crate) use with_child_ids;
+
 /// True when `d` is the data of parsed node `n` (the `_in` debug checks).
-fn is_data_of(d: &NodeData, n: Node) -> bool {
-    static_ast_node(n).is_some_and(|data| std::ptr::eq(d, data))
+fn is_data_of(d: NodeData<'_>, n: Node) -> bool {
+    static_ast_node(n).is_some_and(|data| d.same(data))
 }
 
 /// Defines one Go field accessor as two `Node` methods from one arm list:
@@ -406,7 +555,7 @@ macro_rules! data_accessor {
 
 /// Expands `$mac! { $($args)* [variants] }` with the `NodeData` variants
 /// that hold a Go `Modifiers()` list. `Node::modifiers` and the U1 (b) store
-/// column (`store_node_modifier_bits`) both take the list from here, so they
+/// column (`store_node_modifier_list`) both take the list from here, so they
 /// agree by construction.
 macro_rules! modifiers_variants {
     ($mac:ident! { $($args:tt)* }) => {
@@ -474,35 +623,51 @@ macro_rules! modifiers_accessor {
                 self.file_index(),
                 d,
                 ModifierList::NIL,
-                [$($v),+] => |f, d| mods(f, &d.modifiers)
+                [$($v),+] => |_f, d| d.modifiers.map_or(ModifierList::NIL, |m| data_modifiers(self, m))
             )
         }
     };
 }
 
-/// `store_node_modifier_bits` over the `modifiers_variants!` list.
-macro_rules! store_node_modifier_bits_fn {
+/// `store_node_modifier_list` over the `modifiers_variants!` list.
+macro_rules! store_node_modifier_list_fn {
     ([$($v:ident),+ $(,)?]) => {
-        /// U1 (b): `ModifierList::modifier_flags` of the own modifier list of
-        /// `data`, the data of a store node of kind `kind`, as bits: the value
-        /// `Node::modifiers().modifier_flags()` gives for it (store lists hold
-        /// their Go flags). 0 when the node has no list. The kind test comes
-        /// first, so most nodes are not loaded (the `NodeKids` modifier word).
-        pub(crate) fn store_node_modifier_bits(kind: SyntaxKind, data: &NodeData) -> u32 {
+        /// U1 (b): the own modifier list field of `data`, the data of a store
+        /// node of kind `kind`, or `None` when the node has none. The kind
+        /// test comes first, so most nodes are not loaded (the `NodeKids`
+        /// modifier word).
+        #[inline]
+        pub(crate) fn store_node_modifier_list(
+            kind: SyntaxKind,
+            data: NodeData<'_>,
+        ) -> Option<crate::astdata::ModifierList> {
             let mut has_list = false;
             $(has_list |= variant_has_kind!($v, kind);)+
             if !has_list {
-                return 0;
+                return None;
             }
             match data {
-                $(NodeData::$v(d) => d.modifiers.as_ref().map_or(0, |m| m.flags.0),)+
-                _ => 0,
+                $(NodeData::$v(d) => d.modifiers,)+
+                _ => None,
             }
         }
     };
 }
 
-modifiers_variants!(store_node_modifier_bits_fn! {});
+modifiers_variants!(store_node_modifier_list_fn! {});
+
+/// U1 (b): `ModifierList::modifier_flags` of the own modifier list of
+/// `data`, the data of a store node of kind `kind`, as bits: the value
+/// `Node::modifiers().modifier_flags()` gives for it (store lists hold their
+/// Go flags). `flags` gives the flags of a list field (from the list table
+/// of the store). 0 when the node has no list.
+pub(crate) fn store_node_modifier_bits(
+    kind: SyntaxKind,
+    data: NodeData<'_>,
+    flags: impl FnOnce(crate::astdata::ModifierList) -> u32,
+) -> u32 {
+    store_node_modifier_list(kind, data).map_or(0, flags)
+}
 
 // U4 (CH6, bind A): the plain field arms of Go `Name()`, `Expression()`,
 // `PostfixToken()` and the own `QuestionToken` field. Each macro takes
@@ -807,10 +972,18 @@ macro_rules! other_column_match {
 }
 
 /// `Node::name_data` and `Node::name_data_in`: Go `Name()` from the node
-/// data, over the `name_arms!` arms.
+/// data, over the `name_arms!` arms. `name_data` is not inlined, so
+/// `Node::name` stays small enough to inline.
+// PERF (followups57): noderead2 made `by_data!` larger, and the R207 PGO
+// builds inlined `name_data` into `Node::name` (1,067 bytes), which then no
+// longer inlined into its callers. The Effect plugin calls it often: effect
+// st instructions:u +0.29%, 56M in `Node::name` alone. The R206 builds
+// called `name_data` out of line too. A published store node takes the
+// store column and never calls it.
 macro_rules! name_data_accessor {
     ($($arms:tt)*) => {
         data_accessor! {
+            #[inline(never)]
             fn name_data, name_data_in(n) -> Node {
                 Node::NIL,
                 // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
@@ -894,7 +1067,7 @@ fn column_req_id(id: crate::astdata::NodeId) -> u32 {
 /// data.
 // PERF: called when the slot is made, while its data is hot (a few data
 // matches), so no pass over the node data is needed later.
-pub(crate) fn store_node_children(kind: SyntaxKind, data: &NodeData) -> SlotChildren {
+pub(crate) fn store_node_children(kind: SyntaxKind, data: NodeData<'_>) -> SlotChildren {
     debug_assert!(
         data.matches_syntax_kind(kind),
         "{kind:?} does not fit its NodeData"
@@ -911,7 +1084,7 @@ pub(crate) fn store_node_children(kind: SyntaxKind, data: &NodeData) -> SlotChil
 }
 
 /// `store_node_children` for node data `data`.
-fn store_node_children_from_data(data: &NodeData) -> SlotChildren {
+fn store_node_children_from_data(data: NodeData<'_>) -> SlotChildren {
     let id_opt = |_: usize, id: Option<crate::astdata::NodeId>| Some(column_opt_id(id));
     let id_req = |_: usize, id: crate::astdata::NodeId| Some(column_req_id(id));
     let name = name_arms!(
@@ -1002,7 +1175,7 @@ macro_rules! locals_container_variants {
     };
 }
 
-/// True when `$d` (a `&NodeData`) is one of the listed variants.
+/// True when `$d` (a `NodeData<'_>`) is one of the listed variants.
 macro_rules! data_is_variant {
     ($d:expr, [$($v:ident),+ $(,)?]) => {
         matches!($d, $(NodeData::$v(_))|+)
@@ -1606,13 +1779,11 @@ impl IntoIterator for &NodeSlice {
 
 /// Go `*ast.NodeList`. `NodeList::NIL` is Go `nil`. Equality is pointer
 /// equality, like Go.
-// PERF: U1 (e). A list that the parser made in a store and that no node
-// data holds yet is a pending handle (`PendingList`): its ids live in the
-// AST bump arena, and `store_list_value` builds the astdata list once, in the
-// node data. The handle stays 16 bytes (tag, file or index, pointer), so it
-// returns in registers; that is why the synthetic lists are variants here,
-// not a nested `SyntheticList`. The checker reads `Ts` handles of parsed
-// data; the `Pending` arms are for the parse.
+// PERF: astshrink1. Node data holds a list field as a 4-byte index into the
+// list table of its owner (`crate::astdata::NodeList`); the handle names the
+// table entry, so a list that the parser made and the same list read from
+// node data are one list, like the Go pointer. The handle stays 16 bytes
+// (tag, file or index, pointer), so it returns in registers.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NodeList(ListRef);
 
@@ -1622,24 +1793,17 @@ enum ListRef {
     /// Go `nil`.
     #[default]
     Nil,
-    /// A astdata list field of the node data of store `file`. It lives for
-    /// the process.
+    /// A list of static store `file` (`StaticList`). It lives for the
+    /// process.
     Ts {
         file: u32,
-        list: &'static crate::astdata::NodeList,
+        list: &'static StaticList,
     },
-    /// A store list of store `file` that no node data holds yet.
-    Pending {
-        file: u32,
-        list: &'static PendingList,
-    },
-    /// A list field of synthetic node data (`SyntheticList::Field`).
-    Field { data: u32, sel: ListSel },
-    /// A synthetic factory list (`SyntheticList::Own`).
+    /// A list of this thread's synthetic arena (`SyntheticList::Own`): a
+    /// factory list or a list field of synthetic node data.
     Own { index: u32 },
     /// A list of a store that owns its nodes (a freeable parse, lsshells
-    /// M3c): a list field of node data or a pending list, read at each use
-    /// (`with_store_list`).
+    /// M3c), read at each use (`with_store_list`).
     Store(StoreList),
 }
 
@@ -1648,7 +1812,6 @@ const _: () = assert!(std::mem::size_of::<NodeList>() == 16);
 impl ListRef {
     fn synthetic(list: SyntheticList) -> Self {
         match list {
-            SyntheticList::Field { data, sel } => Self::Field { data, sel },
             SyntheticList::Own { index } => Self::Own { index },
             SyntheticList::Slice { .. } => panic!("a node slice is not a NodeList"),
         }
@@ -1656,9 +1819,8 @@ impl ListRef {
 
     fn synthetic_list(self) -> Option<SyntheticList> {
         match self {
-            Self::Field { data, sel } => Some(SyntheticList::Field { data, sel }),
             Self::Own { index } => Some(SyntheticList::Own { index }),
-            Self::Nil | Self::Ts { .. } | Self::Pending { .. } | Self::Store(_) => None,
+            Self::Nil | Self::Ts { .. } | Self::Store(_) => None,
         }
     }
 }
@@ -1669,16 +1831,9 @@ impl PartialEq for NodeList {
             (true, true) => true,
             (false, false) => match (self.0, other.0) {
                 (ListRef::Ts { list: a, .. }, ListRef::Ts { list: b, .. }) => std::ptr::eq(a, b),
-                // A pending handle equals only itself (the astdata copies in
-                // node data are other lists, plan risk 2).
-                (ListRef::Pending { list: a, .. }, ListRef::Pending { list: b, .. }) => {
-                    std::ptr::eq(a, b)
-                }
                 (ListRef::Store(a), ListRef::Store(b)) => same_store_list(a, b),
-                (a, b) => match (a.synthetic_list(), b.synthetic_list()) {
-                    (Some(a), Some(b)) => synthetic_list_eq(a, b),
-                    _ => false,
-                },
+                (ListRef::Own { index: a }, ListRef::Own { index: b }) => a == b,
+                _ => false,
             },
             _ => false,
         }
@@ -1691,28 +1846,29 @@ impl NodeList {
     /// Go `nil`.
     pub const NIL: Self = Self(ListRef::Nil);
 
-    /// The handle of astdata list `list` of parsed file `file`: a list field
-    /// of node data, or a leaked list. `None` is Go `nil`.
+    /// The handle of list `list` of static store `file`.
     #[inline]
     #[must_use]
-    pub fn from_ts(file: usize, list: Option<&'static crate::astdata::NodeList>) -> Self {
-        match list {
-            Some(list) => Self(ListRef::Ts {
-                file: file as u32,
-                list,
-            }),
-            None => Self::NIL,
-        }
-    }
-
-    /// The handle of pending list `list` of store `file` (U1 (e)).
-    #[inline]
-    #[must_use]
-    pub(crate) fn pending(file: usize, list: &'static PendingList) -> Self {
-        Self(ListRef::Pending {
+    pub(crate) fn from_static(file: usize, list: &'static StaticList) -> Self {
+        Self(ListRef::Ts {
             file: file as u32,
             list,
         })
+    }
+
+    /// The handle of list field `list` (`None` is Go `nil`) of node data of
+    /// static store `file`, whose list table is `lists`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_table(
+        file: usize,
+        lists: &'static [&'static StaticList],
+        list: Option<&crate::astdata::NodeList>,
+    ) -> Self {
+        match list {
+            Some(list) => Self::from_static(file, lists[list.index()]),
+            None => Self::NIL,
+        }
     }
 
     /// The handle of a list of this thread's synthetic arena.
@@ -1736,19 +1892,37 @@ impl NodeList {
     pub fn file(self) -> usize {
         match self.0 {
             ListRef::Nil => 0,
-            ListRef::Ts { file, .. } | ListRef::Pending { file, .. } => file as usize,
+            ListRef::Ts { file, .. } => file as usize,
             ListRef::Store(list) => list.file(),
-            ListRef::Field { .. } | ListRef::Own { .. } => SYNTHETIC_NODE_FILE,
+            ListRef::Own { .. } => SYNTHETIC_NODE_FILE,
         }
     }
 
-    /// The astdata list of a handle of parsed data. `None` for
-    /// `NodeList::NIL`, a pending list and a synthetic list.
+    /// The list of a static store, else `None`.
     #[inline]
     #[must_use]
-    pub fn ts_list(self) -> Option<&'static crate::astdata::NodeList> {
+    pub fn static_list(self) -> Option<&'static StaticList> {
         match self.0 {
             ListRef::Ts { list, .. } => Some(list),
+            _ => None,
+        }
+    }
+
+    /// True for the Go `nil` handle (`NodeList::NIL`). Unlike `is_nil`,
+    /// false for a nil marker list (`store::NIL_LIST_POS`).
+    #[inline]
+    #[must_use]
+    pub(crate) const fn is_nil_handle(self) -> bool {
+        matches!(self.0, ListRef::Nil)
+    }
+
+    /// The store id and the list of a list of a static store, else `None`
+    /// (`store::store_list_value`).
+    #[inline]
+    #[must_use]
+    pub(crate) fn static_parts(self) -> Option<(usize, &'static StaticList)> {
+        match self.0 {
+            ListRef::Ts { file, list } => Some((file as usize, list)),
             _ => None,
         }
     }
@@ -1758,16 +1932,6 @@ impl NodeList {
     #[must_use]
     pub fn synthetic_list(self) -> Option<SyntheticList> {
         self.0.synthetic_list()
-    }
-
-    /// The pending store list of the handle (U1 (e)), else `None`.
-    #[inline]
-    #[must_use]
-    pub fn pending_list(self) -> Option<&'static PendingList> {
-        match self.0 {
-            ListRef::Pending { list, .. } => Some(list),
-            _ => None,
-        }
     }
 
     /// The list of a store that owns its nodes (lsshells M3c), else `None`.
@@ -1791,9 +1955,8 @@ impl NodeList {
         match self.0 {
             ListRef::Nil => None,
             ListRef::Ts { list, .. } => Some(std::ptr::from_ref(list).cast()),
-            ListRef::Pending { list, .. } => Some(std::ptr::from_ref(list).cast()),
             ListRef::Store(list) => Some(with_store_list(list, |l| l.ptr())),
-            repr => repr.synthetic_list().map(synthetic_list_ptr),
+            ListRef::Own { index } => Some(synthetic_list_ptr(SyntheticList::Own { index })),
         }
     }
 
@@ -1806,12 +1969,11 @@ impl NodeList {
     pub fn stored_trailing_comma(self) -> bool {
         match self.0 {
             ListRef::Nil => false,
-            ListRef::Ts { list, .. } => list.has_trailing_comma,
-            ListRef::Pending { list, .. } => list.has_trailing_comma,
+            ListRef::Ts { list, .. } => list.has_trailing_comma(),
             ListRef::Store(list) => list.stored_trailing_comma(),
-            repr => repr
-                .synthetic_list()
-                .is_some_and(|list| with_synthetic_list(list, |l| l.nodes().has_trailing_comma)),
+            ListRef::Own { index } => {
+                with_synthetic_list(SyntheticList::Own { index }, |l| l.has_trailing_comma)
+            }
         }
     }
 
@@ -1822,32 +1984,19 @@ impl NodeList {
     pub fn with_missing_marker(self) -> NodeList {
         match self.0 {
             ListRef::Nil => self,
-            ListRef::Ts { file, list } => Self(ListRef::Ts {
-                file,
-                list: Box::leak(Box::new(crate::astdata::NodeList {
-                    range: list.range,
-                    nodes: Vec::new(),
-                    has_trailing_comma: true,
-                })),
-            }),
-            ListRef::Pending { file, list } => Self(ListRef::Pending {
-                file,
-                list: crate::ast::store::leak_in_ast_arena(PendingList {
-                    range: list.range,
-                    nodes: &[],
-                    has_trailing_comma: true,
-                }),
-            }),
+            ListRef::Ts { file, list } => Self::from_static(
+                file as usize,
+                new_static_missing_list(file as usize, list.range),
+            ),
             // lsshells M3c: the store that owns its nodes keeps the list.
             ListRef::Store(list) => {
                 let range = with_store_list(list, |l| l.range());
                 Self(ListRef::Store(new_store_missing_list(list.file(), range)))
             }
             // A factory parse (lazy JSDoc): the thread's arena owns the list.
-            repr => match repr.synthetic_list() {
-                Some(list) => Self::synthetic(synthetic_missing_list(list)),
-                None => self,
-            },
+            ListRef::Own { index } => {
+                Self::synthetic(synthetic_missing_list(SyntheticList::Own { index }))
+            }
         }
     }
 
@@ -1859,10 +2008,9 @@ impl NodeList {
     pub fn is_nil(self) -> bool {
         match self.0 {
             ListRef::Nil => true,
-            ListRef::Ts { list, .. } => is_nil_list_marker(list),
-            ListRef::Pending { list, .. } => is_nil_list_range(&list.range),
+            ListRef::Ts { list, .. } => is_nil_list_range(&list.range),
             ListRef::Store(list) => list.is_nil_marker(),
-            ListRef::Field { .. } | ListRef::Own { .. } => false,
+            ListRef::Own { .. } => false,
         }
     }
 
@@ -1875,11 +2023,10 @@ impl NodeList {
     #[must_use]
     pub fn nodes(self) -> NodeSlice {
         match self.0 {
-            ListRef::Ts { file, list } => NodeSlice::from_ids(file as usize, &list.nodes),
+            ListRef::Ts { file, list } => NodeSlice::from_ids(file as usize, list.nodes),
             ListRef::Nil => NodeSlice::NIL,
-            ListRef::Pending { file, list } => NodeSlice::from_ids(file as usize, list.nodes),
             ListRef::Store(list) => NodeSlice::from_store(list),
-            repr => NodeSlice::from_synthetic(repr.synthetic_list().expect("synthetic list")),
+            ListRef::Own { index } => NodeSlice::from_synthetic(SyntheticList::Own { index }),
         }
     }
 
@@ -1890,10 +2037,6 @@ impl NodeList {
             ListRef::Nil => panic!("nil NodeList dereference"),
             // Store lists hold the Go `Loc`.
             ListRef::Ts { list, .. } => {
-                assert!(!is_nil_list_marker(list), "nil NodeList dereference");
-                text_range_of(&list.range)
-            }
-            ListRef::Pending { list, .. } => {
                 assert!(!is_nil_list_range(&list.range), "nil NodeList dereference");
                 text_range_of(&list.range)
             }
@@ -1903,9 +2046,8 @@ impl NodeList {
                 text_range_of(&range)
             }
             // A synthetic list holds the Go `Loc`.
-            repr => {
-                let list = repr.synthetic_list().expect("synthetic list");
-                with_synthetic_list(list, |l| text_range_of(&l.nodes().range))
+            ListRef::Own { index } => {
+                with_synthetic_list(SyntheticList::Own { index }, |l| text_range_of(&l.range))
             }
         }
     }
@@ -1938,109 +2080,39 @@ impl NodeList {
 // ──────────────────────────────────────────────────────────────────────
 
 /// Go `*ast.ModifierList`. `ModifierList::NIL` is Go `nil`. Equality is
-/// pointer equality, like Go.
-// PERF: U1 (e). A parser list that no node data holds yet is a pending
-// handle (`PendingModifierList`), as for `NodeList`. 16 bytes.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ModifierList(ModifiersRef);
-
-/// The list that a `ModifierList` names.
-#[derive(Clone, Copy, Debug, Default)]
-enum ModifiersRef {
-    /// Go `nil`.
-    #[default]
-    Nil,
-    /// A astdata list of parsed file `file` (see `ListRef::Ts`).
-    Ts {
-        file: u32,
-        list: &'static crate::astdata::ModifierList,
-    },
-    /// A store list of store `file` that no node data holds yet.
-    Pending {
-        file: u32,
-        list: &'static PendingModifierList,
-    },
-    /// A modifier list field of synthetic node data
-    /// (`SyntheticList::Field`).
-    Field { data: u32, sel: ListSel },
-    /// A synthetic factory modifier list (`SyntheticList::Own`).
-    Own { index: u32 },
-    /// A modifier list of a store that owns its nodes (lsshells M3c, see
-    /// `ListRef::Store`).
-    Store(StoreList),
-}
+/// pointer equality, like Go. It names a list table entry like `NodeList`
+/// (astshrink1); the entry holds Go `ModifiersToFlags`. 16 bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModifierList(NodeList);
 
 const _: () = assert!(std::mem::size_of::<ModifierList>() == 16);
 
-impl ModifiersRef {
-    fn synthetic_list(self) -> Option<SyntheticList> {
-        match self {
-            Self::Field { data, sel } => Some(SyntheticList::Field { data, sel }),
-            Self::Own { index } => Some(SyntheticList::Own { index }),
-            Self::Nil | Self::Ts { .. } | Self::Pending { .. } | Self::Store(_) => None,
-        }
-    }
-}
-
-impl PartialEq for ModifierList {
-    fn eq(&self, other: &Self) -> bool {
-        match (self.0, other.0) {
-            (ModifiersRef::Nil, ModifiersRef::Nil) => true,
-            (ModifiersRef::Ts { list: a, .. }, ModifiersRef::Ts { list: b, .. }) => {
-                std::ptr::eq(a, b)
-            }
-            (ModifiersRef::Pending { list: a, .. }, ModifiersRef::Pending { list: b, .. }) => {
-                std::ptr::eq(a, b)
-            }
-            (ModifiersRef::Store(a), ModifiersRef::Store(b)) => same_store_list(a, b),
-            (a, b) => match (a.synthetic_list(), b.synthetic_list()) {
-                (Some(a), Some(b)) => synthetic_list_eq(a, b),
-                _ => false,
-            },
-        }
-    }
-}
-
-impl Eq for ModifierList {}
-
 impl ModifierList {
     /// Go `nil`.
-    pub const NIL: Self = Self(ModifiersRef::Nil);
+    pub const NIL: Self = Self(NodeList::NIL);
 
-    /// The handle of astdata list `list` of file `file` (see
-    /// `NodeList::from_ts`). `None` is Go `nil`.
+    /// The handle of modifier list `list` of static store `file`.
     #[inline]
     #[must_use]
-    pub fn from_ts(file: usize, list: Option<&'static crate::astdata::ModifierList>) -> Self {
-        match list {
-            Some(list) => Self(ModifiersRef::Ts {
-                file: file as u32,
-                list,
-            }),
-            None => Self::NIL,
-        }
+    pub(crate) fn from_static(file: usize, list: &'static StaticList) -> Self {
+        Self(NodeList::from_static(file, list))
     }
 
-    /// The handle of pending list `list` of store `file` (U1 (e)).
+    /// `NodeList::from_table` for a modifier list field.
     #[inline]
     #[must_use]
-    pub(crate) fn pending(file: usize, list: &'static PendingModifierList) -> Self {
-        Self(ModifiersRef::Pending {
-            file: file as u32,
-            list,
-        })
+    pub(crate) fn from_table(
+        file: usize,
+        lists: &'static [&'static StaticList],
+        list: Option<&crate::astdata::ModifierList>,
+    ) -> Self {
+        Self(NodeList::from_table(file, lists, list.map(|m| &m.list)))
     }
 
     /// The handle of a modifier list of this thread's synthetic arena.
     #[must_use]
     pub fn synthetic(list: SyntheticList) -> Self {
-        Self(match ListRef::synthetic(list) {
-            ListRef::Field { data, sel } => ModifiersRef::Field { data, sel },
-            ListRef::Own { index } => ModifiersRef::Own { index },
-            ListRef::Nil | ListRef::Ts { .. } | ListRef::Pending { .. } | ListRef::Store(_) => {
-                unreachable!()
-            }
-        })
+        Self(NodeList::synthetic(list))
     }
 
     /// The handle of modifier list `list` of a store that owns its nodes
@@ -2048,7 +2120,7 @@ impl ModifierList {
     #[inline]
     #[must_use]
     pub fn store(list: StoreList) -> Self {
-        Self(ModifiersRef::Store(list))
+        Self(NodeList::store(list))
     }
 
     /// The file of the list (see `NodeList::file`). 0 for
@@ -2056,23 +2128,14 @@ impl ModifierList {
     #[inline]
     #[must_use]
     pub fn file(self) -> usize {
-        match self.0 {
-            ModifiersRef::Nil => 0,
-            ModifiersRef::Ts { file, .. } | ModifiersRef::Pending { file, .. } => file as usize,
-            ModifiersRef::Store(list) => list.file(),
-            ModifiersRef::Field { .. } | ModifiersRef::Own { .. } => SYNTHETIC_NODE_FILE,
-        }
+        self.0.file()
     }
 
-    /// The astdata list of a handle of parsed data. `None` for
-    /// `ModifierList::NIL`, a pending list and a synthetic list.
+    /// The list of a static store, else `None`.
     #[inline]
     #[must_use]
-    pub fn ts_list(self) -> Option<&'static crate::astdata::ModifierList> {
-        match self.0 {
-            ModifiersRef::Ts { list, .. } => Some(list),
-            _ => None,
-        }
+    pub fn static_list(self) -> Option<&'static StaticList> {
+        self.0.static_list()
     }
 
     /// The synthetic list of the handle, else `None`.
@@ -2082,29 +2145,16 @@ impl ModifierList {
         self.0.synthetic_list()
     }
 
-    /// The pending store list of the handle (U1 (e)), else `None`.
-    #[inline]
-    #[must_use]
-    pub fn pending_list(self) -> Option<&'static PendingModifierList> {
-        match self.0 {
-            ModifiersRef::Pending { list, .. } => Some(list),
-            _ => None,
-        }
-    }
-
     /// The list of a store that owns its nodes (lsshells M3c), else `None`.
     #[inline]
     #[must_use]
     pub fn store_list(self) -> Option<StoreList> {
-        match self.0 {
-            ModifiersRef::Store(list) => Some(list),
-            _ => None,
-        }
+        self.0.store_list()
     }
 
     #[must_use]
     pub const fn is_nil(self) -> bool {
-        matches!(self.0, ModifiersRef::Nil)
+        matches!(self.0.0, ListRef::Nil)
     }
 
     #[must_use]
@@ -2115,41 +2165,28 @@ impl ModifierList {
     /// Go `modifiers.NodeList`.
     #[must_use]
     pub fn node_list(self) -> NodeList {
-        match self.0 {
-            ModifiersRef::Nil => NodeList::NIL,
-            ModifiersRef::Ts { file, list } => NodeList(ListRef::Ts {
-                file,
-                list: &list.list,
-            }),
-            ModifiersRef::Pending { file, list } => NodeList(ListRef::Pending {
-                file,
-                list: &list.list,
-            }),
-            ModifiersRef::Field { data, sel } => NodeList(ListRef::Field { data, sel }),
-            ModifiersRef::Own { index } => NodeList(ListRef::Own { index }),
-            ModifiersRef::Store(list) => NodeList(ListRef::Store(list)),
-        }
+        self.0
     }
 
     /// Go `modifiers.Nodes`. Empty when nil.
     #[must_use]
     pub fn nodes(self) -> NodeSlice {
-        self.node_list().nodes()
+        self.0.nodes()
     }
 
     #[must_use]
     pub fn pos(self) -> i32 {
-        self.node_list().pos()
+        self.0.pos()
     }
 
     #[must_use]
     pub fn end(self) -> i32 {
-        self.node_list().end()
+        self.0.end()
     }
 
     #[must_use]
     pub fn loc(self) -> TextRange {
-        self.node_list().loc()
+        self.0.loc()
     }
 
     // Go: ast.go:157 ModifierList.ModifierFlags (set at ast.go:162)
@@ -2160,15 +2197,13 @@ impl ModifierList {
     // they read it like Go does instead of walking the modifier nodes.
     #[must_use]
     pub fn modifier_flags(self) -> ModifierFlags {
-        match self.0 {
-            ModifiersRef::Nil => ModifierFlags::NONE,
-            // A store list.
-            ModifiersRef::Ts { list, .. } => ModifierFlags(list.flags.0),
-            ModifiersRef::Pending { list, .. } => ModifierFlags(list.flags.0),
-            ModifiersRef::Store(list) => with_store_list(list, |l| l.modifier_flags()),
-            repr => with_synthetic_list(repr.synthetic_list().expect("synthetic list"), |m| {
-                ModifierFlags(m.modifiers().flags.0)
-            }),
+        match self.0.0 {
+            ListRef::Nil => ModifierFlags::NONE,
+            ListRef::Ts { list, .. } => ModifierFlags(list.modifier_flags().0),
+            ListRef::Store(list) => with_store_list(list, |l| l.modifier_flags()),
+            ListRef::Own { index } => {
+                with_synthetic_list(SyntheticList::Own { index }, |l| ModifierFlags(l.flags.0))
+            }
         }
     }
 }
@@ -2337,13 +2372,19 @@ impl Node {
         if is_synthetic_node(self) {
             return synthetic_kind(self);
         }
+        // PERF: storefast1. A node of the file this thread parses reads its
+        // kind column, with no whole header (as `flags_slow`).
+        if let Some(kind) = active_store_kind(self) {
+            return kind;
+        }
         // A store node holds the Go kind in its header.
         if let Some(h) = try_store_header(self) {
             return h.kind;
         }
         // Go reads the kind of a nil node.
         if self.is_nil() {
-            crate::core::go_nil_dereference();
+            // Go N' loads `node.Kind` (offset 0): addr=0x0.
+            crate::core::go_nil_dereference_at(0x0);
         }
         unreachable!("node {self:?} is not synthetic and has no store")
     }
@@ -2363,9 +2404,11 @@ impl Node {
     /// Go `node.Flags & mask` for a `mask` without a binder-added bit
     /// (`BINDER_ADDED_FLAGS`). For such a mask the binder bits do not
     /// matter, so a published store node reads only its record flags.
-    // PERF: U4 (CH7). `Node::flags` loads the binder data of the file
-    // (`Node::bind`) for every test, also of a parser-only bit such as
-    // `AMBIENT`, `OPTIONAL_CHAIN` or `HAS_JS_DOC`.
+    // PERF: U4 (CH7). When this was added, `Node::flags` loaded the binder
+    // data of the file (`Node::bind`) for every test, also of a parser-only
+    // bit such as `AMBIENT`, `OPTIONAL_CHAIN` or `HAS_JS_DOC`. Since AST
+    // node records step 2a the bind ORs its flags into the record, so this
+    // is now the same read as `Node::flags() & mask`.
     #[inline]
     #[must_use]
     pub fn parser_flags(self, mask: NodeFlags) -> NodeFlags {
@@ -2389,8 +2432,9 @@ impl Node {
         // PERF: a node of the file this thread parses (query Q8). No
         // program holds that file yet, so there are no binder flags and no
         // `FROZEN` or program check is needed.
-        if let Some(h) = active_store_header(self) {
-            return h.flags;
+        // PERF: storefast1. Only the flags word of its record.
+        if let Some(flags) = active_store_flags(self) {
+            return flags;
         }
         if is_synthetic_node(self) {
             return synthetic_flags(self);
@@ -2884,7 +2928,7 @@ impl Node {
     // has no generated accessor.
     #[must_use]
     pub fn body(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
             [
@@ -2894,12 +2938,12 @@ impl Node {
                 SetAccessorDeclaration,
                 ConstructorDeclaration,
                 ModuleDeclaration,
-            ] => |f, d| opt(f, d.body),
+            ] => |ids, d| ids.opt(d.body),
             [
                 FunctionExpression,
                 ArrowFunction,
                 ClassStaticBlockDeclaration,
-            ] => |f, d| req(f, d.body),
+            ] => |ids, d| ids.node(d.body),
         )
     }
 
@@ -3086,7 +3130,7 @@ impl Node {
     // field has no generated accessor.
     #[must_use]
     pub fn raw_text(self) -> &'static str {
-        fn raw_text_of(d: &NodeData) -> Option<&str> {
+        fn raw_text_of(d: NodeData<'_>) -> Option<&str> {
             match d {
                 NodeData::TemplateHead(d) => Some(&d.raw_text),
                 NodeData::TemplateMiddle(d) => Some(&d.raw_text),
@@ -3325,7 +3369,7 @@ impl Node {
     // Go: ast.go:805 TagName
     #[must_use]
     pub fn tag_name(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
             [
@@ -3353,17 +3397,17 @@ impl Node {
                 JsDocSatisfiesTag,
                 JsDocThrowsTag,
                 JsDocImportTag,
-            ] => |f, d| req(f, d.tag_name),
+            ] => |ids, d| ids.node(d.tag_name),
         )
     }
 
     // Go: ast.go:859 PropertyName
     #[must_use]
     pub fn property_name(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
-            [ImportSpecifier, ExportSpecifier, BindingElement] => |f, d| opt(f, d.property_name),
+            [ImportSpecifier, ExportSpecifier, BindingElement] => |ids, d| ids.opt(d.property_name),
         )
     }
 
@@ -3448,17 +3492,17 @@ impl Node {
     // generated accessor.
     #[must_use]
     pub fn attributes(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
-            [JsxOpeningElement, JsxSelfClosingElement] => |f, d| req(f, d.attributes),
+            [JsxOpeningElement, JsxSelfClosingElement] => |ids, d| ids.node(d.attributes),
             [
                 ModuleDeclaration,
                 ImportDeclaration,
                 ExportDeclaration,
                 ImportTypeNode,
                 JsDocImportTag,
-            ] => |f, d| opt(f, d.attributes),
+            ] => |ids, d| ids.opt(d.attributes),
         )
     }
 
@@ -3488,17 +3532,17 @@ impl Node {
     // Go: ast.go:1000 ImportClause
     #[must_use]
     pub fn import_clause(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
-            [ImportDeclaration, JsDocImportTag] => |f, d| opt(f, d.import_clause),
+            [ImportDeclaration, JsDocImportTag] => |ids, d| ids.opt(d.import_clause),
         )
     }
 
     // Go: ast.go:1010 Statement
     #[must_use]
     pub fn statement(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
             [
@@ -3508,7 +3552,7 @@ impl Node {
                 ForInOrOfStatement,
                 WithStatement,
                 LabeledStatement,
-            ] => |f, d| req(f, d.statement),
+            ] => |ids, d| ids.node(d.statement),
         )
     }
 
@@ -3643,7 +3687,7 @@ impl Node {
     // Go: ast.go:1112 QuestionDotToken
     #[must_use]
     pub fn question_dot_token(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
             [
@@ -3651,7 +3695,7 @@ impl Node {
                 PropertyAccessExpression,
                 CallExpression,
                 TaggedTemplateExpression,
-            ] => |f, d| opt(f, d.question_dot_token),
+            ] => |ids, d| ids.opt(d.question_dot_token),
         )
     }
 
@@ -3660,7 +3704,7 @@ impl Node {
     // `TypeExpression` fields have no generated accessor.
     #[must_use]
     pub fn type_expression(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
             [
@@ -3668,24 +3712,24 @@ impl Node {
                 JsDocReturnTag,
                 JsDocTypedefTag,
                 JsDocThrowsTag,
-            ] => |f, d| opt(f, d.type_expression),
+            ] => |ids, d| ids.opt(d.type_expression),
             [
                 JsDocTypeTag,
                 JsDocCallbackTag,
                 JsDocSatisfiesTag,
                 JsDocThisTag,
                 JsDocOverloadTag,
-            ] => |f, d| req(f, d.type_expression),
+            ] => |ids, d| ids.node(d.type_expression),
         )
     }
 
     // Go: ast.go:1146 ClassName
     #[must_use]
     pub fn class_name(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
-            [JsDocAugmentsTag, JsDocImplementsTag] => |f, d| req(f, d.class_name),
+            [JsDocAugmentsTag, JsDocImplementsTag] => |ids, d| ids.node(d.class_name),
         )
     }
 
@@ -3737,7 +3781,67 @@ impl Node {
 // PORT: the per-struct Go methods are merged into one match. The order of
 // each arm follows the generated Go code.
 fn for_each_child_dyn(n: Node, v: &mut dyn FnMut(Node) -> bool) -> bool {
+    // Go `switch n.Kind`: a kind with no case returns false and never reads
+    // `n.data`.
+    // PERF: noderef1 W1. 35 to 48% of the walk entries are tokens and
+    // identifiers (getsym1 report). Their kind is one load from the block
+    // that the node data read needs anyway.
+    if let Some(f) = frozen_store_node(n) {
+        let kind = f.kind();
+        if has_no_child_fields(kind) {
+            debug_assert!(
+                f.data().is_none_or(|d| {
+                    let mut fields = 0;
+                    for_each_child_field(kind, n, d, |_| fields += 1);
+                    fields == 0
+                }),
+                "{kind:?} has child fields"
+            );
+            return false;
+        }
+        // PERF: perfP1 item 1 (perfscan2). A node whose child chain is
+        // known (R2-5 `SlotLinks`, Go `ForEachChild` order; the binder walks
+        // it) walks the chain: two loads per child from one column, no
+        // node data match. Debug builds compare it with the data walk.
+        if let Some(children) = f.children() {
+            debug_assert!(
+                children.eq(children_by_data(n)),
+                "child links differ from the data walk of {kind:?}"
+            );
+            for child in children {
+                if v(child) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if let Some(data) = f.data() {
+            let mut visit = FrozenChildVisit {
+                kind,
+                id_map: f.ids(),
+                lists: f.lists(),
+                file: n.file_index(),
+                v,
+            };
+            return walk_children(data, &mut visit);
+        }
+    }
     for_each_child_impl(n, v, None)
+}
+
+/// The children of `n` from its node data (`for_each_child_impl`), not
+/// from its child chain: the debug check of the chain walk.
+fn children_by_data(n: Node) -> std::vec::IntoIter<Node> {
+    let mut out = Vec::new();
+    for_each_child_impl(
+        n,
+        &mut |c| {
+            out.push(c);
+            false
+        },
+        None,
+    );
+    out.into_iter()
 }
 
 /// A list slot seen by `for_each_child_and_lists`: the list and whether it
@@ -3757,6 +3861,8 @@ impl Node {
     }
 }
 
+/// The walk of `for_each_child_dyn` for a node that is not a published
+/// store node with node data, and the walk of `for_each_child_and_lists`.
 fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<ListHook>) -> bool {
     let Some(data) = static_ast_node(n) else {
         return for_each_scoped_child(n, v, lists);
@@ -3807,10 +3913,28 @@ fn for_each_scoped_child(
 // `Node::new_slow`), a store lookup each.
 pub(crate) fn for_each_store_child_id(
     kind: SyntaxKind,
-    data: &NodeData,
-    v: impl FnMut(u32) -> bool,
+    data: NodeData<'_>,
+    lists: ListIds<'_>,
+    v: impl StoreChildSink,
 ) -> bool {
-    walk_children(data, &mut StoreChildIds { kind, v })
+    walk_children(data, &mut StoreChildIds { kind, lists, v })
+}
+
+/// R3-2: what `for_each_store_child_id` calls with the slot index of each
+/// child (`child` returns true to stop the walk). A closure is one.
+// PERF: storefast1. A sink whose `child` is `#[inline(always)]` (the
+// parser's parent writes, `ParentLinks` in store.rs) is inlined into each
+// arm of `walk_children`, as the generic walk is (`NodeChildVisit`). A
+// closure stays a call per child.
+pub(crate) trait StoreChildSink {
+    fn child(&mut self, index: u32) -> bool;
+}
+
+impl<F: FnMut(u32) -> bool> StoreChildSink for F {
+    #[inline(always)]
+    fn child(&mut self, index: u32) -> bool {
+        self(index)
+    }
 }
 
 /// R3-2: the fields that one arm of `walk_children` visits, in Go
@@ -3844,7 +3968,8 @@ trait ChildVisit<'d> {
     }
 }
 
-/// The generic walk of `for_each_child_impl`.
+/// The generic walk of `for_each_child_impl`: the nodes that are not
+/// published store nodes, and the list hook of `for_each_child_and_lists`.
 // PERF: the methods are always inlined, so each arm of `walk_children`
 // compiles to the same code as the macros of the old single match.
 struct NodeChildVisit<'a, 'b> {
@@ -3884,17 +4009,17 @@ impl ChildVisit<'static> for NodeChildVisit<'_, '_> {
 
     #[inline(always)]
     fn list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
-        self.visit_list(list(self.file, l))
+        self.visit_list(data_list(self.n, *l))
     }
 
     #[inline(always)]
     fn opt_list(&mut self, l: &'static Option<crate::astdata::NodeList>) -> bool {
-        self.visit_list(opt_list(self.file, l))
+        self.visit_list(l.map_or(NodeList::NIL, |l| data_list(self.n, l)))
     }
 
     #[inline(always)]
     fn mods(&mut self, m: &'static Option<crate::astdata::ModifierList>) -> bool {
-        let m = mods(self.file, m);
+        let m = m.map_or(ModifierList::NIL, |m| data_modifiers(self.n, m));
         self.report(m.node_list(), true);
         visit_modifiers(self.v, m)
     }
@@ -3910,12 +4035,87 @@ impl ChildVisit<'static> for NodeChildVisit<'_, '_> {
     }
 }
 
+/// The walk of `for_each_child_dyn` over the data of a published store
+/// node (`FrozenNode`). It visits like `NodeChildVisit`, and makes each
+/// child handle from the id map of the store (`FrozenIds`) that the node
+/// lookup read. It has no list hook: `for_each_child_and_lists` walks with
+/// `NodeChildVisit`.
+// PERF: noderef1 W2. `NodeChildVisit` makes each child with an out-of-line
+// `req` or `opt` call, a registry lookup each (about 25 instructions per
+// field, Go 7, getsym1 report), and each list with a third lookup
+// (`NodeSlice::iter`).
+// PERF: noderef1 W3. Without the hook, the walk has no run-time hook test
+// and no `NodeList` handles on the stack (Go: one `ForEachChild`, no hook).
+struct FrozenChildVisit<'a> {
+    /// Go `n.Kind` (`case_expression`).
+    kind: SyntaxKind,
+    id_map: FrozenIds,
+    /// The list table of the node data (`BlockFile::lists`).
+    lists: &'static [&'static StaticList],
+    file: usize,
+    v: &'a mut dyn FnMut(Node) -> bool,
+}
+
+impl FrozenChildVisit<'_> {
+    /// Go `visitNodeList` of a list field.
+    #[inline(always)]
+    fn visit_list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
+        let l = self.lists[l.index()];
+        !is_nil_list_range(&l.range) && self.ids(l.nodes)
+    }
+}
+
+impl ChildVisit<'static> for FrozenChildVisit<'_> {
+    #[inline(always)]
+    fn node(&mut self, id: crate::astdata::NodeId) -> bool {
+        let child = self.id_map.node(id);
+        debug_assert_eq!(child, Node::new(self.file, id));
+        visit(self.v, child)
+    }
+
+    #[inline(always)]
+    fn opt(&mut self, id: Option<crate::astdata::NodeId>) -> bool {
+        id.is_some_and(|id| self.node(id))
+    }
+
+    #[inline(always)]
+    fn list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
+        self.visit_list(l)
+    }
+
+    #[inline(always)]
+    fn opt_list(&mut self, l: &'static Option<crate::astdata::NodeList>) -> bool {
+        l.as_ref().is_some_and(|l| self.visit_list(l))
+    }
+
+    // Go `visitModifiers`: `ModifierList::is_some` has no nil marker.
+    #[inline(always)]
+    fn mods(&mut self, m: &'static Option<crate::astdata::ModifierList>) -> bool {
+        m.as_ref()
+            .is_some_and(|m| self.ids(self.lists[m.list.index()].nodes))
+    }
+
+    /// Go `visitNodes`: no nil test.
+    #[inline(always)]
+    fn ids(&mut self, ids: &'static [crate::astdata::NodeId]) -> bool {
+        let (map, file) = (self.id_map, self.file);
+        ids.iter().any(|&id| {
+            let child = map.node(id);
+            debug_assert_eq!(child, Node::new(file, id));
+            (self.v)(child)
+        })
+    }
+
+    #[inline(always)]
+    fn case_expression(&mut self, id: crate::astdata::NodeId) -> bool {
+        self.kind == SyntaxKind::CaseClause && self.node(id)
+    }
+}
+
 /// The walk of `for_each_child_impl` over the data of a node of `file`
 /// with no `'static` node: a factory node, or a node that a freeable parse
 /// owns (lsshells M3c). The data is read in a scope, so each list is read
-/// in place (`DataList`), and the list hook gets a copy of it that the
-/// thread's synthetic arena owns (`copy_synthetic_list`, or a factory list
-/// of the same nodes for a store list). Otherwise it visits like
+/// through its handle (`DataList`). Otherwise it visits like
 /// `NodeChildVisit`.
 struct ScopedChildVisit<'a, 'b> {
     n: Node,
@@ -3927,25 +4127,16 @@ struct ScopedChildVisit<'a, 'b> {
 
 impl ScopedChildVisit<'_, '_> {
     /// `NodeChildVisit::report` for a list read in place.
-    // PORT: only the `astdump` tool reads the lists. The copy of a store
-    // list has the nodes and `Loc` of the list, not its missing-list bit.
-    fn report(&mut self, l: DataList<'_>, is_mod: bool) {
-        let file = self.file;
-        if let (Some(h), Some(list)) = (self.lists.as_mut(), l.list) {
-            if l.is_some() {
-                let copy = if file == SYNTHETIC_NODE_FILE {
-                    copy_synthetic_list(list)
-                } else {
-                    let nodes: Vec<Node> = l.nodes().collect();
-                    new_synthetic_node_list(&nodes, text_range_of(&list.range))
-                };
-                h(copy, is_mod);
-            }
+    fn report(&mut self, l: DataList, is_mod: bool) {
+        if let Some(h) = self.lists.as_mut()
+            && l.is_some()
+        {
+            h(l.list, is_mod);
         }
     }
 
     /// Go `visitNodes` over the nodes of `l`.
-    fn visit_nodes(&mut self, l: DataList<'_>) -> bool {
+    fn visit_nodes(&mut self, l: DataList) -> bool {
         for node in l.nodes() {
             if (self.v)(node) {
                 return true;
@@ -3955,7 +4146,7 @@ impl ScopedChildVisit<'_, '_> {
     }
 
     /// Go `visitNodeList` for a list read in place.
-    fn visit_list(&mut self, l: DataList<'_>) -> bool {
+    fn visit_list(&mut self, l: DataList) -> bool {
         self.report(l, false);
         l.is_some() && self.visit_nodes(l)
     }
@@ -3971,18 +4162,18 @@ impl<'d> ChildVisit<'d> for ScopedChildVisit<'_, '_> {
     }
 
     fn list(&mut self, l: &'d crate::astdata::NodeList) -> bool {
-        self.visit_list(DataList::req(self.file, l))
+        self.visit_list(DataList::req(self.n, l))
     }
 
     fn opt_list(&mut self, l: &'d Option<crate::astdata::NodeList>) -> bool {
-        self.visit_list(DataList::opt(self.file, l))
+        self.visit_list(DataList::opt(self.n, l))
     }
 
     // Go `visitModifiers`: `ModifierList::is_some` has no nil marker.
     fn mods(&mut self, m: &'d Option<crate::astdata::ModifierList>) -> bool {
-        let l = DataList::mods(self.file, m);
+        let l = DataList::mods(self.n, m);
         self.report(l, true);
-        l.list.is_some() && self.visit_nodes(l)
+        l.is_some() && self.visit_nodes(l)
     }
 
     fn ids(&mut self, ids: &'d [crate::astdata::NodeId]) -> bool {
@@ -3997,44 +4188,48 @@ impl<'d> ChildVisit<'d> for ScopedChildVisit<'_, '_> {
 
 /// One child field of node data, in Go `ForEachChild` order
 /// (`for_each_child_field`).
-pub(crate) enum ChildField<'d> {
+pub enum ChildField<'d> {
     /// A single child (Go `visit`). `Node::NIL` for Go `nil`.
     Node(Node),
     /// The `FullSignature` child of a function-like node (Go `visit`).
     /// `Node::NIL` for Go `nil`. The API encoder's property mask has no bit
     /// for it.
     FullSignature(Node),
-    /// A list (Go `visitNodeList`). `None` for Go `nil`: no list, or the nil
-    /// marker of a required list field (`is_nil_list_marker`).
-    List(Option<&'d crate::astdata::NodeList>),
-    /// A modifier list (Go `visitModifiers`). `None` for Go `nil`.
-    Modifiers(Option<&'d crate::astdata::ModifierList>),
+    /// A list (Go `visitNodeList`). `NodeList::NIL` for Go `nil`: no list,
+    /// or the nil marker of a required list field.
+    List(NodeList),
+    /// A modifier list (Go `visitModifiers`). `ModifierList::NIL` for Go
+    /// `nil`.
+    Modifiers(ModifierList),
     /// A Go `[]*Node` field with no list (Go `visitNodes`): the children of
     /// a SyntaxList and the property tags of a JSDocTypeLiteral.
     Ids(&'d [crate::astdata::NodeId]),
 }
 
-/// Calls `f` with each child field of `data`, the node data of a node of
-/// Go kind `kind` in store `file`, in Go `ForEachChild` order. Each child
-/// id becomes a `Node` as the field accessors make it (`Node::new`).
+/// Calls `f` with each child field of `data`, the node data of node `n` of
+/// Go kind `kind`, in Go `ForEachChild` order. Each child id becomes a
+/// `Node` as the field accessors make it (`Node::new`), and each list a
+/// handle (`data_list`).
 /// Not in Go (perf, apiperf2): the API encoder (`encode_tree`) reads the
 /// fields of a node of the encoded file once for its property mask and its
 /// children. Go `VisitEachChild` visits the same fields in the same order,
 /// except in a SyntaxList, a JSDocTypeLiteral and a JSDoc parameter or
 /// property tag.
-pub(crate) fn for_each_child_field<'d>(
+pub fn for_each_child_field<'d>(
     kind: SyntaxKind,
-    file: usize,
-    data: &'d NodeData,
+    n: Node,
+    data: NodeData<'d>,
     f: impl FnMut(ChildField<'d>),
 ) {
-    walk_children(data, &mut ChildFields { kind, file, f });
+    let file = n.file_index();
+    walk_children(data, &mut ChildFields { kind, n, file, f });
 }
 
 /// The walk of `for_each_child_field`. It never stops early.
 struct ChildFields<F> {
     /// The Go kind of the node (`case_expression`).
     kind: SyntaxKind,
+    n: Node,
     file: usize,
     f: F,
 }
@@ -4056,21 +4251,22 @@ impl<'d, F: FnMut(ChildField<'d>)> ChildVisit<'d> for ChildFields<F> {
 
     #[inline(always)]
     fn list(&mut self, l: &'d crate::astdata::NodeList) -> bool {
-        (self.f)(ChildField::List((!is_nil_list_marker(l)).then_some(l)));
+        let l = data_list(self.n, *l);
+        (self.f)(ChildField::List(if l.is_nil() { NodeList::NIL } else { l }));
         false
     }
 
     #[inline(always)]
     fn opt_list(&mut self, l: &'d Option<crate::astdata::NodeList>) -> bool {
-        (self.f)(ChildField::List(
-            l.as_ref().filter(|l| !is_nil_list_marker(l)),
-        ));
+        let l = l.map_or(NodeList::NIL, |l| data_list(self.n, l));
+        (self.f)(ChildField::List(if l.is_nil() { NodeList::NIL } else { l }));
         false
     }
 
     #[inline(always)]
     fn mods(&mut self, m: &'d Option<crate::astdata::ModifierList>) -> bool {
-        (self.f)(ChildField::Modifiers(m.as_ref()));
+        let m = m.map_or(ModifierList::NIL, |m| data_modifiers(self.n, m));
+        (self.f)(ChildField::Modifiers(m));
         false
     }
 
@@ -4104,16 +4300,18 @@ impl<'d, F: FnMut(ChildField<'d>)> ChildVisit<'d> for ChildFields<F> {
 /// R3-2: the walk of `for_each_store_child_id`. The ids are slot indexes of
 /// the store of the node. Slot 0 resolves to Go `nil`
 /// (`resolve_store_id`), so a single child field with id 0 is skipped.
-struct StoreChildIds<F> {
+struct StoreChildIds<'l, F> {
     /// The Go kind of the node (`case_expression` reads it).
     kind: SyntaxKind,
+    /// The list table of the node data.
+    lists: ListIds<'l>,
     v: F,
 }
 
-impl<'d, F: FnMut(u32) -> bool> ChildVisit<'d> for StoreChildIds<F> {
+impl<'d, F: StoreChildSink> ChildVisit<'d> for StoreChildIds<'_, F> {
     #[inline(always)]
     fn node(&mut self, id: crate::astdata::NodeId) -> bool {
-        id.index() != 0 && (self.v)(id.index() as u32)
+        id.index() != 0 && self.v.child(id.index() as u32)
     }
 
     #[inline(always)]
@@ -4124,7 +4322,7 @@ impl<'d, F: FnMut(u32) -> bool> ChildVisit<'d> for StoreChildIds<F> {
     // `NodeList::is_nil` of a store list: the nil marker list.
     #[inline(always)]
     fn list(&mut self, l: &'d crate::astdata::NodeList) -> bool {
-        !is_nil_list_marker(l) && self.ids(&l.nodes)
+        self.lists.ids(*l).is_some_and(|ids| self.slots(ids))
     }
 
     #[inline(always)]
@@ -4135,12 +4333,13 @@ impl<'d, F: FnMut(u32) -> bool> ChildVisit<'d> for StoreChildIds<F> {
     // `ModifierList::is_nil` is only `None`.
     #[inline(always)]
     fn mods(&mut self, m: &'d Option<crate::astdata::ModifierList>) -> bool {
-        m.as_ref().is_some_and(|m| self.ids(&m.list.nodes))
+        m.as_ref()
+            .is_some_and(|m| self.lists.ids(m.list).is_some_and(|ids| self.slots(ids)))
     }
 
     #[inline(always)]
     fn ids(&mut self, ids: &'d [crate::astdata::NodeId]) -> bool {
-        ids.iter().any(|id| (self.v)(id.index() as u32))
+        self.slots(ids)
     }
 
     #[inline(always)]
@@ -4149,11 +4348,19 @@ impl<'d, F: FnMut(u32) -> bool> ChildVisit<'d> for StoreChildIds<F> {
     }
 }
 
+impl<F: StoreChildSink> StoreChildIds<'_, F> {
+    /// `v` on each slot index of `ids`, until it returns true.
+    #[inline(always)]
+    fn slots(&mut self, ids: &[crate::astdata::NodeId]) -> bool {
+        ids.iter().any(|id| self.v.child(id.index() as u32))
+    }
+}
+
 /// The Go `ForEachChild` fields of node data `data`, in Go order, for `w`.
 // Go: ast_generated.go ForEachChild (one method per node struct)
 // PORT: the per-struct Go methods are merged into one match. The order of
 // each arm follows the generated Go code.
-fn walk_children<'d>(data: &'d NodeData, w: &mut impl ChildVisit<'d>) -> bool {
+fn walk_children<'d>(data: NodeData<'d>, w: &mut impl ChildVisit<'d>) -> bool {
     macro_rules! n {
         ($x:expr) => {
             w.node($x)
@@ -4543,8 +4750,58 @@ fn walk_children<'d>(data: &'d NodeData, w: &mut impl ChildVisit<'d>) -> bool {
             None => false,
         },
         NodeData::SourceFile(d) => l!(d.statements) || n!(d.end_of_file_token),
-        _ => false,
+        // The data of the kinds of `has_no_child_fields`. Every variant is
+        // listed, so a new variant must pick an arm.
+        NodeData::Token(_)
+        | NodeData::Identifier(_)
+        | NodeData::PrivateIdentifier(_)
+        | NodeData::KeywordExpression(_)
+        | NodeData::KeywordTypeNode(_)
+        | NodeData::NumericLiteral(_)
+        | NodeData::BigIntLiteral(_)
+        | NodeData::StringLiteral(_)
+        | NodeData::RegularExpressionLiteral(_)
+        | NodeData::NoSubstitutionTemplateLiteral(_)
+        | NodeData::TemplateHead(_)
+        | NodeData::TemplateMiddle(_)
+        | NodeData::TemplateTail(_)
+        | NodeData::JsxText(_)
+        | NodeData::ThisTypeNode(_)
+        | NodeData::OmittedExpression(_)
+        | NodeData::SemicolonClassElement(_)
+        | NodeData::EmptyStatement(_)
+        | NodeData::DebuggerStatement(_)
+        | NodeData::JsxOpeningFragment(_)
+        | NodeData::JsxClosingFragment(_)
+        | NodeData::JsDocAllType(_)
+        | NodeData::JsDocText(_)
+        | NodeData::NotEmittedStatement(_)
+        | NodeData::NotEmittedTypeElement(_) => false,
     }
+}
+
+/// Go `(*Node).ForEachChild` (ast_generated.go:8693) has no case for these
+/// kinds and returns false: every token kind (identifiers, literals,
+/// punctuation, keywords) and the node kinds with no child field. Their
+/// data is a variant of the last arm of `walk_children`, which visits
+/// nothing.
+#[inline]
+pub(crate) const fn has_no_child_fields(kind: SyntaxKind) -> bool {
+    kind.is_token()
+        || matches!(
+            kind,
+            SyntaxKind::ThisType
+                | SyntaxKind::OmittedExpression
+                | SyntaxKind::SemicolonClassElement
+                | SyntaxKind::EmptyStatement
+                | SyntaxKind::DebuggerStatement
+                | SyntaxKind::JsxOpeningFragment
+                | SyntaxKind::JsxClosingFragment
+                | SyntaxKind::JsDocAllType
+                | SyntaxKind::JsDocText
+                | SyntaxKind::NotEmittedStatement
+                | SyntaxKind::NotEmittedTypeElement
+        )
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -4584,7 +4841,7 @@ fn facts_if(cond: bool, facts: SubtreeFacts) -> SubtreeFacts {
 }
 
 // Go: subtreefacts.go:89 propagateEraseableSyntaxListSubtreeFacts
-fn propagate_eraseable_list(children: DataList<'_>) -> SubtreeFacts {
+fn propagate_eraseable_list(children: DataList) -> SubtreeFacts {
     facts_if(children.is_some(), TS)
 }
 
@@ -4621,11 +4878,8 @@ fn propagate_subtree_facts(child: Node) -> SubtreeFacts {
 // Go: subtreefacts.go:117 propagateNodeListSubtreeFacts
 // Go: subtreefacts.go:128 propagateModifierListSubtreeFacts (with
 // `propagate_subtree_facts`)
-// PORT: the list is read in place from the node data (`DataList`).
-fn propagate_node_list(
-    children: DataList<'_>,
-    propagate: fn(Node) -> SubtreeFacts,
-) -> SubtreeFacts {
+// PORT: the list is read from the node data as a handle (`DataList`).
+fn propagate_node_list(children: DataList, propagate: fn(Node) -> SubtreeFacts) -> SubtreeFacts {
     let mut facts = NONE_FACTS;
     for child in children.nodes() {
         facts |= propagate(child);
@@ -4637,7 +4891,7 @@ fn propagate_node_list(
 /// `ClassLikeBase` or `AccessorDeclarationBase`), on the data `d` of node
 /// `n`. Go caches `SubtreeFacts()` only for these types (`ast.go:1602`).
 #[inline]
-fn is_composite_data(n: Node, d: &NodeData) -> bool {
+fn is_composite_data(n: Node, d: NodeData<'_>) -> bool {
     match d {
         // PORT: a PropertyDeclaration that Go parses as a PropertySignature
         // (`is_type_syntax_data`).
@@ -4722,7 +4976,7 @@ fn is_composite_data(n: Node, d: &NodeData) -> bool {
 // PERF: emitast1 F2. The callers load the data once and pass it in; this
 // was two data reads of its own for each node (`with_data!` twice).
 #[inline]
-fn is_type_syntax_data(n: Node, d: &NodeData) -> bool {
+fn is_type_syntax_data(n: Node, d: NodeData<'_>) -> bool {
     match d {
         // PORT: a PropertyDeclaration that Go parses as a PropertySignature.
         NodeData::PropertyDeclaration(_) => n.kind() == SyntaxKind::PropertySignature,
@@ -4783,7 +5037,7 @@ fn propagate_node_facts(n: Node) -> SubtreeFacts {
 }
 
 /// `propagate_node_facts` over the data `d` of `n`, read in place.
-fn propagate_node_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
+fn propagate_node_facts_of_data(n: Node, d: NodeData<'_>) -> SubtreeFacts {
     // Go: ast.go:1621 (*TypeSyntaxBase).propagateSubtreeFacts
     if is_type_syntax_data(n, d) {
         return TS;
@@ -4827,7 +5081,7 @@ fn propagate_node_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
 /// node of a `CompositeBase` kind gets the cached facts, or the facts
 /// computed from `d` (and cached). Any other node (a token, an identifier,
 /// a literal, type syntax) gets the facts computed from `d`, not cached.
-fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
+fn subtree_facts_with_data(n: Node, d: NodeData<'_>) -> SubtreeFacts {
     if is_type_syntax_data(n, d) {
         // Go: ast.go:1619 (*TypeSyntaxBase).computeSubtreeFacts
         return TS;
@@ -4846,7 +5100,7 @@ fn subtree_facts_with_data(n: Node, d: &NodeData) -> SubtreeFacts {
 // not once more here: in a deep chain of nodes that Go does not cache
 // (`await await ... x`), each step was 2 tests.
 #[inline]
-fn non_type_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
+fn non_type_subtree_facts(n: Node, d: NodeData<'_>) -> SubtreeFacts {
     debug_assert!(!is_type_syntax_data(n, d), "{:?} is type syntax", n.kind());
     if !is_composite_data(n, d) {
         return subtree_facts_of_data(n, d);
@@ -4857,7 +5111,7 @@ fn non_type_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
 /// `non_type_subtree_facts` for a node of a `CompositeBase` kind: the
 /// cached facts, or the facts computed from `d`, cached.
 #[inline(never)]
-fn composite_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
+fn composite_subtree_facts(n: Node, d: NodeData<'_>) -> SubtreeFacts {
     if let Some(word) = super::store::static_facts_word(n) {
         if let Some(facts) = computed_facts(SubtreeFacts(word.load(Ordering::Relaxed))) {
             return facts;
@@ -4881,7 +5135,7 @@ fn composite_subtree_facts(n: Node, d: &NodeData) -> SubtreeFacts {
 // `(*TypeSyntaxBase).computeSubtreeFacts` is in `subtree_facts_with_data`.
 /// Go `computeSubtreeFacts` over the data `d` of `n`, read in place, for a
 /// node that is not type syntax (`non_type_subtree_facts`).
-fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
+fn subtree_facts_of_data(n: Node, d: NodeData<'_>) -> SubtreeFacts {
     let f = n.file_index();
     macro_rules! p {
         ($x:expr) => {
@@ -4895,22 +5149,22 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
     }
     macro_rules! pl {
         ($x:expr) => {
-            propagate_node_list(DataList::req(f, &$x), propagate_subtree_facts)
+            propagate_node_list(DataList::req(n, &$x), propagate_subtree_facts)
         };
     }
     macro_rules! pol {
         ($x:expr) => {
-            propagate_node_list(DataList::opt(f, &$x), propagate_subtree_facts)
+            propagate_node_list(DataList::opt(n, &$x), propagate_subtree_facts)
         };
     }
     macro_rules! pm {
         ($x:expr) => {
-            propagate_node_list(DataList::mods(f, &$x), propagate_subtree_facts)
+            propagate_node_list(DataList::mods(n, &$x), propagate_subtree_facts)
         };
     }
     macro_rules! el {
         ($x:expr) => {
-            propagate_eraseable_list(DataList::opt(f, &$x))
+            propagate_eraseable_list(DataList::opt(n, &$x))
         };
     }
     macro_rules! e {
@@ -4919,7 +5173,7 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
         };
     }
     let ambient = |m: &Option<crate::astdata::ModifierList>| {
-        in_place_modifier_flags(m).intersects(ModifierFlags::AMBIENT)
+        in_place_modifier_flags(n, m).intersects(ModifierFlags::AMBIENT)
     };
     let jsx = SubtreeFacts::SUBTREE_CONTAINS_JSX;
     match d {
@@ -5014,11 +5268,11 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
         // Go: ast.go:1734 (*BindingPattern).computeSubtreeFacts
         NodeData::BindingPattern(d) => match n.kind() {
             SyntaxKind::ObjectBindingPattern => propagate_node_list(
-                DataList::req(f, &d.elements),
+                DataList::req(n, &d.elements),
                 propagate_object_binding_element,
             ),
             SyntaxKind::ArrayBindingPattern => {
-                propagate_node_list(DataList::req(f, &d.elements), propagate_binding_element)
+                propagate_node_list(DataList::req(n, &d.elements), propagate_binding_element)
             }
             _ => NONE_FACTS,
         },
@@ -5207,7 +5461,7 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
             if d.body.is_none() {
                 TS
             } else {
-                let is_async = modifiers_have_async(&d.modifiers);
+                let is_async = modifiers_have_async(n, &d.modifiers);
                 let is_generator = d.asterisk_token.is_some();
                 pm!(d.modifiers)
                     | po!(d.asterisk_token)
@@ -5298,7 +5552,7 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
         }
         // Go: ast.go:2079 (*FunctionExpression).computeSubtreeFacts
         NodeData::FunctionExpression(d) => {
-            let is_async = modifiers_have_async(&d.modifiers);
+            let is_async = modifiers_have_async(n, &d.modifiers);
             let is_generator = d.asterisk_token.is_some();
             pm!(d.modifiers)
                 | po!(d.asterisk_token)
@@ -5332,14 +5586,14 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
                     SubtreeFacts::SUBTREE_CONTAINS_PRIVATE_IDENTIFIER_IN_EXPRESSION,
                 )
         }
-        // Go: ast.go:2132 (*CallExpression).computeSubtreeFacts
+        // Go: ast.go:2131 (*CallExpression).computeSubtreeFacts
         NodeData::CallExpression(d) => {
             p!(d.expression)
                 | po!(d.question_dot_token)
                 | el!(d.type_arguments)
                 | pl!(d.arguments)
                 | facts_if(
-                    req(f, d.expression).kind() == SyntaxKind::ImportKeyword,
+                    is_import_call(n),
                     SubtreeFacts::SUBTREE_CONTAINS_DYNAMIC_IMPORT,
                 )
         }
@@ -5489,9 +5743,9 @@ fn subtree_facts_of_data(n: Node, d: &NodeData) -> SubtreeFacts {
 }
 
 /// Go `node.modifiers != nil && node.modifiers.ModifierFlags&ModifierFlagsAsync != 0`
-/// for the modifier list `m` of a node, read in place.
-fn modifiers_have_async(m: &Option<crate::astdata::ModifierList>) -> bool {
-    in_place_modifier_flags(m).intersects(ModifierFlags::ASYNC)
+/// for the modifier list field `m` of the data of node `n`.
+fn modifiers_have_async(n: Node, m: &Option<crate::astdata::ModifierList>) -> bool {
+    in_place_modifier_flags(n, m).intersects(ModifierFlags::ASYNC)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -5660,16 +5914,32 @@ pub fn is_array_literal_or_object_literal_destructuring_pattern(node: Node) -> b
 
 // Go: ast.go:1430 accessKind
 fn access_kind(node: Node) -> AccessKind {
+    access_kind_ref(NodeRef::new(node))
+}
+
+/// `access_kind` of the view of a node.
+// PERF: checkid1. The parent, its kind and the parents of the recursive
+// steps are read through views (`NodeRef`): a parent in the same store
+// costs no registry lookup. Go reads struct fields. Same tests, same order.
+fn access_kind_ref(node: NodeRef) -> AccessKind {
     let parent = node.parent();
     if parent.is_nil() {
         return AccessKind::READ;
     }
     match parent.kind() {
         SyntaxKind::ParenthesizedExpression | SyntaxKind::ArrayLiteralExpression => {
-            access_kind(parent)
+            access_kind_ref(parent)
         }
+        // PERF: noderead2. The operator and the left operand come from one
+        // node data read of the parent (`NodeRef::data`, `frozen_data_ids`),
+        // and the operator token kind is read once. Go reads the fields.
         SyntaxKind::PrefixUnaryExpression | SyntaxKind::PostfixUnaryExpression => {
-            let operator = parent.operator();
+            let operator = match parent.data() {
+                Some(NodeData::PrefixUnaryExpression(d)) => d.operator,
+                Some(NodeData::PostfixUnaryExpression(d)) => d.operator,
+                _ => parent.node().operator(),
+            };
+            debug_assert_eq!(operator, parent.node().operator());
             if operator == SyntaxKind::PlusPlusToken || operator == SyntaxKind::MinusMinusToken {
                 AccessKind::READ_WRITE
             } else {
@@ -5677,10 +5947,16 @@ fn access_kind(node: Node) -> AccessKind {
             }
         }
         SyntaxKind::BinaryExpression => {
-            if parent.left() == node {
-                let operator = parent.operator_token();
-                if is_assignment_operator(operator.kind()) {
-                    if operator.kind() == SyntaxKind::EqualsToken {
+            let (left, operator_token) = match frozen_data_ids(parent.node()) {
+                Some((NodeData::BinaryExpression(d), ids)) => {
+                    (ids.node(d.left), ids.node(d.operator_token))
+                }
+                _ => (parent.node().left(), parent.node().operator_token()),
+            };
+            if left == node.node() {
+                let operator = operator_token.kind();
+                if is_assignment_operator(operator) {
+                    if operator == SyntaxKind::EqualsToken {
                         return AccessKind::WRITE;
                     }
                     return AccessKind::READ_WRITE;
@@ -5689,28 +5965,28 @@ fn access_kind(node: Node) -> AccessKind {
             AccessKind::READ
         }
         SyntaxKind::PropertyAccessExpression => {
-            if parent.name() != node {
+            if parent.name() != node.node() {
                 return AccessKind::READ;
             }
-            access_kind(parent)
+            access_kind_ref(parent)
         }
         SyntaxKind::PropertyAssignment => {
-            let parent_access = access_kind(parent.parent());
+            let parent_access = access_kind_ref(parent.parent());
             // In `({ x: varname }) = { x: 1 }`, the left `x` is a read, the right `x` is a write.
-            if node == parent.name() {
+            if node.node() == parent.name() {
                 return reverse_access_kind(parent_access);
             }
             parent_access
         }
         SyntaxKind::ShorthandPropertyAssignment => {
             // Assume it's the local variable being accessed, since we don't check public properties for --noUnusedLocals.
-            if node == parent.object_assignment_initializer() {
+            if node.node() == parent.node().object_assignment_initializer() {
                 return AccessKind::READ;
             }
-            access_kind(parent.parent())
+            access_kind_ref(parent.parent())
         }
         SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement => {
-            if node == parent.initializer() {
+            if node.node() == parent.initializer() {
                 AccessKind::WRITE
             } else {
                 AccessKind::READ
@@ -5738,7 +6014,23 @@ fn reverse_access_kind(a: AccessKind) -> AccessKind {
 /// `DeclarationBase`.
 #[must_use]
 pub fn is_declaration_node(node: Node) -> bool {
-    with_data!(node, |d| matches!(
+    with_data!(node, |d| is_declaration_data(d))
+}
+
+/// `is_declaration_node` on the view of a node (`NodeRef`): a published
+/// store node reads its data with no second registry lookup.
+#[inline]
+#[must_use]
+pub fn is_declaration_node_ref(node: NodeRef) -> bool {
+    match node.data() {
+        Some(d) => is_declaration_data(d),
+        None => is_declaration_node(node.node()),
+    }
+}
+
+/// `is_declaration_node` on the data of the node.
+fn is_declaration_data(d: NodeData<'_>) -> bool {
+    matches!(
         d,
         NodeData::ArrowFunction(_)
             | NodeData::BinaryExpression(_)
@@ -5796,7 +6088,7 @@ pub fn is_declaration_node(node: Node) -> bool {
             | NodeData::TypeLiteralNode(_)
             | NodeData::TypeParameterDeclaration(_)
             | NodeData::VariableDeclaration(_)
-    ))
+    )
 }
 
 // Go: ast.go:1532 IsLocalsContainer
@@ -6202,6 +6494,13 @@ pub fn source_file_original_file_name(file: Node) -> &'static str {
 #[must_use]
 pub fn source_file_span_map(file: Node) -> Option<&'static crate::spanmap::SpanMap> {
     source_file_content_mapper_info(file)?.span_map.as_deref()
+}
+
+// Go: ast/ast.go:2571 (*SourceFile).IsContentMapped (ts#64518)
+// IsContentMapped reports whether this file was produced by a content mapper.
+#[must_use]
+pub fn source_file_is_content_mapped(file: Node) -> bool {
+    source_file_content_mapper_info(file).is_some()
 }
 
 // Go: ast/ast.go:2575 (*SourceFile).ContentMapper
@@ -6704,6 +7003,7 @@ pub fn get_declaration_name(declaration: Node) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::astdata::BoxedData;
 
     /// Go `(*Node)(nil).SubtreeFacts()` dereferences nil. The data read of
     /// nil panics (`static_tier_ast_node`) before any facts cache read, in a
@@ -6753,5 +7053,220 @@ mod tests {
             }
         }
         assert!(cached > 10 && computed > 10, "{cached} {computed}");
+    }
+
+    /// perfP1 item 1 (perfscan2), in a release build: the child chain of
+    /// each published node that has one (R2-5 links, which
+    /// `for_each_child_dyn` walks) is the walk of its node data, in Go
+    /// `ForEachChild` order. A debug build checks this at each walk; the
+    /// protected tests run release builds, so this test checks a sample.
+    #[test]
+    fn child_chains_are_the_data_walk() {
+        const SOURCE: &str = "@dec export abstract class C<T extends object = {}> extends B implements I {\n\
+            ;  #p?: T; static { debugger; } constructor(private a: number) { super(); }\n\
+            get g(): this { return this; } set g(v) {} [k: string]: any; m?<U>(...r: U[]): void;\n\
+            }\n\
+            interface I { (x: number): string; new (): I; readonly [P in keyof T]-?: T[P] }\n\
+            type M<T> = { [P in keyof T as `k${string & P}`]+?: T[P] extends infer U ? U : never };\n\
+            enum E { A = 1 << 2, B }\n\
+            namespace N.M { export import Q = N.Q; }\n\
+            import d, { a as b, type c } from 'm';\n\
+            label: for (const [a, , ...b] of x) { if (a) continue label; else break; }\n\
+            switch (x) { case 1: throw new Error(); default: }\n\
+            try { using r = f(); } catch ({ e = 1 }) { } finally { }\n\
+            async function* g() { yield* await x!; return void delete o[1]?.[2]; }\n\
+            const o = { a, b: 1, ...c, ['d']: 2, m() {}, get x() { return 1; } } satisfies O as const;\n\
+            let t = tag<string>`a${1}b${2}c` + /re/g.source + 1n + (x, y++) - ~!x + (-x) ** 2;\n\
+            /** @param a text */ function h(this: Window, a: unknown): asserts a is string {}\n";
+        let dir =
+            std::env::temp_dir().join(format!("ts_goport_child_chains_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.ts"), SOURCE).unwrap();
+        std::fs::write(
+            dir.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "noLib": true, "types": [] }, "files": ["a.ts"] }"#,
+        )
+        .unwrap();
+        let config = dir.join("tsconfig.json");
+        let program = crate::program::try_load_version(&config.to_string_lossy(), |_| {})
+            .unwrap_or_else(|e| panic!("cannot load {}: {e}", config.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let scope = crate::core::enter_program(Some(program));
+        let root = program
+            .source_files()
+            .find(|file| file.info.file_name.ends_with("/a.ts"))
+            .expect("a.ts is not in the program")
+            .root;
+        // (nodes, nodes with a known chain, those with children).
+        let mut counts = (0, 0, 0);
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            counts.0 += 1;
+            let by_data: Vec<Node> = children_by_data(n).collect();
+            if let Some(chain) = frozen_store_node(n).and_then(|f| f.children()) {
+                assert_eq!(chain.collect::<Vec<_>>(), by_data, "{:?}", n.kind());
+                counts.1 += 1;
+                counts.2 += usize::from(!by_data.is_empty());
+            }
+            stack.extend(by_data);
+        }
+        drop(scope);
+        crate::program::release_program(program);
+        assert!(counts.1 > 250 && counts.2 > 100, "{counts:?}");
+    }
+
+    /// noderef1 W1: `has_no_child_fields` holds for exactly the kinds of the
+    /// variants of the last arm of `walk_children`, and that arm visits no
+    /// field. In parsed code, a node has a child field exactly when its kind
+    /// is not one of them.
+    #[test]
+    fn no_child_kinds_are_the_kinds_of_the_leaf_arm() {
+        use crate::astdata as a;
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+        let (s, f) = (String::new, a::TokenFlags(0));
+        let leaves = [
+            BoxedData::Token(Box::new(a::TokenData)),
+            BoxedData::Identifier(Box::new(a::IdentifierData { text: s() })),
+            BoxedData::PrivateIdentifier(Box::new(a::PrivateIdentifierData { text: s() })),
+            BoxedData::KeywordExpression(Box::new(a::KeywordExpressionData)),
+            BoxedData::KeywordTypeNode(Box::new(a::KeywordTypeNodeData)),
+            BoxedData::NumericLiteral(Box::new(a::NumericLiteralData {
+                text: s(),
+                token_flags: f,
+            })),
+            BoxedData::BigIntLiteral(Box::new(a::BigIntLiteralData {
+                text: s(),
+                token_flags: f,
+            })),
+            BoxedData::StringLiteral(Box::new(a::StringLiteralData {
+                text: s(),
+                token_flags: f,
+            })),
+            BoxedData::RegularExpressionLiteral(Box::new(a::RegularExpressionLiteralData {
+                text: s(),
+                token_flags: f,
+            })),
+            BoxedData::NoSubstitutionTemplateLiteral(Box::new(
+                a::NoSubstitutionTemplateLiteralData {
+                    raw_text: s(),
+                    template_flags: f,
+                    text: s(),
+                    token_flags: f,
+                },
+            )),
+            BoxedData::TemplateHead(Box::new(a::TemplateHeadData {
+                raw_text: s(),
+                template_flags: f,
+                text: s(),
+                token_flags: f,
+            })),
+            BoxedData::TemplateMiddle(Box::new(a::TemplateMiddleData {
+                raw_text: s(),
+                template_flags: f,
+                text: s(),
+                token_flags: f,
+            })),
+            BoxedData::TemplateTail(Box::new(a::TemplateTailData {
+                raw_text: s(),
+                template_flags: f,
+                text: s(),
+                token_flags: f,
+            })),
+            BoxedData::JsxText(Box::new(a::JsxTextData {
+                contains_only_trivia_white_spaces: false,
+                text: s(),
+                token_flags: f,
+            })),
+            BoxedData::ThisTypeNode(Box::new(a::ThisTypeNodeData)),
+            BoxedData::OmittedExpression(Box::new(a::OmittedExpressionData)),
+            BoxedData::SemicolonClassElement(Box::new(a::SemicolonClassElementData)),
+            BoxedData::EmptyStatement(Box::new(a::EmptyStatementData)),
+            BoxedData::DebuggerStatement(Box::new(a::DebuggerStatementData)),
+            BoxedData::JsxOpeningFragment(Box::new(a::JsxOpeningFragmentData)),
+            BoxedData::JsxClosingFragment(Box::new(a::JsxClosingFragmentData)),
+            BoxedData::JsDocAllType(Box::new(a::JsDocAllTypeData)),
+            BoxedData::JsDocText(Box::new(a::JsDocTextData { text: Vec::new() })),
+            BoxedData::NotEmittedStatement(Box::new(a::NotEmittedStatementData)),
+            BoxedData::NotEmittedTypeElement(Box::new(a::NotEmittedTypeElementData)),
+        ];
+        // `n` is the node of `d`: a list field reads the lists of its file.
+        let fields = |kind: SyntaxKind, n: Node, d: NodeData<'_>| {
+            let mut fields = 0;
+            for_each_child_field(kind, n, d, |_| fields += 1);
+            fields
+        };
+        // The leaves are in no file, so a child that a wrong arm visits
+        // reads no store: a parallel test may free file 0 or file 1, and a
+        // debug build checks that the file of a node is not freed
+        // (`file_block`).
+        let no_file = Node(((crate::ast::store::FILE_ID_LIMIT as u64) << 32) | 1);
+        for d in &leaves {
+            assert_eq!(
+                fields(SyntaxKind::Unknown, no_file, d.view()),
+                0,
+                "{}",
+                d.view().schema_name()
+            );
+        }
+        for k in 0..SyntaxKind::COUNT as u16 {
+            let kind = SyntaxKind::try_from(k).unwrap();
+            let leaf = leaves.iter().any(|d| d.view().matches_syntax_kind(kind));
+            assert_eq!(has_no_child_fields(kind), leaf, "{kind:?}");
+        }
+
+        fn collect(n: Node, out: &mut Vec<Node>) {
+            out.push(n);
+            n.for_each_child(|c| {
+                collect(c, out);
+                false
+            });
+        }
+        let text = "@dec export abstract class C<T extends object = {}> extends B implements I {\n\
+            ;  #p?: T; static { debugger; } constructor(private a: number) { super(); }\n\
+            get g(): this { return this; } set g(v) {} [k: string]: any; m?<U>(...r: U[]): void;\n\
+            }\n\
+            interface I { (x: number): string; new (): I; readonly [P in keyof T]-?: T[P] }\n\
+            type M<T> = { [P in keyof T as `k${string & P}`]+?: T[P] extends infer U ? U : never };\n\
+            type F = typeof import('m', { with: { a: 'b' } }).x | (new () => unknown) & [a: 1, b?: 2, ...c: 3[]];\n\
+            enum E { A = 1 << 2, B }\n\
+            declare module 'm' { export = x; }\n\
+            namespace N.M { export import Q = N.Q; }\n\
+            import d, { a as b, type c } from 'm' with { type: 'json' };\n\
+            import * as ns from 'm';\n\
+            export { a as default } from 'm';\n\
+            export * as e from 'm';\n\
+            label: for (const [a, , ...b] of x) { if (a) continue label; else break; }\n\
+            for (let i = 0; i < 1; i++) for (const k in o) while (k) do { ; } while (0);\n\
+            switch (x) { case 1: throw new Error(); default: }\n\
+            try { using r = f(); } catch ({ e = 1 }) { } finally { }\n\
+            async function* g() { yield* await x!; return void delete o[1]?.[2]; }\n\
+            const o = { a, b: 1, ...c, ['d']: 2, m() {}, get x() { return 1; } } satisfies O as const;\n\
+            let t = tag<string>`a${1}b${2}c` + /re/g.source + 1n + (x, y++) - ~!x + (-x) ** 2;\n\
+            let f2 = function () { return <T,>(a: T): a is T => true; };\n\
+            x ??= y ||= z &&= import.meta.url ? new.target : null;\n\
+            declare function h(this: Window, x: unknown): asserts x is string;\n\
+            declare const u: unique symbol;\n";
+        let opts = SourceFileParseOptions {
+            file_name: "/leaves.ts".to_string(),
+            ..Default::default()
+        };
+        let root = parse_source_file(&opts, text, ScriptKind::TS).root;
+        let mut nodes = Vec::new();
+        collect(root, &mut nodes);
+        let (mut leaves_seen, mut inner_seen) = (0, 0);
+        for &n in &nodes {
+            let kind = n.kind();
+            let leaf = with_ast_data(n, |d| fields(kind, n, d)) == 0;
+            assert_eq!(has_no_child_fields(kind), leaf, "{kind:?}");
+            if leaf {
+                leaves_seen += 1;
+            } else {
+                inner_seen += 1;
+            }
+        }
+        assert!(
+            leaves_seen > 50 && inner_seen > 100,
+            "{leaves_seen} {inner_seen}"
+        );
     }
 }

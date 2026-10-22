@@ -7,7 +7,6 @@
 //! `ModifierList`, and Go `nil` is the `NIL` value of each. Nodes go to the
 //! factory target (synthetic arena or the store of the parsed file).
 
-use crate::astdata::NodeData as D;
 use crate::prelude::*;
 
 /// Go `TokenFlagsNone` in astdata form.
@@ -18,12 +17,10 @@ impl NodeFactory {
     pub fn new_do_statement(&self, statement: Node, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::DoStatement,
-            D::DoStatement(Box::new(crate::astdata::DoStatementData {
+            crate::astdata::DoStatementData {
                 expression: self.id(expression),
-                flow_node: None,
                 statement: self.id(statement),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -31,12 +28,10 @@ impl NodeFactory {
     pub fn new_while_statement(&self, expression: Node, statement: Node) -> Node {
         self.new_node(
             SyntaxKind::WhileStatement,
-            D::WhileStatement(Box::new(crate::astdata::WhileStatementData {
+            crate::astdata::WhileStatementData {
                 expression: self.id(expression),
-                flow_node: None,
                 statement: self.id(statement),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -50,16 +45,12 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ForStatement,
-            D::ForStatement(Box::new(crate::astdata::ForStatementData {
+            crate::astdata::ForStatementData {
                 condition: self.oid(condition),
-                flow_node: None,
                 incrementor: self.oid(incrementor),
                 initializer: self.oid(initializer),
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
                 statement: self.id(statement),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -74,16 +65,12 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             kind,
-            D::ForInOrOfStatement(Box::new(crate::astdata::ForInOrOfStatementData {
+            crate::astdata::ForInOrOfStatementData {
                 await_modifier: self.oid(await_modifier),
                 expression: self.id(expression),
-                flow_node: None,
                 initializer: self.id(initializer),
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
                 statement: self.id(statement),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -91,10 +78,9 @@ impl NodeFactory {
     pub fn new_break_statement(&self, label: Node) -> Node {
         self.new_node(
             SyntaxKind::BreakStatement,
-            D::BreakStatement(Box::new(crate::astdata::BreakStatementData {
-                flow_node: None,
+            crate::astdata::BreakStatementData {
                 label: self.oid(label),
-            })),
+            },
         )
     }
 
@@ -102,10 +88,9 @@ impl NodeFactory {
     pub fn new_continue_statement(&self, label: Node) -> Node {
         self.new_node(
             SyntaxKind::ContinueStatement,
-            D::ContinueStatement(Box::new(crate::astdata::ContinueStatementData {
-                flow_node: None,
+            crate::astdata::ContinueStatementData {
                 label: self.oid(label),
-            })),
+            },
         )
     }
 
@@ -113,12 +98,10 @@ impl NodeFactory {
     pub fn new_with_statement(&self, expression: Node, statement: Node) -> Node {
         self.new_node(
             SyntaxKind::WithStatement,
-            D::WithStatement(Box::new(crate::astdata::WithStatementData {
+            crate::astdata::WithStatementData {
                 expression: self.id(expression),
-                flow_node: None,
                 statement: self.id(statement),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -126,12 +109,10 @@ impl NodeFactory {
     pub fn new_switch_statement(&self, expression: Node, case_block: Node) -> Node {
         self.new_node(
             SyntaxKind::SwitchStatement,
-            D::SwitchStatement(Box::new(crate::astdata::SwitchStatementData {
+            crate::astdata::SwitchStatementData {
                 case_block: self.id(case_block),
                 expression: self.id(expression),
-                flow_node: None,
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -139,12 +120,9 @@ impl NodeFactory {
     pub fn new_case_block(&self, clauses: NodeList) -> Node {
         self.new_node(
             SyntaxKind::CaseBlock,
-            D::CaseBlock(Box::new(crate::astdata::CaseBlockData {
+            crate::astdata::CaseBlockData {
                 clauses: self.req_list(clauses),
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -157,12 +135,10 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             kind,
-            D::CaseOrDefaultClause(Box::new(crate::astdata::CaseOrDefaultClauseData {
+            crate::astdata::CaseOrDefaultClauseData {
                 expression: self.id(expression),
-                fallthrough_flow_node: None,
                 statements: self.req_list(statements),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -170,11 +146,9 @@ impl NodeFactory {
     pub fn new_throw_statement(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::ThrowStatement,
-            D::ThrowStatement(Box::new(crate::astdata::ThrowStatementData {
+            crate::astdata::ThrowStatementData {
                 expression: self.id(expression),
-                flow_node: None,
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -187,13 +161,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::TryStatement,
-            D::TryStatement(Box::new(crate::astdata::TryStatementData {
+            crate::astdata::TryStatementData {
                 catch_clause: self.oid(catch_clause),
                 finally_block: self.oid(finally_block),
-                flow_node: None,
                 try_block: self.id(try_block),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -201,13 +173,10 @@ impl NodeFactory {
     pub fn new_catch_clause(&self, variable_declaration: Node, block: Node) -> Node {
         self.new_node(
             SyntaxKind::CatchClause,
-            D::CatchClause(Box::new(crate::astdata::CatchClauseData {
+            crate::astdata::CatchClauseData {
                 block: self.id(block),
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
                 variable_declaration: self.oid(variable_declaration),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -215,9 +184,7 @@ impl NodeFactory {
     pub fn new_debugger_statement(&self) -> Node {
         self.new_node(
             SyntaxKind::DebuggerStatement,
-            D::DebuggerStatement(Box::new(crate::astdata::DebuggerStatementData {
-                flow_node: None,
-            })),
+            crate::astdata::DebuggerStatementData,
         )
     }
 
@@ -225,11 +192,10 @@ impl NodeFactory {
     pub fn new_labeled_statement(&self, label: Node, statement: Node) -> Node {
         self.new_node(
             SyntaxKind::LabeledStatement,
-            D::LabeledStatement(Box::new(crate::astdata::LabeledStatementData {
-                flow_node: None,
+            crate::astdata::LabeledStatementData {
                 label: self.id(label),
                 statement: self.id(statement),
-            })),
+            },
         )
     }
 
@@ -237,10 +203,9 @@ impl NodeFactory {
     pub fn new_binding_pattern(&self, kind: SyntaxKind, elements: NodeList) -> Node {
         self.new_node(
             kind,
-            D::BindingPattern(Box::new(crate::astdata::BindingPatternData {
+            crate::astdata::BindingPatternData {
                 elements: self.req_list(elements),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -254,16 +219,12 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::BindingElement,
-            D::BindingElement(Box::new(crate::astdata::BindingElementData {
+            crate::astdata::BindingElementData {
                 dot_dot_dot_token: self.oid(dot_dot_dot_token),
-                flow_node: None,
                 initializer: self.oid(initializer),
-                local_symbol: None,
                 property_name: self.oid(property_name),
-                symbol: None,
-                facts: 0,
                 name: self.oid(name),
-            })),
+            },
         )
     }
 
@@ -271,11 +232,9 @@ impl NodeFactory {
     pub fn new_missing_declaration(&self, modifiers: ModifierList) -> Node {
         self.new_node(
             SyntaxKind::MissingDeclaration,
-            D::MissingDeclaration(Box::new(crate::astdata::MissingDeclarationData {
-                flow_node: None,
-                symbol: None,
+            crate::astdata::MissingDeclarationData {
                 modifiers: self.mods(modifiers),
-            })),
+            },
         )
     }
 
@@ -289,17 +248,12 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsTypeAliasDeclaration,
-            D::TypeAliasDeclaration(Box::new(crate::astdata::TypeAliasDeclarationData {
-                flow_node: None,
-                local_symbol: None,
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
-                symbol: None,
+            crate::astdata::TypeAliasDeclarationData {
                 type_: self.id(type_node),
                 type_parameters: self.opt_list(type_parameters),
                 modifiers: self.mods(modifiers),
                 name: self.id(name),
-            })),
+            },
         )
     }
 
@@ -313,15 +267,12 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsImportDeclaration,
-            D::ImportDeclaration(Box::new(crate::astdata::ImportDeclarationData {
+            crate::astdata::ImportDeclarationData {
                 attributes: self.oid(attributes),
-                flow_node: None,
                 import_clause: self.oid(import_clause),
                 module_specifier: self.id(module_specifier),
-                symbol: None,
-                facts: 0,
                 modifiers: self.mods(modifiers),
-            })),
+            },
         )
     }
 
@@ -329,11 +280,9 @@ impl NodeFactory {
     pub fn new_namespace_import(&self, name: Node) -> Node {
         self.new_node(
             SyntaxKind::NamespaceImport,
-            D::NamespaceImport(Box::new(crate::astdata::NamespaceImportData {
-                local_symbol: None,
-                symbol: None,
+            crate::astdata::NamespaceImportData {
                 name: self.id(name),
-            })),
+            },
         )
     }
 
@@ -341,14 +290,10 @@ impl NodeFactory {
     pub fn new_namespace_export_declaration(&self, modifiers: ModifierList, name: Node) -> Node {
         self.new_node(
             SyntaxKind::NamespaceExportDeclaration,
-            D::NamespaceExportDeclaration(Box::new(
-                crate::astdata::NamespaceExportDeclarationData {
-                    flow_node: None,
-                    symbol: None,
-                    modifiers: self.mods(modifiers),
-                    name: self.id(name),
-                },
-            )),
+            crate::astdata::NamespaceExportDeclarationData {
+                modifiers: self.mods(modifiers),
+                name: self.id(name),
+            },
         )
     }
 
@@ -356,10 +301,9 @@ impl NodeFactory {
     pub fn new_namespace_export(&self, name: Node) -> Node {
         self.new_node(
             SyntaxKind::NamespaceExport,
-            D::NamespaceExport(Box::new(crate::astdata::NamespaceExportData {
-                symbol: None,
+            crate::astdata::NamespaceExportData {
                 name: self.id(name),
-            })),
+            },
         )
     }
 
@@ -367,9 +311,7 @@ impl NodeFactory {
     pub fn new_semicolon_class_element(&self) -> Node {
         self.new_node(
             SyntaxKind::SemicolonClassElement,
-            D::SemicolonClassElement(Box::new(crate::astdata::SemicolonClassElementData {
-                symbol: None,
-            })),
+            crate::astdata::SemicolonClassElementData,
         )
     }
 
@@ -377,17 +319,10 @@ impl NodeFactory {
     pub fn new_class_static_block_declaration(&self, modifiers: ModifierList, body: Node) -> Node {
         self.new_node(
             SyntaxKind::ClassStaticBlockDeclaration,
-            D::ClassStaticBlockDeclaration(Box::new(
-                crate::astdata::ClassStaticBlockDeclarationData {
-                    body: self.id(body),
-                    locals: crate::astdata::SymbolTable,
-                    next_container: None,
-                    return_flow_node: None,
-                    symbol: None,
-                    facts: 0,
-                    modifiers: self.mods(modifiers),
-                },
-            )),
+            crate::astdata::ClassStaticBlockDeclarationData {
+                body: self.id(body),
+                modifiers: self.mods(modifiers),
+            },
         )
     }
 
@@ -395,7 +330,7 @@ impl NodeFactory {
     pub fn new_omitted_expression(&self) -> Node {
         self.new_node(
             SyntaxKind::OmittedExpression,
-            D::OmittedExpression(Box::new(crate::astdata::OmittedExpressionData)),
+            crate::astdata::OmittedExpressionData,
         )
     }
 
@@ -403,10 +338,10 @@ impl NodeFactory {
     pub fn new_postfix_unary_expression(&self, operand: Node, operator: SyntaxKind) -> Node {
         self.new_node(
             SyntaxKind::PostfixUnaryExpression,
-            D::PostfixUnaryExpression(Box::new(crate::astdata::PostfixUnaryExpressionData {
+            crate::astdata::PostfixUnaryExpressionData {
                 operand: self.id(operand),
                 operator,
-            })),
+            },
         )
     }
 
@@ -414,12 +349,10 @@ impl NodeFactory {
     pub fn new_meta_property(&self, keyword_token: SyntaxKind, name: Node) -> Node {
         self.new_node(
             SyntaxKind::MetaProperty,
-            D::MetaProperty(Box::new(crate::astdata::MetaPropertyData {
-                flow_node: None,
+            crate::astdata::MetaPropertyData {
                 keyword_token,
-                facts: 0,
                 name: self.id(name),
-            })),
+            },
         )
     }
 
@@ -427,11 +360,10 @@ impl NodeFactory {
     pub fn new_template_expression(&self, head: Node, template_spans: NodeList) -> Node {
         self.new_node(
             SyntaxKind::TemplateExpression,
-            D::TemplateExpression(Box::new(crate::astdata::TemplateExpressionData {
+            crate::astdata::TemplateExpressionData {
                 head: self.id(head),
                 template_spans: self.req_list(template_spans),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -439,10 +371,10 @@ impl NodeFactory {
     pub fn new_template_span(&self, expression: Node, literal: Node) -> Node {
         self.new_node(
             SyntaxKind::TemplateSpan,
-            D::TemplateSpan(Box::new(crate::astdata::TemplateSpanData {
+            crate::astdata::TemplateSpanData {
                 expression: self.id(expression),
                 literal: self.id(literal),
-            })),
+            },
         )
     }
 
@@ -450,10 +382,9 @@ impl NodeFactory {
     pub fn new_spread_assignment(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::SpreadAssignment,
-            D::SpreadAssignment(Box::new(crate::astdata::SpreadAssignmentData {
+            crate::astdata::SpreadAssignmentData {
                 expression: self.id(expression),
-                symbol: None,
-            })),
+            },
         )
     }
 
@@ -469,18 +400,14 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::ShorthandPropertyAssignment,
-            D::ShorthandPropertyAssignment(Box::new(
-                crate::astdata::ShorthandPropertyAssignmentData {
-                    equals_token: self.oid(equals_token),
-                    object_assignment_initializer: self.oid(object_assignment_initializer),
-                    postfix_token: self.oid(postfix_token),
-                    symbol: None,
-                    type_: self.oid(type_node),
-                    facts: 0,
-                    modifiers: self.mods(modifiers),
-                    name: self.id(name),
-                },
-            )),
+            crate::astdata::ShorthandPropertyAssignmentData {
+                equals_token: self.oid(equals_token),
+                object_assignment_initializer: self.oid(object_assignment_initializer),
+                postfix_token: self.oid(postfix_token),
+                type_: self.oid(type_node),
+                modifiers: self.mods(modifiers),
+                name: self.id(name),
+            },
         )
     }
 
@@ -488,11 +415,9 @@ impl NodeFactory {
     pub fn new_partially_emitted_expression(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::PartiallyEmittedExpression,
-            D::PartiallyEmittedExpression(Box::new(
-                crate::astdata::PartiallyEmittedExpressionData {
-                    expression: self.id(expression),
-                },
-            )),
+            crate::astdata::PartiallyEmittedExpressionData {
+                expression: self.id(expression),
+            },
         )
     }
 
@@ -505,12 +430,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsxElement,
-            D::JsxElement(Box::new(crate::astdata::JsxElementData {
+            crate::astdata::JsxElementData {
                 children: self.req_list(children),
                 closing_element: self.id(closing_element),
                 opening_element: self.id(opening_element),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -518,11 +442,9 @@ impl NodeFactory {
     pub fn new_jsx_attributes(&self, properties: NodeList) -> Node {
         self.new_node(
             SyntaxKind::JsxAttributes,
-            D::JsxAttributes(Box::new(crate::astdata::JsxAttributesData {
+            crate::astdata::JsxAttributesData {
                 properties: self.req_list(properties),
-                symbol: None,
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -530,11 +452,10 @@ impl NodeFactory {
     pub fn new_jsx_namespaced_name(&self, namespace: Node, name: Node) -> Node {
         self.new_node(
             SyntaxKind::JsxNamespacedName,
-            D::JsxNamespacedName(Box::new(crate::astdata::JsxNamespacedNameData {
+            crate::astdata::JsxNamespacedNameData {
                 namespace: self.id(namespace),
-                facts: 0,
                 name: self.id(name),
-            })),
+            },
         )
     }
 
@@ -547,12 +468,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsxOpeningElement,
-            D::JsxOpeningElement(Box::new(crate::astdata::JsxOpeningElementData {
+            crate::astdata::JsxOpeningElementData {
                 attributes: self.id(attributes),
                 tag_name: self.id(tag_name),
                 type_arguments: self.opt_list(type_arguments),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -565,12 +485,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsxSelfClosingElement,
-            D::JsxSelfClosingElement(Box::new(crate::astdata::JsxSelfClosingElementData {
+            crate::astdata::JsxSelfClosingElementData {
                 attributes: self.id(attributes),
                 tag_name: self.id(tag_name),
                 type_arguments: self.opt_list(type_arguments),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -583,12 +502,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsxFragment,
-            D::JsxFragment(Box::new(crate::astdata::JsxFragmentData {
+            crate::astdata::JsxFragmentData {
                 children: self.req_list(children),
                 closing_fragment: self.id(closing_fragment),
                 opening_fragment: self.id(opening_fragment),
-                facts: 0,
-            })),
+            },
         )
     }
 
@@ -596,7 +514,7 @@ impl NodeFactory {
     pub fn new_jsx_opening_fragment(&self) -> Node {
         self.new_node(
             SyntaxKind::JsxOpeningFragment,
-            D::JsxOpeningFragment(Box::new(crate::astdata::JsxOpeningFragmentData)),
+            crate::astdata::JsxOpeningFragmentData,
         )
     }
 
@@ -604,7 +522,7 @@ impl NodeFactory {
     pub fn new_jsx_closing_fragment(&self) -> Node {
         self.new_node(
             SyntaxKind::JsxClosingFragment,
-            D::JsxClosingFragment(Box::new(crate::astdata::JsxClosingFragmentData)),
+            crate::astdata::JsxClosingFragmentData,
         )
     }
 
@@ -612,12 +530,10 @@ impl NodeFactory {
     pub fn new_jsx_attribute(&self, name: Node, initializer: Node) -> Node {
         self.new_node(
             SyntaxKind::JsxAttribute,
-            D::JsxAttribute(Box::new(crate::astdata::JsxAttributeData {
+            crate::astdata::JsxAttributeData {
                 initializer: self.oid(initializer),
-                symbol: None,
-                facts: 0,
                 name: self.id(name),
-            })),
+            },
         )
     }
 
@@ -625,9 +541,9 @@ impl NodeFactory {
     pub fn new_jsx_spread_attribute(&self, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::JsxSpreadAttribute,
-            D::JsxSpreadAttribute(Box::new(crate::astdata::JsxSpreadAttributeData {
+            crate::astdata::JsxSpreadAttributeData {
                 expression: self.id(expression),
-            })),
+            },
         )
     }
 
@@ -635,9 +551,9 @@ impl NodeFactory {
     pub fn new_jsx_closing_element(&self, tag_name: Node) -> Node {
         self.new_node(
             SyntaxKind::JsxClosingElement,
-            D::JsxClosingElement(Box::new(crate::astdata::JsxClosingElementData {
+            crate::astdata::JsxClosingElementData {
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -645,10 +561,10 @@ impl NodeFactory {
     pub fn new_jsx_expression(&self, dot_dot_dot_token: Node, expression: Node) -> Node {
         self.new_node(
             SyntaxKind::JsxExpression,
-            D::JsxExpression(Box::new(crate::astdata::JsxExpressionData {
+            crate::astdata::JsxExpressionData {
                 dot_dot_dot_token: self.oid(dot_dot_dot_token),
                 expression: self.oid(expression),
-            })),
+            },
         )
     }
 
@@ -660,11 +576,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_text_node(
             SyntaxKind::JsxText,
-            D::JsxText(Box::new(crate::astdata::JsxTextData {
+            crate::astdata::JsxTextData {
                 contains_only_trivia_white_spaces,
                 text: text.into(),
                 token_flags: NO_TOKEN_FLAGS,
-            })),
+            },
         )
     }
 
@@ -672,10 +588,10 @@ impl NodeFactory {
     pub fn new_js_doc(&self, comment: NodeList, tags: NodeList) -> Node {
         self.new_node(
             SyntaxKind::JsDoc,
-            D::JsDoc(Box::new(crate::astdata::JsDocData {
+            crate::astdata::JsDocData {
                 comment: self.req_list(comment),
                 tags: self.opt_list(tags),
-            })),
+            },
         )
     }
 
@@ -683,9 +599,9 @@ impl NodeFactory {
     pub fn new_js_doc_type_expression(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::JsDocTypeExpression,
-            D::JsDocTypeExpression(Box::new(crate::astdata::JsDocTypeExpressionData {
+            crate::astdata::JsDocTypeExpressionData {
                 type_: self.id(type_node),
-            })),
+            },
         )
     }
 
@@ -693,9 +609,9 @@ impl NodeFactory {
     pub fn new_js_doc_non_nullable_type(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::JsDocNonNullableType,
-            D::JsDocNonNullableType(Box::new(crate::astdata::JsDocNonNullableTypeData {
+            crate::astdata::JsDocNonNullableTypeData {
                 type_: self.id(type_node),
-            })),
+            },
         )
     }
 
@@ -703,27 +619,24 @@ impl NodeFactory {
     pub fn new_js_doc_nullable_type(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::JsDocNullableType,
-            D::JsDocNullableType(Box::new(crate::astdata::JsDocNullableTypeData {
+            crate::astdata::JsDocNullableTypeData {
                 type_: self.id(type_node),
-            })),
+            },
         )
     }
 
     // Go: ast/ast_generated.go:7034 NewJSDocAllType
     pub fn new_js_doc_all_type(&self) -> Node {
-        self.new_node(
-            SyntaxKind::JsDocAllType,
-            D::JsDocAllType(Box::new(crate::astdata::JsDocAllTypeData)),
-        )
+        self.new_node(SyntaxKind::JsDocAllType, crate::astdata::JsDocAllTypeData)
     }
 
     // Go: ast/ast_generated.go:7056 NewJSDocVariadicType
     pub fn new_js_doc_variadic_type(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::JsDocVariadicType,
-            D::JsDocVariadicType(Box::new(crate::astdata::JsDocVariadicTypeData {
+            crate::astdata::JsDocVariadicTypeData {
                 type_: self.id(type_node),
-            })),
+            },
         )
     }
 
@@ -731,9 +644,9 @@ impl NodeFactory {
     pub fn new_js_doc_optional_type(&self, type_node: Node) -> Node {
         self.new_node(
             SyntaxKind::JsDocOptionalType,
-            D::JsDocOptionalType(Box::new(crate::astdata::JsDocOptionalTypeData {
+            crate::astdata::JsDocOptionalTypeData {
                 type_: self.id(type_node),
-            })),
+            },
         )
     }
 
@@ -746,11 +659,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocTypeTag,
-            D::JsDocTypeTag(Box::new(crate::astdata::JsDocTypeTagData {
+            crate::astdata::JsDocTypeTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
                 type_expression: self.id(type_expression),
-            })),
+            },
         )
     }
 
@@ -758,10 +671,10 @@ impl NodeFactory {
     pub fn new_js_doc_unknown_tag(&self, tag_name: Node, comment: NodeList) -> Node {
         self.new_node(
             SyntaxKind::JsDocUnknownTag,
-            D::JsDocUnknownTag(Box::new(crate::astdata::JsDocUnknownTagData {
+            crate::astdata::JsDocUnknownTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -775,12 +688,12 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocTemplateTag,
-            D::JsDocTemplateTag(Box::new(crate::astdata::JsDocTemplateTagData {
+            crate::astdata::JsDocTemplateTagData {
                 comment: self.opt_list(comment),
                 constraint: self.id(constraint),
                 tag_name: self.id(tag_name),
                 type_parameters: self.req_list(type_parameters),
-            })),
+            },
         )
     }
 
@@ -793,11 +706,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocReturnTag,
-            D::JsDocReturnTag(Box::new(crate::astdata::JsDocReturnTagData {
+            crate::astdata::JsDocReturnTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
                 type_expression: self.oid(type_expression),
-            })),
+            },
         )
     }
 
@@ -805,10 +718,10 @@ impl NodeFactory {
     pub fn new_js_doc_public_tag(&self, tag_name: Node, comment: NodeList) -> Node {
         self.new_node(
             SyntaxKind::JsDocPublicTag,
-            D::JsDocPublicTag(Box::new(crate::astdata::JsDocPublicTagData {
+            crate::astdata::JsDocPublicTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -816,10 +729,10 @@ impl NodeFactory {
     pub fn new_js_doc_private_tag(&self, tag_name: Node, comment: NodeList) -> Node {
         self.new_node(
             SyntaxKind::JsDocPrivateTag,
-            D::JsDocPrivateTag(Box::new(crate::astdata::JsDocPrivateTagData {
+            crate::astdata::JsDocPrivateTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -827,10 +740,10 @@ impl NodeFactory {
     pub fn new_js_doc_protected_tag(&self, tag_name: Node, comment: NodeList) -> Node {
         self.new_node(
             SyntaxKind::JsDocProtectedTag,
-            D::JsDocProtectedTag(Box::new(crate::astdata::JsDocProtectedTagData {
+            crate::astdata::JsDocProtectedTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -838,10 +751,10 @@ impl NodeFactory {
     pub fn new_js_doc_readonly_tag(&self, tag_name: Node, comment: NodeList) -> Node {
         self.new_node(
             SyntaxKind::JsDocReadonlyTag,
-            D::JsDocReadonlyTag(Box::new(crate::astdata::JsDocReadonlyTagData {
+            crate::astdata::JsDocReadonlyTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -849,10 +762,10 @@ impl NodeFactory {
     pub fn new_js_doc_override_tag(&self, tag_name: Node, comment: NodeList) -> Node {
         self.new_node(
             SyntaxKind::JsDocOverrideTag,
-            D::JsDocOverrideTag(Box::new(crate::astdata::JsDocOverrideTagData {
+            crate::astdata::JsDocOverrideTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -860,10 +773,10 @@ impl NodeFactory {
     pub fn new_js_doc_deprecated_tag(&self, tag_name: Node, comment: NodeList) -> Node {
         self.new_node(
             SyntaxKind::JsDocDeprecatedTag,
-            D::JsDocDeprecatedTag(Box::new(crate::astdata::JsDocDeprecatedTagData {
+            crate::astdata::JsDocDeprecatedTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -876,11 +789,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocSeeTag,
-            D::JsDocSeeTag(Box::new(crate::astdata::JsDocSeeTagData {
+            crate::astdata::JsDocSeeTagData {
                 comment: self.opt_list(comment),
                 name_expression: self.id(name_expression),
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -893,11 +806,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocImplementsTag,
-            D::JsDocImplementsTag(Box::new(crate::astdata::JsDocImplementsTagData {
+            crate::astdata::JsDocImplementsTagData {
                 class_name: self.id(class_name),
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -910,11 +823,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocAugmentsTag,
-            D::JsDocAugmentsTag(Box::new(crate::astdata::JsDocAugmentsTagData {
+            crate::astdata::JsDocAugmentsTagData {
                 class_name: self.id(class_name),
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -927,11 +840,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocSatisfiesTag,
-            D::JsDocSatisfiesTag(Box::new(crate::astdata::JsDocSatisfiesTagData {
+            crate::astdata::JsDocSatisfiesTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
                 type_expression: self.id(type_expression),
-            })),
+            },
         )
     }
 
@@ -944,11 +857,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocThrowsTag,
-            D::JsDocThrowsTag(Box::new(crate::astdata::JsDocThrowsTagData {
+            crate::astdata::JsDocThrowsTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
                 type_expression: self.oid(type_expression),
-            })),
+            },
         )
     }
 
@@ -961,11 +874,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocThisTag,
-            D::JsDocThisTag(Box::new(crate::astdata::JsDocThisTagData {
+            crate::astdata::JsDocThisTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
                 type_expression: self.id(type_expression),
-            })),
+            },
         )
     }
 
@@ -980,13 +893,13 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocImportTag,
-            D::JsDocImportTag(Box::new(crate::astdata::JsDocImportTagData {
+            crate::astdata::JsDocImportTagData {
                 attributes: self.oid(attributes),
                 comment: self.opt_list(comment),
                 import_clause: self.oid(import_clause),
                 module_specifier: self.id(module_specifier),
                 tag_name: self.id(tag_name),
-            })),
+            },
         )
     }
 
@@ -1000,12 +913,12 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocCallbackTag,
-            D::JsDocCallbackTag(Box::new(crate::astdata::JsDocCallbackTagData {
+            crate::astdata::JsDocCallbackTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
                 type_expression: self.id(type_expression),
                 name: self.oid(name),
-            })),
+            },
         )
     }
 
@@ -1018,11 +931,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocOverloadTag,
-            D::JsDocOverloadTag(Box::new(crate::astdata::JsDocOverloadTagData {
+            crate::astdata::JsDocOverloadTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
                 type_expression: self.id(type_expression),
-            })),
+            },
         )
     }
 
@@ -1036,12 +949,12 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocTypedefTag,
-            D::JsDocTypedefTag(Box::new(crate::astdata::JsDocTypedefTagData {
+            crate::astdata::JsDocTypedefTagData {
                 comment: self.opt_list(comment),
                 tag_name: self.id(tag_name),
                 type_expression: self.oid(type_expression),
                 name: self.oid(name),
-            })),
+            },
         )
     }
 
@@ -1054,15 +967,12 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocSignature,
-            D::JsDocSignature(Box::new(crate::astdata::JsDocSignatureData {
+            crate::astdata::JsDocSignatureData {
                 full_signature: None,
-                locals: crate::astdata::SymbolTable,
-                next_container: None,
                 parameters: self.req_list(parameters),
-                symbol: None,
                 type_: self.oid(type_node),
                 type_parameters: self.opt_list(type_parameters),
-            })),
+            },
         )
     }
 
@@ -1070,9 +980,9 @@ impl NodeFactory {
     pub fn new_js_doc_name_reference(&self, name: Node) -> Node {
         self.new_node(
             SyntaxKind::JsDocNameReference,
-            D::JsDocNameReference(Box::new(crate::astdata::JsDocNameReferenceData {
+            crate::astdata::JsDocNameReferenceData {
                 name: self.id(name),
-            })),
+            },
         )
     }
 
@@ -1080,7 +990,7 @@ impl NodeFactory {
     pub fn new_js_doc_text(&self, text: Vec<String>) -> Node {
         self.new_text_node(
             SyntaxKind::JsDocText,
-            D::JsDocText(Box::new(crate::astdata::JsDocTextData { text })),
+            crate::astdata::JsDocTextData { text },
         )
     }
 
@@ -1088,10 +998,10 @@ impl NodeFactory {
     pub fn new_js_doc_link(&self, name: Node, text: Vec<String>) -> Node {
         self.new_text_node(
             SyntaxKind::JsDocLink,
-            D::JsDocLink(Box::new(crate::astdata::JsDocLinkData {
+            crate::astdata::JsDocLinkData {
                 name: self.oid(name),
                 text,
-            })),
+            },
         )
     }
 
@@ -1099,10 +1009,10 @@ impl NodeFactory {
     pub fn new_js_doc_link_plain(&self, name: Node, text: Vec<String>) -> Node {
         self.new_text_node(
             SyntaxKind::JsDocLinkPlain,
-            D::JsDocLinkPlain(Box::new(crate::astdata::JsDocLinkPlainData {
+            crate::astdata::JsDocLinkPlainData {
                 name: self.oid(name),
                 text,
-            })),
+            },
         )
     }
 
@@ -1110,10 +1020,10 @@ impl NodeFactory {
     pub fn new_js_doc_link_code(&self, name: Node, text: Vec<String>) -> Node {
         self.new_text_node(
             SyntaxKind::JsDocLinkCode,
-            D::JsDocLinkCode(Box::new(crate::astdata::JsDocLinkCodeData {
+            crate::astdata::JsDocLinkCodeData {
                 name: self.oid(name),
                 text,
-            })),
+            },
         )
     }
 
@@ -1121,12 +1031,10 @@ impl NodeFactory {
     pub fn new_synthetic_reference_expression(&self, expression: Node, this_arg: Node) -> Node {
         self.new_node(
             SyntaxKind::SyntheticReferenceExpression,
-            D::SyntheticReferenceExpression(Box::new(
-                crate::astdata::SyntheticReferenceExpressionData {
-                    expression: self.id(expression),
-                    this_arg: self.id(this_arg),
-                },
-            )),
+            crate::astdata::SyntheticReferenceExpressionData {
+                expression: self.id(expression),
+                this_arg: self.id(this_arg),
+            },
         )
     }
 
@@ -1139,12 +1047,11 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             SyntaxKind::JsDocTypeLiteral,
-            D::JsDocTypeLiteral(Box::new(crate::astdata::JsDocTypeLiteralData {
+            crate::astdata::JsDocTypeLiteralData {
                 is_array_type,
                 js_doc_property_tags: (!jsdoc_property_tags.is_empty())
                     .then(|| jsdoc_property_tags.iter().map(|&t| self.id(t)).collect()),
-                symbol: None,
-            })),
+            },
         )
     }
 
@@ -1161,16 +1068,14 @@ impl NodeFactory {
     ) -> Node {
         self.new_node(
             kind,
-            D::JsDocParameterOrPropertyTag(Box::new(
-                crate::astdata::JsDocParameterOrPropertyTagData {
-                    comment: self.opt_list(comment),
-                    is_bracketed,
-                    is_name_first,
-                    tag_name: self.id(tag_name),
-                    type_expression: self.oid(type_expression),
-                    name: self.id(name),
-                },
-            )),
+            crate::astdata::JsDocParameterOrPropertyTagData {
+                comment: self.opt_list(comment),
+                is_bracketed,
+                is_name_first,
+                tag_name: self.id(tag_name),
+                type_expression: self.oid(type_expression),
+                name: self.id(name),
+            },
         )
     }
 }
