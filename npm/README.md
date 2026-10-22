@@ -94,12 +94,13 @@ The release workflow (`.github/workflows/release.yml`) makes a release:
 1. Push a tag `v<version>`, for example `git tag v0.1.0 && git push origin v0.1.0`. The npm
    version is the tag without the `v`.
 2. It builds the tsc on Linux x64 and Linux arm64 (static musl, non-PIE: it starts on any Linux of
-   its arch; each builds natively on a Blacksmith runner of that arch), on an arm64 Mac and an
-   Intel Mac (jemalloc does not cross-build for macOS with zig), and on Windows x64 and arm64
-   (MSVC, the C runtime linked in, the system allocator), from the same source. Each is a PGO
-   build trained on its own platform (see below). Blacksmith has no Intel Mac and no arm64
-   Windows runner: darwin-x64 builds on GitHub's `macos-15-intel` and win32-arm64 on GitHub's
-   `windows-11-arm`.
+   its arch; each builds natively on a Blacksmith runner of that arch), on an arm64 Mac (both
+   macOS tscs: jemalloc does not cross-build for macOS with zig, but Apple's clang builds it for
+   x86-64 on an arm64 Mac), and on Windows x64 and arm64 (MSVC, the C runtime linked in, the
+   system allocator), from the same source. Each is a PGO build trained on its own platform (see
+   below), except darwin-x64 and win32-arm64: these ship a plain fat-LTO build, about 10 to 13%
+   slower on a check, because their PGO builds took 76 and 48 minutes. Blacksmith has no arm64
+   Windows runner, so win32-arm64 builds on GitHub's `windows-11-arm`.
 3. It packs the set with `npm-pack.sh --name tsc-rs --package-version <v> --also linux-arm64=<tsc> --also darwin-arm64=<tsc> --also darwin-x64=<tsc> --also win32-x64=<tsc.exe> --also win32-arm64=<tsc.exe>`,
    and `@tsc-rs/typescript` with the same line and `--name @tsc-rs/typescript` (its platform
    packages must be the same bytes), makes one archive per platform (the tsc, the lib files,
@@ -118,14 +119,13 @@ To make a prerelease the default after a check of `npx tsc-rs@next` on each plat
 `npm dist-tag add tsc-rs@<v> latest`, and the same for `@tsc-rs/typescript` and each platform
 package.
 
-The CI builds are PGO builds of the shipped profile (fat LTO): `build-pgo.sh` trains each
-platform's tsc on the set of `scripts/goport/pgo-train.sh`, and the job fails unless the PGO tsc
-gives the same output as a plain build on that set. They have no BOLT: BOLT refuses the static
-Linux bin, macOS has no perf branch sampling for its profile, and BOLT has no PE (Windows)
-support. To make the Linux x64 tsc by
-hand on zbook, use
-`RELEASE_FEATURES=noembed RELEASE_LIBC=musl RELEASE_PIE=0 crates/ts_goport/scripts/build-release.sh <out>/linux-x64`
-and pack and test it:
+The CI builds (but darwin-x64 and win32-arm64) are PGO builds of the shipped profile (fat LTO):
+`build-pgo.sh` trains each platform's tsc on the set of `scripts/goport/pgo-train.sh`, and the job
+fails unless the PGO tsc gives the same output as a plain build on that set. They have no BOLT: BOLT
+refuses the static Linux bin, macOS has no perf branch sampling for its profile, and BOLT has no PE
+(Windows) support. To make the Linux x64 tsc by hand on zbook, use `RELEASE_FEATURES=noembed
+RELEASE_LIBC=musl RELEASE_PIE=0 crates/ts_goport/scripts/build-release.sh <out>/linux-x64` and pack
+and test it:
 
 ```sh
 GOPORT_PIN=<pin> scripts/goport/npm-pack.sh --name tsc-rs --package-version <v> \
